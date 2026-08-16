@@ -24,7 +24,8 @@
       "@harness/session": ["./packages/session/src"],
       "@harness/provider-mock": ["./packages/plugins/provider-mock/src"],
       "@harness/tools-builtin": ["./packages/plugins/tools-builtin/src"],
-      "@harness/provider-anthropic": ["./packages/plugins/provider-anthropic/src"]
+      "@harness/provider-anthropic": ["./packages/plugins/provider-anthropic/src"],
+      "@harness/cli": ["./packages/cli/src"]
     }
   },
   "include": ["packages/*/src", "packages/plugins/*/src"],
