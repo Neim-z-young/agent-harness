@@ -21,9 +21,10 @@
       "@harness/permission": ["./packages/permission/src"],
       "@harness/skill": ["./packages/skill/src"],
       "@harness/agent": ["./packages/agent/src"],
-      "@harness/session": ["./packages/session/src"]
+      "@harness/session": ["./packages/session/src"],
+      "@harness/provider-mock": ["./packages/plugins/provider-mock/src"]
     }
   },
-  "include": ["packages/*/src"],
+  "include": ["packages/*/src", "packages/plugins/*/src"],
   "exclude": ["node_modules", "dist", "reference"]
 }
