@@ -1,0 +1,18 @@
+{
+  "name": "@harness/skill",
+  "version": "0.1.0",
+  "description": "双轨技能系统（Markdown 知识 + 内嵌 Shell），三来源合并 + paths 条件触发",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

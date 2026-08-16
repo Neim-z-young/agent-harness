@@ -1,0 +1,25 @@
+{
+  "name": "@harness/core",
+  "version": "0.1.0",
+  "description": "Harness 核心编排器：生命周期管理 + 能力访问器（session/agent/plugin/bus/context）",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/bus": "workspace:*",
+    "@harness/tool": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/session": "workspace:*",
+    "@harness/agent": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

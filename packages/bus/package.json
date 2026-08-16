@@ -1,0 +1,18 @@
+{
+  "name": "@harness/bus",
+  "version": "0.1.0",
+  "description": "类型安全的事件总线，支持 BusEvent.define / publish / subscribe / subscribeAll",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

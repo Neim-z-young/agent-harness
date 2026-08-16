@@ -1,0 +1,18 @@
+{
+  "name": "@harness/agent",
+  "version": "0.1.0",
+  "description": "Agent 定义：四模式分层（primary/subagent/coordinator/teammate）+ 可组合 Prompt 片段",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

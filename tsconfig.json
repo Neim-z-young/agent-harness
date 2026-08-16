@@ -1,0 +1,29 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "dist",
+    "types": ["bun"],
+    "paths": {
+      "@harness/core": ["./packages/core/src"],
+      "@harness/bus": ["./packages/bus/src"],
+      "@harness/tool": ["./packages/tool/src"],
+      "@harness/plugin": ["./packages/plugin/src"],
+      "@harness/permission": ["./packages/permission/src"],
+      "@harness/skill": ["./packages/skill/src"],
+      "@harness/agent": ["./packages/agent/src"],
+      "@harness/session": ["./packages/session/src"]
+    }
+  },
+  "include": ["packages/*/src"],
+  "exclude": ["node_modules", "dist", "reference"]
+}

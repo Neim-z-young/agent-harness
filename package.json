@@ -1,0 +1,24 @@
+{
+  "name": "agent-harness",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A plugin-based Agent Harness framework built with TypeScript + Bun",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "packages/plugins/*"
+  ],
+  "scripts": {
+    "dev": "bun --filter=* run dev",
+    "build": "bun --filter=* run build",
+    "test": "bun --filter=* run test",
+    "typecheck": "bun --filter=* run typecheck"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "bun": ">=1.1.0"
+  }
+}
