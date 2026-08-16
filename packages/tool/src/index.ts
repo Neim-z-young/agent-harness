@@ -301,3 +301,408 @@ export function partitionToolCalls(uses: ToolUse[]): ToolBatch[] {
 
   return batches
 }
+
+// ===== Tool 自定义错误 =====
+
+/** Schema 校验失败错误（inputSchema 或 outputSchema） */
+export class ToolSchemaError extends Error {
+  /** 'input' 或 'output' */
+  readonly stage: 'input' | 'output'
+  readonly toolId: string
+  readonly cause: unknown
+
+  constructor(toolId: string, stage: 'input' | 'output', cause: unknown) {
+    const causeMsg = cause instanceof Error ? cause.message : String(cause)
+    super(`[${toolId}] ${stage} schema validation failed: ${causeMsg}`)
+    this.name = 'ToolSchemaError'
+    this.toolId = toolId
+    this.stage = stage
+    this.cause = cause
+  }
+}
+
+/** 语义校验失败错误（validateInput） */
+export class ToolValidationError extends Error {
+  readonly toolId: string
+  readonly cause: unknown
+
+  constructor(toolId: string, cause: unknown) {
+    const causeMsg = cause instanceof Error ? cause.message : String(cause)
+    super(`[${toolId}] semantic validation failed: ${causeMsg}`)
+    this.name = 'ToolValidationError'
+    this.toolId = toolId
+    this.cause = cause
+  }
+}
+
+/** 权限拒绝错误 */
+export class ToolPermissionDeniedError extends Error {
+  readonly toolId: string
+  readonly toolKey?: string
+  readonly patterns?: string[]
+
+  constructor(toolId: string, toolKey?: string, patterns?: string[]) {
+    super(`[${toolId}] permission denied (key=${toolKey ?? 'n/a'}, patterns=${JSON.stringify(patterns)})`)
+    this.name = 'ToolPermissionDeniedError'
+    this.toolId = toolId
+    this.toolKey = toolKey
+    this.patterns = patterns
+  }
+}
+
+/** 权限需要询问用户错误（Pipeline 无法自行决策，返回给上层 UI 处理） */
+export class ToolPermissionAskRequiredError extends Error {
+  readonly toolId: string
+  readonly toolKey?: string
+  readonly patterns?: string[]
+
+  constructor(toolId: string, toolKey?: string, patterns?: string[]) {
+    super(`[${toolId}] user permission required (key=${toolKey ?? 'n/a'})`)
+    this.name = 'ToolPermissionAskRequiredError'
+    this.toolId = toolId
+    this.toolKey = toolKey
+    this.patterns = patterns
+  }
+}
+
+// ===== Tool Pipeline Hooks =====
+
+/** PreHook 回调：在权限检查之后、真正 tool.call 之前被调用（中间件风格支持 next） */
+export interface ToolPreHookContext {
+  tool: Tool
+  input: unknown
+  ctx: ToolContext
+  toolUseId: string
+}
+
+export type ToolPreHook = (
+  ctx: ToolPreHookContext,
+  next: (modifiedInput?: unknown) => Promise<ToolResult>
+) => Promise<ToolResult>
+
+/** PostHook 回调：在 tool.call 返回结果之后调用（可观察/修改结果） */
+export interface ToolPostHookContext {
+  tool: Tool
+  input: unknown
+  ctx: ToolContext
+  toolUseId: string
+}
+
+export type ToolPostHook = (ctx: ToolPostHookContext, result: ToolResult) => Awaitable<ToolResult>
+
+// ===== ToolRegistry =====
+
+/** 注册参数 */
+export interface ToolRegisterOptions {
+  /** 若 ID 已存在是否覆盖，默认 false 抛错 */
+  override?: boolean
+}
+
+/**
+ * ToolRegistry：工具注册中心
+ *
+ * 负责：
+ * - register / unregister / get / has 基本 CRUD
+ * - alias 解析（工具别名也可查找）
+ * - filterByWhitelist：按 Agent 的 tools 白名单过滤
+ * - toSchemas：导出给 LLM 的工具 schema 描述（需要适配具体 Provider 时做转换）
+ */
+export class ToolRegistry {
+  private readonly byId = new Map<string, Tool>()
+
+  /**
+   * 注册一个工具
+   * @throws 如果 ID 已存在且 options.override !== true
+   */
+  register(tool: Tool, options: ToolRegisterOptions = {}): this {
+    if (this.byId.has(tool.id) && !options.override) {
+      throw new Error(`ToolRegistry: tool id "${tool.id}" already registered`)
+    }
+    this.byId.set(tool.id, tool)
+    return this
+  }
+
+  /** 批量注册（按数组顺序依次 register） */
+  registerAll(tools: Tool[], options: ToolRegisterOptions = {}): this {
+    for (const t of tools) this.register(t, options)
+    return this
+  }
+
+  /** 注销工具（ID 不存在时忽略） */
+  unregister(toolId: string): this {
+    this.byId.delete(toolId)
+    return this
+  }
+
+  /** 是否存在（ID 或 alias 匹配） */
+  has(idOrAlias: string): boolean {
+    if (this.byId.has(idOrAlias)) return true
+    for (const t of this.byId.values()) {
+      if (t.aliases?.includes(idOrAlias)) return true
+    }
+    return false
+  }
+
+  /**
+   * 获取工具实例（ID 或 alias 查找）
+   * @returns Tool 或 undefined
+   */
+  get(idOrAlias: string): Tool | undefined {
+    const direct = this.byId.get(idOrAlias)
+    if (direct) return direct
+    for (const t of this.byId.values()) {
+      if (t.aliases?.includes(idOrAlias)) return t
+    }
+    return undefined
+  }
+
+  /** 列出所有已注册工具 */
+  list(): Tool[] {
+    return Array.from(this.byId.values())
+  }
+
+  /** 当前注册数量 */
+  get size(): number {
+    return this.byId.size
+  }
+
+  /**
+   * 按 Agent 的工具白名单过滤
+   *
+   * 规则：
+   * - whitelist = ['*'] → 全部放行
+   * - 否则：只保留 ID 在列表里的工具，并同时匹配 alias
+   */
+  filterByWhitelist(whitelist: string[] | ['*']): Tool[] {
+    if (whitelist.length === 1 && whitelist[0] === '*') {
+      return this.list()
+    }
+    const result: Tool[] = []
+    for (const id of whitelist as string[]) {
+      const t = this.get(id)
+      if (t && !result.includes(t)) result.push(t)
+    }
+    return result
+  }
+
+  /** 清空注册表 */
+  clear(): void {
+    this.byId.clear()
+  }
+}
+
+// ===== ToolPipeline =====
+
+/** ToolPipeline 构造参数 */
+export interface ToolPipelineOptions {
+  /** 权限检查实现（通常由 PermissionEngine 提供），缺省时跳过权限检查（开发模式） */
+  checkPermission?: (req: PermissionRequest) => Awaitable<PermissionDecision>
+  /** PreHook 列表（按注册顺序执行，洋葱模型） */
+  preHooks?: ToolPreHook[]
+  /** PostHook 列表（按注册顺序执行） */
+  postHooks?: ToolPostHook[]
+  /** outputSchema 校验失败时是抛错还是降级为 warning，默认 false（抛错） */
+  softOutputSchema?: boolean
+  /** 结果最大字符数截断（用于 ToolResult string 输出，防止 LLM 上下文爆炸），默认 200k */
+  resultMaxChars?: number
+}
+
+/**
+ * ToolPipeline：工具调用 7 步生命周期执行器
+ *
+ * 1. inputSchema.safeParse 硬校验 → 失败抛 ToolSchemaError(stage=input)
+ * 2. tool.validateInput 语义校验 → 失败抛 ToolValidationError
+ * 3. PreHook 洋葱模型管道（可修改 input）
+ * 4. PermissionEngine.check()（若声明了 tool.permission）：
+ *    - allow → 继续
+ *    - ask   → 抛 ToolPermissionAskRequiredError（交给上层处理用户交互）
+ *    - deny  → 抛 ToolPermissionDeniedError
+ * 5. tool.call() 真正调用（含耗时统计、AbortSignal 中断检查）
+ * 6. outputSchema 校验（soft 模式降级为日志，默认抛错）
+ * 7. PostHook 管道（可修改 result）+ 超大结果截断
+ */
+export class ToolPipeline {
+  private readonly checkPermission?: ToolPipelineOptions['checkPermission']
+  private readonly preHooks: ToolPreHook[]
+  private readonly postHooks: ToolPostHook[]
+  private readonly softOutputSchema: boolean
+  private readonly resultMaxChars: number
+
+  constructor(options: ToolPipelineOptions = {}) {
+    this.checkPermission = options.checkPermission
+    this.preHooks = options.preHooks ?? []
+    this.postHooks = options.postHooks ?? []
+    this.softOutputSchema = options.softOutputSchema ?? false
+    this.resultMaxChars = options.resultMaxChars ?? 200_000
+  }
+
+  /** 新增 PreHook（链式调用） */
+  addPreHook(hook: ToolPreHook): this {
+    this.preHooks.push(hook)
+    return this
+  }
+
+  /** 新增 PostHook（链式调用） */
+  addPostHook(hook: ToolPostHook): this {
+    this.postHooks.push(hook)
+    return this
+  }
+
+  /**
+   * 执行一次工具调用（7 步生命周期）
+   */
+  async execute(
+    tool: Tool,
+    rawInput: unknown,
+    ctx: ToolContext,
+    onProgress?: (p: unknown) => void
+  ): Promise<ToolResult> {
+    const startedAt = performance.now()
+
+    // --- Step 1: inputSchema 硬校验 ---
+    const parseResult = tool.inputSchema.safeParse(rawInput)
+    if (!parseResult.success) {
+      throw new ToolSchemaError(tool.id, 'input', parseResult.error)
+    }
+    let input: unknown = parseResult.data
+
+    // --- Step 2: 语义校验（validateInput）---
+    if (tool.validateInput) {
+      try {
+        await tool.validateInput(input as any, ctx)
+      } catch (err) {
+        throw new ToolValidationError(tool.id, err)
+      }
+    }
+
+    // --- 构造 preHook context ---
+    const preCtx: ToolPreHookContext = {
+      tool,
+      input,
+      ctx,
+      toolUseId: ctx.toolUseId,
+    }
+
+    // --- Step 3: PreHook 洋葱管道 + Step 4 权限 + Step 5 tool.call ---
+    // PreHook 采用洋葱模型：第一个 hook 的 next 是第二个 hook，... 最后一个 hook 的 next = doExecute()
+    const index = 0
+    const doExecute = async (finalInput: unknown = input): Promise<ToolResult> => {
+      input = finalInput
+
+      // Step 4: 权限检查（声明了 permission + 有 checkPermission 实现时）
+      if (tool.permission && this.checkPermission) {
+        const permReq: PermissionRequest = {
+          toolKey: tool.permission.key,
+          patterns: tool.permission.extractPatterns(input as any),
+          input,
+        }
+        const decision = await Promise.resolve(this.checkPermission(permReq))
+        // 允许插件通过 updatedInput 重写输入（Claude Code 风格）
+        if (decision.updatedInput !== undefined) {
+          input = decision.updatedInput
+        }
+        switch (decision.behavior) {
+          case 'deny':
+            throw new ToolPermissionDeniedError(tool.id, permReq.toolKey, permReq.patterns)
+          case 'ask':
+            throw new ToolPermissionAskRequiredError(tool.id, permReq.toolKey, permReq.patterns)
+          case 'allow':
+          default:
+            // 放行
+            break
+        }
+      }
+
+      // 中断检查
+      ctx.signal.throwIfAborted?.()
+
+      // Step 5: tool.call() 真正执行
+      const callStartedAt = performance.now()
+      const result0 = await tool.call(input as any, ctx, onProgress)
+      const callDurationMs = performance.now() - callStartedAt
+
+      // 附加耗时元数据
+      const result: ToolResult = {
+        ...result0,
+        meta: {
+          durationMs: callDurationMs,
+          ...(result0.meta ?? {}),
+        },
+      }
+
+      // --- Step 6: outputSchema 校验（可选）---
+      if (tool.outputSchema && result.ok && result.output !== undefined) {
+        const r = tool.outputSchema.safeParse(result.output)
+        if (!r.success) {
+          if (this.softOutputSchema) {
+            // soft：仅日志，不抛错
+            ctx.log?.error?.('outputSchema failed', { toolId: tool.id, error: r.error })
+          } else {
+            throw new ToolSchemaError(tool.id, 'output', r.error)
+          }
+        } else {
+          result.output = r.data
+        }
+      }
+
+      // --- 截断超大结果（string / object→JSON.stringfy→截断→转回字符串提示）---
+      this.truncateLargeResult(result, this.resultMaxChars)
+
+      // 附加总耗时 meta
+      result.meta = {
+        ...(result.meta ?? {}),
+        totalDurationMs: performance.now() - startedAt,
+      }
+      return result
+    }
+
+    // PreHook 洋葱调用链
+    const dispatch = async (hookIndex: number, currentInput: unknown): Promise<ToolResult> => {
+      if (hookIndex >= this.preHooks.length) {
+        return doExecute(currentInput)
+      }
+      const hook = this.preHooks[hookIndex]!
+      // 每个 hook 的 preCtx 能看到最新 input
+      const c: ToolPreHookContext = { ...preCtx, input: currentInput }
+      return hook(c, async (modifiedInput?: unknown): Promise<ToolResult> => {
+        return dispatch(hookIndex + 1, modifiedInput ?? currentInput)
+      })
+    }
+
+    let result = await dispatch(index, input)
+
+    // --- Step 7: PostHook 管道（按顺序）---
+    const postCtx: ToolPostHookContext = {
+      tool,
+      input,
+      ctx,
+      toolUseId: ctx.toolUseId,
+    }
+    for (const hook of this.postHooks) {
+      result = await Promise.resolve(hook(postCtx, result))
+    }
+
+    return result
+  }
+
+  /** 截断超大 ToolResult 输出（仅用于展示层提示，不破坏原结构时尽量保留） */
+  private truncateLargeResult(result: ToolResult, maxChars: number): void {
+    if (!result.ok || result.output === undefined) return
+    if (typeof result.output === 'string') {
+      if (result.output.length > maxChars) {
+        const truncated = result.output.slice(0, maxChars)
+        result.output = truncated + `\n... [truncated, original length=${result.output.length}]` as any
+      }
+    } else {
+      // 对象/数组：尝试 JSON.stringify 估计大小，超了则提示并替换
+      try {
+        const s = JSON.stringify(result.output)
+        if (s.length > maxChars) {
+          result.output = s.slice(0, maxChars) + `\n... [truncated, original length=${s.length}]` as any
+        }
+      } catch {
+        // 不可序列化忽略
+      }
+    }
+  }
+}
