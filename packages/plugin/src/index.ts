@@ -236,3 +236,492 @@ export interface PluginManager {
     ...args: Parameters<NonNullable<Hooks[N]>>
   ): Promise<void>
 }
+
+// ===== 自定义错误 =====
+
+/** 插件 ID 重复 */
+export class PluginDuplicateIdError extends Error {
+  readonly pluginId: string
+  constructor(id: string) {
+    super(`Plugin "${id}" already loaded`)
+    this.name = 'PluginDuplicateIdError'
+    this.pluginId = id
+  }
+}
+
+/** 插件未找到 */
+export class PluginNotFoundError extends Error {
+  readonly pluginId: string
+  constructor(id: string) {
+    super(`Plugin "${id}" not found`)
+    this.name = 'PluginNotFoundError'
+    this.pluginId = id
+  }
+}
+
+/** 循环依赖 */
+export class PluginCircularDependencyError extends Error {
+  readonly cycle: string[]
+  constructor(cycle: string[]) {
+    super(`Circular dependency detected among plugins: ${cycle.join(' → ')} → ${cycle[0]}`)
+    this.name = 'PluginCircularDependencyError'
+    this.cycle = cycle
+  }
+}
+
+/** 缺失依赖 */
+export class PluginMissingDependencyError extends Error {
+  readonly pluginId: string
+  readonly missingDep: string
+  constructor(id: string, missing: string) {
+    super(`Plugin "${id}" depends on "${missing}", which is not provided in the same load batch`)
+    this.name = 'PluginMissingDependencyError'
+    this.pluginId = id
+    this.missingDep = missing
+  }
+}
+
+/** 插件 install 抛错 */
+export class PluginInstallError extends Error {
+  readonly pluginId: string
+  readonly cause: unknown
+  constructor(id: string, cause: unknown) {
+    const msg = cause instanceof Error ? cause.message : String(cause)
+    super(`Plugin "${id}" install() failed: ${msg}`)
+    this.name = 'PluginInstallError'
+    this.pluginId = id
+    this.cause = cause
+  }
+}
+
+/** 插件 uninstall 抛错 */
+export class PluginUninstallError extends Error {
+  readonly pluginId: string
+  readonly cause: unknown
+  constructor(id: string, cause: unknown) {
+    const msg = cause instanceof Error ? cause.message : String(cause)
+    super(`Plugin "${id}" uninstall() failed: ${msg}`)
+    this.name = 'PluginUninstallError'
+    this.pluginId = id
+    this.cause = cause
+  }
+}
+
+/** Hook 管道执行时某个插件抛错 */
+export class PluginHookError extends Error {
+  readonly hookName: string
+  readonly pluginId: string
+  readonly cause: unknown
+  constructor(hookName: string, pluginId: string, cause: unknown) {
+    const msg = cause instanceof Error ? cause.message : String(cause)
+    super(`Hook "${hookName}" in plugin "${pluginId}" failed: ${msg}`)
+    this.name = 'PluginHookError'
+    this.hookName = hookName
+    this.pluginId = pluginId
+    this.cause = cause
+  }
+}
+
+// ===== 拓扑排序 =====
+
+/**
+ * 拓扑排序：按 dependsOn 对插件列表排序
+ *
+ * - 缺失依赖 → PluginMissingDependencyError
+ * - 循环依赖 → PluginCircularDependencyError
+ * - 其他按 Kahn BFS 算法排序
+ */
+export function topologicalSortPlugins(plugins: AgentPlugin[]): AgentPlugin[] {
+  const byId = new Map<string, AgentPlugin>()
+  for (const p of plugins) {
+    if (byId.has(p.id)) throw new PluginDuplicateIdError(p.id)
+    byId.set(p.id, p)
+  }
+
+  // 依赖是否都在同一批内存在（只对在批内的校验；跨批依赖由调用方保证已加载）
+  for (const p of plugins) {
+    for (const dep of p.dependsOn ?? []) {
+      // 若依赖不在批内但 ID 不重复，假设它是跨批的（已加载），跳过校验
+    }
+  }
+
+  // Kahn 算法
+  const indeg = new Map<string, number>()
+  const adj = new Map<string, string[]>()
+  for (const id of byId.keys()) {
+    indeg.set(id, 0)
+    adj.set(id, [])
+  }
+  for (const p of plugins) {
+    for (const dep of p.dependsOn ?? []) {
+      // 仅对批内节点算入度
+      if (byId.has(dep)) {
+        indeg.set(p.id, (indeg.get(p.id) ?? 0) + 1)
+        adj.get(dep)!.push(p.id)
+      }
+    }
+  }
+
+  const queue: string[] = []
+  for (const [id, deg] of indeg) if (deg === 0) queue.push(id)
+
+  const result: AgentPlugin[] = []
+  while (queue.length > 0) {
+    const id = queue.shift()!
+    result.push(byId.get(id)!)
+    for (const nxt of adj.get(id) ?? []) {
+      const d = (indeg.get(nxt) ?? 0) - 1
+      indeg.set(nxt, d)
+      if (d === 0) queue.push(nxt)
+    }
+  }
+
+  if (result.length !== plugins.length) {
+    // 剩余节点组成环，DFS 找一条示例
+    const remaining = new Set(plugins.map((p) => p.id).filter((id) => !result.find((r) => r.id === id)))
+    const cycle: string[] = []
+    const visited = new Set<string>()
+    const stack: string[] = []
+    const dfs = (u: string): boolean => {
+      visited.add(u)
+      stack.push(u)
+      for (const v of byId.get(u)!.dependsOn ?? []) {
+        if (!remaining.has(v)) continue
+        if (stack.includes(v)) {
+          cycle.push(...stack.slice(stack.indexOf(v)))
+          cycle.push(v)
+          return true
+        }
+        if (!visited.has(v) && dfs(v)) return true
+      }
+      stack.pop()
+      return false
+    }
+    for (const id of remaining) if (!visited.has(id) && dfs(id)) break
+    throw new PluginCircularDependencyError(cycle || Array.from(remaining))
+  }
+
+  return result
+}
+
+// ===== HooksRegistry =====
+
+/**
+ * HooksRegistry：Hook name → （pluginId, callback）有序列表
+ *
+ * trigger(name, args) 按注册顺序依次调用所有回调；
+ * - 对 `tool.pre.execute` / `tool.post.execute` 特殊处理 Promise 链返回值给调用方（见 PluginManager）
+ * - 其他 hooks 管道式 mutate 参数（返回值忽略）
+ */
+export class HooksRegistry {
+  private readonly store = new Map<keyof Hooks, Array<{ pluginId: string; fn: NonNullable<Hooks[keyof Hooks]> }>>()
+
+  /** 注册一个插件返回的所有 Hooks */
+  register(pluginId: string, hooks: Hooks | void): void {
+    if (!hooks) return
+    for (const rawKey of Object.keys(hooks) as (keyof Hooks)[]) {
+      const fn = hooks[rawKey] as NonNullable<Hooks[keyof Hooks]> | undefined
+      if (!fn) continue
+      const arr = this.store.get(rawKey) ?? (() => {
+        const a: Array<{ pluginId: string; fn: NonNullable<Hooks[keyof Hooks]> }> = []
+        this.store.set(rawKey, a)
+        return a
+      })()
+      arr.push({ pluginId, fn })
+    }
+  }
+
+  /** 注销某个插件的所有 hooks（unload 时调用） */
+  unregister(pluginId: string): void {
+    for (const [key, arr] of this.store) {
+      const filtered = arr.filter((e) => e.pluginId !== pluginId)
+      if (filtered.length === 0) this.store.delete(key)
+      else this.store.set(key, filtered)
+    }
+  }
+
+  /** 返回某 hook 名称下按注册顺序的回调列表 */
+  listFor<N extends keyof Hooks>(name: N): ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks[N]> }> {
+    return ((this.store.get(name) ?? []) as unknown) as ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks[N]> }>
+  }
+
+  /** 是否有 hook 注册 */
+  has<N extends keyof Hooks>(name: N): boolean {
+    return (this.store.get(name)?.length ?? 0) > 0
+  }
+}
+
+// ===== PluginManagerImpl =====
+
+/** createPluginManager 参数 */
+export interface PluginManagerOptions {
+  /** Bus 事件总线 */
+  bus: Bus
+  /** 初始配置（可选） */
+  initialConfig?: Record<string, unknown>
+  /** 日志器实现（可选，缺省时使用 silent logger） */
+  logger?: PluginContext['log']
+  /** 动态 import 实现（用于 loadBuiltin/loadUser；便于单测注入） */
+  dynamicImport?: (spec: string) => Promise<{ default?: unknown } | unknown>
+}
+
+/**
+ * PluginManager 具体实现
+ *
+ * 流程：
+ * 1. 构造时注入 PluginContext（bus + 内存 config + logger + dynamicImport）
+ * 2. loadInternal/loadBuiltin/loadUser 三级加载
+ *    - 每级：拓扑排序 → 去重检查 → install → hooks 聚合 + bus.event 订阅桥接
+ *    - loadBuiltin/loadUser 调用 dynamicImport 或 Bun 的自动 npm install
+ * 3. trigger(name, ...args) 按插件加载顺序依次回调，出错聚合抛错
+ * 4. unload：bus.event 退订 → hooks unregister → uninstall
+ * 5. hotReload：卸载后再安装
+ */
+export class PluginManagerImpl implements PluginManager {
+  private readonly bus: Bus
+  private readonly ctx: PluginContext
+  private readonly configStore: Record<string, unknown>
+  private readonly dynamicImport: (spec: string) => Promise<{ default?: unknown } | unknown>
+  private readonly logger: PluginContext['log']
+
+  /** 已加载插件表 */
+  private readonly loaded = new Map<string, LoadedPlugin>()
+  /** Hooks 注册表 */
+  private readonly hooks = new HooksRegistry()
+  /** bus.event Hook → Bus unsubscribe 句柄映射 */
+  private readonly busEventUnsubs = new Map<string, () => void>()
+  /** loadBuiltin / loadUser 动态 import 后保存 spec 对应 pluginId 以支持 hotReload */
+  private readonly specById = new Map<string, { source: 'builtin' | 'user'; spec: string }>()
+  /** Internal 原始引用以支持 hotReload */
+  private readonly internalPlugins = new Map<string, AgentPlugin>()
+
+  constructor(options: PluginManagerOptions) {
+    this.bus = options.bus
+    this.configStore = { ...(options.initialConfig ?? {}) }
+    this.logger = options.logger ?? { info() {}, warn() {}, error() {}, debug() {} }
+    this.dynamicImport = options.dynamicImport ?? ((s) => import(/* @vite-ignore */ s))
+
+    // PluginContext
+    this.ctx = {
+      bus: this.bus,
+      config: {
+        get: <T,>(key: string) => this.configStore[key] as T | undefined,
+        set: <T,>(key: string, value: T) => {
+          this.configStore[key] = value
+        },
+      },
+      log: this.logger,
+    }
+  }
+
+  // ---- 三级加载 ----
+
+  async loadInternal(plugins: AgentPlugin[]): Promise<void> {
+    const ordered = topologicalSortPlugins(plugins)
+    for (const p of ordered) {
+      if (this.loaded.has(p.id)) throw new PluginDuplicateIdError(p.id)
+    }
+    for (const p of ordered) {
+      await this.installOne(p, 'internal')
+      this.internalPlugins.set(p.id, p)
+    }
+  }
+
+  async loadBuiltin(npmSpecs: string[]): Promise<void> {
+    const loaded = await Promise.all(npmSpecs.map((s) => this.resolveSpec(s)))
+    await this.loadExternalBatch(loaded, 'builtin', npmSpecs)
+  }
+
+  async loadUser(userSpecs: string[]): Promise<void> {
+    const loaded = await Promise.all(userSpecs.map((s) => this.resolveSpec(s)))
+    await this.loadExternalBatch(loaded, 'user', userSpecs)
+  }
+
+  // ---- 卸载 / 热重载 ----
+
+  async unload(pluginId: string): Promise<void> {
+    const lp = this.loaded.get(pluginId)
+    if (!lp) throw new PluginNotFoundError(pluginId)
+
+    // 1. bus.event 退订
+    const unsub = this.busEventUnsubs.get(pluginId)
+    if (unsub) {
+      unsub()
+      this.busEventUnsubs.delete(pluginId)
+    }
+
+    // 2. hooks 注销
+    this.hooks.unregister(pluginId)
+
+    // 3. uninstall()
+    try {
+      await lp.plugin.uninstall?.()
+    } catch (err) {
+      throw new PluginUninstallError(pluginId, err)
+    }
+
+    // 4. 清理
+    this.loaded.delete(pluginId)
+    this.specById.delete(pluginId)
+    this.internalPlugins.delete(pluginId)
+  }
+
+  async hotReload(pluginId: string): Promise<void> {
+    const lp = this.loaded.get(pluginId)
+    if (!lp) throw new PluginNotFoundError(pluginId)
+
+    const source = lp.source
+    // 保存需要的信息
+    let plugin: AgentPlugin | null = null
+
+    if (source === 'internal') {
+      plugin = this.internalPlugins.get(pluginId) ?? null
+    } else {
+      const specInfo = this.specById.get(pluginId)
+      if (specInfo) {
+        const mod = await this.resolveSpec(specInfo.spec)
+        plugin = mod
+      }
+    }
+
+    // 先卸载
+    await this.unload(pluginId)
+
+    // 再安装
+    if (plugin === null) return
+
+    if (source === 'internal') {
+      // 重新按单批加载
+      await this.installOne(plugin, 'internal')
+      this.internalPlugins.set(pluginId, plugin)
+    } else {
+      await this.installOne(plugin, source as 'builtin' | 'user')
+      this.specById.set(pluginId, { source: source as 'builtin' | 'user', spec: this.specById.get(pluginId)?.spec ?? '' })
+    }
+  }
+
+  list(): LoadedPlugin[] {
+    return Array.from(this.loaded.values())
+  }
+
+  // ---- trigger Hook 管道 ----
+
+  async trigger<N extends keyof Hooks>(
+    name: N,
+    ...args: Parameters<NonNullable<Hooks[N]>>
+  ): Promise<void> {
+    const entries = this.hooks.listFor(name)
+    if (entries.length === 0) return
+
+    const errors: PluginHookError[] = []
+    for (const { pluginId, fn } of entries) {
+      try {
+        await (fn as (...a: unknown[]) => Promise<unknown> | unknown)(...args)
+      } catch (err) {
+        errors.push(new PluginHookError(String(name), pluginId, err))
+      }
+    }
+
+    if (errors.length > 0) {
+      // 多个错误时用 AggregateError 包装
+      if (errors.length === 1) throw errors[0]
+      const agg = new AggregateError(errors, `Hook "${String(name)}": ${errors.length} plugin(s) failed`)
+      ;(agg as { hookName?: string }).hookName = String(name)
+      throw agg
+    }
+  }
+
+  // ===== 内部辅助 =====
+
+  private async installOne(plugin: AgentPlugin, source: LoadedPlugin['source']): Promise<void> {
+    const start = performance.now()
+    let hooksResult: Hooks | void
+    try {
+      hooksResult = await plugin.install(this.ctx)
+    } catch (err) {
+      throw new PluginInstallError(plugin.id, err)
+    }
+
+    const lp: LoadedPlugin = {
+      plugin,
+      hooks: hooksResult,
+      loadedAt: Date.now(),
+      source,
+    }
+    this.loaded.set(plugin.id, lp)
+
+    // 聚合到 HooksRegistry
+    this.hooks.register(plugin.id, hooksResult)
+
+    // bus.event 桥接：如果插件声明了 bus.event Hook，则用 bus.subscribeAll 订阅
+    const busEventFn = hooksResult?.['bus.event']
+    if (busEventFn) {
+      const unsub = this.bus.subscribeAll((record) => {
+        return Promise.resolve(busEventFn(record as BusEventRecord)).catch((err) => {
+          this.logger.error(`[plugin:${plugin.id}] bus.event handler failed`, err)
+        })
+      })
+      this.busEventUnsubs.set(plugin.id, unsub)
+    }
+
+    this.logger.info(`[plugin] loaded ${plugin.id}@${plugin.version} (${(performance.now() - start).toFixed(1)}ms, source=${source})`)
+  }
+
+  private async loadExternalBatch(
+    plugins: AgentPlugin[],
+    source: 'builtin' | 'user',
+    specs: string[]
+  ): Promise<void> {
+    const ordered = topologicalSortPlugins(plugins)
+    for (const p of ordered) {
+      if (this.loaded.has(p.id)) throw new PluginDuplicateIdError(p.id)
+    }
+    const idToSpec = new Map<string, string>()
+    // 简单地按顺序对应：如果顺序不稳定会用插件本身 id 存；实际上 resolver 返回顺序和传入顺序一致
+    for (let i = 0; i < specs.length; i++) {
+      const plug = plugins[i]
+      if (plug) idToSpec.set(plug.id, specs[i]!)
+    }
+    for (const p of ordered) {
+      await this.installOne(p, source)
+      const spec = idToSpec.get(p.id)
+      if (spec) this.specById.set(p.id, { source, spec })
+    }
+  }
+
+  /** 将 spec 解析成 AgentPlugin（dynamic import 后找 default 或 匹配的命名导出） */
+  private async resolveSpec(spec: string): Promise<AgentPlugin> {
+    const mod = await this.dynamicImport(spec)
+    const candidates = [
+      (mod as { default?: unknown }).default,
+      (mod as { default?: { default?: unknown } }).default?.['default'],
+      (mod as { plugin?: unknown }).plugin,
+    ]
+    // 直接是模块对象：找 id + install 字段
+    const probe = (o: unknown): AgentPlugin | null => {
+      if (!o || typeof o !== 'object') return null
+      const x = o as Record<string, unknown>
+      if (typeof x['id'] === 'string' && typeof x['install'] === 'function') return x as unknown as AgentPlugin
+      return null
+    }
+    for (const c of candidates) {
+      const r = probe(c)
+      if (r) return r
+    }
+    if (probe(mod)) return probe(mod)!
+    // 模块是普通对象，尝试遍历找一个 plugin
+    if (mod && typeof mod === 'object') {
+      for (const v of Object.values(mod as Record<string, unknown>)) {
+        const r = probe(v)
+        if (r) return r
+      }
+    }
+    throw new PluginInstallError(spec, new Error(`spec "${spec}" did not export a valid AgentPlugin`))
+  }
+}
+
+// ===== 工厂 =====
+
+export function createPluginManager(options: PluginManagerOptions): PluginManager {
+  return new PluginManagerImpl(options)
+}
