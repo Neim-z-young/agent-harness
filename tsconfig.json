@@ -22,7 +22,8 @@
       "@harness/skill": ["./packages/skill/src"],
       "@harness/agent": ["./packages/agent/src"],
       "@harness/session": ["./packages/session/src"],
-      "@harness/provider-mock": ["./packages/plugins/provider-mock/src"]
+      "@harness/provider-mock": ["./packages/plugins/provider-mock/src"],
+      "@harness/tools-builtin": ["./packages/plugins/tools-builtin/src"]
     }
   },
   "include": ["packages/*/src", "packages/plugins/*/src"],
