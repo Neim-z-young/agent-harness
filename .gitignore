@@ -32,5 +32,8 @@ logs/
 # Bun
 .bun/
 
+# gh CLI local config (contains token)
+.gh-config/
+
 # Test coverage
 coverage/
