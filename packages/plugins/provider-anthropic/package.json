@@ -1,0 +1,25 @@
+{
+  "name": "@harness/provider-anthropic",
+  "version": "0.1.0",
+  "description": "Anthropic Claude Provider 插件：对接 Messages API，支持 Tool Use",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/tool": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/session": "workspace:*",
+    "@harness/bus": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}
