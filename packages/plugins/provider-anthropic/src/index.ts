@@ -22,7 +22,7 @@
  * 3. 环境变量 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
  */
 
-import type { ChatProvider, ChatCompletionOutput } from '@harness/core'
+import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
@@ -401,6 +401,192 @@ export class AnthropicChatProvider implements ChatProvider {
           total: parsed.usage.input_tokens + parsed.usage.output_tokens,
         },
         raw: parsed,
+      }
+    } finally {
+      clearTimeout(timer)
+      if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
+    }
+  }
+
+  // -------- ChatProvider.stream --------
+
+  /**
+   * 流式调用 Anthropic Messages API（stream: true），解析 SSE 事件逐 chunk yield。
+   *
+   * SSE 事件类型：
+   *   message_start       → 初始化
+   *   content_block_start → 新 block 开始（text / tool_use）
+   *   content_block_delta → 增量（text_delta → text，input_json_delta → tool input）
+   *   content_block_stop  → block 结束
+   *   message_delta       → stop_reason / usage
+   *   message_stop        → 流结束
+   */
+  async *stream(params: {
+    providerId: string
+    modelId?: string
+    messages: Message[]
+    params: Record<string, unknown>
+    headers?: Record<string, string>
+    signal?: AbortSignal
+    sessionId?: string
+    agentId?: string
+  }): AsyncGenerator<ChatStreamChunk, void, unknown> {
+    const { system, rest } = extractSystemPrompt(params.messages)
+    const messages = toAnthropicMessages(rest)
+
+    const model = params.modelId ?? this.config.defaultModel
+    const llmParams = params.params ?? {}
+    const toolsDefs = this.toolsGetter().map(toolToAnthropicDef)
+
+    const body: AnthropicRequestBody = {
+      model,
+      max_tokens: this.config.maxTokens,
+      messages,
+      stream: false, // 会覆盖为 true，见下方 streamBody
+    }
+    if (system) body.system = system
+    if (toolsDefs.length > 0) body.tools = toolsDefs
+    if (typeof llmParams.temperature === 'number') body.temperature = llmParams.temperature as number
+    if (typeof llmParams.top_p === 'number') body.top_p = llmParams.top_p as number
+    if (typeof llmParams.top_k === 'number') body.top_k = llmParams.top_k as number
+    if (Array.isArray(llmParams.stop_sequences)) body.stop_sequences = llmParams.stop_sequences as string[]
+
+    // stream 请求体（覆盖 stream: true）
+    const streamBody = { ...body, stream: true as const }
+
+    if (!this.config.apiKey) {
+      throw new Error('Anthropic API Key 未配置，请设置 ANTHROPIC_API_KEY 环境变量或在 config 中传入 apiKey')
+    }
+    if (streamBody.messages.length === 0) {
+      streamBody.messages = [{ role: 'user', content: [{ type: 'text', text: '(no history)' }] }]
+    }
+
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'x-api-key': this.config.apiKey,
+      'anthropic-version': this.config.apiVersion,
+      'Accept': 'text/event-stream',
+      ...(params.headers ?? {}),
+    }
+
+    // AbortController 管理
+    const inner = new AbortController()
+    const outerSignal = params.signal
+    const onOuter = () => inner.abort()
+    if (outerSignal) {
+      if (outerSignal.aborted) inner.abort()
+      else outerSignal.addEventListener('abort', onOuter, { once: true })
+    }
+    const timer = setTimeout(() => inner.abort(new Error(`Anthropic stream 超时（>${this.config.timeoutMs}ms）`)), this.config.timeoutMs)
+
+    try {
+      const url = `${this.config.baseUrl.replace(/\/$/, '')}/v1/messages`
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(streamBody),
+        signal: inner.signal,
+      })
+
+      if (!resp.ok) {
+        const text = await resp.text()
+        let msg = `HTTP ${resp.status}`
+        try { const j = JSON.parse(text); if (j.error?.message) msg = j.error.message } catch {}
+        throw new Error(`Anthropic stream 错误：${msg}`)
+      }
+
+      // SSE 解析
+      const reader = resp.body?.getReader()
+      if (!reader) throw new Error('Response body 不可读（stream not supported）')
+
+      const decoder = new TextDecoder()
+      let buf = ''
+      let modelOut: string | undefined
+      let tokenUsage: { input: number; output: number; total?: number } | undefined
+      // 当前 content block 的 index → 类型映射
+      const blockTypes: Map<number, 'text' | 'tool_use'> = new Map()
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+
+        // 按行解析 SSE
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? '' // 最后一行可能不完整
+
+        let currentEvent = ''
+        let currentData = ''
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim()
+          } else if (line.startsWith('data: ')) {
+            currentData = line.slice(6)
+          } else if (line === '' && currentData) {
+            // 空行 = 事件结束
+            const json = JSON.parse(currentData)
+            currentEvent = json.type ?? currentEvent
+
+            switch (currentEvent) {
+              case 'message_start': {
+                modelOut = json.message?.model
+                const u = json.message?.usage
+                if (u) tokenUsage = { input: u.input_tokens ?? 0, output: u.output_tokens ?? 0 }
+                break
+              }
+              case 'content_block_start': {
+                const block = json.content_block
+                if (block?.type === 'text') {
+                  blockTypes.set(json.index, 'text')
+                } else if (block?.type === 'tool_use') {
+                  blockTypes.set(json.index, 'tool_use')
+                  yield { type: 'tool_use_start', toolUseId: block.id, toolId: block.name }
+                }
+                break
+              }
+              case 'content_block_delta': {
+                const delta = json.delta
+                if (delta?.type === 'text_delta') {
+                  yield { type: 'text_delta', text: delta.text }
+                } else if (delta?.type === 'input_json_delta') {
+                  yield { type: 'tool_use_delta', inputDelta: delta.partial_json }
+                }
+                break
+              }
+              case 'content_block_stop': {
+                const bt = blockTypes.get(json.index)
+                if (bt === 'tool_use') {
+                  yield { type: 'tool_use_stop' }
+                }
+                blockTypes.delete(json.index)
+                break
+              }
+              case 'message_delta': {
+                const u = json.usage
+                if (u && tokenUsage) {
+                  tokenUsage.output = u.output_tokens ?? tokenUsage.output
+                  tokenUsage.total = tokenUsage.input + tokenUsage.output
+                }
+                break
+              }
+              case 'message_stop': {
+                break
+              }
+              case 'error': {
+                throw new Error(`Anthropic stream error: ${json.error?.message ?? JSON.stringify(json)}`)
+              }
+            }
+
+            currentEvent = ''
+            currentData = ''
+          }
+        }
+      }
+
+      yield {
+        type: 'done',
+        model: modelOut ?? model,
+        tokenUsage,
       }
     } finally {
       clearTimeout(timer)

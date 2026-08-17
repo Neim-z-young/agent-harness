@@ -186,6 +186,8 @@ export interface SessionManager {
   list(options?: SessionListOptions): Promise<Session[]>
   /** 发送 prompt（触发 LLM 调用，返回 assistant 消息） */
   prompt(sessionId: string, text: string): Promise<Message>
+  /** 流式发送 prompt：逐事件 yield AgentStreamEvent，最后一个为 done（含最终 Message） */
+  promptStream(sessionId: string, text: string): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown>
 
   /** 更新整条消息（部分字段） */
   updateMessage(sessionId: string, messageId: string, patch: Partial<Message>): Promise<void>

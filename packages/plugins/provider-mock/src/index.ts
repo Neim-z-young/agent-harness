@@ -27,7 +27,7 @@
  * })
  */
 
-import type { ChatProvider, ChatCompletionOutput } from '@harness/core'
+import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
 import type { Message } from '@harness/session'
 
@@ -176,6 +176,95 @@ export class MockChatProvider implements ChatProvider {
     if (reasoning) output.reasoning = reasoning
     if (toolCalls && toolCalls.length > 0) output.toolCalls = toolCalls
     return output
+  }
+
+  /**
+   * 流式完成：把 complete() 的结果按 token 分块 yield。
+   * 默认按空格/换行分词，每块 1-3 个 token。
+   * 若 config.chunkSize 设置，按指定大小切字符。
+   */
+  async *stream(params: {
+    providerId: string
+    modelId?: string
+    messages: Message[]
+    params: Record<string, unknown>
+    headers?: Record<string, string>
+    signal?: AbortSignal
+    sessionId?: string
+    agentId?: string
+  }): AsyncGenerator<ChatStreamChunk, void, unknown> {
+    // 模拟延迟
+    if (this.config.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.config.delayMs))
+    }
+
+    // 记录调用
+    if (this.config.recordCalls) {
+      this.calls.push({
+        providerId: params.providerId,
+        modelId: params.modelId,
+        messages: params.messages,
+        params: params.params,
+        headers: params.headers,
+        sessionId: params.sessionId,
+        agentId: params.agentId,
+      })
+    }
+
+    // 匹配规则（与 complete 共用）
+    const userText = this.lastUserText(params.messages)
+    const rule = this.matchRule(userText)
+    const response = rule?.response ?? this.config.defaultResponse
+    const reasoning = rule?.reasoning ?? this.config.defaultReasoning
+    const model = rule?.model ?? this.config.model
+    const toolCalls = rule?.toolCalls
+    const tokenUsage = this.config.tokenUsage
+
+    // yield reasoning（按行分块）
+    if (reasoning) {
+      for (const line of this._splitTokens(reasoning)) {
+        yield { type: 'reasoning_delta', text: line }
+      }
+    }
+
+    // yield text（按词分块）
+    if (response) {
+      for (const tok of this._splitTokens(response)) {
+        yield { type: 'text_delta', text: tok }
+      }
+    }
+
+    // yield tool calls
+    if (toolCalls) {
+      for (const tc of toolCalls) {
+        yield { type: 'tool_use_start', toolUseId: tc.toolUseId, toolId: tc.toolId }
+        yield { type: 'tool_use_delta', inputDelta: JSON.stringify(tc.input) }
+        yield { type: 'tool_use_stop' }
+      }
+    }
+
+    // done
+    yield {
+      type: 'done',
+      model,
+      tokenUsage: { input: tokenUsage.input, output: tokenUsage.output, total: tokenUsage.input + tokenUsage.output },
+    }
+  }
+
+  /** 将文本按词/标点分块（模拟逐 token 流式） */
+  private _splitTokens(text: string): string[] {
+    // 按空格/换行分词，保留分隔符
+    const tokens: string[] = []
+    let buf = ''
+    for (const ch of text) {
+      buf += ch
+      if (ch === ' ' || ch === '\n' || ch === '.' || ch === ',' || ch === '，' || ch === '。' || ch === '！' || ch === '？') {
+        tokens.push(buf)
+        buf = ''
+      }
+    }
+    if (buf) tokens.push(buf)
+    return tokens
   }
 }
 

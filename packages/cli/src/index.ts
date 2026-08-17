@@ -439,6 +439,18 @@ export class HarnessApp {
     return assistant
   }
 
+  /** 流式发送：逐事件 yield AgentStreamEvent，完成后自动持久化 session */
+  async *sendStream(sessionId: string, text: string): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown> {
+    const h = this.harness
+    const gen = h.session.promptStream(sessionId, text)
+    for await (const ev of gen) {
+      yield ev
+    }
+    // 持久化
+    const sess = (await h.session.get(sessionId))!
+    await this.sessionStore.save(sess)
+  }
+
   /** 关闭 harness */
   async shutdown(): Promise<void> {
     const sess = await this.harness.session.list({ limit: 1 })
@@ -552,42 +564,52 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
       }
     }
 
-    // 正常发送
+    // 正常发送（流式）
     await options.onLine?.(line)
     out(`\n🧑  ${line}\n`)
     const started = Date.now()
-    let assistant: Message
+    let assistant: Message | undefined
     try {
-      // 发送消息（用 options.session 的最新 id，因为 /new 会切换）
       const curSessionId = (options as any).session.id
-      assistant = await app.send(curSessionId, line)
+      const gen = app.sendStream(curSessionId, line)
+      let inReasoning = false
+      let inText = false
+      let inToolOutput = false
+      for await (const ev of gen) {
+        switch (ev.type) {
+          case 'reasoning_delta':
+            if (!inReasoning) { out('💭  '); inReasoning = true }
+            out(ev.text ?? '')
+            break
+          case 'text_delta':
+            if (!inText) { if (inReasoning) out('\n'); out('🤖  '); inText = true }
+            out(ev.text ?? '')
+            break
+          case 'tool_call_start':
+            if (inText || inReasoning) { out('\n'); inText = false; inReasoning = false }
+            out(`🔧  ${ev.toolId} ${JSON.stringify(ev.input).slice(0, 60)}...\n`)
+            break
+          case 'tool_call_result': {
+            const status = ev.isError ? '❌' : '✅'
+            const preview = typeof ev.result === 'string'
+              ? ev.result.slice(0, 120)
+              : JSON.stringify(ev.result ?? '').slice(0, 120)
+            out(`${status}  → ${preview}\n`)
+            break
+          }
+          case 'done':
+            assistant = ev.message
+            break
+        }
+      }
+      if (inText || inReasoning) out('\n') // 换行收尾
     } catch (err: any) {
-      out(`❌  发送失败：${err?.message ?? String(err)}\n`)
+      out(`\n❌  发送失败：${err?.message ?? String(err)}\n`)
       return 'continue'
     }
     const duration = Date.now() - started
-    // 渲染 assistant：先 reasoning，再 text，然后每个 tool call + 结果
-    for (const part of assistant.parts) {
-      if ((part as any).type === 'reasoning') {
-        out(`\n💭  reasoning: ${(part as any).text}\n`)
-      }
-    }
-    for (const part of assistant.parts) {
-      if ((part as any).type === 'text') {
-        out(`🤖  ${(part as any).text}\n`)
-      }
-    }
-    for (const part of assistant.parts as any[]) {
-      if (part.type === 'tool') {
-        const status = part.isError ? '❌' : '✅'
-        const preview = typeof part.result === 'string'
-          ? part.result.slice(0, 80)
-          : JSON.stringify(part.result ?? '').slice(0, 80)
-        out(`${status}  ${part.toolId} ${JSON.stringify(part.input).slice(0, 60)} → ${preview}\n`)
-      }
-    }
-    out(`⏱️  ${duration}ms | agent=${assistant.agentId ?? session.agentId ?? '?'}` +
-      (assistant.meta?.model ? ` | model=${assistant.meta.model}` : '') + '\n\n')
+    out(`⏱️  ${duration}ms | agent=${assistant?.agentId ?? session.agentId ?? '?'}` +
+      (assistant?.meta?.model ? ` | model=${assistant.meta.model}` : '') + '\n\n')
     return 'continue'
   }
 
@@ -683,10 +705,17 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     if (args.command === 'run') {
       const prompt = args.arg ?? ''
       if (!prompt) { write('用法: harness run "<prompt>"\n'); return 1 }
-      const assistant = await app.send(session.id, prompt)
-      // 只打印最终文本（脚本友好）
-      for (const part of assistant.parts) {
-        if ((part as any).type === 'text') write((part as any).text + '\n')
+      // 流式输出（逐 token 打印到 stdout，脚本友好）
+      const gen = app.sendStream(session.id, prompt)
+      for await (const ev of gen) {
+        if (ev.type === 'text_delta') write(ev.text ?? '')
+        else if (ev.type === 'done') {
+          if (ev.message) {
+            // 换行收尾
+            const textParts = ev.message.parts.filter((p: any) => p.type === 'text')
+            if (textParts.length > 0) write('\n')
+          }
+        }
       }
       return 0
     }
