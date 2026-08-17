@@ -320,6 +320,51 @@ export interface ChatCompletionOutput {
   raw?: unknown
 }
 
+// --- 流式类型 ---
+
+/** ChatProvider 流式输出的增量 chunk */
+export interface ChatStreamChunk {
+  type:
+    | 'text_delta'        // 文本增量
+    | 'reasoning_delta'   // 推理增量
+    | 'tool_use_start'    // 工具调用开始（含 id/name）
+    | 'tool_use_delta'    // 工具调用 input 增量（部分 JSON 字符串）
+    | 'tool_use_stop'    // 工具调用结束
+    | 'done'             // 流结束（含 model/usage/raw）
+  /** text_delta / reasoning_delta 的文本片段 */
+  text?: string
+  /** tool_use_start 的工具调用 ID */
+  toolUseId?: string
+  /** tool_use_start 的工具名 */
+  toolId?: string
+  /** tool_use_delta 的部分 JSON 字符串 */
+  inputDelta?: string
+  /** done 时的模型名 */
+  model?: string
+  /** done 时的 token 统计 */
+  tokenUsage?: { input: number; output: number; total?: number }
+  /** done 时的原始响应 */
+  raw?: unknown
+}
+
+/** AgentRuntime 流式事件（在 ChatStreamChunk 基础上增加工具执行结果） */
+export interface AgentStreamEvent {
+  type:
+    | 'text_delta'
+    | 'reasoning_delta'
+    | 'tool_call_start'  // 工具开始执行（含 input 完整值）
+    | 'tool_call_result' // 工具执行结果
+    | 'done'             // 全部完成（含最终 assistant Message）
+  text?: string
+  toolUseId?: string
+  toolId?: string
+  input?: unknown
+  result?: unknown
+  isError?: boolean
+  /** done 时的最终 assistant 消息 */
+  message?: Message
+}
+
 /**
  * LLM Provider 接口
  * Harness 层通过此接口与具体模型提供商解耦。
@@ -328,7 +373,7 @@ export interface ChatCompletionOutput {
 export interface ChatProvider {
   /** Provider ID，如 "anthropic" / "openai" */
   readonly id: string
-  /** 执行一次 chat completion */
+  /** 执行一次 chat completion（非流式） */
   complete(params: {
     providerId: string
     modelId?: string
@@ -339,6 +384,20 @@ export interface ChatProvider {
     sessionId?: string
     agentId?: string
   }): Promise<ChatCompletionOutput>
+  /**
+   * 执行一次流式 chat completion，逐 chunk yield。
+   * 若 Provider 未实现此方法，调用方可 fallback 到 complete()。
+   */
+  stream?(params: {
+    providerId: string
+    modelId?: string
+    messages: Message[]
+    params: LLMParams
+    headers?: Record<string, string>
+    signal?: AbortSignal
+    sessionId?: string
+    agentId?: string
+  }): AsyncGenerator<ChatStreamChunk, void, unknown>
 }
 
 /** 默认空实现：无 Provider 时抛出清晰错误 */
@@ -446,6 +505,29 @@ export class DefaultSessionManager implements SessionManager {
     return assistant as Message
   }
 
+  async *promptStream(sessionId: string, text: string): AsyncGenerator<AgentStreamEvent, void, unknown> {
+    const sess = await this.get(sessionId)
+    if (!sess) throw new Error(`Session "${sessionId}" not found`)
+    const svc = this.services?.()
+    if (!svc) throw new Error('SessionServices 未配置，无法 promptStream()')
+    const msg: Message = {
+      id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+      role: 'user',
+      parts: [{ type: 'text', text }],
+      createdAt: Date.now(),
+    }
+    await this.addMessage(sessionId, msg)
+    // queryStream 内部会写入 user 消息（若不存在），这里已写入，故不会重复
+    const gen = svc.agent.queryStream({
+      sessionId,
+      agentId: sess.agentId ?? svc.currentAgentId(),
+      message: text,
+    })
+    for await (const ev of gen) {
+      yield ev
+    }
+  }
+
   async updateMessage(sessionId: string, messageId: string, patch: Partial<Message>): Promise<void> {
     const sess = this.sessions.get(sessionId)
     if (!sess) return
@@ -544,6 +626,11 @@ export interface AgentRuntime {
    * 多轮/循环由上层或插件继续驱动。
    */
   query(input: AgentQueryInput): Promise<Message>
+  /**
+   * 流式执行一轮推理：逐 chunk yield AgentStreamEvent，最后一个事件为 done（含最终 Message）。
+   * 若 ChatProvider 未实现 stream()，内部自动 fallback 到 complete() 并只发一个 done 事件。
+   */
+  queryStream(input: AgentQueryInput): AsyncGenerator<AgentStreamEvent, void, unknown>
 }
 
 export class AgentRuntimeImpl implements AgentRuntime {
@@ -705,6 +792,223 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
     await this.deps.session.addMessage(sessionId, assistant)
     return assistant
+  }
+
+  /** query/queryStream 共用的准备逻辑：返回构建好的 messages/params/headers/allowedTools */
+  private async _prepareQuery(input: AgentQueryInput): Promise<{
+    agentId: string
+    sessionId: string
+    finalMessages: Message[]
+    params: LLMParams
+    headers: Record<string, string>
+    allowedTools: Tool[]
+  }> {
+    const { sessionId, message } = input
+    const agentId = input.agentId ?? this.defaultAgentId
+    const agent = this.agents.get(agentId)
+    if (!agent) throw new Error(`Agent "${agentId}" not registered`)
+
+    const pool = new DefaultToolPool(this.deps.toolRegistry)
+    await this.deps.triggerPlugin('tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
+    const allowedTools = this.deps.toolRegistry.filterByWhitelist(agent.tools)
+
+    this.deps.permission.updateRules({
+      ...this.deps.permission.getRules(),
+      ...(agent.permission as PermissionRuleset),
+    })
+
+    const sess = await this.deps.session.get(sessionId)
+    if (!sess) throw new Error(`Session "${sessionId}" not found`)
+    if (!sess.messages.some((m) => m.role === 'user' && m.parts.some((p) => p.type === 'text' && (p as any).text === message))) {
+      await this.deps.session.addMessage(sessionId, {
+        id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        role: 'user',
+        parts: [{ type: 'text', text: message }],
+        createdAt: Date.now(),
+      })
+    }
+
+    const session2 = (await this.deps.session.get(sessionId))!
+    const sysParts: string[] = agent.promptFragments ? [...agent.promptFragments] : []
+    if (agent.systemPrompt) { sysParts.length = 0; sysParts.push(agent.systemPrompt) }
+    const promptIn: PromptInput = { agentId, sessionId }
+    await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
+
+    const finalMessages: Message[] = []
+    if (sysParts.length > 0) {
+      finalMessages.push({
+        id: `sys_${Date.now()}`,
+        role: 'system',
+        parts: [{ type: 'text', text: sysParts.join('\n\n') }],
+        createdAt: Date.now(),
+      })
+    }
+    finalMessages.push(...session2.messages)
+
+    const llmIn: LLMInput = {
+      providerId: agent.model?.providerId ?? 'default',
+      modelId: agent.model?.modelId,
+      messages: finalMessages,
+    }
+    const params: LLMParams = {
+      temperature: agent.model?.temperature ?? 0.7,
+      ...(agent.model?.options ?? {}),
+    }
+    const headers: Record<string, string> = {}
+    await this.deps.triggerPlugin('llm.params', llmIn, params)
+    await this.deps.triggerPlugin('llm.headers', llmIn, headers)
+
+    return { agentId, sessionId, finalMessages, params, headers, allowedTools }
+  }
+
+  async *queryStream(input: AgentQueryInput): AsyncGenerator<AgentStreamEvent, void, unknown> {
+    const { agentId, sessionId, finalMessages, params, headers, allowedTools } = await this._prepareQuery(input)
+    const provider = this.deps.chatProvider()
+
+    // 收集流式结果
+    let textBuf = ''
+    let reasoningBuf = ''
+    const toolCalls: Array<{ toolUseId: string; toolId: string; inputParts: string[] }> = []
+    let model: string | undefined
+    let tokenUsage: { input: number; output: number; total?: number } | undefined
+    let raw: unknown
+
+    if (provider.stream) {
+      // 流式路径
+      const gen = provider.stream({
+        providerId: finalMessages[0]?.role === 'system' ? (agentId === 'default' ? 'default' : agentId) : agentId,
+        modelId: this.agents.get(agentId)?.model?.modelId,
+        messages: finalMessages,
+        params,
+        headers,
+        sessionId,
+        agentId,
+      })
+      for await (const chunk of gen) {
+        switch (chunk.type) {
+          case 'text_delta':
+            if (chunk.text) {
+              textBuf += chunk.text
+              yield { type: 'text_delta', text: chunk.text }
+            }
+            break
+          case 'reasoning_delta':
+            if (chunk.text) {
+              reasoningBuf += chunk.text
+              yield { type: 'reasoning_delta', text: chunk.text }
+            }
+            break
+          case 'tool_use_start':
+            toolCalls.push({ toolUseId: chunk.toolUseId ?? '', toolId: chunk.toolId ?? '', inputParts: [] })
+            break
+          case 'tool_use_delta':
+            if (chunk.inputDelta && toolCalls.length > 0) {
+              toolCalls[toolCalls.length - 1].inputParts.push(chunk.inputDelta)
+            }
+            break
+          case 'tool_use_stop':
+            // 不单独 yield，tool_call_start 在执行时发
+            break
+          case 'done':
+            model = chunk.model
+            tokenUsage = chunk.tokenUsage
+            raw = chunk.raw
+            break
+        }
+      }
+    } else {
+      // Fallback：非流式 complete()，模拟单次 yield
+      const completion = await provider.complete({
+        providerId: agentId === 'default' ? 'default' : agentId,
+        modelId: this.agents.get(agentId)?.model?.modelId,
+        messages: finalMessages,
+        params,
+        headers,
+        sessionId,
+        agentId,
+      })
+      textBuf = completion.content
+      reasoningBuf = completion.reasoning ?? ''
+      if (completion.toolCalls) {
+        for (const tc of completion.toolCalls) {
+          toolCalls.push({ toolUseId: tc.toolUseId, toolId: tc.toolId, inputParts: [JSON.stringify(tc.input)] })
+        }
+      }
+      model = completion.model
+      tokenUsage = completion.tokenUsage
+      raw = completion.raw
+      // 一次性 yield 文本
+      if (textBuf) yield { type: 'text_delta', text: textBuf }
+      if (reasoningBuf) yield { type: 'reasoning_delta', text: reasoningBuf }
+    }
+
+    // 构建 assistant 消息
+    const assistantId = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    const assistant: Message = {
+      id: assistantId,
+      role: 'assistant',
+      parts: [],
+      createdAt: Date.now(),
+      agentId,
+      meta: {
+        model,
+        tokenUsage: tokenUsage ? { input: tokenUsage.input, output: tokenUsage.output } : undefined,
+      },
+    }
+    if (reasoningBuf) assistant.parts.push({ type: 'reasoning', text: reasoningBuf })
+    if (textBuf) assistant.parts.push({ type: 'text', text: textBuf })
+
+    // 执行 tool calls
+    for (const tc of toolCalls) {
+      const inputJson = tc.inputParts.join('')
+      let parsedInput: unknown
+      try { parsedInput = inputJson ? JSON.parse(inputJson) : {} }
+      catch { parsedInput = inputJson }
+
+      const tool = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
+      const resultPart: any = {
+        type: 'tool',
+        toolUseId: tc.toolUseId,
+        toolId: tc.toolId,
+        input: parsedInput,
+      }
+
+      yield { type: 'tool_call_start', toolUseId: tc.toolUseId, toolId: tc.toolId, input: parsedInput }
+
+      if (!tool) {
+        resultPart.result = undefined
+        resultPart.isError = true
+        assistant.parts.push(resultPart)
+        yield { type: 'tool_call_result', toolUseId: tc.toolUseId, toolId: tc.toolId, result: undefined, isError: true }
+        continue
+      }
+
+      const tctx: ToolContext = {
+        sessionId,
+        agentId,
+        messageId: assistantId,
+        toolUseId: tc.toolUseId,
+        signal: new AbortController().signal,
+        variables: {},
+        cwd: this.deps.cwd,
+        requestPermission: (r) => this.deps.permission.check(r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
+      }
+      const res: ToolResult = await this.deps.toolPipeline.execute(tool, parsedInput, tctx)
+      resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
+      resultPart.isError = !res.ok
+      assistant.parts.push(resultPart)
+
+      yield {
+        type: 'tool_call_result',
+        toolUseId: tc.toolUseId,
+        toolId: tc.toolId,
+        result: resultPart.result,
+        isError: !res.ok,
+      }
+    }
+
+    await this.deps.session.addMessage(sessionId, assistant)
+    yield { type: 'done', message: assistant }
   }
 }
 
