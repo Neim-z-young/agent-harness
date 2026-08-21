@@ -79,6 +79,17 @@
         "@harness/session": "workspace:*",
       },
     },
+    "packages/plugins/provider-openai": {
+      "name": "@harness/provider-openai",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/plugins/tools-builtin": {
       "name": "@harness/tools-builtin",
       "version": "0.1.0",
@@ -121,6 +132,8 @@
     "@harness/provider-anthropic": ["@harness/provider-anthropic@workspace:packages/plugins/provider-anthropic"],
 
     "@harness/provider-mock": ["@harness/provider-mock@workspace:packages/plugins/provider-mock"],
+
+    "@harness/provider-openai": ["@harness/provider-openai@workspace:packages/plugins/provider-openai"],
 
     "@harness/session": ["@harness/session@workspace:packages/session"],
 
