@@ -1,10 +1,13 @@
 /**
- * @harness/tools-builtin - 内置 Tool 插件
+ * @harness/tools-builtin - 内置 Tool 插件（文件 I/O + Shell 原语）
  *
- * 提供三个基础工具：
+ * 仅保留四个不可替代的原语工具：
  * - read_file：读取文件内容（支持行号、范围、截断）
  * - write_file：写入文件（创建/覆盖/追加）
  * - bash：执行 shell 命令（支持超时、cwd、stdout/stderr/exitCode）
+ * - edit_file：精确查找替换（old_string → new_string）
+ *
+ * 搜索/导航类工具（list_dir / grep_file）见 @harness/tools-search。
  *
  * 通过 tool.pool.assemble Hook 自动注入到 Harness 工具池。
  *
@@ -24,8 +27,8 @@ import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
 
-import { resolve, isAbsolute, relative, join } from 'node:path'
-import { stat, readFile, writeFile, mkdir, readdir } from 'node:fs/promises'
+import { resolve, isAbsolute, relative } from 'node:path'
+import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
 
@@ -438,344 +441,7 @@ export const bashTool = defineTool<BashInput, BashOutput>({
 })
 
 // ========================================================================
-// 4. list_dir 工具
-// ========================================================================
-
-/** list_dir 输入 */
-export interface ListDirInput {
-  /** 目录路径（相对 cwd 或绝对路径，默认 "."） */
-  path?: string
-  /** 是否递归列出子目录（默认 false，最大深度 3） */
-  recursive?: boolean
-  /** 是否显示隐藏文件（默认 false） */
-  showHidden?: boolean
-  /** 最大递归深度（默认 3） */
-  maxDepth?: number
-}
-
-/** list_dir 条目 */
-export interface DirEntry {
-  /** 名称 */
-  name: string
-  /** 类型：file / dir / symlink */
-  type: 'file' | 'dir' | 'symlink'
-  /** 大小（字节，仅 file） */
-  size?: number
-  /** 相对路径（相对于输入路径） */
-  relativePath: string
-}
-
-/** list_dir 输出 */
-export interface ListDirOutput {
-  /** 目录路径（绝对路径） */
-  path: string
-  /** 条目列表 */
-  entries: DirEntry[]
-  /** 总条目数 */
-  count: number
-  /** 是否被截断（超过限制） */
-  truncated: boolean
-}
-
-/** 最大条目数 */
-const MAX_DIR_ENTRIES = 500
-
-/**
- * list_dir 工具：列出目录内容
- *
- * 安全声明：
- * - isReadOnly: true
- * - isConcurrencySafe: true
- * - permission.key: 'read'
- */
-export const listDirTool = defineTool<ListDirInput, ListDirOutput>({
-  id: 'list_dir',
-  description: '列出目录内容。支持递归、隐藏文件显示。返回文件名、类型和大小。',
-  inputSchema: makeSchema<ListDirInput>(),
-  isReadOnly: () => true,
-  isConcurrencySafe: () => true,
-  permission: {
-    key: 'read',
-    extractPatterns: (input) => [input.path ?? '.'],
-  },
-  async call(input, ctx): Promise<ToolResult<ListDirOutput>> {
-    const relPath = input.path ?? '.'
-    const absPath = resolvePath(relPath, ctx.cwd)
-
-    if (!isWithinCwd(absPath, ctx.cwd)) {
-      return {
-        ok: false,
-        error: { message: `路径 "${relPath}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
-      }
-    }
-
-    try {
-      const stats = await stat(absPath)
-      if (!stats.isDirectory()) {
-        return {
-          ok: false,
-          error: { message: `"${relPath}" 不是目录`, code: 'NOT_A_DIR' },
-        }
-      }
-
-      const showHidden = input.showHidden ?? false
-      const recursive = input.recursive ?? false
-      const maxDepth = Math.min(input.maxDepth ?? 3, 5)
-      const entries: DirEntry[] = []
-      let truncated = false
-
-      async function scanDir(dirPath: string, relBase: string, depth: number): Promise<void> {
-        if (truncated) return
-        if (depth > maxDepth) return
-
-        const items = await readdir(dirPath, { withFileTypes: true })
-        // 排序：目录优先，然后按名称
-        const sorted = items.sort((a, b) => {
-          if (a.isDirectory() && !b.isDirectory()) return -1
-          if (!a.isDirectory() && b.isDirectory()) return 1
-          return a.name.localeCompare(b.name)
-        })
-
-        for (const item of sorted) {
-          if (!showHidden && item.name.startsWith('.')) continue
-          if (entries.length >= MAX_DIR_ENTRIES) { truncated = true; return }
-
-          const itemRel = relBase ? `${relBase}/${item.name}` : item.name
-          let type: DirEntry['type'] = 'file'
-          let size: number | undefined
-
-          try {
-            if (item.isSymbolicLink()) {
-              type = 'symlink'
-              const realStat = await stat(join(dirPath, item.name))
-              if (realStat.isFile()) { type = 'file'; size = realStat.size }
-              else if (realStat.isDirectory()) type = 'dir'
-            } else if (item.isDirectory()) {
-              type = 'dir'
-            } else {
-              type = 'file'
-              const s = await stat(join(dirPath, item.name))
-              size = s.size
-            }
-          } catch {
-            // stat 失败时保守处理
-          }
-
-          entries.push({ name: item.name, type, size, relativePath: itemRel })
-
-          // 递归
-          if (recursive && type === 'dir' && depth < maxDepth) {
-            await scanDir(join(dirPath, item.name), itemRel, depth + 1)
-          }
-        }
-      }
-
-      await scanDir(absPath, '', 0)
-
-      return {
-        ok: true,
-        output: {
-          path: absPath,
-          entries,
-          count: entries.length,
-          truncated,
-        },
-      }
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        return { ok: false, error: { message: `目录不存在: ${relPath}`, code: 'DIR_NOT_FOUND' } }
-      }
-      return { ok: false, error: { message: err.message ?? String(err), code: 'LIST_DIR_ERROR' } }
-    }
-  },
-})
-
-// ========================================================================
-// 5. grep_file 工具
-// ========================================================================
-
-/** grep_file 输入 */
-export interface GrepFileInput {
-  /** 搜索模式（正则表达式字符串） */
-  pattern: string
-  /** 搜索路径：文件或目录（相对 cwd 或绝对路径，默认 "."） */
-  path?: string
-  /** 是否递归搜索目录（默认 true） */
-  recursive?: boolean
-  /** 是否大小写敏感（默认 true） */
-  caseSensitive?: boolean
-  /** 文件名 glob 过滤（如 "*.ts"，默认 "*" 匹配所有） */
-  include?: string
-  /** 最大返回匹配数（默认 100） */
-  maxResults?: number
-}
-
-/** grep_file 匹配结果 */
-export interface GrepMatch {
-  /** 文件路径（绝对路径） */
-  filePath: string
-  /** 相对路径（相对于 cwd） */
-  relativePath: string
-  /** 行号（1-based） */
-  line: number
-  /** 匹配行内容 */
-  content: string
-  /** 匹配部分（高亮用，若 capture groups 存在则取第一个 group，否则取整行） */
-  match: string
-}
-
-/** grep_file 输出 */
-export interface GrepFileOutput {
-  /** 搜索模式 */
-  pattern: string
-  /** 搜索路径 */
-  path: string
-  /** 匹配结果列表 */
-  matches: GrepMatch[]
-  /** 总匹配数 */
-  count: number
-  /** 搜索的文件数 */
-  filesSearched: number
-  /** 是否被截断 */
-  truncated: boolean
-}
-
-/** 最大 grep 搜索文件数 */
-const MAX_GREP_FILES = 200
-
-/**
- * glob 匹配（简单实现：* → 任意字符，? → 单个字符）
- */
-function globMatch(pattern: string, name: string): boolean {
-  const regexStr = pattern
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/\*/g, '.*')
-    .replace(/\?/g, '.')
-  return new RegExp(`^${regexStr}$`).test(name)
-}
-
-/**
- * grep_file 工具：搜索文件内容
- *
- * 安全声明：
- * - isReadOnly: true
- * - isConcurrencySafe: true
- * - permission.key: 'read'
- */
-export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
-  id: 'grep_file',
-  description: '在文件或目录中搜索文本模式（正则表达式）。支持 glob 文件过滤、大小写敏感、递归搜索。',
-  inputSchema: makeSchema<GrepFileInput>(),
-  isReadOnly: () => true,
-  isConcurrencySafe: () => true,
-  permission: {
-    key: 'read',
-    extractPatterns: (input) => [input.path ?? '.'],
-  },
-  async call(input, ctx): Promise<ToolResult<GrepFileOutput>> {
-    const relPath = input.path ?? '.'
-    const absPath = resolvePath(relPath, ctx.cwd)
-
-    if (!isWithinCwd(absPath, ctx.cwd)) {
-      return {
-        ok: false,
-        error: { message: `路径 "${relPath}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
-      }
-    }
-
-    try {
-      let regex: RegExp
-      try {
-        regex = new RegExp(input.pattern, input.caseSensitive === false ? 'gi' : 'g')
-      } catch (e: any) {
-        return { ok: false, error: { message: `正则表达式无效: ${e.message}`, code: 'INVALID_REGEX' } }
-      }
-
-      const recursive = input.recursive ?? true
-      const includeGlob = input.include ?? '*'
-      const maxResults = input.maxResults ?? 100
-      const matches: GrepMatch[] = []
-      let filesSearched = 0
-      let truncated = false
-
-      async function searchFile(filePath: string, relFilePath: string): Promise<void> {
-        if (truncated) return
-        filesSearched++
-        if (filesSearched > MAX_GREP_FILES) { truncated = true; return }
-
-        try {
-          const content = await readFile(filePath, 'utf-8')
-          const lines = content.split('\n')
-          for (let i = 0; i < lines.length; i++) {
-            if (matches.length >= maxResults) { truncated = true; return }
-            regex.lastIndex = 0
-            const m = regex.exec(lines[i])
-            if (m) {
-              matches.push({
-                filePath,
-                relativePath: relFilePath,
-                line: i + 1,
-                content: lines[i],
-                match: m[1] ?? m[0],
-              })
-            }
-          }
-        } catch {
-          // 跳过无法读取的文件
-        }
-      }
-
-      async function scanDir(dirPath: string, relBase: string): Promise<void> {
-        if (truncated) return
-        const items = await readdir(dirPath, { withFileTypes: true })
-        for (const item of items) {
-          if (truncated) return
-          if (item.name.startsWith('.') && !includeGlob.startsWith('.')) continue
-
-          const itemAbs = join(dirPath, item.name)
-          const itemRel = relBase ? `${relBase}/${item.name}` : item.name
-
-          if (item.isDirectory()) {
-            if (recursive) await scanDir(itemAbs, itemRel)
-          } else if (item.isFile()) {
-            if (globMatch(includeGlob, item.name)) {
-              await searchFile(itemAbs, itemRel)
-            }
-          }
-        }
-      }
-
-      const stats = await stat(absPath)
-      if (stats.isFile()) {
-        await searchFile(absPath, relPath)
-      } else if (stats.isDirectory()) {
-        await scanDir(absPath, '')
-      } else {
-        return { ok: false, error: { message: `路径不是文件或目录: ${relPath}`, code: 'INVALID_PATH' } }
-      }
-
-      return {
-        ok: true,
-        output: {
-          pattern: input.pattern,
-          path: absPath,
-          matches,
-          count: matches.length,
-          filesSearched,
-          truncated,
-        },
-      }
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        return { ok: false, error: { message: `路径不存在: ${relPath}`, code: 'PATH_NOT_FOUND' } }
-      }
-      return { ok: false, error: { message: err.message ?? String(err), code: 'GREP_ERROR' } }
-    }
-  },
-})
-
-// ========================================================================
-// 6. edit_file 工具
+// 4. edit_file 工具
 // ========================================================================
 
 /** edit_file 输入 */
@@ -913,11 +579,11 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
 })
 
 // ========================================================================
-// 7. AgentPlugin 入口
+// 5. AgentPlugin 入口
 // ========================================================================
 
-/** 内置工具列表（可按需选取） */
-export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, listDirTool, grepFileTool, editFileTool]
+/** 内置工具列表（仅保留文件 I/O + Shell 四个原语；搜索类见 @harness/tools-search） */
+export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, editFileTool]
 
 /**
  * 内置 Tool 插件
@@ -937,9 +603,9 @@ export function createToolsBuiltinPlugin(options?: {
 
   return {
     id: 'tools.builtin',
-    version: '0.2.0',
+    version: '0.3.0',
     name: '内置工具',
-    description: '提供 read_file / write_file / bash / list_dir / grep_file / edit_file 六个基础工具',
+    description: '提供 read_file / write_file / bash / edit_file 四个文件 I/O + Shell 原语（搜索类见 @harness/tools-search）',
     async install(ctx) {
       ctx.log.info('内置工具插件已加载', { tools: tools.map((t) => t.id) })
       return {
@@ -953,5 +619,5 @@ export function createToolsBuiltinPlugin(options?: {
   }
 }
 
-/** 默认导出：注入全部六个工具的插件常量 */
+/** 默认导出：注入全部四个原语工具的插件常量 */
 export const toolsBuiltinPlugin: AgentPlugin = createToolsBuiltinPlugin()

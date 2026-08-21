@@ -100,6 +100,15 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/tools-search": {
+      "name": "@harness/tools-search",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/session": {
       "name": "@harness/session",
       "version": "0.1.0",
@@ -142,6 +151,8 @@
     "@harness/tool": ["@harness/tool@workspace:packages/tool"],
 
     "@harness/tools-builtin": ["@harness/tools-builtin@workspace:packages/plugins/tools-builtin"],
+
+    "@harness/tools-search": ["@harness/tools-search@workspace:packages/plugins/tools-search"],
 
     "@types/bun": ["@types/bun@1.3.14", "https://registry.npmmirror.com/@types/bun/-/bun-1.3.14.tgz", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 
