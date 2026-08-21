@@ -1,5 +1,56 @@
 # Agent Harness 开发日志
 
+## 2026-08-21：流式输出 + Provider 扩展 + 工具插件化拆分
+
+### 今日完成
+
+在 Phase 3 基础上完成三项交付：流式输出打通全链路、新增 OpenAI Provider、按"原语才内置"原则拆分工具包。**14 个包 typecheck 全绿，215 个单元测试全通过（595 断言）**。
+
+#### 1. 模块开发
+
+| # | 提交 | 模块 / 变更 | 能力 | 测试数 |
+|---|---|---|---|---|
+| 1 | `fb9c3ae` | `@harness/core` 流式输出 | `ChatStreamChunk` + `AgentStreamEvent` 类型；`ChatProvider.stream?()` 可选方法；`AgentRuntime.queryStream()` 边流式边处理工具调用；`SessionManager.promptStream()`；CLI REPL / `run` 子命令逐 token 打印 | — |
+| 2 | `fb9c3ae` | `@harness/provider-anthropic` 流式 | `AnthropicChatProvider.stream()`：解析 SSE（`message_start` / `content_block_delta` / `message_delta`），yield `text_delta` / `tool_use_start` / `tool_use_delta` / `tool_use_stop` / `done` | 4 |
+| 3 | `fb9c3ae` | `@harness/provider-mock` 流式 | `MockChatProvider.stream()`：逐 token 模拟输出，供无网络环境测试流式链路 | — |
+| 4 | `ddc5db3` | `@harness/tools-builtin` 新增工具 | `list_dir`（目录列举：递归/隐藏文件/类型/大小）、`grep_file`（正则检索：glob 过滤/大小写/递归）、`edit_file`（精确替换：`oldString`→`newString`，`replaceAll`/多行/多重匹配校验） | 16 |
+| 5 | `4d39c29` | `@harness/provider-openai`（新包） | OpenAI Chat Completions 对接：Bearer auth、Part→messages 序列化（`tool_calls` 数组 / `role:tool` 带 `tool_call_id` / `image_url` data: URI）、Tool Schema 导出、`complete()` 非流式 + `stream()` 流式（SSE `data:[DONE]` 终止、tool_calls 按 index 累积 arguments 增量） | 17 |
+| 6 | `e65543d` | 工具插件化拆分 | `@harness/tools-builtin` 瘦身为 4 个原语（v0.3.0）；`list_dir`/`grep_file` 抽到新包 `@harness/tools-search`（v0.1.0，自包含 helper + `toolsSearchPlugin` 工厂） | 14 |
+
+#### 2. 关键技术决策
+
+- **流式类型分层**：`ChatStreamChunk`（Provider 层，纯 LLM 输出）与 `AgentStreamEvent`（Agent 层，含工具执行结果）解耦，让 Provider 不感知工具执行
+- **OpenAI 与 Anthropic 序列化差异**：Anthropic 用 `tool_use`/`tool_result` block；OpenAI 用 assistant.tool_calls 数组 + 独立 `role:tool` 消息（带 `tool_call_id` 关联），两条序列化路径分别实现
+- **工具流式增量累积**：OpenAI 的 `tool_calls` 按帧增量（首帧带 id+name，后续只带 arguments 片段），用 `Map<index, state>` 累积并按帧 yield `tool_use_delta`
+- **"原语才内置"判定原则**：内置仅留不可替代、不可组合替代、非场景化的工具。`read_file`/`write_file`/`edit_file`/`bash` 是文件 I/O + Shell 原语；`list_dir`/`grep_file` 属搜索导航场景（`bash ls/grep` 可替代），抽为独立插件
+- **插件包自包含**：`@harness/tools-search` 自带 `resolvePath`/`isWithinCwd`/`makeSchema`/`globMatch` helper，不反向依赖 `@harness/tools-builtin`，保持插件可独立装卸
+- **配置三级来源一致**：OpenAI Provider 沿用 `直接传入 > ctx.config.get('provider.openai') > 环境变量 OPENAI_API_KEY/OPENAI_BASE_URL` 优先级，与 Anthropic Provider 对齐
+
+#### 3. 遇到的问题与修复
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| `new-tools.test.ts` 类型错误 `res.output` 可能 undefined | 测试直接访问 `res.output.count` 未做空断言 | 统一加非空断言 `res.output!.count`（仅在 `res.ok===true` 分支） |
+| `ToolContext` 缺 `toolUseId` 字段 | 测试 ctx 构造遗漏该必填字段 | 补 `toolUseId: 'tu1'` |
+| 旧测试断言 `builtinTools` 6 个工具 | 拆分后 builtin 仅 4 个、search 2 个 | 更新断言为 `['bash','edit_file','read_file','write_file']`，search 包独立断言 `['grep_file','list_dir']` |
+| Anthropic stream 测试 mock fetch 类型不匹配 | mock 返回类型与全局 `fetch` 签名冲突 | mock 函数返回类型改 `any` |
+| 拆分后 `readdir`/`join`/`globMatch` 成为 tools-builtin 死代码 | 仅被迁出的 list_dir/grep_file 使用 | 清理 imports 与 helper，迁入 tools-search |
+
+#### 4. 代码统计
+
+```
+14 个 packages / 215 个测试 / 595 个 expect（较 08-16 +6 包 +45 测试）
+当前工具分布：
+  - @harness/tools-builtin（v0.3.0）：read_file / write_file / bash / edit_file（4 原语）
+  - @harness/tools-search（v0.1.0）：list_dir / grep_file（搜索类）
+当前 Provider 分布：
+  - @harness/provider-anthropic（complete + stream）
+  - @harness/provider-openai（complete + stream）
+  - @harness/provider-mock（complete + stream，测试用）
+```
+
+---
+
 ## 2026-08-16：Phase 1 ~ Phase 3 核心交付
 
 ### 今日完成
@@ -60,22 +111,24 @@
 
 #### Phase 4：实用化与扩展
 
-| 优先级 | 方向 | 说明 |
-|---|---|---|
-| **P0** | 更多内置工具 | `list_dir` / `grep_file` / `edit_file`（让 CLI 真的能读写改代码） |
-| **P0** | 流式输出 | Provider 支持 `stream: true`，REPL 逐 token 打印（当前是一次性返回） |
-| **P1** | `@harness/provider-openai` | GPT-4o / GPT-4.1 适配，统一 ChatProvider 抽象 |
-| **P1** | 会话管理增强 | 标题自动生成、关键词搜索、导出 Markdown、Compaction（长会话摘要压缩） |
-| **P1** | 插件化 CLI 扩展 | 插件可往 CLI 注册自己的子命令 / `/xxx` 斜杠命令 |
-| **P2** | MCP Client 插件 | 对接 Model Context Protocol，支持 local stdio + remote SSE MCP Server |
-| **P2** | Subagent 插件 | `AgentTool` + `runAgent()`，支持子 Agent 嵌套调用 |
-| **P2** | Skill Layer | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project） |
-| **P3** | TUI 形态 | 基于终端 UI 的富交互（类似 Claude Code TUI） |
-| **P3** | Swarm 协作 | Team + Mailbox + Task List + 权限桥接（多 Agent 协作） |
+| 优先级 | 方向 | 说明 | 状态 |
+|---|---|---|---|
+| ~~**P0**~~ | ~~更多内置工具~~ | ~~`list_dir` / `grep_file` / `edit_file`~~ | ✅ 完成（08-21，edit_file 留 builtin，list_dir/grep_file 抽 tools-search） |
+| ~~**P0**~~ | ~~流式输出~~ | ~~Provider `stream: true` + REPL 逐 token~~ | ✅ 完成（08-21，core/anthropic/mock 三端 stream） |
+| ~~**P1**~~ | ~~`@harness/provider-openai`~~ | ~~GPT-4o 适配，统一 ChatProvider~~ | ✅ 完成（08-21，complete + stream） |
+| **P0** | 工具持续插件化 | `@harness/tools-web`（web_fetch）/ `tools-glob` / `tools-media`（view_image）按场景拆包 | ⏳ 进行中 |
+| **P1** | 会话管理增强 | 标题自动生成、关键词搜索、导出 Markdown、Compaction（长会话摘要压缩） | ⬜ 待办 |
+| **P1** | 插件化 CLI 扩展 | 插件可往 CLI 注册自己的子命令 / `/xxx` 斜杠命令 | ⬜ 待办 |
+| **P2** | MCP Client 插件 | 对接 Model Context Protocol，支持 local stdio + remote SSE MCP Server | ⬜ 待办 |
+| **P2** | Subagent 插件 | `AgentTool` + `runAgent()`，支持子 Agent 嵌套调用 | ⬜ 待办 |
+| **P2** | Skill Layer | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project） | ⬜ 待办 |
+| **P3** | TUI 形态 | 基于终端 UI 的富交互（类似 Claude Code TUI） | ⬜ 待办 |
+| **P3** | Swarm 协作 | Team + Mailbox + Task List + 权限桥接（多 Agent 协作） | ⬜ 待办 |
 
 #### 近期优先推进顺序
 
-1. **流式输出** — 体验提升最大，当前 REPL 等待返回时是阻塞的
-2. **`edit_file` + `list_dir` + `grep_file`** — 让 CLI 具备基本的代码浏览和编辑能力
-3. **会话 Compaction** — 长对话场景必需
-4. **`@harness/provider-openai`** — 多模型支持
+1. ~~**流式输出**~~ — ✅ 已完成
+2. ~~**`edit_file` + `list_dir` + `grep_file`**~~ — ✅ 已完成（含工具插件化拆分）
+3. **`@harness/tools-web` / `tools-glob` / `tools-media`** — 按场景继续插件化，复用 tools-search 模板（自包含 helper + tool.pool.assemble Hook）
+4. **会话 Compaction** — 长对话场景必需
+5. ~~**`@harness/provider-openai`**~~ — ✅ 已完成
