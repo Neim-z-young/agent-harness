@@ -89,7 +89,7 @@ function buildSseResponse(options: {
 }
 
 /** 创建 mock fetch，返回 ReadableStream SSE */
-function mockFetchSse(sseText: string, status = 200): typeof fetch {
+function mockFetchSse(sseText: string, status = 200): any {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     start(controller) {
@@ -97,12 +97,13 @@ function mockFetchSse(sseText: string, status = 200): typeof fetch {
       controller.close()
     },
   })
-  return ((() => Promise.resolve({
+  const mockResp = {
     ok: status >= 200 && status < 300,
     status,
     body: stream,
     text: () => Promise.resolve(sseText),
-  }) as any)) as typeof fetch
+  }
+  return () => Promise.resolve(mockResp)
 }
 
 function makeMessages(text: string): Message[] {
