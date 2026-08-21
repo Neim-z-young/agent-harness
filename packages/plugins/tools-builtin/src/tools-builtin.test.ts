@@ -427,8 +427,8 @@ describe('@harness/tools-builtin', () => {
       await h.stop()
     })
 
-    it('builtinTools 导出包含六个工具', () => {
-      expect(builtinTools.map((t) => t.id).sort()).toEqual(['bash', 'edit_file', 'grep_file', 'list_dir', 'read_file', 'write_file'])
+    it('builtinTools 导出包含四个原语工具', () => {
+      expect(builtinTools.map((t) => t.id).sort()).toEqual(['bash', 'edit_file', 'read_file', 'write_file'])
     })
   })
 })
