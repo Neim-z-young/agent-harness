@@ -1,5 +1,66 @@
 # Agent Harness 开发日志
 
+## 2026-08-22（续）：会话管理增强 + CLI 扩展 + MCP Client 插件
+
+### 今日完成
+
+在 Phase 4 会话 Compaction 之后，连续推进三项 P1/P2 交付：会话管理增强（标题/搜索/导出）、插件化 CLI 命令扩展（`cli.commands` / `cli.command` Hook）、MCP Client 插件（stdio + HTTP/SSE transport + resources/prompts 发现 + Bearer 鉴权）。**18 个包 typecheck 全绿，43 个新增单元测试全通过（@harness/mcp-client 34 + core/cli 新增 9）**。
+
+#### 1. 模块开发
+
+| # | 提交 | 模块 / 变更 | 能力 | 测试数 |
+|---|---|---|---|---|
+| 1 | `33974b1` | `@harness/core` `DefaultSessionManager` 会话增强 | ① `generateTitle()`：规则化标题生成（首条用户消息前 60 字符 + 工具调用密度提示 + 长文本截断标记）② `search(keyword)`：关键词检索（标题 + 消息文本 + 工具名 + 工具输入）③ `exportMarkdown(sessionId)`：渲染完整对话为 Markdown（系统记忆 + 用户/助手轮次 + 工具调用 codeblock + 元数据尾部） | 6 |
+| 2 | `33974b1` | `@harness/cli` 新增斜杠命令 | `/search <keyword>` 调用 `session.search` 列出匹配会话；`/export [path]` 导出当前会话 Markdown 到文件或 stdout | — |
+| 3 | `195c12f` | `@harness/plugin` Hooks 扩展 | 新增 `cli.commands(input)` Hook（插件注册可用斜杠命令到 `/help`）+ `cli.command(input)` Hook（插件处理自定义斜杠命令，可输出文本、控制 result: continue/exit） | 3 |
+| 4 | `195c12f` | `@harness/cli` 插件命令分发 | REPL 解析未知 `/xxx` 时依次调用插件的 `cli.command` Hook；`/help` 列出插件注册的命令 | — |
+| 5 | `82acf8e` | `@harness/mcp-client`（新包 v0.1.0） | MCP Client 插件首版：`McpClient`（JSON-RPC 2.0 over stdio，initialize/tools/list/tools/call）、`StdioTransport`（spawn 子进程 + 行分隔 JSON 收发）、`convertMcpToolToHarnessTool`（MCP 工具 → Harness Tool，Fail-Closed 默认值）、`createMcpClientPlugin`（harness.start 连接 + tool.pool.assemble 注入 + `/mcp` CLI 命令） | 9 |
+| 6 | `139c00c` | `@harness/mcp-client` v0.2.0 增强 | ① `HttpTransport`：Streamable HTTP（MCP 2025-03-26），POST JSON-RPC，响应支持 JSON / SSE 流，自动缓存并回传 `Mcp-Session-Id` ② `SseTransport`：旧版 HTTP+SSE，GET 建立 SSE 流接收 `endpoint` 事件，POST 到该端点 ③ `defaultTransportFactory`：根据 `config.transport` 选择 ④ `McpClient` 扩展：缓存 `serverCapabilities`/`serverInfo`/`protocolVersion`；新增 `listResources`/`readResource`/`subscribeResource`/`listPrompts`/`getPrompt`；`onNotification` 接收 `resources/listChanged` 等通知 ⑤ `McpAuthConfig`：bearerToken / authorizationHeader / 自定义 headers ⑥ `/mcp` 子命令扩展：servers/tools/resources/read \<uri\>/prompts/prompt \<name\> ⑦ `autoInjectResources`：可选把资源 text 注入到 `prompt.system.transform` | 25 |
+
+#### 2. 关键技术决策
+
+- **标题生成不依赖 LLM**：规则化提取首条用户消息前 60 字符 + 工具调用密度提示，可离线、可重复、无费用，作为默认策略。后续可通过 hook 注入 LLM 生成版本。
+- **搜索覆盖多维度**：标题 + 消息文本 + 工具名 + 工具输入四维匹配，单条命中即返回，避免漏检。
+- **Markdown 导出格式约定**：系统记忆 → 用户/助手轮次（含工具调用 codeblock）→ 元数据尾部（会话 ID、消息数、压缩统计），可直接作为文档归档。
+- **CLI 扩展用 Hook 而非硬编码**：插件通过 `cli.commands` 声明命令、`cli.command` 处理命令，CLI 层只做分发，保持开放-封闭原则。
+- **MCP Transport 三态抽象**：`McpTransport` 接口统一 stdio/http/sse 三种传输，`send` 返回 `void | Promise<void>` 兼容同步/异步 transport；`defaultTransportFactory` 根据配置字段选择，缺省按 command/url 推断。
+- **capabilities 驱动的方法可用性**：`McpClient.listTools/listResources/listPrompts` 先检查 `serverCapabilities` 对应字段，未声明时返回空数组（不调用 server），避免无效请求。
+- **Bearer 鉴权分层**：`authorizationHeader` 优先级高于 `bearerToken`，便于用户直接传入完整 Authorization 头（如 OAuth2 流程外层拿到的 token）。
+- **autoInjectResources 可选注入**：默认不注入资源到 system prompt（避免污染上下文），通过 `'all'` 或 `string[]` 策略显式启用，注入通过 `prompt.system.transform` hook 完成。
+- **OAuth2 PKCE 暂不实现**：完整 OAuth2 授权码 + PKCE 流程需要独立 OAuth client 模块和回调服务器，复杂度高且与 MCP 协议本身解耦。当前提供静态 Bearer Token 注入，足以对接大多数 MCP Server。
+
+#### 3. 遇到的问题与修复
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| 标题生成测试"长文本截断"用例失败 | 测试用例文本长度不足 60 字符 | 扩展测试用例文本长度，确保超过 60 字符触发截断逻辑 |
+| `cli.command` Hook 测试 `cliInput` 类型错误 | 缺少 `result` 可选属性 | 显式定义 `cliInput` 类型，包含 `result?: 'continue' \| 'exit'` |
+| MCP Client 旧测试 `listTools` 返回空 | 扩展后 `listTools` 依赖 `capabilities.tools`，旧测试 mock initialize 响应未声明 capabilities | 补充 mock 响应 `capabilities: { tools: {} }` |
+| MCP Client `listPrompts` 请求悬挂超时 | autoInject 测试 mock 未注册 `prompts/list`，但 capabilities 声明了 prompts | 补注册 `prompts/list` 返回空数组 |
+| `defaultTransportFactory` stdio 测试 spawn ENOENT | 受限测试环境 PATH 缺 `/bin`，`echo` 找不到 | 改用绝对路径 `/bin/echo` |
+| HTTP transport SSE 流解析遗漏最后一段 | `lastIndexOf('\n\n')` 未 flush 残留 buffer | 循环结束后补 flush `buf + '\n\n'` |
+
+#### 4. 代码统计
+
+```
+18 个 packages / typecheck 全绿 / 新增 43 个测试
+当前 MCP Client 能力：
+  - stdio transport（子进程 JSON-RPC）
+  - http transport（Streamable HTTP，JSON/SSE 响应，Mcp-Session-Id 会话）
+  - sse transport（旧版 HTTP+SSE，endpoint 事件）
+  - resources/list + resources/read + subscribe
+  - prompts/list + prompts/get
+  - Bearer Token 鉴权
+  - /mcp 子命令：servers / tools / resources / read / prompts / prompt
+  - autoInjectResources 注入 system prompt
+对外 API：
+  - createMcpClientPlugin({ servers, transportFactory?, autoInjectResources? })
+  - McpClient.connect/listTools/callTool/listResources/readResource/listPrompts/getPrompt
+  - defaultTransportFactory(config)
+```
+
+---
+
 ## 2026-08-23：会话 Compaction（三级压缩 + 系统记忆注入）
 
 ### 今日完成
@@ -236,5 +297,19 @@ CLI 斜杠命令：
 1. ~~**流式输出**~~ — ✅ 已完成
 2. ~~**`edit_file` + `list_dir` + `grep_file`**~~ — ✅ 已完成（含工具插件化拆分）
 3. ~~**`@harness/tools-web` / `tools-glob` / `tools-media`**~~ — ✅ 已完成（三场景包 33 测试）
-4. **会话 Compaction** — 长对话场景必需
+4. ~~**会话 Compaction**~~ — ✅ 已完成（三级压缩 + 系统记忆注入）
 5. ~~**`@harness/provider-openai`**~~ — ✅ 已完成
+6. ~~**会话管理增强**~~ — ✅ 已完成（标题生成 + 关键词搜索 + Markdown 导出）
+7. ~~**插件化 CLI 扩展**~~ — ✅ 已完成（cli.commands / cli.command Hook）
+8. ~~**MCP Client 插件**~~ — ✅ 已完成（stdio + HTTP/SSE transport + resources/prompts + Bearer 鉴权）
+
+#### 剩余待办
+
+| 优先级 | 方向 | 说明 |
+|---|---|---|
+| **P2** | Subagent 插件 | `AgentTool` + `runAgent()`，支持子 Agent 嵌套调用 |
+| **P2** | Skill Layer | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project） |
+| **P2** | Provider 补全 | Gemini / 通义 / 智谱 等多模型适配 |
+| **P3** | TUI 形态 | 基于终端 UI 的富交互（类似 Claude Code TUI） |
+| **P3** | Swarm 协作 | Team + Mailbox + Task List + 权限桥接（多 Agent 协作） |
+| **P3** | OAuth2 PKCE | 完整 OAuth2 授权码流程（回调服务器 + token 刷新），用于对接 OAuth2-protected MCP Server |
