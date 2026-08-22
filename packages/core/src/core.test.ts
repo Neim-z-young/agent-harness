@@ -479,13 +479,33 @@ describe('@harness/core', () => {
     it('compactIfNeeded 阈值命中时压缩，否则 no-op', async () => {
       const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
       const sess = await h.session.create()
-      // 2 条消息估算 2*500=1000 tokens < 默认阈值 8000 → 不压缩
+      // 2 条消息 ~38 tokens < 阈值 100 → 不压缩
       await fillMessages(h, sess.id, 1)
+      const did1 = await h.session.compactIfNeeded(sess.id, { thresholdTokens: 100 })
+      expect(did1).toBe(false)
+      // 20 条消息 ~750 tokens ≥ 阈值 100 → 压缩
+      await fillMessages(h, sess.id, 9) // 已有 2 条 + 18 = 20 条
+      const did2 = await h.session.compactIfNeeded(sess.id, { thresholdTokens: 100 })
+      expect(did2).toBe(true)
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBeLessThan(20)
+      await h.stop()
+    })
+
+    it('compactIfNeeded 百分比阈值：默认 80% 可用窗口才触发', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fillMessages(h, sess.id, 10) // 20 条消息，估算 token 远低于 136K
+      // 默认参数：(200000 - 30000) * 0.8 = 136000，20 条消息约 750 tokens → 不触发
       const did1 = await h.session.compactIfNeeded(sess.id, {})
       expect(did1).toBe(false)
-      // 20 条消息估算 20*500=10000 ≥ 8000 → 压缩
-      await fillMessages(h, sess.id, 9) // 已有 2 条 + 18 = 20 条
-      const did2 = await h.session.compactIfNeeded(sess.id, {})
+      // 用小窗口 + 高百分比触发：contextWindow=500, reserved=100, pct=80 → 阈值=320
+      // 20 条消息约 750 tokens ≥ 320 → 触发
+      const did2 = await h.session.compactIfNeeded(sess.id, {
+        contextWindowTokens: 500,
+        reservedTokens: 100,
+        autoCompactThresholdPct: 80,
+      })
       expect(did2).toBe(true)
       const s = (await h.session.get(sess.id))!
       expect(s.messages.length).toBeLessThan(20)

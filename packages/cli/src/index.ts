@@ -517,7 +517,7 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
           out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
           out('  /switch ?          列出已注册 Agent\n')
           out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
-          out('  /compact auto      达到阈值才压缩（= compactIfNeeded）\n')
+          out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           return 'continue'
 
         case '/exit': case '/quit':
@@ -566,7 +566,10 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
             const did = await harness.session.compactIfNeeded(curSessionId)
             const info = await harness.session.getCompactionInfo(curSessionId)
             if (did) out(`已触发压缩（阈值命中）：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)
-            else out(`未达阈值（估计 ${((await harness.session.get(curSessionId))!.messages.length * 500)} tokens），跳过压缩。\n`)
+            else {
+              const est = await harness.session.estimateTokens(curSessionId)
+              out(`未达阈值（估算 ${est} tokens），跳过压缩。\n`)
+            }
           } else {
             const strategy = (arg === 'prune' || arg === 'summary' || arg === 'agent') ? arg : 'summary'
             await harness.session.compact(curSessionId, strategy)

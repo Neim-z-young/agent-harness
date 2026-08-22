@@ -216,13 +216,36 @@ export interface CompactOptions {
    * - agent：调用 LLM 生成摘要（调用者需提供调用能力；若缺失自动 fallback 到 summary）
    */
   strategy?: CompactionStrategy
-  /** 每条消息的平均 token 估算（用于估算上下文长度是否达到阈值；默认 500） */
-  tokensPerMessage?: number
-  /** 触发阈值（估算总 token 数达到多少才压缩；默认 8000） */
+  /**
+   * 模型上下文窗口大小（tokens）。
+   * 与 autoCompactThresholdPct / reservedTokens 配合，计算百分比阈值。
+   * 默认 200000（200K 窗口）
+   */
+  contextWindowTokens?: number
+  /**
+   * 触发百分比：估算 token 占"可用窗口"（contextWindow - reserved）的百分比达到此值才压缩。
+   * 默认 80（即 80% 使用率才触发），适配从 128K 到 1M 窗口的模型。
+   */
+  autoCompactThresholdPct?: number
+  /**
+   * 预留 tokens（给摘要生成留空间）。
+   * 默认 30000（参考 Claude Code 的 20K max output + 13K buffer）。
+   */
+  reservedTokens?: number
+  /**
+   * 固定阈值（估算总 token 数达到多少才压缩）。
+   * 优先于百分比计算；不传则用 (contextWindow - reserved) * pct% 计算。
+   */
   thresholdTokens?: number
-  /** 压缩后保留的最近消息数（user+assistant 算一对；默认 6 条 = 3 轮对话） */
+  /**
+   * [已废弃] 每条消息的平均 token 估算。
+   * 现改用字符长度 / 4 精确估算（参考 Claude Code 的 roughTokenCountEstimation）。
+   * 保留向后兼容：传入时仍按此值估算。
+   */
+  tokensPerMessage?: number
+  /** 压缩后保留的最近消息数（user+assistant 算一对；默认 10 条 = 5 轮对话） */
   keepRecentMessages?: number
-  /** 摘要最大字符数（仅 summary / agent 策略；默认 1200） */
+  /** 摘要最大字符数（仅 summary / agent 策略；默认 8000） */
   summaryMaxChars?: number
 }
 
@@ -274,6 +297,8 @@ export interface SessionManager {
   compact(sessionId: string, strategy?: CompactionStrategy, options?: CompactOptions): Promise<void>
   /** 估算当前上下文长度达到阈值时才压缩（无触发时为 no-op）；返回是否真的执行了压缩 */
   compactIfNeeded(sessionId: string, options?: CompactOptions): Promise<boolean>
+  /** 估算当前会话的 token 数（按字符长度 / 4） */
+  estimateTokens(sessionId: string): Promise<number>
   /** 读取当前压缩记忆（CompactMemory + 元数据），供 Agent 注入 system prompt */
   getCompactionInfo(sessionId: string): Promise<{ meta?: CompactionMeta; memory?: CompactMemory }>
 }

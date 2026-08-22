@@ -631,7 +631,7 @@ export class DefaultSessionManager implements SessionManager {
     if (!sess) return
     const now = Date.now()
     const strat = strategy ?? options.strategy ?? 'summary'
-    const keepRecent = Math.max(options.keepRecentMessages ?? 6, 0)
+    const keepRecent = Math.max(options.keepRecentMessages ?? 10, 0)
 
     const beforeLen = sess.messages.length
     // 所有消息按时间排序（约定已是）；不包含 role===system 的消息（它们在 AgentRuntime 内动态构建，不在 session.messages 里）
@@ -647,7 +647,7 @@ export class DefaultSessionManager implements SessionManager {
     const prevMemory = this.readMemory(sess)
 
     if (strat === 'summary' || strat === 'agent') {
-      const maxChars = options.summaryMaxChars ?? 1200
+      const maxChars = options.summaryMaxChars ?? 8000
       if (strat === 'agent') {
         // 尝试调用 agent（通过 services?.agent）——缺失或失败则 fallback 到规则摘要
         const svc = this.services?.()
@@ -704,12 +704,53 @@ export class DefaultSessionManager implements SessionManager {
   async compactIfNeeded(sessionId: string, options: CompactOptions = {}): Promise<boolean> {
     const sess = this.sessions.get(sessionId)
     if (!sess) return false
-    const tokensPerMsg = options.tokensPerMessage ?? 500
-    const threshold = options.thresholdTokens ?? 8000
-    const estimated = sess.messages.length * tokensPerMsg
+    // token 估算：优先用旧的 tokensPerMessage（向后兼容），否则用字符长度 / 4
+    const estimated = options.tokensPerMessage != null
+      ? sess.messages.length * options.tokensPerMessage
+      : this.estimateTokensForMessages(sess.messages)
+    // 阈值计算：固定阈值优先，否则用百分比
+    let threshold: number
+    if (options.thresholdTokens != null) {
+      threshold = options.thresholdTokens
+    } else {
+      const ctx = options.contextWindowTokens ?? 200000
+      const reserved = options.reservedTokens ?? 30000
+      const pct = options.autoCompactThresholdPct ?? 80
+      threshold = Math.floor((ctx - reserved) * (pct / 100))
+    }
     if (estimated < threshold) return false
     await this.compact(sessionId, options.strategy ?? 'summary', options)
     return true
+  }
+
+  async estimateTokens(sessionId: string): Promise<number> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return 0
+    return this.estimateTokensForMessages(sess.messages)
+  }
+
+  /**
+   * 粗估 messages 的 token 数：按字符长度 / 4（参考 Claude Code 的 roughTokenCountEstimation）。
+   * text part: text.length / 4
+   * tool part: JSON.stringify(result + input).length / 4
+   * 其他 part: JSON.stringify(part).length / 4
+   */
+  private estimateTokensForMessages(messages: Message[]): number {
+    let chars = 0
+    for (const m of messages) {
+      for (const p of m.parts) {
+        const pt = p as any
+        if (pt.type === 'text') {
+          chars += String(pt.text ?? '').length
+        } else if (pt.type === 'tool') {
+          try { chars += JSON.stringify(pt.result ?? '').length } catch { chars += 100 }
+          try { chars += JSON.stringify(pt.input ?? {}).length } catch { /* ignore */ }
+        } else {
+          try { chars += JSON.stringify(pt).length } catch { /* ignore */ }
+        }
+      }
+    }
+    return Math.ceil(chars / 4)
   }
 
   async getCompactionInfo(sessionId: string) {
