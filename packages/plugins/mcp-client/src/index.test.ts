@@ -2,6 +2,9 @@ import { describe, it, expect } from 'bun:test'
 import {
   McpClient,
   StdioTransport,
+  HttpTransport,
+  SseTransport,
+  defaultTransportFactory,
   convertMcpToolToHarnessTool,
   createMcpClientPlugin,
   type McpTransport,
@@ -47,6 +50,11 @@ class MockTransport implements McpTransport {
   close(): void { /* noop */ }
 
   get sent(): string[] { return this.sentMessages }
+
+  /** 模拟服务器主动推送消息（用于测试通知/请求） */
+  triggerMessage(data: string): void {
+    this.handler?.(data)
+  }
 }
 
 // ===== 测试 =====
@@ -175,7 +183,7 @@ describe('convertMcpToolToHarnessTool', () => {
 describe('createMcpClientPlugin', () => {
   it('插件 connect + tool.pool.assemble 注入工具', async () => {
     const transport = new MockTransport()
-    transport.register('initialize', () => ({ protocolVersion: '2024-11-05' }))
+    transport.register('initialize', () => ({ protocolVersion: '2024-11-05', capabilities: { tools: {} } }))
     transport.register('tools/list', () => ({
       tools: [
         { name: 'search', description: 'Search web' },
@@ -219,11 +227,11 @@ describe('createMcpClientPlugin', () => {
     expect(cmdInput.commands.length).toBe(1)
     expect(cmdInput.commands[0].command).toBe('mcp')
 
-    // cli.command 处理 /mcp
+    // cli.command 处理 /mcp tools
     const cmdOut: string[] = []
     const cliInput: { command: string; arg: string; out: (s: string) => void; sessionId: string; raw: string; result?: 'continue' | 'exit' } = {
-      command: 'mcp', arg: '', out: (s: string) => { cmdOut.push(s) },
-      sessionId: 's1', raw: 'mcp',
+      command: 'mcp', arg: 'tools', out: (s: string) => { cmdOut.push(s) },
+      sessionId: 's1', raw: 'mcp tools',
     }
     await (hooks as any)['cli.command']?.(cliInput)
     expect(cliInput.result).toBe('continue')
@@ -232,13 +240,12 @@ describe('createMcpClientPlugin', () => {
     await plugin.uninstall?.()
   })
 
-  it('无工具时 /mcp 命令不注册', async () => {
+  it('无 server 连接时 /mcp 命令不注册', async () => {
     const transport = new MockTransport()
-    transport.register('initialize', () => ({ protocolVersion: '2024-11-05' }))
-    transport.register('tools/list', () => ({ tools: [] }))
-
+    // 不注册 initialize，让 connect 失败（pending 直到 30s 超时，但测试只验证 commands）
+    // 改为：servers 为空数组
     const plugin = createMcpClientPlugin({
-      servers: [{ name: 'empty', command: 'fake' }],
+      servers: [],
       transportFactory: () => transport,
     })
 
@@ -253,6 +260,489 @@ describe('createMcpClientPlugin', () => {
     const cmdInput = { commands: [] as any[] }
     await (hooks as any)['cli.commands']?.(cmdInput)
     expect(cmdInput.commands.length).toBe(0)
+
+    await plugin.uninstall?.()
+  })
+})
+
+// ===== Resources / Prompts 能力测试 =====
+
+describe('McpClient resources/prompts', () => {
+  function createMockClientWithCaps(name: string = 'srv'): { client: McpClient; transport: MockTransport } {
+    const transport = new MockTransport()
+    transport.register('initialize', () => ({
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: { listChanged: true },
+        resources: { listChanged: true, subscribe: true },
+        prompts: { listChanged: true },
+      },
+      serverInfo: { name: 'mock-srv', version: '1.0' },
+    }))
+    const client = new McpClient(name, transport)
+    return { client, transport }
+  }
+
+  it('listResources + readResource 正常工作', async () => {
+    const { client, transport } = createMockClientWithCaps()
+    transport.register('resources/list', () => ({
+      resources: [
+        { uri: 'file:///a.txt', name: 'a', description: 'A file', mimeType: 'text/plain' },
+        { uri: 'file:///b.md', name: 'b' },
+      ],
+    }))
+    transport.register('resources/read', (params: any) => ({
+      contents: [{ uri: params.uri, mimeType: 'text/plain', text: `Content of ${params.uri}` }],
+    }))
+    await client.connect()
+    const resources = await client.listResources()
+    expect(resources.length).toBe(2)
+    expect(resources[0].uri).toBe('file:///a.txt')
+
+    const contents = await client.readResource('file:///a.txt')
+    expect(contents[0].text).toBe('Content of file:///a.txt')
+  })
+
+  it('capabilities 不含 resources 时 listResources 返回空数组', async () => {
+    const transport = new MockTransport()
+    transport.register('initialize', () => ({
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {} },
+    }))
+    const client = new McpClient('srv', transport)
+    await client.connect()
+    expect(await client.listResources()).toEqual([])
+    expect(await client.readResource('any://uri')).toEqual([])
+  })
+
+  it('listPrompts + getPrompt 正常工作', async () => {
+    const { client, transport } = createMockClientWithCaps()
+    transport.register('prompts/list', () => ({
+      prompts: [
+        { name: 'greet', description: '打招呼', arguments: [{ name: 'name', required: true }] },
+      ],
+    }))
+    transport.register('prompts/get', (params: any) => ({
+      messages: [{ role: 'user', content: { type: 'text', text: `Hello ${params.arguments?.name}` } }],
+    }))
+    await client.connect()
+    const prompts = await client.listPrompts()
+    expect(prompts.length).toBe(1)
+    expect(prompts[0].name).toBe('greet')
+
+    const messages = await client.getPrompt('greet', { name: 'Alice' })
+    expect(messages[0].content.text).toBe('Hello Alice')
+  })
+
+  it('connect 缓存 serverInfo 和 protocolVersion', async () => {
+    const { client } = createMockClientWithCaps('my-srv')
+    await client.connect()
+    expect(client.serverInfo.name).toBe('mock-srv')
+    expect(client.serverInfo.version).toBe('1.0')
+    expect(client.protocolVersion).toBe('2024-11-05')
+    expect(client.serverCapabilities.resources?.subscribe).toBe(true)
+  })
+
+  it('onNotification 接收 resources/listChanged 通知', async () => {
+    const { client, transport } = createMockClientWithCaps()
+    await client.connect()
+    const calls: string[] = []
+    client.onNotification((method) => calls.push(method))
+    // 直接模拟 server 推送通知
+    transport.triggerMessage(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/resources/listChanged' }))
+    expect(calls).toEqual(['notifications/resources/listChanged'])
+  })
+})
+
+// ===== HTTP transport 测试 =====
+
+describe('HttpTransport', () => {
+  function makeJsonResp(body: unknown, status = 200): any {
+    return Promise.resolve({
+      ok: status >= 200 && status < 300,
+      status,
+      headers: new Map([
+        ['Content-Type', 'application/json'],
+        ['Mcp-Session-Id', 'sess-123'],
+      ]),
+      text: () => Promise.resolve(JSON.stringify(body)),
+    })
+  }
+
+  it('POST JSON-RPC 请求并接收 JSON 响应', async () => {
+    const calls: any[] = []
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (url: string, init: any) => {
+      calls.push({ url, init })
+      return makeJsonResp({ jsonrpc: '2.0', id: 1, result: { tools: [{ name: 't1' }] } })
+    }
+    try {
+      const t = new HttpTransport({ url: 'https://mcp.example.com' })
+      const received: string[] = []
+      t.onMessage((data) => received.push(data))
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))
+      expect(received.length).toBe(1)
+      const msg = JSON.parse(received[0])
+      expect(msg.result.tools[0].name).toBe('t1')
+      expect(calls[0].init.method).toBe('POST')
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('Bearer Token 注入 Authorization 头', async () => {
+    let capturedHeaders: any
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (_url: string, init: any) => {
+      capturedHeaders = init.headers
+      return makeJsonResp({ jsonrpc: '2.0', id: 1, result: {} })
+    }
+    try {
+      const t = new HttpTransport({
+        url: 'https://mcp.example.com',
+        auth: { bearerToken: 'abc123', headers: { 'X-Custom': 'yes' } },
+      })
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))
+      expect(capturedHeaders['Authorization']).toBe('Bearer abc123')
+      expect(capturedHeaders['X-Custom']).toBe('yes')
+      expect(capturedHeaders['Content-Type']).toBe('application/json')
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('authorizationHeader 优先级高于 bearerToken', async () => {
+    let capturedHeaders: any
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (_url: string, init: any) => {
+      capturedHeaders = init.headers
+      return makeJsonResp({ jsonrpc: '2.0', id: 1, result: {} })
+    }
+    try {
+      const t = new HttpTransport({
+        url: 'https://mcp.example.com',
+        auth: { bearerToken: 'low', authorizationHeader: 'Bearer high' },
+      })
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: {} }))
+      expect(capturedHeaders['Authorization']).toBe('Bearer high')
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('Mcp-Session-Id 在后续请求中被回传', async () => {
+    const calls: any[] = []
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (url: string, init: any) => {
+      calls.push(init.headers)
+      return makeJsonResp({ jsonrpc: '2.0', id: 1, result: {} })
+    }
+    try {
+      const t = new HttpTransport({ url: 'https://mcp.example.com' })
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'a', params: {} }))
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 2, method: 'b', params: {} }))
+      // 第一次请求没有 session id
+      expect(calls[0]['Mcp-Session-Id']).toBeUndefined()
+      // 第二次请求带上缓存的 session id
+      expect(calls[1]['Mcp-Session-Id']).toBe('sess-123')
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('SSE 流响应解析多个 data 事件', async () => {
+    const prev = (globalThis as any).fetch
+    const sseBody = 'data: {"jsonrpc":"2.0","id":1,"result":{"a":1}}\n\ndata: {"jsonrpc":"2.0","method":"notifications/changed"}\n\n'
+    const encoder = new TextEncoder()
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(sseBody))
+        controller.close()
+      },
+    })
+    ;(globalThis as any).fetch = () => Promise.resolve({
+      ok: true,
+      status: 200,
+      headers: new Map([['Content-Type', 'text/event-stream']]),
+      body: stream,
+    })
+    try {
+      const t = new HttpTransport({ url: 'https://mcp.example.com' })
+      const received: string[] = []
+      t.onMessage((data) => received.push(data))
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))
+      expect(received.length).toBe(2)
+      expect(JSON.parse(received[0]).result.a).toBe(1)
+      expect(JSON.parse(received[1]).method).toBe('notifications/changed')
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+})
+
+// ===== SSE transport 测试 =====
+
+describe('SseTransport', () => {
+  it('GET 建立 SSE 流并接收 endpoint 事件，POST 请求到该端点', async () => {
+    let getHeaders: any
+    let postUrl: string = ''
+    let postBody: any
+    const prev = (globalThis as any).fetch
+    const encoder = new TextEncoder()
+    // 第一次 GET 返回 SSE 流：先推 endpoint 事件，再推 message 响应
+    const sseStream = (endpointUrl: string, response: unknown) => new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(`event: endpoint\ndata: ${endpointUrl}\n\n`))
+        controller.enqueue(encoder.encode(`event: message\ndata: ${JSON.stringify(response)}\n\n`))
+        controller.close()
+      },
+    })
+    ;(globalThis as any).fetch = (url: string, init: any) => {
+      if (init?.method === 'GET') {
+        getHeaders = init.headers
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Map([['Content-Type', 'text/event-stream']]),
+          body: sseStream('https://mcp.example.com/messages', { jsonrpc: '2.0', id: 1, result: { ok: true } }),
+        })
+      }
+      if (init?.method === 'POST') {
+        postUrl = url
+        postBody = init.body
+        return Promise.resolve({ ok: true, status: 202, headers: new Map(), text: () => Promise.resolve('') })
+      }
+      throw new Error(`Unexpected fetch ${url}`)
+    }
+    try {
+      const t = new SseTransport({ url: 'https://mcp.example.com/sse', auth: { bearerToken: 'tok' } })
+      const received: string[] = []
+      t.onMessage((data) => received.push(data))
+      await t.connectSse()
+      // 等待 SSE 流被消费（事件循环）
+      await new Promise((r) => setTimeout(r, 10))
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))
+      expect(getHeaders['Authorization']).toBe('Bearer tok')
+      expect(postUrl).toBe('https://mcp.example.com/messages')
+      expect(received.length).toBe(1)
+      expect(JSON.parse(received[0]).result.ok).toBe(true)
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+})
+
+// ===== defaultTransportFactory 测试 =====
+
+describe('defaultTransportFactory', () => {
+  it('stdio 配置返回 StdioTransport', () => {
+    const t = defaultTransportFactory({ name: 's', command: '/bin/echo', args: ['hi'] })
+    expect(t).toBeInstanceOf(StdioTransport)
+    t.close()
+  })
+  it('http 配置返回 HttpTransport', () => {
+    const t = defaultTransportFactory({ name: 's', transport: 'http', url: 'https://x.com' })
+    expect(t).toBeInstanceOf(HttpTransport)
+  })
+  it('sse 配置返回 SseTransport', () => {
+    const t = defaultTransportFactory({ name: 's', transport: 'sse', url: 'https://x.com' })
+    expect(t).toBeInstanceOf(SseTransport)
+  })
+  it('缺省 transport 字段，有 url 默认 http', () => {
+    const t = defaultTransportFactory({ name: 's', url: 'https://x.com' })
+    expect(t).toBeInstanceOf(HttpTransport)
+  })
+  it('stdio 缺 command 抛错', () => {
+    expect(() => defaultTransportFactory({ name: 's', transport: 'stdio' })).toThrow('缺少 command')
+  })
+  it('http 缺 url 抛错', () => {
+    expect(() => defaultTransportFactory({ name: 's', transport: 'http' })).toThrow('缺少 url')
+  })
+})
+
+// ===== 插件 resources / prompts CLI 命令测试 =====
+
+describe('createMcpClientPlugin resources/prompts', () => {
+  function createPluginWithCaps() {
+    const transport = new MockTransport()
+    transport.register('initialize', () => ({
+      protocolVersion: '2024-11-05',
+      capabilities: {
+        tools: { listChanged: true },
+        resources: { listChanged: true, subscribe: true },
+        prompts: { listChanged: true },
+      },
+      serverInfo: { name: 'mock', version: '1' },
+    }))
+    transport.register('tools/list', () => ({ tools: [{ name: 't', description: 'A tool' }] }))
+    transport.register('resources/list', () => ({
+      resources: [
+        { uri: 'config://app.yaml', name: 'app config', mimeType: 'text/yaml' },
+        { uri: 'docs://readme', description: 'README' },
+      ],
+    }))
+    transport.register('resources/read', (params: any) => ({
+      contents: [{ uri: params.uri, mimeType: 'text/plain', text: `BODY of ${params.uri}` }],
+    }))
+    transport.register('prompts/list', () => ({
+      prompts: [{ name: 'review', description: 'Code review', arguments: [{ name: 'lang', required: true }] }],
+    }))
+    transport.register('prompts/get', (params: any) => ({
+      messages: [{ role: 'user', content: { type: 'text', text: `Review code in ${params.arguments?.lang}` } }],
+    }))
+    return createMcpClientPlugin({
+      servers: [{ name: 'mock-srv', command: 'fake' }],
+      transportFactory: () => transport,
+    })
+  }
+
+  async function setupPlugin() {
+    const plugin = createPluginWithCaps()
+    const ctx = {
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    }
+    const hooks = await plugin.install(ctx as any)
+    await (hooks as any)['harness.start']?.()
+    return { plugin, hooks }
+  }
+
+  function makeCliInput(arg: string): any {
+    const out: string[] = []
+    return {
+      command: 'mcp', arg, out: (s: string) => { out.push(s) }, sessionId: 's1', raw: `mcp ${arg}`,
+      result: undefined as any,
+      _out: out,
+    }
+  }
+
+  it('/mcp resources 列出资源', async () => {
+    const { hooks } = await setupPlugin()
+    const input = makeCliInput('resources')
+    await (hooks as any)['cli.command']?.(input)
+    expect(input._out.join('')).toInclude('config://app.yaml')
+    expect(input._out.join('')).toInclude('docs://readme')
+  })
+
+  it('/mcp read <uri> 读取资源内容', async () => {
+    const { hooks } = await setupPlugin()
+    const input = makeCliInput('read config://app.yaml')
+    await (hooks as any)['cli.command']?.(input)
+    expect(input._out.join('')).toInclude('BODY of config://app.yaml')
+  })
+
+  it('/mcp read 未找到的资源给出提示', async () => {
+    const { hooks } = await setupPlugin()
+    const input = makeCliInput('read unknown://nope')
+    await (hooks as any)['cli.command']?.(input)
+    expect(input._out.join('')).toInclude('未找到资源')
+  })
+
+  it('/mcp prompts 列出 prompts', async () => {
+    const { hooks } = await setupPlugin()
+    const input = makeCliInput('prompts')
+    await (hooks as any)['cli.command']?.(input)
+    expect(input._out.join('')).toInclude('review')
+    expect(input._out.join('')).toInclude('lang*')
+  })
+
+  it('/mcp prompt <name> lang=ts 渲染 prompt', async () => {
+    const { hooks } = await setupPlugin()
+    const input = makeCliInput('prompt review lang=ts')
+    await (hooks as any)['cli.command']?.(input)
+    expect(input._out.join('')).toInclude('Review code in ts')
+  })
+
+  it('/mcp servers 显示 server 概览', async () => {
+    const { hooks } = await setupPlugin()
+    const input = makeCliInput('servers')
+    await (hooks as any)['cli.command']?.(input)
+    const out = input._out.join('')
+    expect(out).toInclude('mock-srv')
+    expect(out).toInclude('tools=1')
+    expect(out).toInclude('resources=2')
+    expect(out).toInclude('prompts=1')
+  })
+})
+
+// ===== autoInjectResources 测试 =====
+
+describe('createMcpClientPlugin autoInjectResources', () => {
+  it("policy='all' 把资源 text 注入到 prompt.system.transform", async () => {
+    const transport = new MockTransport()
+    transport.register('initialize', () => ({
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {}, resources: { listChanged: true }, prompts: {} },
+    }))
+    transport.register('tools/list', () => ({ tools: [] }))
+    transport.register('resources/list', () => ({
+      resources: [{ uri: 'file://config.yaml', mimeType: 'text/yaml' }],
+    }))
+    transport.register('resources/read', (p: any) => ({
+      contents: [{ uri: p.uri, text: 'app: demo\nport: 8080' }],
+    }))
+    transport.register('prompts/list', () => ({ prompts: [] }))
+
+    const plugin = createMcpClientPlugin({
+      servers: [{ name: 'cfg-srv', command: 'fake' }],
+      transportFactory: () => transport,
+      autoInjectResources: 'all',
+    })
+    const ctx = {
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    }
+    const hooks = await plugin.install(ctx as any)
+    await (hooks as any)['harness.start']?.()
+
+    const parts: string[] = ['base system prompt']
+    await (hooks as any)['prompt.system.transform']?.({}, parts)
+    const combined = parts.join('\n')
+    expect(combined).toInclude('MCP Resources')
+    expect(combined).toInclude('app: demo')
+    expect(combined).toInclude('port: 8080')
+
+    await plugin.uninstall?.()
+  })
+
+  it("policy=['file://a.txt'] 只注入指定 URI", async () => {
+    const transport = new MockTransport()
+    transport.register('initialize', () => ({
+      protocolVersion: '2024-11-05',
+      capabilities: { tools: {}, resources: { listChanged: true }, prompts: {} },
+    }))
+    transport.register('tools/list', () => ({ tools: [] }))
+    transport.register('resources/list', () => ({
+      resources: [
+        { uri: 'file://a.txt' },
+        { uri: 'file://b.txt' },
+      ],
+    }))
+    transport.register('resources/read', (p: any) => ({
+      contents: [{ uri: p.uri, text: `body-${p.uri}` }],
+    }))
+    transport.register('prompts/list', () => ({ prompts: [] }))
+
+    const plugin = createMcpClientPlugin({
+      servers: [{ name: 'srv', command: 'fake' }],
+      transportFactory: () => transport,
+      autoInjectResources: ['file://a.txt'],
+    })
+    const ctx = {
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    }
+    const hooks = await plugin.install(ctx as any)
+    await (hooks as any)['harness.start']?.()
+
+    const parts: string[] = []
+    await (hooks as any)['prompt.system.transform']?.({}, parts)
+    const combined = parts.join('\n')
+    expect(combined).toInclude('body-file://a.txt')
+    expect(combined).not.toInclude('body-file://b.txt')
 
     await plugin.uninstall?.()
   })
