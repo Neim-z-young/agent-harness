@@ -494,6 +494,19 @@ export class DefaultSessionManager implements SessionManager {
     return out
   }
 
+  async search(query: string, options?: SessionListOptions): Promise<Session[]> {
+    const q = query.toLowerCase().trim()
+    if (!q) return []
+    let results = Array.from(this.sessions.values()).filter((s) =>
+      s.messages.some((m) =>
+        m.parts.some((p: any) => p.type === 'text' && String(p.text ?? '').toLowerCase().includes(q))
+      )
+    )
+    if (options?.agentId) results = results.filter((s) => s.agentId === options.agentId)
+    if (options?.limit) results = results.slice(0, options.limit)
+    return results
+  }
+
   async prompt(sessionId: string, text: string): Promise<Message> {
     const sess = await this.get(sessionId)
     if (!sess) throw new Error(`Session "${sessionId}" not found`)
@@ -566,6 +579,13 @@ export class DefaultSessionManager implements SessionManager {
     const sess = this.sessions.get(sessionId)
     if (!sess) return
     sess.messages.push(message)
+    // 自动生成标题：首条 user 消息截取前 60 字符
+    if (!sess.title && message.role === 'user') {
+      const textPart = message.parts.find((p: any) => p.type === 'text') as any
+      if (textPart?.text) {
+        sess.title = String(textPart.text).replace(/\n/g, ' ').slice(0, 60)
+      }
+    }
     sess.updatedAt = Date.now()
   }
 
@@ -760,6 +780,55 @@ export class DefaultSessionManager implements SessionManager {
       meta: this.readMeta(sess),
       memory: this.readMemory(sess),
     }
+  }
+
+  async exportMarkdown(sessionId: string): Promise<string> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return ''
+    const lines: string[] = []
+    // 标题
+    lines.push(`# ${sess.title ?? sess.id}`)
+    lines.push('')
+    lines.push(`> 会话 ID: \`${sess.id}\``)
+    lines.push(`> 创建时间: ${new Date(sess.createdAt).toLocaleString()}`)
+    lines.push(`> 更新时间: ${new Date(sess.updatedAt).toLocaleString()}`)
+    if (sess.agentId) lines.push(`> Agent: ${sess.agentId}`)
+    lines.push('')
+    // 压缩记忆
+    const mem = this.readMemory(sess)
+    if (mem?.summaryText) {
+      lines.push('## 会话压缩记忆')
+      lines.push('')
+      lines.push(`> 压缩轮次：${mem.round}`)
+      lines.push(`> 摘要：${mem.summaryText}`)
+      lines.push('')
+    }
+    // 消息
+    for (const m of sess.messages) {
+      const ts = new Date(m.createdAt).toLocaleString()
+      const roleLabel = m.role === 'user' ? '👤 **User**' : m.role === 'assistant' ? '🤖 **Assistant**' : `🔧 **${m.role}**`
+      lines.push(`---`)
+      lines.push('')
+      lines.push(`${roleLabel}  \n*${ts}*`)
+      lines.push('')
+      for (const p of m.parts) {
+        const pt = p as any
+        if (pt.type === 'text') {
+          lines.push(String(pt.text ?? ''))
+          lines.push('')
+        } else if (pt.type === 'tool') {
+          const input = (() => { try { return JSON.stringify(pt.input ?? {}) } catch { return String(pt.input ?? '') } })()
+          const result = (() => { try { return typeof pt.result === 'string' ? pt.result : JSON.stringify(pt.result ?? '') } catch { return String(pt.result ?? '') } })()
+          lines.push('```')
+          lines.push(`[Tool: ${pt.toolId}]`)
+          lines.push(`Input: ${input.slice(0, 500)}`)
+          lines.push(`Result: ${result.slice(0, 500)}`)
+          lines.push('```')
+          lines.push('')
+        }
+      }
+    }
+    return lines.join('\n')
   }
 
   // --------- 内部摘要实现 ---------

@@ -266,6 +266,8 @@ export interface SessionManager {
   get(sessionId: string): Promise<Session | undefined>
   /** 列出会话 */
   list(options?: SessionListOptions): Promise<Session[]>
+  /** 关键词搜索会话（匹配消息文本，大小写不敏感） */
+  search(query: string, options?: SessionListOptions): Promise<Session[]>
   /** 发送 prompt（触发 LLM 调用，返回 assistant 消息） */
   prompt(sessionId: string, text: string): Promise<Message>
   /** 流式发送 prompt：逐事件 yield AgentStreamEvent，最后一个为 done（含最终 Message） */
@@ -301,4 +303,6 @@ export interface SessionManager {
   estimateTokens(sessionId: string): Promise<number>
   /** 读取当前压缩记忆（CompactMemory + 元数据），供 Agent 注入 system prompt */
   getCompactionInfo(sessionId: string): Promise<{ meta?: CompactionMeta; memory?: CompactMemory }>
+  /** 导出会话为 Markdown 文本 */
+  exportMarkdown(sessionId: string): Promise<string>
 }

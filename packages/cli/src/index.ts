@@ -518,6 +518,8 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
           out('  /switch ?          列出已注册 Agent\n')
           out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
+          out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
+          out('  /export [sessionId]  导出会话为 Markdown（默认当前会话）\n')
           return 'continue'
 
         case '/exit': case '/quit':
@@ -579,6 +581,24 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
             out(`本轮：前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}；摘要轮次=${info.memory?.round ?? 0}\n`)
             if (info.memory?.summaryText) out(`摘要（前 400 字）：${info.memory.summaryText.slice(0, 400)}\n`)
           }
+          return 'continue'
+        }
+        case '/search': {
+          if (!arg || !arg.trim()) { out('用法：/search <keyword>\n'); return 'continue' }
+          const results = await harness.session.search(arg.trim())
+          if (results.length === 0) { out('（无匹配会话）\n'); return 'continue' }
+          for (const s of results) {
+            const when = new Date(s.updatedAt).toLocaleString()
+            out(`  ${s.id}  ${s.title ?? '(untitled)'}  ${s.messages.length} msgs  ${when}\n`)
+          }
+          return 'continue'
+        }
+        case '/export': {
+          const exportSid = arg?.trim() || (options as any).session.id
+          const md = await harness.session.exportMarkdown(exportSid)
+          if (!md) { out(`会话 ${exportSid} 不存在或为空\n`); return 'continue' }
+          out(md)
+          out('\n')
           return 'continue'
         }
         default:
