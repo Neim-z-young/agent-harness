@@ -100,8 +100,35 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/tools-glob": {
+      "name": "@harness/tools-glob",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/tools-media": {
+      "name": "@harness/tools-media",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/plugins/tools-search": {
       "name": "@harness/tools-search",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/tools-web": {
+      "name": "@harness/tools-web",
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
@@ -152,7 +179,13 @@
 
     "@harness/tools-builtin": ["@harness/tools-builtin@workspace:packages/plugins/tools-builtin"],
 
+    "@harness/tools-glob": ["@harness/tools-glob@workspace:packages/plugins/tools-glob"],
+
+    "@harness/tools-media": ["@harness/tools-media@workspace:packages/plugins/tools-media"],
+
     "@harness/tools-search": ["@harness/tools-search@workspace:packages/plugins/tools-search"],
+
+    "@harness/tools-web": ["@harness/tools-web@workspace:packages/plugins/tools-web"],
 
     "@types/bun": ["@types/bun@1.3.14", "https://registry.npmmirror.com/@types/bun/-/bun-1.3.14.tgz", { "dependencies": { "bun-types": "1.3.14" } }, "sha512-h1hFqFVcvAvD9j9K7ZW7vd82aSA+rTdznZa+5bwvCwqSB1jmmfLcbIWhOLx1/+boy/xmjgCs/OMUL8hRJSmnPw=="],
 

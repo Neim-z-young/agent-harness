@@ -51,6 +51,59 @@
 
 ---
 
+## 2026-08-22：工具插件化持续扩展（glob/web/media 三场景包）
+
+### 今日完成
+
+延续"原语内置，场景按插件接入"的拆分原则，新增三个场景工具包。**17 个包 typecheck 全绿，248 个单元测试全通过（690 断言，较 08-21 +33 测试）**。
+
+#### 1. 模块开发
+
+| # | 模块（新包） | 工具 | 核心能力 | 测试数 |
+|---|---|---|---|---|
+| 1 | `@harness/tools-glob` v0.1.0 | `glob` | 多模式 `**` / `*` / `?` 通配符；`!` 取反 + `exclude` 便捷字段；隐藏文件默认跳过；文件大小 min/max 过滤；最大深度限制；结果上限截断；cwd 边界保护 | 9 |
+| 2 | `@harness/tools-web` v0.1.0 | `web_fetch` | HTTP(S) 抓取，支持 GET/POST/PUT/PATCH/DELETE；自定义 headers / body（对象自动 JSON 序列化）；三种返回格式 `text` / `json` / `base64`（data: URI）；follow redirects / maxBytes 截断 / timeoutMs + AbortSignal；SSRF 防护（默认拦截 10.x / 172.16-31 / 192.168 / 127.x / fc/fd / localhost*.local）；`allowPrivateNetwork` 显式放行 | 14 |
+| 3 | `@harness/tools-media` v0.1.0 | `view_image` | 本地图片读取转 base64 data URI + 尺寸解析（PNG/JPEG/GIF/BMP/WebP 魔数识别，含 PNG/GIF/BMP 宽高、JPEG SOF0 段遍历）；maxBytes + strictSize 模式（过大报错 or 仅回元数据）；cwd 路径边界保护 | 10 |
+
+三包均按 `tools-search` 模板统一：
+- 自包含 helper（resolvePath / isWithinCwd / makeSchema / 场景专用 helper），不反向依赖 `tools-builtin`
+- `defineTool` + Fail-Closed 安全声明（`isReadOnly`/`isDestructive`/`isConcurrencySafe`），`permission.key` 按场景分配（`read`/`network`）
+- `createXxxPlugin({ toolIds })` 工厂 + 默认导出 `toolsXxxPlugin` 常量
+- 通过 `tool.pool.assemble` Hook 注入 `ToolRegistry`
+
+#### 2. 关键技术决策
+
+- **三插件均 `isConcurrencySafe=true` 声明**：glob 纯读、web_fetch 请求幂等、view_image 只读，可并行执行（Fail-Closed 需显式声明）
+- **web_fetch 权限键用 `network`（非 `read`/`write`）**：网络访问是独立能力维度，与本地文件的读写权限体系分离，可被 permission 引擎单独管控
+- **SSRF 默认 fail-closed，白名单开启**：私有 IP / localhost / .local / 169.254 link-local 全部拦截，仅当调用方显式 `allowPrivateNetwork=true` 才放行——与 fail-closed 哲学一致
+- **view_image 尺寸解析零依赖**：纯字节判断 PNG IHDR/JPEG SOF0/GIF6/7/BMP DIB 头，不引入 sharp/jimp 等本地图像库
+- **已 abort signal 同步快速路径**：web_fetch 在进入 await fetch 前同步检查 `inner.signal.aborted`，避免 mock fetch 不监听 signal 时悬挂
+- **glob 正则按段构建**：`**` 段末尾位置写 `.*`（匹配任何内容到结尾）、非末尾写 `(?:.*/)?`（包含段间 `/`），其它段单独转义后拼接，避免双重 `/` 问题
+
+#### 3. 遇到的问题与修复
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| glob `**/*.ts` 匹配空（递归、排除两个用例失败） | `globToRegex` 用 join('/') 把 `(?:.*/)?` 与下段之间插入了额外 `/`，导致必须存在 `/` 才能匹配（根层漏掉） | 改为按段逐段拼接：非末尾 `**` → `(?:.*/)?`（自带末尾 `/`）、非末尾普通段 → `escaped` + `/` |
+| `readFile(path, null, { length: 32 })` 三参数 TS 错误 | Node `fs/promises.readFile` 仅接受 `(path, options?)` 两参数，无 `length` 选项 | 改用 `open(path, 'r') → fh.read({ buffer, length: 32 }) → fh.close()` 三步 |
+| `mkdirSync(join('src', { recursive: true }))` 类型错误 | 把 mkdirSync options 当 join 第三参数传入了（括号错位） | 修正括号：`mkdirSync(join('src'), { recursive: true })` |
+| `error.detail` TS 类型不匹配（`JSON_PARSE_ERROR` 中） | Tool `ToolError` 结构仅 `{ message, code?, cause? }`，无 `detail` | 把原始字节片段拼接到 `message` 字符串中，移除非法 `detail` 字段 |
+| web_fetch AbortSignal 测试 5s 超时挂死 | 最初 mock fetch 返回永不 settle Promise，inner.signal abort 也无法让 hanging fetch 解挂 | 改写：1) 已 abort 用例改用"提前 abort signal + fetch 前同步检查快速失败"；2) timeout 用例 mock fetch 监听 init.signal 的 abort 事件，收到后 reject AbortError，settle Promise |
+
+#### 4. 代码统计
+
+```
+17 个 packages / 248 个测试 / 690 个 expect（较 08-21 +3 包 +33 测试）
+
+场景工具插件（按 tools-search 模板）：
+  - @harness/tools-search   v0.1.0 list_dir / grep_file（搜索导航）
+  - @harness/tools-glob     v0.1.0 glob（模式匹配）
+  - @harness/tools-web      v0.1.0 web_fetch（网络抓取 + SSRF 防护）
+  - @harness/tools-media    v0.1.0 view_image（多模态图像 base64 + 尺寸）
+```
+
+---
+
 ## 2026-08-16：Phase 1 ~ Phase 3 核心交付
 
 ### 今日完成
@@ -116,7 +169,7 @@
 | ~~**P0**~~ | ~~更多内置工具~~ | ~~`list_dir` / `grep_file` / `edit_file`~~ | ✅ 完成（08-21，edit_file 留 builtin，list_dir/grep_file 抽 tools-search） |
 | ~~**P0**~~ | ~~流式输出~~ | ~~Provider `stream: true` + REPL 逐 token~~ | ✅ 完成（08-21，core/anthropic/mock 三端 stream） |
 | ~~**P1**~~ | ~~`@harness/provider-openai`~~ | ~~GPT-4o 适配，统一 ChatProvider~~ | ✅ 完成（08-21，complete + stream） |
-| **P0** | 工具持续插件化 | `@harness/tools-web`（web_fetch）/ `tools-glob` / `tools-media`（view_image）按场景拆包 | ⏳ 进行中 |
+| ~~**P0**~~ | ~~工具持续插件化~~ | ~~tools-web / tools-glob / tools-media 三场景拆包~~ | ✅ 完成（08-22，三新包 +33 测试） |
 | **P1** | 会话管理增强 | 标题自动生成、关键词搜索、导出 Markdown、Compaction（长会话摘要压缩） | ⬜ 待办 |
 | **P1** | 插件化 CLI 扩展 | 插件可往 CLI 注册自己的子命令 / `/xxx` 斜杠命令 | ⬜ 待办 |
 | **P2** | MCP Client 插件 | 对接 Model Context Protocol，支持 local stdio + remote SSE MCP Server | ⬜ 待办 |
@@ -129,6 +182,6 @@
 
 1. ~~**流式输出**~~ — ✅ 已完成
 2. ~~**`edit_file` + `list_dir` + `grep_file`**~~ — ✅ 已完成（含工具插件化拆分）
-3. **`@harness/tools-web` / `tools-glob` / `tools-media`** — 按场景继续插件化，复用 tools-search 模板（自包含 helper + tool.pool.assemble Hook）
+3. ~~**`@harness/tools-web` / `tools-glob` / `tools-media`**~~ — ✅ 已完成（三场景包 33 测试）
 4. **会话 Compaction** — 长对话场景必需
 5. ~~**`@harness/provider-openai`**~~ — ✅ 已完成
