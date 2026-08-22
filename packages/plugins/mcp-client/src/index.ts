@@ -2,10 +2,14 @@
  * @harness/mcp-client
  *
  * MCP Client 插件：对接 Model Context Protocol
- * - stdio transport：通过子进程 stdin/stdout 通信（newline-delimited JSON-RPC 2.0）
- * - 自动发现 MCP Server 的工具并注册到 Harness ToolRegistry
+ * - 支持三种 transport：
+ *   - stdio：通过子进程 stdin/stdout 通信（newline-delimited JSON-RPC 2.0）
+ *   - http：Streamable HTTP（MCP 2025-03-26），POST JSON-RPC 请求，响应可为 JSON 或 SSE 流
+ *   - sse：旧版 HTTP+SSE（MCP 2024-11-05 之前的 HTTP transport），GET 建立 SSE 后 POST 请求
+ * - 自动发现 MCP Server 的 tools / resources / prompts 并按需注册到 Harness
  * - 工具命名：mcp__${serverName}__${toolName}（同 Claude Code 约定）
  * - 工具安全声明：Fail-Closed（isReadOnly=false, isDestructive=false）
+ * - 支持 Bearer Token 鉴权（HTTP/SSE transport）
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -14,16 +18,44 @@ import type { Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
 
 // ===== 类型定义 =====
 
-/** MCP Server 配置（stdio transport） */
+/** 鉴权配置（用于 HTTP/SSE transport） */
+export interface McpAuthConfig {
+  /** Bearer Token，会在请求头注入 `Authorization: Bearer ${token}` */
+  bearerToken?: string
+  /** 直接作为 Authorization 头值（如 "Bearer xxx"），优先级高于 bearerToken */
+  authorizationHeader?: string
+  /** 自定义请求头（合并到 fetch headers） */
+  headers?: Record<string, string>
+}
+
+/** MCP Server 配置（支持 stdio / http / sse 三种 transport） */
 export interface McpServerConfig {
   /** 服务器名称（用于工具命名 mcp__${name}__${tool}） */
   name: string
-  /** 启动命令（如 "npx"） */
-  command: string
-  /** 命令参数 */
+  /**
+   * 传输类型。缺省时根据字段推断：
+   * - 有 command → stdio
+   * - 有 url → http
+   */
+  transport?: 'stdio' | 'sse' | 'http'
+  /** stdio 模式：启动命令（如 "npx"） */
+  command?: string
+  /** stdio 模式：命令参数 */
   args?: string[]
-  /** 环境变量 */
+  /** stdio 模式：环境变量 */
   env?: Record<string, string>
+  /** sse/http 模式：服务器 URL */
+  url?: string
+  /** 鉴权配置（仅 sse/http） */
+  auth?: McpAuthConfig
+  /** MCP 协议版本号，缺省 '2024-11-05' */
+  protocolVersion?: string
+  /** 单次请求超时（毫秒），缺省 30000 */
+  requestTimeoutMs?: number
+  /** 是否自动发现 resources（缺省 true） */
+  discoverResources?: boolean
+  /** 是否自动发现 prompts（缺省 true） */
+  discoverPrompts?: boolean
 }
 
 /** MCP 工具定义（来自 tools/list 响应） */
@@ -39,11 +71,49 @@ export interface McpToolCallResult {
   isError?: boolean
 }
 
+/** MCP 资源定义（来自 resources/list 响应） */
+export interface McpResourceDef {
+  uri: string
+  name?: string
+  description?: string
+  mimeType?: string
+}
+
+/** MCP 资源内容（来自 resources/read 响应） */
+export interface McpResourceContent {
+  uri: string
+  mimeType?: string
+  text?: string
+  blob?: string
+}
+
+/** MCP Prompt 定义（来自 prompts/list 响应） */
+export interface McpPromptDef {
+  name: string
+  description?: string
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>
+}
+
+/** MCP Prompt 消息（来自 prompts/get 响应） */
+export interface McpPromptMessage {
+  role: 'user' | 'assistant'
+  content: { type: string; text?: string; [k: string]: unknown }
+}
+
+/** MCP Server 能力（来自 initialize 响应） */
+export interface McpServerCapabilities {
+  tools?: { listChanged?: boolean }
+  resources?: { listChanged?: boolean; subscribe?: boolean }
+  prompts?: { listChanged?: boolean }
+  logging?: {}
+  experimental?: Record<string, unknown>
+}
+
 // ===== Transport 抽象 =====
 
 /** 传输层接口（便于测试注入） */
 export interface McpTransport {
-  /** 发送原始数据 */
+  /** 发送原始数据（JSON-RPC 字符串） */
   send(data: string): void
   /** 注册消息处理回调 */
   onMessage(handler: (data: string) => void): void
@@ -86,6 +156,206 @@ export class StdioTransport implements McpTransport {
   }
 }
 
+// ===== HTTP/SSE transport 公共辅助 =====
+
+/** 把鉴权配置 + 自定义头合并为 fetch headers */
+function buildAuthHeaders(auth?: McpAuthConfig): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+  if (auth?.authorizationHeader) headers['Authorization'] = auth.authorizationHeader
+  else if (auth?.bearerToken) headers['Authorization'] = `Bearer ${auth.bearerToken}`
+  if (auth?.headers) Object.assign(headers, auth.headers)
+  return headers
+}
+
+/** 从 SSE 文本流中解析出 data 行（按 `\n\n` 分事件，每个事件合并多行 data） */
+function parseSseChunk(chunk: string): string[] {
+  const messages: string[] = []
+  // SSE 事件以空行分隔；只取 data: 行内容（多行 data 用 \n 拼接）
+  const events = chunk.split(/\r?\n\r?\n/)
+  for (const ev of events) {
+    if (!ev.trim()) continue
+    const dataLines = ev
+      .split(/\r?\n/)
+      .filter((l) => l.startsWith('data:'))
+      .map((l) => l.slice(5).replace(/^ /, ''))
+    if (dataLines.length > 0) messages.push(dataLines.join('\n'))
+  }
+  return messages
+}
+
+/** Streamable HTTP transport（MCP 2025-03-26）：直接 POST JSON-RPC，响应可为 JSON 或 SSE */
+export class HttpTransport implements McpTransport {
+  private handler?: (data: string) => void
+  private closed = false
+  private sessionId?: string
+  private readonly url: string
+  private readonly auth?: McpAuthConfig
+
+  constructor(config: { url: string; auth?: McpAuthConfig }) {
+    this.url = config.url
+    this.auth = config.auth
+  }
+
+  async send(data: string): Promise<void> {
+    if (this.closed) throw new Error('HTTP transport closed')
+    const headers: Record<string, string> = buildAuthHeaders(this.auth)
+    headers['Accept'] = 'application/json, text/event-stream'
+    if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId
+
+    const resp = await fetch(this.url, {
+      method: 'POST',
+      headers,
+      body: data,
+    })
+    // 缓存 session id（202 状态或首次响应）
+    const sid = resp.headers.get('Mcp-Session-Id')
+    if (sid) this.sessionId = sid
+
+    const contentType = resp.headers.get('Content-Type') ?? ''
+    if (contentType.includes('text/event-stream')) {
+      // SSE 流响应：逐块解析
+      const reader = resp.body?.getReader()
+      if (!reader) return
+      const decoder = new TextDecoder()
+      let buf = ''
+      while (!this.closed) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        // 按事件边界切分，保留最后一段不完整的内容
+        const lastBoundary = buf.lastIndexOf('\n\n')
+        if (lastBoundary !== -1) {
+          const complete = buf.slice(0, lastBoundary + 2)
+          buf = buf.slice(lastBoundary + 2)
+          for (const msg of parseSseChunk(complete)) {
+            this.handler?.(msg)
+          }
+        }
+      }
+      // flush 残留
+      if (buf.trim()) for (const msg of parseSseChunk(buf + '\n\n')) this.handler?.(msg)
+    } else if (contentType.includes('application/json')) {
+      const text = await resp.text()
+      if (text.trim()) this.handler?.(text)
+    } else if (resp.status === 202) {
+      // Accepted：响应在后续 SSE 推送中（这里不处理，等后续 GET 流）
+    } else {
+      throw new Error(`HTTP ${resp.status}: ${await resp.text().catch(() => '')}`)
+    }
+  }
+
+  onMessage(handler: (data: string) => void): void {
+    this.handler = handler
+  }
+
+  close(): void {
+    this.closed = true
+  }
+}
+
+/** 旧版 HTTP+SSE transport（MCP 2024-11-05 之前的 HTTP transport） */
+export class SseTransport implements McpTransport {
+  private handler?: (data: string) => void
+  private closed = false
+  private postEndpoint?: string
+  private readonly baseUrl: string
+  private readonly auth?: McpAuthConfig
+
+  constructor(config: { url: string; auth?: McpAuthConfig }) {
+    this.baseUrl = config.url
+    this.auth = config.auth
+  }
+
+  /** 建立 SSE 连接，等待服务器推送 endpoint 事件 */
+  async connectSse(): Promise<void> {
+    if (this.closed) throw new Error('SSE transport closed')
+    const headers = buildAuthHeaders(this.auth)
+    headers['Accept'] = 'text/event-stream'
+    const resp = await fetch(this.baseUrl, { method: 'GET', headers })
+    if (!resp.ok) throw new Error(`SSE connect failed: ${resp.status}`)
+    const reader = resp.body?.getReader()
+    if (!reader) throw new Error('No SSE stream')
+
+    const decoder = new TextDecoder()
+    let buf = ''
+    // 后台消费 SSE 流
+    ;(async () => {
+      while (!this.closed) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        const lastBoundary = buf.lastIndexOf('\n\n')
+        if (lastBoundary !== -1) {
+          const complete = buf.slice(0, lastBoundary + 2)
+          buf = buf.slice(lastBoundary + 2)
+          this.handleSseEvent(complete)
+        }
+      }
+    })().catch(() => { /* 连接断开忽略 */ })
+  }
+
+  private handleSseEvent(raw: string): void {
+    // 解析 event + data
+    const lines = raw.split(/\r?\n/)
+    let eventName = 'message'
+    const dataLines: string[] = []
+    for (const l of lines) {
+      if (l.startsWith('event:')) eventName = l.slice(6).trim()
+      else if (l.startsWith('data:')) dataLines.push(l.slice(5).replace(/^ /, ''))
+    }
+    const data = dataLines.join('\n')
+    if (eventName === 'endpoint') {
+      // 服务器告知 POST 端点（可能是相对 URL）
+      this.postEndpoint = data.startsWith('http')
+        ? data
+        : new URL(data, this.baseUrl).toString()
+    } else if (eventName === 'message' && data) {
+      this.handler?.(data)
+    }
+  }
+
+  async send(data: string): Promise<void> {
+    if (this.closed) throw new Error('SSE transport closed')
+    if (!this.postEndpoint) throw new Error('SSE endpoint not received yet')
+    const headers = buildAuthHeaders(this.auth)
+    const resp = await fetch(this.postEndpoint, {
+      method: 'POST',
+      headers,
+      body: data,
+    })
+    // POST 响应应为 202，实际 JSON-RPC 响应通过 SSE 流推送
+    if (!resp.ok && resp.status !== 202) {
+      throw new Error(`SSE POST failed: ${resp.status}`)
+    }
+  }
+
+  onMessage(handler: (data: string) => void): void {
+    this.handler = handler
+  }
+
+  close(): void {
+    this.closed = true
+  }
+}
+
+/** 默认 transport 工厂：根据 config.transport 选择 */
+export function defaultTransportFactory(config: McpServerConfig): McpTransport {
+  const t = config.transport ?? (config.command ? 'stdio' : 'http')
+  if (t === 'stdio') {
+    if (!config.command) throw new Error(`MCP Server "${config.name}" 缺少 command（stdio 模式必填）`)
+    return new StdioTransport({ command: config.command, args: config.args, env: config.env })
+  }
+  if (t === 'sse') {
+    if (!config.url) throw new Error(`MCP Server "${config.name}" 缺少 url（sse 模式必填）`)
+    return new SseTransport({ url: config.url, auth: config.auth })
+  }
+  if (t === 'http') {
+    if (!config.url) throw new Error(`MCP Server "${config.name}" 缺少 url（http 模式必填）`)
+    return new HttpTransport({ url: config.url, auth: config.auth })
+  }
+  throw new Error(`Unknown transport: ${t as string}`)
+}
+
 // ===== MCP Client =====
 
 /** JSON-RPC 2.0 请求/响应管理 */
@@ -93,29 +363,48 @@ export class McpClient {
   private nextId = 1
   private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
   private connected = false
+  /** Server capabilities（initialize 响应中缓存） */
+  private capabilities: McpServerCapabilities = {}
+  /** Server 信息（initialize 响应中缓存） */
+  serverInfo: { name?: string; version?: string } = {}
+  /** 协议版本（initialize 响应中缓存） */
+  protocolVersion: string = '2024-11-05'
+  /** 配置（用于读取 protocolVersion / requestTimeoutMs） */
+  private readonly config?: McpServerConfig
 
   constructor(
     public readonly name: string,
     private readonly transport: McpTransport,
+    config?: McpServerConfig,
   ) {
+    this.config = config
     transport.onMessage((data) => this.handleMessage(data))
   }
 
   /** 建立 MCP 连接：发送 initialize + notifications/initialized */
   async connect(): Promise<void> {
+    const protocolVersion = this.config?.protocolVersion ?? '2024-11-05'
     const result = await this.request('initialize', {
-      protocolVersion: '2024-11-05',
+      protocolVersion,
       capabilities: {},
       clientInfo: { name: 'harness-mcp-client', version: '0.1.0' },
     })
+    const resp = (result ?? {}) as {
+      protocolVersion?: string
+      capabilities?: McpServerCapabilities
+      serverInfo?: { name?: string; version?: string }
+    }
+    if (resp.protocolVersion) this.protocolVersion = resp.protocolVersion
+    if (resp.capabilities) this.capabilities = resp.capabilities
+    if (resp.serverInfo) this.serverInfo = resp.serverInfo
     this.connected = true
     // 发送 initialized 通知（不期望响应）
-    this.notify('notifications/initialized', {})
-    return result as void
+    await this.notify('notifications/initialized', {})
   }
 
   /** 列出 MCP Server 提供的工具 */
   async listTools(): Promise<McpToolDef[]> {
+    if (!this.capabilities.tools) return []
     const result = await this.request('tools/list', {})
     const tools = (result as { tools?: McpToolDef[] })?.tools ?? []
     return tools
@@ -125,6 +414,50 @@ export class McpClient {
   async callTool(name: string, args: Record<string, unknown>): Promise<McpToolCallResult> {
     const result = await this.request('tools/call', { name, arguments: args })
     return result as McpToolCallResult
+  }
+
+  /** 列出 MCP Server 提供的资源 */
+  async listResources(): Promise<McpResourceDef[]> {
+    if (!this.capabilities.resources) return []
+    const result = await this.request('resources/list', {})
+    const resources = (result as { resources?: McpResourceDef[] })?.resources ?? []
+    return resources
+  }
+
+  /** 读取指定资源的内容 */
+  async readResource(uri: string): Promise<McpResourceContent[]> {
+    if (!this.capabilities.resources) return []
+    const result = await this.request('resources/read', { uri })
+    const contents = (result as { contents?: McpResourceContent[] })?.contents ?? []
+    return contents
+  }
+
+  /** 订阅资源变更（需 capabilities.resources.subscribe） */
+  async subscribeResource(uri: string): Promise<void> {
+    if (!this.capabilities.resources?.subscribe) return
+    await this.notify('resources/subscribe', { uri })
+  }
+
+  /** 取消订阅资源变更 */
+  async unsubscribeResource(uri: string): Promise<void> {
+    if (!this.capabilities.resources?.subscribe) return
+    await this.notify('resources/unsubscribe', { uri })
+  }
+
+  /** 列出 MCP Server 提供的 prompts */
+  async listPrompts(): Promise<McpPromptDef[]> {
+    if (!this.capabilities.prompts) return []
+    const result = await this.request('prompts/list', {})
+    const prompts = (result as { prompts?: McpPromptDef[] })?.prompts ?? []
+    return prompts
+  }
+
+  /** 获取指定 prompt 渲染后的消息 */
+  async getPrompt(name: string, args?: Record<string, string>): Promise<McpPromptMessage[]> {
+    if (!this.capabilities.prompts) return []
+    const result = await this.request('prompts/get', { name, arguments: args ?? {} })
+    const messages = (result as { messages?: McpPromptMessage[] })?.messages ?? []
+    return messages
   }
 
   /** 关闭连接 */
@@ -137,39 +470,75 @@ export class McpClient {
   }
 
   get isConnected(): boolean { return this.connected }
+  /** 服务器能力（只读视图） */
+  get serverCapabilities(): Readonly<McpServerCapabilities> { return this.capabilities }
 
   // ----- JSON-RPC 内部 -----
 
-  private request(method: string, params: unknown): Promise<unknown> {
+  /** 设置自定义通知处理器（用于插件层接收 resources/listChanged 等通知） */
+  onNotification(handler: (method: string, params: unknown) => void): void {
+    this.notificationHandler = handler
+  }
+  private notificationHandler?: (method: string, params: unknown) => void
+
+  private async request(method: string, params: unknown): Promise<unknown> {
     const id = this.nextId++
+    const timeoutMs = this.config?.requestTimeoutMs ?? 30_000
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
-      this.transport.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
-      // 超时 30s
+      // send 可能是 async（HTTP/SSE transport），需要捕获其抛出的错误
+      Promise.resolve(this.transport.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })))
+        .catch((err) => {
+          if (this.pending.has(id)) {
+            this.pending.delete(id)
+            reject(new Error(`MCP send "${method}" failed: ${String((err as Error)?.message ?? err)}`))
+          }
+        })
+      // 超时
       setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id)
-          reject(new Error(`MCP request "${method}" timed out (30s)`))
+          reject(new Error(`MCP request "${method}" timed out (${timeoutMs}ms)`))
         }
-      }, 30_000)
+      }, timeoutMs)
     })
   }
 
-  private notify(method: string, params: unknown): void {
-    this.transport.send(JSON.stringify({ jsonrpc: '2.0', method, params }))
+  private async notify(method: string, params: unknown): Promise<void> {
+    try {
+      await Promise.resolve(this.transport.send(JSON.stringify({ jsonrpc: '2.0', method, params })))
+    } catch (err) {
+      // notify 失败不阻塞业务，但记录到 stderr
+      console.error(`[mcp-client] notify "${method}" failed:`, (err as Error)?.message ?? err)
+    }
   }
 
   private handleMessage(data: string): void {
     let msg: any
     try { msg = JSON.parse(data) } catch { return }
-    // 响应（有 id）
+    // 响应（有 id 且 pending 中存在）
     if (msg.id != null && this.pending.has(msg.id)) {
       const p = this.pending.get(msg.id)!
       this.pending.delete(msg.id)
       if (msg.error) p.reject(new Error(msg.error?.message ?? 'MCP error'))
       else p.resolve(msg.result)
+      return
     }
-    // 通知/请求（无 id 或有 method 无 result/error）—暂不处理
+    // 通知 / 请求（有 method 无 id 或 id 不在 pending 中）
+    if (msg.method && msg.id == null) {
+      // 纯通知
+      this.notificationHandler?.(msg.method, msg.params)
+    } else if (msg.method && msg.id != null) {
+      // 服务器发起的请求（如 sampling/createMessage、roots/list）
+      // 当前实现：返回 method not supported 错误响应
+      try {
+        Promise.resolve(this.transport.send(JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          error: { code: -32601, message: `Method not supported: ${msg.method}` },
+        }))).catch(() => { /* ignore */ })
+      } catch { /* ignore */ }
+    }
   }
 }
 
@@ -229,26 +598,41 @@ export function convertMcpToolToHarnessTool(
 
 // ===== 插件工厂 =====
 
+/** MCP Server 在插件内部的运行时状态 */
+interface McpServerRuntime {
+  config: McpServerConfig
+  client: McpClient
+  tools: Tool[]
+  resources: McpResourceDef[]
+  prompts: McpPromptDef[]
+}
+
 /**
  * 创建 MCP Client 插件
  *
  * @param servers MCP Server 配置列表
- * @param transportFactory 可选：自定义传输层工厂（测试注入用）
+ * @param transportFactory 可选：自定义传输层工厂（测试注入用）。缺省使用 defaultTransportFactory。
+ * @param autoInjectResources 可选：自动把这些资源的 text 内容追加到 system prompt。
+ *   - 'all'：注入所有发现到的资源
+ *   - string[]：注入指定 URI 的资源
+ *   - 缺省：不注入
  */
 export function createMcpClientPlugin(options: {
   servers: McpServerConfig[]
   transportFactory?: (config: McpServerConfig) => McpTransport
+  autoInjectResources?: 'all' | string[]
 }): AgentPlugin {
-  const { servers, transportFactory } = options
-  const clients: McpClient[] = []
-  const discoveredTools: Tool[] = []
+  const { servers, transportFactory, autoInjectResources } = options
+  const runtimes: McpServerRuntime[] = []
+  /** 自动注入的资源内容缓存（uri → text） */
+  const injectedResourceCache = new Map<string, string>()
   let connected = false
 
   return {
     id: 'mcp.client',
-    version: '0.1.0',
+    version: '0.2.0',
     name: 'MCP Client',
-    description: `MCP Client 插件：连接 ${servers.length} 个 MCP Server，自动发现并注册工具`,
+    description: `MCP Client 插件：连接 ${servers.length} 个 MCP Server，自动发现并注册工具 / 资源 / prompts`,
 
     async install(ctx) {
       ctx.log.info('MCP Client 插件已加载', { servers: servers.map((s) => s.name) })
@@ -259,15 +643,50 @@ export function createMcpClientPlugin(options: {
             try {
               const transport = transportFactory
                 ? transportFactory(config)
-                : new StdioTransport(config)
-              const client = new McpClient(config.name, transport)
+                : defaultTransportFactory(config)
+              const client = new McpClient(config.name, transport, config)
               await client.connect()
-              const tools = await client.listTools()
-              for (const t of tools) {
-                discoveredTools.push(convertMcpToolToHarnessTool(t, config.name, client))
+
+              // SSE transport 需要先建立 SSE 流
+              if (transport instanceof SseTransport) {
+                await (transport as SseTransport).connectSse()
               }
-              clients.push(client)
-              ctx.log.info(`MCP Server "${config.name}" 已连接`, { tools: tools.map((t) => t.name) })
+
+              // 监听 server 通知：resources/listChanged 等
+              client.onNotification((method, _params) => {
+                if (method === 'notifications/resources/listChanged') {
+                  // 重新拉取资源列表并更新对应 runtime
+                  client.listResources()
+                    .then((fresh) => {
+                      const rt = runtimes.find((r) => r.client === client)
+                      if (rt) rt.resources = fresh
+                    })
+                    .catch(() => { /* ignore */ })
+                }
+              })
+
+              const tools = await client.listTools()
+              const harnessTools = tools.map((t) => convertMcpToolToHarnessTool(t, config.name, client))
+
+              let resources: McpResourceDef[] = []
+              if (config.discoverResources !== false) {
+                resources = await client.listResources()
+                // 自动注入资源到 system prompt
+                if (autoInjectResources) await loadAutoInjectResources(client, resources, injectedResourceCache, autoInjectResources)
+              }
+              let prompts: McpPromptDef[] = []
+              if (config.discoverPrompts !== false) {
+                prompts = await client.listPrompts()
+              }
+
+              runtimes.push({ config, client, tools: harnessTools, resources, prompts })
+              ctx.log.info(`MCP Server "${config.name}" 已连接`, {
+                transport: config.transport ?? (config.command ? 'stdio' : 'http'),
+                tools: tools.map((t) => t.name),
+                resources: resources.map((r) => r.uri),
+                prompts: prompts.map((p) => p.name),
+                capabilities: client.serverCapabilities,
+              })
             } catch (err) {
               ctx.log.error(`MCP Server "${config.name}" 连接失败`, { error: String((err as Error)?.message ?? err) })
             }
@@ -276,26 +695,138 @@ export function createMcpClientPlugin(options: {
         },
 
         async 'tool.pool.assemble'(_input, pool) {
-          for (const tool of discoveredTools) {
-            ;(pool as { add: (t: unknown) => void }).add(tool)
+          for (const rt of runtimes) {
+            for (const tool of rt.tools) {
+              ;(pool as { add: (t: unknown) => void }).add(tool)
+            }
+          }
+        },
+
+        'prompt.system.transform'(_input, parts) {
+          // 注入自动拉取的资源文本
+          if (injectedResourceCache.size > 0) {
+            const section = Array.from(injectedResourceCache.entries())
+              .map(([uri, text]) => `## MCP Resource: ${uri}\n${text}`)
+              .join('\n\n')
+            if (section) parts.push(`\n\n# MCP Resources\n\n${section}`)
           }
         },
 
         'cli.commands'(input) {
-          if (discoveredTools.length > 0) {
-            input.commands.push({ command: 'mcp', description: '列出已注册的 MCP 工具' })
+          if (runtimes.length > 0) {
+            input.commands.push({
+              command: 'mcp',
+              description: 'MCP 服务器 / 工具 / 资源 / prompts 管理',
+              usage: '/mcp [servers | tools | resources | read <uri> | prompts | prompt <name>]',
+            })
           }
         },
 
         async 'cli.command'(input) {
           if (input.command !== 'mcp') return
-          if (discoveredTools.length === 0) {
-            input.out('（无已注册的 MCP 工具）\n')
-          } else {
-            input.out(`已注册 ${discoveredTools.length} 个 MCP 工具：\n`)
-            for (const t of discoveredTools) {
-              input.out(`  ${t.id}  -  ${t.description}\n`)
+          const sub = (input.arg.trim().split(/\s+/)[0] ?? '').toLowerCase()
+          const rest = input.arg.trim().slice(sub.length).trim()
+
+          if (sub === '' || sub === 'servers') {
+            // 列出所有 server
+            if (runtimes.length === 0) {
+              input.out('（无已连接的 MCP Server）\n')
+            } else {
+              input.out(`已连接 ${runtimes.length} 个 MCP Server：\n`)
+              for (const rt of runtimes) {
+                const t = rt.config.transport ?? (rt.config.command ? 'stdio' : 'http')
+                input.out(`  ${rt.config.name}  [${t}]  tools=${rt.tools.length}  resources=${rt.resources.length}  prompts=${rt.prompts.length}\n`)
+              }
             }
+          } else if (sub === 'tools') {
+            const total = runtimes.reduce((s, r) => s + r.tools.length, 0)
+            if (total === 0) {
+              input.out('（无已注册的 MCP 工具）\n')
+            } else {
+              input.out(`已注册 ${total} 个 MCP 工具：\n`)
+              for (const rt of runtimes) {
+                for (const t of rt.tools) {
+                  input.out(`  ${t.id}  -  ${t.description}\n`)
+                }
+              }
+            }
+          } else if (sub === 'resources') {
+            const total = runtimes.reduce((s, r) => s + r.resources.length, 0)
+            if (total === 0) {
+              input.out('（无 MCP 资源）\n')
+            } else {
+              input.out(`可用 ${total} 个 MCP 资源：\n`)
+              for (const rt of runtimes) {
+                for (const r of rt.resources) {
+                  input.out(`  [${rt.config.name}] ${r.uri}  -  ${r.description ?? r.name ?? '(no description)'}\n`)
+                }
+              }
+            }
+          } else if (sub === 'read') {
+            if (!rest) {
+              input.out('用法：/mcp read <uri>\n')
+            } else {
+              // 跨所有 server 查找该 URI
+              let found = false
+              for (const rt of runtimes) {
+                if (!rt.resources.some((r) => r.uri === rest)) continue
+                try {
+                  const contents = await rt.client.readResource(rest)
+                  for (const c of contents) {
+                    if (c.text) input.out(`[${c.uri}] (${c.mimeType ?? 'text'})\n${c.text}\n`)
+                    else if (c.blob) input.out(`[${c.uri}] (base64 blob, ${c.blob.length} chars)\n`)
+                  }
+                  found = true
+                } catch (err) {
+                  input.out(`读取失败：${(err as Error)?.message ?? err}\n`)
+                  found = true
+                }
+              }
+              if (!found) input.out(`未找到资源：${rest}\n`)
+            }
+          } else if (sub === 'prompts') {
+            const total = runtimes.reduce((s, r) => s + r.prompts.length, 0)
+            if (total === 0) {
+              input.out('（无 MCP prompts）\n')
+            } else {
+              input.out(`可用 ${total} 个 MCP prompts：\n`)
+              for (const rt of runtimes) {
+                for (const p of rt.prompts) {
+                  const args = p.arguments?.map((a) => `${a.name}${a.required ? '*' : ''}`).join(', ') ?? ''
+                  input.out(`  [${rt.config.name}] ${p.name}  -  ${p.description ?? ''}${args ? `  args: ${args}` : ''}\n`)
+                }
+              }
+            }
+          } else if (sub === 'prompt') {
+            // /mcp prompt <name> [k=v k=v...]
+            const parts = rest.split(/\s+/).filter(Boolean)
+            if (parts.length === 0) {
+              input.out('用法：/mcp prompt <name> [key=value ...]\n')
+            } else {
+              const promptName = parts[0]
+              const args: Record<string, string> = {}
+              for (const kv of parts.slice(1)) {
+                const [k, ...vParts] = kv.split('=')
+                if (k && vParts.length > 0) args[k] = vParts.join('=')
+              }
+              let found = false
+              for (const rt of runtimes) {
+                if (!rt.prompts.some((p) => p.name === promptName)) continue
+                try {
+                  const messages = await rt.client.getPrompt(promptName, args)
+                  for (const m of messages) {
+                    input.out(`[${m.role}] ${m.content.text ?? JSON.stringify(m.content)}\n`)
+                  }
+                  found = true
+                } catch (err) {
+                  input.out(`获取 prompt 失败：${(err as Error)?.message ?? err}\n`)
+                  found = true
+                }
+              }
+              if (!found) input.out(`未找到 prompt：${promptName}\n`)
+            }
+          } else {
+            input.out(`未知子命令：${sub}\n用法：/mcp [servers | tools | resources | read <uri> | prompts | prompt <name>]\n`)
           }
           input.result = 'continue'
         },
@@ -303,10 +834,34 @@ export function createMcpClientPlugin(options: {
     },
 
     async uninstall() {
-      for (const c of clients) c.close()
-      clients.length = 0
-      discoveredTools.length = 0
+      for (const rt of runtimes) rt.client.close()
+      runtimes.length = 0
+      injectedResourceCache.clear()
       connected = false
     },
+  }
+}
+
+// ===== 插件内部 helper =====
+
+/** 根据 autoInjectResources 策略加载资源文本到缓存 */
+async function loadAutoInjectResources(
+  client: McpClient,
+  resources: McpResourceDef[],
+  cache: Map<string, string>,
+  policy: 'all' | string[],
+): Promise<void> {
+  const targets = policy === 'all'
+    ? resources
+    : resources.filter((r) => (policy as string[]).includes(r.uri))
+  for (const r of targets) {
+    try {
+      const contents = await client.readResource(r.uri)
+      const text = contents
+        .map((c) => c.text ?? '')
+        .filter(Boolean)
+        .join('\n')
+      if (text) cache.set(r.uri, text)
+    } catch { /* 忽略单个资源读取失败 */ }
   }
 }
