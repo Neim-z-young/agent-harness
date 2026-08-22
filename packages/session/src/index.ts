@@ -119,6 +119,42 @@ export interface Message {
   }
 }
 
+// ===== Session Compaction Schema =====
+
+/** 压缩状态元数据（约定写入 Session.meta.compaction） */
+export interface CompactionMeta {
+  /** 累计压缩次数 */
+  count: number
+  /** 最近一次压缩策略 */
+  lastStrategy?: CompactionStrategy
+  /** 最近一次压缩时间 */
+  lastAt?: number
+  /** 最近一次压缩前的消息数 */
+  lastMessagesBefore?: number
+  /** 最近一次压缩后的消息数 */
+  lastMessagesAfter?: number
+  /** 累计被压缩掉的消息数（用于统计/调试） */
+  totalPrunedMessages?: number
+}
+
+/**
+ * 会话压缩"记忆"接口（约定写入 Session.meta.compactMemory）。
+ * memory 是压缩后的长期对话摘要。Agent 在每次推理前把它作为 system prompt 的一部分注入，
+ * 让 LLM 知道已经被压缩掉的历史上下文。
+ */
+export interface CompactMemory {
+  /** 摘要文本（由 summary / agent 策略生成；prune 策略为 null） */
+  summaryText?: string
+  /** 压缩前的消息窗口起始（messages[0] 原来的时间戳或 createdAt） */
+  memoryStartAt?: number
+  /** 摘要轮次：每多一次压缩累加 1，summary 策略会把"上一轮摘要"作为上下文参考 */
+  round: number
+}
+
+/** 约定写入 Session.meta 的 key */
+export const COMPACT_META_KEY = 'compaction' as const
+export const COMPACT_MEMORY_KEY = 'compactMemory' as const
+
 // ===== Session =====
 
 /**
@@ -140,7 +176,11 @@ export interface Session {
   messages: Message[]
   /** 工作目录 */
   cwd?: string
-  /** 元数据 */
+  /**
+   * 元数据（推荐使用 `CompactionMeta` / `CompactMemory` 约定：
+   *   - meta[COMPACT_META_KEY]: CompactionMeta
+   *   - meta[COMPACT_MEMORY_KEY]: CompactMemory
+   */
   meta?: Record<string, unknown>
 }
 
@@ -166,6 +206,25 @@ export interface SessionListOptions {
 
 /** 压缩策略 */
 export type CompactionStrategy = 'prune' | 'summary' | 'agent'
+
+/** compact() / compactIfNeeded() 共用选项 */
+export interface CompactOptions {
+  /**
+   * 压缩策略
+   * - prune：只截断最旧的消息（保留 system 消息 + 最近 K 条 user/assistant 对），不生成摘要
+   * - summary（默认）：对被截断的窗口做轻量规则摘要（按消息类型统计 + 首尾要点），结果写入 CompactMemory.summaryText
+   * - agent：调用 LLM 生成摘要（调用者需提供调用能力；若缺失自动 fallback 到 summary）
+   */
+  strategy?: CompactionStrategy
+  /** 每条消息的平均 token 估算（用于估算上下文长度是否达到阈值；默认 500） */
+  tokensPerMessage?: number
+  /** 触发阈值（估算总 token 数达到多少才压缩；默认 8000） */
+  thresholdTokens?: number
+  /** 压缩后保留的最近消息数（user+assistant 算一对；默认 6 条 = 3 轮对话） */
+  keepRecentMessages?: number
+  /** 摘要最大字符数（仅 summary / agent 策略；默认 1200） */
+  summaryMaxChars?: number
+}
 
 /**
  * 会话管理器接口
@@ -211,6 +270,10 @@ export interface SessionManager {
   /** 撤销回滚 */
   unrevert(sessionId: string, snapshotId: string): Promise<void>
 
-  /** 压缩会话（控制上下文长度） */
-  compact(sessionId: string, strategy?: CompactionStrategy): Promise<void>
+  /** 立即压缩会话 */
+  compact(sessionId: string, strategy?: CompactionStrategy, options?: CompactOptions): Promise<void>
+  /** 估算当前上下文长度达到阈值时才压缩（无触发时为 no-op）；返回是否真的执行了压缩 */
+  compactIfNeeded(sessionId: string, options?: CompactOptions): Promise<boolean>
+  /** 读取当前压缩记忆（CompactMemory + 元数据），供 Agent 注入 system prompt */
+  getCompactionInfo(sessionId: string): Promise<{ meta?: CompactionMeta; memory?: CompactMemory }>
 }

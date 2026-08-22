@@ -477,7 +477,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/save']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/save', '/compact']
 
 /**
  * 启动交互式 REPL。
@@ -516,6 +516,8 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
           out('  /save              手动保存当前会话\n')
           out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
           out('  /switch ?          列出已注册 Agent\n')
+          out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
+          out('  /compact auto      达到阈值才压缩（= compactIfNeeded）\n')
           return 'continue'
 
         case '/exit': case '/quit':
@@ -556,6 +558,24 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
           const cur = (await harness.session.get(session.id))!
           cur.agentId = arg
           out(`已切换到 Agent ${arg}（影响下次 send）\n`)
+          return 'continue'
+        }
+        case '/compact': {
+          const curSessionId = (options as any).session.id as string
+          if (arg === 'auto' || arg === 'ifneeded') {
+            const did = await harness.session.compactIfNeeded(curSessionId)
+            const info = await harness.session.getCompactionInfo(curSessionId)
+            if (did) out(`已触发压缩（阈值命中）：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)
+            else out(`未达阈值（估计 ${((await harness.session.get(curSessionId))!.messages.length * 500)} tokens），跳过压缩。\n`)
+          } else {
+            const strategy = (arg === 'prune' || arg === 'summary' || arg === 'agent') ? arg : 'summary'
+            await harness.session.compact(curSessionId, strategy)
+            const info = await harness.session.getCompactionInfo(curSessionId)
+            out(`已压缩会话（策略=${strategy}）：`)
+            out(`累计压缩次数=${info.meta?.count ?? 0}，累计压缩消息=${info.meta?.totalPrunedMessages ?? 0}\n`)
+            out(`本轮：前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}；摘要轮次=${info.memory?.round ?? 0}\n`)
+            if (info.memory?.summaryText) out(`摘要（前 400 字）：${info.memory.summaryText.slice(0, 400)}\n`)
+          }
           return 'continue'
         }
         default:
@@ -721,6 +741,13 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     }
 
     // repl / resume / start → REPL
+    {
+      const did = await harness.session.compactIfNeeded(session.id)
+      if (did) {
+        const info = await harness.session.getCompactionInfo(session.id)
+        write(`[会话] 自动压缩：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)
+      }
+    }
     await startRepl({ app, harness, session })
     return 0
   } finally {

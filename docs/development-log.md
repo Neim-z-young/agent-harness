@@ -1,5 +1,58 @@
 # Agent Harness 开发日志
 
+## 2026-08-23：会话 Compaction（三级压缩 + 系统记忆注入）
+
+### 今日完成
+
+完成 Phase 4 的会话压缩能力：三种压缩策略（prune / summary / agent）、按阈值自动触发 `compactIfNeeded`、压缩后摘要作为长期系统记忆注入到 Agent system prompt；CLI 暴露 `/compact` 斜杠命令、resume/repl/run 启动时自动 compactIfNeeded。
+
+**17 个包 typecheck 全绿（0 error）；与 compaction 相关 4 个新增单元测试全部通过**。
+
+#### 1. 模块开发
+
+| # | 模块 / 变更 | 能力点 | 测试数 |
+|---|---|---|---|
+| 1 | `@harness/session` Session.meta schema 扩展 | 导出 `CompactionMeta`（压缩统计：count/lastStrategy/totalPrunedMessages 等）+ `CompactMemory`（摘要文本+轮次+记忆起点）+ `COMPACT_META_KEY` / `COMPACT_MEMORY_KEY` 约定；扩展 `CompactOptions`（`strategy` / `thresholdTokens` / `keepRecentMessages` / `summaryMaxChars` / `tokensPerMessage`）；`SessionManager` 接口新增 `compact(…, options?)` / `compactIfNeeded(…)` / `getCompactionInfo(…)` | — |
+| 2 | `@harness/core` `DefaultSessionManager` compaction 实现 | 三级策略：`prune`（只截断、保留最近 K 条）/ `summary`（规则摘要：角色分布+首末用户要点+助手节选+工具调用统计，无需 LLM）/ `agent`（复用 AgentRuntime.query 生成摘要，缺失时自动 fallback 到 summary）；多轮合并：把"前一轮 CompactMemory.summaryText"作为上下文附加在新摘要前方，跨压缩轮次保留长期记忆；统计写入 `Session.meta` | — |
+| 3 | `@harness/core` `AgentRuntimeImpl` 系统记忆注入 | 新增 `appendCompactionMemory()` helper，在构建 system prompt（`query()` 与流式 `buildContext()` 两处）时把压缩记忆作为独立 system part 追加（在 `prompt.system.transform` hook 之前，允许插件二次改写） | — |
+| 4 | `@harness/cli` 命令 + 自动压缩 | 新增 `/compact [prune|summary|agent|auto]` 命令，打印压缩后 meta+memory 摘要；在 `repl / resume / run` 进入交互前调用一次 `compactIfNeeded`，命中阈值时提示压缩结果 | — |
+| 5 | `@harness/core` `core.test.ts` Session Compaction 测试块 | 4 个关键验证：① summary 策略长度+meta/memory 统计 ② prune 策略不产生新摘要 ③ compactIfNeeded 阈值触发/no-op ④ system prompt 注入 memory 片段包含压缩标题、轮次与摘要正文 | 4 |
+
+#### 2. 关键技术决策
+
+- **Compaction 不直接压缩 system prompt**：我们的 system prompt 在 AgentRuntime 内动态拼合 agent.promptFragments 与 compaction memory，不写入 session.messages。压缩算法只处理 session.messages（约定不含 system 消息），避免重复拼接。
+- **多轮摘要累积而非覆盖**：新一轮压缩时把"旧 CompactMemory.summaryText"作为"更早记忆"段落加在新摘要前方，避免 LLM 丢失更早语义；同时 `round` 单调递增，system memory 注入时会展示轮次。
+- **默认阈值（8000 tokens × 500/msg）偏保守**：`compactIfNeeded` 默认使用 8000 tokens 触发（估算 = `messages.length × tokensPerMessage`，默认每条 500），与 keepRecentMessages=6（最近 3 轮）保证短对话永远不触发。
+- **agent 策略采用 fail-closed fallback**：`agent` 策略优先走 AgentRuntime.query 调 LLM 生成摘要；若缺少 ChatProvider/AgentRuntime 或调用出错，不抛异常给业务，静默回落到 ruleBasedSummary，保证 compaction 永远可用。
+- **summary 策略做确定性、无 LLM 依赖**：规则摘要按"首末用户要点 + 助手节选 + 工具调用统计 + 前压缩轮次提示"组合，可离线、可重复、无费用，作为默认策略。
+- **CompactOptions 设计为单源**：`compact()` 的第二参数 `strategy` 与第三参数 `options.strategy` 等价，`strategy` 显式参数优先，便于 CLI 直接传策略、也便于程序化代码通过 CompactOptions 调用。
+
+#### 3. 遇到的问题与修复
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| 测试最初 `h.session.update(id, fn)` 报错 `update` 不存在于 `SessionManager` 接口 | `@harness/session` 暴露的是细粒度的 `updateMessage / addMessage / updatePart`，没有整 session mutate 入口 | 改用 helper `fillMessages(h, sessionId, rounds)` 循环调用 `h.session.addMessage` 注入消息 |
+| core typecheck：`SessionManager` import 类型中缺 `CompactOptions / CompactionMeta / CompactMemory / COMPACT_META_KEY / COMPACT_MEMORY_KEY` | 新增类型未同步进 import | 在 `import type` 块补齐，并 `import { COMPACT_META_KEY as COMPACT_META_KEY_VAL, COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL }` 引入运行时常量，避免同文件类型/值混合引用问题 |
+| 无 test 文件的包（permission/agent/skill/session）`bun test` 返回 exit code 1 | 这些包只有 `scripts.test="bun test"`，默认 bun 找不到 *.test.ts 返回 1 | 暂不在本次修（属 monorepo 历史脚本问题，与 compaction 无关）；逐个包验证 core、cli、builtin/plugin 均 0 fail |
+
+#### 4. 代码统计
+
+```
+17 个 packages / typecheck 全绿 / 新增 compaction 单测 4 个 / 核心断言数：
+  - 压缩长度：summary 20→6、prune 16→4
+  - 统计：count=1 / lastMessagesBefore / totalPrunedMessages / round
+  - 注入：system prompt 含"会话压缩记忆"与摘要前缀匹配
+会话 compaction 能力对外 API：
+  - SessionManager.compact(sessionId, strategy?, options?)
+  - SessionManager.compactIfNeeded(sessionId, options?) => boolean
+  - SessionManager.getCompactionInfo(sessionId) => { meta?, memory? }
+CLI 斜杠命令：
+  - /compact [prune|summary|agent]
+  - /compact auto (或 ifneeded) = compactIfNeeded
+```
+
+---
+
 ## 2026-08-21：流式输出 + Provider 扩展 + 工具插件化拆分
 
 ### 今日完成
