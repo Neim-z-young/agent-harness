@@ -184,6 +184,15 @@ import type {
   SessionListOptions,
   SessionManager,
   CompactionStrategy,
+  CompactOptions,
+  CompactionMeta,
+  CompactMemory,
+  COMPACT_META_KEY,
+  COMPACT_MEMORY_KEY,
+} from '@harness/session'
+import {
+  COMPACT_META_KEY as COMPACT_META_KEY_VAL,
+  COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
 } from '@harness/session'
 
 // ========================================================================
@@ -597,10 +606,261 @@ export class DefaultSessionManager implements SessionManager {
     this.sessions.set(sessionId, JSON.parse(JSON.stringify(unrevert)))
   }
 
-  async compact(sessionId: string, _strategy?: CompactionStrategy): Promise<void> {
-    // 默认压缩：占位实现（MVP 不做摘要算法）
+  // ---------- Compaction ----------
+
+  private readMeta(sess: Session): CompactionMeta {
+    const raw = sess.meta?.[COMPACT_META_KEY_VAL] as CompactionMeta | undefined
+    return raw ?? { count: 0, totalPrunedMessages: 0 }
+  }
+  private writeMeta(sess: Session, meta: CompactionMeta): void {
+    sess.meta = { ...(sess.meta ?? {}), [COMPACT_META_KEY_VAL]: meta }
+  }
+  private readMemory(sess: Session): CompactMemory | undefined {
+    return sess.meta?.[COMPACT_MEMORY_KEY_VAL] as CompactMemory | undefined
+  }
+  private writeMemory(sess: Session, mem: CompactMemory): void {
+    sess.meta = { ...(sess.meta ?? {}), [COMPACT_MEMORY_KEY_VAL]: mem }
+  }
+
+  async compact(
+    sessionId: string,
+    strategy?: CompactionStrategy,
+    options: CompactOptions = {}
+  ): Promise<void> {
     const sess = this.sessions.get(sessionId)
-    if (sess) sess.updatedAt = Date.now()
+    if (!sess) return
+    const now = Date.now()
+    const strat = strategy ?? options.strategy ?? 'summary'
+    const keepRecent = Math.max(options.keepRecentMessages ?? 6, 0)
+
+    const beforeLen = sess.messages.length
+    // 所有消息按时间排序（约定已是）；不包含 role===system 的消息（它们在 AgentRuntime 内动态构建，不在 session.messages 里）
+    const msgs = sess.messages
+    if (msgs.length <= keepRecent) return // 无需压缩
+
+    const cutIndex = Math.max(0, msgs.length - keepRecent)
+    const windowToPrune = msgs.slice(0, cutIndex)
+    const kept = msgs.slice(cutIndex)
+
+    // 生成摘要（仅 summary / agent）
+    let summaryText: string | undefined
+    const prevMemory = this.readMemory(sess)
+
+    if (strat === 'summary' || strat === 'agent') {
+      const maxChars = options.summaryMaxChars ?? 1200
+      if (strat === 'agent') {
+        // 尝试调用 agent（通过 services?.agent）——缺失或失败则 fallback 到规则摘要
+        const svc = this.services?.()
+        summaryText = await this.tryAgentSummary({
+          window: windowToPrune,
+          prevMemory,
+          maxChars,
+          agentRuntime: svc?.agent,
+          sessionId,
+          agentId: sess.agentId ?? svc?.currentAgentId(),
+        })
+      }
+      // summary 策略，或 agent 策略 fallback：统一走规则摘要
+      if (!summaryText) {
+        summaryText = this.ruleBasedSummary(windowToPrune, prevMemory, maxChars)
+      }
+    }
+
+    const memoryStartAt = (windowToPrune[0]?.createdAt ?? sess.createdAt)
+
+    // 更新记忆：保留"旧轮次"并把 summaryText 写入
+    const newRound = (prevMemory?.round ?? 0) + 1
+    // 合并新旧摘要：把旧 summary 作为"更早记忆"放在新摘要前面
+    const mergedSummary = summaryText !== undefined
+      ? (prevMemory?.summaryText ? `（更早记忆，第 ${prevMemory.round} 轮摘要）\n${prevMemory.summaryText}\n\n（最新压缩，第 ${newRound} 轮）\n${summaryText}`
+        : summaryText)
+      : prevMemory?.summaryText
+    const newMemory: CompactMemory = {
+      summaryText: mergedSummary,
+      memoryStartAt: prevMemory?.memoryStartAt ?? memoryStartAt,
+      round: newRound,
+    }
+    this.writeMemory(sess, newMemory)
+
+    // 实际截断：删除 windowToPrune
+    sess.messages = kept
+    const afterLen = sess.messages.length
+
+    // 更新元数据
+    const oldMeta = this.readMeta(sess)
+    const newMeta: CompactionMeta = {
+      count: oldMeta.count + 1,
+      lastStrategy: strat,
+      lastAt: now,
+      lastMessagesBefore: beforeLen,
+      lastMessagesAfter: afterLen,
+      totalPrunedMessages: (oldMeta.totalPrunedMessages ?? 0) + (beforeLen - afterLen),
+    }
+    this.writeMeta(sess, newMeta)
+
+    sess.updatedAt = now
+  }
+
+  async compactIfNeeded(sessionId: string, options: CompactOptions = {}): Promise<boolean> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return false
+    const tokensPerMsg = options.tokensPerMessage ?? 500
+    const threshold = options.thresholdTokens ?? 8000
+    const estimated = sess.messages.length * tokensPerMsg
+    if (estimated < threshold) return false
+    await this.compact(sessionId, options.strategy ?? 'summary', options)
+    return true
+  }
+
+  async getCompactionInfo(sessionId: string) {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return {}
+    return {
+      meta: this.readMeta(sess),
+      memory: this.readMemory(sess),
+    }
+  }
+
+  // --------- 内部摘要实现 ---------
+
+  /** 规则摘要：简单但稳定的基于消息类型/文本要点的摘要；无需 LLM */
+  private ruleBasedSummary(
+    window: Message[],
+    prevMemory: CompactMemory | undefined,
+    maxChars: number
+  ): string {
+    const lines: string[] = []
+    const total = window.length
+    lines.push(`对话摘要（压缩前消息数：${total}，时间范围 ${
+      window[0]?.createdAt ? new Date(window[0].createdAt).toISOString() : '?'
+    } ~ ${
+      window[window.length - 1]?.createdAt ? new Date(window[window.length - 1].createdAt).toISOString() : '?'
+    }）`)
+    if (prevMemory?.round) {
+      lines.push(`上一轮为第 ${prevMemory.round} 次压缩，本摘要建立在先前记忆之上。`)
+    }
+
+    // 参与方统计
+    const byRole: Record<string, number> = {}
+    const toolCalls: Array<{ toolId: string; result: unknown }> = []
+    const firstUserLines: string[] = []
+    const lastUserLines: string[] = []
+    const assistantLines: string[] = []
+
+    for (const m of window) {
+      byRole[m.role] = (byRole[m.role] ?? 0) + 1
+      if (m.role === 'user') {
+        const texts = m.parts.filter((p: any) => p.type === 'text').map((p: any) => String(p.text))
+        if (texts.length) {
+          if (firstUserLines.length < 2) firstUserLines.push(texts.join('\n').slice(0, 200))
+          lastUserLines.length = 0
+          lastUserLines.push(texts.join('\n').slice(0, 200))
+        }
+      } else if (m.role === 'assistant') {
+        for (const p of m.parts) {
+          const pt = p as any
+          if (pt.type === 'text') assistantLines.push(String(pt.text).slice(0, 200))
+          else if (pt.type === 'tool') {
+            toolCalls.push({ toolId: String(pt.toolId), result: pt.result })
+          }
+        }
+      } else if (m.role === 'tool') {
+        for (const p of m.parts) {
+          const pt = p as any
+          if (pt.type === 'tool') {
+            toolCalls.push({ toolId: String(pt.toolId), result: pt.result })
+          }
+        }
+      }
+    }
+
+    lines.push(`参与角色分布：${Object.entries(byRole).map(([k, v]) => `${k}=${v}`).join(', ')}`)
+
+    if (firstUserLines.length) {
+      lines.push('最早的用户消息要点：')
+      for (const l of firstUserLines) lines.push(`- ${l}`)
+    }
+    if (lastUserLines.length) {
+      lines.push('最近的用户消息要点：')
+      for (const l of lastUserLines) lines.push(`- ${l}`)
+    }
+    if (assistantLines.length) {
+      const joined = assistantLines.slice(0, 3).join('\n').slice(0, 500)
+      lines.push(`助手要点（节选）：\n- ${joined}`)
+    }
+    if (toolCalls.length) {
+      const perTool = new Map<string, number>()
+      for (const tc of toolCalls) perTool.set(tc.toolId, (perTool.get(tc.toolId) ?? 0) + 1)
+      lines.push(`工具调用（共 ${toolCalls.length} 次）：${
+        Array.from(perTool.entries()).map(([id, c]) => `${id}×${c}`).join(', ')
+      }`)
+      // 列出前 3 条结果小片段
+      const first3 = toolCalls.slice(0, 3).map((t) => {
+        let s = ''
+        try { s = typeof t.result === 'string' ? t.result : JSON.stringify(t.result) }
+        catch { s = String(t.result) }
+        return `${t.toolId}: ${s.slice(0, 100)}`
+      })
+      if (first3.length) {
+        lines.push('工具结果节选：')
+        for (const l of first3) lines.push(`- ${l}`)
+      }
+    }
+
+    let out = lines.join('\n')
+    if (out.length > maxChars) out = out.slice(0, maxChars - 3) + '...'
+    return out
+  }
+
+  /**
+   * 尝试调用 Agent/LLM 生成摘要（agent strategy）。
+   * 若当前缺少 AgentRuntime / ChatProvider / 出错，则返回空字符串让调用方 fallback。
+   */
+  private async tryAgentSummary(args: {
+    window: Message[]
+    prevMemory: CompactMemory | undefined
+    maxChars: number
+    agentRuntime?: AgentRuntime
+    sessionId: string
+    agentId?: string
+  }): Promise<string | undefined> {
+    const { window, prevMemory, maxChars, agentRuntime } = args
+    if (!agentRuntime || !args.agentId) return undefined
+
+    const userLines: string[] = []
+    for (const m of window) {
+      if (m.role === 'user' || m.role === 'assistant' || m.role === 'tool') {
+        for (const p of m.parts) {
+          const pt = p as any
+          if (pt.type === 'text') userLines.push(`[${m.role}] ${String(pt.text).slice(0, 300)}`)
+          else if (pt.type === 'tool') {
+            const line = `[tool] id=${pt.toolId} input=${JSON.stringify(pt.input ?? {}).slice(0, 200)} result=${JSON.stringify(pt.result ?? '').slice(0, 200)}`
+            userLines.push(line)
+          }
+        }
+      }
+    }
+    let userContent = `请把下面对话窗口压缩为 1 段长摘要（不超过 ${maxChars} 字符），保留关键意图、决策与工具结果：\n\n`
+    userContent += userLines.join('\n').slice(0, 4000)
+    if (prevMemory?.summaryText) {
+      userContent = `此前已有摘要记忆（用作上下文背景，无需复述）：\n${prevMemory.summaryText.slice(0, 800)}\n\n---\n` + userContent
+    }
+
+    try {
+      // 复用 AgentRuntime 做一轮推理；失败则 return undefined（不把异常抛出给业务）
+      const msg = await agentRuntime.query({
+        sessionId: args.sessionId + '__compaction__',
+        agentId: args.agentId,
+        message: userContent,
+      })
+      const texts = (msg.parts as unknown as any[])
+        .filter((p) => p.type === 'text')
+        .map((p) => String(p.text))
+      const summary = texts.join('\n').trim().slice(0, maxChars) || undefined
+      return summary
+    } catch {
+      return undefined
+    }
   }
 }
 
@@ -655,6 +915,25 @@ export class AgentRuntimeImpl implements AgentRuntime {
     this.defaultAgentId = defaultAgentId
   }
 
+  /** 把 Session.CompactMemory 追加到 sysParts（作为长期系统记忆），让 LLM 看到已压缩的历史。 */
+  private async appendCompactionMemory(sessionId: string, sysParts: string[]): Promise<void> {
+    const info = await this.deps.session.getCompactionInfo(sessionId)
+    if (!info.memory?.summaryText) return
+    const blockLines: string[] = []
+    blockLines.push('=== 会话压缩记忆（已被截断/压缩的对话历史摘要）===')
+    blockLines.push(`压缩轮次：${info.memory.round}`)
+    if (info.memory.memoryStartAt) {
+      blockLines.push(`覆盖时间起点：${new Date(info.memory.memoryStartAt).toISOString()}`)
+    }
+    if (info.meta?.totalPrunedMessages) {
+      blockLines.push(`累计压缩消息数：${info.meta.totalPrunedMessages}`)
+    }
+    blockLines.push('摘要内容：')
+    blockLines.push(info.memory.summaryText)
+    blockLines.push('===============================================')
+    sysParts.push(blockLines.join('\n'))
+  }
+
   register(def: AgentDefinition): void {
     this.agents.set(def.id, def)
   }
@@ -698,6 +977,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 构建 system prompt
     const sysParts: string[] = agent.promptFragments ? [...agent.promptFragments] : []
     if (agent.systemPrompt) sysParts.length = 0, sysParts.push(agent.systemPrompt)
+    await this.appendCompactionMemory(sessionId, sysParts)
     const promptIn: PromptInput = { agentId, sessionId }
     await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
 
@@ -831,6 +1111,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const session2 = (await this.deps.session.get(sessionId))!
     const sysParts: string[] = agent.promptFragments ? [...agent.promptFragments] : []
     if (agent.systemPrompt) { sysParts.length = 0; sysParts.push(agent.systemPrompt) }
+    await this.appendCompactionMemory(sessionId, sysParts)
     const promptIn: PromptInput = { agentId, sessionId }
     await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
 

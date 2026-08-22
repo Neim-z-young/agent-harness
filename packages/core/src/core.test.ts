@@ -417,4 +417,102 @@ describe('@harness/core', () => {
       )
     })
   })
+
+  describe('Session Compaction', () => {
+    function makeSessionMessages(n: number): Message[] {
+      const out: Message[] = []
+      for (let i = 0; i < n; i++) {
+        out.push({
+          id: `u_${i}`,
+          role: 'user',
+          parts: [{ type: 'text', text: `第${i}轮用户问题：${'x'.repeat(50)}` }],
+          createdAt: Date.now() + i * 2,
+        })
+        out.push({
+          id: `a_${i}`,
+          role: 'assistant',
+          parts: [{ type: 'text', text: `回复第${i}轮：${'y'.repeat(80)}` }],
+          createdAt: Date.now() + i * 2 + 1,
+        })
+      }
+      return out
+    }
+
+    /** 用 addMessage 填充 N 轮 user/assistant */
+    async function fillMessages(h: Harness, sessionId: string, rounds: number) {
+      for (const m of makeSessionMessages(rounds)) await h.session.addMessage(sessionId, m)
+    }
+
+    it('summary 策略：压缩后 messages 变短，摘要写入 CompactMemory，统计正确', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fillMessages(h, sess.id, 10)
+      await h.session.compact(sess.id, 'summary', { keepRecentMessages: 6 })
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBe(6)
+      const info = await h.session.getCompactionInfo(sess.id)
+      expect(info.meta?.count).toBe(1)
+      expect(info.meta?.lastStrategy).toBe('summary')
+      expect(info.meta?.lastMessagesBefore).toBe(20)
+      expect(info.meta?.lastMessagesAfter).toBe(6)
+      expect(info.meta?.totalPrunedMessages).toBe(14)
+      expect(info.memory?.round).toBe(1)
+      expect(info.memory?.summaryText).toBeTruthy()
+      expect(info.memory!.summaryText!.length).toBeGreaterThan(20)
+      await h.stop()
+    })
+
+    it('prune 策略：只截断，不生成摘要文本', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fillMessages(h, sess.id, 8)
+      await h.session.compact(sess.id, 'prune', { keepRecentMessages: 4 })
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBe(4)
+      const info = await h.session.getCompactionInfo(sess.id)
+      expect(info.meta?.lastStrategy).toBe('prune')
+      // prune 策略不产生新 summary，但 memory.round 仍递增
+      expect(info.memory?.round).toBe(1)
+      await h.stop()
+    })
+
+    it('compactIfNeeded 阈值命中时压缩，否则 no-op', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      // 2 条消息估算 2*500=1000 tokens < 默认阈值 8000 → 不压缩
+      await fillMessages(h, sess.id, 1)
+      const did1 = await h.session.compactIfNeeded(sess.id, {})
+      expect(did1).toBe(false)
+      // 20 条消息估算 20*500=10000 ≥ 8000 → 压缩
+      await fillMessages(h, sess.id, 9) // 已有 2 条 + 18 = 20 条
+      const did2 = await h.session.compactIfNeeded(sess.id, {})
+      expect(did2).toBe(true)
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBeLessThan(20)
+      await h.stop()
+    })
+
+    it('AgentRuntime.query 把 CompactMemory 注入为 system prompt 片段', async () => {
+      const provider = mockChatProvider('text')
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: provider })
+      const sess = await h.session.create()
+      await fillMessages(h, sess.id, 6)
+      // 先压缩一轮，产生 memory.summaryText
+      await h.session.compact(sess.id, 'summary', { keepRecentMessages: 4 })
+      const info = await h.session.getCompactionInfo(sess.id)
+      expect(info.memory?.summaryText).toBeTruthy()
+      await h.start()
+      await h.agent.query({ sessionId: sess.id, agentId: 'default', message: '测试一下' })
+      await h.stop()
+      expect(provider.calls.length).toBeGreaterThan(0)
+      const lastCall = provider.calls[provider.calls.length - 1]
+      const sysMsg = (lastCall.messages as Message[]).find((m) => m.role === 'system')
+      expect(sysMsg).toBeTruthy()
+      const texts = sysMsg!.parts.filter((p: any) => p.type === 'text').map((p: any) => String(p.text))
+      const combined = texts.join('\n')
+      expect(combined).toContain('会话压缩记忆')
+      expect(combined).toContain(`压缩轮次：${info.memory!.round}`)
+      expect(combined).toContain(info.memory!.summaryText!.slice(0, 60))
+    })
+  })
 })
