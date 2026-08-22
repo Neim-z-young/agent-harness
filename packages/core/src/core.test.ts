@@ -535,4 +535,93 @@ describe('@harness/core', () => {
       expect(combined).toContain(info.memory!.summaryText!.slice(0, 60))
     })
   })
+
+  describe('Session Management Enhancement', () => {
+    it('自动标题：首条 user 消息截取为 title', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      expect(sess.title).toBeUndefined()
+      await h.session.addMessage(sess.id, {
+        id: `m_${Date.now()}`,
+        role: 'user',
+        parts: [{ type: 'text', text: '帮我写一个排序算法并解释原理' }],
+        createdAt: Date.now(),
+      })
+      const updated = (await h.session.get(sess.id))!
+      expect(updated.title).toBe('帮我写一个排序算法并解释原理')
+      // 第二条 user 消息不覆盖标题
+      await h.session.addMessage(sess.id, {
+        id: `m_${Date.now() + 1}`,
+        role: 'user',
+        parts: [{ type: 'text', text: '再来一个搜索算法' }],
+        createdAt: Date.now() + 1,
+      })
+      const updated2 = (await h.session.get(sess.id))!
+      expect(updated2.title).toBe('帮我写一个排序算法并解释原理')
+      await h.stop()
+    })
+
+    it('自动标题：超长消息截取 60 字符', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      const longText = '这是一段非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常非常长的用户输入内容需要被截断到六十个字符以内的标题'
+      await h.session.addMessage(sess.id, {
+        id: `m_${Date.now()}`,
+        role: 'user',
+        parts: [{ type: 'text', text: longText }],
+        createdAt: Date.now(),
+      })
+      const updated = (await h.session.get(sess.id))!
+      expect(updated.title!.length).toBe(60)
+      expect(longText.startsWith(updated.title!)).toBe(true)
+      await h.stop()
+    })
+
+    it('search：关键词搜索匹配消息文本', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const s1 = await h.session.create()
+      await h.session.addMessage(s1.id, {
+        id: 'm1', role: 'user',
+        parts: [{ type: 'text', text: '如何使用 TypeScript 泛型' }],
+        createdAt: Date.now(),
+      })
+      const s2 = await h.session.create()
+      await h.session.addMessage(s2.id, {
+        id: 'm2', role: 'user',
+        parts: [{ type: 'text', text: 'Python 数据分析教程' }],
+        createdAt: Date.now(),
+      })
+      const results = await h.session.search('TypeScript')
+      expect(results.length).toBe(1)
+      expect(results[0].id).toBe(s1.id)
+      // 大小写不敏感
+      const results2 = await h.session.search('typescript')
+      expect(results2.length).toBe(1)
+      // 无匹配
+      const results3 = await h.session.search('Java')
+      expect(results3.length).toBe(0)
+      await h.stop()
+    })
+
+    it('exportMarkdown：导出会话为 Markdown 文本', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await h.session.addMessage(sess.id, {
+        id: 'u1', role: 'user',
+        parts: [{ type: 'text', text: '你好' }],
+        createdAt: Date.now(),
+      })
+      await h.session.addMessage(sess.id, {
+        id: 'a1', role: 'assistant',
+        parts: [{ type: 'text', text: '你好！有什么可以帮你的？' }],
+        createdAt: Date.now() + 1,
+      })
+      const md = await h.session.exportMarkdown(sess.id)
+      expect(md).toContain('# 你好')
+      expect(md).toContain('**User**')
+      expect(md).toContain('你好！有什么可以帮你的？')
+      expect(md).toContain('**Assistant**')
+      await h.stop()
+    })
+  })
 })
