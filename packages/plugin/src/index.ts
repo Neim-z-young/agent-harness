@@ -165,6 +165,44 @@ export interface Hooks {
   // === Bus 事件订阅 ===
   /** 订阅所有 Bus 事件（用于日志、遥测、桥接） */
   'bus.event'?: (event: BusEventRecord) => Awaitable<void>
+
+  // === CLI 扩展 ===
+  /** 注册 CLI 斜杠命令：插件往 input.commands 追加自己的命令定义 */
+  'cli.commands'?: (input: CliCommandsInput) => Awaitable<void>
+  /** 处理 CLI 斜杠命令：当 REPL 收到非内置 /xxx 时触发，插件设 input.result 表示已处理 */
+  'cli.command'?: (input: CliCommandInput) => Awaitable<void>
+}
+
+/** CLI 命令定义（供 /help 展示） */
+export interface CliCommandDef {
+  /** 命令名（不含 /，如 "mcp" → /mcp） */
+  command: string
+  /** 简短描述 */
+  description: string
+  /** 用法说明 */
+  usage?: string
+}
+
+/** cli.commands hook 的输入 */
+export interface CliCommandsInput {
+  /** 插件往此数组追加命令定义 */
+  commands: CliCommandDef[]
+}
+
+/** cli.command hook 的输入 */
+export interface CliCommandInput {
+  /** 原始命令行（不含前缀 /） */
+  raw: string
+  /** 命令名（第一个 token，不含 /） */
+  command: string
+  /** 参数部分（命令名后的剩余文本） */
+  arg: string
+  /** 输出函数（往终端写文本） */
+  out: (text: string) => void
+  /** 当前会话 ID */
+  sessionId: string
+  /** 处理结果：插件设为 'continue' 或 'exit' 表示已处理 */
+  result?: 'continue' | 'exit'
 }
 
 // ===== AgentPlugin 接口 =====

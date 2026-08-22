@@ -60,6 +60,9 @@ export type {
   CompactionContext,
   PermissionRequestLike,
   PermissionDecisionLike,
+  CliCommandDef,
+  CliCommandsInput,
+  CliCommandInput,
 } from '@harness/plugin'
 
 export {
