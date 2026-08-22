@@ -12,6 +12,7 @@ import {
   main,
 } from './index'
 import type { PermissionDecision } from '@harness/permission'
+import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 describe('parseCliArgs 命令解析', () => {
   it('默认 repl 命令', () => {
@@ -226,5 +227,93 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     } finally {
       process.stdout.write = originalWrite
     }
+  })
+})
+
+describe('插件 CLI 命令扩展', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-cli-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  /** 测试插件：注册 /status 斜杠命令 */
+  function createStatusPlugin(): AgentPlugin {
+    return {
+      id: 'test.status-cmd',
+      version: '1.0.0',
+      name: 'Status Command Plugin',
+      async install() {
+        const hooks: Hooks = {
+          'cli.commands'(input) {
+            input.commands.push({ command: 'status', description: '显示会话状态' })
+          },
+          'cli.command'(input) {
+            if (input.command !== 'status') return
+            input.out(`会话 ${input.sessionId} 运行中\n`)
+            input.result = 'continue'
+          },
+        }
+        return hooks
+      },
+    }
+  }
+
+  it('插件 /status 命令被 REPL 分发', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      extraPlugins: [createStatusPlugin()],
+    })
+    const { harness, session } = await app.boot()
+    const r = await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/status', '/exit'],
+    })
+    expect(r).toBe('exit')
+    const output = chunks.join('')
+    expect(output).toInclude('会话')
+    expect(output).toInclude('运行中')
+    await app.shutdown()
+  })
+
+  it('/help 显示插件注册的命令', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      extraPlugins: [createStatusPlugin()],
+    })
+    const { harness, session } = await app.boot()
+    await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/help', '/exit'],
+    })
+    const output = chunks.join('')
+    expect(output).toInclude('/status')
+    expect(output).toInclude('显示会话状态')
+    await app.shutdown()
+  })
+
+  it('未知命令仍提示未知', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      extraPlugins: [createStatusPlugin()],
+    })
+    const { harness, session } = await app.boot()
+    await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/foobar', '/exit'],
+    })
+    const output = chunks.join('')
+    expect(output).toInclude('未知命令')
+    await app.shutdown()
   })
 })

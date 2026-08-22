@@ -520,6 +520,14 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
           out('  /export [sessionId]  导出会话为 Markdown（默认当前会话）\n')
+          // 收集插件注册的命令
+          try {
+            const cmdInput = { commands: [] as Array<{ command: string; description: string; usage?: string }> }
+            await harness.plugin.trigger('cli.commands', cmdInput)
+            for (const c of cmdInput.commands) {
+              out(`  /${c.command.padEnd(16)}${c.description}\n`)
+            }
+          } catch { /* 忽略插件 hook 错误 */ }
           return 'continue'
 
         case '/exit': case '/quit':
@@ -601,9 +609,23 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
           out('\n')
           return 'continue'
         }
-        default:
+        default: {
+          // 尝试交给插件处理
+          const cmdInput: { raw: string; command: string; arg: string; out: (s: string) => void; sessionId: string; result?: 'continue' | 'exit' } = {
+            raw: line.slice(1),
+            command: cmd.slice(1),
+            arg: (arg ?? '').trim(),
+            out,
+            sessionId: (options as any).session.id,
+          }
+          try {
+            await harness.plugin.trigger('cli.command', cmdInput)
+          } catch { /* 忽略插件 hook 错误 */ }
+          if (cmdInput.result === 'exit') return 'exit'
+          if (cmdInput.result === 'continue') return 'continue'
           out(`未知命令：${line}，输入 /help 查看。\n`)
           return 'continue'
+        }
       }
     }
 
