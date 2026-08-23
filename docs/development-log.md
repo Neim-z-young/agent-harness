@@ -1,5 +1,210 @@
 # Agent Harness 开发日志
 
+## 2026-08-23（续 5）：Skill / Agent 多级加载修复
+
+### 今日完成
+
+修复 Skill Layer 和 Agent 加载中"承诺多级、实际只有 project 一级"的问题，落地 user 级 + project 级两层加载，实现 project 覆盖 user 的优先级策略。
+
+#### 问题回顾
+
+Skill 代码注释宣称三来源合并（bundled/user/project/mcp）+ 优先级覆盖，实际实现：
+- `SkillManagerImpl.load(dir)` 把目录路径硬编码为 `source: 'project'`
+- CLI 只配置 `skillDirs: ['.harness/skills']` 单一目录
+- core 遍历 skillDirs 不区分来源
+
+Agent 加载存在同样问题：CLI 只配置 `agentDirs: ['.harness/agents']` 单一目录。
+
+#### 1. 模块修复
+
+**@harness/skill — `load()` 接口增加 sourceTag 参数**（[packages/skill/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/skill/src/index.ts)）
+
+- 接口签名：`load(source: SkillSource | string, sourceTag?: SkillSource = 'project')`
+- 当 `source` 为目录路径时，用 `sourceTag` 标记来源（user/project/mcp）
+- `skillFromMarkdown` 调用时传入 tag，MCP 来源强制 `allowEmbedShell=false`
+- 同 ID 后加载覆盖先加载（map.set 覆盖语义）
+- 注释更新：MCP 来源建议通过 register() 注册从 MCP Server 拉取的 Skill
+
+**@harness/core — `skillDirs` / `agentDirs` 接口扩展**（[packages/core/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts)）
+
+- `skillDirs?: Array<string | { dir: string; source?: SkillSource }>`（兼容字符串和对象形式）
+- `agentDirs?: Array<string | { dir: string; source?: 'user' | 'project' }>`（同上）
+- Skill 加载逻辑（init() 中）：从 entry 提取 `dirPath` + `sourceTag`，调用 `this.skillManager.load(resolvedDir, sourceTag)`
+- Agent 加载逻辑（构造函数中）：从 entry 提取 `dirPath`，按数组顺序遍历（同 ID 后加载覆盖先加载）
+- 顶部 import 补 `type SkillSource`
+
+**@harness/cli — 默认配置两级加载**（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+
+- `agentDirs: [{ dir: '~/.harness/agents', source: 'user' }, '.harness/agents']`
+- `skillDirs: [{ dir: '~/.harness/skills', source: 'user' }, '.harness/skills']`
+- user 在前、project 在后，project 覆盖 user
+
+#### 2. 测试
+
+**@harness/skill 新增 3 个测试用例**（[packages/skill/src/index.test.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/skill/src/index.test.ts)）
+
+- `多级加载：user → project 顺序，project 覆盖 user（同 ID 后加载覆盖先加载）`：同 ID 在 user/project 两级目录分别定义，验证 `loadedFrom === 'project'` 且 content 是 project 版本
+- `sourceTag 缺省为 project`：调用 `mgr.load(tmpDir)` 不传 sourceTag，验证 `loadedFrom === 'project'`
+- `sourceTag: user 不影响 allowEmbedShell（默认 true）`：验证 user 来源不被强制禁用 shell embed（只有 mcp 来源才强制禁用）
+
+#### 3. 验证
+
+- @harness/skill：21/21 测试通过（67 assertions）
+- @harness/core：22/22 测试通过（86 assertions）
+- @harness/cli：16/16 测试通过（52 assertions）
+- 全部 22 个包 typecheck 通过，无回归
+
+#### 4. 设计决策
+
+- **API 兼容性**：`skillDirs`/`agentDirs` 同时支持字符串和 `{dir, source}` 对象形式，旧用法（字符串数组）默认按 project 处理
+- **多级覆盖靠加载顺序**：core 按数组顺序遍历，user 目录在前、project 目录在后，依赖 `register()`/`skills.set()` 的覆盖语义，不需要显式优先级比较
+- **MCP 来源不走文件目录**：MCP 来源的 Skill 一般从 MCP Server 拉取，建议通过插件用 `register()` 注册
+- **Agent 不加 loadedFrom 字段**：Agent 没有来源相关的安全策略差异（不像 Skill 有 `allowEmbedShell` 安全切断），多级覆盖靠加载顺序保证即可
+
+---
+
+## 2026-08-23（续 4）：Skill Layer 实现
+
+### 今日完成
+
+实现双轨制 Skill Layer：Skill = 知识（Markdown 正文）+ Tool = 功能（代码执行），支持从文件系统加载 Markdown 格式的 Skill 定义，通过 paths 条件触发和 Agent 白名单控制注入到 system prompt。
+
+#### 1. 模块开发
+
+**@harness/skill — 双轨技能系统**（[packages/skill/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/skill/src/index.ts)）
+
+新建包，实现完整 Skill 系统：
+
+- **Skill 接口**：id / name / description / loadedFrom / paths / userInvocable / agentBind / content / embeds / allowEmbedShell / allowedTools / model / effort
+- **SkillSource 类型**：`bundled` | `user` | `project` | `mcp`（MCP 来源强制 `allowEmbedShell=false`，防 RCE）
+- **SkillManager 接口**：`all() / get(id) / load(source) / matchByPath(path) / filterByAgent(agentId) / reload(id)`
+- **SkillManagerImpl 实现**：
+  - `load(dir)` 支持两种目录结构：`skills/skill-name/SKILL.md`（目录形式，Claude Code 风格）和 `skills/skill-name.md`（单文件形式）
+  - `matchByPath(filePath)` 遍历所有 Skill，检查 paths glob 匹配
+  - `filterByAgent(agentId)` 按 agentBind 过滤可用技能
+  - `reload(id)` 从原始来源目录热重载
+  - 同 ID 优先级：project > user > bundled > mcp（后加载覆盖先加载）
+- **skillFromMarkdown** 解析函数：
+  - 解析 frontmatter（简化 YAML 解析器，无外部依赖）+ body
+  - `id` 优先取 `frontmatter.id`，最后 `fallbackId`（目录名）
+  - `name` 优先取 `frontmatter.name`，最后 `fallbackId`
+  - 提取内嵌资源：`!\`cmd\`` → shell embed，`{{var}}` → variable embed
+  - MCP 来源强制 `allowEmbedShell=false`
+- **formatSkillForPrompt** 格式化函数：`# Skill: ${name}` + `> ${description}` + Markdown 正文
+
+**@harness/core — SkillManager 集成 + 注入 Hook**（[packages/core/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts)）
+
+- `HarnessOptions` 新增 `skillDirs?: string[]` 配置项
+- `HarnessImpl` 新增 `skillManager?: SkillManager` 字段（构造函数中实例化，避免构造函数 await）
+- `init()` 方法中：
+  1. 从 `skillDirs` 异步加载 SKILL.md（构造函数不能 await，延迟到 init）
+  2. 仅当有 Skill 加载成功时才注册 `core.skill-injection` 插件（避免空 Hook）
+  3. 插件实现 `prompt.system.transform` Hook：读取 `agent.skills` 白名单，注入对应 Skill 到 system prompt
+- 新增 `core.skill-injection` 内置插件：`id: 'core.skill-injection'`，`version: '0.1.0'`，install() 返回 Hooks
+
+**@harness/cli — 默认配置 skillDirs**（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+
+- `createHarness` 调用默认配置 `skillDirs: ['.harness/skills']`，支持从项目目录加载 Skill
+
+#### 2. 测试
+
+**@harness/skill 单元测试**（[packages/skill/src/index.test.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/skill/src/index.test.ts)）
+
+18 个测试用例，62 个断言，全部通过：
+
+- `skillFromMarkdown`：完整 frontmatter + body、无 name 用 fallbackId、无 frontmatter 用默认值、MCP 来源强制禁用 shell embed、非 MCP 来源默认允许、userInvocable: false、agentBind 绑定、内嵌资源提取
+- `SkillManagerImpl`：register+get+all、filterByAgent（无/有 agentBind）、matchByPath glob 匹配、load 目录形式、load 单文件形式、load 不存在目录、reload 热重载
+- `formatSkillForPrompt`：带描述格式化、无描述省略描述行
+
+#### 3. 关键设计决策
+
+- **双轨制**：Skill = 知识（Markdown），Tool = 功能（代码执行），分离关注点
+- **三来源合并**：bundled / user / project / mcp，同 ID 后加载覆盖先加载
+- **MCP 安全切断**：MCP 来源强制 `allowEmbedShell=false`，防 RCE（同 Claude Code 安全策略）
+- **paths 条件触发**：glob 匹配文件路径自动注入上下文（参考 Claude Code loadSkillsDir）
+- **Agent 白名单**：`agent.skills` 字段控制哪些 Skill 注入到该 Agent 的 system prompt
+- **id 与 name 分离**：id 来自目录名或显式 `frontmatter.id`，name 是显示名（与 Claude Code 一致）
+
+#### 4. 验证
+
+- @harness/skill：18/18 测试通过（62 assertions）
+- @harness/core：22/22 测试通过（86 assertions）
+- @harness/agent：19/19 测试通过（42 assertions）
+- 全部 22 个包 typecheck 通过，无回归
+
+---
+
+## 2026-08-23（续 3）：Subagent 工具调用摘要
+
+### 今日完成
+
+在 Subagent Bus 事件推送完成后，实现工具调用摘要功能：当子 Agent 最终回复过长时，自动截断文本 + 附加工具调用列表，避免上下文膨胀。
+
+#### 1. 模块开发
+
+**@harness/subagent — 工具调用摘要**（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）
+
+新增 4 个 helper 函数 + 2 个输出字段 + 1 个配置项：
+
+- `summarizeToolInput(toolId, input)` — 按 toolId 提取关键信息（read_file→path, bash→command, glob→pattern, grep_file→pattern, web_fetch→url, 默认→第一个字符串值）
+- `truncateStr(s, maxLen)` — 截断字符串加 `...` 后缀
+- `countToolCalls(messages)` — 统计子 session 中所有 `type: 'tool'` part 数量
+- `summarizeResult(messages, finalText, maxResultLength)` — 超过阈值时生成摘要 = 截断文本(500字) + 工具调用列表 + 截断提示
+
+新增配置和字段：
+- `SubagentPluginOptions.maxResultLength`（缺省 2000 字符）
+- `SubagentToolOutput.summarized`（布尔，标记是否被摘要）
+- `SubagentToolOutput.toolCallCount`（子 Agent 内部工具调用次数）
+- `renderResult` 输出也包含 `summarized` 和 `toolCallCount`
+
+摘要格式示例：
+```
+这是子 Agent 的前 500 字回复...
+
+[工具调用摘要（3 次调用）]
+- read_file: /src/foo.ts
+- bash: npm test
+- bash: false [错误]
+
+[完整回复 3000 字符已截断为摘要]
+```
+
+#### 2. 测试
+
+- 8 个新增单元测试（[packages/plugins/subagent/src/index.test.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.test.ts) 工具调用摘要测试块）
+- 覆盖：短结果不摘要 / 长结果摘要+工具调用列表 / 错误工具标记 / maxResultLength 可配置 / 无工具调用仅截断文本 / renderResult 新字段 / summarizeToolInput 按类型提取 / bash 长命令截断到 80 字符
+- **subagent 包：41 pass / 0 fail / 154 assertions**
+- 全量 typecheck：22 个包全绿
+
+## 2026-08-23（续 2）：Subagent 实时进度推送（Bus 事件）
+
+### 今日完成
+
+在 Subagent 基础插件（独立 session + 递归白名单 + description/model/sessionId/parentId）完成后，实现 Subagent Bus 事件推送功能，让父 Agent / CLI / TUI 能实时感知子 Agent 执行进度。
+
+#### 1. 模块开发
+
+**@harness/subagent — Bus 事件推送**（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）
+
+定义 3 个类型安全的 Bus 事件（`SubagentEvents`）：
+- `subagent.started` — 子 Agent 开始执行（agentId, agentName, subSessionId, parentSessionId, parentAgentId, parentMessageId, toolUseId, prompt, description, isContinuation, startedAt）
+- `subagent.completed` — 子 Agent 完成（agentId, subSessionId, parentSessionId, toolUseId, replyPreview, messageCount, durationMs）
+- `subagent.failed` — 子 Agent 失败（agentId?, subSessionId?, parentSessionId, toolUseId, code, message, durationMs）
+
+关键设计：
+- `HarnessLike` 接口扩展 `bus?: Bus`，在 `harness.start` hook 中自动获取（`HarnessImpl.bus` 是 public 字段）
+- `call()` 方法在 6 个关键节点发布事件：HARNESS_NOT_READY / AGENT_NOT_FOUND / INVALID_AGENT_MODE / SESSION_NOT_FOUND / SESSION_CREATE_FAILED / SUBAGENT_FAILED → `failed`；session 创建后 → `started`；成功 → `completed`
+- `publishFailed` 闭包封装避免重复代码，`bus.publish().catch()` 确保事件发布失败不影响主流程
+- 长 prompt 截断到 500 字符，长 reply 截断到 200 字符（均加 `...` 后缀）
+- 增强 harness 健壮性检查：`!harness || !harness.agent || !harness.session` 统一返回 HARNESS_NOT_READY
+
+#### 2. 测试
+
+- 10 个新增单元测试（[packages/plugins/subagent/src/index.test.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.test.ts) Bus 事件测试块）
+- 覆盖：成功执行 started+completed / 续接 session isContinuation=true / Agent 未注册 failed / Harness 未就绪 failed / 超时 started+failed / 无 bus 正常工作 / 长 reply 截断 / 长 prompt 截断 / SUBAGENT_FAILED 含 subSessionId
+- **subagent 包：33 pass / 0 fail / 122 assertions**
+- 全量 typecheck：22 个包全绿
+
 ## 2026-08-22（续）：会话管理增强 + CLI 扩展 + MCP Client 插件
 
 ### 今日完成
@@ -305,11 +510,16 @@ CLI 斜杠命令：
 
 #### 剩余待办
 
-| 优先级 | 方向 | 说明 |
-|---|---|---|
-| **P2** | Subagent 插件 | `AgentTool` + `runAgent()`，支持子 Agent 嵌套调用 |
-| **P2** | Skill Layer | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project） |
-| **P2** | Provider 补全 | Gemini / 通义 / 智谱 等多模型适配 |
-| **P3** | TUI 形态 | 基于终端 UI 的富交互（类似 Claude Code TUI） |
-| **P3** | Swarm 协作 | Team + Mailbox + Task List + 权限桥接（多 Agent 协作） |
-| **P3** | OAuth2 PKCE | 完整 OAuth2 授权码流程（回调服务器 + token 刷新），用于对接 OAuth2-protected MCP Server |
+| 优先级 | 能力 | 说明 | 状态 |
+|---|---|---|---|
+| **P2** | ~~Subagent 实时进度推送（Bus 事件）~~ | ~~子 Agent 执行过程中通过 Bus 发布进度事件（工具调用开始/结束、中间文本），父 Agent / CLI 可订阅展示~~ ✅ 完成（08-23，3 个事件：started/completed/failed + 10 个单元测试） | ✅ |
+| **P2** | ~~Subagent 工具调用摘要~~ | ~~子 Agent 内部工具调用链过长时生成摘要后返回父 Agent，避免上下文膨胀~~ ✅ 完成（08-23，summarizeResult + 8 个单元测试） | ✅ |
+| **P2** | 基于 caller.permission 过滤 Agent | 根据调用者（父 Agent / 用户）的权限动态过滤可用子 Agent 列表，权限不足的子 Agent 不在 `/subagents` 列出 | 待做 |
+| **P2** | 配置文件加载 Agent | 从配置文件（如 `.harness/agents.yaml` 或 `harness.config.ts`）加载 Agent 定义，支持运行时动态注册子 Agent | 待做 |
+| **P2** | Skill Layer | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project） | 待做 |
+| ~~**P2**~~ | ~~Provider 补全~~ | ~~Gemini / 通义 / 智谱 等多模型适配~~ ✅ 完成（08-23，Gemini 独立实现 + Qwen/GLM 复用 OpenAIChatProvider） | ✅ |
+| **P3** | Subagent run_in_background | 子 Agent 后台异步执行，父 Agent 不阻塞等待，通过 Bus 事件或轮询获取结果 | 待做 |
+| **P3** | Subagent git worktree 隔离 | 子 Agent 在独立 git worktree 中执行，避免与父 Agent 工作区冲突 | 待做 |
+| **P3** | Swarm teammate | Team + Mailbox + Task List + 权限桥接（多 Agent 协作） | 待做 |
+| **P3** | TUI 形态 | 基于终端 UI 的富交互（类似 Claude Code TUI） | 待做 |
+| **P3** | OAuth2 PKCE | 完整 OAuth2 授权码流程（回调服务器 + token 刷新），用于对接 OAuth2-protected MCP Server | 待做 |

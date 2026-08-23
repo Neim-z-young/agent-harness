@@ -174,6 +174,10 @@ import {
 import type {
   AgentDefinition,
 } from '@harness/agent'
+import { agentFromMarkdown } from '@harness/agent'
+import { createSkillManager, formatSkillForPrompt, type SkillManager, type Skill, type SkillSource } from '@harness/skill'
+import { readdirSync, readFileSync, existsSync } from 'node:fs'
+import { join, basename, extname } from 'node:path'
 import type {
   PermissionRuleset,
   PermissionEngine,
@@ -1446,6 +1450,19 @@ export interface AgentHarnessOptions {
   defaultAgentId?: string
   /** 初始 Agent 定义列表（默认注册） */
   agents?: AgentDefinition[]
+  /**
+   * Agent 配置文件目录列表（从 .harness/agents/ 等目录加载 Markdown Agent 定义）
+   * 每个目录扫描 *.md 文件，解析 frontmatter + body 为 AgentDefinition 并注册。
+   * 加载顺序：options.agents 先注册，然后 agentDirs 中的 Agent（同 ID 后加载覆盖先加载）
+   *
+   * 支持两种形式：
+   * - 字符串：目录路径（缺省按 project 来源处理）
+   * - 对象：`{ dir: string, source?: 'user' | 'project' }` 显式指定来源
+   *
+   * 多级加载：建议 user 目录在前，project 目录在后，project 覆盖 user
+   * 例：`[{ dir: '~/.harness/agents', source: 'user' }, '.harness/agents']`
+   */
+  agentDirs?: Array<string | { dir: string; source?: 'user' | 'project' }>
   /** 内置插件列表（随 create 阶段 loadInternal） */
   internalPlugins?: AgentPlugin[]
   /** 默认插件 npm spec（会走 loadBuiltin，支持测试注入 dynamicImport） */
@@ -1456,6 +1473,22 @@ export interface AgentHarnessOptions {
   config?: Record<string, unknown>
   /** 是否启用 Skill 系统（MVP 留占位） */
   enableSkills?: boolean
+  /**
+   * Skill 配置文件目录列表（从 .harness/skills/ 等目录加载 SKILL.md）
+   * 支持两种目录结构：
+   * - skill-name/SKILL.md（目录形式，Claude Code 风格）
+   * - skill-name.md（单文件形式）
+   * Skill 通过 agent.skills 白名单注入到 system prompt
+   *
+   * 支持两种形式：
+   * - 字符串：目录路径（缺省按 project 来源处理）
+   * - 对象：`{ dir: string, source?: SkillSource }` 显式指定来源
+   *
+   * 多级加载：建议 user 目录在前，project 目录在后，project 覆盖 user。
+   * MCP 来源一般不走文件目录，建议通过插件用 register() 注册。
+   * 例：`[{ dir: '~/.harness/skills', source: 'user' }, '.harness/skills']`
+   */
+  skillDirs?: Array<string | { dir: string; source?: SkillSource }>
   /** 可选：自定义 ChatProvider 注入（若无则安装 Provider 插件后才可用） */
   chatProvider?: ChatProvider
   /** 可选：自定义 PermissionEngine（无则 DefaultPermissionEngine，默认 ask→deny） */
@@ -1490,6 +1523,8 @@ export class HarnessImpl implements Harness {
   public readonly plugin: PluginManager
   public readonly session: SessionManager
   public readonly agent: AgentRuntime
+  /** Skill 管理器（从 skillDirs 加载，通过 prompt.system.transform 注入） */
+  public skillManager?: SkillManager
 
   private chatProvider: ChatProvider
   private started = false
@@ -1574,8 +1609,42 @@ export class HarnessImpl implements Harness {
       cwd: options.cwd ?? process.cwd(),
     })
     ;(options.agents ?? []).forEach((a) => agentImpl.register(a))
+
+    // 从配置文件目录加载 Agent（支持多级来源：user → project，后加载覆盖先加载）
+    // 参考 Claude Code loadAgentsDir 和 OpenCode config.ts loadAgent 逻辑
+    for (const entry of options.agentDirs ?? []) {
+      const dirPath = typeof entry === 'string' ? entry : entry.dir
+      // source 仅用于日志，AgentDefinition 没有 loadedFrom 字段
+      // （多级覆盖通过加载顺序保证，user 在前 project 在后）
+      const cwd = this.options.cwd ?? process.cwd()
+      const resolvedDir = join(cwd, dirPath)
+      if (!existsSync(resolvedDir)) continue
+      try {
+        const entries = readdirSync(resolvedDir, { withFileTypes: true })
+        for (const fileEntry of entries) {
+          if (!fileEntry.isFile() || extname(fileEntry.name) !== '.md') continue
+          const filePath = join(resolvedDir, fileEntry.name)
+          try {
+            const content = readFileSync(filePath, 'utf-8')
+            // 文件名（不含扩展名）作为 fallbackId
+            const fallbackId = basename(fileEntry.name, '.md')
+            const def = agentFromMarkdown(content, fallbackId)
+            agentImpl.register(def)
+          } catch (err) {
+            this.options.logger?.warn?.(`Agent 配置文件加载失败: ${filePath}: ${(err as Error)?.message ?? err}`)
+          }
+        }
+      } catch (err) {
+        this.options.logger?.warn?.(`Agent 目录扫描失败: ${resolvedDir}: ${(err as Error)?.message ?? err}`)
+      }
+    }
+
     this.agent = agentImpl
     agentRuntime = agentImpl
+
+    // SkillManager 实例化（从 skillDirs 异步加载放到 init() 中，避免构造函数里 await）
+    this.skillManager = createSkillManager()
+
     // 防止 _self 被 tree-shaking 判定为未使用（真实运行中无用，仅满足 lint）
     void _self
   }
@@ -1588,6 +1657,56 @@ export class HarnessImpl implements Harness {
       if (this.options.internalPlugins?.length) await this.plugin.loadInternal(this.options.internalPlugins)
       if (this.options.builtinPlugins?.length) await this.plugin.loadBuiltin(this.options.builtinPlugins)
       if (this.options.userPlugins?.length) await this.plugin.loadUser(this.options.userPlugins)
+
+      // Skill 注入插件：在 prompt.system.transform Hook 中注入匹配的 Skill 内容
+      // 参考 Claude Code 的 Skill 注入机制：agent.skills 白名单中的 Skill 自动注入到 system prompt
+      if (this.skillManager) {
+        // 1. 从 skillDirs 异步加载 SKILL.md（构造函数中不能 await，故延迟到 init）
+        //    多级来源：按 skillDirs 数组顺序加载，后加载覆盖先加载（user → project）
+        //    支持 string（缺省 project）和 {dir, source} 对象形式
+        const cwd = this.options.cwd ?? process.cwd()
+        for (const entry of this.options.skillDirs ?? []) {
+          const dirPath = typeof entry === 'string' ? entry : entry.dir
+          const sourceTag = typeof entry === 'string' ? 'project' : (entry.source ?? 'project')
+          const resolvedDir = join(cwd, dirPath)
+          if (!existsSync(resolvedDir)) continue
+          try {
+            await this.skillManager.load(resolvedDir, sourceTag)
+          } catch (err) {
+            this.options.logger?.warn?.(`Skill 目录加载失败: ${resolvedDir} (source=${sourceTag}): ${(err as Error)?.message ?? err}`)
+          }
+        }
+
+        // 2. 仅当有 Skill 加载成功时才注册注入插件（避免空 Hook）
+        if (this.skillManager.all().length > 0) {
+          const skillManager = this.skillManager
+          const agentAccessor = this.agent
+          await this.plugin.loadInternal([{
+            id: 'core.skill-injection',
+            version: '0.1.0',
+            name: 'Skill 注入',
+            description: '将 agent.skills 白名单中的 Skill 通过 prompt.system.transform 注入到 system prompt',
+            async install() {
+              return {
+                async 'prompt.system.transform'(
+                  input: { agentId: string; sessionId: string },
+                  parts: string[],
+                ) {
+                  const agent = agentAccessor.get(input.agentId)
+                  if (!agent?.skills || agent.skills.length === 0) return
+                  // 注入白名单中的 Skill（参考 Claude Code getPromptForCommand）
+                  for (const skillId of agent.skills) {
+                    const skill = skillManager.get(skillId)
+                    if (skill) {
+                      parts.push(formatSkillForPrompt(skill))
+                    }
+                  }
+                },
+              } as import('@harness/plugin').Hooks
+            },
+          }])
+        }
+      }
 
       // harness.init Hook（给插件最后一次修改 context/tool 机会）
       const initIn: PluginHarnessInitInput = { harnessOptions: this.options }

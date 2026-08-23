@@ -15,7 +15,8 @@
     "@harness/plugin": "workspace:*",
     "@harness/agent": "workspace:*",
     "@harness/session": "workspace:*",
-    "@harness/bus": "workspace:*"
+    "@harness/bus": "workspace:*",
+    "@harness/permission": "workspace:*"
   },
   "scripts": {
     "dev": "tsc --noEmit --watch",
