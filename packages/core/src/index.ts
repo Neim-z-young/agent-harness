@@ -478,6 +478,7 @@ export class DefaultSessionManager implements SessionManager {
       agentId: options?.agentId,
       messages: [],
       cwd: options?.cwd,
+      parentId: options?.parentId,
       meta: options?.meta,
     }
     this.sessions.set(id, sess)
@@ -985,6 +986,8 @@ export interface AgentQueryInput {
   sessionId: string
   agentId?: string
   message: string
+  /** 模型覆盖（SubagentTool 派出子 Agent 时可指定模型，优先级高于 agent 定义） */
+  model?: { providerId?: string; modelId?: string; temperature?: number }
 }
 
 export interface AgentRuntime {
@@ -1107,13 +1110,14 @@ export class AgentRuntimeImpl implements AgentRuntime {
     finalMessages.push(...session2.messages)
 
     // LLM params + headers（触发 llm.params / llm.headers hooks）
+    // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
     const llmIn: LLMInput = {
-      providerId: agent.model?.providerId ?? 'default',
-      modelId: agent.model?.modelId,
+      providerId: input.model?.providerId ?? agent.model?.providerId ?? 'default',
+      modelId: input.model?.modelId ?? agent.model?.modelId,
       messages: finalMessages,
     }
     const params: LLMParams = {
-      temperature: agent.model?.temperature ?? 0.7,
+      temperature: input.model?.temperature ?? agent.model?.temperature ?? 0.7,
       ...(agent.model?.options ?? {}),
     }
     const headers: Record<string, string> = {}
@@ -1239,13 +1243,14 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
     finalMessages.push(...session2.messages)
 
+    // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
     const llmIn: LLMInput = {
-      providerId: agent.model?.providerId ?? 'default',
-      modelId: agent.model?.modelId,
+      providerId: input.model?.providerId ?? agent.model?.providerId ?? 'default',
+      modelId: input.model?.modelId ?? agent.model?.modelId,
       messages: finalMessages,
     }
     const params: LLMParams = {
-      temperature: agent.model?.temperature ?? 0.7,
+      temperature: input.model?.temperature ?? agent.model?.temperature ?? 0.7,
       ...(agent.model?.options ?? {}),
     }
     const headers: Record<string, string> = {}

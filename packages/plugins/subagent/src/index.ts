@@ -46,6 +46,12 @@ export interface SubagentToolInput {
   agentId: string
   /** 派给子 Agent 的任务描述 */
   prompt: string
+  /** 3-5 词简短描述（用于 UI 展示和工具调用日志，类似 Claude Code 的 description 参数） */
+  description?: string
+  /** 模型覆盖（优先级高于子 Agent 定义中的 model；不传则用子 Agent 自身配置） */
+  model?: { providerId?: string; modelId?: string; temperature?: number }
+  /** 续接已有子 session（多轮子 Agent 对话）；不传则创建新 session */
+  sessionId?: string
 }
 
 /** SubagentTool 的输出 */
@@ -121,8 +127,8 @@ export function createSubagentTool(
   return defineTool<SubagentToolInput, SubagentToolOutput>({
     id: 'subagent',
     aliases: ['agent', 'run_agent', 'task'],
-    description: '派一个子 Agent 执行独立任务（隔离 session）。输入 agentId（子 Agent ID）和 prompt（任务描述）。',
-    documentation: 'SubagentTool 让主 Agent 能派出子 Agent 执行独立任务。子 Agent 用独立 session 隔离上下文，有独立的工具白名单和权限配置。子 Agent 完成后，最终回复作为工具结果返回给主 Agent。',
+    description: '派一个子 Agent 执行独立任务（隔离 session）。输入：agentId（子 Agent ID）、prompt（任务描述）、description（3-5 词简短描述，可选）、model（模型覆盖，可选）、sessionId（续接已有子 session，可选）。',
+    documentation: 'SubagentTool 让主 Agent 能派出子 Agent 执行独立任务。子 Agent 用独立 session 隔离上下文，有独立的工具白名单和权限配置。可选通过 model 参数覆盖子 Agent 的模型配置，通过 sessionId 参数续接已有子 session 实现多轮对话。子 Agent 完成后，最终回复作为工具结果返回给主 Agent。',
     searchHint: 'subagent agent task delegate spawn worker',
 
     // Fail-Closed 安全声明
@@ -169,23 +175,37 @@ export function createSubagentTool(
         }
       }
 
-      // 创建子 session（隔离上下文）
+      // 子 session：input.sessionId 有值则续接（多轮子 Agent 对话），无值则创建新 session
       let subSessionId: string
-      try {
-        const title = input.prompt.length > 60 ? input.prompt.slice(0, 60) + '...' : input.prompt
-        const subSession = await session.create({ title })
-        subSessionId = subSession.id
-      } catch (err) {
-        return {
-          ok: false,
-          error: {
-            message: `创建子 session 失败：${(err as Error)?.message ?? err}`,
-            code: 'SESSION_CREATE_FAILED',
-          },
+      if (input.sessionId) {
+        // 续接已有子 session
+        const existing = await session.get(input.sessionId)
+        if (!existing) {
+          return {
+            ok: false,
+            error: { message: `子 session "${input.sessionId}" 不存在`, code: 'SESSION_NOT_FOUND' },
+          }
+        }
+        subSessionId = input.sessionId
+      } else {
+        // 创建新子 session（隔离上下文，关联父 session 便于审计追溯）
+        try {
+          const title = input.description
+            ?? (input.prompt.length > 60 ? input.prompt.slice(0, 60) + '...' : input.prompt)
+          const subSession = await session.create({ title, parentId: ctx.sessionId })
+          subSessionId = subSession.id
+        } catch (err) {
+          return {
+            ok: false,
+            error: {
+              message: `创建子 session 失败：${(err as Error)?.message ?? err}`,
+              code: 'SESSION_CREATE_FAILED',
+            },
+          }
         }
       }
 
-      // 带超时调用 agent.query
+      // 带超时调用 agent.query（传入 model 覆盖）
       const controller = new AbortController()
       const timer = setTimeout(() => controller.abort(), timeoutMs)
 
@@ -195,6 +215,7 @@ export function createSubagentTool(
           sessionId: subSessionId,
           agentId: input.agentId,
           message: input.prompt,
+          model: input.model,
         })
 
         const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -243,7 +264,10 @@ export function createSubagentTool(
 
     renderUse: (input) => ({
       agentId: input.agentId,
+      description: input.description,
       prompt: input.prompt.length > 100 ? input.prompt.slice(0, 100) + '...' : input.prompt,
+      model: input.model?.modelId,
+      sessionId: input.sessionId,
     }),
     renderResult: (result) => {
       if (!result.ok || !result.output) return undefined

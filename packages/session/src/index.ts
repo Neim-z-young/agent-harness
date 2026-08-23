@@ -176,6 +176,8 @@ export interface Session {
   messages: Message[]
   /** 工作目录 */
   cwd?: string
+  /** 父会话 ID（子 Agent 派生时关联，便于审计追溯） */
+  parentId?: string
   /**
    * 元数据（推荐使用 `CompactionMeta` / `CompactMemory` 约定：
    *   - meta[COMPACT_META_KEY]: CompactionMeta
@@ -192,6 +194,8 @@ export interface SessionCreateOptions {
   agentId?: string
   cwd?: string
   meta?: Record<string, unknown>
+  /** 父会话 ID（子 Agent 派生时关联，便于审计追溯） */
+  parentId?: string
 }
 
 /** 列表查询选项 */
