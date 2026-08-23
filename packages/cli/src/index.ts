@@ -384,11 +384,22 @@ export class HarnessApp {
     if (this.options.extraPlugins?.length) providerPlugins.push(...this.options.extraPlugins)
 
     // 创建 Harness
+    const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
     const harness = await createHarness({
       cwd: this.options.cwd,
       defaultAgentId: this.options.agentId,
       internalPlugins: providerPlugins,
       agents: [this.defaultAgent(), ...(this.options.agents ?? [])],
+      // Agent 多级加载：user 全局目录在前，project 项目目录在后（后者覆盖前者）
+      agentDirs: [
+        { dir: join(home, '.harness', 'agents'), source: 'user' },
+        '.harness/agents',
+      ],
+      // Skill 多级加载：user 全局目录在前，project 项目目录在后（后者覆盖前者）
+      skillDirs: [
+        { dir: join(home, '.harness', 'skills'), source: 'user' },
+        '.harness/skills',
+      ],
       permission: perm,
       logger: {
         info: (msg, meta) => this.options.verbose

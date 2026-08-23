@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "双轨技能系统（Markdown 知识 + 内嵌 Shell），三来源合并 + paths 条件触发",
   "type": "module",
+  "dependencies": {
+    "@harness/permission": "workspace:*"
+  },
   "exports": {
     ".": {
       "types": "./src/index.ts",

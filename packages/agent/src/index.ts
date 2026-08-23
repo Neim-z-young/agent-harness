@@ -134,3 +134,287 @@ export interface AgentDefinition {
   /** Swarm 协作能力声明 */
   swarm?: SwarmCapabilities
 }
+
+// ===== 从 Markdown 配置文件加载 Agent =====
+
+/**
+ * Frontmatter 解析结果
+ */
+export interface ParsedMarkdown {
+  /** YAML frontmatter 解析结果 */
+  frontmatter: Record<string, unknown>
+  /** Markdown body（frontmatter 之后的正文） */
+  body: string
+}
+
+/**
+ * 解析 Markdown 文件的 YAML frontmatter 和 body。
+ *
+ * 参考 Claude Code `frontmatterParser.ts` 和 OpenCode 的 agent 配置加载。
+ * 支持简化的 YAML 语法：
+ * - `key: value`（标量：字符串/数字/布尔值）
+ * - `key:\n  - item`（列表）
+ * - `key:\n  nested: value`（嵌套对象）
+ * - `key: [a, b]`（内联列表）
+ * - `key: "quoted"`（引号字符串，去除引号）
+ *
+ * @param content Markdown 文件内容
+ * @returns { frontmatter, body }
+ */
+export function parseFrontmatter(content: string): ParsedMarkdown {
+  const fmMatch = content.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/)
+  if (!fmMatch) {
+    return { frontmatter: {}, body: content }
+  }
+  const yamlBlock = fmMatch[1]
+  const body = fmMatch[2]
+  const frontmatter = parseSimpleYaml(yamlBlock)
+  return { frontmatter, body }
+}
+
+/**
+ * 简化 YAML 解析器（自包含，无外部依赖）。
+ * 支持标量、列表、嵌套对象、内联列表。
+ */
+function parseSimpleYaml(yaml: string): Record<string, unknown> {
+  const lines = yaml.split('\n').map((l) => l.replace(/\r$/, ''))
+  const result: Record<string, unknown> = {}
+  let i = 0
+
+  while (i < lines.length) {
+    const line = lines[i]
+    // 跳过空行和注释
+    if (!line.trim() || line.trim().startsWith('#')) {
+      i++
+      continue
+    }
+
+    const m = line.match(/^(\s*)(['"]?[\w*-]+['"]?):\s*(.*)$/)
+    if (!m) {
+      i++
+      continue
+    }
+
+    const indent = m[1].length
+    const key = m[2].replace(/^['"]|['"]$/g, '')
+    const value = m[3].trim()
+
+    if (indent > 0) {
+      // 顶层解析器忽略缩进行（由嵌套处理逻辑消费）
+      i++
+      continue
+    }
+
+    if (value === '') {
+      // 可能是列表或嵌套对象
+      const { parsed, nextIdx } = parseBlock(lines, i + 1, 2)
+      result[key] = parsed
+      i = nextIdx
+      continue // parseBlock 已返回下一个未消费行索引，跳过 i++
+    } else if (value.startsWith('[') && value.endsWith(']')) {
+      // 内联列表：[a, b, c]
+      result[key] = value.slice(1, -1).split(',').map((s) => parseScalar(s.trim()))
+    } else if (value.startsWith('{') && value.endsWith('}')) {
+      // 内联对象：{key: value}（简化，不常用）
+      result[key] = parseInlineObject(value)
+    } else {
+      // 标量
+      result[key] = parseScalar(value)
+    }
+    i++
+  }
+
+  return result
+}
+
+/** 解析缩进块（列表或嵌套对象） */
+function parseBlock(
+  lines: string[],
+  startIdx: number,
+  expectedIndent: number,
+): { parsed: unknown; nextIdx: number } {
+  // 检查第一个非空行是列表项还是 key-value
+  let idx = startIdx
+  while (idx < lines.length && !lines[idx].trim()) idx++
+  if (idx >= lines.length) return { parsed: [], nextIdx: idx }
+
+  const firstLine = lines[idx]
+  const firstIndent = firstLine.length - firstLine.trimStart().length
+
+  if (firstLine.trim().startsWith('- ')) {
+    // 列表
+    const items: unknown[] = []
+    while (idx < lines.length) {
+      const line = lines[idx]
+      if (!line.trim()) {
+        idx++
+        continue
+      }
+      const indent = line.length - line.trimStart().length
+      if (indent < firstIndent) break
+      const itemMatch = line.match(/^\s*-\s+(.*)$/)
+      if (!itemMatch) break
+      const itemValue = itemMatch[1].trim()
+      if (itemValue === '') {
+        // 列表项是嵌套对象
+        const { parsed, nextIdx } = parseBlock(lines, idx + 1, firstIndent + 2)
+        items.push(parsed)
+        idx = nextIdx
+      } else {
+        items.push(parseScalar(itemValue))
+      }
+      idx++
+    }
+    return { parsed: items, nextIdx: idx }
+  }
+
+  // 嵌套对象
+  const obj: Record<string, unknown> = {}
+  while (idx < lines.length) {
+    const line = lines[idx]
+    if (!line.trim()) {
+      idx++
+      continue
+    }
+    const indent = line.length - line.trimStart().length
+    if (indent < firstIndent) break
+    const kvMatch = line.match(/^\s*(['"]?[\w*-]+['"]?):\s*(.*)$/)
+    if (!kvMatch) break
+    const k = kvMatch[1].replace(/^['"]|['"]$/g, '')
+    const v = kvMatch[2].trim()
+    if (v === '') {
+      const { parsed, nextIdx } = parseBlock(lines, idx + 1, firstIndent + 2)
+      obj[k] = parsed
+      idx = nextIdx
+    } else if (v.startsWith('[') && v.endsWith(']')) {
+      obj[k] = v.slice(1, -1).split(',').map((s) => parseScalar(s.trim()))
+    } else {
+      obj[k] = parseScalar(v)
+    }
+    idx++
+  }
+  return { parsed: obj, nextIdx: idx }
+}
+
+/** 解析标量值：去除引号，转换布尔值/数字 */
+function parseScalar(s: string): unknown {
+  if (!s) return ''
+  // 去除引号
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) {
+    return s.slice(1, -1)
+  }
+  // 布尔值
+  if (s === 'true') return true
+  if (s === 'false') return false
+  if (s === 'null' || s === '~') return undefined
+  // 数字
+  if (/^-?\d+$/.test(s)) return parseInt(s, 10)
+  if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s)
+  return s
+}
+
+/** 解析内联对象 {key: value, key2: value2} */
+function parseInlineObject(s: string): Record<string, unknown> {
+  const inner = s.slice(1, -1).trim()
+  if (!inner) return {}
+  const obj: Record<string, unknown> = {}
+  for (const pair of inner.split(',')) {
+    const colonIdx = pair.indexOf(':')
+    if (colonIdx === -1) continue
+    const k = pair.slice(0, colonIdx).trim()
+    const v = pair.slice(colonIdx + 1).trim()
+    obj[k] = parseScalar(v)
+  }
+  return obj
+}
+
+/**
+ * 从 Markdown 配置文件内容构建 AgentDefinition。
+ *
+ * frontmatter 字段映射到 AgentDefinition 的字段：
+ * - id, name, description, icon, tags, mode, tools, skills, subagents
+ * - permission, model
+ * - body（Markdown 正文）→ promptFragments[0]
+ *
+ * 必填字段缺失时抛错（id, name, mode, tools, permission）。
+ *
+ * @param content Markdown 文件内容
+ * @param fallbackId 如果 frontmatter 无 id，用此值（如文件名）
+ * @returns AgentDefinition
+ */
+export function agentFromMarkdown(content: string, fallbackId?: string): AgentDefinition {
+  const { frontmatter, body } = parseFrontmatter(content)
+
+  const id = String(frontmatter.id ?? fallbackId ?? '')
+  const name = String(frontmatter.name ?? id)
+  const mode = String(frontmatter.mode ?? 'subagent') as AgentMode
+  const description = String(frontmatter.description ?? '')
+
+  if (!id) {
+    throw new Error('Agent 配置文件缺少 id（frontmatter.id 或 fallbackId）')
+  }
+
+  // tools: 支持 ['*'] 或 string[]
+  const toolsRaw = frontmatter.tools
+  const tools: string[] | ['*'] = Array.isArray(toolsRaw)
+    ? toolsRaw.map(String)
+    : typeof toolsRaw === 'string' && toolsRaw === '*'
+      ? ['*']
+      : []
+
+  // permission: 简写 'allow'/'deny'/'ask' → { '*': value }
+  // 或详细对象 { read: 'allow', write: 'ask', '*': 'deny' }
+  const permRaw = frontmatter.permission
+  let permission: AgentPermissionConfig
+  if (typeof permRaw === 'string') {
+    permission = { '*': permRaw as PermissionBehavior }
+  } else if (permRaw && typeof permRaw === 'object') {
+    permission = permRaw as AgentPermissionConfig
+  } else {
+    permission = { '*': 'ask' }
+  }
+
+  // model
+  const modelRaw = frontmatter.model as Record<string, unknown> | undefined
+  const model = modelRaw && typeof modelRaw === 'object'
+    ? {
+        providerId: modelRaw.providerId ? String(modelRaw.providerId) : undefined,
+        modelId: modelRaw.modelId ? String(modelRaw.modelId) : undefined,
+        temperature: typeof modelRaw.temperature === 'number' ? modelRaw.temperature : undefined,
+      }
+    : undefined
+
+  // tags
+  const tags = Array.isArray(frontmatter.tags) ? frontmatter.tags.map(String) : undefined
+
+  // skills
+  const skills = Array.isArray(frontmatter.skills) ? frontmatter.skills.map(String) : undefined
+
+  // subagents
+  const subagents = Array.isArray(frontmatter.subagents) ? frontmatter.subagents.map(String) : undefined
+
+  // icon
+  const icon = frontmatter.icon ? String(frontmatter.icon) : undefined
+
+  // promptFragments：body 作为第一个片段
+  const bodyText = body.trim()
+  const promptFragments = bodyText ? [bodyText] : undefined
+
+  const def: AgentDefinition = {
+    id,
+    name,
+    description,
+    mode,
+    tools,
+    permission,
+  }
+
+  if (icon) def.icon = icon
+  if (tags) def.tags = tags
+  if (skills) def.skills = skills
+  if (subagents) def.subagents = subagents
+  if (model) def.model = model
+  if (promptFragments) def.promptFragments = promptFragments
+
+  return def
+}
