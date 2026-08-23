@@ -22,7 +22,7 @@ function makeMessage(role: 'user' | 'assistant', text: string): Message {
   }
 }
 
-function createMockAgentRuntime(agents: AgentDefinition[], queryImpl?: (input: { sessionId: string; agentId?: string; message: string }) => Promise<Message>): AgentRuntime {
+function createMockAgentRuntime(agents: AgentDefinition[], queryImpl?: (input: { sessionId: string; agentId?: string; message: string; model?: { providerId?: string; modelId?: string; temperature?: number } }) => Promise<Message>): AgentRuntime {
   const agentMap = new Map(agents.map((a) => [a.id, a]))
   return {
     register: (def: AgentDefinition) => { agentMap.set(def.id, def) },
@@ -35,7 +35,7 @@ function createMockAgentRuntime(agents: AgentDefinition[], queryImpl?: (input: {
 
 function createMockSessionManager(sessions: Map<string, Session>): SessionManager {
   return {
-    create: async (options?: { title?: string }) => {
+    create: async (options?: { title?: string; parentId?: string }) => {
       const id = `s_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
       const session: Session = {
         id,
@@ -43,6 +43,7 @@ function createMockSessionManager(sessions: Map<string, Session>): SessionManage
         messages: [],
         createdAt: Date.now(),
         updatedAt: Date.now(),
+        parentId: options?.parentId,
       }
       sessions.set(id, session)
       return session
@@ -230,6 +231,133 @@ describe('SubagentTool', () => {
     expect(rendered.sessionId).toBe('s_1')
     expect(rendered.preview.length).toBeLessThan(300)
     expect(rendered.preview).toInclude('...')
+  })
+
+  // ===== Phase 1 新增测试 =====
+
+  it('description 参数用作 session title', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const s = sessions.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('assistant', 'done')) }
+      return makeMessage('assistant', 'done')
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false)
+    const res = await tool.call(
+      { agentId: 'coder', prompt: '重构', description: 'Refactor foo' },
+      makeToolContext(),
+    )
+
+    expect(res.ok).toBe(true)
+    const created = sessions.get(res.output!.sessionId)
+    expect(created?.title).toBe('Refactor foo')
+  })
+
+  it('model 覆盖传给 agent.query', async () => {
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    let capturedModel: unknown = undefined
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      capturedModel = input.model
+      const s = sessionsRef.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('assistant', 'ok')) }
+      return makeMessage('assistant', 'ok')
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false)
+    await tool.call(
+      { agentId: 'coder', prompt: 'test', model: { modelId: 'gpt-4o', temperature: 0.1 } },
+      makeToolContext(),
+    )
+
+    expect(capturedModel).toEqual({ modelId: 'gpt-4o', temperature: 0.1 })
+  })
+
+  it('sessionId 续接已有子 session', async () => {
+    const sessions = new Map<string, Session>()
+    // 预先创建一个子 session
+    const session = createMockSessionManager(sessions)
+    const existing = await session.create({ title: 'existing sub' })
+    existing.messages.push(makeMessage('user', '第一轮'))
+    existing.messages.push(makeMessage('assistant', '第一轮回复'))
+
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const s = sessionsRef.get(input.sessionId)!
+      s.messages.push(makeMessage('user', input.message))
+      const msg = makeMessage('assistant', '第二轮回复')
+      s.messages.push(msg)
+      return msg
+    })
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false)
+    const res = await tool.call(
+      { agentId: 'coder', prompt: '第二轮', sessionId: existing.id },
+      makeToolContext(),
+    )
+
+    expect(res.ok).toBe(true)
+    expect(res.output!.sessionId).toBe(existing.id)
+    expect(res.output!.message).toBe('第二轮回复')
+    expect(res.output!.messageCount).toBe(4) // 2 轮 × 2 条
+  })
+
+  it('sessionId 不存在时返回 SESSION_NOT_FOUND', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async () => makeMessage('assistant', 'x'))
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false)
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'test', sessionId: 'nonexistent' },
+      makeToolContext(),
+    )
+
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('SESSION_NOT_FOUND')
+  })
+
+  it('新创建的子 session 关联 parentId', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const s = sessions.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('assistant', 'done')) }
+      return makeMessage('assistant', 'done')
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false)
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'test' },
+      makeToolContext({ sessionId: 'parent-session-123' }),
+    )
+
+    expect(res.ok).toBe(true)
+    const created = sessions.get(res.output!.sessionId)
+    expect(created?.parentId).toBe('parent-session-123')
+  })
+
+  it('renderUse 包含 description/model/sessionId', () => {
+    const tool = createSubagentTool(() => undefined, 5000, false)
+    const rendered = tool.renderUse!({
+      agentId: 'coder',
+      prompt: 'test',
+      description: 'Refactor foo',
+      model: { modelId: 'gpt-4o' },
+      sessionId: 's_existing',
+    }) as any
+    expect(rendered.agentId).toBe('coder')
+    expect(rendered.description).toBe('Refactor foo')
+    expect(rendered.model).toBe('gpt-4o')
+    expect(rendered.sessionId).toBe('s_existing')
   })
 })
 
