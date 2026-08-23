@@ -34,6 +34,8 @@ export interface OpenAIProviderConfig {
   apiKey?: string
   /** API 根路径（默认 https://api.openai.com，可指向 Azure / 本地代理） */
   baseUrl?: string
+  /** API 路径（默认 /v1/chat/completions；智谱等兼容 API 可改为 /chat/completions） */
+  apiPath?: string
   /** 默认模型（默认 gpt-4o-mini） */
   defaultModel?: string
   /** max_tokens 默认值（默认 4096） */
@@ -44,6 +46,8 @@ export interface OpenAIProviderConfig {
   organization?: string
   /** 当模型输出空时是否报错（默认 false 返回空 content） */
   strictEmptyContent?: boolean
+  /** Provider ID（默认 'openai'；子类可覆盖如 'qwen' / 'glm'） */
+  providerId?: string
 }
 
 // ===== OpenAI API 类型（精简子集）=====
@@ -339,11 +343,11 @@ function toolToOpenAIDef(tool: Tool): OpenAIToolDef {
 // ========================================================================
 
 export class OpenAIChatProvider implements ChatProvider {
-  readonly id = 'openai'
+  readonly id: string
   readonly calls: Array<{ body: OpenAIRequestBody; response?: OpenAIResponseBody; error?: unknown }> = []
 
   private readonly config: Required<
-    Pick<OpenAIProviderConfig, 'baseUrl' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'strictEmptyContent'>
+    Pick<OpenAIProviderConfig, 'baseUrl' | 'apiPath' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'strictEmptyContent' | 'providerId'>
   > & { apiKey?: string; organization?: string }
 
   private toolsGetter: () => Tool[]
@@ -358,12 +362,15 @@ export class OpenAIChatProvider implements ChatProvider {
     this.config = {
       apiKey: config.apiKey ?? envKey,
       baseUrl: config.baseUrl ?? envBase ?? 'https://api.openai.com',
+      apiPath: config.apiPath ?? '/v1/chat/completions',
       defaultModel: config.defaultModel ?? 'gpt-4o-mini',
       maxTokens: config.maxTokens ?? 4096,
       timeoutMs: config.timeoutMs ?? 120_000,
       organization: config.organization,
       strictEmptyContent: config.strictEmptyContent ?? false,
+      providerId: config.providerId ?? 'openai',
     }
+    this.id = this.config.providerId
   }
 
   setToolsGetter(getter: () => Tool[]): void {
@@ -454,7 +461,7 @@ export class OpenAIChatProvider implements ChatProvider {
       }
 
       const headers = this.buildHeaders(params.headers)
-      const url = `${this.config.baseUrl.replace(/\/$/, '')}/v1/chat/completions`
+      const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`
       const resp = await fetch(url, {
         method: 'POST',
         headers,
@@ -570,7 +577,7 @@ export class OpenAIChatProvider implements ChatProvider {
     const timer = setTimeout(() => inner.abort(new Error(`OpenAI stream 超时（>${this.config.timeoutMs}ms）`)), this.config.timeoutMs)
 
     try {
-      const url = `${this.config.baseUrl.replace(/\/$/, '')}/v1/chat/completions`
+      const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`
       const resp = await fetch(url, {
         method: 'POST',
         headers,

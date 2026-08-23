@@ -58,6 +58,16 @@
         "@harness/bus": "workspace:*",
       },
     },
+    "packages/plugins/mcp-client": {
+      "name": "@harness/mcp-client",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/plugins/provider-anthropic": {
       "name": "@harness/provider-anthropic",
       "version": "0.1.0",
@@ -65,6 +75,29 @@
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/provider-gemini": {
+      "name": "@harness/provider-gemini",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/provider-glm": {
+      "name": "@harness/provider-glm",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/provider-openai": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -83,6 +116,30 @@
       "name": "@harness/provider-openai",
       "version": "0.1.0",
       "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/provider-qwen": {
+      "name": "@harness/provider-qwen",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/provider-openai": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/subagent": {
+      "name": "@harness/subagent",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/plugin": "workspace:*",
@@ -161,19 +218,29 @@
 
     "@harness/core": ["@harness/core@workspace:packages/core"],
 
+    "@harness/mcp-client": ["@harness/mcp-client@workspace:packages/plugins/mcp-client"],
+
     "@harness/permission": ["@harness/permission@workspace:packages/permission"],
 
     "@harness/plugin": ["@harness/plugin@workspace:packages/plugin"],
 
     "@harness/provider-anthropic": ["@harness/provider-anthropic@workspace:packages/plugins/provider-anthropic"],
 
+    "@harness/provider-gemini": ["@harness/provider-gemini@workspace:packages/plugins/provider-gemini"],
+
+    "@harness/provider-glm": ["@harness/provider-glm@workspace:packages/plugins/provider-glm"],
+
     "@harness/provider-mock": ["@harness/provider-mock@workspace:packages/plugins/provider-mock"],
 
     "@harness/provider-openai": ["@harness/provider-openai@workspace:packages/plugins/provider-openai"],
 
+    "@harness/provider-qwen": ["@harness/provider-qwen@workspace:packages/plugins/provider-qwen"],
+
     "@harness/session": ["@harness/session@workspace:packages/session"],
 
     "@harness/skill": ["@harness/skill@workspace:packages/skill"],
+
+    "@harness/subagent": ["@harness/subagent@workspace:packages/plugins/subagent"],
 
     "@harness/tool": ["@harness/tool@workspace:packages/tool"],
 
