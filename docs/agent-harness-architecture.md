@@ -895,9 +895,22 @@ Claude Code 文件副本方案保留为**非 git 项目 fallback**（见 10.4 �
 **待办**：
 - [ ] 无（§10.3 集成路线全部落地；后续增强见 §10.4）
 
-### 10.4 后续增强（边界外）
+### 10.4 双后端 + 存储治理（✅ 已实现）
 
-- [ ] 非 git 项目 fallback：Claude Code fileHistory 文件副本 + 三级变更检测（stat/mtime/内容）
-- [ ] 接入用户仓库 `check-ignore`（复用用户 .gitignore 语义过滤快照范围）
-- [ ] `git gc --prune=7.days` 定期清理（OpenCode 同款）
-- [ ] 快照上限 / 淘汰策略（Claude Code MAX_SNAPSHOTS=100 参考）
+**背景**：10.1 选型预留的 4 项边界外增强已全部落地——非 git fallback、check-ignore、git gc 定期清理、快照上限淘汰。
+
+- [x] **非 git 项目 fallback**：`SnapshotService` 重构为接口，`GitSnapshotService`（默认）+ `FileSnapshotService`（纯文件系统，对齐 Claude Code fileHistory）双后端，`createSnapshotService({ backend: 'auto' | 'git' | 'file' })` 工厂，auto（默认）探测 git 二进制（`resolveGitBin` 依次查 PATH / `/usr/bin/git` / `/opt/homebrew/bin/git`），不可用自动降级文件副本后端
+  - File 后端存储：`~/.harness/file-snapshots/{worktree-hash}/`（`backups/{sha256_16}@v{n}` + `snapshots.json` 快照链，ID 为 `fs-{seq}` 递增序号）
+  - **三级变更检测**（对齐 `checkOriginFileChanged`）：stat（mode/size/mtime）一致直接复用上一备份；stat/mtime 变化再读内容兜底，内容一致仍复用（增量快照避免冗余 I/O）；内容不同才 `copyFile` 新备份（`version+1`）
+  - 恢复幂等：`restore`/`checkout` 先判目标备份是否为 null（null → `rm` 删除，对齐 applySnapshot 的 unlink 分支），否则 `copyFile` + `chmod` 恢复权限
+  - diff 用简化行 diff（前缀/后缀公共行 + 中间区贪心对齐，识别"插入/删除在中间"的公共行），产出 unified patch + 增删统计，足够回滚预览
+  - 与 git 后端接口一致：`capture / files / diff / preview / restore / checkout / gc` + `enabled` 语义 + 越界防护
+- [x] **check-ignore 语义过滤快照范围**：
+  - git 后端：`refresh` 的 `ls-files --others --exclude-standard` 自动复用用户项目 .gitignore（OpenCode 同款）
+  - file 后端：惰性读取 worktree 根 `.gitignore`（简化 matcher：`*` / `**` / `?` / 目录 `/` 结尾 / `!` 取反 / `#` 注释），并额外跳过 `.git` 与位于 worktree 内的 dataDir 自身
+- [x] **`git gc --prune=7.days` 定期清理**：`GitSnapshotService.gc()`（公共方法，加锁）+ `gcUnlocked()`（无锁内部实现）；capture 每 `gcEvery` 次（默认 50，0 关闭）自动触发，prune 掉快照注册表（`snapshot-ids.json`）淘汰后无引用的旧对象；自动 gc 在 capture 锁内调用无锁内部方法，避免同 key 嵌套死锁
+- [x] **快照上限 / 淘汰策略**（对齐 Claude Code `MAX_SNAPSHOTS = 100`）：
+  - git 后端：`maxSnapshots`（默认 100）注册表记录已知 tree hash，超出淘汰最旧（对象由后续 `git gc` 物理清理）
+  - file 后端：快照链超出 `maxSnapshots` shift 最旧快照；`gc()` 清理快照链中不再被引用的 `@v{n}` 备份（被淘汰快照独有 → 删除；被保留快照复用的 → 保留）
+
+**验证**：snapshot 包 25 用例全绿（原 11 用例 + git 后端 gc/上限 3 用例 + file 后端全流程/上限淘汰/gc/.gitignore/enabled 8 用例 + 工厂后端选择 3 用例）；core/revert/cli 既有用例无回归；全仓 25 包 typecheck 通过。

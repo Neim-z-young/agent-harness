@@ -1,5 +1,41 @@
 # Agent Harness 开发日志
 
+## 2026-08-24（续 5）：§10.4 双后端 + 存储治理（快照 fallback / gc / 上限）
+
+### 重构 `@harness/snapshot` 为双后端（[packages/snapshot/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/snapshot/src/index.ts)）
+
+实现 §10.4 全部 4 项边界外增强：
+
+- **`SnapshotService` 从 class 改为 interface**，`GitSnapshotService`（默认，OpenCode git tree 方案）+ 新增 `FileSnapshotService`（Claude Code fileHistory 文件副本方案）双实现
+- **工厂 auto 探测**：`createSnapshotService({ backend: 'auto'|'git'|'file' })`；auto 用 `resolveGitBin()`（依次查 PATH / `/usr/bin/git` / `/opt/homebrew/bin/git`，带缓存）探测 git，不可用自动降级 file 后端；`runGit` 同步改用解析出的 git 二进制（修复终端 PATH 异常下 git 不可用）
+- **FileSnapshotService**（不依赖 git）：
+  - 存储：`~/.harness/file-snapshots/{worktree-hash}/`（`backups/{sha256_16}@v{n}` + `snapshots.json` 快照链，ID `fs-{seq}`）
+  - **三级变更检测**（对齐 `checkOriginFileChanged`）：`FileBackupMeta` 记录 `backup/version/mode/size/mtime`；stat（mode/size/mtime）一致直接复用；变化再内容级兜底，一致仍复用（增量快照）；不同才 `copyFile` 新备份
+  - `restore`/`checkout` 幂等：目标备份 null → `rm`（对齐 applySnapshot unlink 分支），否则 `copyFile` + `chmod` 恢复权限
+  - diff 用简化行 diff（前缀/后缀公共行 + 中间区贪心对齐，识别"插入在中间"的公共行），unified patch + 增删统计
+  - `gc()`：清理快照链不再引用的 `@v{n}` 备份
+- **check-ignore**：git 后端 `--exclude-standard` 隐式复用用户 .gitignore；file 后端惰性读根 `.gitignore`（简化 matcher：`*`/`**`/`?`/目录 `/` 结尾/`!` 取反/`#` 注释）+ 跳过 `.git` 与 worktree 内 dataDir
+- **git gc + 上限**：`GitSnapshotService` 新增 `snapshot-ids.json` 注册表（`maxSnapshots` 默认 100 淘汰最旧）+ `gc()`/`gcUnlocked()`（`git gc --prune=7.days`），capture 每 `gcEvery` 次（默认 50）自动 gc
+
+### 踩坑修复
+
+| 问题 | 原因 | 修复 |
+|---|---|---|
+| 自动 gc 时 capture 返回 undefined（快照丢失） | `recordSnapshotId` 内调 `this.gc()`，与外层 capture 的 `mutex.run('tree')` 同 key 嵌套死锁 | 抽 `gcUnlocked()` 无锁内部方法，公共 `gc()` 加锁、锁内路径直调无锁版 |
+| file 后端每次 capture 都新建备份（增量快照失效） | `FileBackupMeta` 未存 size/mtime，`info.size === prev.size` 恒 false | 补 `size`/`mtime` 字段，三级检测 stat 级对齐 |
+| file 后端 diff 统计偏差（公共行 'three' 被算作 -/+） | 简单前后缀匹配在"插入在中间"时失准 | 中间区贪心对齐：对 a 剩余行在 b 剩余区间顺序查首个匹配 |
+| tsc 报 `number \| bigint` / `Dirent` 泛型错误 | `Awaited<ReturnType<typeof stat>>` 解析为联合类型 | 显式 `import type { Stats, Dirent }` |
+
+### 测试与验证
+
+- snapshot 包 **25 用例全绿**（原 11 + git 后端 gc/上限 3 + file 后端 8 + 工厂 3）；`typecheck` 通过
+- 全仓 25 包 typecheck 通过；core/revert/cli 既有用例无回归
+- 注：`@harness/tools-builtin`（bash 工具）与 `@harness/permission`/`@harness/session`（无测试文件）失败为既有环境问题（终端 PATH 缺 `/bin` 导致 `spawn('bash')` ENOENT），与本次改动无关
+
+### 文档
+
+- [docs/agent-harness-architecture.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agent-harness-architecture.md) §10.4 由「后续增强（边界外）」更新为「双后端 + 存储治理（✅ 已实现）」，4 项 ☐ 全部改为 ✅
+
 ## 2026-08-24（续 4）：CLI /revert 命令（文件快照回滚交互）
 
 ### 接入 `@harness/cli`（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
