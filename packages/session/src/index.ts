@@ -309,4 +309,15 @@ export interface SessionManager {
   getCompactionInfo(sessionId: string): Promise<{ meta?: CompactionMeta; memory?: CompactMemory }>
   /** 导出会话为 Markdown 文本 */
   exportMarkdown(sessionId: string): Promise<string>
+
+  /**
+   * 向会话的待处理通知队列追加一条通知消息（如后台任务完成通知）。
+   * 通知会在下一次 query 开始时通过 drainNotifications 取出并注入为 user-role 消息。
+   */
+  enqueueNotification(sessionId: string, message: string): void
+  /**
+   * 取出并清空会话的所有待处理通知消息，返回通知文本数组。
+   * 在 AgentRuntime.query 开始时调用，将通知作为 user-role 消息注入对话。
+   */
+  drainNotifications(sessionId: string): string[]
 }

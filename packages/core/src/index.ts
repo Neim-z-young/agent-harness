@@ -839,6 +839,22 @@ export class DefaultSessionManager implements SessionManager {
     return lines.join('\n')
   }
 
+  // --------- 待处理通知队列（后台任务完成通知等） ---------
+
+  private readonly pendingNotifications = new Map<string, string[]>()
+
+  enqueueNotification(sessionId: string, message: string): void {
+    const queue = this.pendingNotifications.get(sessionId) ?? []
+    queue.push(message)
+    this.pendingNotifications.set(sessionId, queue)
+  }
+
+  drainNotifications(sessionId: string): string[] {
+    const queue = this.pendingNotifications.get(sessionId) ?? []
+    if (queue.length > 0) this.pendingNotifications.delete(sessionId)
+    return queue
+  }
+
   // --------- 内部摘要实现 ---------
 
   /** 规则摘要：简单但稳定的基于消息类型/文本要点的摘要；无需 LLM */
@@ -1084,6 +1100,20 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 写入 user 消息（若还未在 session.prompt 里写入）
     const sess = await this.deps.session.get(sessionId)
     if (!sess) throw new Error(`Session "${sessionId}" not found`)
+
+    // 在处理用户输入前，先 drain 待处理通知（如后台任务完成通知），
+    // 将其作为 user-role 消息注入对话，大模型在后续 turn 自动感知任务完成，
+    // 不需要主动调用 task_status 工具轮询。参考 Claude Code enqueueAgentNotification。
+    const notifications = this.deps.session.drainNotifications(sessionId)
+    for (const notif of notifications) {
+      await this.deps.session.addMessage(sessionId, {
+        id: `notif_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        role: 'user',
+        parts: [{ type: 'text', text: notif }],
+        createdAt: Date.now(),
+      })
+    }
+
     if (!sess.messages.some((m) => m.role === 'user' && m.parts.some((p) => p.type === 'text' && (p as any).text === message))) {
       await this.deps.session.addMessage(sessionId, {
         id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -1220,6 +1250,18 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
     const sess = await this.deps.session.get(sessionId)
     if (!sess) throw new Error(`Session "${sessionId}" not found`)
+
+    // drain 待处理通知（如后台任务完成通知），注入为 user-role 消息
+    const notifications = this.deps.session.drainNotifications(sessionId)
+    for (const notif of notifications) {
+      await this.deps.session.addMessage(sessionId, {
+        id: `notif_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        role: 'user',
+        parts: [{ type: 'text', text: notif }],
+        createdAt: Date.now(),
+      })
+    }
+
     if (!sess.messages.some((m) => m.role === 'user' && m.parts.some((p) => p.type === 'text' && (p as any).text === message))) {
       await this.deps.session.addMessage(sessionId, {
         id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,

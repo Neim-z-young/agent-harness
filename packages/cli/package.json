@@ -22,7 +22,8 @@
     "@harness/permission": "workspace:*",
     "@harness/provider-mock": "workspace:*",
     "@harness/provider-anthropic": "workspace:*",
-    "@harness/tools-builtin": "workspace:*"
+    "@harness/tools-builtin": "workspace:*",
+    "@harness/subagent": "workspace:*"
   },
   "scripts": {
     "dev": "bun run ./src/index.ts repl",

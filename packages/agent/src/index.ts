@@ -108,6 +108,14 @@ export interface AgentDefinition {
    */
   mode: AgentMode
 
+  // === 后台执行声明 ===
+  /**
+   * 是否默认后台执行（不依赖模型每次传 runInBackground）。
+   * 参考 Claude Code `selectedAgent.background === true`（Fork/Coordinator 强制异步）。
+   * 仅对 mode=subagent 的 Agent 生效；为 true 时该 Agent 被派出默认走 runInBackground 路径。
+   */
+  background?: boolean
+
   // === 能力白名单 ===
   /** 工具 ID 列表，['*'] 表示全部工具 */
   tools: string[] | ['*']
@@ -333,6 +341,7 @@ function parseInlineObject(s: string): Record<string, unknown> {
  *
  * frontmatter 字段映射到 AgentDefinition 的字段：
  * - id, name, description, icon, tags, mode, tools, skills, subagents
+ * - background（默认后台执行）
  * - permission, model
  * - body（Markdown 正文）→ promptFragments[0]
  *
@@ -393,6 +402,11 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
   // subagents
   const subagents = Array.isArray(frontmatter.subagents) ? frontmatter.subagents.map(String) : undefined
 
+  // background（frontmatter.background: true|false）
+  const background = typeof frontmatter.background === 'boolean'
+    ? frontmatter.background
+    : undefined
+
   // icon
   const icon = frontmatter.icon ? String(frontmatter.icon) : undefined
 
@@ -413,6 +427,7 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
   if (tags) def.tags = tags
   if (skills) def.skills = skills
   if (subagents) def.subagents = subagents
+  if (background !== undefined) def.background = background
   if (model) def.model = model
   if (promptFragments) def.promptFragments = promptFragments
 

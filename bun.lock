@@ -32,6 +32,7 @@
         "@harness/provider-anthropic": "workspace:*",
         "@harness/provider-mock": "workspace:*",
         "@harness/session": "workspace:*",
+        "@harness/subagent": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
       },
@@ -44,6 +45,7 @@
         "@harness/bus": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/session": "workspace:*",
+        "@harness/skill": "workspace:*",
         "@harness/tool": "workspace:*",
       },
     },
@@ -142,6 +144,7 @@
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/tool": "workspace:*",
@@ -203,6 +206,9 @@
     "packages/skill": {
       "name": "@harness/skill",
       "version": "0.1.0",
+      "dependencies": {
+        "@harness/permission": "workspace:*",
+      },
     },
     "packages/tool": {
       "name": "@harness/tool",

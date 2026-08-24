@@ -3,16 +3,22 @@ import { tmpdir } from 'node:os'
 import {
   createSubagentPlugin,
   createSubagentTool,
+  BackgroundTaskRegistry,
+  BackgroundTaskMonitor,
+  SubagentEvents,
+  formatTaskNotification,
   isAgentDenied,
   filterAccessibleAgents,
   type SubagentToolInput,
   type SubagentToolOutput,
   type SubagentPluginOptions,
 } from './index'
+import { createBus } from '@harness/bus'
 import type { AgentDefinition } from '@harness/agent'
 import type { AgentRuntime } from '@harness/core'
 import type { SessionManager, Session, Message } from '@harness/session'
 import type { ToolContext, ToolResult } from '@harness/tool'
+import { partitionToolCalls, type ToolUse } from '@harness/tool'
 
 // ===== Mock helper =====
 
@@ -37,6 +43,7 @@ function createMockAgentRuntime(agents: AgentDefinition[], queryImpl?: (input: {
 }
 
 function createMockSessionManager(sessions: Map<string, Session>): SessionManager {
+  const pendingNotifications = new Map<string, string[]>()
   return {
     create: async (options?: { title?: string; parentId?: string }) => {
       const id = `s_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
@@ -72,6 +79,16 @@ function createMockSessionManager(sessions: Map<string, Session>): SessionManage
     generateTitle: async () => '',
     exportMarkdown: async () => '',
     estimateTokens: async () => 0,
+    enqueueNotification: (sessionId: string, message: string) => {
+      const queue = pendingNotifications.get(sessionId) ?? []
+      queue.push(message)
+      pendingNotifications.set(sessionId, queue)
+    },
+    drainNotifications: (sessionId: string) => {
+      const queue = pendingNotifications.get(sessionId) ?? []
+      if (queue.length > 0) pendingNotifications.delete(sessionId)
+      return queue
+    },
   } as unknown as SessionManager
 }
 
@@ -485,8 +502,9 @@ describe('createSubagentPlugin', () => {
     // CLI commands 注册
     const cmdInput = { commands: [] as any[] }
     ;(hooks as any)['cli.commands']?.(cmdInput)
-    expect(cmdInput.commands.length).toBe(1)
+    expect(cmdInput.commands.length).toBe(2)
     expect(cmdInput.commands[0].command).toBe('subagents')
+    expect(cmdInput.commands[1].command).toBe('tasks')
 
     // CLI command 处理
     const out: string[] = []
@@ -503,14 +521,15 @@ describe('createSubagentPlugin', () => {
     expect(cliInput.result).toBe('continue')
   })
 
-  it('无子 Agent 时不注册 /subagents 命令', async () => {
+  it('无子 Agent 时不注册 /subagents 命令（但仍注册 /tasks 命令）', async () => {
     const plugin = createSubagentPlugin({ subagents: [] })
     const { ctx } = makeCtx()
     const hooks = await plugin.install(ctx)
 
     const cmdInput = { commands: [] as any[] }
     ;(hooks as any)['cli.commands']?.(cmdInput)
-    expect(cmdInput.commands.length).toBe(0)
+    expect(cmdInput.commands.length).toBe(1)
+    expect(cmdInput.commands[0].command).toBe('tasks')
   })
 
   it('uninstall 清理 harness 引用', async () => {
@@ -1548,4 +1567,609 @@ describe('SubagentTool PERMISSION_DENIED', () => {
       events,
     }
   }
+})
+
+// ===== BackgroundTaskRegistry 单元测试 =====
+
+describe('BackgroundTaskRegistry', () => {
+  it('register → pending → start → running', () => {
+    const reg = new BackgroundTaskRegistry()
+    const taskId = reg.register({
+      agentId: 'coder',
+      agentName: 'Coder',
+      subSessionId: 's_1',
+      parentSessionId: 'p_1',
+      prompt: 'test',
+    })
+    expect(taskId).toStartWith('task-')
+
+    const task = reg.get(taskId)!
+    expect(task.status).toBe('pending')
+    expect(task.agentId).toBe('coder')
+    expect(task.subSessionId).toBe('s_1')
+
+    reg.start(taskId)
+    expect(reg.get(taskId)!.status).toBe('running')
+    expect(reg.get(taskId)!.startedAt).toBeGreaterThan(0)
+  })
+
+  it('complete → 触发 wait 的 resolver', async () => {
+    const reg = new BackgroundTaskRegistry()
+    const taskId = reg.register({
+      agentId: 'coder',
+      agentName: 'Coder',
+      subSessionId: 's_1',
+      parentSessionId: 'p_1',
+      prompt: 'test',
+    })
+    reg.start(taskId)
+
+    // 启动 waiter
+    const waitPromise = reg.wait(taskId, 1000)
+    // 立即完成
+    reg.complete(taskId, { result: 'done', messageCount: 5, toolCallCount: 2 })
+
+    const task = await waitPromise
+    expect(task).toBeDefined()
+    expect(task!.status).toBe('completed')
+    expect(task!.result).toBe('done')
+    expect(task!.messageCount).toBe(5)
+    expect(task!.toolCallCount).toBe(2)
+    expect(task!.durationMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it('fail → 触发 wait 的 resolver', async () => {
+    const reg = new BackgroundTaskRegistry()
+    const taskId = reg.register({
+      agentId: 'coder',
+      agentName: 'Coder',
+      subSessionId: 's_1',
+      parentSessionId: 'p_1',
+      prompt: 'test',
+    })
+    reg.start(taskId)
+
+    const waitPromise = reg.wait(taskId, 1000)
+    reg.fail(taskId, { code: 'SUBAGENT_FAILED', message: 'error msg' })
+
+    const task = await waitPromise
+    expect(task!.status).toBe('failed')
+    expect(task!.errorCode).toBe('SUBAGENT_FAILED')
+    expect(task!.errorMessage).toBe('error msg')
+  })
+
+  it('wait 已完成任务立即返回', async () => {
+    const reg = new BackgroundTaskRegistry()
+    const taskId = reg.register({
+      agentId: 'coder', agentName: 'Coder', subSessionId: 's_1', parentSessionId: 'p_1', prompt: 'x',
+    })
+    reg.start(taskId)
+    reg.complete(taskId, { result: 'done' })
+
+    const task = await reg.wait(taskId, 100)
+    expect(task!.status).toBe('completed')
+  })
+
+  it('wait 超时返回 undefined', async () => {
+    const reg = new BackgroundTaskRegistry()
+    const taskId = reg.register({
+      agentId: 'coder', agentName: 'Coder', subSessionId: 's_1', parentSessionId: 'p_1', prompt: 'x',
+    })
+    reg.start(taskId)
+
+    const task = await reg.wait(taskId, 50)
+    expect(task).toBeUndefined()
+  })
+
+  it('list 支持状态和 parentSessionId 过滤', () => {
+    const reg = new BackgroundTaskRegistry()
+    const t1 = reg.register({ agentId: 'a', agentName: 'A', subSessionId: 's1', parentSessionId: 'p1', prompt: 'x' })
+    const t2 = reg.register({ agentId: 'b', agentName: 'B', subSessionId: 's2', parentSessionId: 'p1', prompt: 'y' })
+    const t3 = reg.register({ agentId: 'c', agentName: 'C', subSessionId: 's3', parentSessionId: 'p2', prompt: 'z' })
+
+    reg.start(t1); reg.complete(t1, { result: 'done' })
+    reg.start(t2)
+
+    expect(reg.list()).toHaveLength(3)
+    expect(reg.list({ status: 'completed' })).toHaveLength(1)
+    expect(reg.list({ status: 'running' })).toHaveLength(1)
+    expect(reg.list({ parentSessionId: 'p1' })).toHaveLength(2)
+    expect(reg.list({ parentSessionId: 'p1', status: 'completed' })).toHaveLength(1)
+  })
+
+  it('cancel 通过 AbortController 中断', () => {
+    const reg = new BackgroundTaskRegistry()
+    const taskId = reg.register({
+      agentId: 'a', agentName: 'A', subSessionId: 's1', parentSessionId: 'p1', prompt: 'x',
+    })
+    const controller = new AbortController()
+    reg.get(taskId)!.controller = controller
+    reg.start(taskId)
+
+    let aborted = false
+    controller.signal.addEventListener('abort', () => { aborted = true })
+    expect(reg.cancel(taskId)).toBe(true)
+    expect(aborted).toBe(true)
+    // 已 abort 后再次 cancel 返回 false（status 还是 running，但 controller.signal 已 aborted）
+    // 实际：cancel 只检查 status === 'running'，所以仍可调用，但 abort 是幂等的
+  })
+
+  it('clear 清理已完成/失败任务', () => {
+    const reg = new BackgroundTaskRegistry()
+    const t1 = reg.register({ agentId: 'a', agentName: 'A', subSessionId: 's1', parentSessionId: 'p1', prompt: 'x' })
+    const t2 = reg.register({ agentId: 'b', agentName: 'B', subSessionId: 's2', parentSessionId: 'p1', prompt: 'y' })
+    reg.start(t1); reg.complete(t1, { result: 'done' })
+    reg.start(t2); reg.fail(t2, { code: 'ERR', message: 'fail' })
+
+    expect(reg.list()).toHaveLength(2)
+    const removed = reg.clear()
+    expect(removed).toBe(2)
+    expect(reg.list()).toHaveLength(0)
+  })
+
+  it('并发多个任务（独立 taskId）', () => {
+    const reg = new BackgroundTaskRegistry()
+    const ids = new Set<string>()
+    for (let i = 0; i < 5; i++) {
+      const id = reg.register({
+        agentId: `a${i}`, agentName: `A${i}`, subSessionId: `s${i}`, parentSessionId: 'p1', prompt: 'x',
+      })
+      ids.add(id)
+    }
+    expect(ids.size).toBe(5)  // 5 个独立 taskId
+    expect(reg.list()).toHaveLength(5)
+  })
+})
+
+// ===== SubagentTool runInBackground 集成测试 =====
+
+describe('SubagentTool runInBackground', () => {
+  const coderAgent: AgentDefinition = {
+    id: 'coder',
+    name: 'Coder',
+    description: '负责写代码的子 Agent',
+    mode: 'subagent',
+    tools: ['read_file', 'write_file', 'bash'],
+    permission: { '*': 'allow' },
+    promptFragments: ['你是写代码的子 Agent'],
+  }
+
+  it('runInBackground=true 立即返回 taskId（不等待子 Agent 完成）', async () => {
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    // 模拟延迟的 agent.query
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      await new Promise((r) => setTimeout(r, 100))
+      const msg = makeMessage('assistant', 'background done')
+      const s = sessionsRef.get(input.sessionId)
+      if (s) {
+        s.messages.push(makeMessage('user', input.message))
+        s.messages.push(msg)
+      }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+    const start = Date.now()
+    const res = await tool.call(
+      { agentId: 'coder', prompt: '后台重构', runInBackground: true },
+      makeToolContext(),
+    )
+    const elapsed = Date.now() - start
+
+    expect(res.ok).toBe(true)
+    expect(res.output!.background).toBe(true)
+    expect(res.output!.taskId).toStartWith('task-')
+    expect(res.output!.sessionId).toStartWith('s_')
+    // 立即返回（远小于 100ms 的 query 延迟）
+    expect(elapsed).toBeLessThan(50)
+
+    // 等待后台任务完成
+    const task = await registry.wait(res.output!.taskId!, 1000)
+    expect(task).toBeDefined()
+    expect(task!.status).toBe('completed')
+    expect(task!.result).toBe('background done')
+    expect(task!.messageCount).toBe(2)
+  })
+
+  it('runInBackground=true 子 Agent 失败时 task 状态变 failed', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async () => {
+      throw new Error('query error')
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'fail task', runInBackground: true },
+      makeToolContext(),
+    )
+    expect(res.ok).toBe(true)
+
+    const task = await registry.wait(res.output!.taskId!, 1000)
+    expect(task!.status).toBe('failed')
+    expect(task!.errorCode).toBe('SUBAGENT_FAILED')
+    expect(task!.errorMessage).toContain('query error')
+  })
+
+
+  it('并行调用多个 background subagent，所有任务独立完成', async () => {
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const delay = 30 + Math.random() * 50
+      await new Promise((r) => setTimeout(r, delay))
+      const msg = makeMessage('assistant', `done ${input.message}`)
+      const s = sessionsRef.get(input.sessionId)
+      if (s) {
+        s.messages.push(makeMessage('user', input.message))
+        s.messages.push(msg)
+      }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+
+    // 并行启动 3 个后台任务
+    const prompts = ['task A', 'task B', 'task C']
+    const startPromises = prompts.map((p) =>
+      tool.call({ agentId: 'coder', prompt: p, runInBackground: true }, makeToolContext())
+    )
+    const results = await Promise.all(startPromises)
+
+    expect(results).toHaveLength(3)
+    const taskIds = results.map((r) => r.output!.taskId)
+    expect(new Set(taskIds).size).toBe(3)  // 3 个独立 taskId
+
+    // 等待所有任务完成
+    const waitPromises = taskIds.map((id) => registry.wait(id!, 1000))
+    const tasks = await Promise.all(waitPromises)
+
+    for (let i = 0; i < 3; i++) {
+      expect(tasks[i]!.status).toBe('completed')
+      expect(tasks[i]!.result).toBe(`done ${prompts[i]}`)
+    }
+  })
+
+  it('partitionToolCalls：所有 subagent 调用均分到串行批次（即使 runInBackground=true）', async () => {
+    const harness = {
+      agent: createMockAgentRuntime([coderAgent], async () => makeMessage('assistant', 'ok')),
+      session: createMockSessionManager(new Map()),
+    }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+
+    // 构造 4 个工具调用：bg, bg, sync, bg
+    // 即使有 runInBackground=true，也全部各自串行批次
+    const makeUse = (prompt: string, bg: boolean): ToolUse => ({
+      toolId: 'subagent',
+      tool,
+      input: { agentId: 'coder', prompt, runInBackground: bg } as unknown,
+      toolUseId: `${bg ? 'bg' : 'sync'}-${prompt}`,
+    })
+    const uses: ToolUse[] = [
+      makeUse('A', true),
+      makeUse('B', true),
+      makeUse('C', false),
+      makeUse('D', true),
+    ]
+
+    const batches = partitionToolCalls(uses)
+
+    // 预期 4 个批次，全部串行：
+    // runInBackground 的并行性由异步执行块保证，不依赖 partitionToolCalls
+    expect(batches).toHaveLength(4)
+    for (const batch of batches) {
+      expect(batch.parallel).toBe(false)
+      expect(batch.uses).toHaveLength(1)
+    }
+  })
+
+  it('runInBackground=true 任务完成后自动向父 session 注入 task-notification 通知', async () => {
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const delay = 20 + Math.random() * 20
+      await new Promise((r) => setTimeout(r, delay))
+      const msg = makeMessage('assistant', `done ${input.message}`)
+      const s = sessionsRef.get(input.sessionId)
+      if (s) {
+        s.messages.push(makeMessage('user', input.message))
+        s.messages.push(msg)
+      }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+
+    // 父 session 必须先存在
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'do something', runInBackground: true },
+      ctx,
+    )
+
+    expect(res.ok).toBe(true)
+    expect(res.output!.taskId).toBeDefined()
+
+    // 等待后台任务完成
+    const taskId = res.output!.taskId!
+    await registry.wait(taskId, 1000)
+
+    // 验证父 session 的 pendingNotifications 队列中已注入通知
+    const notifications = session.drainNotifications(parentSession.id)
+    expect(notifications).toHaveLength(1)
+    const notif = notifications[0]
+    expect(notif).toInclude('<task-notification>')
+    expect(notif).toInclude(`<task-id>${taskId}</task-id>`)
+    expect(notif).toInclude('<status>completed</status>')
+    expect(notif).toInclude('Agent "coder" completed')
+    expect(notif).toInclude('<result>done do something</result>')
+    expect(notif).toInclude('<duration-ms>')
+
+    // 再次 drain 应为空（去重，不重复注入）
+    const again = session.drainNotifications(parentSession.id)
+    expect(again).toHaveLength(0)
+  })
+
+  it('runInBackground=true 任务失败后自动注入 failed task-notification 通知', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async () => {
+      throw new Error('agent crashed')
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'will fail', runInBackground: true },
+      ctx,
+    )
+
+    const taskId = res.output!.taskId!
+    await registry.wait(taskId, 1000)
+
+    const notifications = session.drainNotifications(parentSession.id)
+    expect(notifications).toHaveLength(1)
+    expect(notifications[0]).toInclude('<status>failed</status>')
+    expect(notifications[0]).toInclude('Agent "coder" failed')
+    expect(notifications[0]).toInclude('agent crashed')
+  })
+
+  it('formatTaskNotification 生成完整的 task-notification XML', () => {
+    const notif = formatTaskNotification({
+      taskId: 'task-abc-1',
+      status: 'completed',
+      agentName: 'coder',
+      description: '写单元测试',
+      result: '已添加 3 个测试用例',
+      outputPath: '/tmp/task-abc-1.txt',
+      durationMs: 1500,
+      messageCount: 5,
+      toolCallCount: 2,
+    })
+    expect(notif).toInclude('<task-notification>')
+    expect(notif).toInclude('</task-notification>')
+    expect(notif).toInclude('<task-id>task-abc-1</task-id>')
+    expect(notif).toInclude('<status>completed</status>')
+    expect(notif).toInclude('Agent "写单元测试" completed')
+    expect(notif).toInclude('<result>已添加 3 个测试用例</result>')
+    expect(notif).toInclude('<output-file>/tmp/task-abc-1.txt</output-file>')
+    expect(notif).toInclude('<duration-ms>1500</duration-ms>')
+    expect(notif).toInclude('<message-count>5</message-count>')
+    expect(notif).toInclude('<tool-call-count>2</tool-call-count>')
+  })
+
+  it('Agent 定义 background=true 时，即使不传 runInBackground 也走后台路径', async () => {
+    const bgAgent: AgentDefinition = {
+      id: 'researcher',
+      name: 'Researcher',
+      description: '默认后台执行的调研 Agent',
+      mode: 'subagent',
+      tools: ['read_file', 'web_search'],
+      permission: { '*': 'allow' },
+      promptFragments: ['你是调研 Agent'],
+      background: true,
+    }
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([bgAgent], async (input) => {
+      await new Promise((r) => setTimeout(r, 100))
+      const msg = makeMessage('assistant', 'research done')
+      const s = sessionsRef.get(input.sessionId)
+      if (s) {
+        s.messages.push(makeMessage('user', input.message))
+        s.messages.push(msg)
+      }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+
+    // 关键：不传 runInBackground，靠 Agent 定义 background: true 触发后台路径
+    const start = Date.now()
+    const res = await tool.call(
+      { agentId: 'researcher', prompt: '调研竞品定价' },
+      makeToolContext(),
+    )
+    const elapsed = Date.now() - start
+
+    expect(res.ok).toBe(true)
+    expect(res.output!.background).toBe(true)
+    expect(res.output!.taskId).toStartWith('task-')
+    // 立即返回（未等 100ms 的 query 延迟完成）
+    expect(elapsed).toBeLessThan(50)
+
+    // 等待后台任务完成
+    const task = await registry.wait(res.output!.taskId!, 1000)
+    expect(task!.status).toBe('completed')
+    expect(task!.result).toBe('research done')
+  })
+})
+
+// ===== BackgroundTaskMonitor 单元测试（P1-4 前端事件驱动展示）=====
+
+describe('BackgroundTaskMonitor', () => {
+  function makeStarted(taskId: string, overrides: Record<string, unknown> = {}) {
+    return {
+      agentId: 'coder',
+      agentName: 'Coder',
+      subSessionId: 's_sub',
+      parentSessionId: 's_parent',
+      parentAgentId: 'default',
+      parentMessageId: 'm1',
+      toolUseId: 't1',
+      prompt: '写单元测试',
+      description: '写单元测试',
+      isContinuation: false,
+      startedAt: Date.now(),
+      taskId,
+      background: true,
+      ...overrides,
+    }
+  }
+
+  it('started → running，completed → completed + 结果预览', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus })
+
+    const snapshots: Array<ReadonlyArray<unknown>> = []
+    monitor.subscribe((tasks) => snapshots.push(tasks))
+
+    await bus.publish(SubagentEvents.started, makeStarted('task-1') as any)
+    expect(monitor.getTasks()).toHaveLength(1)
+    const running = monitor.get('task-1')!
+    expect(running.status).toBe('running')
+    expect(running.agentName).toBe('Coder')
+    expect(running.description).toBe('写单元测试')
+
+    await bus.publish(SubagentEvents.completed, {
+      agentId: 'coder',
+      subSessionId: 's_sub',
+      parentSessionId: 's_parent',
+      toolUseId: 't1',
+      replyPreview: '已添加 3 个测试用例',
+      messageCount: 5,
+      durationMs: 1200,
+      taskId: 'task-1',
+      background: true,
+    } as any)
+    const done = monitor.get('task-1')!
+    expect(done.status).toBe('completed')
+    expect(done.result).toBe('已添加 3 个测试用例')
+    expect(done.durationMs).toBe(1200)
+    expect(done.messageCount).toBe(5)
+    expect(done.finishedAt).toBeDefined()
+
+    // 快照依次触发（running → completed 至少 2 次）
+    expect(snapshots.length).toBeGreaterThanOrEqual(2)
+    monitor.dispose()
+  })
+
+  it('failed → status=failed + error 信息', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus })
+
+    await bus.publish(SubagentEvents.started, makeStarted('task-2') as any)
+    await bus.publish(SubagentEvents.failed, {
+      agentId: 'coder',
+      subSessionId: 's_sub',
+      parentSessionId: 's_parent',
+      toolUseId: 't1',
+      code: 'QUERY_FAILED',
+      message: 'provider error',
+      durationMs: 800,
+      taskId: 'task-2',
+      background: true,
+    } as any)
+
+    const t = monitor.get('task-2')!
+    expect(t.status).toBe('failed')
+    expect(t.error).toEqual({ code: 'QUERY_FAILED', message: 'provider error' })
+    expect(t.durationMs).toBe(800)
+    monitor.dispose()
+  })
+
+  it('parentSessionIds 过滤：只展示指定父 session 的任务', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus, parentSessionIds: ['s_a'] })
+
+    await bus.publish(SubagentEvents.started, makeStarted('task-3', { parentSessionId: 's_a' }) as any)
+    await bus.publish(SubagentEvents.started, makeStarted('task-4', { parentSessionId: 's_b' }) as any)
+
+    expect(monitor.getTasks()).toHaveLength(1)
+    expect(monitor.get('task-3')).toBeDefined()
+    expect(monitor.get('task-4')).toBeUndefined()
+    monitor.dispose()
+  })
+
+  it('backgroundOnly=false 时也纳入前台任务；默认只关注后台任务', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus }) // 默认 backgroundOnly=true
+
+    await bus.publish(SubagentEvents.started, makeStarted('task-bg', { background: true }) as any)
+    await bus.publish(SubagentEvents.started, makeStarted('task-fg', { background: false }) as any)
+
+    expect(monitor.get('task-bg')).toBeDefined()
+    expect(monitor.get('task-fg')).toBeUndefined()
+    monitor.dispose()
+
+    const monitorAll = new BackgroundTaskMonitor({ bus, backgroundOnly: false })
+    await bus.publish(SubagentEvents.started, makeStarted('task-fg2', { background: false }) as any)
+    expect(monitorAll.get('task-fg2')).toBeDefined()
+    monitorAll.dispose()
+  })
+
+  it('无 taskId 的 started 事件被忽略（前台任务）', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus, backgroundOnly: false })
+
+    await bus.publish(SubagentEvents.started, { ...makeStarted('x', { background: false }), taskId: undefined } as any)
+    expect(monitor.getTasks()).toHaveLength(0)
+    monitor.dispose()
+  })
+
+  it('dispose 后不再接收事件', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus })
+    monitor.dispose()
+
+    await bus.publish(SubagentEvents.started, makeStarted('task-5') as any)
+    expect(monitor.getTasks()).toHaveLength(0)
+  })
 })

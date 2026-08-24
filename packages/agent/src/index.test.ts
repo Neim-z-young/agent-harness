@@ -249,6 +249,29 @@ subagents:
     expect(def.subagents).toEqual(['coder', 'reviewer', 'explorer'])
   })
 
+  it('background: true → 默认后台执行声明', () => {
+    const content = `---
+id: researcher
+name: Researcher
+description: 调研 Agent
+mode: subagent
+background: true
+---`
+    const def = agentFromMarkdown(content)
+    expect(def.background).toBe(true)
+  })
+
+  it('未声明 background → undefined（默认前台）', () => {
+    const content = `---
+id: coder
+name: Coder
+description: 子 Agent
+mode: subagent
+---`
+    const def = agentFromMarkdown(content)
+    expect(def.background).toBeUndefined()
+  })
+
   it('icon 和 skills 字段', () => {
     const content = `---
 id: coder

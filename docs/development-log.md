@@ -1,5 +1,82 @@
 # Agent Harness 开发日志
 
+## 2026-08-23（续 6）：Subagent run_in_background + 并行执行
+
+### 今日完成
+
+为 Subagent 插件添加后台异步执行和并行子 Agent 调度能力，让主 Agent 能派出多个子 Agent 同时执行任务，提升复杂任务的并行吞吐。参考 Claude Code 的 `forkSubagent.ts` + `LocalAgentTask` 和 OpenCode 的异步任务模型。
+
+#### 1. BackgroundTaskRegistry — 后台任务生命周期管理
+
+**新增类 `BackgroundTaskRegistry`**（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）
+
+- 状态机：`pending → running → completed | failed`（每状态对应时间戳 `createdAt` / `startedAt` / `completedAt`）
+- `register(input)`：分配 `task-{时间戳36进制}-{计数36进制}` 形式 taskId，状态初始为 `pending`
+- `start(taskId)`：切换为 `running`，记录 `startedAt`
+- `complete(taskId, result)`：切换为 `completed`，若未显式传 `durationMs` 则用 `completedAt - startedAt` 自动计算
+- `fail(taskId, error)`：切换为 `failed`，记录 `errorCode` / `errorMessage`
+- `wait(taskId, timeoutMs)`：阻塞等待任务结束，内部用 `resolvers` 队列 + `AbortController` 实现超时，已完成任务立即返回
+- `list(filter?)`：支持按 `status` 和 `parentSessionId` 过滤
+- `cancel(taskId)`：触发 `AbortController.abort()`，返回是否取消成功
+- `clear(filter?)`：清理已完成/失败任务
+
+#### 2. SubagentTool — runInBackground 模式
+
+**`SubagentTool` 扩展 `runInBackground` 参数**（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）
+
+- 输入 schema 新增 `runInBackground?: boolean`（默认 false，保持同步调用语义）
+- `runInBackground=true` 时：
+  1. `registry.register()` 注册任务 → 返回 taskId
+  2. `registry.start(taskId)` 切换 running
+  3. `void (async () => { ... })()` 异步执行子 Agent query，主 Agent 不阻塞
+  4. 完成后 `registry.complete/fail(taskId, ...)` 更新状态
+  5. 立即返回 `{ ok: true, output: { sessionId, taskId, background: true, message: '后台任务已启动...' } }`
+- 异步块内复用同步路径的完整逻辑：超时控制（AbortController + 120s 默认）、工具调用摘要、临时文件输出、Bus 事件发布
+- Bus 事件（`subagent.started/completed/failed`）新增 `taskId` 和 `background` 字段，支持后台任务跟踪
+
+#### 3. TaskStatusTool — 后台任务查询
+
+**新增工具 `task_status`**（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）
+
+- 输入：`{ taskId: string, wait?: boolean, timeoutMs?: number }`
+- `wait=false`（默认）：立即返回任务当前状态（pending/running/completed/failed）
+- `wait=true`：阻塞等待任务结束或超时（默认 30s），底层调用 `registry.wait(taskId, timeoutMs)`
+- 错误码：`TASK_NOT_FOUND`（taskId 不存在）、`REGISTRY_NOT_READY`（registry 未初始化）、`TASK_WAIT_TIMEOUT`（等待超时）
+- `isReadOnly: true`（查询操作不影响状态）
+
+#### 4. /tasks CLI 命令
+
+**新增 `/tasks` 命令**（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）
+
+- 用法：`/tasks [running|completed|failed]`
+- 无参数：列出所有后台任务（最多显示 50 条）
+- 带状态参数：按状态过滤
+- 每条任务显示：taskId、agentId、agentName、status、durationMs、prompt 预览（前 60 字符）
+- 无子 Agent 配置时也注册此命令（只要有 harness 引用）
+
+#### 5. 并行子 Agent 执行
+
+`runInBackground=true` 的并行性由异步执行块 `void (async () => {})()` 保证，**不依赖 `partitionToolCalls`**。
+
+- `SubagentTool.isConcurrencySafe` 保持 `() => false`：子 Agent 可能修改共享状态（如文件），即使后台模式也不做并行调度承诺
+- `partitionToolCalls` 会将多个 subagent 调用分到各自的串行批次，但每个批次只是注册任务 + 启动异步块 + 立即返回 taskId，几乎不耗时
+- 真正的子 Agent 执行在各自异步块中并行运行，不受 `partitionToolCalls` 影响
+- 多个写操作 Agent 操作同一文件的冲突由 agent 配置/worktree 隔离负责，不在工具调度层解决
+
+#### 6. 测试
+
+**@harness/subagent 新增 2 个测试套件共 17 个用例**（[packages/plugins/subagent/src/index.test.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.test.ts)）
+
+- `BackgroundTaskRegistry`（8 用例）：register/start/complete/fail/wait/list/cancel/clear 全链路 + 并发任务独立性
+- `SubagentTool runInBackground`（9 用例）：立即返回 taskId、子 Agent 失败时状态变 failed、TaskStatusTool 查询/等待/超时/不存在/无 registry、并行 3 个 background subagent 独立完成
+- 更新 4 个已有测试断言：`tool.pool.assemble` 注入 2 工具、`/subagents` 注册 2 命令、无子 Agent 时仍注册 `/tasks`、`uninstall` 后 2 工具均不可用
+
+#### 7. 验证
+
+- `@harness/subagent` 单元测试：83 pass / 0 fail（272 assertions）
+- 全量 typecheck：22 个包全部通过
+- 无回归：原有 66 个测试保持通过
+
 ## 2026-08-23（续 5）：Skill / Agent 多级加载修复
 
 ### 今日完成

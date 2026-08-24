@@ -8,9 +8,11 @@ import {
   CliPermissionEngine,
   HarnessApp,
   startRepl,
+  attachBackgroundTaskPanel,
   HELP_TEXT,
   main,
 } from './index'
+import { SubagentEvents } from '@harness/subagent'
 import type { PermissionDecision } from '@harness/permission'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
@@ -314,6 +316,80 @@ describe('插件 CLI 命令扩展', () => {
     })
     const output = chunks.join('')
     expect(output).toInclude('未知命令')
+    await app.shutdown()
+  })
+})
+
+describe('后台任务面板 attachBackgroundTaskPanel（P1-4）', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-cli-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('subagent 后台任务 started/completed 事件实时打印状态行', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    const detach = attachBackgroundTaskPanel({ harness, stdout })
+
+    const started = {
+      agentId: 'researcher', agentName: 'Researcher',
+      subSessionId: 's_sub', parentSessionId: 's_parent', parentAgentId: 'default',
+      parentMessageId: 'm1', toolUseId: 't1',
+      prompt: '调研竞品定价', description: '调研竞品定价',
+      isContinuation: false, startedAt: Date.now(),
+      taskId: 'task-1', background: true,
+    }
+    await harness.bus.publish(SubagentEvents.started, started as any)
+    await harness.bus.publish(SubagentEvents.completed, {
+      agentId: 'researcher', subSessionId: 's_sub', parentSessionId: 's_parent',
+      toolUseId: 't1', replyPreview: '竞品 X 定价 29 美元/月', messageCount: 5, durationMs: 1200,
+      taskId: 'task-1', background: true,
+    } as any)
+    detach()
+
+    const output = chunks.join('')
+    expect(output).toInclude('[后台任务] task-1 开始：Researcher')
+    expect(output).toInclude('调研竞品定价')
+    expect(output).toInclude('[后台任务] task-1 完成：Researcher（1200ms）')
+    expect(output).toInclude('竞品 X 定价 29 美元/月')
+    await app.shutdown()
+  })
+
+  it('subagent 后台任务 failed 事件打印失败行', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    const detach = attachBackgroundTaskPanel({ harness, stdout })
+
+    await harness.bus.publish(SubagentEvents.started, {
+      agentId: 'researcher', agentName: 'Researcher',
+      subSessionId: 's_sub', parentSessionId: 's_parent', parentAgentId: 'default',
+      parentMessageId: 'm1', toolUseId: 't1',
+      prompt: '调研失败任务', description: '调研失败任务',
+      isContinuation: false, startedAt: Date.now(),
+      taskId: 'task-2', background: true,
+    } as any)
+    await harness.bus.publish(SubagentEvents.failed, {
+      agentId: 'researcher', subSessionId: 's_sub', parentSessionId: 's_parent',
+      toolUseId: 't1', code: 'QUERY_FAILED', message: 'provider error', durationMs: 800,
+      taskId: 'task-2', background: true,
+    } as any)
+    detach()
+
+    const output = chunks.join('')
+    expect(output).toInclude('[后台任务] task-2 开始')
+    expect(output).toInclude('[后台任务] task-2 失败：Researcher')
+    expect(output).toInclude('provider error')
     await app.shutdown()
   })
 })

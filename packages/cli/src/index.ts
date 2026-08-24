@@ -37,6 +37,7 @@ import {
 } from '@harness/provider-mock'
 import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatProvider } from '@harness/provider-anthropic'
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
+import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import type { Message, Session } from '@harness/session'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -490,6 +491,63 @@ export interface ReplOptions {
 /** 特殊 REPL 命令（以 / 开头） */
 const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/save', '/compact']
 
+// ========================================================================
+// 5.1 后台任务面板（P1-4 前端事件驱动展示）
+// ========================================================================
+
+export interface BackgroundTaskPanelOptions {
+  /** Harness 实例（提供 bus） */
+  harness: Harness
+  /** 输出流（默认 process.stdout） */
+  stdout?: NodeJS.WritableStream | { write: (s: string) => void }
+  /** 仅展示这些父 session 派发的任务；不传则展示所有 */
+  parentSessionIds?: string[]
+}
+
+/**
+ * 挂载后台任务面板（P1-4 前端事件驱动展示）。
+ *
+ * 订阅 subagent.started / completed / failed Bus 事件，任务状态变化时
+ * 增量打印到 stdout（⏳ 开始 / ✅ 完成 / ❌ 失败 + 结果预览），
+ * 用户无需执行 /tasks、无需大模型主动查询。
+ *
+ * UI 无关：本函数只做"事件 → 文本行"的渲染，底层状态由
+ * @harness/subagent 的 BackgroundTaskMonitor 维护。
+ *
+ * @returns 卸载函数（取消订阅 + 释放 monitor）
+ */
+export function attachBackgroundTaskPanel(options: BackgroundTaskPanelOptions): () => void {
+  const { harness } = options
+  if (!harness.bus) return () => {}
+  const out = (s: string) => (options.stdout ?? process.stdout).write(s)
+
+  const monitor = new BackgroundTaskMonitor({
+    bus: harness.bus,
+    parentSessionIds: options.parentSessionIds,
+  })
+  /** taskId → 已打印的状态（增量渲染，同一状态只打印一次） */
+  const printed = new Map<string, BackgroundTaskView['status']>()
+
+  const off = monitor.subscribe((tasks) => {
+    for (const t of tasks) {
+      if (printed.get(t.taskId) === t.status) continue
+      printed.set(t.taskId, t.status)
+      if (t.status === 'running') {
+        out(`⏳  [后台任务] ${t.taskId} 开始：${t.agentName}${t.description ? `（${t.description}）` : ''}\n`)
+      } else if (t.status === 'completed') {
+        out(`✅  [后台任务] ${t.taskId} 完成：${t.agentName}（${t.durationMs ?? '?'}ms）\n`)
+        if (t.result) {
+          out(`     ↳ ${t.result.length > 140 ? t.result.slice(0, 140) + '…' : t.result}\n`)
+        }
+      } else if (t.status === 'failed') {
+        out(`❌  [后台任务] ${t.taskId} 失败：${t.agentName} — ${t.error?.message ?? '未知错误'}\n`)
+      }
+    }
+  })
+
+  return () => { off(); monitor.dispose() }
+}
+
 /**
  * 启动交互式 REPL。
  *
@@ -497,10 +555,25 @@ const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch'
  * - 显示 assistant 文本 + 每个 tool call（执行前→执行后）
  * - /exit、/quit 退出；/sessions 列出持久化会话；/new 清空当前会话；/save 手动保存
  * - 支持 scriptedStdin（测试用，或流水线一次性脚本）
+ * - 自动挂载后台任务面板：subagent 后台任务开始/完成/失败时实时打印（P1-4）
  *
  * @returns 退出原因：'exit' / 'eof' / 'scripted-done'
  */
 export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 'scripted-done'> {
+  // P1-4：挂载后台任务面板（事件驱动自动展示，无需 /tasks）
+  const detachPanel = attachBackgroundTaskPanel({
+    harness: options.harness,
+    stdout: options.stdout,
+  })
+  try {
+    return await startReplCore(options)
+  } finally {
+    detachPanel()
+  }
+}
+
+/** startRepl 内部实现（由 startRepl wrapper 挂载任务面板后调用） */
+async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'scripted-done'> {
   const { app, harness, session } = options
   const out = (s: string) => (options.stdout ?? process.stdout).write(s)
 

@@ -73,6 +73,10 @@ export const SubagentEvents = {
     isContinuation: boolean
     /** 开始时间戳 */
     startedAt: number
+    /** 后台任务 ID（runInBackground=true 时有值） */
+    taskId?: string
+    /** 是否为后台执行 */
+    background?: boolean
   }>('subagent.started'),
 
   completed: BusEvent.define<{
@@ -90,6 +94,10 @@ export const SubagentEvents = {
     messageCount: number
     /** 执行耗时（ms） */
     durationMs: number
+    /** 后台任务 ID（runInBackground=true 时有值） */
+    taskId?: string
+    /** 是否为后台执行 */
+    background?: boolean
   }>('subagent.completed'),
 
   failed: BusEvent.define<{
@@ -107,6 +115,10 @@ export const SubagentEvents = {
     message: string
     /** 执行耗时（ms） */
     durationMs: number
+    /** 后台任务 ID（runInBackground=true 时有值） */
+    taskId?: string
+    /** 是否为后台执行 */
+    background?: boolean
   }>('subagent.failed'),
 } as const
 
@@ -124,6 +136,20 @@ export interface SubagentToolInput {
   model?: { providerId?: string; modelId?: string; temperature?: number }
   /** 续接已有子 session（多轮子 Agent 对话）；不传则创建新 session */
   sessionId?: string
+  /**
+   * 是否在后台运行（fire-and-forget）：
+   * - true：立即返回 taskId 和子 sessionId，不等待子 Agent 执行完成
+   * - 不传 / false：同步等待子 Agent 完成（默认）
+   *
+   * 后台任务执行完成后：
+   * 1. 通过 Bus 事件 subagent.completed / subagent.failed 推送（带 taskId）
+   * 2. 自动向父会话注入 <task-notification> 通知，下一轮推理开始时可见
+   * 3. 用户可通过 CLI /tasks 命令查看任务列表
+   *
+   * 参考 Claude Code fork subagent 的 task-notification 模型：
+   * 工具立即返回 "Background task started"，结果通过事件通知。
+   */
+  runInBackground?: boolean
 }
 
 /** SubagentTool 的输出 */
@@ -140,6 +166,10 @@ export interface SubagentToolOutput {
   toolCallCount: number
   /** 完整输出的临时文件路径（summarized=true 时有值，父 Agent 可用 read_file/grep_file 探索） */
   outputPath?: string
+  /** 后台任务 ID（runInBackground=true 时有值） */
+  taskId?: string
+  /** 是否为后台模式（runInBackground=true 时为 true） */
+  background?: boolean
 }
 
 /** createSubagentPlugin 的配置 */
@@ -438,17 +468,45 @@ export function createSubagentTool(
   maxResultLength: number = 2000,
   maxResultLines: number = 500,
   directive?: string,
+  getRegistry?: () => BackgroundTaskRegistry | undefined,
 ): Tool<SubagentToolInput, SubagentToolOutput> {
   return defineTool<SubagentToolInput, SubagentToolOutput>({
     id: 'subagent',
     aliases: ['agent', 'run_agent', 'task'],
-    description: '派一个子 Agent 执行独立任务（隔离 session）。输入：agentId（子 Agent ID）、prompt（任务描述）、description（3-5 词简短描述，可选）、model（模型覆盖，可选）、sessionId（续接已有子 session，可选）。',
-    documentation: 'SubagentTool 让主 Agent 能派出子 Agent 执行独立任务。子 Agent 用独立 session 隔离上下文，有独立的工具白名单和权限配置。可选通过 model 参数覆盖子 Agent 的模型配置，通过 sessionId 参数续接已有子 session 实现多轮对话。子 Agent 完成后，最终回复作为工具结果返回给主 Agent。',
-    searchHint: 'subagent agent task delegate spawn worker',
+    description: '派一个子 Agent 执行独立任务（隔离 session）。输入：agentId（子 Agent ID）、prompt（任务描述）、description（3-5 词简短描述，可选）、model（模型覆盖，可选）、sessionId（续接已有子 session，可选）、runInBackground（可选）。决策规则：需要结果才能继续 → 前台（默认）；有独立工作可并行、或无需阻塞当前流程 → runInBackground: true（后台异步执行，立即返回 taskId）。后台任务完成后系统自动向本会话注入任务完成通知，不要 sleep/poll/主动查询进度。',
+    documentation: `SubagentTool 让主 Agent 能派出子 Agent 执行独立任务。
+
+## 前台 / 后台决策规则
+
+- 需要子 Agent 的结果才能继续下一步 → **前台（默认）**：子 Agent 执行完成后，最终回复作为工具结果返回。
+- 子 Agent 有独立工作可并行、或当前流程无需等待其结果 → **后台（runInBackground: true）**：立即返回 taskId，子 Agent 在后台异步执行。
+- 多次 runInBackground=true 调用会在后台并行执行多个子 Agent，互不阻塞。
+
+## 后台模式（runInBackground: true）
+
+立即返回 taskId，子 Agent 在后台异步执行。执行完成后：
+1. 通过 Bus 事件 subagent.completed / subagent.failed 推送（带 taskId）
+2. 自动向父会话注入 <task-notification> 通知（下一轮推理开始时可见），无需主动查询
+
+## 反模式警示（必须遵守）
+
+- do NOT sleep, poll, or proactively check on the subagent's progress — 完成后系统自动通知
+- Don't race — 派发后台任务后不要伪造或预测尚未到达的结果
+- Don't peek — 不要主动读取子 Agent 的输出文件来查进度
+
+## 并行执行多个子 Agent
+
+依赖后台异步执行机制：
+- 同步并行：在一次 assistant 消息中发起多个 subagent 工具调用（各自前台执行，结果直接返回）
+- 后台并行：多次 runInBackground=true 调用，子 Agent 在后台并行执行，完成后自动通知`,
+    searchHint: 'subagent agent task delegate spawn worker background async',
 
     // Fail-Closed 安全声明
     isReadOnly: () => false,          // 子 Agent 可能执行写操作
-    isConcurrencySafe: () => false,   // 子 Agent 可能修改共享状态
+    // 子 Agent 可能修改共享状态（如文件），即使 runInBackground=true 也保持串行调度。
+    // 后台并行性由 runInBackground 机制保证（异步执行块），不依赖 partitionToolCalls。
+    // 多个写操作 Agent 操作同一文件的冲突由 agent 配置/worktree 隔离负责。
+    isConcurrencySafe: () => false,
     isDestructive: () => false,       // 工具本身不破坏，但子 Agent 内部可能
     requiresUserInteraction: false,
 
@@ -563,6 +621,181 @@ export function createSubagentTool(
         }
       }
 
+      // ===== 后台模式分流（runInBackground=true 或 Agent 定义 background=true）=====
+      // 参考 Claude Code fork subagent 的 task-notification 模型：
+      // 工具立即返回 taskId 和 "Background task started" 提示，子 Agent 在后台异步执行。
+      // 执行完成后通过 Bus 事件 + enqueueNotification 自动通知父 Agent（task_status 工具已移除）。
+      const shouldRunInBackground = input.runInBackground === true || agentDef.background === true
+      const registry = getRegistry?.()
+      if (shouldRunInBackground && registry) {
+        // 1. 注册后台任务，获取 taskId
+        const taskId = registry.register({
+          agentId: input.agentId,
+          agentName: agentDef.name,
+          subSessionId,
+          parentSessionId: ctx.sessionId,
+          parentAgentId: ctx.agentId,
+          prompt: input.prompt,
+          description: input.description,
+        })
+        const controller = new AbortController()
+        // 把 controller 存到 task 上，便于后续 cancel()
+        const task = registry.get(taskId)
+        if (task) task.controller = controller
+        registry.start(taskId)
+
+        // 2. 发布 started 事件（带 taskId）
+        if (bus) {
+          bus.publish(SubagentEvents.started, {
+            agentId: input.agentId,
+            agentName: agentDef.name,
+            subSessionId,
+            parentSessionId: ctx.sessionId,
+            parentAgentId: ctx.agentId,
+            parentMessageId: ctx.messageId,
+            toolUseId: ctx.toolUseId,
+            prompt: input.prompt.length > 500 ? input.prompt.slice(0, 500) + '...' : input.prompt,
+            description: input.description,
+            isContinuation,
+            startedAt: startTime,
+            taskId,
+            background: true,
+          }).catch(() => { /* Bus 发布失败不影响主流程 */ })
+        }
+
+        // 3. 异步执行子 Agent（不 await，fire-and-forget）
+        //    执行完成后更新 task 状态 + publish completed/failed 事件
+        const effectivePromptBg = directive ? `${directive}\n\n${input.prompt}` : input.prompt
+        const timerBg = setTimeout(() => controller.abort(), timeoutMs)
+        void (async () => {
+          try {
+            const queryPromise = agent.query({
+              sessionId: subSessionId,
+              agentId: input.agentId,
+              message: effectivePromptBg,
+              model: input.model,
+            })
+            const timeoutPromise = new Promise<never>((_resolve, reject) => {
+              controller.signal.addEventListener('abort', () => {
+                reject(new Error(`后台子 Agent 执行超时（${timeoutMs}ms）`))
+              })
+            })
+            const finalMessage = await Promise.race([queryPromise, timeoutPromise])
+
+            // 提取结果 + 生成摘要
+            const subSession = await session.get(subSessionId)
+            const messages = subSession?.messages ?? [finalMessage]
+            const finalText = extractFinalAssistantText(messages) || '(子 Agent 无文本回复)'
+            const toolCallCount = countToolCalls(messages)
+            const { text: resultText, summarized, outputPath } = summarizeResult(
+              messages,
+              finalText,
+              maxResultLength,
+              maxResultLines,
+              undefined,
+            )
+
+            // 更新 task 为 completed
+            registry.complete(taskId, {
+              result: resultText,
+              summarized,
+              messageCount: messages.length,
+              toolCallCount,
+              outputPath,
+              durationMs: Date.now() - startTime,
+            })
+
+            // publish completed 事件（带 taskId）
+            if (bus) {
+              bus.publish(SubagentEvents.completed, {
+                agentId: input.agentId,
+                subSessionId,
+                parentSessionId: ctx.sessionId,
+                toolUseId: ctx.toolUseId,
+                replyPreview: resultText.length > 200 ? resultText.slice(0, 200) + '...' : resultText,
+                messageCount: messages.length,
+                durationMs: Date.now() - startTime,
+                taskId,
+                background: true,
+              }).catch(() => { /* ignore */ })
+            }
+
+            // 自动向父 session 注入 task-notification 通知（去重）
+            const task = registry.get(taskId)
+            if (task && !task.notified) {
+              task.notified = true
+              const notification = formatTaskNotification({
+                taskId,
+                status: 'completed',
+                agentName: input.agentId,
+                description: input.description,
+                result: resultText,
+                outputPath,
+                durationMs: Date.now() - startTime,
+                messageCount: messages.length,
+                toolCallCount,
+              })
+              session.enqueueNotification(ctx.sessionId, notification)
+            }
+          } catch (err) {
+            const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}`
+            const failDurationMs = Date.now() - startTime
+            // 更新 task 为 failed
+            registry.fail(taskId, {
+              code: 'SUBAGENT_FAILED',
+              message: errMsg,
+              durationMs: failDurationMs,
+            })
+            // publish failed 事件（带 taskId）
+            if (bus) {
+              bus.publish(SubagentEvents.failed, {
+                agentId: input.agentId,
+                subSessionId,
+                parentSessionId: ctx.sessionId,
+                toolUseId: ctx.toolUseId,
+                code: 'SUBAGENT_FAILED',
+                message: errMsg,
+                durationMs: failDurationMs,
+                taskId,
+                background: true,
+              }).catch(() => { /* ignore */ })
+            }
+
+            // 自动向父 session 注入 task-notification 通知（去重）
+            const task = registry.get(taskId)
+            if (task && !task.notified) {
+              task.notified = true
+              const notification = formatTaskNotification({
+                taskId,
+                status: 'failed',
+                agentName: input.agentId,
+                description: input.description,
+                error: errMsg,
+                durationMs: failDurationMs,
+              })
+              session.enqueueNotification(ctx.sessionId, notification)
+            }
+          } finally {
+            clearTimeout(timerBg)
+          }
+        })()
+
+        // 4. 立即返回 taskId（不等待子 Agent 完成）
+        return {
+          ok: true,
+          output: {
+            sessionId: subSessionId,
+            taskId,
+            background: true,
+            message: `后台任务已启动（taskId: ${taskId}）。子 Agent 在后台异步执行，执行完成后自动向本会话注入 <task-notification> 通知，无需主动查询。`,
+            messageCount: 0,
+            summarized: false,
+            toolCallCount: 0,
+          },
+        }
+      }
+
+      // ===== 同步模式（默认）=====
       // 发布 subagent.started 事件
       if (bus) {
         bus.publish(SubagentEvents.started, {
@@ -679,11 +912,14 @@ export function createSubagentTool(
       prompt: input.prompt.length > 100 ? input.prompt.slice(0, 100) + '...' : input.prompt,
       model: input.model?.modelId,
       sessionId: input.sessionId,
+      runInBackground: input.runInBackground,
     }),
     renderResult: (result) => {
       if (!result.ok || !result.output) return undefined
       return {
         sessionId: result.output.sessionId,
+        taskId: result.output.taskId,
+        background: result.output.background,
         preview: result.output.message.length > 200
           ? result.output.message.slice(0, 200) + '...'
           : result.output.message,
@@ -720,12 +956,14 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
 
   let harness: HarnessLike | undefined
   let subagentTool: Tool<SubagentToolInput, SubagentToolOutput>
+  /** 后台任务注册表（生命周期与插件实例一致） */
+  const registry = new BackgroundTaskRegistry()
 
   return {
     id: 'subagent',
-    version: '0.1.0',
+    version: '0.2.0',
     name: 'Subagent',
-    description: `Subagent 插件：派出子 Agent 执行独立任务（${subagents.length} 个子 Agent 已注册）`,
+    description: `Subagent 插件：派出子 Agent 执行独立任务（${subagents.length} 个子 Agent 已注册，支持 runInBackground）`,
 
     async install(ctx) {
       ctx.log.info('Subagent 插件已加载', {
@@ -740,7 +978,9 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         maxResultLength,
         maxResultLines,
         directive,
+        () => registry,
       )
+
 
       return {
         async 'harness.start'(input) {
@@ -784,46 +1024,99 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
               usage: '/subagents',
             })
           }
+          // /tasks 命令：列出后台任务（用户直接在 CLI 查看）
+          input.commands.push({
+            command: 'tasks',
+            description: '列出后台子 Agent 任务（runInBackground=true 派出的任务）',
+            usage: '/tasks [running|completed|failed]',
+          })
         },
 
         async 'cli.command'(input) {
-          if (input.command !== 'subagents') return
-          const registered = subagents.filter((a) => a.mode === 'subagent')
-          if (registered.length === 0) {
-            input.out('（无已注册的子 Agent）\n')
-          } else {
-            // 基于 caller.permission 过滤可见子 Agent（参考 OpenCode accessibleAgents 逻辑）
-            // 从 sessionId 获取 session，再从 session.agentId 获取父 Agent 定义
-            let accessible = registered
-            if (harness?.session) {
-              try {
-                const session = await harness.session.get(input.sessionId)
-                const callerAgentId = session?.agentId
-                if (callerAgentId && harness.agent) {
-                  const callerAgent = harness.agent.get(callerAgentId)
-                  if (callerAgent) {
-                    accessible = filterAccessibleAgents(registered, callerAgent.permission)
-                  }
-                }
-              } catch { /* session 不存在或读取失败，列出全部 */ }
-            }
-
-            if (accessible.length === 0) {
-              input.out('（当前 Agent 无权调用任何子 Agent）\n')
+          // ===== /subagents 命令 =====
+          if (input.command === 'subagents') {
+            const registered = subagents.filter((a) => a.mode === 'subagent')
+            if (registered.length === 0) {
+              input.out('（无已注册的子 Agent）\n')
             } else {
-              const hiddenCount = registered.length - accessible.length
-              const hint = hiddenCount > 0 ? `（${hiddenCount} 个被权限过滤隐藏）` : ''
-              input.out(`可调用 ${accessible.length} 个子 Agent${hint}：\n`)
-              for (const a of accessible) {
-                const tools = Array.isArray(a.tools) ? a.tools.join(', ') : '*'
-                input.out(`  ${a.id}  -  ${a.name}\n`)
-                input.out(`    描述：${a.description}\n`)
-                input.out(`    工具：${tools}\n`)
-                if (a.model?.modelId) input.out(`    模型：${a.model.modelId}\n`)
+              // 基于 caller.permission 过滤可见子 Agent（参考 OpenCode accessibleAgents 逻辑）
+              // 从 sessionId 获取 session，再从 session.agentId 获取父 Agent 定义
+              let accessible = registered
+              if (harness?.session) {
+                try {
+                  const session = await harness.session.get(input.sessionId)
+                  const callerAgentId = session?.agentId
+                  if (callerAgentId && harness.agent) {
+                    const callerAgent = harness.agent.get(callerAgentId)
+                    if (callerAgent) {
+                      accessible = filterAccessibleAgents(registered, callerAgent.permission)
+                    }
+                  }
+                } catch { /* session 不存在或读取失败，列出全部 */ }
+              }
+
+              if (accessible.length === 0) {
+                input.out('（当前 Agent 无权调用任何子 Agent）\n')
+              } else {
+                const hiddenCount = registered.length - accessible.length
+                const hint = hiddenCount > 0 ? `（${hiddenCount} 个被权限过滤隐藏）` : ''
+                input.out(`可调用 ${accessible.length} 个子 Agent${hint}：\n`)
+                for (const a of accessible) {
+                  const tools = Array.isArray(a.tools) ? a.tools.join(', ') : '*'
+                  input.out(`  ${a.id}  -  ${a.name}\n`)
+                  input.out(`    描述：${a.description}\n`)
+                  input.out(`    工具：${tools}\n`)
+                  if (a.model?.modelId) input.out(`    模型：${a.model.modelId}\n`)
+                }
               }
             }
+            input.result = 'continue'
+            return
           }
-          input.result = 'continue'
+
+          // ===== /tasks 命令：列出后台子 Agent 任务 =====
+          if (input.command === 'tasks') {
+            // 解析可选参数：running / completed / failed
+            const arg = (input.arg ?? '').trim().split(/\s+/)[0]?.toLowerCase() ?? ''
+            const statusFilter: BackgroundTaskStatus | undefined =
+              arg === 'running' ? 'running'
+              : arg === 'completed' ? 'completed'
+              : arg === 'failed' ? 'failed'
+              : arg === 'pending' ? 'pending'
+              : undefined
+
+            const all = registry.list({
+              status: statusFilter,
+              parentSessionId: input.sessionId,
+            })
+
+            if (all.length === 0) {
+              const filterHint = statusFilter ? `（${statusFilter}）` : ''
+              input.out(`（无后台任务${filterHint}）\n`)
+            } else {
+              input.out(`后台任务 ${all.length} 个${statusFilter ? `（${statusFilter}）` : ''}：\n`)
+              for (const t of all) {
+                const ageMs = Date.now() - t.createdAt
+                const ageStr = ageMs < 60_000 ? `${Math.floor(ageMs / 1000)}s` : `${Math.floor(ageMs / 60_000)}m`
+                const statusIcon = t.status === 'completed' ? '✓' : t.status === 'failed' ? '✗' : t.status === 'running' ? '⏵' : '○'
+                input.out(`  ${statusIcon} ${t.taskId}  -  ${t.agentName}（${t.status}, ${ageStr}）\n`)
+                if (t.description) input.out(`    描述：${t.description}\n`)
+                if (t.result) {
+                  const preview = t.result.length > 80 ? t.result.slice(0, 80) + '...' : t.result
+                  input.out(`    结果：${preview}\n`)
+                }
+                if (t.errorMessage) {
+                  const preview = t.errorMessage.length > 80 ? t.errorMessage.slice(0, 80) + '...' : t.errorMessage
+                  input.out(`    错误：${preview}\n`)
+                }
+                if (t.durationMs !== undefined) input.out(`    耗时：${t.durationMs}ms\n`)
+              }
+              input.out('\n')
+              input.out('提示：任务完成后系统自动通知父 Agent，无需主动查询。\n')
+            }
+            input.result = 'continue'
+            return
+          }
         },
       } as Hooks
     },
@@ -833,6 +1126,439 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     },
   }
 }
+
+// ===== BackgroundTaskRegistry（后台任务注册表）=====
+
+/**
+ * 格式化 task-notification 通知消息（注入父 session，供大模型在后续 turn 感知任务完成）。
+ * 参考 Claude Code 的 enqueueAgentNotification + `<task-notification>` XML 格式。
+ */
+export function formatTaskNotification(input: {
+  taskId: string
+  status: 'completed' | 'failed'
+  agentName: string
+  description?: string
+  result?: string
+  error?: string
+  outputPath?: string
+  durationMs: number
+  messageCount?: number
+  toolCallCount?: number
+}): string {
+  const label = input.description || input.agentName
+  const summary = input.status === 'completed'
+    ? `Agent "${label}" completed`
+    : `Agent "${label}" failed: ${input.error ?? 'Unknown error'}`
+  const resultSection = input.result ? `\n<result>${input.result}</result>` : ''
+  const outputPathSection = input.outputPath
+    ? `\n<output-file>${input.outputPath}</output-file>`
+    : ''
+  const usageSection = `\n<usage><duration-ms>${input.durationMs}</duration-ms>${
+    input.messageCount !== undefined ? `<message-count>${input.messageCount}</message-count>` : ''
+  }${
+    input.toolCallCount !== undefined ? `<tool-call-count>${input.toolCallCount}</tool-call-count>` : ''
+  }</usage>`
+  return `<task-notification>
+<task-id>${input.taskId}</task-id>
+<status>${input.status}</status>
+<summary>${summary}</summary>${resultSection}${outputPathSection}${usageSection}
+</task-notification>`
+}
+
+
+/**
+ * 后台任务状态
+ * - pending：已创建但未开始执行
+ * - running：正在执行中
+ * - completed：成功完成（结果可用）
+ * - failed：执行失败
+ */
+export type BackgroundTaskStatus = 'pending' | 'running' | 'completed' | 'failed'
+
+/**
+ * 后台任务记录
+ */
+export interface BackgroundTask {
+  /** 任务 ID（唯一） */
+  taskId: string
+  /** 子 Agent ID */
+  agentId: string
+  /** 子 Agent 名称 */
+  agentName: string
+  /** 子 session ID（独立隔离上下文） */
+  subSessionId: string
+  /** 父 session ID */
+  parentSessionId: string
+  /** 父 Agent ID */
+  parentAgentId?: string
+  /** 任务描述 */
+  prompt: string
+  /** 简短描述 */
+  description?: string
+  /** 任务状态 */
+  status: BackgroundTaskStatus
+  /** 创建时间戳 */
+  createdAt: number
+  /** 开始执行时间戳 */
+  startedAt?: number
+  /** 完成/失败时间戳 */
+  completedAt?: number
+  /** 执行耗时（ms，完成/失败后才有） */
+  durationMs?: number
+  /** 子 Agent 最终回复文本（完成时才有，超过阈值时为摘要） */
+  result?: string
+  /** 错误码（失败时才有） */
+  errorCode?: string
+  /** 错误消息（失败时才有） */
+  errorMessage?: string
+  /** 回复是否被摘要截断 */
+  summarized?: boolean
+  /** 子 session 消息总数 */
+  messageCount?: number
+  /** 子 Agent 内部工具调用次数 */
+  toolCallCount?: number
+  /** 完整输出的临时文件路径 */
+  outputPath?: string
+  /** 用于取消后台任务的 AbortController */
+  controller?: AbortController
+  /** 完成通知是否已注入父 session（去重，防止重复注入） */
+  notified?: boolean
+}
+
+/**
+ * 后台任务注册表
+ *
+ * 管理 runInBackground=true 模式创建的子 Agent 后台任务：
+ * - 注册（pending → running）
+ * - 查询（get / list）
+ * - 等待（wait，可选超时）
+ * - 取消（cancel，通过 AbortController.abort 中断 query）
+ * - 完成/失败回调（complete / fail）
+ *
+ * 任务结果保留在内存中，直到显式 clear 或进程退出。
+ * 适用于 CLI /tasks 命令展示任务列表。
+ */
+export class BackgroundTaskRegistry {
+  private tasks = new Map<string, BackgroundTask>()
+  private resolvers = new Map<string, Array<(task: BackgroundTask) => void>>()
+  private counter = 0
+
+  /**
+   * 注册新任务，返回 taskId
+   */
+  register(input: Omit<BackgroundTask, 'taskId' | 'status' | 'createdAt'>): string {
+    this.counter += 1
+    const taskId = `task-${Date.now().toString(36)}-${this.counter.toString(36)}`
+    const task: BackgroundTask = {
+      ...input,
+      taskId,
+      status: 'pending',
+      createdAt: Date.now(),
+    }
+    this.tasks.set(taskId, task)
+    return taskId
+  }
+
+  /**
+   * 标记任务为 running（开始执行）
+   */
+  start(taskId: string): void {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    task.status = 'running'
+    task.startedAt = Date.now()
+  }
+
+  /**
+   * 标记任务为 completed，存储结果，触发所有 wait 的 resolver
+   */
+  complete(taskId: string, result: Partial<Pick<BackgroundTask,
+    'result' | 'summarized' | 'messageCount' | 'toolCallCount' | 'outputPath' | 'durationMs'
+  >>): void {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    task.status = 'completed'
+    task.completedAt = Date.now()
+    Object.assign(task, result)
+    if (!task.durationMs && task.startedAt) {
+      task.durationMs = task.completedAt - task.startedAt
+    }
+    this.notifyResolvers(taskId, task)
+  }
+
+  /**
+   * 标记任务为 failed，存储错误信息，触发所有 wait 的 resolver
+   */
+  fail(taskId: string, error: { code: string; message: string; durationMs?: number }): void {
+    const task = this.tasks.get(taskId)
+    if (!task) return
+    task.status = 'failed'
+    task.completedAt = Date.now()
+    task.errorCode = error.code
+    task.errorMessage = error.message
+    if (error.durationMs !== undefined) {
+      task.durationMs = error.durationMs
+    } else if (task.startedAt) {
+      task.durationMs = task.completedAt - task.startedAt
+    }
+    this.notifyResolvers(taskId, task)
+  }
+
+  /**
+   * 查询任务（不等待）
+   */
+  get(taskId: string): BackgroundTask | undefined {
+    return this.tasks.get(taskId)
+  }
+
+  /**
+   * 列出所有后台任务（可选过滤状态）
+   */
+  list(filter?: { status?: BackgroundTaskStatus; parentSessionId?: string }): BackgroundTask[] {
+    const all = Array.from(this.tasks.values())
+    return all.filter((t) => {
+      if (filter?.status && t.status !== filter.status) return false
+      if (filter?.parentSessionId && t.parentSessionId !== filter.parentSessionId) return false
+      return true
+    }).sort((a, b) => b.createdAt - a.createdAt)
+  }
+
+  /**
+   * 等待任务完成/失败（阻塞直到结果或超时）
+   * 已完成/失败的任务立即返回。
+   *
+   * @param taskId 任务 ID
+   * @param timeoutMs 超时（ms），缺省 0 表示无限等待
+   * @returns 任务记录，或超时返回 undefined
+   */
+  async wait(taskId: string, timeoutMs: number = 0): Promise<BackgroundTask | undefined> {
+    const task = this.tasks.get(taskId)
+    if (!task) return undefined
+    if (task.status === 'completed' || task.status === 'failed') return task
+
+    return new Promise<BackgroundTask | undefined>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      if (timeoutMs > 0) {
+        timer = setTimeout(() => {
+          // 超时：从 resolvers 中移除当前 resolver，避免内存泄漏
+          const arr = this.resolvers.get(taskId) ?? []
+          this.resolvers.set(taskId, arr.filter((r) => r !== resolver))
+          resolve(undefined)
+        }, timeoutMs)
+      }
+
+      const resolver = (t: BackgroundTask) => {
+        if (timer) clearTimeout(timer)
+        resolve(t)
+      }
+      const arr = this.resolvers.get(taskId) ?? []
+      arr.push(resolver)
+      this.resolvers.set(taskId, arr)
+    })
+  }
+
+  /**
+   * 取消任务（通过 AbortController 中断 agent.query）
+   * 仅 running 状态有效；pending/completed/failed 无效。
+   */
+  cancel(taskId: string): boolean {
+    const task = this.tasks.get(taskId)
+    if (!task || task.status !== 'running' || !task.controller) return false
+    task.controller.abort()
+    return true
+  }
+
+  /**
+   * 清理已完成/失败的任务（释放内存）
+   */
+  clear(filter?: { status?: 'completed' | 'failed' }): number {
+    const all = Array.from(this.tasks.entries())
+    let removed = 0
+    for (const [id, t] of all) {
+      if (t.status === 'completed' || t.status === 'failed') {
+        if (!filter || t.status === filter.status) {
+          this.tasks.delete(id)
+          this.resolvers.delete(id)
+          removed += 1
+        }
+      }
+    }
+    return removed
+  }
+
+  /** 触发所有 wait 的 resolver */
+  private notifyResolvers(taskId: string, task: BackgroundTask): void {
+    const arr = this.resolvers.get(taskId) ?? []
+    this.resolvers.delete(taskId)
+    for (const resolve of arr) resolve(task)
+  }
+}
+
+// ===== 后台任务展示 Monitor（P1-4 前端事件驱动展示）=====
+
+/** 后台任务展示视图（UI 无关，供 CLI REPL / Web UI 渲染） */
+export interface BackgroundTaskView {
+  /** 后台任务 ID */
+  taskId: string
+  /** 子 Agent ID */
+  agentId: string
+  /** 子 Agent 名称 */
+  agentName: string
+  /** 父 session ID（任务发起方会话） */
+  parentSessionId: string
+  /** 父 Agent ID（任务发起方） */
+  parentAgentId?: string
+  /** 任务描述（完整 prompt） */
+  prompt: string
+  /** 简短描述（UI 展示用） */
+  description?: string
+  /** 任务状态 */
+  status: 'running' | 'completed' | 'failed'
+  /** 开始时间戳 */
+  startedAt: number
+  /** 结束时间戳（completed/failed 时有值） */
+  finishedAt?: number
+  /** 执行耗时（ms，completed/failed 时有值） */
+  durationMs?: number
+  /** 结果预览（completed 时，replyPreview） */
+  result?: string
+  /** 错误信息（failed 时） */
+  error?: { code: string; message: string }
+  /** 子 session 消息总数（completed 时） */
+  messageCount?: number
+}
+
+export interface BackgroundTaskMonitorOptions {
+  /** Bus 实例（订阅 subagent.started/completed/failed） */
+  bus: Bus
+  /** 仅展示这些父 session 派发的任务；不传则展示所有 */
+  parentSessionIds?: string[]
+  /** 仅展示后台任务（background=true 的事件）；默认 true */
+  backgroundOnly?: boolean
+}
+
+/** 任务变更订阅回调（每次快照变化时触发） */
+export type BackgroundTaskListener = (tasks: readonly BackgroundTaskView[]) => void
+
+/**
+ * 后台任务事件驱动 Monitor（P1-4）。
+ *
+ * 订阅 subagent.started / completed / failed Bus 事件，维护后台任务的
+ * 展示状态快照（running → completed/failed），前端（CLI REPL / 未来 Web UI）
+ * 通过 subscribe() 自动渲染，无需大模型主动调用查询工具、无需执行 /tasks。
+ *
+ * UI 无关：只维护状态 + 广播变更，不依赖任何渲染框架。
+ *
+ * @example
+ * const monitor = new BackgroundTaskMonitor({ bus })
+ * monitor.subscribe((tasks) => renderPanel(tasks))
+ * // 完成后释放
+ * monitor.dispose()
+ */
+export class BackgroundTaskMonitor {
+  private readonly tasks = new Map<string, BackgroundTaskView>()
+  private readonly listeners = new Set<BackgroundTaskListener>()
+  private readonly unsubscribers: Array<() => void> = []
+  private readonly backgroundOnly: boolean
+  private readonly parentSessionIds?: string[]
+
+  constructor(options: BackgroundTaskMonitorOptions) {
+    this.backgroundOnly = options.backgroundOnly ?? true
+    this.parentSessionIds = options.parentSessionIds
+    const { bus } = options
+    const interested = (parentSessionId: string) =>
+      !this.parentSessionIds || this.parentSessionIds.length === 0
+      || this.parentSessionIds.includes(parentSessionId)
+
+    this.unsubscribers.push(
+      bus.subscribe(SubagentEvents.started, ({ payload }) => {
+        if (!this.accept(payload.background)) return
+        if (!interested(payload.parentSessionId)) return
+        if (!payload.taskId) return
+        this.tasks.set(payload.taskId, {
+          taskId: payload.taskId,
+          agentId: payload.agentId,
+          agentName: payload.agentName,
+          parentSessionId: payload.parentSessionId,
+          parentAgentId: payload.parentAgentId,
+          prompt: payload.prompt,
+          description: payload.description,
+          status: 'running',
+          startedAt: payload.startedAt,
+        })
+        this.emit()
+      }),
+      bus.subscribe(SubagentEvents.completed, ({ payload }) => {
+        if (!this.accept(payload.background)) return
+        if (!interested(payload.parentSessionId)) return
+        if (!payload.taskId) return
+        const t = this.tasks.get(payload.taskId)
+        if (!t) return
+        t.status = 'completed'
+        t.finishedAt = Date.now()
+        t.durationMs = payload.durationMs
+        t.result = payload.replyPreview
+        t.messageCount = payload.messageCount
+        this.emit()
+      }),
+      bus.subscribe(SubagentEvents.failed, ({ payload }) => {
+        if (!this.accept(payload.background)) return
+        if (!interested(payload.parentSessionId)) return
+        if (!payload.taskId) return
+        const t = this.tasks.get(payload.taskId)
+        if (!t) return
+        t.status = 'failed'
+        t.finishedAt = Date.now()
+        t.durationMs = payload.durationMs
+        t.error = { code: payload.code, message: payload.message }
+        this.emit()
+      }),
+    )
+  }
+
+  /** 是否纳入展示（后台任务过滤） */
+  private accept(background?: boolean): boolean {
+    if (!this.backgroundOnly) return true
+    return background === true
+  }
+
+  /** 当前任务快照（按开始时间升序） */
+  getTasks(): readonly BackgroundTaskView[] {
+    return Array.from(this.tasks.values()).sort((a, b) => a.startedAt - b.startedAt)
+  }
+
+  /** 获取单个任务视图 */
+  get(taskId: string): BackgroundTaskView | undefined {
+    return this.tasks.get(taskId)
+  }
+
+  /** 订阅任务快照变更（返回取消订阅函数） */
+  subscribe(listener: BackgroundTaskListener): () => void {
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  /** 取消全部 Bus 订阅并清空监听器 */
+  dispose(): void {
+    for (const off of this.unsubscribers) off()
+    this.unsubscribers.length = 0
+    this.listeners.clear()
+  }
+
+  private emit(): void {
+    const snapshot = this.getTasks()
+    for (const listener of this.listeners) {
+      try { listener(snapshot) } catch { /* 单个监听器错误不影响其他 */ }
+    }
+  }
+}
+
+/** 创建后台任务 Monitor（便捷工厂） */
+export function createBackgroundTaskMonitor(options: BackgroundTaskMonitorOptions): BackgroundTaskMonitor {
+  return new BackgroundTaskMonitor(options)
+}
+
+
 
 // ===== 便捷导出 =====
 
