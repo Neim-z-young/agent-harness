@@ -392,4 +392,41 @@ describe('后台任务面板 attachBackgroundTaskPanel（P1-4）', () => {
     expect(output).toInclude('provider error')
     await app.shutdown()
   })
+
+  it('subagent.progress 事件实时打印工具调用进度（P1-5）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    const detach = attachBackgroundTaskPanel({ harness, stdout })
+
+    await harness.bus.publish(SubagentEvents.started, {
+      agentId: 'researcher', agentName: 'Researcher',
+      subSessionId: 's_sub', parentSessionId: 's_parent', parentAgentId: 'default',
+      parentMessageId: 'm1', toolUseId: 't1',
+      prompt: '读取文件', description: '读取文件',
+      isContinuation: false, startedAt: Date.now(),
+      taskId: 'task-3', background: true,
+    } as any)
+    await harness.bus.publish(SubagentEvents.progress, {
+      taskId: 'task-3', agentId: 'researcher', parentSessionId: 's_parent',
+      toolUseId: 'tu-1', toolName: 'read_file', toolStatus: 'running',
+      summary: 'src/index.ts', timestamp: Date.now(),
+    } as any)
+    await harness.bus.publish(SubagentEvents.progress, {
+      taskId: 'task-3', agentId: 'researcher', parentSessionId: 's_parent',
+      toolUseId: 'tu-1', toolName: 'read_file', toolStatus: 'completed',
+      summary: 'file content', timestamp: Date.now(),
+    } as any)
+    detach()
+
+    const output = chunks.join('')
+    expect(output).toInclude('🔧  [task-3] read_file：src/index.ts...')
+    expect(output).toInclude('✅  [task-3] read_file → file content')
+    await app.shutdown()
+  })
 })

@@ -120,6 +120,29 @@ export const SubagentEvents = {
     /** 是否为后台执行 */
     background?: boolean
   }>('subagent.failed'),
+
+  /**
+   * 子 Agent 工具调用进度事件（P1-5）。
+   * 后台任务执行期间，每次工具调用开始/完成时发布，前端实时展示进度。
+   */
+  progress: BusEvent.define<{
+    /** 后台任务 ID */
+    taskId: string
+    /** 子 Agent ID */
+    agentId: string
+    /** 父 session ID */
+    parentSessionId: string
+    /** 工具调用 ID */
+    toolUseId: string
+    /** 工具 ID（如 read_file / bash） */
+    toolName: string
+    /** 工具执行状态 */
+    toolStatus: 'running' | 'completed' | 'failed'
+    /** 进度摘要（工具输入/结果预览） */
+    summary: string
+    /** 进度时间戳 */
+    timestamp: number
+  }>('subagent.progress'),
 } as const
 
 // ===== 类型定义 =====
@@ -665,26 +688,71 @@ export function createSubagentTool(
 
         // 3. 异步执行子 Agent（不 await，fire-and-forget）
         //    执行完成后更新 task 状态 + publish completed/failed 事件
+        //    使用 queryStream：遍历工具调用事件，实时发布 subagent.progress（P1-5）
         const effectivePromptBg = directive ? `${directive}\n\n${input.prompt}` : input.prompt
         const timerBg = setTimeout(() => controller.abort(), timeoutMs)
         void (async () => {
           try {
-            const queryPromise = agent.query({
-              sessionId: subSessionId,
-              agentId: input.agentId,
-              message: effectivePromptBg,
-              model: input.model,
-            })
             const timeoutPromise = new Promise<never>((_resolve, reject) => {
               controller.signal.addEventListener('abort', () => {
                 reject(new Error(`后台子 Agent 执行超时（${timeoutMs}ms）`))
               })
             })
-            const finalMessage = await Promise.race([queryPromise, timeoutPromise])
+
+            // 进度发布辅助（工具调用开始/完成/失败 → subagent.progress 事件）
+            const publishProgress = (
+              toolStatus: 'running' | 'completed' | 'failed',
+              toolUseId: string,
+              toolName: string,
+              summary: string,
+            ) => {
+              if (!bus) return
+              bus.publish(SubagentEvents.progress, {
+                taskId,
+                agentId: input.agentId,
+                parentSessionId: ctx.sessionId,
+                toolUseId,
+                toolName,
+                toolStatus,
+                summary,
+                timestamp: Date.now(),
+              }).catch(() => { /* Bus 发布失败不影响主流程 */ })
+            }
+
+            // 遍历 queryStream：yield tool_call_start / tool_call_result / done
+            const execPromise = (async () => {
+              let finalMessage: Message | undefined
+              const stream = agent.queryStream({
+                sessionId: subSessionId,
+                agentId: input.agentId,
+                message: effectivePromptBg,
+                model: input.model,
+              })
+              for await (const ev of stream) {
+                if (ev.type === 'tool_call_start') {
+                  const detail = summarizeToolInput(ev.toolId ?? '', ev.input)
+                  publishProgress('running', ev.toolUseId ?? '', ev.toolId ?? '', detail)
+                } else if (ev.type === 'tool_call_result') {
+                  const preview = typeof ev.result === 'string'
+                    ? ev.result.slice(0, 120)
+                    : JSON.stringify(ev.result ?? '').slice(0, 120)
+                  publishProgress(
+                    ev.isError ? 'failed' : 'completed',
+                    ev.toolUseId ?? '',
+                    ev.toolId ?? '',
+                    preview || (ev.isError ? '执行失败' : '完成'),
+                  )
+                } else if (ev.type === 'done') {
+                  finalMessage = ev.message
+                }
+              }
+              return finalMessage
+            })()
+            const finalMessage = await Promise.race([execPromise, timeoutPromise])
 
             // 提取结果 + 生成摘要
             const subSession = await session.get(subSessionId)
-            const messages = subSession?.messages ?? [finalMessage]
+            const messages = subSession?.messages ?? (finalMessage ? [finalMessage] : [])
             const finalText = extractFinalAssistantText(messages) || '(子 Agent 无文本回复)'
             const toolCallCount = countToolCalls(messages)
             const { text: resultText, summarized, outputPath } = summarizeResult(
@@ -1426,6 +1494,22 @@ export interface BackgroundTaskView {
   error?: { code: string; message: string }
   /** 子 session 消息总数（completed 时） */
   messageCount?: number
+  /** 工具调用进度列表（P1-5：最新在前） */
+  progress?: BackgroundTaskProgress[]
+}
+
+/** 单条工具调用进度（P1-5） */
+export interface BackgroundTaskProgress {
+  /** 工具调用 ID */
+  toolUseId: string
+  /** 工具 ID */
+  toolName: string
+  /** 工具执行状态 */
+  toolStatus: 'running' | 'completed' | 'failed'
+  /** 进度摘要（工具输入/结果预览） */
+  summary: string
+  /** 进度时间戳 */
+  timestamp: number
 }
 
 export interface BackgroundTaskMonitorOptions {
@@ -1511,6 +1595,23 @@ export class BackgroundTaskMonitor {
         t.finishedAt = Date.now()
         t.durationMs = payload.durationMs
         t.error = { code: payload.code, message: payload.message }
+        this.emit()
+      }),
+      // P1-5：工具调用进度 → 追加到对应任务（最新在前）
+      bus.subscribe(SubagentEvents.progress, ({ payload }) => {
+        if (!interested(payload.parentSessionId)) return
+        const t = this.tasks.get(payload.taskId)
+        if (!t) return
+        const entry: BackgroundTaskProgress = {
+          toolUseId: payload.toolUseId,
+          toolName: payload.toolName,
+          toolStatus: payload.toolStatus,
+          summary: payload.summary,
+          timestamp: payload.timestamp,
+        }
+        // 同一 toolUseId 的旧条目（running）被新条目（completed/failed）覆盖
+        const others = (t.progress ?? []).filter((p) => p.toolUseId !== entry.toolUseId)
+        t.progress = [entry, ...others]
         this.emit()
       }),
     )

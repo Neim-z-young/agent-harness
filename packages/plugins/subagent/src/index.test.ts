@@ -15,7 +15,7 @@ import {
 } from './index'
 import { createBus } from '@harness/bus'
 import type { AgentDefinition } from '@harness/agent'
-import type { AgentRuntime } from '@harness/core'
+import type { AgentRuntime, AgentStreamEvent } from '@harness/core'
 import type { SessionManager, Session, Message } from '@harness/session'
 import type { ToolContext, ToolResult } from '@harness/tool'
 import { partitionToolCalls, type ToolUse } from '@harness/tool'
@@ -31,14 +31,26 @@ function makeMessage(role: 'user' | 'assistant', text: string): Message {
   }
 }
 
-function createMockAgentRuntime(agents: AgentDefinition[], queryImpl?: (input: { sessionId: string; agentId?: string; message: string; model?: { providerId?: string; modelId?: string; temperature?: number } }) => Promise<Message>): AgentRuntime {
+type MockQueryImpl = (input: { sessionId: string; agentId?: string; message: string; model?: { providerId?: string; modelId?: string; temperature?: number } }) => Promise<Message>
+
+function createMockAgentRuntime(
+  agents: AgentDefinition[],
+  queryImpl?: MockQueryImpl,
+  streamImpl?: (input: Parameters<MockQueryImpl>[0]) => AsyncGenerator<AgentStreamEvent, void, unknown>,
+): AgentRuntime {
   const agentMap = new Map(agents.map((a) => [a.id, a]))
   return {
     register: (def: AgentDefinition) => { agentMap.set(def.id, def) },
     get: (id: string) => agentMap.get(id),
     list: () => Array.from(agentMap.values()),
     query: queryImpl ?? (async () => makeMessage('assistant', 'mock response')),
-    queryStream: async function* () { /* noop */ },
+    // 默认流：走 queryImpl 拿最终消息，yield text_delta + done（P1-5 后后台执行依赖 queryStream）
+    queryStream: streamImpl ?? (async function* (input) {
+      const msg = queryImpl ? await queryImpl(input) : makeMessage('assistant', 'mock response')
+      const text = msg.parts.filter((p) => p.type === 'text').map((p: any) => p.text).join('')
+      if (text) yield { type: 'text_delta', text }
+      yield { type: 'done', message: msg }
+    }),
   }
 }
 
@@ -2040,6 +2052,50 @@ describe('SubagentTool runInBackground', () => {
     expect(task!.status).toBe('completed')
     expect(task!.result).toBe('research done')
   })
+
+  it('后台执行期间通过 queryStream 发布 subagent.progress 工具调用进度事件（P1-5）', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], undefined, async function* (input) {
+      yield { type: 'tool_call_start', toolUseId: 'tu-1', toolId: 'read_file', input: { path: 'src/index.ts' } }
+      yield { type: 'tool_call_result', toolUseId: 'tu-1', toolId: 'read_file', result: 'file content', isError: false }
+      yield { type: 'tool_call_start', toolUseId: 'tu-2', toolId: 'bash', input: { command: 'ls' } }
+      yield { type: 'tool_call_result', toolUseId: 'tu-2', toolId: 'bash', result: 'index.ts\n', isError: false }
+      yield { type: 'text_delta', text: 'done reading' }
+      yield { type: 'done', message: makeMessage('assistant', 'progress done') }
+    })
+    const session = createMockSessionManager(sessions)
+    const bus = createBus()
+    const progressEvents: Array<any> = []
+    const off = bus.subscribe(SubagentEvents.progress, ({ payload }) => progressEvents.push(payload))
+    const harness = { agent, session, bus }
+    const registry = new BackgroundTaskRegistry()
+
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+    const res = await tool.call(
+      { agentId: 'coder', prompt: '读取文件', runInBackground: true },
+      makeToolContext(),
+    )
+    const taskId = res.output!.taskId!
+    await registry.wait(taskId, 1000)
+    off()
+
+    expect(progressEvents.length).toBeGreaterThanOrEqual(4)
+    // running 事件：read_file 输入摘要
+    const running = progressEvents.find((e) => e.toolStatus === 'running' && e.toolName === 'read_file')
+    expect(running).toBeDefined()
+    expect(running.taskId).toBe(taskId)
+    expect(running.summary).toInclude('src/index.ts')
+    // completed 事件：read_file 结果预览
+    const completed = progressEvents.find((e) => e.toolStatus === 'completed' && e.toolName === 'read_file')
+    expect(completed).toBeDefined()
+    expect(completed.summary).toInclude('file content')
+    // bash 输入摘要
+    const bash = progressEvents.find((e) => e.toolName === 'bash' && e.toolStatus === 'running')
+    expect(bash).toBeDefined()
+    expect(bash.summary).toInclude('ls')
+  })
 })
 
 // ===== BackgroundTaskMonitor 单元测试（P1-4 前端事件驱动展示）=====
@@ -2171,5 +2227,37 @@ describe('BackgroundTaskMonitor', () => {
 
     await bus.publish(SubagentEvents.started, makeStarted('task-5') as any)
     expect(monitor.getTasks()).toHaveLength(0)
+  })
+
+  it('progress 事件追加到任务进度列表，同 toolUseId 覆盖旧条目（P1-5）', async () => {
+    const bus = createBus()
+    const monitor = new BackgroundTaskMonitor({ bus })
+
+    await bus.publish(SubagentEvents.started, makeStarted('task-6') as any)
+    await bus.publish(SubagentEvents.progress, {
+      taskId: 'task-6', agentId: 'coder', parentSessionId: 's_parent',
+      toolUseId: 'tu-1', toolName: 'read_file', toolStatus: 'running',
+      summary: 'src/index.ts', timestamp: 1,
+    } as any)
+    await bus.publish(SubagentEvents.progress, {
+      taskId: 'task-6', agentId: 'coder', parentSessionId: 's_parent',
+      toolUseId: 'tu-1', toolName: 'read_file', toolStatus: 'completed',
+      summary: 'file content', timestamp: 2,
+    } as any)
+    await bus.publish(SubagentEvents.progress, {
+      taskId: 'task-6', agentId: 'coder', parentSessionId: 's_parent',
+      toolUseId: 'tu-2', toolName: 'bash', toolStatus: 'running',
+      summary: 'ls', timestamp: 3,
+    } as any)
+
+    const t = monitor.get('task-6')!
+    expect(t.progress).toHaveLength(2)
+    // 最新在前
+    expect(t.progress![0].toolUseId).toBe('tu-2')
+    // tu-1 的 running 被 completed 覆盖
+    const tu1 = t.progress!.find((p) => p.toolUseId === 'tu-1')!
+    expect(tu1.toolStatus).toBe('completed')
+    expect(tu1.summary).toBe('file content')
+    monitor.dispose()
   })
 })

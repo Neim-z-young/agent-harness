@@ -743,18 +743,20 @@ Subagent 后台执行能力已实现 `runInBackground` + `BackgroundTaskRegistry
 
 ---
 
-#### P1-5：进度推送（⬜ 待实现）
+#### P1-5：进度推送（✅ 已完成）
 
 **目标**：子 Agent 执行中的工具调用进度通过 Bus 事件实时推送到前端。
 
 **改动**：
-- 新增 `subagent.progress` Bus 事件，包含 `{ taskId, toolName, toolStatus, summary }`
-- 子 Agent 每次工具调用时发布进度事件
-- 前端 `BackgroundTaskPanel` 展示实时进度
+- 新增 `subagent.progress` Bus 事件，包含 `{ taskId, agentId, parentSessionId, toolUseId, toolName, toolStatus: running|completed|failed, summary, timestamp }`
+- 后台执行改用 `agent.queryStream` 替代 `agent.query`：遍历事件流，`tool_call_start` → 发布 `running` 进度（含工具输入摘要，复用 `summarizeToolInput`），`tool_call_result` → 发布 `completed/failed` 进度（含结果预览）
+- `BackgroundTaskMonitor` 订阅 progress 事件，任务视图新增 `progress[]`（同 `toolUseId` 的 running 被 completed/failed 覆盖，最新在前）
+- CLI `attachBackgroundTaskPanel` 增量打印进度行（🔧 工具执行中 / ✅ 完成 / ❌ 失败）
+- 测试 mock 的 `queryStream` 补齐默认实现（走 queryImpl 产出 done 事件），后台测试随 queryStream 迁移
 
 **参考**：OpenCode `Bus.subscribe(PartUpdated)` → `ctx.metadata` 推送模式
 
-**依赖**：P1-4（前端组件）
+**依赖**：P1-4（前端组件）→ 已完成，面板同步支持进度展示
 
 ---
 
@@ -777,7 +779,7 @@ Subagent 后台执行能力已实现 `runInBackground` + `BackgroundTaskRegistry
 ✅ P0-2 (Agent background 字段) ──────────────┐
                                              ├──→ ✅ P0-3 (通知自动注入) ──→ ✅ P0-1 (Prompt 增强)
 ✅ P0-3 (通知注入基础设施) ─────────────────┘
-✅ P1-4 (前端展示: BackgroundTaskMonitor + CLI 任务面板) ──→ ⬜ P1-5 (进度推送)
+✅ P1-4 (前端展示: BackgroundTaskMonitor + CLI 任务面板) ──→ ✅ P1-5 (进度推送: subagent.progress + 面板进度行)
 → Coordinator 插件承载 (forceAsync / barrier / SendMessage) — 见第九节
 ```
 
@@ -819,7 +821,7 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] SubagentTool 描述增强：前台/后台决策规则 + "Don't sleep/poll/peek" 反模式（已完成 P0-1）
 - [x] AgentDefinition `background?: boolean` 字段（已完成 P0-2）
 - [x] P1-4 前端事件驱动展示（`BackgroundTaskMonitor` + CLI `attachBackgroundTaskPanel` 实时面板）
-- [ ] P1-5 进度推送（`subagent.progress` Bus 事件）
+- [x] P1-5 进度推送（`subagent.progress` Bus 事件 + 面板进度行）
 
 **划归 `Coordinator Plugin`（新包，P3，架构图 Phase 4 已预留位置）**：
 - [ ] 环境变量 `HARNESS_COORDINATOR_MODE` + `AgentDefinition.mode: 'coordinator'` + Coordinator System Prompt（四阶段规则 + "You orchestrate, not implement"）

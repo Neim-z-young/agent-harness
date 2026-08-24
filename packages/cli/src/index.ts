@@ -527,20 +527,36 @@ export function attachBackgroundTaskPanel(options: BackgroundTaskPanelOptions): 
   })
   /** taskId → 已打印的状态（增量渲染，同一状态只打印一次） */
   const printed = new Map<string, BackgroundTaskView['status']>()
+  /** 已打印的进度条目（taskId:toolUseId:toolStatus，P1-5） */
+  const printedProgress = new Set<string>()
 
   const off = monitor.subscribe((tasks) => {
     for (const t of tasks) {
-      if (printed.get(t.taskId) === t.status) continue
-      printed.set(t.taskId, t.status)
-      if (t.status === 'running') {
-        out(`⏳  [后台任务] ${t.taskId} 开始：${t.agentName}${t.description ? `（${t.description}）` : ''}\n`)
-      } else if (t.status === 'completed') {
-        out(`✅  [后台任务] ${t.taskId} 完成：${t.agentName}（${t.durationMs ?? '?'}ms）\n`)
-        if (t.result) {
-          out(`     ↳ ${t.result.length > 140 ? t.result.slice(0, 140) + '…' : t.result}\n`)
+      if (printed.get(t.taskId) !== t.status) {
+        printed.set(t.taskId, t.status)
+        if (t.status === 'running') {
+          out(`⏳  [后台任务] ${t.taskId} 开始：${t.agentName}${t.description ? `（${t.description}）` : ''}\n`)
+        } else if (t.status === 'completed') {
+          out(`✅  [后台任务] ${t.taskId} 完成：${t.agentName}（${t.durationMs ?? '?'}ms）\n`)
+          if (t.result) {
+            out(`     ↳ ${t.result.length > 140 ? t.result.slice(0, 140) + '…' : t.result}\n`)
+          }
+        } else if (t.status === 'failed') {
+          out(`❌  [后台任务] ${t.taskId} 失败：${t.agentName} — ${t.error?.message ?? '未知错误'}\n`)
         }
-      } else if (t.status === 'failed') {
-        out(`❌  [后台任务] ${t.taskId} 失败：${t.agentName} — ${t.error?.message ?? '未知错误'}\n`)
+      }
+      // P1-5：增量打印工具调用进度（最新在前，遍历找未打印的）
+      for (const p of t.progress ?? []) {
+        const key = `${t.taskId}:${p.toolUseId}:${p.toolStatus}`
+        if (printedProgress.has(key)) continue
+        printedProgress.add(key)
+        if (p.toolStatus === 'running') {
+          out(`  🔧  [${t.taskId}] ${p.toolName}${p.summary ? `：${p.summary}` : ''}...\n`)
+        } else if (p.toolStatus === 'completed') {
+          out(`  ✅  [${t.taskId}] ${p.toolName} → ${p.summary || '完成'}\n`)
+        } else {
+          out(`  ❌  [${t.taskId}] ${p.toolName} 失败 → ${p.summary || '未知错误'}\n`)
+        }
       }
     }
   })
