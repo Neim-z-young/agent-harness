@@ -26,6 +26,7 @@
       "dependencies": {
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
+        "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
@@ -58,6 +59,19 @@
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
+      },
+    },
+    "packages/plugins/coordinator": {
+      "name": "@harness/coordinator",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/agent": "workspace:*",
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/subagent": "workspace:*",
+        "@harness/tool": "workspace:*",
       },
     },
     "packages/plugins/mcp-client": {
@@ -221,6 +235,8 @@
     "@harness/bus": ["@harness/bus@workspace:packages/bus"],
 
     "@harness/cli": ["@harness/cli@workspace:packages/cli"],
+
+    "@harness/coordinator": ["@harness/coordinator@workspace:packages/plugins/coordinator"],
 
     "@harness/core": ["@harness/core@workspace:packages/core"],
 

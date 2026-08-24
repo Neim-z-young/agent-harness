@@ -38,6 +38,7 @@ import {
 import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatProvider } from '@harness/provider-anthropic'
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
+import { CoordinatorEvents } from '@harness/coordinator'
 import type { Message, Session } from '@harness/session'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -565,6 +566,25 @@ export function attachBackgroundTaskPanel(options: BackgroundTaskPanelOptions): 
 }
 
 /**
+ * 挂载 Coordinator 自动续轮（Coordinator 插件配套）。
+ *
+ * 订阅 `coordinator.barrier.completed` 事件——coordinator 派出的后台任务
+ * 全部完成/失败时触发——向 REPL 注入一行 `<continue/>` 作为伪用户输入，
+ * 从而启动下一轮 query：drainNotifications 将任务完成通知注入对话，
+ * coordinator 自动汇总结果、继续派工或输出最终报告（用户零操作）。
+ *
+ * @param emitLine 把一行注入 REPL 输入队列的函数（readline 模式：rl.emit('line', l)）
+ * @returns 卸载函数
+ */
+export function attachAutoContinue(harness: Harness, emitLine: (line: string) => void): () => void {
+  if (!harness.bus) return () => {}
+  return harness.bus.subscribe(CoordinatorEvents.barrierCompleted, () => emitLine('<continue/>'))
+}
+
+/** REPL 自动续轮标记消息（不作为用户输入展示/回显） */
+const AUTO_CONTINUE_LINE = '<continue/>'
+
+/**
  * 启动交互式 REPL。
  *
  * - 用户输入文本 → HarnessApp.send()
@@ -730,8 +750,12 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
     }
 
     // 正常发送（流式）
-    await options.onLine?.(line)
-    out(`\n🧑  ${line}\n`)
+    // 自动续轮（<continue/>）是系统注入的伪输入，不回显用户前缀
+    const isAutoContinue = line === AUTO_CONTINUE_LINE
+    if (!isAutoContinue) {
+      await options.onLine?.(line)
+      out(`\n🧑  ${line}\n`)
+    }
     const started = Date.now()
     let assistant: Message | undefined
     try {
@@ -797,13 +821,15 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
       output: options.stdout ?? process.stdout as any,
       prompt: '❯ ',
     })
+    // Coordinator 自动续轮：barrier 完成后注入 <continue/> 触发下一轮 query
+    const detachAutoContinue = attachAutoContinue(harness, (line) => rl.emit('line', line))
     rl.prompt()
     rl.on('line', async (line) => {
       const r = await processLine(line)
       if (r === 'exit') { rl.close(); resolve('exit') }
       else rl.prompt()
     })
-    rl.on('close', () => resolve('eof'))
+    rl.on('close', () => { detachAutoContinue(); resolve('eof') })
   })
 }
 

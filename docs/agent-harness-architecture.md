@@ -780,7 +780,8 @@ Subagent 后台执行能力已实现 `runInBackground` + `BackgroundTaskRegistry
                                              ├──→ ✅ P0-3 (通知自动注入) ──→ ✅ P0-1 (Prompt 增强)
 ✅ P0-3 (通知注入基础设施) ─────────────────┘
 ✅ P1-4 (前端展示: BackgroundTaskMonitor + CLI 任务面板) ──→ ✅ P1-5 (进度推送: subagent.progress + 面板进度行)
-→ Coordinator 插件承载 (forceAsync / barrier / SendMessage) — 见第九节
+✅ Coordinator 插件 (@harness/coordinator)：mode 身份 + System Prompt / barrier 自动集齐续轮 / forceAsync / send_message
+⬜ 后续：写操作按文件集串行化 → Swarm Plugin（见第九节）
 ```
 
 P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中承诺"系统自动通知"。
@@ -796,7 +797,7 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 | 层级 | 定位 | 类比 | 状态 |
 |------|------|------|------|
 | ① Subagent | **执行单元**：一次性、无状态的任务执行器，父 Agent 调用工具 spawn，跑完即走，结果返回创建者 | 派"外包"做单点任务，做完结算走人 | ✅ 已实现（`@harness/subagent`） |
-| ② Coordinator | **调度单元**：切换主线程身份为 orchestrator，自己不写代码，负责 Research→Synthesis→Impl→Verify 四阶段派工、汇总、续派 | "项目经理"角色，全程跟进分阶段调度，不亲自干活 | ⬜ 后续计划（P3 新包 `Coordinator Plugin`） |
+| ② Coordinator | **调度单元**：切换主线程身份为 orchestrator，自己不写代码，负责 Research→Synthesis→Impl→Verify 四阶段派工、汇总、续派 | "项目经理"角色，全程跟进分阶段调度，不亲自干活 | ✅ 已实现核心（`@harness/coordinator`），写操作串行化待后续 |
 | ③ Swarm Teammate | **组织单元**：显式创建 team 实体 + 共享任务池 + 长期收件箱 + 权限桥，成员长期在线协作 | "正式团队"，有工位、邮箱、共享任务看板、跨成员审批 | ⬜ 更远期（P3 新包 `Swarm Plugin`） |
 
 ### 9.2 功能归属判定规则
@@ -823,12 +824,12 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] P1-4 前端事件驱动展示（`BackgroundTaskMonitor` + CLI `attachBackgroundTaskPanel` 实时面板）
 - [x] P1-5 进度推送（`subagent.progress` Bus 事件 + 面板进度行）
 
-**划归 `Coordinator Plugin`（新包，P3，架构图 Phase 4 已预留位置）**：
-- [ ] 环境变量 `HARNESS_COORDINATOR_MODE` + `AgentDefinition.mode: 'coordinator'` + Coordinator System Prompt（四阶段规则 + "You orchestrate, not implement"）
-- [ ] **Barrier 同步原语**：记录 `pendingTaskIdSet`，集齐后自动注入 `<continue/>` 触发下轮 query（直接解决"多调研任务→等待→汇总"场景）
-- [ ] forceAsync 开关：所有 subagent spawn 强制 runInBackground（原 P2-6）
-- [ ] SendMessage / Resume 工具：续跑已有 taskId（不是新建子 Agent）
-- [ ] 写操作按文件集串行化调度策略（检测 target 文件集冲突，延迟执行冲突 worker）
+**划归 `Coordinator Plugin`（✅ 已实现 `@harness/coordinator`）**：
+- [x] `AgentDefinition.mode: 'coordinator'`（AgentMode 已内置）+ `prompt.system.transform` 注入 Coordinator System Prompt（四阶段规则 + orchestrator 身份）
+- [x] **Barrier 同步原语**：`CoordinatorBarrierTracker` 跟踪 per-session 后台任务（订阅 subagent.started/completed/failed），全部完成/失败后发布 `coordinator.barrier.completed` 事件；CLI `attachAutoContinue` 订阅后注入 `<continue/>` 自动续轮（直接解决"多调研任务→等待→汇总"场景）
+- [x] forceAsync：插件选项或 `HARNESS_FORCE_ASYNC=true`，`tool.pre.execute` 拦截 subagent 调用强制 runInBackground（原 P2-6）
+- [x] send_message 工具：续跑已有 taskId（延续 worker 会话上下文返回回复），仅注入 mode=coordinator 的 Agent
+- [ ] 写操作按文件集串行化调度策略（检测 target 文件集冲突，延迟执行冲突 worker）→ 后续增强
 
 **划归 `Swarm Plugin`（新包，更远期 P3）**：
 - [ ] Team 实体 + team file 持久化

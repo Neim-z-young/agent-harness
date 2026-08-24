@@ -9,10 +9,12 @@ import {
   HarnessApp,
   startRepl,
   attachBackgroundTaskPanel,
+  attachAutoContinue,
   HELP_TEXT,
   main,
 } from './index'
 import { SubagentEvents } from '@harness/subagent'
+import { CoordinatorEvents } from '@harness/coordinator'
 import type { PermissionDecision } from '@harness/permission'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
@@ -427,6 +429,52 @@ describe('后台任务面板 attachBackgroundTaskPanel（P1-4）', () => {
     const output = chunks.join('')
     expect(output).toInclude('🔧  [task-3] read_file：src/index.ts...')
     expect(output).toInclude('✅  [task-3] read_file → file content')
+    await app.shutdown()
+  })
+})
+
+describe('Coordinator 自动续轮 attachAutoContinue', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-cli-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('coordinator.barrier.completed 事件触发注入 <continue/>', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+
+    const injected: string[] = []
+    const detach = attachAutoContinue(harness, (line) => injected.push(line))
+    await harness.bus.publish(CoordinatorEvents.barrierCompleted, {
+      sessionId: 's_parent', taskIds: ['task-a', 'task-b'],
+    } as any)
+    detach()
+
+    expect(injected).toEqual(['<continue/>'])
+    await app.shutdown()
+  })
+
+  it('卸载后不再注入', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+
+    const injected: string[] = []
+    const detach = attachAutoContinue(harness, (line) => injected.push(line))
+    detach()
+    await harness.bus.publish(CoordinatorEvents.barrierCompleted, { sessionId: 's', taskIds: [] } as any)
+
+    expect(injected).toHaveLength(0)
     await app.shutdown()
   })
 })

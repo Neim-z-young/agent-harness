@@ -1,5 +1,38 @@
 # Agent Harness 开发日志
 
+## 2026-08-24：Subagent 后台展示层完善 + Coordinator 插件
+
+### 今日完成
+
+#### 1. P0-1/P0-2：Prompt 决策指导 + Agent 级后台声明
+
+- `SubagentTool` 描述增强：前台/后台决策规则 + "Don't sleep/poll/peek" 反模式；清理 `task_status` 工具残留文案
+- `AgentDefinition` 新增 `background?: boolean`（[packages/agent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/agent/src/index.ts)），`agentFromMarkdown` 支持 frontmatter 解析；后台判定并入 `agentDef.background`
+
+#### 2. P1-4：前端事件驱动展示
+
+- `@harness/subagent` 新增 UI 无关 `BackgroundTaskMonitor`（[packages/plugins/subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）：订阅 subagent.started/completed/failed 维护任务快照
+- `@harness/cli` 新增 `attachBackgroundTaskPanel`（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：任务状态实时打印，`startRepl` 自动挂载
+
+#### 3. P1-5：进度推送
+
+- 新增 `subagent.progress` Bus 事件（toolName/toolStatus/summary/timestamp）
+- 后台执行改用 `agent.queryStream` 遍历工具调用事件发布进度；Monitor 任务视图新增 `progress[]`；CLI 面板增量打印
+
+#### 4. Coordinator 插件（新包 `@harness/coordinator`）
+
+**新包**：[packages/plugins/coordinator](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/coordinator/src/index.ts)，`dependsOn: ['subagent']`，把主 Agent 变成 orchestrator：
+
+- **Coordinator 身份**：`AgentDefinition.mode === 'coordinator'` 时通过 `prompt.system.transform` 注入 `COORDINATOR_SYSTEM_PROMPT`（四阶段 Research→Synthesis→Implementation→Verification + 派工规则 + 反模式）
+- **Barrier 自动集齐**：`CoordinatorBarrierTracker` 跟踪 per-session 后台任务，全部完成/失败后发布 `coordinator.barrier.completed` 事件；CLI `attachAutoContinue` 订阅后注入 `<continue/>` 自动触发下一轮 query（解决"多调研→等齐→自动汇总"）
+- **forceAsync**：插件选项或 `HARNESS_FORCE_ASYNC=true`，`tool.pre.execute` 拦截 subagent 调用强制后台化（原 P2-6）
+- **send_message 工具**：续跑已有 taskId（延续 worker 会话上下文），仅注入 mode=coordinator 的 Agent；running 中拒绝、TASK_NOT_FOUND 兜底
+
+#### 5. 测试
+
+- coordinator 14 用例：BarrierTracker 单测 / send_message / prompt 注入 / forceAsync / 事件发布
+- cli 新增自动续轮 attachAutoContinue 2 用例；全仓 typecheck 通过
+
 ## 2026-08-23（续 6）：Subagent run_in_background + 并行执行
 
 ### 今日完成

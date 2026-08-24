@@ -1,0 +1,27 @@
+{
+  "name": "@harness/coordinator",
+  "version": "0.1.0",
+  "description": "Coordinator 插件：把主 Agent 变成 orchestrator（四阶段派工）+ barrier 自动集齐续轮 + forceAsync + send_message 续跑",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/tool": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/agent": "workspace:*",
+    "@harness/session": "workspace:*",
+    "@harness/bus": "workspace:*",
+    "@harness/subagent": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}
