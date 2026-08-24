@@ -536,6 +536,91 @@ describe('@harness/core', () => {
     })
   })
 
+  describe('AgentRuntime + snapshot 自动捕获挂载（meta.snapshot）', () => {
+    it('注入 snapshot 工厂后，query 的 assistant 消息携带 meta.snapshot.start（首轮 files 为空）', async () => {
+      let calls = 0
+      const svc = {
+        capture: async () => { calls++; return `tree-${calls}` as any },
+        files: async () => ['a.txt', 'b.txt'],
+      }
+      const h = await createHarness({
+        agents: [makeAgent()],
+        chatProvider: mockChatProvider(),
+        snapshot: () => svc as any,
+      })
+      const sess = await h.session.create()
+      const reply = await h.agent.query({ sessionId: sess.id, message: '你好' })
+
+      const snap = (reply.meta as any)?.snapshot
+      expect(snap).toBeDefined()
+      expect(snap.start).toBe('tree-1')
+      // 首轮无上一轮快照基准，files 为空（不对齐 any 旧快照）
+      expect(snap.files).toBeUndefined()
+    })
+
+    it('queryStream 同样挂载 meta.snapshot', async () => {
+      let calls = 0
+      const svc = {
+        capture: async () => { calls++; return `tree-${calls}` as any },
+        files: async () => [],
+      }
+      const h = await createHarness({
+        agents: [makeAgent()],
+        chatProvider: mockChatProvider(),
+        snapshot: () => svc as any,
+      })
+      const sess = await h.session.create()
+      let last: any
+      for await (const ev of h.agent.queryStream({ sessionId: sess.id, message: '流式测试' })) {
+        if (ev.type === 'done') last = (ev as any).message
+      }
+      const snap = (last?.meta as any)?.snapshot
+      expect(snap).toBeDefined()
+      expect(snap.start).toBe('tree-1')
+    })
+
+    it('第二轮 query 的 files 为两轮快照间的变更文件', async () => {
+      let snapCount = 0
+      const filesCalls: Array<{ from: string; to: string }> = []
+      const svc = {
+        capture: async () => { snapCount++; return `tree-${snapCount}` as any },
+        files: async (from: string, to: string) => { filesCalls.push({ from, to }); return ['c.txt'] },
+      }
+      const h = await createHarness({
+        agents: [makeAgent()],
+        chatProvider: mockChatProvider(),
+        snapshot: () => svc as any,
+      })
+      const sess = await h.session.create()
+      await h.agent.query({ sessionId: sess.id, message: '第一轮' })
+      const second = await h.agent.query({ sessionId: sess.id, message: '第二轮' })
+
+      const snap = (second.meta as any)?.snapshot
+      expect(snap.start).toBe('tree-2')
+      expect(snap.files).toEqual(['c.txt'])
+      expect(filesCalls).toEqual([{ from: 'tree-1', to: 'tree-2' }])
+    })
+
+    it('未注入 snapshot 工厂时不挂载 meta.snapshot', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      const reply = await h.agent.query({ sessionId: sess.id, message: '你好' })
+      expect((reply.meta as any)?.snapshot).toBeUndefined()
+    })
+
+    it('capture 失败（返回 undefined）时 best-effort，不挂载且不中断推理', async () => {
+      const h = await createHarness({
+        agents: [makeAgent()],
+        chatProvider: mockChatProvider(),
+        snapshot: () => ({ capture: async () => undefined, files: async () => [] }) as any,
+      })
+      const sess = await h.session.create()
+      const reply = await h.agent.query({ sessionId: sess.id, message: '你好' })
+      expect(reply.parts.some((p) => (p as any).type === 'text')).toBe(true)
+      expect((reply.meta as any)?.snapshot).toBeUndefined()
+    })
+  })
+
   describe('Session Management Enhancement', () => {
     it('自动标题：首条 user 消息截取为 title', async () => {
       const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })

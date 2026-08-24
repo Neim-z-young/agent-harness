@@ -1,5 +1,65 @@
 # Agent Harness 开发日志
 
+## 2026-08-24（续 4）：CLI /revert 命令（文件快照回滚交互）
+
+### 接入 `@harness/cli`（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+
+实现 §10.3 第 5 条：CLI `/revert` 命令闭环（capture 挂消息 → stage 回滚 → clear/commit）：
+
+- `HarnessAppOptions` 新增 `snapshot?: boolean`（默认 false）：开启时创建 `SnapshotService`（基于 resolve 后的 cwd）注入 `createHarness.snapshot`（自动挂载 meta.snapshot），并启用 `/revert` 命令
+- `/revert` 子命令：`stage <messageID>`（回滚 + 逐文件 diff 展示，patch 截断 400 字符）/ `clear`（撤销）/ `commit`（接受）/ `status` / `help`；未启用快照时提示；异常经 try/catch 打印"回滚失败"不崩溃
+- `/help` 列表新增 `/revert`；`REPL_COMMANDS` 注册
+- cli 新增依赖 `@harness/snapshot`、`@harness/revert`
+- 测试：cli 新增 6 用例（未启用提示 / help / status / stage 错误路径 / 未知子命令 / help 列表），27 用例全绿；全仓 typecheck 通过
+
+## 2026-08-24（续 3）：core 自动 capture 挂载（AgentRuntimeImpl.query / queryStream）
+
+### 接入 `@harness/core`（[packages/core/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts)）
+
+实现 §10.3 第 1 条：AgentRuntime 每轮自动快照并挂载到消息：
+
+- `AgentHarnessOptions` 新增可选 `snapshot?: () => SnapshotService`（@harness/snapshot 工厂），`createHarness` 透传给 `AgentRuntimeImpl`
+- `AgentRuntimeImpl` 新增 `captureForMessage(sessionId)`：每轮 LLM 调用后、工具执行前 `capture()`，`files` = 相对上一轮快照的变更文件（按 sessionId 维护 `lastSnapshots`，首轮为空）；capture 失败 best-effort（返回 undefined 不中断推理）
+- `query()` / `queryStream()` 生成的 assistant 消息挂 `meta.snapshot = { start, files }`（对齐 OpenCode `message.snapshot`），供 `@harness/revert` 的 `collectSnapshotMap` 收集回滚目标
+- 未注入 snapshot 工厂则不启用（向后兼容，现有调用不受影响）
+- core 新增依赖 `@harness/snapshot`（workspace:*）
+- 测试：core 新增 5 用例（query/queryStream 挂载、第二轮 files 计算、未注入不挂载、capture 失败 best-effort），27 用例全绿；全仓 typecheck 通过
+
+## 2026-08-24（续 2）：Revert 三态 + Bus 事件（`@harness/revert`）
+
+### 新包 `@harness/revert`（[packages/revert](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/revert/src/index.ts)）
+
+实现 §10.3 会话级文件回滚三态（对齐 OpenCode `SessionRevert.stage/clear/commit`）：
+
+- **`SessionRevert.stage({ sessionId, messageID, snapshotMap? })`**：定位边界消息 → `collectSnapshotMap` 收集其后 assistant 消息的快照引用（或显式 `snapshotMap`）→ `SnapshotService.restore` 选择性回滚 → `diff(original → 回滚后)` 生成回滚 diff → 保存 `session.meta.revert`（RevertState）→ 发布 `snapshot.revert.staged`；重复 stage 沿用首次 original
+- **`clear(sessionId)`**：按 RevertState 恢复回滚前原始快照（撤销回滚）→ 发布 `snapshot.revert.cleared`；**`commit(sessionId)`**：接受回滚 → 清除状态 → 发布 `snapshot.revert.committed`
+- **消息快照引用约定**（对齐 OpenCode `message.snapshot`）：`message.meta.snapshot = { start, files }`，提供 `attachSnapshotToMessage()` / `collectSnapshotMap()` 辅助
+- **Bus 事件**：`RevertEvents.staged/cleared/committed`（域 `snapshot.revert.*`）
+- 自定义错误 `RevertError(operation, message, cause)`
+- 测试：10 用例全绿（stage 回滚 + 事件 / snapshotMap 覆盖 / 错误路径 / clear 撤销 / commit 接受 / 重复 stage 沿用 original / 挂载与收集辅助）；typecheck 通过
+- 后续待办：AgentRuntime query 开始时自动 capture + attachSnapshotToMessage（core 集成）
+
+## 2026-08-24（续）：Snapshot 调研 + `@harness/snapshot` 包骨架
+
+### 调研：OpenCode / Claude Code 快照与回滚方案
+
+- `reference/` 更新：新增 `opencode-dev/`（OpenCode **完整真实源码 v2**），`claude-code-analysis-main` 补充《快照与回滚.md / 快照与回滚2.md》深度分析文档
+- **OpenCode v2**（`packages/core/snapshot.ts` + `git.ts`）：独立 git 仓库 + `git write-tree` 内容寻址；`capture`（diff-files + ls-files → add --sparse → write-tree）、`preview`（临时 GIT_INDEX_FILE 零副作用）、`restore`（ls-tree 判定 → checkout / rm）、`checkout`（read-tree + checkout-index）；消息内嵌 `snapshot.start`，`SessionRevert.stage/clear/commit` 三态
+- **Claude Code**（fileHistory.ts）：文件副本方案，`{sha256_16}@v{n}` 备份 + 快照链（上限 100）；编辑前 trackEdit + 回合结束 makeSnapshot；三级变更检测（stat/mtime/内容）；`fileHistoryRewind` → applySnapshot（unlink/restoreBackup/skip 幂等）
+- **结论**：本项目采用 OpenCode git tree 方案（去重、复用 git 语义、可预览），Claude Code 文件副本保留为非 git fallback
+
+### 新包 `@harness/snapshot`（[packages/snapshot](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/snapshot/src/index.ts)）
+
+- `SnapshotService`：`capture / files / diff / preview / restore / checkout`，快照仓库 `~/.harness/snapshots/{worktree-hash}`（独立于用户 .git）
+- `GitRepo`（--git-dir/--work-tree 显式指定）+ `KeyedMutex`（按仓库串行化写操作）+ `SnapshotError`
+- 安全边界：restore 路径逃逸校验；>2MB untracked 跳过；capture best-effort
+- 踩坑修复：① diff/preview 内嵌套调用同 key 互斥锁 → 死锁超时，抽取 `filesUnlocked`/`diffUnlocked`；② preview 未刷新 index → 基准树过期，先 `refresh('.')` 再 write-tree
+- 测试：11 用例全部通过（hash 稳定性 / files / diff / restore / checkout / preview 零副作用 / 大文件跳过 / disabled），typecheck 通过
+
+### 文档
+
+- [docs/agent-harness-architecture.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agent-harness-architecture.md) 新增 §10「文件历史与回滚」（选型对比 / 包设计 / 集成路线 / 后续增强）
+
 ## 2026-08-24：Subagent 后台展示层完善 + Coordinator 插件
 
 ### 今日完成

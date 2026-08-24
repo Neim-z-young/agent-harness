@@ -24,7 +24,9 @@
     "@harness/provider-anthropic": "workspace:*",
     "@harness/tools-builtin": "workspace:*",
     "@harness/subagent": "workspace:*",
-    "@harness/coordinator": "workspace:*"
+    "@harness/coordinator": "workspace:*",
+    "@harness/snapshot": "workspace:*",
+    "@harness/revert": "workspace:*"
   },
   "scripts": {
     "dev": "bun run ./src/index.ts repl",

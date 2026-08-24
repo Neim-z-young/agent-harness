@@ -837,3 +837,67 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [ ] Task List Plane（TaskCreate/List/Claim/Update/Stop）
 - [ ] Leader Permission Bridge（队友权限请求借用 leader 的 ToolUseConfirmQueue）
 - [ ] in-process teammate（AsyncLocalStorage 隔离）+ tmux/iTerm2 后端
+
+## 十、文件历史与回滚：Snapshot / Diff / Revert
+
+> 记录日期：2026-08-24。来源：OpenCode v2 真实源码（`opencode-dev/packages/core/snapshot.ts` + `git.ts`）与 Claude Code fileHistory 分析（`claude-code-analysis-main/快照与回滚.md`）。
+
+### 10.1 方案选型（两案对比）
+
+| 维度 | OpenCode v2（git tree 方案） | Claude Code（fileHistory 文件副本方案） |
+|------|------------------------------|------------------------------------------|
+| 本质 | 独立 git 仓库 + `git write-tree` 内容寻址 | 备份文件 `{sha256_16}@v{n}` + 快照链元数据 |
+| 存储 | tree hash 只存引用，对象库自动去重压缩 | 每个变更文件全量副本（mtime/size 跳过） |
+| 依赖 | 用户项目必须是 git | 纯文件系统，不依赖 git |
+| 回滚 | `git checkout` / `read-tree`，git 语义保证 | `copyFile` + `chmod` + `unlink` |
+| 回滚预览 | 临时 index 零副作用 diff | 备份内容对比统计 |
+| 并发 | KeyedMutex 按仓库加锁 | 无 |
+| 大文件 | >2MB untracked 跳过 | 无限制 |
+
+**本项目选型：主方案采用 OpenCode git tree 方案（`@harness/snapshot`，✅ 已实现骨架）**，理由：
+1. content-addressed tree 天然去重，快照开销 = 一个 hash 字符串；
+2. 恢复/回滚复用 git 成熟语义（checkout / read-tree），不自行实现文件恢复；
+3. preview 借助临时 `GIT_INDEX_FILE` 可做到零副作用回滚预览。
+Claude Code 文件副本方案保留为**非 git 项目 fallback**（见 10.4 后续增强）。
+
+### 10.2 `@harness/snapshot` 包设计（已实现）
+
+**存储位置**：`~/.harness/snapshots/{sha256(worktree).slice(0,16)}`（独立 git 仓库，`--git-dir`/`--work-tree` 显式指定；不触碰用户项目 `.git`，避免污染用户 index/对象库）。
+
+**接口**（`createSnapshotService({ worktree, gitDirectory?, maximumUntrackedFileBytes?, enabled? })`）：
+
+| 方法 | 语义 | 底层命令 |
+|------|------|----------|
+| `capture(scope?)` | 快照当前状态，返回 tree hash；失败 best-effort 返回 undefined | `diff-files` + `ls-files --others` → `rm --cached`（超限）→ `add --all --sparse` → `write-tree` |
+| `files(from,to)` | 两个快照间变更文件列表 | `git diff --name-only -z` |
+| `diff(from,to)` | 结构化 FileDiff（status/增删/patch） | `--name-status` + `--numstat` + `--unified=3` |
+| `preview(files)` | 零副作用回滚预览（不落盘） | 临时 index → `read-tree` → `update-index --cacheinfo` → `write-tree` → diff |
+| `restore(files)` | 选择性恢复（目标树不存在则删除） | `ls-tree` 判定 → `checkout {tree} -- file` / `rm` |
+| `checkout(tree)` | 整仓恢复（快照外文件保留） | `read-tree` + `checkout-index --all --force` |
+
+**关键设计决策**：
+- **锁**：所有写操作经 `KeyedMutex.run('tree', ...)` 按仓库串行化；`diff`/`preview` 内部复用无锁私有方法（`filesUnlocked`/`diffUnlocked`），避免同 key 嵌套死锁（踩坑记录）。
+- **index 同步**：`preview` 在 write-tree 前必须先 `refresh('.')`，否则基准树是上次 capture 的过期状态（踩坑记录）。
+- **安全边界**：`restore` 校验路径不得逃逸 worktree（`path.relative` 前缀检查）；未跟踪文件超 `maximumUntrackedFileBytes`（默认 2MB）跳过。
+- **错误**：统一 `SnapshotError(operation, message, cause)`，模块特定失败场景。
+
+### 10.3 集成路线（Revert 三态 ✅ 已实现 `@harness/revert`）
+
+1. **capture 挂消息**（✅ 已实现）：AgentRuntime（`AgentRuntimeImpl.query` / `queryStream`）在每轮 LLM 调用后、工具执行前自动 `SnapshotService.capture()`，并把 `meta.snapshot = { start, files }` 挂到生成的 assistant 消息上（`files` = 相对上一轮快照的变更文件，首轮为空）。通过 `createHarness({ snapshot: () => SnapshotService })` 注入，未注入则不启用。对齐 OpenCode `llm.ts` 的 `startSnapshot`。
+2. **Revert 三态**（✅ 已实现，`@harness/revert` 的 `SessionRevert`，对齐 OpenCode `SessionRevert.stage/clear/commit`）：
+   - `stage({ sessionId, messageID, snapshotMap? })`：定位边界消息 → 收集其后 assistant 消息的快照引用（`collectSnapshotMap`）或显式 `snapshotMap` → `restore` 选择性回滚 → `diff(original → 回滚后)` 生成回滚 diff → 保存 `session.meta.revert`（RevertState）→ 发布 `snapshot.revert.staged`；
+   - `clear(sessionId)`：按 RevertState 恢复回滚前的原始快照（撤销回滚）→ 发布 `snapshot.revert.cleared`；
+   - `commit(sessionId)`：接受回滚（文件保持回滚后状态）→ 清除 revert 状态 → 发布 `snapshot.revert.committed`。
+3. **Bus 事件**（✅ 已实现，域 `snapshot.revert.*`）：`staged { sessionId, messageID, diff, files }` / `cleared { sessionId }` / `committed { sessionId, messageID }`，CLI/UI 订阅展示。
+4. **Diff 展示**：回合级 diff 复用工具结果内嵌的 structuredPatch（Claude Code useTurnDiffs 思路，增量聚合），git 快照 diff 作为补充。
+5. **CLI `/revert` 命令**（✅ 已实现）：`HarnessApp({ snapshot: true })` 启用（默认关闭，避免非 git 环境开销）；`/revert stage <messageID>`（回滚 + diff 展示）/ `clear`（撤销）/ `commit`（接受）/ `status` / `help`。
+
+**待办**：
+- [ ] 无（§10.3 集成路线全部落地；后续增强见 §10.4）
+
+### 10.4 后续增强（边界外）
+
+- [ ] 非 git 项目 fallback：Claude Code fileHistory 文件副本 + 三级变更检测（stat/mtime/内容）
+- [ ] 接入用户仓库 `check-ignore`（复用用户 .gitignore 语义过滤快照范围）
+- [ ] `git gc --prune=7.days` 定期清理（OpenCode 同款）
+- [ ] 快照上限 / 淘汰策略（Claude Code MAX_SNAPSHOTS=100 参考）

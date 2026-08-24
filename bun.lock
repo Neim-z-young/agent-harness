@@ -47,6 +47,7 @@
         "@harness/plugin": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/skill": "workspace:*",
+        "@harness/snapshot": "workspace:*",
         "@harness/tool": "workspace:*",
       },
     },
@@ -210,6 +211,15 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/revert": {
+      "name": "@harness/revert",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "*",
+        "@harness/session": "*",
+        "@harness/snapshot": "*",
+      },
+    },
     "packages/session": {
       "name": "@harness/session",
       "version": "0.1.0",
@@ -223,6 +233,10 @@
       "dependencies": {
         "@harness/permission": "workspace:*",
       },
+    },
+    "packages/snapshot": {
+      "name": "@harness/snapshot",
+      "version": "0.1.0",
     },
     "packages/tool": {
       "name": "@harness/tool",
@@ -258,9 +272,13 @@
 
     "@harness/provider-qwen": ["@harness/provider-qwen@workspace:packages/plugins/provider-qwen"],
 
+    "@harness/revert": ["@harness/revert@workspace:packages/revert"],
+
     "@harness/session": ["@harness/session@workspace:packages/session"],
 
     "@harness/skill": ["@harness/skill@workspace:packages/skill"],
+
+    "@harness/snapshot": ["@harness/snapshot@workspace:packages/snapshot"],
 
     "@harness/subagent": ["@harness/subagent@workspace:packages/plugins/subagent"],
 

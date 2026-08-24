@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -475,6 +475,74 @@ describe('Coordinator 自动续轮 attachAutoContinue', () => {
     await harness.bus.publish(CoordinatorEvents.barrierCompleted, { sessionId: 's', taskIds: [] } as any)
 
     expect(injected).toHaveLength(0)
+    await app.shutdown()
+  })
+})
+
+describe('/revert 命令', () => {
+  let dir: string
+  beforeEach(() => {
+    // 普通临时目录即可：快照仓库独立于 worktree，命令分支不依赖 worktree 是 git 仓库
+    dir = mkdtempSync(join(tmpdir(), 'harness-cli-revert-'))
+  })
+  afterEach(() => rmSync(dir, { recursive: true, force: true }))
+
+  async function bootApp(snapshot = false) {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      snapshot,
+    })
+    const { harness, session } = await app.boot()
+    return { app, harness, session, stdout, chunks }
+  }
+
+  it('未启用 snapshot 时 /revert 提示启用', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(false)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/revert', '/exit'] })
+    expect(chunks.join('')).toInclude('快照未启用')
+    await app.shutdown()
+  })
+
+  it('启用后 /revert help 显示子命令用法', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/revert help', '/exit'] })
+    const out = chunks.join('')
+    expect(out).toInclude('stage')
+    expect(out).toInclude('clear')
+    expect(out).toInclude('commit')
+    expect(out).toInclude('status')
+    await app.shutdown()
+  })
+
+  it('/revert status 无进行中回滚时提示', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/revert status', '/exit'] })
+    expect(chunks.join('')).toInclude('当前无进行中的回滚')
+    await app.shutdown()
+  })
+
+  it('/revert stage 不存在的消息时打印回滚失败（不崩溃）', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/revert stage no-such-msg', '/exit'] })
+    expect(chunks.join('')).toInclude('回滚失败')
+    await app.shutdown()
+  })
+
+  it('/revert 未知子命令提示', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/revert nope', '/exit'] })
+    expect(chunks.join('')).toInclude('未知子命令')
+    await app.shutdown()
+  })
+
+  it('/help 列表包含 /revert', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/help', '/exit'] })
+    expect(chunks.join('')).toInclude('/revert')
     await app.shutdown()
   })
 })

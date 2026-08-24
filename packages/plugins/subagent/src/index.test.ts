@@ -2066,7 +2066,7 @@ describe('SubagentTool runInBackground', () => {
     const session = createMockSessionManager(sessions)
     const bus = createBus()
     const progressEvents: Array<any> = []
-    const off = bus.subscribe(SubagentEvents.progress, ({ payload }) => progressEvents.push(payload))
+    const off = bus.subscribe(SubagentEvents.progress, ({ payload }) => { progressEvents.push(payload) })
     const harness = { agent, session, bus }
     const registry = new BackgroundTaskRegistry()
 

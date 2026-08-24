@@ -201,6 +201,10 @@ import {
   COMPACT_META_KEY as COMPACT_META_KEY_VAL,
   COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
 } from '@harness/session'
+import type {
+  SnapshotID,
+  SnapshotService,
+} from '@harness/snapshot'
 
 // ========================================================================
 // 1. ContextProvider (DI 容器)
@@ -1032,6 +1036,10 @@ export interface AgentRuntime {
 export class AgentRuntimeImpl implements AgentRuntime {
   private readonly agents = new Map<string, AgentDefinition>()
   private readonly defaultAgentId: string
+  /** 惰性创建的快照服务实例 */
+  private snapshotSvc: SnapshotService | undefined
+  /** 每 session 最近一次快照（用于计算本轮变更文件列表） */
+  private readonly lastSnapshots = new Map<string, SnapshotID>()
   constructor(
     defaultAgentId: string,
     private readonly deps: {
@@ -1046,6 +1054,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
       ) => Promise<void>
       readonly bus: Bus
       readonly cwd: string
+      /** 可选：快照服务工厂（注入后自动 capture 挂载 meta.snapshot） */
+      readonly snapshot?: () => SnapshotService
     }
   ) {
     this.defaultAgentId = defaultAgentId
@@ -1068,6 +1078,36 @@ export class AgentRuntimeImpl implements AgentRuntime {
     blockLines.push(info.memory.summaryText)
     blockLines.push('===============================================')
     sysParts.push(blockLines.join('\n'))
+  }
+
+  /** 惰性获取快照服务（deps.snapshot 未注入则不启用自动快照） */
+  private getSnapshotService(): SnapshotService | undefined {
+    if (this.snapshotSvc === undefined && this.deps.snapshot) {
+      this.snapshotSvc = this.deps.snapshot()
+    }
+    return this.snapshotSvc
+  }
+
+  /**
+   * 本轮开始时 capture 文件快照，返回挂到 assistant 消息 `meta.snapshot` 的引用。
+   * files 为相对上一轮快照的变更文件列表（首轮为 undefined）；
+   * capture 失败 best-effort 返回 undefined（不中断推理）。
+   */
+  private async captureForMessage(
+    sessionId: string,
+  ): Promise<{ start: SnapshotID; files?: string[] } | undefined> {
+    const svc = this.getSnapshotService()
+    if (!svc) return undefined
+    try {
+      const start = await svc.capture()
+      if (!start) return undefined
+      const last = this.lastSnapshots.get(sessionId)
+      const files = last ? await svc.files(last, start) : undefined
+      this.lastSnapshots.set(sessionId, start)
+      return { start, files }
+    } catch {
+      return undefined
+    }
   }
 
   register(def: AgentDefinition): void {
@@ -1169,6 +1209,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
       agentId,
     })
 
+    // 本轮开始时自动 capture 快照并挂到 assistant 消息（供 revert 收集回滚目标）
+    const snap = await this.captureForMessage(sessionId)
+
     // 创建 assistant 消息
     const assistantId = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
     const assistant: Message = {
@@ -1183,6 +1226,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
           input: completion.tokenUsage.input,
           output: completion.tokenUsage.output,
         } : undefined,
+        ...(snap ? { snapshot: { start: snap.start, files: snap.files } } : {}),
       },
     }
     if (completion.reasoning) assistant.parts.push({ type: 'reasoning', text: completion.reasoning })
@@ -1310,6 +1354,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const { agentId, sessionId, finalMessages, params, headers, allowedTools } = await this._prepareQuery(input)
     const provider = this.deps.chatProvider()
 
+    // 本轮开始时自动 capture 快照（挂到 assistant 消息 meta.snapshot）
+    const snap = await this.captureForMessage(sessionId)
+
     // 收集流式结果
     let textBuf = ''
     let reasoningBuf = ''
@@ -1398,6 +1445,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       meta: {
         model,
         tokenUsage: tokenUsage ? { input: tokenUsage.input, output: tokenUsage.output } : undefined,
+        ...(snap ? { snapshot: { start: snap.start, files: snap.files } } : {}),
       },
     }
     if (reasoningBuf) assistant.parts.push({ type: 'reasoning', text: reasoningBuf })
@@ -1539,6 +1587,14 @@ export interface AgentHarnessOptions {
   bus?: Bus
   /** 可选：自定义 ToolRegistry（便于测试注入） */
   toolRegistry?: ToolRegistry
+  /**
+   * 可选：快照服务工厂（@harness/snapshot）。
+   * 注入后，AgentRuntime 每轮 query/queryStream 会自动 capture 文件快照，
+   * 并把 `meta.snapshot = { start, files }` 挂到生成的 assistant 消息上
+   * （供 @harness/revert 收集回滚目标，对齐 OpenCode message.snapshot）。
+   * 未注入则不启用自动快照记录。
+   */
+  snapshot?: () => SnapshotService
   /** 可选：透传给 PluginManager（测试注入 dynamicImport） */
   pluginOverrides?: Partial<PluginManagerOptions>
   /** 可选：透传 logger */
@@ -1649,6 +1705,7 @@ export class HarnessImpl implements Harness {
       triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
       bus: this.bus,
       cwd: options.cwd ?? process.cwd(),
+      snapshot: options.snapshot,
     })
     ;(options.agents ?? []).forEach((a) => agentImpl.register(a))
 

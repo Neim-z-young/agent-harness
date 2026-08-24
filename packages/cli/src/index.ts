@@ -39,6 +39,8 @@ import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatPr
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
+import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
+import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import type { Message, Session } from '@harness/session'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -296,11 +298,19 @@ export interface HarnessAppOptions {
   agents?: AgentDefinition[]
   /** 额外 internalPlugins */
   extraPlugins?: AgentPlugin[]
+  /**
+   * 启用文件快照 + /revert 命令（默认 false）。
+   * 开启后：createHarness 注入 @harness/snapshot 工厂（每轮 query 自动 capture
+   * 并挂载 meta.snapshot），REPL 提供 /revert stage|clear|commit|status。
+   */
+  snapshot?: boolean
 }
 
 export class HarnessApp {
   public readonly sessionStore: SessionFileStore
   public readonly permissionStorePath: string
+  /** 文件快照服务（options.snapshot 开启时创建，供 createHarness 注入与 /revert 命令） */
+  public readonly snapshotService: SnapshotService | undefined
   private harness!: Harness
   private options: Required<Pick<HarnessAppOptions, 'cwd' | 'dataDir' | 'agentId' | 'provider'>> & HarnessAppOptions
 
@@ -309,6 +319,9 @@ export class HarnessApp {
     this.options = { ...options, cwd, dataDir: resolve(options.dataDir), agentId: options.agentId, provider: options.provider }
     this.sessionStore = new SessionFileStore(this.options.dataDir)
     this.permissionStorePath = join(this.options.dataDir, 'permissions.json')
+    if (options.snapshot) {
+      this.snapshotService = createSnapshotService({ worktree: cwd })
+    }
   }
 
   /** 加载权限文件 */
@@ -403,6 +416,7 @@ export class HarnessApp {
         '.harness/skills',
       ],
       permission: perm,
+      snapshot: this.snapshotService ? () => this.snapshotService! : undefined,
       logger: {
         info: (msg, meta) => this.options.verbose
           ? this.options.stdout?.write?.(`[INFO] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}\n`)
@@ -640,6 +654,7 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
           out('  /export [sessionId]  导出会话为 Markdown（默认当前会话）\n')
+          out('  /revert <sub>         文件快照回滚：stage/clear/commit/status/help\n')
           // 收集插件注册的命令
           try {
             const cmdInput = { commands: [] as Array<{ command: string; description: string; usage?: string }> }
@@ -728,6 +743,68 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
           out(md)
           out('\n')
           return 'continue'
+        }
+        case '/revert': {
+          if (!options.app.snapshotService) {
+            out('快照未启用：构造 HarnessApp 时传 snapshot: true 后可用 /revert。\n')
+            return 'continue'
+          }
+          const revert = createSessionRevert({
+            session: harness.session,
+            snapshot: options.app.snapshotService,
+            bus: harness.bus,
+          })
+          const parts = line.split(/\s+/).filter(Boolean)
+          const sub = parts[1] ?? 'help'
+          const sid = session.id
+          try {
+            switch (sub) {
+              case 'help': {
+                out('用法：\n')
+                out('  /revert stage <messageID>  回滚该消息之后的文件变更（生成 diff）\n')
+                out('  /revert clear              撤销回滚（恢复回滚前状态）\n')
+                out('  /revert commit             接受回滚（文件保持回滚后状态）\n')
+                out('  /revert status             查看当前回滚状态\n')
+                return 'continue'
+              }
+              case 'status': {
+                const state = await revert.getState(sid)
+                if (!state) { out('（当前无进行中的回滚）\n'); return 'continue' }
+                out(`回滚状态：messageID=${state.messageID}\n`)
+                out(`快照：${state.snapshot}\n`)
+                const filesText = (state.files ?? []).map((f) => `${f.path} (+${f.additions}/-${f.deletions})`).join(', ')
+                out(`变更文件：${filesText || '（无）'}\n`)
+                return 'continue'
+              }
+              case 'clear': {
+                await revert.clear(sid)
+                out('已撤销回滚，文件恢复回滚前状态。\n')
+                return 'continue'
+              }
+              case 'commit': {
+                await revert.commit(sid)
+                out('已接受回滚，文件保持回滚后状态。\n')
+                return 'continue'
+              }
+              case 'stage': {
+                const messageID = parts[2]
+                if (!messageID) { out('用法：/revert stage <messageID>\n'); return 'continue' }
+                const state = await revert.stage({ sessionId: sid, messageID })
+                out(`已回滚 ${messageID} 之后的文件变更（${state.files?.length ?? 0} 个文件）：\n`)
+                for (const f of state.files ?? []) {
+                  out(`  ${f.status.padEnd(8)} ${f.path}  +${f.additions}/-${f.deletions}\n`)
+                  if (f.patch) out(`${f.patch.slice(0, 400)}${f.patch.length > 400 ? '...' : ''}\n`)
+                }
+                return 'continue'
+              }
+              default:
+                out(`未知子命令：${sub}，输入 /revert help 查看用法。\n`)
+                return 'continue'
+            }
+          } catch (err: any) {
+            out(`回滚失败：${err?.message ?? String(err)}\n`)
+            return 'continue'
+          }
         }
         default: {
           // 尝试交给插件处理
