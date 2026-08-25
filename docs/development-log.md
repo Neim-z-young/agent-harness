@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-08-24（续 6）：Coordinator 写操作串行化 + Swarm Plugin（@harness/swarm）
+
+### 1. Coordinator 写操作按文件集串行化（§9.4 收官）
+
+- `SubagentToolInput` 新增 `targetFiles?: string[]`（worker 派工时声明要写的文件/目录，调度元数据，subagent 工具本身不消费）
+- `CoordinatorFileArbiter`（[packages/plugins/coordinator/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/coordinator/src/index.ts)）：`pathsOverlap` 前缀匹配冲突检测（相同/目录子路径/祖先后代）+ FIFO 等待队列
+- `tool.pre.execute` 拦截 subagent 调用：冲突派工 `await acquire(toolUseId, targetFiles)` 阻塞；后台任务由 subagent.completed/failed 事件（按 toolUseId）释放声明，同步任务在 next() 返回时 finally 释放
+- `createCoordinatorPlugin({ serializeWrites: true })` 默认开启，仅对声明了 targetFiles 的调用生效；forceAsync 与仲裁合并到同一 preHook
+- 测试：coordinator 29 用例全绿（新增 pathsOverlap 6 + arbiter 5 + 串行化集成 5）
+
+### 2. Swarm Plugin 新包 `@harness/swarm`（§9.4 Swarm 项核心落地）
+
+参考 Claude Code swarm（teammateMailbox / TeamCreateTool / TaskCreateTool / TaskStopTool / leaderPermissionBridge / spawnInProcess），存储根 `~/.harness/teams/`：
+
+- **TeamManager**：team file 持久化（`{name}/team.json`，name/description/lead/members，同名成员覆盖），create/get/list/addMember/delete，create 时初始化 inboxes/
+- **TeammateMailbox**：`{name}/inboxes/{agent}.json` 文件收件箱，`withLock`（原子 'wx' 锁文件 + EEXIST 重试 + 超时）串行化并发写；readUnread/markMessageAsReadByRef/countUnread
+- **TaskListPlane**：`{name}/tasks.json` 共享任务池，状态机 available → in_progress → completed/failed/cancelled（生命周期校验 + claim 冲突检测 + stop 统一 kill switch）
+- **LeaderPermissionBridge**：module-level `registerLeaderConfirmQueue`（CLI/REPL 注册 leader 确认入口）+ `requestPermissionThroughLeader`（teammate ask 权限带 workerBadge 回流 leader；无桥 fail-closed 拒绝）
+- **InboxPoller**：`attachInboxPoller` 周期轮询未读消息回调宿主（纯逻辑 + 手动 pollOnce，可独立测试）
+- **in-process teammate 基础**：`TeammateRegistry` + `withTeammateIdentity`（AsyncLocalStorage 身份隔离）+ `formatAgentId`（{name}@{team}）；完整执行循环 + tmux/iTerm2 后端列后续
+- **工具**（tool.pool.assemble 注入全部 Agent）：team_create/team_delete/team_status、send_teammate_message（mailbox 路由，避免与 coordinator send_message 冲突）、task_create/list/claim/update/stop
+- 测试：swarm 28 用例全绿（sanitizeName 2 + TeamManager 5 + Mailbox 4 + TaskList 5 + PermissionBridge 2 + Poller 2 + teammate 2 + 工具 5 + 插件 1）
+- 踩坑：`withLock` 首版 catch 吞掉 ENOENT（父目录不存在）→ 无限重试锁超时；修复为 withLock 内先 mkdir 父目录 + 仅 EEXIST 重试
+
+### 验证与提交
+
+- 全仓 26 包 typecheck 通过；coordinator 29 + swarm 28 + subagent 92 测试全绿
+- 文档：架构 §9.4 Coordinator 全部 ✅、Swarm 核心 ✅（完整执行循环/tmux 后端留待办）；development-log 续 6
+
 ## 2026-08-24（续 5）：§10.4 双后端 + 存储治理（快照 fallback / gc / 上限）
 
 ### 重构 `@harness/snapshot` 为双后端（[packages/snapshot/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/snapshot/src/index.ts)）

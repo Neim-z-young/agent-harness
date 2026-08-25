@@ -32,7 +32,9 @@
         "@harness/plugin": "workspace:*",
         "@harness/provider-anthropic": "workspace:*",
         "@harness/provider-mock": "workspace:*",
+        "@harness/revert": "workspace:*",
         "@harness/session": "workspace:*",
+        "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
@@ -165,6 +167,18 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/swarm": {
+      "name": "@harness/swarm",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/agent": "workspace:*",
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/plugins/tools-builtin": {
       "name": "@harness/tools-builtin",
       "version": "0.1.0",
@@ -281,6 +295,8 @@
     "@harness/snapshot": ["@harness/snapshot@workspace:packages/snapshot"],
 
     "@harness/subagent": ["@harness/subagent@workspace:packages/plugins/subagent"],
+
+    "@harness/swarm": ["@harness/swarm@workspace:packages/plugins/swarm"],
 
     "@harness/tool": ["@harness/tool@workspace:packages/tool"],
 
