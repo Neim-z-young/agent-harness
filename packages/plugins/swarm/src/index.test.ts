@@ -13,7 +13,12 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
   attachInboxPoller,
+  createPermissionRequest,
+  createPermissionResponse,
   createSendTeammateMessageTool,
+  createShutdownDecision,
+  createShutdownDecisionTool,
+  createShutdownRequest,
   createSwarmPlugin,
   createTaskClaimTool,
   createTaskCreateTool,
@@ -23,10 +28,15 @@ import {
   createTeamDeleteTool,
   createTeamStatusTool,
   formatAgentId,
+  generateRequestId,
   getCurrentTeammate,
   hasLeaderConfirmQueue,
+  hasPendingPermissionCallback,
+  isStructuredProtocolMessage,
+  processMailboxPermissionResponse,
   registerLeaderConfirmQueue,
   requestPermissionThroughLeader,
+  requestSwarmPermission,
   runTeammateTick,
   sanitizeName,
   spawnInProcessTeammate,
@@ -35,9 +45,13 @@ import {
   TeammateMailbox,
   TeamManager,
   TeammateRegistry,
+  teammateRegistry,
+  unregisterLeaderConfirmQueue,
   withTeammateIdentity,
   withLock,
   type ConfirmRequest,
+  type MailboxMessage,
+  type ShutdownDecisionInput,
   type SwarmTask,
   type TeamMember,
 } from './index'
@@ -53,6 +67,8 @@ async function makeDir(prefix: string): Promise<string> {
 
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })))
+  // 复位模块级全局状态，避免测试间相互污染
+  unregisterLeaderConfirmQueue()
 })
 
 function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
@@ -260,6 +276,121 @@ describe('LeaderPermissionBridge', () => {
     queue[0]!.resolve({ allow: true })
     await expect(pending).resolves.toEqual({ allow: true })
   })
+
+  it('unregisterLeaderConfirmQueue 复位后 fail-closed', async () => {
+    unregisterLeaderConfirmQueue()
+    expect(hasLeaderConfirmQueue()).toBe(false)
+    const decision = await requestPermissionThroughLeader({ toolName: 'bash' })
+    expect(decision).toEqual({ allow: false })
+  })
+})
+
+// ===== mailbox 协作协议（类型扩展 + helper 构造函数） =====
+
+describe('mailbox 协作协议', () => {
+  it('isStructuredProtocolMessage：协议类型 true，普通 message false', () => {
+    const base = { from: 'a', to: 'b', text: '', timestamp: 't' }
+    expect(isStructuredProtocolMessage({ ...base, type: 'permission_request' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'permission_response' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'sandbox_permission_request' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'plan_approval_request' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'shutdown_request' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'shutdown_approved' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'shutdown_rejected' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'idle_notification' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'task_assignment' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'team_permission_update' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'mode_set_request' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'task_notification' })).toBe(true)
+    expect(isStructuredProtocolMessage({ ...base, type: 'message' })).toBe(false)
+  })
+
+  it('generateRequestId：前缀 + 自增序列不重复', () => {
+    const a = generateRequestId('perm')
+    const b = generateRequestId('perm')
+    expect(a.startsWith('perm-')).toBe(true)
+    expect(a).not.toBe(b)
+  })
+
+  it('createPermissionRequest / createPermissionResponse 携带配对字段', () => {
+    const req = createPermissionRequest({ from: 'bob', to: 'lead', toolName: 'bash', input: { command: 'ls' } })
+    expect(req.type).toBe('permission_request')
+    expect(req.requestId).toBeDefined()
+    expect(req.text).toContain('bash')
+    expect(req.data).toMatchObject({ toolName: 'bash', input: { command: 'ls' } })
+
+    const res = createPermissionResponse({ from: 'lead', to: 'bob', requestId: req.requestId!, allow: true, forever: true })
+    expect(res.type).toBe('permission_response')
+    expect(res.replyTo).toBe(req.requestId)
+    expect(res.data).toEqual({ allow: true, forever: true })
+  })
+
+  it('createShutdownRequest / createShutdownDecision 生成 approved / rejected 两类决策', () => {
+    const req = createShutdownRequest({ from: 'lead', to: 'bob', reason: '收工' })
+    expect(req.type).toBe('shutdown_request')
+    expect(req.requestId).toBeDefined()
+    expect(req.text).toContain('收工')
+
+    const ok = createShutdownDecision({ from: 'bob', to: 'lead', requestId: req.requestId!, decision: 'approved' })
+    expect(ok.type).toBe('shutdown_approved')
+    expect(ok.replyTo).toBe(req.requestId)
+    expect(ok.decision).toBe('approved')
+    expect(ok.text).toContain('已批准')
+
+    const no = createShutdownDecision({ from: 'bob', to: 'lead', requestId: req.requestId!, decision: 'rejected', reason: '还有任务' })
+    expect(no.type).toBe('shutdown_rejected')
+    expect(no.decision).toBe('rejected')
+    expect(no.text).toContain('还有任务')
+  })
+})
+
+// ===== 权限 mailbox 双轨 fallback =====
+
+describe('权限 mailbox fallback', () => {
+  it('requestSwarmPermission 无 leader 桥时降级 mailbox：写请求 + 响应配对 resolve', async () => {
+    const dir = await makeDir('swarm-perm-')
+    const mb = new TeammateMailbox(dir)
+    expect(hasLeaderConfirmQueue()).toBe(false)
+
+    const pending = requestSwarmPermission({
+      from: 'bob', toolName: 'write_file', input: { path: '/x' }, mailbox: mb, team: 'alpha', leaderName: 'lead',
+    })
+
+    // requestSwarmPermission 异步写 inbox，轮询等待写入完成
+    let leaderInbox: MailboxMessage[] = []
+    for (let i = 0; i < 20 && leaderInbox.length === 0; i++) {
+      leaderInbox = await mb.readMailbox('alpha', 'lead')
+      if (leaderInbox.length === 0) await new Promise((r) => setTimeout(r, 5))
+    }
+    expect(leaderInbox).toHaveLength(1)
+    expect(leaderInbox[0]!.type).toBe('permission_request')
+    const requestId = leaderInbox[0]!.requestId!
+    expect(requestId).toBeDefined()
+    expect(hasPendingPermissionCallback(requestId)).toBe(true)
+
+    // leader 写回 permission_response（allow + forever）
+    await mb.writeToMailbox('alpha', 'bob', createPermissionResponse({ from: 'lead', to: 'bob', requestId, allow: true, forever: true }))
+    const handled = await processMailboxPermissionResponse(mb, 'alpha', 'bob')
+    expect(handled).toBe(true)
+    await expect(pending).resolves.toEqual({ allow: true, forever: true })
+    expect(hasPendingPermissionCallback(requestId)).toBe(false)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+  })
+
+  it('processMailboxPermissionResponse：未知 requestId 不 resolve 但标记已读', async () => {
+    const dir = await makeDir('swarm-perm-')
+    const mb = new TeammateMailbox(dir)
+    expect(hasPendingPermissionCallback()).toBe(false)
+    await mb.writeToMailbox('alpha', 'bob', createPermissionResponse({ from: 'lead', to: 'bob', requestId: 'ghost', allow: true }))
+    const handled = await processMailboxPermissionResponse(mb, 'alpha', 'bob')
+    expect(handled).toBe(false)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+  })
+
+  it('requestSwarmPermission 双轨皆不可用 → fail-closed 拒绝', async () => {
+    const decision = await requestSwarmPermission({ from: 'bob', toolName: 'bash' })
+    expect(decision).toEqual({ allow: false })
+  })
 })
 
 // ===== InboxPoller =====
@@ -431,18 +562,24 @@ describe('runTeammateTick（teammate 执行循环）', () => {
     expect(leaderInbox[0]!.text).toContain('失败')
   })
 
-  it('shutdown 消息：状态置 shutdown 并中止', async () => {
+  it('shutdown_request：不直接关停，交给模型决策（query 注入 approve/reject 上下文）', async () => {
     const dir = await makeDir('swarm-tick-')
     const mb = new TeammateMailbox(dir)
     const plane = new TaskListPlane(dir)
-    const { harness } = makeMockHarness()
+    const { harness, queries } = makeMockHarness()
     const state = makeTeammateState()
     const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
 
-    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: '收工', timestamp: 't1', type: 'shutdown' })
-    await runTeammateTick(state, deps)
-    expect(state.status).toBe('shutdown')
-    expect(state.abortController.signal.aborted).toBe(true)
+    await mb.writeToMailbox('alpha', 'bob', createShutdownRequest({ from: 'lead', to: 'bob', reason: '收工' }))
+    const result = await runTeammateTick(state, deps)
+    expect(result.handledMessages).toBe(1)
+    expect(queries).toHaveLength(1)
+    expect(queries[0]!.message).toContain('关停请求')
+    expect(queries[0]!.message).toContain('approve_shutdown')
+    // 不直接 abort：关停由模型调用 approve_shutdown 工具决策后触发
+    expect(state.status).toBe('running')
+    expect(state.abortController.signal.aborted).toBe(false)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
   })
 })
 
@@ -572,6 +709,56 @@ describe('Swarm 工具', () => {
     expect(res.ok).toBe(false)
     expect(res.error!.code).toBe('TEAM_CREATE_FAILED')
   })
+
+  it('approve_shutdown：回发 shutdown_approved + 触发 onDecision 关停回调', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const mb = new TeammateMailbox(dir)
+    let decided: { input: ShutdownDecisionInput; ctx: ToolContext } | undefined
+    const tool = createShutdownDecisionTool('approved', () => mb, async (input, ctx) => { decided = { input, ctx } })
+
+    const res = await tool.call({ team: 'alpha', memberName: 'bob', requestId: 'shutdown-1', reason: '收工' }, makeCtx())
+    expect(res.ok).toBe(true)
+    expect(res.output).toEqual({ decision: 'approved' })
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    expect(leaderInbox[0]!.type).toBe('shutdown_approved')
+    expect(leaderInbox[0]!.from).toBe('bob')
+    expect(leaderInbox[0]!.replyTo).toBe('shutdown-1')
+    expect(decided?.input.memberName).toBe('bob')
+  })
+
+  it('reject_shutdown：回发 shutdown_rejected，不传 onDecision 即不触发关停', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const mb = new TeammateMailbox(dir)
+    // 与插件接法一致：reject 不注入 onDecision（仅 approve 触发关停）
+    const tool = createShutdownDecisionTool('rejected', () => mb)
+
+    const res = await tool.call({ team: 'alpha', memberName: 'bob', requestId: 'shutdown-1' }, makeCtx())
+    expect(res.ok).toBe(true)
+    expect(res.output).toEqual({ decision: 'rejected' })
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    expect(leaderInbox[0]!.type).toBe('shutdown_rejected')
+    expect(leaderInbox[0]!.from).toBe('bob')
+  })
+
+  it('approve_shutdown 插件注入：按 memberName 查找 registry 并置 shutdown', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const plugin = createSwarmPlugin({ teamsDir: dir })
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    const pool: any = { added: [], add: (t: any) => { pool.added.push(t) } }
+    await hooks['tool.pool.assemble']({ agentId: 'coordinator' }, pool)
+    const approve = pool.added.find((t: any) => t.id === 'approve_shutdown')
+
+    // 在全局 teammateRegistry 注册一个 teammate（identity.team 为 sanitize 后团队名）
+    const state = makeTeammateState()
+    teammateRegistry.register(state)
+
+    const res = await approve.call({ team: 'alpha', memberName: 'bob' }, makeCtx({ agentId: 'researcher' }))
+    expect(res.ok).toBe(true)
+    expect(state.status).toBe('shutdown')
+    expect(state.abortController.signal.aborted).toBe(true)
+    // 清理全局 registry，避免污染后续测试
+    teammateRegistry['tasks'].clear()
+  })
 })
 
 // ===== 插件 =====
@@ -584,6 +771,8 @@ describe('createSwarmPlugin', () => {
     await hooks['tool.pool.assemble']({ agentId: 'any' }, pool)
     const ids = (pool.added as string[]).sort()
     expect(ids).toEqual([
+      'approve_shutdown',
+      'reject_shutdown',
       'send_teammate_message',
       'task_claim',
       'task_create',

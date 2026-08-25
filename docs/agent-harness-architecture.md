@@ -838,15 +838,15 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] Task List Plane：`TaskListPlane`（tasks.json 共享任务池，状态机 available → in_progress → completed/failed/cancelled + 生命周期校验 + claim 冲突检测），工具 task_create/list/claim/update/stop
 - [x] Leader Permission Bridge：`registerLeaderConfirmQueue`（module-level，CLI/REPL 注册 leader 的 confirm queue）+ `requestPermissionThroughLeader`（teammate ask 权限请求带 workerBadge 回流 leader；无桥 fail-closed 拒绝）
 - [x] in-process teammate 基础：`TeammateRegistry` + `withTeammateIdentity` AsyncLocalStorage 身份隔离 + `formatAgentId`
-- [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（单轮：mailbox 未读消息处理——普通消息 query 后回复写回发送者、shutdown 消息触发关停；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止）
+- [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（单轮：mailbox 未读消息处理——普通消息 query 后回复写回发送者、`shutdown_request` 注入模型决策（不直接关停）；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止）
 - [ ] tmux/iTerm2 进程后端（out-of-process teammate）→ 后续增强
-- [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套，`tool.pool.assemble` 注入全部 Agent
+- [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套 / approve_shutdown / reject_shutdown，`tool.pool.assemble` 注入全部 Agent
 
 **Swarm 后续待办（对照 Claude Code 源码调研 `04h-multi-agent.md` / teammateMailbox / inProcessRunner / useInboxPoller / tasks.ts）**：
 
-- [ ] **mailbox 协作协议类型扩展**：`permission_request/response`、`sandbox_*`、`plan_approval_*`、`idle_notification`、`task_assignment`、`team_permission_update`、`mode_set_request` + `isStructuredProtocolMessage` 路由（当前仅 message/shutdown/task_notification）
-- [ ] **权限 mailbox 双轨 fallback**：`requestPermissionThroughLeader` 无桥时降级 mailbox（permission_request 写 leader inbox → leader poller 弹 UI → response 回写 → teammate poller 命中回调 resolve），`useSwarmPermissionPoller` 的 `pendingCallbacks` Map + 500ms 轮询
-- [ ] **shutdown 模型决策**：shutdown_request → teammate 用 approveShutdown/rejectShutdown 工具决策 → shutdown_response → in-process abort / tmux gracefulShutdown（当前为直接关停）
+- [x] **mailbox 协作协议类型扩展**：`MailboxMessageType` 扩至 15 种（permission/sandbox/plan_approval/shutdown/idle_notification/task_assignment/team_permission_update/mode_set_request/task_notification）+ `isStructuredProtocolMessage` 路由（结构化消息不进普通 LLM 上下文）+ 协议 helper（`createPermissionRequest/Response`、`createShutdownRequest/Decision`、`generateRequestId`，requestId/replyTo 配对）
+- [x] **权限 mailbox 双轨 fallback**：`requestSwarmPermission`——有 leader 桥走 confirm queue（workerBadge）；无桥且提供 mailbox 时降级（`sendPermissionRequestViaMailbox` 写 permission_request → `registerPermissionCallback` 挂起回调 → leader 写回 response → `processMailboxPermissionResponse` 命中 requestId 配对 resolve）；双轨皆无 fail-closed 拒绝
+- [x] **shutdown 模型决策**：`runTeammateTick` 对 shutdown_request 不直接关停，注入 query 由模型调用 `approve_shutdown`/`reject_shutdown` 工具决策；工具回发 shutdown_approved/shutdown_rejected（replyTo=requestId），approve 时插件按 memberName 查 registry abort + 置 shutdown
 - [ ] **inbox poller 优先级**：shutdown 最高（防 peer 消息饿死）→ lead 消息 > peer 消息（FIFO）→ `tryClaimNextTask`；投递成功后才 markRead（防丢消息）
 - [ ] **task 依赖与认领锁**：`blockedBy` 依赖未解决不可认领 + claim 文件级锁防 TOCTOU（tasks.ts `claimTaskWithBusyCheck`）
 - [ ] **idle_notification**：teammate 每轮结束向 leader 发空闲通知（idleReason: available/interrupted/failed + peer DM 摘要）

@@ -224,6 +224,24 @@ export class TeamManager {
 
 // ===== Mailbox：文件式收件箱（带锁） =====
 
+/** mailbox 协作协议消息类型（对齐 Claude Code MailboxMessage 协议；isStructuredProtocolMessage 用于路由分流） */
+export type MailboxMessageType =
+  | 'message' // 普通文本
+  | 'permission_request' // 权限请求（teammate → leader）
+  | 'permission_response' // 权限响应（leader → teammate）
+  | 'sandbox_permission_request' // sandbox 权限请求
+  | 'sandbox_permission_response' // sandbox 权限响应
+  | 'plan_approval_request' // plan 审批请求
+  | 'plan_approval_response' // plan 审批响应
+  | 'shutdown_request' // 关停请求（leader → teammate）
+  | 'shutdown_approved' // 关停已批准（teammate → leader）
+  | 'shutdown_rejected' // 关停被拒绝（teammate → leader）
+  | 'idle_notification' // teammate 空闲通知（→ leader）
+  | 'task_assignment' // 任务指派
+  | 'team_permission_update' // 团队权限更新
+  | 'mode_set_request' // 模式设置请求
+  | 'task_notification' // 任务完成/失败通知
+
 /** Mailbox 消息（对齐 Claude Code MailboxMessage；type 支持协作协议消息） */
 export interface MailboxMessage {
   /** 发送者成员名 */
@@ -234,11 +252,133 @@ export interface MailboxMessage {
   summary?: string
   /** ISO 时间戳 */
   timestamp: string
-  /** 协作协议消息类型（普通文本 / 权限请求 / 权限响应 / 关停 / 任务通知） */
-  type: 'message' | 'permission_request' | 'permission_response' | 'shutdown' | 'task_notification'
+  /** 协作协议消息类型 */
+  type: MailboxMessageType
   read?: boolean
-  /** 关联请求 ID（权限请求/响应配对用） */
+  /** 关联请求 ID（权限/关停/plan 请求-响应配对） */
   replyTo?: string
+  /** 发起方生成的 requestId（响应方写 replyTo 关联） */
+  requestId?: string
+  /** plan 审批响应携带的 leader 权限模式（供对方继承） */
+  permissionMode?: string
+  /** idle_notification 空闲原因 */
+  idleReason?: 'available' | 'interrupted' | 'failed'
+  /** shutdown 决策（shutdown_approved/rejected） */
+  decision?: 'approved' | 'rejected'
+  /** 附加结构化数据（permission 响应 allow/forever、sandbox、team_permission_update 等） */
+  data?: Record<string, unknown>
+}
+
+/** 结构化协议消息类型（非普通 message，poller/teammate 循环按此路由） */
+const STRUCTURED_PROTOCOL_TYPES: ReadonlySet<MailboxMessageType> = new Set([
+  'permission_request',
+  'permission_response',
+  'sandbox_permission_request',
+  'sandbox_permission_response',
+  'plan_approval_request',
+  'plan_approval_response',
+  'shutdown_request',
+  'shutdown_approved',
+  'shutdown_rejected',
+  'idle_notification',
+  'task_assignment',
+  'team_permission_update',
+  'mode_set_request',
+  'task_notification',
+])
+
+/** 是否为协作协议消息（true = 结构化路由，避免被当作普通 LLM 上下文吞掉） */
+export function isStructuredProtocolMessage(msg: MailboxMessage): boolean {
+  return STRUCTURED_PROTOCOL_TYPES.has(msg.type)
+}
+
+let protocolSeq = 0
+
+/** 生成请求 ID（权限/关停/plan 配对用；对齐 generateRequestId） */
+export function generateRequestId(prefix: string): string {
+  protocolSeq = (protocolSeq + 1) % 0xffff
+  return `${prefix}-${Date.now().toString(36)}-${protocolSeq.toString(36)}`
+}
+
+/** 构造权限请求消息（对齐 createPermissionRequest） */
+export function createPermissionRequest(opts: {
+  from: string
+  to: string
+  toolName: string
+  input?: unknown
+  requestId?: string
+  summary?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  const requestId = opts.requestId ?? generateRequestId('perm')
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: `[permission] ${opts.toolName} 需要权限批准`,
+    summary: opts.summary,
+    timestamp: new Date().toISOString(),
+    type: 'permission_request',
+    requestId,
+    data: { toolName: opts.toolName, input: opts.input },
+  }
+}
+
+/** 构造权限响应消息（对齐 createPermissionResponse） */
+export function createPermissionResponse(opts: {
+  from: string
+  to: string
+  requestId: string
+  allow: boolean
+  forever?: boolean
+  summary?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: opts.allow ? `[permission] 已批准` : `[permission] 已拒绝`,
+    summary: opts.summary,
+    timestamp: new Date().toISOString(),
+    type: 'permission_response',
+    replyTo: opts.requestId,
+    data: { allow: opts.allow, forever: opts.forever ?? false },
+  }
+}
+
+/** 构造关停请求消息（对齐 sendShutdownRequestToMailbox） */
+export function createShutdownRequest(opts: {
+  from: string
+  to: string
+  reason?: string
+  requestId?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  const requestId = opts.requestId ?? generateRequestId('shutdown')
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: `[shutdown] 请求关停${opts.reason ? `：${opts.reason}` : ''}`,
+    timestamp: new Date().toISOString(),
+    type: 'shutdown_request',
+    requestId,
+    data: { reason: opts.reason },
+  }
+}
+
+/** 构造关停决策响应消息（shutdown_approved / shutdown_rejected） */
+export function createShutdownDecision(opts: {
+  from: string
+  to: string
+  requestId: string
+  decision: 'approved' | 'rejected'
+  reason?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: `[shutdown] ${opts.decision === 'approved' ? '已批准关停' : '拒绝关停'}${opts.reason ? `：${opts.reason}` : ''}`,
+    timestamp: new Date().toISOString(),
+    type: opts.decision === 'approved' ? 'shutdown_approved' : 'shutdown_rejected',
+    replyTo: opts.requestId,
+    decision: opts.decision,
+  }
 }
 
 /**
@@ -473,6 +613,11 @@ export function hasLeaderConfirmQueue(): boolean {
   return leaderEnqueue !== undefined
 }
 
+/** 注销 leader 权限桥（CLI/测试清理全局状态） */
+export function unregisterLeaderConfirmQueue(): void {
+  leaderEnqueue = undefined
+}
+
 /**
  * teammate 权限请求：优先借用 leader 的权限确认队列（带 workerBadge）；
  * 无 leader 桥时 fail-closed 拒绝。
@@ -487,6 +632,99 @@ export function requestPermissionThroughLeader(
     }
     leaderEnqueue({ ...req, resolve })
   })
+}
+
+// ===== 权限 mailbox 双轨 fallback（对齐 useSwarmPermissionPoller + permissionSync） =====
+
+/** 挂起的权限回调（requestId → resolve；teammate 侧注册，收到响应后触发） */
+const pendingPermissionCallbacks = new Map<string, (decision: PermissionDecision) => void>()
+
+/** 注册权限回调（requestId 关联） */
+export function registerPermissionCallback(requestId: string, resolve: (decision: PermissionDecision) => void): void {
+  pendingPermissionCallbacks.set(requestId, resolve)
+}
+
+/** 是否还有挂起的权限回调 */
+export function hasPendingPermissionCallback(requestId?: string): boolean {
+  return requestId ? pendingPermissionCallbacks.has(requestId) : pendingPermissionCallbacks.size > 0
+}
+
+/** 通过 mailbox 向目标（通常是 leader）发送权限请求 */
+export async function sendPermissionRequestViaMailbox(
+  mailbox: TeammateMailbox,
+  team: string,
+  recipientName: string,
+  req: { from: string; toolName: string; input?: unknown; requestId?: string },
+): Promise<void> {
+  await mailbox.writeToMailbox(team, recipientName, createPermissionRequest({
+    from: req.from,
+    to: recipientName,
+    toolName: req.toolName,
+    input: req.input,
+    requestId: req.requestId,
+  }))
+}
+
+/**
+ * 处理 teammate inbox 中的权限响应（permission_response / sandbox_permission_response）：
+ * 命中挂起回调则 resolve 并标记已读；返回是否处理了响应。
+ * teammate poller / 执行循环空闲时调用。
+ */
+export async function processMailboxPermissionResponse(
+  mailbox: TeammateMailbox,
+  team: string,
+  agentName: string,
+): Promise<boolean> {
+  const unread = await mailbox.readUnreadMessages(team, agentName)
+  let handled = false
+  for (const msg of unread) {
+    if (msg.type !== 'permission_response' && msg.type !== 'sandbox_permission_response') continue
+    const requestId = msg.replyTo
+    if (requestId && pendingPermissionCallbacks.has(requestId)) {
+      const resolve = pendingPermissionCallbacks.get(requestId)!
+      pendingPermissionCallbacks.delete(requestId)
+      const allow = msg.data?.allow === true
+      const forever = msg.data?.forever === true
+      resolve({ allow, forever })
+      handled = true
+    }
+    await mailbox.markMessageAsReadByRef(team, agentName, { from: msg.from, timestamp: msg.timestamp })
+  }
+  return handled
+}
+
+/**
+ * 双轨权限请求：有 leader 桥走 confirm queue（workerBadge）；
+ * 无桥且提供 mailbox 时降级为 mailbox 请求/响应配对（挂起回调 + 响应轮询）。
+ * 两者皆不可用时 fail-closed 拒绝。
+ */
+export async function requestSwarmPermission(opts: {
+  from: string
+  toolName: string
+  input?: unknown
+  workerBadge?: { name: string; color?: string }
+  /** 无 leader 桥时的 mailbox 降级参数（都提供才降级） */
+  mailbox?: TeammateMailbox
+  team?: string
+  leaderName?: string
+}): Promise<PermissionDecision> {
+  if (hasLeaderConfirmQueue()) {
+    return requestPermissionThroughLeader({ toolName: opts.toolName, input: opts.input, workerBadge: opts.workerBadge })
+  }
+  if (opts.mailbox && opts.team && opts.leaderName) {
+    const requestId = generateRequestId('perm')
+    const decision = new Promise<PermissionDecision>((resolve) => {
+      registerPermissionCallback(requestId, resolve)
+    })
+    await sendPermissionRequestViaMailbox(opts.mailbox, opts.team, opts.leaderName, {
+      from: opts.from,
+      toolName: opts.toolName,
+      input: opts.input,
+      requestId,
+    })
+    return decision
+  }
+  return { allow: false }
 }
 
 // ===== Inbox Poller =====
@@ -685,14 +923,29 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
   try {
     if (state.status === 'shutdown') return result
 
-    // 1) mailbox 消息
+    // 1) 先处理挂起的权限响应（mailbox 双轨 fallback 的回调配对）
+    await processMailboxPermissionResponse(deps.mailbox, deps.team, deps.name)
+
+    // 2) mailbox 消息
     const messages = await deps.mailbox.readUnreadMessages(deps.team, deps.name)
     for (const msg of messages) {
-      if (state.status === 'shutdown') break
-      if (msg.type === 'shutdown') {
-        state.abortController.abort()
-        state.status = 'shutdown'
+      if (state.status !== 'running' && state.status !== 'idle') break
+      if (msg.type === 'shutdown_request') {
+        // shutdown 模型决策（对齐 Claude Code：shutdown_request 不自动批准）：
+        // 把请求注入 query，由模型调用 approve_shutdown / reject_shutdown 工具决策
+        try {
+          await withTeammateIdentity(state.identity, () =>
+            deps.harness.agent.query({
+              sessionId: state.sessionId,
+              agentId: state.identity.agentId,
+              message: `收到团队关停请求（requestId=${msg.requestId ?? '-'}）：${msg.text}\n请调用 approve_shutdown 或 reject_shutdown 工具做出决策。`,
+            }),
+          )
+        } catch {
+          // 决策查询失败不阻断循环
+        }
         await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
+        result.handledMessages++
         continue
       }
       try {
@@ -1012,8 +1265,8 @@ export interface SendTeammateMessageInput {
   /** 消息内容 */
   message: string
   summary?: string
-  /** 消息类型（默认 message） */
-  type?: 'message' | 'task_notification' | 'permission_response' | 'shutdown'
+  /** 消息类型（默认 message；协作协议消息见 MailboxMessageType） */
+  type?: 'message' | 'task_notification' | 'permission_response' | 'shutdown_request' | 'shutdown_approved' | 'shutdown_rejected' | 'idle_notification'
 }
 export interface SendTeammateMessageOutput {
   deliveredTo: string
@@ -1053,6 +1306,67 @@ export function createSendTeammateMessageTool(getMailbox: () => TeammateMailbox)
     },
     renderUse: (input) => ({ to: input.to, message: input.message.length > 100 ? input.message.slice(0, 100) + '...' : input.message }),
     renderResult: (result) => (result.ok && result.output ? { to: result.output.deliveredTo, from: result.output.from } : undefined),
+  })
+}
+
+// ===== shutdown 决策工具（模型对 shutdown_request 的批准/拒绝，对齐 Claude Code approveShutdown/rejectShutdown） =====
+
+/** approve_shutdown / reject_shutdown 输入 */
+export interface ShutdownDecisionInput {
+  team: string
+  /** 团队成员名（默认用当前 agentId；关停目标按此查找 registry） */
+  memberName?: string
+  /** 关联的 shutdown_request 的 requestId */
+  requestId?: string
+  reason?: string
+}
+
+/** approve_shutdown / reject_shutdown 输出 */
+export interface ShutdownDecisionOutput {
+  decision: 'approved' | 'rejected'
+}
+
+/**
+ * 创建 shutdown 决策工具（approve_shutdown / reject_shutdown）：
+ * 向 leader 回发 shutdown_approved / shutdown_rejected；approved 时通过 onDecision
+ * 回调触发自身关停（宿主注入，如 abort controller + 状态置 shutdown）。
+ */
+export function createShutdownDecisionTool(
+  decision: 'approved' | 'rejected',
+  getMailbox: () => TeammateMailbox,
+  onDecision?: (input: ShutdownDecisionInput, ctx: ToolContext) => void | Promise<void>,
+): Tool<ShutdownDecisionInput, ShutdownDecisionOutput> {
+  const id = decision === 'approved' ? 'approve_shutdown' : 'reject_shutdown'
+  return defineTool<ShutdownDecisionInput, ShutdownDecisionOutput>({
+    id,
+    aliases: decision === 'approved' ? ['accept_shutdown'] : ['deny_shutdown'],
+    description:
+      decision === 'approved'
+        ? '批准团队关停请求：向 leader 回发 shutdown_approved 并触发自身关停。输入：team、requestId（关联的关停请求 ID，可选）、memberName（可选，默认当前成员）、reason（可选）。'
+        : '拒绝团队关停请求：向 leader 回发 shutdown_rejected，自身继续运行。输入：team、requestId（可选）、memberName（可选）、reason（可选）。',
+    isReadOnly: () => false,
+    isConcurrencySafe: () => false,
+    isDestructive: () => decision === 'approved',
+    requiresUserInteraction: false,
+    inputSchema: makeSchema<ShutdownDecisionInput>(),
+    permission: { key: id, extractPatterns: (input) => [input.team] },
+    async call(input, ctx) {
+      try {
+        await getMailbox().writeToMailbox(input.team, TEAM_LEAD_NAME, createShutdownDecision({
+          from: input.memberName ?? ctx.agentId,
+          to: TEAM_LEAD_NAME,
+          requestId: input.requestId ?? '',
+          decision,
+          reason: input.reason,
+        }))
+        await onDecision?.(input, ctx)
+        return { ok: true, output: { decision } }
+      } catch (err) {
+        return { ok: false, error: { message: (err as Error).message, code: 'SHUTDOWN_DECISION_FAILED' } }
+      }
+    },
+    renderUse: (input) => ({ team: input.team, requestId: input.requestId, reason: input.reason }),
+    renderResult: (result) => (result.ok && result.output ? { decision: result.output.decision } : undefined),
   })
 }
 
@@ -1253,6 +1567,16 @@ export function createSwarmPlugin(options: SwarmPluginOptions = {}): AgentPlugin
         createTeamDeleteTool(() => teamManager) as unknown as Tool<unknown, unknown>,
         createTeamStatusTool(() => teamManager, () => taskPlane) as unknown as Tool<unknown, unknown>,
         createSendTeammateMessageTool(() => mailbox) as unknown as Tool<unknown, unknown>,
+        // shutdown 决策工具：approve 时按 memberName 查找 teammate 并关停
+        createShutdownDecisionTool('approved', () => mailbox, async (input, ctx) => {
+          const name = input.memberName ?? ctx.agentId
+          const state = teammateRegistry.findByMember(input.team, name)
+          if (state) {
+            state.abortController.abort()
+            state.status = 'shutdown'
+          }
+        }) as unknown as Tool<unknown, unknown>,
+        createShutdownDecisionTool('rejected', () => mailbox) as unknown as Tool<unknown, unknown>,
         createTaskCreateTool(() => taskPlane) as unknown as Tool<unknown, unknown>,
         createTaskListTool(() => taskPlane) as unknown as Tool<unknown, unknown>,
         createTaskClaimTool(() => taskPlane) as unknown as Tool<unknown, unknown>,

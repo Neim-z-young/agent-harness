@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 9）：Swarm 待办前三项落地（mailbox 协议 + 权限双轨 + shutdown 模型决策）
+
+对照架构 §9.4「Swarm 后续待办」，实现前 3 项（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：
+
+### 1. mailbox 协作协议类型扩展
+
+- `MailboxMessageType` 扩至 15 种：message + permission_request/response + sandbox_* + plan_approval_* + shutdown_request/approved/rejected + idle_notification + task_assignment + team_permission_update + mode_set_request + task_notification
+- `isStructuredProtocolMessage` 路由：结构化协议消息与普通 message 区分（poller/tick 按此路由，避免被当普通 LLM 上下文吞掉）
+- 协议 helper 构造函数：`generateRequestId`（前缀+自增序列）、`createPermissionRequest/Response`（requestId/replyTo + data.allow/forever）、`createShutdownRequest/Decision`（shutdown_request → approved/rejected）
+- `SendTeammateMessageInput.type` 同步扩展（shutdown_request/shutdown_approved/shutdown_rejected/idle_notification）
+
+### 2. 权限 mailbox 双轨 fallback
+
+- `requestSwarmPermission`：有 leader 桥走 confirm queue（workerBadge）；无桥且提供 mailbox/team/leaderName 时降级 mailbox——`sendPermissionRequestViaMailbox` 写 permission_request 到 leader inbox + `registerPermissionCallback` 挂起回调；leader 写回 permission_response 后由 `processMailboxPermissionResponse` 命中 requestId 配对 resolve（data.allow/forever）；双轨皆无 fail-closed 拒绝
+- `runTeammateTick` 每轮最先处理挂起的权限响应，再读普通消息
+- 新增 `unregisterLeaderConfirmQueue`（对称清理，测试复位全局状态）
+
+### 3. shutdown 模型决策
+
+- `runTeammateTick` 对 `shutdown_request` 不直接关停：注入 query（含 requestId）由模型调用 `approve_shutdown`/`reject_shutdown` 工具决策（对齐 Claude Code approveShutdown）
+- `createShutdownDecisionTool('approved'|'rejected')`：回发 shutdown_approved/shutdown_rejected（replyTo=requestId）；approve 时通过 onDecision 回调触发关停
+- 插件注入：approve 工具按 memberName 查 teammateRegistry，命中则 abort + 状态置 shutdown；reject 仅回发响应
+
+### 验证与提交
+
+- 测试：swarm 45 用例全绿（+11：协议 helper 5 + 权限 fallback 3 + shutdown 工具 3），插件注入清单更新为 11 个工具
+- 全仓 26 包 typecheck 通过
+- 文档：架构 §9.4 前三项标记 ✅（inbox poller 优先级 / task 依赖锁 / idle_notification / plan approval / tmux 后端 / team file 字段 / send_message 路由统一 留待办）
+
 ## 2026-08-24（续 8）：写锁设计修正（声明级 → 文件级）+ Swarm 待办记录
 
 ### 1. FileWriteArbiter：文件级写锁（替代派工声明级仲裁）
