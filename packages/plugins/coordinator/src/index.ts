@@ -172,6 +172,95 @@ export class CoordinatorBarrierTracker {
   }
 }
 
+// ===== File Arbiter：写操作按文件集串行化（§9.4 后续增强） =====
+
+/**
+ * 两个文件集是否重叠（路径前缀匹配）：
+ * - 相同路径（`src/a.ts` vs `src/a.ts`）
+ * - 目录与子路径（`src/` vs `src/a.ts`）
+ * - 祖先目录与后代目录（`src/` vs `src/features/`）
+ */
+export function pathsOverlap(a: string[], b: string[]): boolean {
+  const norm = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '')
+  for (const paRaw of a) {
+    const pa = norm(paRaw)
+    if (!pa) continue
+    for (const pbRaw of b) {
+      const pb = norm(pbRaw)
+      if (!pb) continue
+      if (pa === pb || pa.startsWith(`${pb}/`) || pb.startsWith(`${pa}/`)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * 写操作文件集仲裁器：按"声明的 target 文件集"串行化冲突的 worker。
+ *
+ * 语义：一个 worker 在派工时声明它要写的文件/目录（targetFiles）；若与当前
+ * 运行中 worker 的文件集重叠（pathsOverlap），则阻塞等待，直到前序 worker
+ * release（完成/失败）后才放行——保证同一批文件不会被多个 worker 并发改写。
+ *
+ * 纯逻辑、无外部依赖，可独立测试。
+ */
+export class CoordinatorFileArbiter {
+  /** key（工具调用 toolUseId）→ 声明的文件集 */
+  private readonly claims = new Map<string, string[]>()
+  /** 冲突等待队列（FIFO） */
+  private readonly waiters: Array<{ key: string; files: string[]; resolve: () => void }> = []
+
+  /** 当前持有文件集声明的 key 列表（诊断/测试） */
+  claimed(): string[] {
+    return Array.from(this.claims.keys())
+  }
+
+  /** 当前等待中的 key 数量（诊断/测试） */
+  waitingCount(): number {
+    return this.waiters.length
+  }
+
+  /**
+   * 声明文件集：与运行中声明冲突时阻塞（FIFO 等待），直到冲突解除后放行并持有声明。
+   * @param key 调用唯一标识（toolUseId）；release 时使用同一 key
+   * @param files 声明要写入的文件/目录（项目相对路径）
+   */
+  async acquire(key: string, files: string[]): Promise<void> {
+    for (;;) {
+      if (!this.findConflict(files)) {
+        this.claims.set(key, files)
+        return
+      }
+      await new Promise<void>((resolve) => {
+        this.waiters.push({ key, files, resolve })
+      })
+      // 被 release 唤醒后回到循环重新检查；若被其他等待者抢先则继续排队
+    }
+  }
+
+  /** 释放文件集声明（幂等），并唤醒所有不再冲突的等待者 */
+  release(key: string): void {
+    this.claims.delete(key)
+    const remaining: Array<{ key: string; files: string[]; resolve: () => void }> = []
+    for (const w of this.waiters) {
+      if (this.findConflict(w.files)) {
+        remaining.push(w)
+      } else {
+        w.resolve()
+      }
+    }
+    this.waiters.length = 0
+    this.waiters.push(...remaining)
+  }
+
+  /** 与当前所有声明冲突的文件集所属 key（无则 undefined） */
+  private findConflict(files: string[]): string | undefined {
+    for (const [key, claimed] of this.claims) {
+      if (pathsOverlap(files, claimed)) return key
+    }
+    return undefined
+  }
+}
+
 // ===== SendMessage 工具 =====
 
 /** send_message 工具输入 */
@@ -288,6 +377,12 @@ export interface CoordinatorPluginOptions {
   autoContinue?: boolean
   /** send_message 执行超时（毫秒），缺省 120_000 */
   timeoutMs?: number
+  /**
+   * 写操作按文件集串行化（默认 true）：subagent 调用声明了 targetFiles 时，
+   * 与运行中 worker 文件集冲突的派工延迟到前序 worker 完成后再执行。
+   * 仅对声明了 targetFiles 的调用生效；未声明不仲裁。
+   */
+  serializeWrites?: boolean
 }
 
 /** 读取环境变量布尔值（'1' / 'true' / 'yes'） */
@@ -301,21 +396,23 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
   const forceAsync = options.forceAsync ?? isEnvTruthy(process.env.HARNESS_FORCE_ASYNC)
   const autoContinue = options.autoContinue ?? true
   const timeoutMs = options.timeoutMs ?? 120_000
+  const serializeWrites = options.serializeWrites ?? true
 
   let harness: HarnessLike | undefined
   let bus: Bus | undefined
   let sendMessageTool: Tool<SendMessageInput, SendMessageOutput> | undefined
   const tracker = new CoordinatorBarrierTracker()
+  const arbiter = new CoordinatorFileArbiter()
 
   return {
     id: 'coordinator',
     version: '0.1.0',
     name: 'Coordinator',
-    description: `Coordinator 插件：主 Agent 变 orchestrator（四阶段派工）+ barrier 自动集齐续轮 + forceAsync=${forceAsync} + send_message 续跑`,
+    description: `Coordinator 插件：主 Agent 变 orchestrator（四阶段派工）+ barrier 自动集齐续轮 + forceAsync=${forceAsync} + send_message 续跑 + 写操作串行化=${serializeWrites}`,
     dependsOn: ['subagent'],
 
     async install(ctx) {
-      ctx.log.info('Coordinator 插件已加载', { forceAsync, autoContinue })
+      ctx.log.info('Coordinator 插件已加载', { forceAsync, autoContinue, serializeWrites })
 
       sendMessageTool = createSendMessageTool(() => harness, () => tracker, timeoutMs)
 
@@ -354,6 +451,8 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
                 parentSessionId: payload.parentSessionId,
                 status: 'completed',
               })
+              // 后台 worker 完成 → 释放其文件集声明（唤醒冲突等待者）
+              if (serializeWrites) arbiter.release(payload.toolUseId)
             })
             bus.subscribe(SubagentEvents.failed, ({ payload }) => {
               if (!payload.taskId) return
@@ -362,6 +461,7 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
                 parentSessionId: payload.parentSessionId,
                 status: 'failed',
               })
+              if (serializeWrites) arbiter.release(payload.toolUseId)
             })
           }
         },
@@ -374,14 +474,31 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
           }
         },
 
-        // forceAsync：强制所有 subagent spawn 后台化
+        // forceAsync + 写操作串行化：拦截 subagent 调用
         // 注：core 的 preHook next 实际签名是 (modifiedInput?: unknown) => Promise<ToolResult>，
         // 但 Hooks 接口类型声明为 () => Promise<unknown>，此处用 any 兼容传参改写
         async 'tool.pre.execute'(ctx: any, next: any) {
-          if (forceAsync && ctx?.tool?.id === 'subagent' && ctx?.input && typeof ctx.input === 'object') {
-            return next({ ...ctx.input, runInBackground: true })
+          const isSubagent = ctx?.tool?.id === 'subagent' && ctx?.input && typeof ctx.input === 'object'
+          if (!isSubagent) return next()
+
+          let input = ctx.input
+          if (forceAsync) input = { ...input, runInBackground: true }
+
+          const targetFiles = Array.isArray(input.targetFiles) ? input.targetFiles : undefined
+          const shouldArbitrate = serializeWrites && !!targetFiles && targetFiles.length > 0
+          if (shouldArbitrate) {
+            // 冲突则阻塞，直到前序 worker release（后台任务由 completed/failed 事件释放）
+            await arbiter.acquire(ctx.toolUseId, targetFiles)
           }
-          return next()
+          try {
+            return await next(input)
+          } finally {
+            // 同步调用（非后台）：worker 已在 next() 内执行完，立即释放；
+            // 后台任务由 subagent.completed/failed 事件在 worker 真正完成时释放
+            if (shouldArbitrate && input.runInBackground !== true) {
+              arbiter.release(ctx.toolUseId)
+            }
+          }
         },
 
         // 给 coordinator Agent 注入 send_message 工具

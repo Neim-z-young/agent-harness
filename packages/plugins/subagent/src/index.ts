@@ -173,6 +173,12 @@ export interface SubagentToolInput {
    * 工具立即返回 "Background task started"，结果通过事件通知。
    */
   runInBackground?: boolean
+  /**
+   * 该 worker 预计写入的文件/目录（项目相对路径）。
+   * 调度元数据：Coordinator 插件据此做"写操作按文件集串行化"（冲突的派工延迟到前序
+   * worker 完成后再执行，避免多个 worker 并发改同一批文件）。subagent 工具本身不消费。
+   */
+  targetFiles?: string[]
 }
 
 /** SubagentTool 的输出 */

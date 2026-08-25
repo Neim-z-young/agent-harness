@@ -829,7 +829,7 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] **Barrier 同步原语**：`CoordinatorBarrierTracker` 跟踪 per-session 后台任务（订阅 subagent.started/completed/failed），全部完成/失败后发布 `coordinator.barrier.completed` 事件；CLI `attachAutoContinue` 订阅后注入 `<continue/>` 自动续轮（直接解决"多调研任务→等待→汇总"场景）
 - [x] forceAsync：插件选项或 `HARNESS_FORCE_ASYNC=true`，`tool.pre.execute` 拦截 subagent 调用强制 runInBackground（原 P2-6）
 - [x] send_message 工具：续跑已有 taskId（延续 worker 会话上下文返回回复），仅注入 mode=coordinator 的 Agent
-- [ ] 写操作按文件集串行化调度策略（检测 target 文件集冲突，延迟执行冲突 worker）→ 后续增强
+- [x] **写操作按文件集串行化调度**：`SubagentToolInput` 新增 `targetFiles?: string[]`（worker 声明要写的文件/目录）；`CoordinatorFileArbiter`（`pathsOverlap` 前缀匹配冲突检测 + FIFO 等待队列）在 `tool.pre.execute` 拦截 subagent 调用，与运行中 worker 文件集冲突的派工阻塞到前序 worker 完成（后台任务由 subagent.completed/failed 事件释放声明，同步任务在调用返回时立即释放）；`createCoordinatorPlugin({ serializeWrites: true })` 默认开启，仅对声明了 targetFiles 的调用生效
 
 **划归 `Swarm Plugin`（新包，更远期 P3）**：
 - [ ] Team 实体 + team file 持久化

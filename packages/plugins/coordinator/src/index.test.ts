@@ -2,9 +2,11 @@ import { describe, it, expect } from 'bun:test'
 import {
   CoordinatorBarrierTracker,
   CoordinatorEvents,
+  CoordinatorFileArbiter,
   COORDINATOR_SYSTEM_PROMPT,
   createCoordinatorPlugin,
   createSendMessageTool,
+  pathsOverlap,
   type SendMessageInput,
 } from './index'
 import { createBus } from '@harness/bus'
@@ -175,6 +177,93 @@ describe('CoordinatorBarrierTracker', () => {
   })
 })
 
+// ===== CoordinatorFileArbiter 单元测试（§9.4 写操作串行化） =====
+
+describe('pathsOverlap', () => {
+  it('相同路径重叠', () => {
+    expect(pathsOverlap(['src/a.ts'], ['src/a.ts'])).toBe(true)
+  })
+  it('目录与子路径重叠', () => {
+    expect(pathsOverlap(['src/'], ['src/a.ts'])).toBe(true)
+    expect(pathsOverlap(['src/a.ts'], ['src/'])).toBe(true)
+  })
+  it('祖先目录与后代目录重叠', () => {
+    expect(pathsOverlap(['src/'], ['src/features/hook.ts'])).toBe(true)
+  })
+  it('./ 前缀与尾部斜杠归一化后仍识别', () => {
+    expect(pathsOverlap(['./src'], ['src//a.ts'])).toBe(true)
+  })
+  it('不相关路径不重叠', () => {
+    expect(pathsOverlap(['src/a.ts'], ['docs/readme.md'])).toBe(false)
+    expect(pathsOverlap(['src/a'], ['src-ab/b'])).toBe(false)
+  })
+  it('空文件集不重叠', () => {
+    expect(pathsOverlap([], ['src/a.ts'])).toBe(false)
+    expect(pathsOverlap(['src/a.ts'], [])).toBe(false)
+  })
+})
+
+describe('CoordinatorFileArbiter', () => {
+  it('无冲突立即 acquire 并持有声明', async () => {
+    const arb = new CoordinatorFileArbiter()
+    await arb.acquire('t1', ['src/a.ts'])
+    await arb.acquire('t2', ['docs/'])
+    expect(arb.claimed().sort()).toEqual(['t1', 't2'])
+  })
+
+  it('冲突阻塞，release 后放行', async () => {
+    const arb = new CoordinatorFileArbiter()
+    await arb.acquire('t1', ['src/'])
+    expect(arb.claimed()).toEqual(['t1'])
+
+    let released = false
+    const p2 = arb.acquire('t2', ['src/a.ts']).then(() => { released = true })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(released).toBe(false) // t2 与 t1 冲突 → 阻塞
+    expect(arb.waitingCount()).toBe(1)
+
+    arb.release('t1')
+    await p2
+    expect(released).toBe(true)
+    expect(arb.waitingCount()).toBe(0)
+    expect(arb.claimed()).toEqual(['t2'])
+  })
+
+  it('多等待者 FIFO：释放一个后按顺序放行', async () => {
+    const arb = new CoordinatorFileArbiter()
+    await arb.acquire('a', ['src/'])
+
+    const order: string[] = []
+    const pb = arb.acquire('b', ['src/a.ts']).then(() => { order.push('b'); return 'b' })
+    const pc = arb.acquire('c', ['src/a.ts']).then(() => { order.push('c'); return 'c' })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(order).toEqual([])
+
+    arb.release('a') // 唤醒 b（不再冲突），c 继续等
+    await pb
+    expect(order).toEqual(['b'])
+    expect(arb.waitingCount()).toBe(1)
+
+    arb.release('b')
+    await pc
+    expect(order).toEqual(['b', 'c'])
+  })
+
+  it('不同文件集可并行持有（互不阻塞）', async () => {
+    const arb = new CoordinatorFileArbiter()
+    await arb.acquire('a', ['src/'])
+    await arb.acquire('b', ['docs/'])
+    await arb.acquire('c', ['test/'])
+    expect(arb.claimed().length).toBe(3)
+  })
+
+  it('release 幂等：释放未持有的 key 不抛错', () => {
+    const arb = new CoordinatorFileArbiter()
+    expect(() => arb.release('ghost')).not.toThrow()
+    expect(arb.claimed()).toEqual([])
+  })
+})
+
 // ===== send_message 工具测试 =====
 
 describe('send_message 工具', () => {
@@ -332,5 +421,93 @@ describe('createCoordinatorPlugin', () => {
     expect(COORDINATOR_SYSTEM_PROMPT).toInclude('Don')
     expect(COORDINATOR_SYSTEM_PROMPT).toInclude('send_message')
     expect(COORDINATOR_SYSTEM_PROMPT).toInclude('<task-notification>')
+  })
+
+  it('serializeWrites：声明 targetFiles 的冲突派工延迟到前序 worker 完成（后台事件释放）', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+
+    const calls: string[] = []
+    const next = (modified?: any) => { calls.push(modified?.prompt ?? '?'); return { ok: true } }
+
+    // worker A：后台 + targetFiles=['src/a.ts'] → 立即放行并持有声明
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tA' },
+      next,
+    )
+
+    // worker B：同文件集 → 应被阻塞
+    let bDone = false
+    const pB = hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tB' },
+      (modified?: any) => { calls.push(modified?.prompt ?? '?'); bDone = true; return { ok: true } },
+    )
+    await new Promise((r) => setTimeout(r, 20))
+    expect(bDone).toBe(false)
+    expect(calls).toEqual(['A'])
+
+    // worker A 完成 → 释放声明 → B 放行
+    await bus.publish(SubagentEvents.completed, {
+      agentId: 'researcher', subSessionId: 'sA', parentSessionId: 's_parent', toolUseId: 'tA',
+      replyPreview: 'A done', messageCount: 1, durationMs: 1, taskId: 'task-a', background: true,
+    } as any)
+    await pB
+    expect(bDone).toBe(true)
+    expect(calls).toEqual(['A', 'B'])
+  })
+
+  it('serializeWrites：未声明 targetFiles 的调用不仲裁（直接放行）', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+
+    let nextCalled = false
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'no-files', runInBackground: true }, toolUseId: 'tX' },
+      () => { nextCalled = true; return { ok: true } },
+    )
+    expect(nextCalled).toBe(true)
+  })
+
+  it('serializeWrites：同步（非后台）调用完成后立即释放声明', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+
+    // 同步 worker A：targetFiles 声明，完成后应立即释放（finally 分支）
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'] }, toolUseId: 'tA' },
+      () => { return { ok: true } },
+    )
+    // 同文件集同步 worker B：A 已释放 → 不再阻塞，直接放行
+    let bDone = false
+    const pB = hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'] }, toolUseId: 'tB' },
+      () => { bDone = true; return { ok: true } },
+    )
+    await pB
+    expect(bDone).toBe(true)
+  })
+
+  it('serializeWrites=false：冲突派工不延迟', async () => {
+    const { bus, harness, plugin } = setup({ serializeWrites: false })
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+
+    const calls: string[] = []
+    const next = (modified?: any) => { calls.push(modified?.prompt ?? '?'); return { ok: true } }
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tA' },
+      next,
+    )
+    let bDone = false
+    const pB = hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tB' },
+      (modified?: any) => { calls.push(modified?.prompt ?? '?'); bDone = true; return { ok: true } },
+    )
+    await pB
+    expect(bDone).toBe(true)
+    expect(calls).toEqual(['A', 'B'])
   })
 })
