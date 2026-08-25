@@ -172,93 +172,87 @@ export class CoordinatorBarrierTracker {
   }
 }
 
-// ===== File Arbiter：写操作按文件集串行化（§9.4 后续增强） =====
+// ===== FileWriteArbiter：文件级写锁（跨 session 互斥） =====
 
 /**
- * 两个文件集是否重叠（路径前缀匹配）：
- * - 相同路径（`src/a.ts` vs `src/a.ts`）
- * - 目录与子路径（`src/` vs `src/a.ts`）
- * - 祖先目录与后代目录（`src/` vs `src/features/`）
- */
-export function pathsOverlap(a: string[], b: string[]): boolean {
-  const norm = (p: string) => p.replace(/^\.\//, '').replace(/\/+$/, '')
-  for (const paRaw of a) {
-    const pa = norm(paRaw)
-    if (!pa) continue
-    for (const pbRaw of b) {
-      const pb = norm(pbRaw)
-      if (!pb) continue
-      if (pa === pb || pa.startsWith(`${pb}/`) || pb.startsWith(`${pa}/`)) return true
-    }
-  }
-  return false
-}
-
-/**
- * 写操作文件集仲裁器：按"声明的 target 文件集"串行化冲突的 worker。
+ * 文件级写锁：按 canonical 路径互斥，锁持有 = 单次写工具调用（write_file/edit_file）。
  *
- * 语义：一个 worker 在派工时声明它要写的文件/目录（targetFiles）；若与当前
- * 运行中 worker 的文件集重叠（pathsOverlap），则阻塞等待，直到前序 worker
- * release（完成/失败）后才放行——保证同一批文件不会被多个 worker 并发改写。
+ * 语义（对比旧的"派工声明级"仲裁，锁粒度大幅收窄）：
+ * - 不在 subagent 派工时按 targetFiles 整组阻塞——agent 实际写哪些文件在执行前
+ *   并不确定，声明级锁会误伤不相关 worker（见架构文档 §9.4 设计修正）。
+ * - 改为在真正写文件时按目标路径加锁：同一路径被其他 session 的写操作持有时，
+ *   本次写等待其完成；同 session 内天然串行，无需加锁。
  *
  * 纯逻辑、无外部依赖，可独立测试。
  */
-export class CoordinatorFileArbiter {
-  /** key（工具调用 toolUseId）→ 声明的文件集 */
-  private readonly claims = new Map<string, string[]>()
-  /** 冲突等待队列（FIFO） */
-  private readonly waiters: Array<{ key: string; files: string[]; resolve: () => void }> = []
+export class FileWriteArbiter {
+  /** 规范化路径 → 持有者 */
+  private readonly holders = new Map<string, { sessionId: string; toolUseId: string }>()
+  /** 规范化路径 → 等待者队列（FIFO） */
+  private readonly waiters = new Map<string, Array<() => void>>()
 
-  /** 当前持有文件集声明的 key 列表（诊断/测试） */
-  claimed(): string[] {
-    return Array.from(this.claims.keys())
+  /** 当前持有写锁的路径（诊断/测试） */
+  lockedPaths(): string[] {
+    return Array.from(this.holders.keys())
   }
 
-  /** 当前等待中的 key 数量（诊断/测试） */
-  waitingCount(): number {
-    return this.waiters.length
+  /** 某路径当前等待数量（诊断/测试） */
+  waitingCount(writePath?: string): number {
+    if (writePath) return this.waiters.get(normalizeWritePath(writePath))?.length ?? 0
+    let total = 0
+    for (const q of this.waiters.values()) total += q.length
+    return total
   }
 
   /**
-   * 声明文件集：与运行中声明冲突时阻塞（FIFO 等待），直到冲突解除后放行并持有声明。
-   * @param key 调用唯一标识（toolUseId）；release 时使用同一 key
-   * @param files 声明要写入的文件/目录（项目相对路径）
+   * 获取写锁：路径被其他 session 持有时阻塞（per-path FIFO），直到释放。
+   * 同 session 重复获取直接放行（单 session 工具调用天然串行）。
    */
-  async acquire(key: string, files: string[]): Promise<void> {
+  async acquireWrite(writePath: string, owner: { sessionId: string; toolUseId: string }): Promise<void> {
+    const norm = normalizeWritePath(writePath)
     for (;;) {
-      if (!this.findConflict(files)) {
-        this.claims.set(key, files)
+      const holder = this.holders.get(norm)
+      if (!holder) {
+        this.holders.set(norm, owner)
         return
       }
+      if (holder.sessionId === owner.sessionId) return // 同 session 串行，无需改 holder
       await new Promise<void>((resolve) => {
-        this.waiters.push({ key, files, resolve })
+        const q = this.waiters.get(norm) ?? []
+        q.push(resolve)
+        this.waiters.set(norm, q)
       })
-      // 被 release 唤醒后回到循环重新检查；若被其他等待者抢先则继续排队
+      // 被 release 唤醒后回到循环重新检查
     }
   }
 
-  /** 释放文件集声明（幂等），并唤醒所有不再冲突的等待者 */
-  release(key: string): void {
-    this.claims.delete(key)
-    const remaining: Array<{ key: string; files: string[]; resolve: () => void }> = []
-    for (const w of this.waiters) {
-      if (this.findConflict(w.files)) {
-        remaining.push(w)
-      } else {
-        w.resolve()
-      }
+  /** 释放写锁（幂等），唤醒该路径 FIFO 队首等待者 */
+  releaseWrite(writePath: string, toolUseId: string): void {
+    const norm = normalizeWritePath(writePath)
+    const holder = this.holders.get(norm)
+    if (!holder || holder.toolUseId !== toolUseId) return
+    this.holders.delete(norm)
+    const q = this.waiters.get(norm)
+    if (q && q.length > 0) {
+      q.shift()!()
+      if (q.length === 0) this.waiters.delete(norm)
     }
-    this.waiters.length = 0
-    this.waiters.push(...remaining)
   }
+}
 
-  /** 与当前所有声明冲突的文件集所属 key（无则 undefined） */
-  private findConflict(files: string[]): string | undefined {
-    for (const [key, claimed] of this.claims) {
-      if (pathsOverlap(files, claimed)) return key
-    }
-    return undefined
-  }
+/** 规范化写路径：resolve + 去尾斜杠 + 小写（仅路径语义，不做存在性检查） */
+export function normalizeWritePath(p: string): string {
+  return p.replace(/\/+$/, '')
+}
+
+/** 写类工具（有明确 path 输入参数；bash 无法可靠解析写入路径，不纳入） */
+const WRITE_TOOL_IDS = ['write_file', 'edit_file']
+
+/** 从写工具输入提取目标路径；非写工具/无路径返回 undefined */
+function extractWritePath(toolId: string, input: unknown): string | undefined {
+  if (!WRITE_TOOL_IDS.includes(toolId) || !input || typeof input !== 'object') return undefined
+  const p = (input as { path?: unknown }).path
+  return typeof p === 'string' && p.length > 0 ? p : undefined
 }
 
 // ===== SendMessage 工具 =====
@@ -378,9 +372,9 @@ export interface CoordinatorPluginOptions {
   /** send_message 执行超时（毫秒），缺省 120_000 */
   timeoutMs?: number
   /**
-   * 写操作按文件集串行化（默认 true）：subagent 调用声明了 targetFiles 时，
-   * 与运行中 worker 文件集冲突的派工延迟到前序 worker 完成后再执行。
-   * 仅对声明了 targetFiles 的调用生效；未声明不仲裁。
+   * 文件级写锁（默认 true）：write_file/edit_file 等写工具按目标路径互斥——
+   * 同一路径被其他 session（worker）的写操作持有时，本次写等待其完成再执行。
+   * 锁粒度 = 单次写工具调用（不再按 targetFiles 派工声明整组阻塞）。
    */
   serializeWrites?: boolean
 }
@@ -402,7 +396,7 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
   let bus: Bus | undefined
   let sendMessageTool: Tool<SendMessageInput, SendMessageOutput> | undefined
   const tracker = new CoordinatorBarrierTracker()
-  const arbiter = new CoordinatorFileArbiter()
+  const arbiter = new FileWriteArbiter()
 
   return {
     id: 'coordinator',
@@ -451,8 +445,6 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
                 parentSessionId: payload.parentSessionId,
                 status: 'completed',
               })
-              // 后台 worker 完成 → 释放其文件集声明（唤醒冲突等待者）
-              if (serializeWrites) arbiter.release(payload.toolUseId)
             })
             bus.subscribe(SubagentEvents.failed, ({ payload }) => {
               if (!payload.taskId) return
@@ -461,7 +453,6 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
                 parentSessionId: payload.parentSessionId,
                 status: 'failed',
               })
-              if (serializeWrites) arbiter.release(payload.toolUseId)
             })
           }
         },
@@ -474,35 +465,28 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
           }
         },
 
-        // forceAsync + 写操作串行化：拦截 subagent 调用
+        // forceAsync + 文件级写锁：拦截工具调用
         // 注：core 的 preHook next 实际签名是 (modifiedInput?: unknown) => Promise<ToolResult>，
         // 但 Hooks 接口类型声明为 () => Promise<unknown>，此处用 any 兼容传参改写
         async 'tool.pre.execute'(ctx: any, next: any) {
-          const isSubagent = ctx?.tool?.id === 'subagent' && ctx?.input && typeof ctx.input === 'object'
-          if (!isSubagent) return next()
-
-          let input = ctx.input
-          if (forceAsync) input = { ...input, runInBackground: true }
-
-          // 写文件集：调用显式传 targetFiles 优先，否则回退到被派 Agent 定义的 writesTo 声明
-          let targetFiles = Array.isArray(input.targetFiles) ? input.targetFiles : undefined
-          if ((!targetFiles || targetFiles.length === 0) && typeof input.agentId === 'string') {
-            targetFiles = harness?.agent.get(input.agentId)?.writesTo
-          }
-          const shouldArbitrate = serializeWrites && !!targetFiles && targetFiles.length > 0
-          if (shouldArbitrate) {
-            // 冲突则阻塞，直到前序 worker release（后台任务由 completed/failed 事件释放）
-            await arbiter.acquire(ctx.toolUseId, targetFiles)
-          }
-          try {
-            return await next(input)
-          } finally {
-            // 同步调用（非后台）：worker 已在 next() 内执行完，立即释放；
-            // 后台任务由 subagent.completed/failed 事件在 worker 真正完成时释放
-            if (shouldArbitrate && input.runInBackground !== true) {
-              arbiter.release(ctx.toolUseId)
+          // 文件级写锁：写类工具按目标路径跨 session 互斥（锁持有 = 本次写调用）
+          if (serializeWrites && ctx?.input && typeof ctx.input === 'object') {
+            const writePath = extractWritePath(ctx?.tool?.id, ctx.input)
+            if (writePath) {
+              await arbiter.acquireWrite(writePath, { sessionId: ctx.sessionId, toolUseId: ctx.toolUseId })
+              try {
+                return await next()
+              } finally {
+                arbiter.releaseWrite(writePath, ctx.toolUseId)
+              }
             }
           }
+
+          // forceAsync：强制 subagent spawn 后台化（不做派工级写仲裁）
+          if (forceAsync && ctx?.tool?.id === 'subagent' && ctx?.input && typeof ctx.input === 'object') {
+            return next({ ...ctx.input, runInBackground: true })
+          }
+          return next()
         },
 
         // 给 coordinator Agent 注入 send_message 工具

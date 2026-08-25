@@ -829,7 +829,8 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] **Barrier 同步原语**：`CoordinatorBarrierTracker` 跟踪 per-session 后台任务（订阅 subagent.started/completed/failed），全部完成/失败后发布 `coordinator.barrier.completed` 事件；CLI `attachAutoContinue` 订阅后注入 `<continue/>` 自动续轮（直接解决"多调研任务→等待→汇总"场景）
 - [x] forceAsync：插件选项或 `HARNESS_FORCE_ASYNC=true`，`tool.pre.execute` 拦截 subagent 调用强制 runInBackground（原 P2-6）
 - [x] send_message 工具：续跑已有 taskId（延续 worker 会话上下文返回回复），仅注入 mode=coordinator 的 Agent
-- [x] **写操作按文件集串行化调度**：`SubagentToolInput` 新增 `targetFiles?: string[]`（worker 声明要写的文件/目录）；`AgentDefinition` 新增 `writesTo?: string[]`（frontmatter `writesTo:` 解析，声明该 Agent 预计写入路径——`targetFiles` 的**自动填充源**）；`CoordinatorFileArbiter`（`pathsOverlap` 前缀匹配冲突检测 + FIFO 等待队列）在 `tool.pre.execute` 拦截 subagent 调用，与运行中 worker 文件集冲突的派工阻塞到前序 worker 完成（后台任务由 subagent.completed/failed 事件释放声明，同步任务在调用返回时立即释放）；`createCoordinatorPlugin({ serializeWrites: true })` 默认开启，仅对声明了 targetFiles 的调用生效（显式传 targetFiles 优先，否则回退 Agent 定义 writesTo）
+- [x] **文件级写锁（设计修正）**：`FileWriteArbiter` 按 canonical 路径跨 session 互斥，锁持有 = 单次写工具调用（write_file/edit_file，从输入 `path` 提取目标）；同一路径被其他 session 的写操作持有时本次写等待，同 session 内天然串行不加锁。`tool.pre.execute` 在写工具执行前 `acquireWrite`、finally `releaseWrite`。
+  - **设计修正说明**：初版为"派工声明级"仲裁（subagent 调用按 `targetFiles`/`AgentDefinition.writesTo` 整组阻塞）——但 agent 实际写哪些文件执行前并不确定，声明级锁会误伤不相关 worker 且锁持有到 worker 生命周期过长。改为文件级后，锁粒度 = 单次写调用，subagent 派工不再阻塞；`SubagentToolInput.targetFiles` / `AgentDefinition.writesTo` 保留为提示性声明（不参与仲裁）。bash 工具无法可靠解析写入路径，不纳入（与 Claude Code 一致，靠 prompt 纪律兜底）。
 
 **划归 `Swarm Plugin`（新包 `@harness/swarm`，✅ 已实现核心）**：
 - [x] Team 实体 + team file 持久化：`TeamManager`（`~/.harness/teams/{name}/team.json`，name/lead/members + inboxes/ 目录；create/get/list/addMember/delete，同名成员覆盖）
@@ -840,6 +841,19 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（单轮：mailbox 未读消息处理——普通消息 query 后回复写回发送者、shutdown 消息触发关停；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止）
 - [ ] tmux/iTerm2 进程后端（out-of-process teammate）→ 后续增强
 - [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套，`tool.pool.assemble` 注入全部 Agent
+
+**Swarm 后续待办（对照 Claude Code 源码调研 `04h-multi-agent.md` / teammateMailbox / inProcessRunner / useInboxPoller / tasks.ts）**：
+
+- [ ] **mailbox 协作协议类型扩展**：`permission_request/response`、`sandbox_*`、`plan_approval_*`、`idle_notification`、`task_assignment`、`team_permission_update`、`mode_set_request` + `isStructuredProtocolMessage` 路由（当前仅 message/shutdown/task_notification）
+- [ ] **权限 mailbox 双轨 fallback**：`requestPermissionThroughLeader` 无桥时降级 mailbox（permission_request 写 leader inbox → leader poller 弹 UI → response 回写 → teammate poller 命中回调 resolve），`useSwarmPermissionPoller` 的 `pendingCallbacks` Map + 500ms 轮询
+- [ ] **shutdown 模型决策**：shutdown_request → teammate 用 approveShutdown/rejectShutdown 工具决策 → shutdown_response → in-process abort / tmux gracefulShutdown（当前为直接关停）
+- [ ] **inbox poller 优先级**：shutdown 最高（防 peer 消息饿死）→ lead 消息 > peer 消息（FIFO）→ `tryClaimNextTask`；投递成功后才 markRead（防丢消息）
+- [ ] **task 依赖与认领锁**：`blockedBy` 依赖未解决不可认领 + claim 文件级锁防 TOCTOU（tasks.ts `claimTaskWithBusyCheck`）
+- [ ] **idle_notification**：teammate 每轮结束向 leader 发空闲通知（idleReason: available/interrupted/failed + peer DM 摘要）
+- [ ] **plan approval 自动批准 + permissionMode 继承**（leader 侧自动批准 plan_approval_request 并回写，含 leader 权限模式继承）
+- [ ] **tmux/iTerm2 进程后端**：out-of-process teammate（pane + CLI 传身份 + 初始 prompt 投 mailbox），与 in-process 分流（`handleSpawn`）
+- [ ] **team file 字段补全**：joinedAt / tmuxPaneId / cwd / subscriptions；`setLeaderTeamName` 让 `getTaskListId()` 指向 team 目录（多后端共享任务池）
+- [ ] **send_message 路由统一**：本地 subagent resume（coordinator 已有）与 mailbox 路由（swarm）合一，支持 `to='*'` broadcast
 
 ## 十、文件历史与回滚：Snapshot / Diff / Revert
 

@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-08-24（续 8）：写锁设计修正（声明级 → 文件级）+ Swarm 待办记录
+
+### 1. FileWriteArbiter：文件级写锁（替代派工声明级仲裁）
+
+**问题（用户反馈）**：初版 `CoordinatorFileArbiter` 只在 subagent 工具调用时触发，且按 `targetFiles`/`writesTo` 在**派工时**整组阻塞——agent 实际写哪些文件执行前并不确定，声明级锁会误伤不相关 worker，且锁持有到 worker 生命周期过长。
+
+**修正**（[packages/plugins/coordinator/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/coordinator/src/index.ts)）：
+- 重命名为 `FileWriteArbiter`：按 canonical 路径跨 session 互斥（per-path FIFO 等待队列），同 session 内天然串行直接放行
+- 锁持有 = **单次写工具调用**：`tool.pre.execute` 对 `write_file`/`edit_file`（从输入 `path` 提取目标）执行前 `acquireWrite`、finally `releaseWrite`；subagent 派工不再做任何声明级阻塞（仅保留 forceAsync）
+- `SubagentToolInput.targetFiles` / `AgentDefinition.writesTo` 保留为提示性声明，不参与仲裁；bash 无法可靠解析写入路径，不纳入（与 Claude Code 一致靠 prompt 纪律兜底）
+- 测试：coordinator 25 用例全绿（FileWriteArbiter 6 + 插件集成 5：跨 session 阻塞/并行/顺序释放/非写工具不拦截/开关）
+
+### 2. Swarm 待实现功能记录（对照 Claude Code 源码调研）
+
+已记录到架构文档 §9.4「Swarm 后续待办」10 项：mailbox 协议类型扩展（permission/sandbox/plan_approval/idle_notification 等 + isStructuredProtocolMessage 路由）、权限 mailbox 双轨 fallback、shutdown 模型决策（approveShutdown 工具）、inbox poller 优先级 + 投递后 markRead、task blockedBy 依赖 + claim 文件锁防 TOCTOU、idle_notification、plan approval 自动批准 + permissionMode 继承、tmux/iTerm2 后端、team file 字段补全 + setLeaderTeamName、send_message 路由统一（resume + mailbox + broadcast）
+
 ## 2026-08-24（续 7）：targetFiles 写入源 + in-process teammate 完整执行循环
 
 ### 1. targetFiles 写入源修复（Coordinator 串行化真实生效）

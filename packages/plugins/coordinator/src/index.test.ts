@@ -2,11 +2,10 @@ import { describe, it, expect } from 'bun:test'
 import {
   CoordinatorBarrierTracker,
   CoordinatorEvents,
-  CoordinatorFileArbiter,
   COORDINATOR_SYSTEM_PROMPT,
   createCoordinatorPlugin,
   createSendMessageTool,
-  pathsOverlap,
+  FileWriteArbiter,
   type SendMessageInput,
 } from './index'
 import { createBus } from '@harness/bus'
@@ -177,90 +176,79 @@ describe('CoordinatorBarrierTracker', () => {
   })
 })
 
-// ===== CoordinatorFileArbiter 单元测试（§9.4 写操作串行化） =====
+// ===== FileWriteArbiter 单元测试（文件级写锁） =====
 
-describe('pathsOverlap', () => {
-  it('相同路径重叠', () => {
-    expect(pathsOverlap(['src/a.ts'], ['src/a.ts'])).toBe(true)
-  })
-  it('目录与子路径重叠', () => {
-    expect(pathsOverlap(['src/'], ['src/a.ts'])).toBe(true)
-    expect(pathsOverlap(['src/a.ts'], ['src/'])).toBe(true)
-  })
-  it('祖先目录与后代目录重叠', () => {
-    expect(pathsOverlap(['src/'], ['src/features/hook.ts'])).toBe(true)
-  })
-  it('./ 前缀与尾部斜杠归一化后仍识别', () => {
-    expect(pathsOverlap(['./src'], ['src//a.ts'])).toBe(true)
-  })
-  it('不相关路径不重叠', () => {
-    expect(pathsOverlap(['src/a.ts'], ['docs/readme.md'])).toBe(false)
-    expect(pathsOverlap(['src/a'], ['src-ab/b'])).toBe(false)
-  })
-  it('空文件集不重叠', () => {
-    expect(pathsOverlap([], ['src/a.ts'])).toBe(false)
-    expect(pathsOverlap(['src/a.ts'], [])).toBe(false)
-  })
-})
-
-describe('CoordinatorFileArbiter', () => {
-  it('无冲突立即 acquire 并持有声明', async () => {
-    const arb = new CoordinatorFileArbiter()
-    await arb.acquire('t1', ['src/a.ts'])
-    await arb.acquire('t2', ['docs/'])
-    expect(arb.claimed().sort()).toEqual(['t1', 't2'])
+describe('FileWriteArbiter', () => {
+  it('不同路径可并行持有（互不阻塞）', async () => {
+    const arb = new FileWriteArbiter()
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't1' })
+    await arb.acquireWrite('docs/b.md', { sessionId: 's1', toolUseId: 't2' })
+    await arb.acquireWrite('src/c.ts', { sessionId: 's2', toolUseId: 't3' })
+    expect(arb.lockedPaths().sort()).toEqual(['docs/b.md', 'src/a.ts', 'src/c.ts'])
   })
 
-  it('冲突阻塞，release 后放行', async () => {
-    const arb = new CoordinatorFileArbiter()
-    await arb.acquire('t1', ['src/'])
-    expect(arb.claimed()).toEqual(['t1'])
+  it('同一路径跨 session 阻塞，release 后放行', async () => {
+    const arb = new FileWriteArbiter()
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't1' })
 
-    let released = false
-    const p2 = arb.acquire('t2', ['src/a.ts']).then(() => { released = true })
+    let acquired = false
+    const p2 = arb.acquireWrite('src/a.ts', { sessionId: 's2', toolUseId: 't2' }).then(() => { acquired = true })
     await new Promise((r) => setTimeout(r, 10))
-    expect(released).toBe(false) // t2 与 t1 冲突 → 阻塞
-    expect(arb.waitingCount()).toBe(1)
+    expect(acquired).toBe(false) // 被 s1 持有 → 阻塞
+    expect(arb.waitingCount('src/a.ts')).toBe(1)
 
-    arb.release('t1')
+    arb.releaseWrite('src/a.ts', 't1')
     await p2
-    expect(released).toBe(true)
-    expect(arb.waitingCount()).toBe(0)
-    expect(arb.claimed()).toEqual(['t2'])
+    expect(acquired).toBe(true)
+    expect(arb.waitingCount('src/a.ts')).toBe(0)
+    expect(arb.lockedPaths()).toEqual(['src/a.ts']) // 现在由 t2 持有
+  })
+
+  it('同 session 重复获取直接放行（不阻塞自身）', async () => {
+    const arb = new FileWriteArbiter()
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't1' })
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't2' }) // 同 session 串行，直接过
+    expect(arb.lockedPaths()).toEqual(['src/a.ts'])
+    // t1 释放仍有效（holder 未被 t2 覆盖）
+    arb.releaseWrite('src/a.ts', 't1')
+    expect(arb.lockedPaths()).toEqual([])
   })
 
   it('多等待者 FIFO：释放一个后按顺序放行', async () => {
-    const arb = new CoordinatorFileArbiter()
-    await arb.acquire('a', ['src/'])
+    const arb = new FileWriteArbiter()
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't1' })
 
     const order: string[] = []
-    const pb = arb.acquire('b', ['src/a.ts']).then(() => { order.push('b'); return 'b' })
-    const pc = arb.acquire('c', ['src/a.ts']).then(() => { order.push('c'); return 'c' })
+    const pb = arb.acquireWrite('src/a.ts', { sessionId: 's2', toolUseId: 't2' }).then(() => { order.push('b') })
+    const pc = arb.acquireWrite('src/a.ts', { sessionId: 's3', toolUseId: 't3' }).then(() => { order.push('c') })
     await new Promise((r) => setTimeout(r, 10))
     expect(order).toEqual([])
 
-    arb.release('a') // 唤醒 b（不再冲突），c 继续等
+    arb.releaseWrite('src/a.ts', 't1') // 唤醒 b
     await pb
     expect(order).toEqual(['b'])
-    expect(arb.waitingCount()).toBe(1)
 
-    arb.release('b')
+    arb.releaseWrite('src/a.ts', 't2') // 唤醒 c
     await pc
     expect(order).toEqual(['b', 'c'])
   })
 
-  it('不同文件集可并行持有（互不阻塞）', async () => {
-    const arb = new CoordinatorFileArbiter()
-    await arb.acquire('a', ['src/'])
-    await arb.acquire('b', ['docs/'])
-    await arb.acquire('c', ['test/'])
-    expect(arb.claimed().length).toBe(3)
+  it('release 幂等：释放未持有/非持有者释放不抛错', () => {
+    const arb = new FileWriteArbiter()
+    expect(() => arb.releaseWrite('ghost.ts', 't0')).not.toThrow()
+    expect(arb.lockedPaths()).toEqual([])
   })
 
-  it('release 幂等：释放未持有的 key 不抛错', () => {
-    const arb = new CoordinatorFileArbiter()
-    expect(() => arb.release('ghost')).not.toThrow()
-    expect(arb.claimed()).toEqual([])
+  it('尾部斜杠归一化：同一路径不同写法视为同一锁', async () => {
+    const arb = new FileWriteArbiter()
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't1' })
+    let acquired = false
+    const p2 = arb.acquireWrite('src/a.ts/', { sessionId: 's2', toolUseId: 't2' }).then(() => { acquired = true })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(acquired).toBe(false)
+    arb.releaseWrite('src/a.ts', 't1')
+    await p2
+    expect(acquired).toBe(true)
   })
 })
 
@@ -423,121 +411,115 @@ describe('createCoordinatorPlugin', () => {
     expect(COORDINATOR_SYSTEM_PROMPT).toInclude('<task-notification>')
   })
 
-  it('serializeWrites：声明 targetFiles 的冲突派工延迟到前序 worker 完成（后台事件释放）', async () => {
+  it('文件级写锁：write_file 被其他 session 持有 → 阻塞到该写完成', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
     await hooks['harness.start']({ harness })
 
-    const calls: string[] = []
-    const next = (modified?: any) => { calls.push(modified?.prompt ?? '?'); return { ok: true } }
-
-    // worker A：后台 + targetFiles=['src/a.ts'] → 立即放行并持有声明
-    await hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tA' },
-      next,
+    // session sA 写 src/a.ts，next 挂起模拟写操作进行中（锁持有 = 本次写调用）
+    const pA = hooks['tool.pre.execute'](
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts', content: 'x' }, toolUseId: 'tA', sessionId: 'sA' },
+      () => new Promise((r) => setTimeout(r, 100)),
     )
-
-    // worker B：同文件集 → 应被阻塞
+    // session sB 写同一路径 → 阻塞
     let bDone = false
     const pB = hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tB' },
-      (modified?: any) => { calls.push(modified?.prompt ?? '?'); bDone = true; return { ok: true } },
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts', content: 'y' }, toolUseId: 'tB', sessionId: 'sB' },
+      () => { bDone = true; return { ok: true } },
     )
     await new Promise((r) => setTimeout(r, 20))
     expect(bDone).toBe(false)
-    expect(calls).toEqual(['A'])
 
-    // worker A 完成 → 释放声明 → B 放行
-    await bus.publish(SubagentEvents.completed, {
-      agentId: 'researcher', subSessionId: 'sA', parentSessionId: 's_parent', toolUseId: 'tA',
-      replyPreview: 'A done', messageCount: 1, durationMs: 1, taskId: 'task-a', background: true,
-    } as any)
+    await pA // sA 写完成 → finally 释放锁
     await pB
     expect(bDone).toBe(true)
-    expect(calls).toEqual(['A', 'B'])
   })
 
-  it('serializeWrites：未声明 targetFiles 的调用不仲裁（直接放行）', async () => {
+  it('文件级写锁：不同路径的写操作并行不阻塞', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
     await hooks['harness.start']({ harness })
 
-    let nextCalled = false
-    await hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'no-files', runInBackground: true }, toolUseId: 'tX' },
-      () => { nextCalled = true; return { ok: true } },
+    const pA = hooks['tool.pre.execute'](
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tA', sessionId: 'sA' },
+      () => new Promise((r) => setTimeout(r, 100)),
     )
-    expect(nextCalled).toBe(true)
-  })
-
-  it('serializeWrites：同步（非后台）调用完成后立即释放声明', async () => {
-    const { bus, harness, plugin } = setup()
-    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
-
-    // 同步 worker A：targetFiles 声明，完成后应立即释放（finally 分支）
-    await hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'] }, toolUseId: 'tA' },
-      () => { return { ok: true } },
-    )
-    // 同文件集同步 worker B：A 已释放 → 不再阻塞，直接放行
     let bDone = false
     const pB = hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'] }, toolUseId: 'tB' },
+      { tool: { id: 'write_file' }, input: { path: 'docs/b.md' }, toolUseId: 'tB', sessionId: 'sB' },
+      () => { bDone = true; return { ok: true } },
+    )
+    await pB
+    expect(bDone).toBe(true) // 不同路径不阻塞
+    await pA
+  })
+
+  it('写工具完成后 finally 释放锁：顺序写同一路径不阻塞', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tA', sessionId: 'sA' },
+      () => { return { ok: true } },
+    )
+    // sA 已完成（await 返回时锁已释放）→ sB 同路径直接放行
+    let bDone = false
+    const pB = hooks['tool.pre.execute'](
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )
     await pB
     expect(bDone).toBe(true)
   })
 
-  it('serializeWrites=false：冲突派工不延迟', async () => {
+  it('非写工具不被拦截（subagent 派工不再做声明级仲裁）', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+
+    // 两个 subagent 调用即使带相同 targetFiles 也直接放行（不再派工级阻塞）
+    const calls: string[] = []
+    const next = () => { calls.push('called'); return { ok: true } }
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tA', sessionId: 'sA' },
+      next,
+    )
+    let bDone = false
+    const pB = hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tB', sessionId: 'sB' },
+      () => { bDone = true; return { ok: true } },
+    )
+    await pB
+    expect(bDone).toBe(true)
+    expect(calls).toEqual(['called'])
+
+    // read_file（有 path 但非写工具）不被拦截
+    let readDone = false
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'read_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tR', sessionId: 'sC' },
+      () => { readDone = true; return { ok: true } },
+    )
+    expect(readDone).toBe(true)
+  })
+
+  it('serializeWrites=false：写工具不做文件级互斥', async () => {
     const { bus, harness, plugin } = setup({ serializeWrites: false })
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
     await hooks['harness.start']({ harness })
 
-    const calls: string[] = []
-    const next = (modified?: any) => { calls.push(modified?.prompt ?? '?'); return { ok: true } }
-    await hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tA' },
-      next,
+    // sA 挂起写 src/a.ts，sB 同路径 → 直接放行（不等待）
+    const pA = hooks['tool.pre.execute'](
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tA', sessionId: 'sA' },
+      () => new Promise((r) => setTimeout(r, 100)),
     )
     let bDone = false
     const pB = hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tB' },
-      (modified?: any) => { calls.push(modified?.prompt ?? '?'); bDone = true; return { ok: true } },
-    )
-    await pB
-    expect(bDone).toBe(true)
-    expect(calls).toEqual(['A', 'B'])
-  })
-
-  it('serializeWrites：未显式传 targetFiles 时回退到 Agent 定义 writesTo 仲裁', async () => {
-    const { bus, harness, plugin } = setup()
-    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
-    // 注册一个声明 writesTo 的 worker（真实使用路径：Agent 定义声明，模型无需传 targetFiles）
-    harness.agent.register({ ...workerAgent, id: 'coder', writesTo: ['src/'] })
-
-    // worker A（coder，未传 targetFiles → 自动用 writesTo=['src/'] 仲裁并持有声明）
-    await hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'coder', prompt: 'A', runInBackground: true }, toolUseId: 'tA' },
-      () => { return { ok: true } },
-    )
-    // worker B（同 coder，同样未传 targetFiles）→ 冲突阻塞
-    let bDone = false
-    const pB = hooks['tool.pre.execute'](
-      { tool: { id: 'subagent' }, input: { agentId: 'coder', prompt: 'B', runInBackground: true }, toolUseId: 'tB' },
+      { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )
-    await new Promise((r) => setTimeout(r, 20))
-    expect(bDone).toBe(false)
-
-    // A 完成 → 释放 → B 放行
-    await bus.publish(SubagentEvents.completed, {
-      agentId: 'coder', subSessionId: 'sA', parentSessionId: 's_parent', toolUseId: 'tA',
-      replyPreview: 'A done', messageCount: 1, durationMs: 1, taskId: 'task-a', background: true,
-    } as any)
     await pB
     expect(bDone).toBe(true)
+    await pA
   })
 })
