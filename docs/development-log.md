@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-08-24（续 7）：targetFiles 写入源 + in-process teammate 完整执行循环
+
+### 1. targetFiles 写入源修复（Coordinator 串行化真实生效）
+
+- **问题**：`SubagentToolInput.targetFiles` 是可选字段，但 `makeSchema` 不透传 LLM 可见 schema、工具描述未提及、coordinator 只读不填——**无任何写入来源**，仲裁器实际不会触发
+- **修复**：`AgentDefinition` 新增 `writesTo?: string[]`（[packages/agent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/agent/src/index.ts)，frontmatter `writesTo:` 解析）；coordinator `tool.pre.execute` 在调用未显式传 `targetFiles` 时，自动从被派 Agent 定义 `writesTo` 填充（显式传参优先）
+- 测试：agent 23 用例（+2 writesTo 解析）、coordinator 30 用例（+1 定义回退仲裁）
+
+### 2. in-process teammate 完整执行循环（@harness/swarm）
+
+对齐 Claude Code `spawnInProcessTeammate` + `inProcessRunner` teammateLoop + `tryClaimNextTask`：
+
+- **`spawnInProcessTeammate`**：加入/创建团队（新建时 lead=自身）→ 创建独立子 session → 注册（默认全局 `teammateRegistry` 单例，可注入隔离实例）→ 带初始 prompt 立即执行一轮（AsyncLocalStorage 身份上下文）
+- **`runTeammateTick`**（单轮执行体）：① mailbox 未读消息——普通消息作为 query 输入、回复写回发送者、标记已读；shutdown 类型消息触发 abort + 状态置 shutdown；② `tryClaimNextTask`——认领 available 任务 → query 执行 → 更新任务 completed/failed + 向 leader 发 task_notification（replyTo=taskId）
+- **`startTeammateLoop`**：周期驱动 tick（intervalMs 可配），stop()/shutdown 消息停止
+- 修复：spawn 时团队新建后 teammate 未入队（补 addMember）
+- 测试：swarm 34 用例全绿（+6：tick 消息处理/任务完成/任务失败/shutdown + spawn 注册/loop 自动执行）
+
+### 验证与提交
+
+- 全仓 26 包 typecheck 通过；agent 23 + coordinator 30 + swarm 34 测试全绿
+- 文档：架构 §9.4 Coordinator 补 writesTo 自动填充说明、Swarm in-process 完整循环 ✅（tmux/iTerm2 后端留待办）
+
 ## 2026-08-24（续 6）：Coordinator 写操作串行化 + Swarm Plugin（@harness/swarm）
 
 ### 1. Coordinator 写操作按文件集串行化（§9.4 收官）

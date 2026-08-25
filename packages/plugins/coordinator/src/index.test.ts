@@ -510,4 +510,34 @@ describe('createCoordinatorPlugin', () => {
     expect(bDone).toBe(true)
     expect(calls).toEqual(['A', 'B'])
   })
+
+  it('serializeWrites：未显式传 targetFiles 时回退到 Agent 定义 writesTo 仲裁', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['harness.start']({ harness })
+    // 注册一个声明 writesTo 的 worker（真实使用路径：Agent 定义声明，模型无需传 targetFiles）
+    harness.agent.register({ ...workerAgent, id: 'coder', writesTo: ['src/'] })
+
+    // worker A（coder，未传 targetFiles → 自动用 writesTo=['src/'] 仲裁并持有声明）
+    await hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'coder', prompt: 'A', runInBackground: true }, toolUseId: 'tA' },
+      () => { return { ok: true } },
+    )
+    // worker B（同 coder，同样未传 targetFiles）→ 冲突阻塞
+    let bDone = false
+    const pB = hooks['tool.pre.execute'](
+      { tool: { id: 'subagent' }, input: { agentId: 'coder', prompt: 'B', runInBackground: true }, toolUseId: 'tB' },
+      () => { bDone = true; return { ok: true } },
+    )
+    await new Promise((r) => setTimeout(r, 20))
+    expect(bDone).toBe(false)
+
+    // A 完成 → 释放 → B 放行
+    await bus.publish(SubagentEvents.completed, {
+      agentId: 'coder', subSessionId: 'sA', parentSessionId: 's_parent', toolUseId: 'tA',
+      replyPreview: 'A done', messageCount: 1, durationMs: 1, taskId: 'task-a', background: true,
+    } as any)
+    await pB
+    expect(bDone).toBe(true)
+  })
 })

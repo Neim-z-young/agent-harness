@@ -630,13 +630,236 @@ export function formatAgentId(name: string, team: string): string {
   return `${sanitizeName(name)}@${sanitizeName(team)}`
 }
 
-// ===== 工具 =====
+/** 全局 teammate 注册表单例（spawnInProcessTeammate 默认注册目标，对齐 module-level task registry） */
+export const teammateRegistry = new TeammateRegistry()
+
+// ===== in-process teammate 完整执行循环（对齐 inProcessRunner teammateLoop） =====
 
 /** Harness 引用最小接口（避免循环依赖） */
 interface HarnessLike {
   agent: AgentRuntime
   session: SessionManager
 }
+
+/** 从 Message 提取最终文本 */
+function extractText(msg: { parts: Array<{ type: string; text?: string }> }): string {
+  return msg.parts.filter((p) => p.type === 'text').map((p) => p.text ?? '').join('')
+}
+
+/** teammate 单轮执行依赖 */
+export interface TeammateTickDeps {
+  harness: HarnessLike
+  mailbox: TeammateMailbox
+  taskPlane: TaskListPlane
+  team: string
+  /** 成员名（mailbox 收件人地址） */
+  name: string
+}
+
+/** teammate 单轮执行结果（诊断/测试） */
+export interface TeammateTickResult {
+  /** 处理的 mailbox 消息数 */
+  handledMessages: number
+  /** 本轮认领并执行的任务 */
+  claimedTask?: SwarmTask
+  /** 执行完的任务（completed/failed） */
+  finishedTask?: SwarmTask
+  /** 本轮的异常（不抛出，循环继续） */
+  error?: string
+}
+
+/** 认领下一个 available 任务（对齐 tryClaimNextTask） */
+export async function tryClaimNextTask(deps: TeammateTickDeps): Promise<SwarmTask | undefined> {
+  const tasks = await deps.taskPlane.list(deps.team, 'available')
+  if (tasks.length === 0) return undefined
+  return deps.taskPlane.claim(deps.team, tasks[0]!.id, deps.name)
+}
+
+/**
+ * teammate 单轮执行（对齐 teammateLoop 的循环体）：
+ * 1. 处理 mailbox 未读消息（shutdown 类型触发关停；普通消息作为 query 输入，回复写回发送者）
+ * 2. tryClaimNextTask：认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification
+ */
+export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTickDeps): Promise<TeammateTickResult> {
+  const result: TeammateTickResult = { handledMessages: 0 }
+  try {
+    if (state.status === 'shutdown') return result
+
+    // 1) mailbox 消息
+    const messages = await deps.mailbox.readUnreadMessages(deps.team, deps.name)
+    for (const msg of messages) {
+      if (state.status === 'shutdown') break
+      if (msg.type === 'shutdown') {
+        state.abortController.abort()
+        state.status = 'shutdown'
+        await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
+        continue
+      }
+      try {
+        const reply = await withTeammateIdentity(state.identity, () =>
+          deps.harness.agent.query({
+            sessionId: state.sessionId,
+            agentId: state.identity.agentId,
+            message: msg.text,
+          }),
+        )
+        await deps.mailbox.writeToMailbox(deps.team, msg.from, {
+          from: deps.name,
+          text: extractText(reply) || '(无文本回复)',
+          timestamp: new Date().toISOString(),
+          type: 'message',
+          replyTo: msg.timestamp,
+        })
+      } catch (err) {
+        result.error = `message handling failed: ${(err as Error).message}`
+      }
+      await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
+      result.handledMessages++
+    }
+
+    // 2) 认领并执行任务
+    const task = await tryClaimNextTask(deps)
+    if (!task) return result
+    result.claimedTask = task
+    try {
+      const reply = await withTeammateIdentity(state.identity, () =>
+        deps.harness.agent.query({
+          sessionId: state.sessionId,
+          agentId: state.identity.agentId,
+          message: `执行团队任务 ${task.id}：${task.title}${task.description ? `\n\n${task.description}` : ''}`,
+        }),
+      )
+      const finished = await deps.taskPlane.update(deps.team, task.id, { status: 'completed', result: extractText(reply) })
+      result.finishedTask = finished
+      // 向 leader 发送任务完成通知
+      await deps.mailbox.writeToMailbox(deps.team, 'lead', {
+        from: deps.name,
+        text: `任务 ${task.id}「${task.title}」已完成`,
+        summary: extractText(reply).slice(0, 200),
+        timestamp: new Date().toISOString(),
+        type: 'task_notification',
+        replyTo: task.id,
+      })
+    } catch (err) {
+      const message = (err as Error).message
+      result.error = `task execution failed: ${message}`
+      result.finishedTask = await deps.taskPlane.update(deps.team, task.id, { status: 'failed', result: message })
+      await deps.mailbox.writeToMailbox(deps.team, 'lead', {
+        from: deps.name,
+        text: `任务 ${task.id}「${task.title}」失败：${message}`,
+        timestamp: new Date().toISOString(),
+        type: 'task_notification',
+        replyTo: task.id,
+      })
+    }
+    return result
+  } catch (err) {
+    result.error = (err as Error).message
+    return result
+  }
+}
+
+/**
+ * 派生 in-process teammate（对齐 spawnInProcessTeammate）：
+ * 加入团队（不存在则创建，lead=自身）→ 创建独立子 session → 注册到 registry →
+ * 带初始 prompt 则立即执行一轮。
+ */
+export async function spawnInProcessTeammate(input: {
+  harness: HarnessLike
+  teamManager: TeamManager
+  team: string
+  name: string
+  /** Agent 定义 ID（mode: 'subagent'） */
+  agentId: string
+  /** 初始任务（可选，立即执行一轮） */
+  prompt?: string
+  model?: TeammateTaskState['model']
+  color?: string
+  /** 注册目标（默认全局 teammateRegistry；测试可注入隔离实例） */
+  registry?: TeammateRegistry
+}): Promise<TeammateTaskState> {
+  const { harness, teamManager, team, name, agentId, prompt, model, color, registry: targetRegistry } = input
+  let teamFile = await teamManager.get(team)
+  if (!teamFile) {
+    teamFile = await teamManager.create({ name: team, leadAgentId: agentId, leadSessionId: '' })
+  }
+  // 加入团队（lead 同名则跳过，避免覆盖）
+  if (sanitizeName(name) !== TEAM_LEAD_NAME) {
+    await teamManager.addMember(team, { agentId, name, role: 'teammate', model, color })
+  }
+
+  const session = await harness.session.create({
+    parentId: teamFile.leadSessionId || undefined,
+    title: `${sanitizeName(name)}@${teamFile.name}`,
+  })
+
+  const taskId = formatAgentId(name, team)
+  const state: TeammateTaskState = {
+    agentId: taskId,
+    identity: { team: teamFile.name, name: sanitizeName(name), agentId, color },
+    sessionId: session.id,
+    status: 'running',
+    prompt: prompt ?? '',
+    model,
+    abortController: new AbortController(),
+    createdAt: Date.now(),
+  }
+  ;(targetRegistry ?? teammateRegistry).register(state)
+
+  if (prompt) {
+    await withTeammateIdentity(state.identity, () =>
+      harness.agent.query({ sessionId: session.id, agentId, message: prompt }),
+    )
+  }
+  return state
+}
+
+/** teammate 循环句柄 */
+export interface TeammateLoopHandle {
+  /** 停止循环（teammate 进入 shutdown） */
+  stop(): Promise<void>
+  readonly running: boolean
+}
+
+/**
+ * 启动 teammate 执行循环：每 intervalMs 执行一轮 runTeammateTick，
+ * 直到 shutdown（stop() 或 mailbox shutdown 消息）。
+ */
+export function startTeammateLoop(
+  state: TeammateTaskState,
+  deps: TeammateTickDeps,
+  options?: { intervalMs?: number },
+): TeammateLoopHandle {
+  const intervalMs = options?.intervalMs ?? 1000
+  let timer: ReturnType<typeof setInterval> | undefined
+  let stopped = false
+
+  async function tick(): Promise<void> {
+    if (stopped || state.status === 'shutdown') {
+      stopped = true
+      if (timer) clearInterval(timer)
+      return
+    }
+    await runTeammateTick(state, deps).catch(() => undefined)
+  }
+
+  timer = setInterval(() => { void tick() }, intervalMs)
+  void tick()
+
+  return {
+    async stop() {
+      stopped = true
+      if (timer) clearInterval(timer)
+      state.status = 'shutdown'
+      state.abortController.abort()
+    },
+    get running() {
+      return !stopped && state.status !== 'shutdown'
+    },
+  }
+}
+
+// ===== 工具 =====
 
 /** 工具上下文提取当前 agent/session（供 lead 身份等） */
 function ctxIdentity(ctx: ToolContext): { agentId: string; sessionId: string } {

@@ -286,4 +286,29 @@ skills:
     expect(def.icon).toBe('code')
     expect(def.skills).toEqual(['refactor', 'debug'])
   })
+
+  it('writesTo: 解析写文件集声明（Coordinator 串行化用）', () => {
+    const content = `---
+id: coder
+name: Coder
+description: 实现 Agent
+mode: subagent
+writesTo:
+  - src/
+  - package.json
+---`
+    const def = agentFromMarkdown(content)
+    expect(def.writesTo).toEqual(['src/', 'package.json'])
+  })
+
+  it('未声明 writesTo → undefined', () => {
+    const content = `---
+id: coder
+name: Coder
+description: 子 Agent
+mode: subagent
+---`
+    const def = agentFromMarkdown(content)
+    expect(def.writesTo).toBeUndefined()
+  })
 })

@@ -116,6 +116,14 @@ export interface AgentDefinition {
    */
   background?: boolean
 
+  // === 写操作声明（Coordinator 文件集串行化读取） ===
+  /**
+   * 该 Agent 预计写入的文件/目录（项目相对路径）。
+   * Coordinator 派工时的写操作串行化据此仲裁：subagent 调用未显式传 targetFiles 时，
+   * 自动用此声明填充（声明了 targetFiles 的调用优先）。
+   */
+  writesTo?: string[]
+
   // === 能力白名单 ===
   /** 工具 ID 列表，['*'] 表示全部工具 */
   tools: string[] | ['*']
@@ -407,6 +415,9 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
     ? frontmatter.background
     : undefined
 
+  // writesTo（frontmatter.writesTo: [路径列表]，Coordinator 写操作串行化用）
+  const writesTo = Array.isArray(frontmatter.writesTo) ? frontmatter.writesTo.map(String) : undefined
+
   // icon
   const icon = frontmatter.icon ? String(frontmatter.icon) : undefined
 
@@ -428,6 +439,7 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
   if (skills) def.skills = skills
   if (subagents) def.subagents = subagents
   if (background !== undefined) def.background = background
+  if (writesTo) def.writesTo = writesTo
   if (model) def.model = model
   if (promptFragments) def.promptFragments = promptFragments
 

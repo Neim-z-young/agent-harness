@@ -829,15 +829,16 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] **Barrier 同步原语**：`CoordinatorBarrierTracker` 跟踪 per-session 后台任务（订阅 subagent.started/completed/failed），全部完成/失败后发布 `coordinator.barrier.completed` 事件；CLI `attachAutoContinue` 订阅后注入 `<continue/>` 自动续轮（直接解决"多调研任务→等待→汇总"场景）
 - [x] forceAsync：插件选项或 `HARNESS_FORCE_ASYNC=true`，`tool.pre.execute` 拦截 subagent 调用强制 runInBackground（原 P2-6）
 - [x] send_message 工具：续跑已有 taskId（延续 worker 会话上下文返回回复），仅注入 mode=coordinator 的 Agent
-- [x] **写操作按文件集串行化调度**：`SubagentToolInput` 新增 `targetFiles?: string[]`（worker 声明要写的文件/目录）；`CoordinatorFileArbiter`（`pathsOverlap` 前缀匹配冲突检测 + FIFO 等待队列）在 `tool.pre.execute` 拦截 subagent 调用，与运行中 worker 文件集冲突的派工阻塞到前序 worker 完成（后台任务由 subagent.completed/failed 事件释放声明，同步任务在调用返回时立即释放）；`createCoordinatorPlugin({ serializeWrites: true })` 默认开启，仅对声明了 targetFiles 的调用生效
+- [x] **写操作按文件集串行化调度**：`SubagentToolInput` 新增 `targetFiles?: string[]`（worker 声明要写的文件/目录）；`AgentDefinition` 新增 `writesTo?: string[]`（frontmatter `writesTo:` 解析，声明该 Agent 预计写入路径——`targetFiles` 的**自动填充源**）；`CoordinatorFileArbiter`（`pathsOverlap` 前缀匹配冲突检测 + FIFO 等待队列）在 `tool.pre.execute` 拦截 subagent 调用，与运行中 worker 文件集冲突的派工阻塞到前序 worker 完成（后台任务由 subagent.completed/failed 事件释放声明，同步任务在调用返回时立即释放）；`createCoordinatorPlugin({ serializeWrites: true })` 默认开启，仅对声明了 targetFiles 的调用生效（显式传 targetFiles 优先，否则回退 Agent 定义 writesTo）
 
 **划归 `Swarm Plugin`（新包 `@harness/swarm`，✅ 已实现核心）**：
 - [x] Team 实体 + team file 持久化：`TeamManager`（`~/.harness/teams/{name}/team.json`，name/lead/members + inboxes/ 目录；create/get/list/addMember/delete，同名成员覆盖）
 - [x] Mailbox（锁文件）+ Inbox Poller：`TeammateMailbox`（`inboxes/{agent}.json`，`withLock` 原子锁文件串行化并发写，读未读/标记已读）+ `attachInboxPoller`（周期轮询未读消息回调宿主，纯逻辑可独立测试）
 - [x] Task List Plane：`TaskListPlane`（tasks.json 共享任务池，状态机 available → in_progress → completed/failed/cancelled + 生命周期校验 + claim 冲突检测），工具 task_create/list/claim/update/stop
 - [x] Leader Permission Bridge：`registerLeaderConfirmQueue`（module-level，CLI/REPL 注册 leader 的 confirm queue）+ `requestPermissionThroughLeader`（teammate ask 权限请求带 workerBadge 回流 leader；无桥 fail-closed 拒绝）
-- [x] in-process teammate 基础：`TeammateRegistry` + `spawnInProcessTeammate` 前置（`withTeammateIdentity` AsyncLocalStorage 身份隔离 + `formatAgentId`）
-- [ ] in-process teammate 完整执行循环（poller 驱动 teammate query）+ tmux/iTerm2 后端 → 后续增强
+- [x] in-process teammate 基础：`TeammateRegistry` + `withTeammateIdentity` AsyncLocalStorage 身份隔离 + `formatAgentId`
+- [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（单轮：mailbox 未读消息处理——普通消息 query 后回复写回发送者、shutdown 消息触发关停；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止）
+- [ ] tmux/iTerm2 进程后端（out-of-process teammate）→ 后续增强
 - [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套，`tool.pool.assemble` 注入全部 Agent
 
 ## 十、文件历史与回滚：Snapshot / Diff / Revert

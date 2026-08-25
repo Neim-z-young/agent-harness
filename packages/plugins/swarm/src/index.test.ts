@@ -27,7 +27,10 @@ import {
   hasLeaderConfirmQueue,
   registerLeaderConfirmQueue,
   requestPermissionThroughLeader,
+  runTeammateTick,
   sanitizeName,
+  spawnInProcessTeammate,
+  startTeammateLoop,
   TaskListPlane,
   TeammateMailbox,
   TeamManager,
@@ -317,6 +320,178 @@ describe('in-process teammate', () => {
       expect(getCurrentTeammate()).toMatchObject({ name: 'bob' })
     })
     expect(getCurrentTeammate()).toBeUndefined()
+  })
+})
+
+// ===== in-process teammate 完整执行循环 =====
+
+/** mock harness（query 记录调用 + session.create 返回独立 session） */
+function makeMockHarness() {
+  const queries: Array<{ sessionId: string; agentId: string; message: string }> = []
+  const agent = {
+    query: async (input: { sessionId: string; agentId?: string; message: string }) => {
+      queries.push(input as { sessionId: string; agentId: string; message: string })
+      return {
+        id: 'm',
+        role: 'assistant',
+        parts: [{ type: 'text', text: `回复: ${input.message.slice(0, 30)}` }],
+        createdAt: Date.now(),
+      }
+    },
+  }
+  const session = {
+    create: async (opts?: { title?: string; parentId?: string }) => ({
+      id: `s_${Math.random().toString(36).slice(2, 7)}`,
+      title: opts?.title ?? 'session',
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      parentId: opts?.parentId,
+    }),
+  }
+  return { harness: { agent, session } as any, queries }
+}
+
+function makeTeammateState(overrides: Partial<Parameters<typeof runTeammateTick>[0]> = {}) {
+  const state = {
+    agentId: 'bob@alpha',
+    identity: { team: 'alpha', name: 'bob', agentId: 'researcher' },
+    sessionId: 's_sub',
+    status: 'running',
+    prompt: '',
+    abortController: new AbortController(),
+    createdAt: Date.now(),
+    ...overrides,
+  }
+  return state as Parameters<typeof runTeammateTick>[0]
+}
+
+describe('runTeammateTick（teammate 执行循环）', () => {
+  it('处理 mailbox 未读消息：query 执行 + 回复写回发送者 + 消息标记已读', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness, queries } = makeMockHarness()
+    const state = makeTeammateState()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: '请调研竞品', timestamp: 't1', type: 'message' })
+
+    const result = await runTeammateTick(state, deps)
+    expect(result.handledMessages).toBe(1)
+    expect(queries).toHaveLength(1)
+    expect(queries[0]!.message).toBe('请调研竞品')
+    expect(queries[0]!.sessionId).toBe('s_sub')
+    // 回复写回 lead 的 inbox
+    const leadInbox = await mb.readMailbox('alpha', 'lead')
+    expect(leadInbox[0]!.from).toBe('bob')
+    expect(leadInbox[0]!.text).toContain('回复: 请调研竞品')
+    // 已读
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+  })
+
+  it('认领并执行 available 任务：claim → query → completed + 通知 leader', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness, queries } = makeMockHarness()
+    const state = makeTeammateState()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    const task = await plane.create('alpha', { title: '写 README', description: '中文版' })
+    const result = await runTeammateTick(state, deps)
+
+    expect(result.claimedTask?.id).toBe(task.id)
+    expect(result.finishedTask?.status).toBe('completed')
+    expect(queries[0]!.message).toContain('写 README')
+    const updated = await plane.get('alpha', task.id)
+    expect(updated!.status).toBe('completed')
+    expect(updated!.result).toContain('回复:')
+    // leader 收到 task_notification
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    expect(leaderInbox[0]!.type).toBe('task_notification')
+    expect(leaderInbox[0]!.replyTo).toBe(task.id)
+  })
+
+  it('任务执行失败 → 任务标记 failed + 通知 leader', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const agent = { query: async () => { throw new Error('boom') } }
+    const session = { create: async () => ({ id: 's' }) }
+    const state = makeTeammateState()
+    const deps = { harness: { agent, session } as any, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    const task = await plane.create('alpha', { title: 'T' })
+    const result = await runTeammateTick(state, deps)
+    expect(result.finishedTask?.status).toBe('failed')
+    expect(result.error).toContain('boom')
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    expect(leaderInbox[0]!.type).toBe('task_notification')
+    expect(leaderInbox[0]!.text).toContain('失败')
+  })
+
+  it('shutdown 消息：状态置 shutdown 并中止', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness } = makeMockHarness()
+    const state = makeTeammateState()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: '收工', timestamp: 't1', type: 'shutdown' })
+    await runTeammateTick(state, deps)
+    expect(state.status).toBe('shutdown')
+    expect(state.abortController.signal.aborted).toBe(true)
+  })
+})
+
+describe('spawnInProcessTeammate + startTeammateLoop', () => {
+  it('spawnInProcessTeammate：加入团队 + 注册 + 初始 prompt 立即执行', async () => {
+    const dir = await makeDir('swarm-spawn-')
+    const mgr = new TeamManager(dir)
+    const { harness, queries } = makeMockHarness()
+    const registry = new TeammateRegistry()
+
+    const state = await spawnInProcessTeammate({
+      harness, teamManager: mgr, team: 'Alpha', name: 'bob', agentId: 'researcher', prompt: '初始任务', registry,
+    })
+
+    expect(state.agentId).toBe('bob@alpha')
+    expect(registry.get('bob@alpha')).toBeDefined()
+    expect(state.sessionId).toBeDefined()
+    // 团队已建（lead=researcher）+ bob 入队
+    const team = await mgr.get('alpha')
+    expect(team!.members.map((m) => m.name)).toEqual(['lead', 'bob'])
+    // 初始 prompt 执行了一轮
+    expect(queries).toHaveLength(1)
+    expect(queries[0]!.message).toBe('初始任务')
+  })
+
+  it('startTeammateLoop：自动认领任务并完成，stop 停止', async () => {
+    const dir = await makeDir('swarm-loop-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness } = makeMockHarness()
+    const state = makeTeammateState()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    await plane.create('alpha', { title: '任务A' })
+    const loop = startTeammateLoop(state, deps, { intervalMs: 20 })
+
+    // 等待循环认领并完成
+    for (let i = 0; i < 50; i++) {
+      const t = await plane.get('alpha', (await plane.list('alpha'))[0]!.id)
+      if (t?.status === 'completed') break
+      await new Promise((r) => setTimeout(r, 20))
+    }
+    const task = (await plane.list('alpha'))[0]!
+    expect(task.status).toBe('completed')
+    expect(task.claimedBy).toBe('bob')
+
+    await loop.stop()
+    expect(loop.running).toBe(false)
+    expect(state.status).toBe('shutdown')
   })
 })
 

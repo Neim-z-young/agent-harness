@@ -484,7 +484,11 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
           let input = ctx.input
           if (forceAsync) input = { ...input, runInBackground: true }
 
-          const targetFiles = Array.isArray(input.targetFiles) ? input.targetFiles : undefined
+          // 写文件集：调用显式传 targetFiles 优先，否则回退到被派 Agent 定义的 writesTo 声明
+          let targetFiles = Array.isArray(input.targetFiles) ? input.targetFiles : undefined
+          if ((!targetFiles || targetFiles.length === 0) && typeof input.agentId === 'string') {
+            targetFiles = harness?.agent.get(input.agentId)?.writesTo
+          }
           const shouldArbitrate = serializeWrites && !!targetFiles && targetFiles.length > 0
           if (shouldArbitrate) {
             // 冲突则阻塞，直到前序 worker release（后台任务由 completed/failed 事件释放）
