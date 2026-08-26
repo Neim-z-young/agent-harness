@@ -32,6 +32,7 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks'
+import { spawn } from 'node:child_process'
 import { open, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
@@ -1335,6 +1336,162 @@ export async function spawnInProcessTeammate(input: {
     )
   }
   return state
+}
+
+// ===== out-of-process teammate：tmux / iTerm2 终端后端 =====
+
+/** teammate 后端类型（spawnTeammate 分流） */
+export type TeammateBackend = 'in-process' | 'tmux' | 'iterm2'
+
+/** 终端后端选项 */
+export interface TerminalBackendOptions {
+  /** 终端后端（默认 tmux） */
+  backend?: 'tmux' | 'iterm2'
+  /** 命令执行器（默认 spawn 收集 stdout；测试注入 fake） */
+  run?: (cmd: string, args: string[]) => Promise<string>
+  /** tmux 会话名（默认 swarm-{team}-{name}） */
+  sessionName?: string
+  /** CLI 可执行文件名（默认 harness） */
+  cliCommand?: string
+  /** 追加 CLI 参数（如 --data-dir <dir>） */
+  cliArgs?: string[]
+}
+
+/** 默认命令执行器：spawn 并收集 stdout（exit != 0 抛错） */
+export function runTerminalCommand(cmd: string, args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] })
+    let stdout = ''
+    let stderr = ''
+    child.stdout.on('data', (d: Buffer) => { stdout += d.toString() })
+    child.stderr.on('data', (d: Buffer) => { stderr += d.toString() })
+    child.on('error', reject)
+    child.on('close', (code) => {
+      if (code === 0) resolve(stdout.trim())
+      else reject(new Error(`${cmd} exit ${code}: ${stderr.trim().slice(0, 500)}`))
+    })
+  })
+}
+
+/**
+ * 派生 out-of-process teammate（对齐 Claude Code tmux/iTerm2 spawn）：
+ * 在终端（tmux 会话 / iTerm2 窗口）中启动一个独立的 CLI 进程作为 teammate，
+ * 通过 CLI `teammate` 子命令携带团队/成员身份持续轮询 mailbox 执行任务。
+ * 返回分配的 pane/window id（写入 TeamMember.tmuxPaneId）。
+ */
+export async function spawnTerminalTeammate(input: {
+  teamManager: TeamManager
+  team: string
+  name: string
+  agentId: string
+  cwd?: string
+  model?: TeammateTaskState['model']
+  color?: string
+  options?: TerminalBackendOptions
+}): Promise<{ paneId: string; member: TeamMember }> {
+  const { teamManager, team, name, agentId, model, color } = input
+  const opts = input.options ?? {}
+  const backend = opts.backend ?? 'tmux'
+  const run = opts.run ?? runTerminalCommand
+  const cwd = input.cwd ?? process.cwd()
+
+  // 团队：不存在则创建（lead = 发起者），否则复用
+  let teamFile = await teamManager.get(team)
+  if (!teamFile) {
+    teamFile = await teamManager.create({ name: team, leadAgentId: agentId, leadSessionId: '' })
+  }
+  const memberName = sanitizeName(name)
+
+  // CLI 启动命令（teammate 子命令：携带团队/成员身份）
+  const cliCommand = opts.cliCommand ?? 'harness'
+  const launchCmd = [
+    cliCommand,
+    'teammate',
+    '--team', teamFile.name,
+    '--name', memberName,
+    '--agent', agentId,
+    '--cwd', cwd,
+    ...(opts.cliArgs ?? []),
+  ].join(' ')
+
+  let paneId: string
+  if (backend === 'tmux') {
+    const sessionName = opts.sessionName ?? `swarm-${teamFile.name}-${memberName}`
+    try {
+      await run('tmux', ['new-session', '-d', '-s', sessionName, '-c', cwd])
+    } catch {
+      // 会话已存在：在新窗口挂载
+      await run('tmux', ['new-window', '-t', sessionName, '-c', cwd])
+    }
+    await run('tmux', ['send-keys', '-t', `${sessionName}:0`, launchCmd, 'Enter'])
+    paneId = `${sessionName}:0`
+  } else {
+    // iTerm2：osascript 创建窗口 + 写入启动命令
+    const script = [
+      'tell application "iTerm2"',
+      '  activate',
+      `  tell (create window with default profile)`,
+      `    set name to "${memberName}@${teamFile.name}"`,
+      '    tell current session',
+      `      write text "${launchCmd}"`,
+      '    end tell',
+      '    set wid to id',
+      '  end tell',
+      '  return wid',
+      'end tell',
+    ].join('\n')
+    paneId = (await run('osascript', ['-e', script])).trim()
+  }
+
+  // 记录 pane/window id 到成员（同名覆盖，joinedAt 由 addMember 保留）
+  const member: TeamMember = { agentId, name: memberName, role: 'teammate', model, color, tmuxPaneId: paneId, cwd }
+  await teamManager.addMember(team, member)
+  return { paneId, member }
+}
+
+/**
+ * 统一 spawn 入口：按 backend 分流 in-process / tmux / iTerm2。
+ * in-process → 同进程子会话 + 注册 registry；终端后端 → 独立 CLI 进程 + tmuxPaneId。
+ */
+export async function spawnTeammate(input: {
+  backend?: TeammateBackend
+  harness?: HarnessLike
+  teamManager: TeamManager
+  team: string
+  name: string
+  agentId: string
+  prompt?: string
+  model?: TeammateTaskState['model']
+  color?: string
+  registry?: TeammateRegistry
+  cwd?: string
+  options?: TerminalBackendOptions
+}): Promise<TeammateTaskState | { paneId: string; member: TeamMember }> {
+  const backend = input.backend ?? input.options?.backend ?? 'in-process'
+  if (backend === 'in-process') {
+    if (!input.harness) throw new SwarmError('team', 'in-process 后端需要提供 harness 引用')
+    return spawnInProcessTeammate({
+      harness: input.harness,
+      teamManager: input.teamManager,
+      team: input.team,
+      name: input.name,
+      agentId: input.agentId,
+      prompt: input.prompt,
+      model: input.model,
+      color: input.color,
+      registry: input.registry,
+    })
+  }
+  return spawnTerminalTeammate({
+    teamManager: input.teamManager,
+    team: input.team,
+    name: input.name,
+    agentId: input.agentId,
+    cwd: input.cwd,
+    model: input.model,
+    color: input.color,
+    options: { ...input.options, backend },
+  })
 }
 
 /** teammate 循环句柄 */

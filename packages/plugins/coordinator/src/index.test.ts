@@ -292,6 +292,49 @@ describe('send_message 工具', () => {
     expect(res.ok).toBe(false)
     expect(res.error!.code).toBe('TASK_RUNNING')
   })
+
+  it('mailbox 路由：team + to 单播到成员 inbox', async () => {
+    const { tracker } = setup()
+    const delivered: string[] = []
+    const mailbox = { writeToMailbox: async (_team: string, recipient: string) => { delivered.push(recipient) } }
+    const t = createSendMessageTool(() => ({ agent: {} as any, session: {} as any }), () => tracker, {
+      mailbox, getTeamMembers: async () => ['lead', 'bob', 'carol'],
+    })
+    const res = await t.call({ team: 'alpha', to: 'bob', message: 'hi bob' }, makeToolContext())
+    expect(res.ok).toBe(true)
+    expect(delivered).toEqual(['bob'])
+    expect(res.output!.deliveredTo).toEqual(['bob'])
+    expect(res.output!.team).toBe('alpha')
+  })
+
+  it('mailbox 路由：to="*" 广播到团队所有成员', async () => {
+    const { tracker } = setup()
+    const delivered: string[] = []
+    const mailbox = { writeToMailbox: async (_team: string, recipient: string, msg: any) => {
+      delivered.push(`${recipient}:${msg.text}`)
+    } }
+    const t = createSendMessageTool(() => ({ agent: {} as any, session: {} as any }), () => tracker, {
+      mailbox, getTeamMembers: async () => ['lead', 'bob', 'carol'],
+    })
+    const res = await t.call({ team: 'alpha', to: '*', message: '全员注意', description: '广播' }, makeToolContext())
+    expect(res.ok).toBe(true)
+    expect(delivered).toEqual(['lead:全员注意', 'bob:全员注意', 'carol:全员注意'])
+    expect(res.output!.deliveredTo).toEqual(['lead', 'bob', 'carol'])
+  })
+
+  it('mailbox 路由未配置 → MAILBOX_NOT_CONFIGURED', async () => {
+    const { tool } = setup() // 未注入 mailbox
+    const res = await tool.call({ team: 'alpha', to: 'bob', message: 'hi' }, makeToolContext())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('MAILBOX_NOT_CONFIGURED')
+  })
+
+  it('无目标（无 team+to 也无 taskId）→ INVALID_TARGET', async () => {
+    const { tool } = setup()
+    const res = await tool.call({ message: 'hi' }, makeToolContext())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('INVALID_TARGET')
+  })
 })
 
 // ===== 插件集成测试 =====

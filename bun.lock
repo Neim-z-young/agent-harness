@@ -36,6 +36,7 @@
         "@harness/session": "workspace:*",
         "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
+        "@harness/swarm": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
       },

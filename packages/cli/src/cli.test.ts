@@ -54,6 +54,15 @@ describe('parseCliArgs 命令解析', () => {
     expect(parseCliArgs(['-h']).command).toBe('help')
     expect(parseCliArgs(['--help', 'repl']).command).toBe('help')
   })
+
+  it('teammate 子命令 + --team/--name 身份参数', () => {
+    const a = parseCliArgs(['teammate', '--team', 'Alpha', '--name', 'bob', '--agent', 'researcher', '--data-dir', '/x'])
+    expect(a.command).toBe('teammate')
+    expect(a.team).toBe('Alpha')
+    expect(a.name).toBe('bob')
+    expect(a.agentId).toBe('researcher')
+    expect(a.dataDir).toBe('/x')
+  })
 })
 
 describe('SessionFileStore 会话持久化', () => {

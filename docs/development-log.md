@@ -1,5 +1,31 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 12）：Swarm 待办收尾——tmux/iTerm2 进程后端 + send_message 路由统一
+
+对照架构 §9.4「Swarm 后续待办」，实现最后 2 项（8、10），Swarm 待办 10 项全部完成：
+
+### 1. tmux/iTerm2 进程后端（out-of-process teammate）
+
+- swarm 新增 `spawnTerminalTeammate`（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：
+  - tmux：`new-session -d`（已存在则 `new-window`）→ `send-keys` 注入 CLI 启动命令 → paneId 写入 `TeamMember.tmuxPaneId`
+  - iTerm2：osascript 创建窗口 + `write text` 启动命令，返回 window id
+  - 命令执行器可注入（`run`），默认 `spawn` 收集 stdout，纯逻辑可测试
+- CLI 新增 `teammate` 子命令（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：`harness teammate --team <t> --name <n> --agent <a>`——复用 HarnessApp.boot + `startTeammateLoop` 持续轮询 mailbox/认领任务，直到 shutdown 退出
+- `spawnTeammate` 统一分流：backend = in-process | tmux | iterm2
+
+### 2. send_message 路由统一
+
+- coordinator `send_message` 双路由（[packages/plugins/coordinator/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/coordinator/src/index.ts)）：
+  - **mailbox 路由**（team + to）：单播到成员 inbox；`to='*'` 广播到团队全部成员
+  - **本地续跑路由**（taskId）：原 worker 子会话续跑语义不变
+- mailbox 经插件选项依赖注入（`SendMailbox` 鸭子接口，不硬依赖 swarm），未注入时 mailbox 路由返回 `MAILBOX_NOT_CONFIGURED`；无目标返回 `INVALID_TARGET`
+
+### 验证与提交
+
+- 测试：swarm 63 用例全绿（+3：tmux 命令序列/iTerm2 osascript/spawn 分流）、coordinator 29（+4：单播/广播/未配置/无目标）、cli 28（+1：teammate 参数解析）
+- 全仓 26 包 typecheck 通过
+- 文档：架构 §9.4 Swarm 待办 10 项全部 ✅
+
 ## 2026-08-26（续 11）：Swarm 待办 7、9 项落地（plan approval + team file 字段补全）
 
 对照架构 §9.4「Swarm 后续待办」，实现第 7、9 项（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：

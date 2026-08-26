@@ -25,6 +25,7 @@
     "@harness/tools-builtin": "workspace:*",
     "@harness/subagent": "workspace:*",
     "@harness/coordinator": "workspace:*",
+    "@harness/swarm": "workspace:*",
     "@harness/snapshot": "workspace:*",
     "@harness/revert": "workspace:*"
   },

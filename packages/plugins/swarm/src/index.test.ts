@@ -48,6 +48,8 @@ import {
   sanitizeName,
   sortMessagesByPriority,
   spawnInProcessTeammate,
+  spawnTeammate,
+  spawnTerminalTeammate,
   startTeammateLoop,
   TaskListPlane,
   TeammateMailbox,
@@ -887,6 +889,75 @@ describe('spawnInProcessTeammate + startTeammateLoop', () => {
     await loop.stop()
     expect(loop.running).toBe(false)
     expect(state.status).toBe('shutdown')
+  })
+})
+
+// ===== out-of-process teammate（tmux / iTerm2 终端后端） =====
+
+describe('out-of-process teammate', () => {
+  it('spawnTerminalTeammate（tmux）：命令序列 + paneId + 成员 tmuxPaneId 落盘', async () => {
+    const dir = await makeDir('swarm-term-')
+    const mgr = new TeamManager(dir)
+    const calls: Array<[string, string[]]> = []
+    const run = async (cmd: string, args: string[]) => { calls.push([cmd, args]); return '' }
+
+    const result = await spawnTerminalTeammate({
+      teamManager: mgr, team: 'Alpha', name: 'bob', agentId: 'researcher', cwd: '/tmp/x',
+      options: { run, cliArgs: ['--data-dir', '/tmp/data'] },
+    })
+    expect(result.paneId).toBe('swarm-alpha-bob:0')
+    // tmux 命令序列：new-session → send-keys（CLI teammate 启动命令）
+    expect(calls[0]![0]).toBe('tmux')
+    expect(calls[0]![1]).toEqual(['new-session', '-d', '-s', 'swarm-alpha-bob', '-c', '/tmp/x'])
+    expect(calls[1]![1]).toEqual([
+      'send-keys', '-t', 'swarm-alpha-bob:0',
+      'harness teammate --team alpha --name bob --agent researcher --cwd /tmp/x --data-dir /tmp/data',
+      'Enter',
+    ])
+    // 成员 tmuxPaneId / cwd 已写入 team file
+    const team = await mgr.get('alpha')
+    expect(team!.members.map((m) => m.name)).toEqual(['lead', 'bob'])
+    expect(mgr.getMember(team!, 'bob')!.tmuxPaneId).toBe('swarm-alpha-bob:0')
+    expect(mgr.getMember(team!, 'bob')!.cwd).toBe('/tmp/x')
+  })
+
+  it('spawnTerminalTeammate（iTerm2）：走 osascript 创建窗口', async () => {
+    const dir = await makeDir('swarm-term-')
+    const mgr = new TeamManager(dir)
+    const calls: Array<[string, string[]]> = []
+    const run = async (cmd: string, args: string[]) => { calls.push([cmd, args]); return 'wid-42' }
+
+    const result = await spawnTerminalTeammate({
+      teamManager: mgr, team: 'Alpha', name: 'bob', agentId: 'researcher',
+      options: { backend: 'iterm2', run },
+    })
+    expect(calls[0]![0]).toBe('osascript')
+    const script = calls[0]![1]![1]!
+    expect(script).toContain('tell application "iTerm2"')
+    expect(script).toContain('harness teammate --team alpha --name bob')
+    expect(result.paneId).toBe('wid-42')
+  })
+
+  it('spawnTeammate 分流：in-process 缺 harness 抛错；tmux 返回 paneId', async () => {
+    const dir = await makeDir('swarm-term-')
+    const mgr = new TeamManager(dir)
+    // in-process 未提供 harness → 抛错
+    let caught: unknown
+    try {
+      await spawnTeammate({ teamManager: mgr, team: 'Alpha', name: 'bob', agentId: 'researcher' })
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeDefined()
+    expect((caught as Error).message).toContain('harness')
+    // tmux 分流（显式 backend）
+    const out = await spawnTeammate({
+      teamManager: mgr, team: 'Alpha', name: 'carol', agentId: 'researcher',
+      backend: 'tmux',
+      options: { run: async () => '' },
+    })
+    expect('paneId' in out).toBe(true)
+    expect((out as { paneId: string }).paneId).toBe('swarm-alpha-carol:0')
   })
 })
 

@@ -259,20 +259,28 @@ function extractWritePath(toolId: string, input: unknown): string | undefined {
 
 /** send_message 工具输入 */
 export interface SendMessageInput {
-  /** 已派出的后台任务 ID（subagent runInBackground 返回的 taskId） */
-  taskId: string
-  /** 续跑指令（延续该 worker 的会话上下文） */
+  /** 已派出的后台任务 ID（subagent runInBackground 返回的 taskId；本地续跑路由） */
+  taskId?: string
+  /** 续跑指令 / 要发送的消息内容 */
   message: string
   /** 简短描述（可选） */
   description?: string
+  /** mailbox 路由：目标团队成员名（'*' = 广播给团队所有成员） */
+  to?: string
+  /** mailbox 路由：团队名（提供 to 时需要） */
+  team?: string
 }
 
 /** send_message 工具输出 */
 export interface SendMessageOutput {
-  /** worker 的最终回复文本 */
+  /** worker 的最终回复文本 / mailbox 路由投递摘要 */
   message: string
-  /** worker 会话累计消息数 */
-  messageCount: number
+  /** worker 会话累计消息数（本地续跑路由） */
+  messageCount?: number
+  /** mailbox 路由投递目标列表 */
+  deliveredTo?: string[]
+  /** mailbox 路由团队名 */
+  team?: string
 }
 
 /** Harness 引用最小接口（避免循环依赖） */
@@ -292,29 +300,95 @@ function extractText(msg: Message): string {
   return msg.parts.filter((p) => p.type === 'text').map((p) => (p as { text: string }).text).join('')
 }
 
+/** mailbox 路由最小接口（由 swarm TeammateMailbox 注入，避免 coordinator 依赖 swarm 包） */
+export interface SendMailbox {
+  writeToMailbox(
+    team: string,
+    recipient: string,
+    msg: { from: string; text: string; summary?: string; timestamp: string; type?: string },
+  ): Promise<unknown>
+}
+
+/** send_message 工具选项 */
+export interface SendMessageToolOptions {
+  /** 本地续跑超时（毫秒，默认 120_000） */
+  timeoutMs?: number
+  /** mailbox 路由：注入 swarm mailbox 后支持 to/team 投递 */
+  mailbox?: SendMailbox
+  /** mailbox 路由：团队成员名列表（广播 to='*' 时使用） */
+  getTeamMembers?: (team: string) => Promise<string[]>
+}
+
 /**
- * send_message 工具：向已派出的 worker（taskId）续跑消息。
- * 延续该 worker 的子 session 上下文（多轮对话），返回 worker 回复。
+ * send_message 工具：统一两条路由——
+ * 1. **mailbox 路由**（提供 team + to）：向团队成员 mailbox 投递消息；`to='*'` 广播到团队所有成员。
+ * 2. **本地续跑路由**（提供 taskId）：向已派出的 worker（taskId）续跑消息，延续其子会话上下文。
  * 仅对 mode=coordinator 的 Agent 注入。
  */
 export function createSendMessageTool(
   getHarness: () => HarnessLike | undefined,
   getTracker: () => CoordinatorBarrierTracker,
-  timeoutMs: number,
+  timeoutMsOrOptions: number | SendMessageToolOptions = 120_000,
 ): Tool<SendMessageInput, SendMessageOutput> {
+  const opts: SendMessageToolOptions = typeof timeoutMsOrOptions === 'number'
+    ? { timeoutMs: timeoutMsOrOptions }
+    : timeoutMsOrOptions
+  const timeoutMs = opts.timeoutMs ?? 120_000
+
   return defineTool<SendMessageInput, SendMessageOutput>({
     id: 'send_message',
     aliases: ['resume_worker', 'message_worker'],
-    description: '向已派出的 worker（后台任务 taskId）发送续跑消息，延续其会话上下文，返回 worker 回复。用于协调器给已有 worker 补充指令、追问细节或催办。输入：taskId（后台任务 ID）、message（续跑指令）、description（可选）。',
+    description: '向 worker/团队成员发送消息，两条路由：① mailbox 路由——输入 team + to（成员名或 * 广播到团队全部成员），投递到成员 inbox；② 本地续跑路由——输入 taskId（已派出的后台任务 ID），延续其会话上下文执行并返回回复。',
     isReadOnly: () => false,
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
 
     inputSchema: makeSchema<SendMessageInput>(),
-    permission: { key: 'send_message', extractPatterns: (input) => [input.taskId] },
+    permission: { key: 'send_message', extractPatterns: (input) => [input.taskId ?? input.to ?? ''] },
 
-    async call(input: SendMessageInput, _ctx: ToolContext): Promise<ToolResult<SendMessageOutput>> {
+    async call(input: SendMessageInput, ctx: ToolContext): Promise<ToolResult<SendMessageOutput>> {
+      // mailbox 路由：team + to（成员名 / '*' 广播）
+      if (input.team && input.to) {
+        if (!opts.mailbox) {
+          return { ok: false, error: { message: 'mailbox 路由未配置（未注入 swarm mailbox）', code: 'MAILBOX_NOT_CONFIGURED' } }
+        }
+        try {
+          const targets = input.to === '*'
+            ? (await opts.getTeamMembers?.(input.team)) ?? []
+            : [input.to]
+          if (targets.length === 0) {
+            return { ok: false, error: { message: `广播目标为空：团队 "${input.team}" 无成员`, code: 'MAILBOX_NO_TARGETS' } }
+          }
+          const now = new Date().toISOString()
+          for (const target of targets) {
+            await opts.mailbox.writeToMailbox(input.team, target, {
+              from: ctx.agentId,
+              text: input.message,
+              summary: input.description,
+              timestamp: now,
+              type: 'message',
+            })
+          }
+          return {
+            ok: true,
+            output: {
+              message: input.to === '*'
+                ? `已广播到 ${targets.length} 位成员：${targets.join(', ')}`
+                : `已投递到 ${targets[0]}`,
+              deliveredTo: targets,
+              team: input.team,
+            },
+          }
+        } catch (err) {
+          return { ok: false, error: { message: `send_message（mailbox）失败：${(err as Error)?.message ?? err}`, code: 'MAILBOX_SEND_FAILED' } }
+        }
+      }
+
+      // 本地续跑路由：taskId → worker 子会话
+      if (!input.taskId) {
+        return { ok: false, error: { message: '缺少目标：需提供 team+to（mailbox 路由）或 taskId（续跑路由）', code: 'INVALID_TARGET' } }
+      }
       const harness = getHarness()
       if (!harness?.agent || !harness.session) {
         return { ok: false, error: { message: 'Harness 未就绪（harness.start 未触发）', code: 'HARNESS_NOT_READY' } }
@@ -349,14 +423,17 @@ export function createSendMessageTool(
     },
 
     renderUse: (input) => ({
-      taskId: input.taskId,
+      taskId: input.taskId ?? '',
+      to: input.to,
+      team: input.team,
       message: input.message.length > 100 ? input.message.slice(0, 100) + '...' : input.message,
     }),
     renderResult: (result) => {
       if (!result.ok || !result.output) return undefined
       return {
         message: result.output.message.length > 200 ? result.output.message.slice(0, 200) + '...' : result.output.message,
-        messageCount: result.output.messageCount,
+        ...(result.output.deliveredTo ? { deliveredTo: result.output.deliveredTo } : {}),
+        ...(result.output.messageCount !== undefined ? { messageCount: result.output.messageCount } : {}),
       }
     },
   })
@@ -377,6 +454,10 @@ export interface CoordinatorPluginOptions {
    * 锁粒度 = 单次写工具调用（不再按 targetFiles 派工声明整组阻塞）。
    */
   serializeWrites?: boolean
+  /** send_message mailbox 路由：注入 swarm 的 mailbox（支持 team+to 投递 / '*' 广播） */
+  mailbox?: SendMailbox
+  /** send_message mailbox 路由：团队成员名列表（广播 to='*' 时使用） */
+  getTeamMembers?: (team: string) => Promise<string[]>
 }
 
 /** 读取环境变量布尔值（'1' / 'true' / 'yes'） */
@@ -408,7 +489,11 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
     async install(ctx) {
       ctx.log.info('Coordinator 插件已加载', { forceAsync, autoContinue, serializeWrites })
 
-      sendMessageTool = createSendMessageTool(() => harness, () => tracker, timeoutMs)
+      sendMessageTool = createSendMessageTool(() => harness, () => tracker, {
+        timeoutMs,
+        mailbox: options.mailbox,
+        getTeamMembers: options.getTeamMembers,
+      })
 
       return {
         async 'harness.start'(input) {

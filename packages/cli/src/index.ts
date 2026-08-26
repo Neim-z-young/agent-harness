@@ -39,6 +39,14 @@ import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatPr
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
+import {
+  createSwarmManagers,
+  formatAgentId,
+  sanitizeName,
+  startTeammateLoop,
+  type TeammateTaskState,
+  type TeammateTickDeps,
+} from '@harness/swarm'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import type { Message, Session } from '@harness/session'
@@ -55,13 +63,17 @@ import { createInterface } from 'node:readline'
 // ========================================================================
 
 export interface CliArgs {
-  /** 子命令：repl / start / list-sessions / resume / run */
-  command: 'repl' | 'list-sessions' | 'resume' | 'run' | 'help'
+  /** 子命令：repl / start / list-sessions / resume / run / teammate */
+  command: 'repl' | 'list-sessions' | 'resume' | 'run' | 'teammate' | 'help'
   /** resume / run 的参数 */
   arg?: string
   /** 选项 */
   cwd?: string
   agentId?: string
+  /** teammate 子命令：所属团队（sanitize 后） */
+  team?: string
+  /** teammate 子命令：成员名（sanitize 后） */
+  name?: string
   provider?: 'mock' | 'anthropic'
   sessionId?: string
   dataDir?: string
@@ -88,6 +100,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     else if (cmd === 'list-sessions') command = 'list-sessions'
     else if (cmd === 'resume') command = 'resume'
     else if (cmd === 'run') command = 'run'
+    else if (cmd === 'teammate') command = 'teammate'
     else if (cmd === 'help' || cmd === '--help' || cmd === '-h') { out.showHelp = true; command = 'help' }
     else { arg = cmd } // 非标准：直接填 arg 用于 run 无命令场景
     if ((command === 'resume' || command === 'run') && args.length > 0 && !args[0].startsWith('-')) {
@@ -126,6 +139,8 @@ export function parseCliArgs(raw: string[]): CliArgs {
     switch (key) {
       case 'c': case 'cwd': out.cwd = value; break
       case 'a': case 'agent': out.agentId = value; break
+      case 'team': out.team = value; break
+      case 'name': out.name = value; break
       case 'p': case 'provider': out.provider = value === 'mock' ? 'mock' : value === 'anthropic' ? 'anthropic' : undefined; break
       case 's': case 'session': out.sessionId = value; break
       case 'd': case 'data-dir': out.dataDir = value; break
@@ -921,7 +936,12 @@ export const HELP_TEXT = `harness — Agent Harness CLI
   harness list-sessions [options]       列出持久化会话
   harness resume <sessionId> [opt]      恢复指定会话进入 REPL
   harness run "<prompt>" [opt]          一次性执行 prompt，输出结果后退出
+  harness teammate --team <t> --name <n> [opt]   以 out-of-process teammate 身份运行（终端后端 spawn）
   harness help | -h | --help            显示帮助
+
+teammate 选项:
+      --team <team>           所属团队名（sanitize 后）
+      --name <name>           成员名（sanitize 后）
 
 选项:
   -c, --cwd <dir>            工作目录（默认当前目录）
@@ -936,6 +956,61 @@ export const HELP_TEXT = `harness — Agent Harness CLI
 // ========================================================================
 // 7. 顶层 main()：处理脚本入口
 // ========================================================================
+
+/**
+ * teammate 子命令：以 out-of-process teammate 身份运行（终端后端 spawn 的独立 CLI 进程）。
+ *
+ * 复用 HarnessApp.boot（provider/harness/会话），从团队共享目录读取 mailbox/taskPlane，
+ * 启动 startTeammateLoop 持续轮询 mailbox + 认领任务，直到收到 shutdown
+ * （approve_shutdown 决策 / 外部 stop）退出。
+ */
+export async function runTeammateCli(options: {
+  args: CliArgs
+  cwd: string
+  dataDir: string
+  provider: 'mock' | 'anthropic'
+  agentId: string
+  permissionMode: 'allow-all' | 'ask'
+}): Promise<number> {
+  const { args, cwd, dataDir, provider, agentId, permissionMode } = options
+  const write = (s: string) => process.stdout.write(s)
+  const team = args.team
+  const name = args.name
+  if (!team || !name) {
+    write('用法: harness teammate --team <team> --name <成员名> --agent <agentId>\n')
+    return 1
+  }
+
+  const app = new HarnessApp({ cwd, dataDir, agentId, provider, permissionMode, verbose: args.verbose })
+  const { harness, session } = await app.boot()
+  const { mailbox, taskPlane } = createSwarmManagers(join(dataDir, 'teams'))
+
+  const memberTeam = sanitizeName(team)
+  const memberName = sanitizeName(name)
+  const state: TeammateTaskState = {
+    agentId: formatAgentId(name, team),
+    identity: { team: memberTeam, name: memberName, agentId },
+    sessionId: session.id,
+    status: 'running',
+    prompt: '',
+    abortController: new AbortController(),
+    createdAt: Date.now(),
+  }
+  const deps: TeammateTickDeps = { harness, mailbox, taskPlane, team: memberTeam, name: memberName }
+  write(`[teammate] ${memberName}@${memberTeam} 已上线（session=${session.id}），开始轮询 mailbox...\n`)
+
+  const loop = startTeammateLoop(state, deps, { intervalMs: 1000 })
+  // 挂起直到 shutdown（approve_shutdown / stop 将状态置 shutdown）
+  await new Promise<void>((resolve) => {
+    const poll = setInterval(() => {
+      if (state.status === 'shutdown') { clearInterval(poll); resolve() }
+    }, 300)
+  })
+  await loop.stop()
+  try { await app.shutdown() } catch {}
+  write('[teammate] 已退出\n')
+  return 0
+}
 
 export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<number> {
   const args = parseCliArgs(rawArgs)
@@ -960,6 +1035,10 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       write(`${s.id}\t${s.title ?? ''}\t${s.messageCount} msgs\t${when}\n`)
     }
     return 0
+  }
+
+  if (args.command === 'teammate') {
+    return runTeammateCli({ args, cwd, dataDir, provider, agentId, permissionMode })
   }
 
   const app = new HarnessApp({

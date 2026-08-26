@@ -851,9 +851,9 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] **task 依赖与认领锁**：`SwarmTask.blockedBy`（任务创建可选）+ `claim` 锁内 busy-check——依赖任务全部 completed 才可认领（指向不存在的任务视为未解决），`withLock` 文件锁防 TOCTOU；`tryClaimNextTask` 跳过依赖未解决/已被并发认领的任务
 - [x] **idle_notification**：`createIdleNotification` + `runTeammateTick` 每轮结束向 leader 发空闲通知（idleReason: available/interrupted/failed + 处理摘要）；消息循环中途被中断（approve_shutdown 触发关停）时发 interrupted 且不再认领任务
 - [x] **plan approval 自动批准 + permissionMode 继承**：`createPlanApprovalRequest/Response` + `requestPlanApproval`（teammate 写请求 + 挂起回调配对）；`processMailboxPlanApprovalRequests`（leader 侧自动批准并回写，携带 leader 当前 permissionMode 供对方继承）；`runTeammateTick` 每轮先处理 plan_approval_response 配对
-- [ ] **tmux/iTerm2 进程后端**：out-of-process teammate（pane + CLI 传身份 + 初始 prompt 投 mailbox），与 in-process 分流（`handleSpawn`）
+- [x] **tmux/iTerm2 进程后端**：`spawnTerminalTeammate`（tmux new-session + send-keys 启动 CLI / iTerm2 osascript 建窗）→ CLI 新增 `teammate` 子命令（携带 --team/--name/--agent 身份，复用 boot + startTeammateLoop 轮询 mailbox/认领任务）；`spawnTeammate` 按 backend（in-process/tmux/iterm2）分流，tmuxPaneId 写入 TeamMember
 - [x] **team file 字段补全**：`TeamMember` 增 joinedAt / tmuxPaneId / cwd / subscriptions；`TeamFile` 增 leaderTeamName + `setLeaderTeamName`（多后端共享任务池定位；TaskListPlane 本就团队绑定，in-process 已天然共享）
-- [ ] **send_message 路由统一**：本地 subagent resume（coordinator 已有）与 mailbox 路由（swarm）合一，支持 `to='*'` broadcast
+- [x] **send_message 路由统一**：coordinator `send_message` 双路由——mailbox 路由（team + to 单播 / `to='*'` 广播到全部成员）与本地续跑路由（taskId → worker 子会话）；mailbox 通过插件选项依赖注入（`SendMailbox` 接口，不硬依赖 swarm），未注入时 mailbox 路由返回 MAILBOX_NOT_CONFIGURED
 
 ## 十、文件历史与回滚：Snapshot / Diff / Revert
 
