@@ -1,5 +1,27 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 11）：Swarm 待办 7、9 项落地（plan approval + team file 字段补全）
+
+对照架构 §9.4「Swarm 后续待办」，实现第 7、9 项（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：
+
+### 1. plan approval 自动批准 + permissionMode 继承
+
+- helper：`createPlanApprovalRequest`（plan 内容 + 期望 permissionMode）、`createPlanApprovalResponse`（approved + leader permissionMode）
+- teammate 侧：`requestPlanApproval`（写 plan_approval_request 到 leader inbox + 挂起回调）、`processMailboxPlanApprovalResponse`（命中 requestId 配对 resolve，返回 approved + 继承的 permissionMode）
+- leader 侧：`processMailboxPlanApprovalRequests` 自动批准 plan_approval_request 并回写响应，携带 leader 当前 permissionMode（宿主传入）供 teammate 继承
+- `runTeammateTick` 每轮先处理 plan_approval_response 配对（与权限响应并列）
+
+### 2. team file 字段补全 + setLeaderTeamName
+
+- `TeamMember` 增 joinedAt / tmuxPaneId / cwd / subscriptions；lead 与新增成员自动记录 joinedAt（同名覆盖保留原值）
+- `TeamFile` 增 leaderTeamName + `TeamManager.setLeaderTeamName`（多后端共享任务池定位；out-of-process teammate 通过它找到归属团队目录）
+
+### 验证与提交
+
+- 测试：swarm 60 用例全绿（+5：字段补全 1 + setLeaderTeamName 1 + plan approval 3）
+- 全仓 26 包 typecheck 通过
+- 文档：架构 §9.4 第 7、9 项标记 ✅（tmux/iTerm2 后端、send_message 路由统一 留待办）
+
 ## 2026-08-26（续 10）：Swarm 待办 4-6 项落地（poller 优先级 + task 依赖锁 + idle_notification）
 
 对照架构 §9.4「Swarm 后续待办」，实现第 4-6 项（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：

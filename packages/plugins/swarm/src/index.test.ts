@@ -16,6 +16,8 @@ import {
   createIdleNotification,
   createPermissionRequest,
   createPermissionResponse,
+  createPlanApprovalRequest,
+  createPlanApprovalResponse,
   createSendTeammateMessageTool,
   createShutdownDecision,
   createShutdownDecisionTool,
@@ -33,10 +35,14 @@ import {
   getCurrentTeammate,
   hasLeaderConfirmQueue,
   hasPendingPermissionCallback,
+  hasPendingPlanApproval,
   isStructuredProtocolMessage,
   processMailboxPermissionResponse,
+  processMailboxPlanApprovalRequests,
+  processMailboxPlanApprovalResponse,
   registerLeaderConfirmQueue,
   requestPermissionThroughLeader,
+  requestPlanApproval,
   requestSwarmPermission,
   runTeammateTick,
   sanitizeName,
@@ -137,6 +143,36 @@ describe('TeamManager', () => {
     const team2 = await mgr.addMember('alpha', { ...member, color: 'red' })
     expect(team2.members).toHaveLength(2)
     expect(mgr.getMember(team2, 'bob')!.color).toBe('red')
+  })
+
+  it('成员字段补全：lead/新成员记录 joinedAt，保留 tmuxPaneId/cwd/subscriptions', async () => {
+    const dir = await makeDir('swarm-team-')
+    const mgr = new TeamManager(dir)
+    await mgr.create({ name: 'Alpha', leadAgentId: 'coordinator', leadSessionId: 's_lead' })
+    expect((await mgr.get('alpha'))!.members[0]!.joinedAt).toBeDefined()
+
+    const team = await mgr.addMember('alpha', {
+      agentId: 'researcher', name: 'bob', role: 'teammate',
+      tmuxPaneId: 'pane-1', cwd: '/tmp/x', subscriptions: ['#alpha'],
+    })
+    const bob = mgr.getMember(team, 'bob')!
+    expect(bob.joinedAt).toBeDefined()
+    expect(bob.tmuxPaneId).toBe('pane-1')
+    expect(bob.cwd).toBe('/tmp/x')
+    expect(bob.subscriptions).toEqual(['#alpha'])
+    // 同名覆盖保留原有 joinedAt
+    const team2 = await mgr.addMember('alpha', { ...bob, color: 'red' })
+    expect(mgr.getMember(team2, 'bob')!.joinedAt).toBe(bob.joinedAt)
+  })
+
+  it('setLeaderTeamName 写入 leaderTeamName（多后端共享任务池定位）', async () => {
+    const dir = await makeDir('swarm-team-')
+    const mgr = new TeamManager(dir)
+    await mgr.create({ name: 'Alpha', leadAgentId: 'coordinator', leadSessionId: 's_lead' })
+    const team = await mgr.setLeaderTeamName('alpha', 'alpha-tasks')
+    expect(team.leaderTeamName).toBe('alpha-tasks')
+    expect((await mgr.get('alpha'))!.leaderTeamName).toBe('alpha-tasks')
+    await expect(mgr.setLeaderTeamName('ghost', 'x')).rejects.toThrow('not found')
   })
 
   it('list 列出全部团队；get 不存在返回 undefined', async () => {
@@ -464,6 +500,61 @@ describe('权限 mailbox fallback', () => {
   it('requestSwarmPermission 双轨皆不可用 → fail-closed 拒绝', async () => {
     const decision = await requestSwarmPermission({ from: 'bob', toolName: 'bash' })
     expect(decision).toEqual({ allow: false })
+  })
+})
+
+// ===== plan approval + permissionMode 继承 =====
+
+describe('plan approval', () => {
+  it('createPlanApprovalRequest / createPlanApprovalResponse 携带配对字段', () => {
+    const req = createPlanApprovalRequest({ from: 'bob', to: 'lead', plan: '实现模块 X', permissionMode: 'bypassPermissions' })
+    expect(req.type).toBe('plan_approval_request')
+    expect(req.requestId).toBeDefined()
+    expect(req.permissionMode).toBe('bypassPermissions')
+    expect(req.data).toMatchObject({ plan: '实现模块 X' })
+    expect(isStructuredProtocolMessage(req)).toBe(true)
+
+    const res = createPlanApprovalResponse({ from: 'lead', to: 'bob', requestId: req.requestId!, approved: true, permissionMode: 'acceptEdits' })
+    expect(res.type).toBe('plan_approval_response')
+    expect(res.replyTo).toBe(req.requestId)
+    expect(res.data).toEqual({ approved: true, permissionMode: 'acceptEdits' })
+  })
+
+  it('requestPlanApproval → leader 自动批准 → 响应配对 resolve（含 permissionMode 继承）', async () => {
+    const dir = await makeDir('swarm-plan-')
+    const mb = new TeammateMailbox(dir)
+
+    const pending = requestPlanApproval({ from: 'bob', to: 'lead', plan: '重构 A', permissionMode: 'plan', mailbox: mb, team: 'alpha' })
+
+    // leader inbox 收到 plan_approval_request
+    let leaderInbox: MailboxMessage[] = []
+    for (let i = 0; i < 20 && leaderInbox.length === 0; i++) {
+      leaderInbox = await mb.readMailbox('alpha', 'lead')
+      if (leaderInbox.length === 0) await new Promise((r) => setTimeout(r, 5))
+    }
+    expect(leaderInbox[0]!.type).toBe('plan_approval_request')
+    expect(leaderInbox[0]!.permissionMode).toBe('plan')
+
+    // leader 自动批准（携带当前 permissionMode 继承给 teammate）
+    const handled = await processMailboxPlanApprovalRequests(mb, 'alpha', 'lead', { permissionMode: 'acceptEdits' })
+    expect(handled).toBe(1)
+    expect(await mb.countUnread('alpha', 'lead')).toBe(0)
+    // 响应投递到 teammate inbox，处理配对后 resolve
+    const handledRes = await processMailboxPlanApprovalResponse(mb, 'alpha', 'bob')
+    expect(handledRes).toBe(true)
+    await expect(pending).resolves.toEqual({ approved: true, permissionMode: 'acceptEdits' })
+    expect(hasPendingPlanApproval()).toBe(false)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+  })
+
+  it('processMailboxPlanApprovalResponse：未知 requestId 不 resolve 但标记已读', async () => {
+    const dir = await makeDir('swarm-plan-')
+    const mb = new TeammateMailbox(dir)
+    expect(hasPendingPlanApproval()).toBe(false)
+    await mb.writeToMailbox('alpha', 'bob', createPlanApprovalResponse({ from: 'lead', to: 'bob', requestId: 'ghost', approved: true }))
+    const handled = await processMailboxPlanApprovalResponse(mb, 'alpha', 'bob')
+    expect(handled).toBe(false)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
   })
 })
 

@@ -119,6 +119,14 @@ export interface TeamMember {
   model?: { providerId?: string; modelId?: string; temperature?: number }
   color?: string
   role: 'lead' | 'teammate'
+  /** 加入时间（首次入队时记录） */
+  joinedAt?: number
+  /** tmux pane id（out-of-process teammate 后端） */
+  tmuxPaneId?: string
+  /** 工作目录（out-of-process teammate 启动 cwd） */
+  cwd?: string
+  /** 消息订阅（后续 mailbox 路由广播用） */
+  subscriptions?: string[]
 }
 
 /** Team 文件（对齐 Claude Code TeamFile） */
@@ -128,6 +136,8 @@ export interface TeamFile {
   createdAt: number
   leadAgentId: string
   leadSessionId: string
+  /** 归属 leader 团队名（setLeaderTeamName 写入；多后端共享任务池定位） */
+  leaderTeamName?: string
   members: TeamMember[]
 }
 
@@ -167,6 +177,7 @@ export class TeamManager {
           agentType: input.leadAgentType,
           model: input.leadModel,
           role: 'lead',
+          joinedAt: Date.now(),
         },
       ],
     }
@@ -202,11 +213,12 @@ export class TeamManager {
     return teams
   }
 
-  /** 加入成员（幂等：同名覆盖） */
+  /** 加入成员（幂等：同名覆盖；新成员记录 joinedAt） */
   async addMember(name: string, member: TeamMember): Promise<TeamFile> {
     const team = await this.get(name)
     if (!team) throw new SwarmError('team', `Team not found: ${name}`)
-    team.members = [...team.members.filter((m) => m.name !== member.name), member]
+    const full: TeamMember = { ...member, joinedAt: member.joinedAt ?? Date.now() }
+    team.members = [...team.members.filter((m) => m.name !== member.name), full]
     await writeFile(this.teamFilePath(name), JSON.stringify(team, null, 2), 'utf-8')
     return team
   }
@@ -214,6 +226,18 @@ export class TeamManager {
   /** 查询成员（按成员名） */
   getMember(team: TeamFile, memberName: string): TeamMember | undefined {
     return team.members.find((m) => m.name === memberName)
+  }
+
+  /**
+   * 设置 leader 团队名：把团队绑定到 leader 的任务池命名空间（多后端共享任务池定位；
+   * out-of-process teammate 通过 leaderTeamName 找到自己归属的团队目录）。
+   */
+  async setLeaderTeamName(name: string, leaderTeamName: string): Promise<TeamFile> {
+    const team = await this.get(name)
+    if (!team) throw new SwarmError('team', `Team not found: ${name}`)
+    team.leaderTeamName = leaderTeamName
+    await writeFile(this.teamFilePath(name), JSON.stringify(team, null, 2), 'utf-8')
+    return team
   }
 
   /** 删除团队（连同 inboxes/tasks） */
@@ -410,6 +434,47 @@ export function createIdleNotification(opts: {
     timestamp: new Date().toISOString(),
     type: 'idle_notification',
     idleReason,
+  }
+}
+
+/** 构造 plan 审批请求消息（teammate → leader；携带 plan 内容 + 期望 permissionMode） */
+export function createPlanApprovalRequest(opts: {
+  from: string
+  to: string
+  plan?: string
+  permissionMode?: string
+  requestId?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  const requestId = opts.requestId ?? generateRequestId('plan')
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: `[plan] 请求审批计划${opts.plan ? `：${opts.plan.slice(0, 100)}` : ''}`,
+    timestamp: new Date().toISOString(),
+    type: 'plan_approval_request',
+    requestId,
+    permissionMode: opts.permissionMode,
+    data: { plan: opts.plan, permissionMode: opts.permissionMode },
+  }
+}
+
+/** 构造 plan 审批响应消息（leader → teammate；approved + leader permissionMode 继承） */
+export function createPlanApprovalResponse(opts: {
+  from: string
+  to: string
+  requestId: string
+  approved: boolean
+  permissionMode?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: `[plan] ${opts.approved ? '已批准' : '已拒绝'}`,
+    timestamp: new Date().toISOString(),
+    type: 'plan_approval_response',
+    replyTo: opts.requestId,
+    permissionMode: opts.permissionMode,
+    data: { approved: opts.approved, permissionMode: opts.permissionMode },
   }
 }
 
@@ -771,6 +836,117 @@ export async function requestSwarmPermission(opts: {
   return { allow: false }
 }
 
+// ===== plan approval + permissionMode 继承（对齐 Claude Code plan approval 自动批准） =====
+
+/** 挂起的 plan 审批回调（requestId → resolve；teammate 侧注册，收到响应后触发） */
+const pendingPlanApprovalCallbacks = new Map<string, (result: PlanApprovalResult) => void>()
+
+/** plan 审批结果（approved + 继承的 leader permissionMode） */
+export interface PlanApprovalResult {
+  approved: boolean
+  permissionMode?: string
+}
+
+/** 注册 plan 审批回调（requestId 关联） */
+export function registerPlanApprovalCallback(requestId: string, resolve: (result: PlanApprovalResult) => void): void {
+  pendingPlanApprovalCallbacks.set(requestId, resolve)
+}
+
+/** 是否还有挂起的 plan 审批回调 */
+export function hasPendingPlanApproval(requestId?: string): boolean {
+  return requestId ? pendingPlanApprovalCallbacks.has(requestId) : pendingPlanApprovalCallbacks.size > 0
+}
+
+/** 通过 mailbox 向 leader 发送 plan 审批请求 */
+export async function sendPlanApprovalRequestViaMailbox(
+  mailbox: TeammateMailbox,
+  team: string,
+  recipientName: string,
+  req: { from: string; plan?: string; permissionMode?: string; requestId?: string },
+): Promise<void> {
+  await mailbox.writeToMailbox(team, recipientName, createPlanApprovalRequest({
+    from: req.from,
+    to: recipientName,
+    plan: req.plan,
+    permissionMode: req.permissionMode,
+    requestId: req.requestId,
+  }))
+}
+
+/** teammate 侧：请求 plan 审批（写请求到 leader inbox + 挂起回调等待响应配对） */
+export async function requestPlanApproval(opts: {
+  from: string
+  to: string
+  plan?: string
+  permissionMode?: string
+  mailbox: TeammateMailbox
+  team: string
+}): Promise<PlanApprovalResult> {
+  const requestId = generateRequestId('plan')
+  const result = new Promise<PlanApprovalResult>((resolve) => {
+    registerPlanApprovalCallback(requestId, resolve)
+  })
+  await sendPlanApprovalRequestViaMailbox(opts.mailbox, opts.team, opts.to, {
+    from: opts.from,
+    plan: opts.plan,
+    permissionMode: opts.permissionMode,
+    requestId,
+  })
+  return result
+}
+
+/** teammate 侧：处理 inbox 中的 plan_approval_response（命中回调 resolve + 标记已读） */
+export async function processMailboxPlanApprovalResponse(
+  mailbox: TeammateMailbox,
+  team: string,
+  agentName: string,
+): Promise<boolean> {
+  const unread = await mailbox.readUnreadMessages(team, agentName)
+  let handled = false
+  for (const msg of unread) {
+    if (msg.type !== 'plan_approval_response') continue
+    const requestId = msg.replyTo
+    if (requestId && pendingPlanApprovalCallbacks.has(requestId)) {
+      const resolve = pendingPlanApprovalCallbacks.get(requestId)!
+      pendingPlanApprovalCallbacks.delete(requestId)
+      resolve({
+        approved: msg.data?.approved === true,
+        permissionMode: msg.permissionMode ?? (msg.data?.permissionMode as string | undefined),
+      })
+      handled = true
+    }
+    await mailbox.markMessageAsReadByRef(team, agentName, { from: msg.from, timestamp: msg.timestamp })
+  }
+  return handled
+}
+
+/**
+ * leader 侧：自动批准 plan_approval_request 并回写 plan_approval_response
+ * （含 leader permissionMode 继承）；返回处理的请求数。
+ */
+export async function processMailboxPlanApprovalRequests(
+  mailbox: TeammateMailbox,
+  team: string,
+  leaderName: string,
+  opts: { permissionMode?: string } = {},
+): Promise<number> {
+  const unread = await mailbox.readUnreadMessages(team, leaderName)
+  let handled = 0
+  for (const msg of unread) {
+    if (msg.type !== 'plan_approval_request') continue
+    await mailbox.writeToMailbox(team, msg.from, createPlanApprovalResponse({
+      from: leaderName,
+      to: msg.from,
+      requestId: msg.requestId ?? msg.replyTo ?? '',
+      approved: true,
+      permissionMode: opts.permissionMode,
+    }))
+    await mailbox.markMessageAsReadByRef(team, leaderName, { from: msg.from, timestamp: msg.timestamp })
+    handled++
+  }
+  return handled
+}
+
 // ===== Inbox Poller =====
 
 export interface InboxPollerOptions {
@@ -996,8 +1172,9 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
   try {
     if (state.status === 'shutdown') return result
 
-    // 1) 先处理挂起的权限响应（mailbox 双轨 fallback 的回调配对）
+    // 1) 先处理挂起的权限响应 / plan 审批响应（mailbox 双轨 fallback 的回调配对）
     await processMailboxPermissionResponse(deps.mailbox, deps.team, deps.name)
+    await processMailboxPlanApprovalResponse(deps.mailbox, deps.team, deps.name)
 
     // 2) mailbox 消息（优先级：shutdown 最高 → lead > peer，同级 FIFO）
     const messages = sortMessagesByPriority(await deps.mailbox.readUnreadMessages(deps.team, deps.name))
