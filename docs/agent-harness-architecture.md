@@ -582,6 +582,7 @@ const AnthropicProviderPlugin: AgentPlugin = {
 | Coordinator Plugin | Coordinator Prompt + worker 通知 | P3 |
 | Swarm Plugin | Team + Mailbox + Task List + 权限桥接 | P3 |
 | Multi-Backend | in-process / tmux / iTerm2 teammate | P3 |
+| TUI 形态 | `harness --tui` alt-screen 全屏交互（自研 ANSI：日志滚动 + 输入行 + 快捷键） | P3 ✅（08-26） |
 
 ---
 

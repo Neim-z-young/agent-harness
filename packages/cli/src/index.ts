@@ -16,6 +16,7 @@
  *   --session <id>            复用/新建指定 ID 的会话（如 resume）
  *   --data-dir <dir>          持久化目录（默认 ~/.harness）
  *   --permission <mode>       allow-all / ask（默认 ask）
+ *   --tui                     以 TUI（alt-screen 全屏）模式启动 REPL
  *   --verbose                 输出调试信息
  *
  * 可执行入口（shebang 指向 bun）。模块对外导出 CLIApp 类，便于测试。
@@ -49,6 +50,7 @@ import {
 } from '@harness/swarm'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
+import { startTuiRepl } from './tui'
 import type { Message, Session } from '@harness/session'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -79,6 +81,8 @@ export interface CliArgs {
   dataDir?: string
   permissionMode?: 'allow-all' | 'ask'
   verbose?: boolean
+  /** 以 TUI（alt-screen 全屏）模式启动 REPL */
+  tui?: boolean
   showHelp?: boolean
 }
 
@@ -114,6 +118,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     const a = args.shift()!
     if (a === '-h' || a === '--help') { out.showHelp = true; continue }
     if (a === '-v' || a === '--verbose') { out.verbose = true; continue }
+    if (a === '--tui') { out.tui = true; continue }
     const [k, v] = a.startsWith('--')
       ? a.slice(2).split('=', 2) as [string, string | undefined]
       : (() => {
@@ -613,42 +618,42 @@ export function attachAutoContinue(harness: Harness, emitLine: (line: string) =>
 /** REPL 自动续轮标记消息（不作为用户输入展示/回显） */
 const AUTO_CONTINUE_LINE = '<continue/>'
 
-/**
- * 启动交互式 REPL。
- *
- * - 用户输入文本 → HarnessApp.send()
- * - 显示 assistant 文本 + 每个 tool call（执行前→执行后）
- * - /exit、/quit 退出；/sessions 列出持久化会话；/new 清空当前会话；/save 手动保存
- * - 支持 scriptedStdin（测试用，或流水线一次性脚本）
- * - 自动挂载后台任务面板：subagent 后台任务开始/完成/失败时实时打印（P1-4）
- *
- * @returns 退出原因：'exit' / 'eof' / 'scripted-done'
- */
-export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 'scripted-done'> {
-  // P1-4：挂载后台任务面板（事件驱动自动展示，无需 /tasks）
-  const detachPanel = attachBackgroundTaskPanel({
-    harness: options.harness,
-    stdout: options.stdout,
-  })
-  try {
-    return await startReplCore(options)
-  } finally {
-    detachPanel()
-  }
+// ========================================================================
+// 5.2 processLine 工厂（REPL / TUI 共用会话处理内核）
+// ========================================================================
+
+export interface ProcessLineOptions {
+  app: HarnessApp
+  harness: Harness
+  /** 当前会话（可变：/new 会换绑新会话，工厂内部维护 current 指针） */
+  session: Session
+  /** 输出函数 */
+  out: (s: string) => void
+  /** 收到普通用户输入时回调（REPL 回显前触发） */
+  onLine?: (line: string) => Promise<void> | void
+  /** /new 换绑新会话后回调（让调用方同步自身会话引用） */
+  setSession?: (session: Session) => void
 }
 
-/** startRepl 内部实现（由 startRepl wrapper 挂载任务面板后调用） */
-async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'scripted-done'> {
-  const { app, harness, session } = options
-  const out = (s: string) => (options.stdout ?? process.stdout).write(s)
+export type ProcessLineResult = 'continue' | 'exit'
 
-  out(`Harness CLI (session=${session.id}, agent=${session.agentId ?? 'default'})\n`)
-  out(`输入问题开始对话；输入 /help 查看特殊命令；/exit 退出。\n\n`)
+/**
+ * 创建「处理一行输入」的函数（REPL 与 TUI 共用同一套会话处理逻辑）。
+ *
+ * - 处理 `/` 特殊命令（/help /exit /sessions /save /new /switch /compact
+ *   /search /export /revert + 插件 cli.commands / cli.command hook）
+ * - 普通消息经 app.sendStream 流式渲染（reasoning_delta / text_delta /
+ *   tool_call_start / tool_call_result / done 事件）
+ * - AUTO_CONTINUE_LINE（<continue/>）为系统注入的伪输入，不回显
+ *
+ * @returns (raw) => Promise<'continue' | 'exit'>
+ */
+export function createProcessLine(options: ProcessLineOptions): (raw: string) => Promise<ProcessLineResult> {
+  const { app, harness } = options
+  const out = options.out
+  let current = options.session
 
-  let idx = 0
-  const scripted = options.scriptedStdin ? [...options.scriptedStdin] : null
-
-  const processLine = async (raw: string): Promise<'continue' | 'exit'> => {
+  return async (raw) => {
     const line = raw.trim()
     if (!line) return 'continue'
 
@@ -693,17 +698,18 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
           return 'continue'
         }
         case '/save': {
-          const s = (await harness.session.get(session.id))!
+          const s = (await harness.session.get(current.id))!
           await app.sessionStore.save(s)
-          out(`已保存会话 ${session.id}\n`)
+          out(`已保存会话 ${current.id}\n`)
           return 'continue'
         }
         case '/new': {
-          const cur = (await harness.session.get(session.id))!
+          const cur = (await harness.session.get(current.id))!
           await app.sessionStore.save(cur)
-          const next = await harness.session.create({ agentId: session.agentId })
-          // 更新 REPL 绑定：重新赋值
-          ;(options as any).session = next
+          const next = await harness.session.create({ agentId: current.agentId })
+          // 换绑当前会话：工厂内部指针 + 通知调用方
+          current = next
+          options.setSession?.(next)
           out(`已新建会话 ${next.id}\n`)
           return 'continue'
         }
@@ -715,13 +721,13 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
           }
           const exists = harness.agent.get(arg)
           if (!exists) { out(`Agent "${arg}" 未注册。\n`); return 'continue' }
-          const cur = (await harness.session.get(session.id))!
+          const cur = (await harness.session.get(current.id))!
           cur.agentId = arg
           out(`已切换到 Agent ${arg}（影响下次 send）\n`)
           return 'continue'
         }
         case '/compact': {
-          const curSessionId = (options as any).session.id as string
+          const curSessionId = current.id
           if (arg === 'auto' || arg === 'ifneeded') {
             const did = await harness.session.compactIfNeeded(curSessionId)
             const info = await harness.session.getCompactionInfo(curSessionId)
@@ -752,7 +758,7 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
           return 'continue'
         }
         case '/export': {
-          const exportSid = arg?.trim() || (options as any).session.id
+          const exportSid = arg?.trim() || current.id
           const md = await harness.session.exportMarkdown(exportSid)
           if (!md) { out(`会话 ${exportSid} 不存在或为空\n`); return 'continue' }
           out(md)
@@ -760,18 +766,18 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
           return 'continue'
         }
         case '/revert': {
-          if (!options.app.snapshotService) {
+          if (!app.snapshotService) {
             out('快照未启用：构造 HarnessApp 时传 snapshot: true 后可用 /revert。\n')
             return 'continue'
           }
           const revert = createSessionRevert({
             session: harness.session,
-            snapshot: options.app.snapshotService,
+            snapshot: app.snapshotService,
             bus: harness.bus,
           })
           const parts = line.split(/\s+/).filter(Boolean)
           const sub = parts[1] ?? 'help'
-          const sid = session.id
+          const sid = current.id
           try {
             switch (sub) {
               case 'help': {
@@ -828,7 +834,7 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
             command: cmd.slice(1),
             arg: (arg ?? '').trim(),
             out,
-            sessionId: (options as any).session.id,
+            sessionId: current.id,
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)
@@ -851,7 +857,7 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
     const started = Date.now()
     let assistant: Message | undefined
     try {
-      const curSessionId = (options as any).session.id
+      const curSessionId = current.id
       const gen = app.sendStream(curSessionId, line)
       let inReasoning = false
       let inText = false
@@ -889,10 +895,56 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
       return 'continue'
     }
     const duration = Date.now() - started
-    out(`⏱️  ${duration}ms | agent=${assistant?.agentId ?? session.agentId ?? '?'}` +
+    out(`⏱️  ${duration}ms | agent=${assistant?.agentId ?? current.agentId ?? '?'}` +
       (assistant?.meta?.model ? ` | model=${assistant.meta.model}` : '') + '\n\n')
     return 'continue'
   }
+}
+
+/**
+ * 启动交互式 REPL。
+ *
+ * - 用户输入文本 → HarnessApp.send()
+ * - 显示 assistant 文本 + 每个 tool call（执行前→执行后）
+ * - /exit、/quit 退出；/sessions 列出持久化会话；/new 清空当前会话；/save 手动保存
+ * - 支持 scriptedStdin（测试用，或流水线一次性脚本）
+ * - 自动挂载后台任务面板：subagent 后台任务开始/完成/失败时实时打印（P1-4）
+ *
+ * @returns 退出原因：'exit' / 'eof' / 'scripted-done'
+ */
+export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 'scripted-done'> {
+  // P1-4：挂载后台任务面板（事件驱动自动展示，无需 /tasks）
+  const detachPanel = attachBackgroundTaskPanel({
+    harness: options.harness,
+    stdout: options.stdout,
+  })
+  try {
+    return await startReplCore(options)
+  } finally {
+    detachPanel()
+  }
+}
+
+/** startRepl 内部实现（由 startRepl wrapper 挂载任务面板后调用） */
+async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'scripted-done'> {
+  const { app, harness, session } = options
+  const out = (s: string) => (options.stdout ?? process.stdout).write(s)
+
+  out(`Harness CLI (session=${session.id}, agent=${session.agentId ?? 'default'})\n`)
+  out(`输入问题开始对话；输入 /help 查看特殊命令；/exit 退出。\n\n`)
+
+  let idx = 0
+  const scripted = options.scriptedStdin ? [...options.scriptedStdin] : null
+
+  // 会话处理内核（与 TUI 共用）：流式渲染、/ 命令、插件 cli.command hook
+  const processLine = createProcessLine({
+    app,
+    harness,
+    session,
+    out,
+    onLine: options.onLine,
+    setSession: (s) => { (options as any).session = s },
+  })
 
   if (scripted) {
     for (const line of scripted) {
@@ -951,6 +1003,7 @@ teammate 选项:
   -d, --data-dir <dir>       持久化目录（默认 ~/.harness）
       --permission <mode>    allow-all / ask（默认 ask）
   -v, --verbose              输出调试信息
+      --tui                  以 TUI（alt-screen 全屏）模式启动 REPL
 `
 
 // ========================================================================
@@ -1067,7 +1120,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       return 0
     }
 
-    // repl / resume / start → REPL
+    // repl / resume / start → REPL（--tui 时进入 alt-screen 全屏 TUI）
     {
       const did = await harness.session.compactIfNeeded(session.id)
       if (did) {
@@ -1075,7 +1128,11 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
         write(`[会话] 自动压缩：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)
       }
     }
-    await startRepl({ app, harness, session })
+    if (args.tui) {
+      await startTuiRepl({ app, harness, session })
+    } else {
+      await startRepl({ app, harness, session })
+    }
     return 0
   } finally {
     try { await app.shutdown() } catch {}

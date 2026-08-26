@@ -1,5 +1,33 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 13）：TUI 形态落地——自研 ANSI 渲染（预留迁移）
+
+### 方案决策
+
+- **自研 ANSI TUI**（放弃现成库：ink 依赖 react-reconciler 与零依赖风格冲突、blessed 已停维护带 CVE、clack 满足不了多面板需求）
+- **渲染层严格隔离**：TUI 与 REPL 共用同一套会话处理内核（`createProcessLine`），渲染/输入层独立成模块，未来若需求膨胀（鼠标、富布局）可低成本迁移 ink
+
+### 实现（[packages/cli/src](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src)）
+
+1. **t1 重构**：`startReplCore` 的 `processLine` 提取为可复用工厂 `createProcessLine({ app, harness, session, out, onLine?, setSession? })`（[index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）——流式事件渲染、`/` 命令、插件 cli.command hook、`AUTO_CONTINUE_LINE` 全部共用；REPL 与 TUI 同一内核
+2. **t2 新建 `tui.ts`**：
+   - `KeyDecoder`：raw-mode 键盘字节流 → KeyEvent（箭头/Enter/Backspace/Ctrl-C/Tab/Home/End/Delete；跨块转义序列缓冲）
+   - `TuiScreen`：alt-screen 全屏渲染（状态栏 + 日志区自动滚动 + 底部输入行 + 光标定位 CSI）；`append` 流式拼接当前行
+   - `startTuiRepl`：非阻塞输入循环，Enter 提交 → createProcessLine 处理 → 输出回流日志区；`drainQueue` 共享 promise 防并发；退出前 flushRender 保证退出序列收尾
+3. **t3 CLI 入口**：`harness --tui` 进入 TUI 模式（parseCliArgs 新增 tui 标志 + main 分支 + HELP_TEXT）
+4. **t4 测试**：`tui.test.ts` 21 用例（KeyDecoder 10 / TuiScreen 5 / startTuiRepl 4 / --tui 2），cli 28 用例保持全绿
+
+### 修复
+
+- KeyDecoder `\x1b[n~`（Delete）解码：`fin==='~'` 分支不可达，统一到未知 CSI 路径解析
+- startTuiRepl 脚本模式并发 drain：`void drainQueue()` 与 `await drainQueue()` 竞争导致提前返回丢流式输出 → 共享进行中 promise
+- TuiScreen.append 把流式 token 当独立行 → 改为追加当前行（换行才分行）
+
+### 状态
+
+- cli 49 用例全绿（+21），全仓 26 包 typecheck 通过
+- 边界：本次不做鼠标交互、富文本布局（预留迁移口的边界条件）
+
 ## 2026-08-26（续 12）：Swarm 待办收尾——tmux/iTerm2 进程后端 + send_message 路由统一
 
 对照架构 §9.4「Swarm 后续待办」，实现最后 2 项（8、10），Swarm 待办 10 项全部完成：
@@ -899,5 +927,5 @@ CLI 斜杠命令：
 | **P3** | Subagent run_in_background | 子 Agent 后台异步执行，父 Agent 不阻塞等待，通过 Bus 事件或轮询获取结果 | 待做 |
 | **P3** | Subagent git worktree 隔离 | 子 Agent 在独立 git worktree 中执行，避免与父 Agent 工作区冲突 | 待做 |
 | **P3** | Swarm teammate | Team + Mailbox + Task List + 权限桥接（多 Agent 协作） | 待做 |
-| **P3** | TUI 形态 | 基于终端 UI 的富交互（类似 Claude Code TUI） | 待做 |
+| **P3** | ~~TUI 形态~~ | ~~基于终端 UI 的富交互（类似 Claude Code TUI）~~ ✅ 完成（08-26，自研 ANSI alt-screen：`--tui` + 日志滚动 + 输入行 + 21 测试） | ✅ |
 | **P3** | OAuth2 PKCE | 完整 OAuth2 授权码流程（回调服务器 + token 刷新），用于对接 OAuth2-protected MCP Server | 待做 |
