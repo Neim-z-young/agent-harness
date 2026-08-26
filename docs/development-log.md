@@ -1,5 +1,29 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 14）：TUI 输入修复——真实终端无法输入字符
+
+### 现象
+
+`harness repl --tui` 启动后界面正常渲染，但键盘输入无反应（字符不显示、回车不提交）。
+
+### 根因（[tui.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.ts)）
+
+两个叠加 bug：
+
+1. **drainQueue busy 标志竞态（致命）**：`draining = (async () => {...})()` 中，async IIFE 同步完成时 `finally { draining = null }` 先执行，随后赋值把已 resolve 的 promise 写回 `draining`。真实终端下字符块与回车块是两次独立 data 事件——字符块的 drainQueue 同步完成后 `draining` 仍非空，回车块调用 drainQueue 被 `if (draining) return` 拦截，**提交的行永不处理**。修复：改用 promise 链（`queueTail = queueTail.then(...)`）串行处理，天然不丢行。
+2. **按键不触发重绘**：handleKeys 仅在 Enter 提交时 scheduleRender，char/退格/方向键修改 screen.input 后屏幕不刷新，用户看不到输入的字符。修复：每次按键后统一 scheduleRender。
+
+### 排查过程
+
+- expect（pty）复现不稳定（bun 冷启动慢 + `~/.harness` 写入 EPERM 干扰）→ 用 python `pty.fork()` 复现真实终端输入
+- 逐级 stderr 调试定位：`TUI-DATA`（data 事件收到 hi ✓）→ `TUI-KEY`（char 插入 screen.input ✓）→ `TUI-DRAINQ-CALL`（enter 时 `draining=true` 拦截 ✗）
+
+### 验证
+
+- python pty 全流程：`🧑 hi` 回显 → `🤖 (Mock Provider) 你好，我是测试助手。` 流式渲染 → 退出序列收尾
+- 新增回归测试「输入与回车分块到达（真实模式时序）也能提交处理」（修复前必失败）
+- cli 50 用例全绿（+1），全仓 26 包 typecheck 通过
+
 ## 2026-08-26（续 13）：TUI 形态落地——自研 ANSI 渲染（预留迁移）
 
 ### 方案决策

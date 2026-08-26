@@ -364,27 +364,22 @@ export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit
     resolveDone(reason)
   }
 
-  // 输入队列：用户 Enter 提交 + 自动续轮注入，串行处理（防并发写冲突）。
-  // draining 保存进行中的 promise，重复调用共享同一轮，脚本模式 await 时
-  // 能真正等到当前行处理完成（避免提前返回丢流式输出）。
+  // 输入队列：用户 Enter 提交 + 自动续轮注入。
+  // 用 promise 链保证串行处理且不丢行——不能用"busy 标志"：async 函数同步
+  // 完成时标志会被赋回的 resolved promise 覆盖，导致后续提交的行永不处理。
   const pendingLines: string[] = []
-  let draining: Promise<void> | null = null
+  let queueTail: Promise<void> = Promise.resolve()
   function drainQueue(): Promise<void> {
-    if (exitSignal) return Promise.resolve()
-    if (draining) return draining
-    draining = (async () => {
-      try {
-        while (pendingLines.length > 0 && !exitSignal) {
-          const line = pendingLines.shift()!
-          const r = await processLine(line)
-          if (r === 'exit') { finish('exit'); return }
-          scheduleRender()
-        }
-      } finally {
-        draining = null
+    queueTail = queueTail.then(async () => {
+      if (exitSignal) return
+      while (pendingLines.length > 0 && !exitSignal) {
+        const line = pendingLines.shift()!
+        const r = await processLine(line)
+        if (r === 'exit') { finish('exit'); return }
+        scheduleRender()
       }
-    })()
-    return draining
+    })
+    return queueTail
   }
 
   function handleKeys(keys: KeyEvent[]): void {
@@ -392,10 +387,9 @@ export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit
       if (exitSignal) return
       if (ev.type === 'ctrl-c') { finish('exit'); return }
       const line = screen.handleKey(ev)
-      if (line !== null) {
-        if (line.trim()) pendingLines.push(line)
-        scheduleRender()
-      }
+      if (line !== null && line.trim()) pendingLines.push(line)
+      // 任何改变屏幕状态的按键（输入/退格/光标移动）都触发重绘
+      scheduleRender()
     }
     if (!exitSignal) void drainQueue()
   }

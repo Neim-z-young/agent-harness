@@ -255,6 +255,25 @@ describe('startTuiRepl 集成（mock provider）', () => {
     expect(out).toContain('收到')
     await app.shutdown()
   })
+
+  it('输入与回车分块到达（真实模式时序）也能提交处理', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = makeApp(stdout)
+    const { harness, session } = await app.boot()
+    // 复现真实终端：字符块与回车块是两次独立 data 事件。
+    // 修复前 drainQueue 的 busy 标志在字符块同步完成后仍非空，回车块提交的行永不处理。
+    const r = await startTuiRepl({
+      app, harness, session, stdout,
+      width: 40, height: 10,
+      scriptedKeys: ['hi', '\r'],
+    })
+    expect(r).toBe('scripted-done')
+    const out = chunks.join('')
+    expect(out).toContain('🧑  hi')
+    expect(out).toContain('你好，我是 TUI 助手。')
+    await app.shutdown()
+  })
 })
 
 // ------------------------------------------------------------------------
