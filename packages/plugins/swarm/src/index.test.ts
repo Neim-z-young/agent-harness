@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
   attachInboxPoller,
+  createIdleNotification,
   createPermissionRequest,
   createPermissionResponse,
   createSendTeammateMessageTool,
@@ -39,6 +40,7 @@ import {
   requestSwarmPermission,
   runTeammateTick,
   sanitizeName,
+  sortMessagesByPriority,
   spawnInProcessTeammate,
   startTeammateLoop,
   TaskListPlane,
@@ -46,6 +48,7 @@ import {
   TeamManager,
   TeammateRegistry,
   teammateRegistry,
+  tryClaimNextTask,
   unregisterLeaderConfirmQueue,
   withTeammateIdentity,
   withLock,
@@ -251,7 +254,52 @@ describe('TaskListPlane', () => {
   it('任务不存在抛错', async () => {
     const dir = await makeDir('swarm-task-')
     const plane = new TaskListPlane(dir)
-    await expect(plane.claim('alpha', 'nope', 'bob')).rejects.toThrow(/not found/)
+    await expect(plane.claim('alpha', 'ghost', 'bob')).rejects.toThrow('Task not found')
+  })
+
+  it('blockedBy 依赖：未完成不可认领，完成后可认领', async () => {
+    const dir = await makeDir('swarm-task-')
+    const plane = new TaskListPlane(dir)
+    const dep = await plane.create('alpha', { title: '调研' })
+    const main = await plane.create('alpha', { title: '写报告', blockedBy: [dep.id] })
+    // 依赖未完成：不可认领
+    await expect(plane.claim('alpha', main.id, 'bob')).rejects.toThrow('blocked')
+    // 完成依赖后：可认领（依赖先 claim → completed）
+    await plane.claim('alpha', dep.id, 'alice')
+    await plane.update('alpha', dep.id, { status: 'completed' })
+    const claimed = await plane.claim('alpha', main.id, 'bob')
+    expect(claimed.status).toBe('in_progress')
+    expect(claimed.blockedBy).toEqual([dep.id])
+  })
+
+  it('blockedBy 指向不存在的任务 → 始终不可认领', async () => {
+    const dir = await makeDir('swarm-task-')
+    const plane = new TaskListPlane(dir)
+    const t = await plane.create('alpha', { title: 'T', blockedBy: ['ghost'] })
+    await expect(plane.claim('alpha', t.id, 'bob')).rejects.toThrow('blocked')
+  })
+
+  it('tryClaimNextTask 跳过依赖未解决的任务，认领下一个可认领任务', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness } = makeMockHarness()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    const dep = await plane.create('alpha', { title: '调研' })
+    const blocked = await plane.create('alpha', { title: '写报告', blockedBy: [dep.id] })
+    const free = await plane.create('alpha', { title: '独立任务' })
+    await plane.claim('alpha', dep.id, 'alice') // 依赖已被占用（in_progress）
+
+    // 第一个 available 是 blocked（依赖未完成）→ 跳过，认领 free
+    const claimed = await tryClaimNextTask(deps)
+    expect(claimed!.id).toBe(free.id)
+
+    // 依赖与 free 都完成后，blocked 可被认领
+    await plane.update('alpha', dep.id, { status: 'completed' })
+    await plane.update('alpha', free.id, { status: 'completed' })
+    const next = await tryClaimNextTask(deps)
+    expect(next!.id).toBe(blocked.id)
   })
 })
 
@@ -342,6 +390,32 @@ describe('mailbox 协作协议', () => {
     expect(no.decision).toBe('rejected')
     expect(no.text).toContain('还有任务')
   })
+
+  it('sortMessagesByPriority：shutdown 最高 → lead > peer，同级 FIFO', () => {
+    const base = { text: '', timestamp: 't', type: 'message' as const }
+    const peer1 = { ...base, from: 'alice', to: 'bob' }
+    const peer2 = { ...base, from: 'carol', to: 'bob' }
+    const lead = { ...base, from: 'lead', to: 'bob' }
+    const shutdown = { ...base, from: 'lead', to: 'bob', type: 'shutdown_request' as const }
+
+    const sorted = sortMessagesByPriority([peer1, lead, shutdown, peer2])
+    expect(sorted[0]!.type).toBe('shutdown_request')
+    expect(sorted[1]!.from).toBe('lead')
+    expect(sorted[2]!.from).toBe('alice')
+    expect(sorted[3]!.from).toBe('carol')
+    // 同级保持 FIFO
+    expect(sortMessagesByPriority([peer2, peer1]).map((m) => m.from)).toEqual(['carol', 'alice'])
+  })
+
+  it('createIdleNotification 生成 idle_notification（默认 available）', () => {
+    const n = createIdleNotification({ from: 'bob', to: 'lead', idleReason: 'failed', summary: '处理 1 条消息' })
+    expect(n.type).toBe('idle_notification')
+    expect(n.idleReason).toBe('failed')
+    expect(n.text).toContain('failed')
+    expect(n.summary).toBe('处理 1 条消息')
+    const d = createIdleNotification({ from: 'bob', to: 'lead' })
+    expect(d.idleReason).toBe('available')
+  })
 })
 
 // ===== 权限 mailbox 双轨 fallback =====
@@ -418,6 +492,24 @@ describe('InboxPoller', () => {
     await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: 'auto', timestamp: 't1', type: 'message' })
     await new Promise((r) => setTimeout(r, 80))
     expect(received).toContain('auto')
+    poller.stop()
+  })
+
+  it('onMessage 失败 → 不标记已读（下轮重试，防丢消息）', async () => {
+    const dir = await makeDir('swarm-poll-')
+    const mb = new TeammateMailbox(dir)
+    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: 'hi', timestamp: 't1', type: 'message' })
+    let attempts = 0
+    const poller = attachInboxPoller({
+      mailbox: mb, team: 'alpha', agent: 'bob', intervalMs: 0,
+      onMessage: async () => { attempts++; if (attempts === 1) throw new Error('boom') },
+    })
+    await poller.pollOnce()
+    expect(attempts).toBe(1)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(1) // 失败消息保持未读
+    await poller.pollOnce()
+    expect(attempts).toBe(2)
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0) // 成功后标记已读
     poller.stop()
   })
 })
@@ -580,6 +672,81 @@ describe('runTeammateTick（teammate 执行循环）', () => {
     expect(state.status).toBe('running')
     expect(state.abortController.signal.aborted).toBe(false)
     expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+  })
+
+  it('消息优先级：shutdown_request 先于 peer 消息处理', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness, queries } = makeMockHarness()
+    const state = makeTeammateState()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    await mb.writeToMailbox('alpha', 'bob', { from: 'alice', text: 'peer 消息', timestamp: 't1', type: 'message' })
+    await mb.writeToMailbox('alpha', 'bob', createShutdownRequest({ from: 'lead', to: 'bob', reason: '收工' }))
+    const result = await runTeammateTick(state, deps)
+    // shutdown 决策先执行（queries[0] 含 approve_shutdown 上下文），再处理 peer 消息
+    expect(queries).toHaveLength(2)
+    expect(queries[0]!.message).toContain('approve_shutdown')
+    expect(queries[1]!.message).toBe('peer 消息')
+    expect(result.handledMessages).toBe(2)
+  })
+
+  it('空闲通知：无消息无任务 → leader 收到 idle_notification(available)', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const { harness } = makeMockHarness()
+    const state = makeTeammateState()
+    const deps = { harness, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    const result = await runTeammateTick(state, deps)
+    expect(result.handledMessages).toBe(0)
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    expect(leaderInbox[0]!.type).toBe('idle_notification')
+    expect(leaderInbox[0]!.idleReason).toBe('available')
+  })
+
+  it('空闲通知：任务失败 → idle_notification(failed)', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const agent = { query: async () => { throw new Error('boom') } }
+    const session = { create: async () => ({ id: 's' }) }
+    const state = makeTeammateState()
+    const deps = { harness: { agent, session } as any, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    await plane.create('alpha', { title: 'T' })
+    const result = await runTeammateTick(state, deps)
+    expect(result.error).toContain('boom')
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    const idle = leaderInbox.find((m) => m.type === 'idle_notification')
+    expect(idle?.idleReason).toBe('failed')
+  })
+
+  it('中断：消息处理中状态置 shutdown → idle_notification(interrupted) 且不再认领任务', async () => {
+    const dir = await makeDir('swarm-tick-')
+    const mb = new TeammateMailbox(dir)
+    const plane = new TaskListPlane(dir)
+    const state = makeTeammateState()
+    // 模型在消息处理中触发了 approve_shutdown（状态置 shutdown）
+    const agent = {
+      query: async () => {
+        state.status = 'shutdown'
+        return { id: 'm', role: 'assistant', parts: [{ type: 'text', text: 'ok' }], createdAt: Date.now() }
+      },
+    }
+    const session = { create: async () => ({ id: 's' }) }
+    const deps = { harness: { agent, session } as any, mailbox: mb, taskPlane: plane, team: 'alpha', name: 'bob' }
+
+    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: 'hi', timestamp: 't1', type: 'message' })
+    await plane.create('alpha', { title: '不该被认领' })
+    const result = await runTeammateTick(state, deps)
+
+    expect(result.claimedTask).toBeUndefined() // 中断后不认领任务
+    const leaderInbox = await mb.readMailbox('alpha', 'lead')
+    const idle = leaderInbox.find((m) => m.type === 'idle_notification')
+    expect(idle?.idleReason).toBe('interrupted')
   })
 })
 

@@ -292,6 +292,19 @@ export function isStructuredProtocolMessage(msg: MailboxMessage): boolean {
   return STRUCTURED_PROTOCOL_TYPES.has(msg.type)
 }
 
+/**
+ * 消息优先级排序（对齐 Claude Code useInboxPoller 的 inbox priority）：
+ * shutdown 最高（防 peer 消息饿死）→ lead 消息 > peer 消息；同级保持写入顺序（FIFO，sort 稳定）。
+ */
+export function sortMessagesByPriority(messages: MailboxMessage[]): MailboxMessage[] {
+  const priority = (m: MailboxMessage): number => {
+    if (m.type === 'shutdown_request' || m.type === 'shutdown_approved' || m.type === 'shutdown_rejected') return 0
+    if (m.from === TEAM_LEAD_NAME) return 1
+    return 2
+  }
+  return [...messages].sort((a, b) => priority(a) - priority(b))
+}
+
 let protocolSeq = 0
 
 /** 生成请求 ID（权限/关停/plan 配对用；对齐 generateRequestId） */
@@ -378,6 +391,25 @@ export function createShutdownDecision(opts: {
     type: opts.decision === 'approved' ? 'shutdown_approved' : 'shutdown_rejected',
     replyTo: opts.requestId,
     decision: opts.decision,
+  }
+}
+
+/** 构造空闲通知消息（teammate → leader；每轮结束上报可用/中断/失败 + 处理摘要） */
+export function createIdleNotification(opts: {
+  from: string
+  to: string
+  idleReason?: 'available' | 'interrupted' | 'failed'
+  summary?: string
+}): Omit<MailboxMessage, 'to'> & { to: string } {
+  const idleReason = opts.idleReason ?? 'available'
+  return {
+    from: opts.from,
+    to: opts.to,
+    text: `[idle] ${idleReason}`,
+    summary: opts.summary,
+    timestamp: new Date().toISOString(),
+    type: 'idle_notification',
+    idleReason,
   }
 }
 
@@ -468,6 +500,8 @@ export interface SwarmTask {
   status: SwarmTaskStatus
   /** 认领成员名 */
   claimedBy?: string
+  /** 依赖任务 id 列表：全部 completed 后才可认领 */
+  blockedBy?: string[]
   createdAt: number
   updatedAt: number
   result?: string
@@ -507,11 +541,12 @@ export class TaskListPlane {
   }
 
   /** 创建任务（available） */
-  async create(team: string, input: { title: string; description?: string }): Promise<SwarmTask> {
+  async create(team: string, input: { title: string; description?: string; blockedBy?: string[] }): Promise<SwarmTask> {
     const task: SwarmTask = {
       id: genId('task'),
       title: input.title,
       description: input.description,
+      blockedBy: input.blockedBy && input.blockedBy.length > 0 ? input.blockedBy : undefined,
       status: 'available',
       createdAt: Date.now(),
       updatedAt: Date.now(),
@@ -535,7 +570,7 @@ export class TaskListPlane {
     return (await this.read(team)).find((t) => t.id === id)
   }
 
-  /** 认领任务：available → in_progress（已被认领/非 available 抛错） */
+  /** 认领任务：available → in_progress（已被认领/非 available/依赖未解决抛错；锁内 busy-check 防 TOCTOU） */
   async claim(team: string, id: string, agentName: string): Promise<SwarmTask> {
     let claimed: SwarmTask | undefined
     await withLock(this.lockPath(team), async () => {
@@ -544,6 +579,15 @@ export class TaskListPlane {
       if (!task) throw new SwarmError('task', `Task not found: ${id}`)
       if (task.status !== 'available') {
         throw new SwarmError('task', `Task ${id} is not claimable (status=${task.status}, claimedBy=${task.claimedBy ?? '-'})`)
+      }
+      if (task.blockedBy && task.blockedBy.length > 0) {
+        const unresolved = task.blockedBy.filter((bid) => {
+          const blocker = tasks.find((t) => t.id === bid)
+          return !blocker || blocker.status !== 'completed'
+        })
+        if (unresolved.length > 0) {
+          throw new SwarmError('task', `Task ${id} is blocked by unresolved tasks: ${unresolved.join(', ')}`)
+        }
       }
       task.status = 'in_progress'
       task.claimedBy = agentName
@@ -758,15 +802,17 @@ export function attachInboxPoller(options: InboxPollerOptions): InboxPoller {
   let unread = 0
 
   async function pollOnce(): Promise<void> {
-    const messages = await options.mailbox.readUnreadMessages(options.team, options.agent)
+    // 优先级：shutdown 最高 → lead > peer（同级 FIFO）
+    const messages = sortMessagesByPriority(await options.mailbox.readUnreadMessages(options.team, options.agent))
     if (messages.length === 0) return
     for (const msg of messages) {
       try {
         await options.onMessage(msg)
+        // 投递成功后才标记已读（失败留未读，下轮重试，防丢消息）
+        await options.mailbox.markMessageAsReadByRef(options.team, options.agent, { from: msg.from, timestamp: msg.timestamp })
       } catch {
-        // 单个消息处理失败不阻断后续
+        // 单个消息处理失败不阻断后续；该消息保持未读等待下轮重试
       }
-      await options.mailbox.markMessageAsReadByRef(options.team, options.agent, { from: msg.from, timestamp: msg.timestamp })
     }
     unread = await options.mailbox.countUnread(options.team, options.agent)
   }
@@ -906,17 +952,44 @@ export interface TeammateTickResult {
   error?: string
 }
 
-/** 认领下一个 available 任务（对齐 tryClaimNextTask） */
+/** 认领下一个 available 任务（对齐 tryClaimNextTask；依赖未解决/已被并发认领的任务跳过，尝试下一个） */
 export async function tryClaimNextTask(deps: TeammateTickDeps): Promise<SwarmTask | undefined> {
   const tasks = await deps.taskPlane.list(deps.team, 'available')
   if (tasks.length === 0) return undefined
-  return deps.taskPlane.claim(deps.team, tasks[0]!.id, deps.name)
+  for (const task of tasks) {
+    try {
+      return await deps.taskPlane.claim(deps.team, task.id, deps.name)
+    } catch {
+      // 依赖未解决或竞态被抢：跳过尝试下一个
+    }
+  }
+  return undefined
+}
+
+/** 向 leader 发送 idle_notification（每轮结束上报空闲状态 + 处理摘要） */
+async function sendIdleNotification(deps: TeammateTickDeps, result: TeammateTickResult, interrupted: boolean): Promise<void> {
+  const idleReason: 'available' | 'interrupted' | 'failed' = result.error
+    ? 'failed'
+    : interrupted
+      ? 'interrupted'
+      : 'available'
+  await deps.mailbox.writeToMailbox(deps.team, TEAM_LEAD_NAME, {
+    from: deps.name,
+    text: `[idle] ${idleReason}`,
+    summary: `处理 ${result.handledMessages} 条消息${result.claimedTask ? `，认领任务 ${result.claimedTask.id}` : ''}${result.finishedTask ? `，任务 ${result.finishedTask.id} → ${result.finishedTask.status}` : ''}${result.error ? `，异常：${result.error}` : ''}`,
+    timestamp: new Date().toISOString(),
+    type: 'idle_notification',
+    idleReason,
+    data: { handledMessages: result.handledMessages },
+  })
 }
 
 /**
  * teammate 单轮执行（对齐 teammateLoop 的循环体）：
- * 1. 处理 mailbox 未读消息（shutdown 类型触发关停；普通消息作为 query 输入，回复写回发送者）
- * 2. tryClaimNextTask：认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification
+ * 1. 处理挂起的权限响应（mailbox 双轨 fallback 回调配对）
+ * 2. 按优先级处理 mailbox 未读消息（shutdown 最高 → lead > peer；投递成功后才标记已读，防丢消息）
+ * 3. tryClaimNextTask：认领 available 任务（依赖已解决）→ query 执行 → 更新任务状态 + 通知 leader
+ * 4. 每轮结束向 leader 发 idle_notification（available / interrupted / failed + 处理摘要）
  */
 export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTickDeps): Promise<TeammateTickResult> {
   const result: TeammateTickResult = { handledMessages: 0 }
@@ -926,8 +999,8 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
     // 1) 先处理挂起的权限响应（mailbox 双轨 fallback 的回调配对）
     await processMailboxPermissionResponse(deps.mailbox, deps.team, deps.name)
 
-    // 2) mailbox 消息
-    const messages = await deps.mailbox.readUnreadMessages(deps.team, deps.name)
+    // 2) mailbox 消息（优先级：shutdown 最高 → lead > peer，同级 FIFO）
+    const messages = sortMessagesByPriority(await deps.mailbox.readUnreadMessages(deps.team, deps.name))
     for (const msg of messages) {
       if (state.status !== 'running' && state.status !== 'idle') break
       if (msg.type === 'shutdown_request') {
@@ -941,11 +1014,13 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
               message: `收到团队关停请求（requestId=${msg.requestId ?? '-'}）：${msg.text}\n请调用 approve_shutdown 或 reject_shutdown 工具做出决策。`,
             }),
           )
+          // 决策投递成功后才标记已读
+          await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
+          result.handledMessages++
         } catch {
-          // 决策查询失败不阻断循环
+          // 决策查询失败：不标记已读，下轮重试
+          result.error = 'shutdown decision failed'
         }
-        await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
-        result.handledMessages++
         continue
       }
       try {
@@ -963,16 +1038,28 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
           type: 'message',
           replyTo: msg.timestamp,
         })
+        // 回复投递成功后才标记已读
+        await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
+        result.handledMessages++
       } catch (err) {
         result.error = `message handling failed: ${(err as Error).message}`
+        // 不标记已读：下轮重试，防丢消息
       }
-      await deps.mailbox.markMessageAsReadByRef(deps.team, deps.name, { from: msg.from, timestamp: msg.timestamp })
-      result.handledMessages++
     }
 
-    // 2) 认领并执行任务
+    // 消息循环中途被中断（如 approve_shutdown 触发关停）：不再认领任务
+    const interrupted = state.status !== 'running' && state.status !== 'idle'
+    if (interrupted) {
+      await sendIdleNotification(deps, result, true)
+      return result
+    }
+
+    // 3) 认领并执行任务
     const task = await tryClaimNextTask(deps)
-    if (!task) return result
+    if (!task) {
+      await sendIdleNotification(deps, result, false)
+      return result
+    }
     result.claimedTask = task
     try {
       const reply = await withTeammateIdentity(state.identity, () =>
@@ -985,7 +1072,7 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
       const finished = await deps.taskPlane.update(deps.team, task.id, { status: 'completed', result: extractText(reply) })
       result.finishedTask = finished
       // 向 leader 发送任务完成通知
-      await deps.mailbox.writeToMailbox(deps.team, 'lead', {
+      await deps.mailbox.writeToMailbox(deps.team, TEAM_LEAD_NAME, {
         from: deps.name,
         text: `任务 ${task.id}「${task.title}」已完成`,
         summary: extractText(reply).slice(0, 200),
@@ -997,7 +1084,7 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
       const message = (err as Error).message
       result.error = `task execution failed: ${message}`
       result.finishedTask = await deps.taskPlane.update(deps.team, task.id, { status: 'failed', result: message })
-      await deps.mailbox.writeToMailbox(deps.team, 'lead', {
+      await deps.mailbox.writeToMailbox(deps.team, TEAM_LEAD_NAME, {
         from: deps.name,
         text: `任务 ${task.id}「${task.title}」失败：${message}`,
         timestamp: new Date().toISOString(),
@@ -1005,9 +1092,15 @@ export async function runTeammateTick(state: TeammateTaskState, deps: TeammateTi
         replyTo: task.id,
       })
     }
+    await sendIdleNotification(deps, result, false)
     return result
   } catch (err) {
     result.error = (err as Error).message
+    try {
+      await sendIdleNotification(deps, result, false)
+    } catch {
+      // 通知失败不掩盖原始错误
+    }
     return result
   }
 }
@@ -1375,6 +1468,8 @@ export interface TaskCreateInput {
   team: string
   title: string
   description?: string
+  /** 依赖任务 id 列表（全部完成后才可认领） */
+  blockedBy?: string[]
 }
 export type TaskCreateOutput = SwarmTask
 
@@ -1382,7 +1477,7 @@ export function createTaskCreateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
   return defineTool<TaskCreateInput, TaskCreateOutput>({
     id: 'task_create',
     aliases: ['create_task'],
-    description: '在团队共享任务平面创建任务（available，等待成员认领）。输入：team、title、description（可选）。',
+    description: '在团队共享任务平面创建任务（available，等待成员认领）。输入：team、title、description（可选）、blockedBy（可选，依赖任务 id 列表，全部完成后才可认领）。',
     isReadOnly: () => false,
     isConcurrencySafe: () => false,
     isDestructive: () => false,
@@ -1391,7 +1486,7 @@ export function createTaskCreateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     permission: { key: 'task_create', extractPatterns: (input) => [input.team] },
     async call(input) {
       try {
-        return { ok: true, output: await getTaskPlane().create(input.team, { title: input.title, description: input.description }) }
+        return { ok: true, output: await getTaskPlane().create(input.team, { title: input.title, description: input.description, blockedBy: input.blockedBy }) }
       } catch (err) {
         return { ok: false, error: { message: (err as Error).message, code: 'TASK_CREATE_FAILED' } }
       }

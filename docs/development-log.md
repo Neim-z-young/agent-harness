@@ -1,5 +1,32 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 10）：Swarm 待办 4-6 项落地（poller 优先级 + task 依赖锁 + idle_notification）
+
+对照架构 §9.4「Swarm 后续待办」，实现第 4-6 项（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：
+
+### 1. inbox poller 优先级 + 投递后才 markRead
+
+- `sortMessagesByPriority`：shutdown（request/approved/rejected）最高（防 peer 消息饿死）→ lead 消息 > peer 消息，同级稳定排序保持 FIFO
+- `attachInboxPoller` 与 `runTeammateTick` 共用排序；**投递成功后才 markRead**——onMessage/query 失败的消息保持未读，下轮重试（防丢消息）
+- `runTeammateTick` 新增中断守卫：消息循环中状态被置 shutdown（如 approve_shutdown 触发关停）时不再认领任务
+
+### 2. task 依赖（blockedBy）与认领锁
+
+- `SwarmTask.blockedBy?: string[]`（task_create 工具可选输入）：依赖任务全部 completed 才可认领，指向不存在的任务视为未解决
+- `claim` 在 `withLock` 内 busy-check（状态 + 依赖双重校验，文件锁防 TOCTOU）
+- `tryClaimNextTask` 跳过依赖未解决/已被并发认领的任务，认领下一个可认领任务
+
+### 3. idle_notification（每轮结束上报）
+
+- `createIdleNotification` helper（idleReason: available/interrupted/failed + summary）
+- `runTeammateTick` 每轮结束向 leader 发 idle_notification：无任务 → available；结果异常 → failed；消息循环中途被关停 → interrupted（且不再认领任务）
+
+### 验证与提交
+
+- 测试：swarm 55 用例全绿（+10：优先级排序 2 + poller 重试 1 + blockedBy 3 + 空闲通知 3 + createIdleNotification 1）
+- 全仓 26 包 typecheck 通过
+- 文档：架构 §9.4 第 4-6 项标记 ✅（plan approval / tmux 后端 / team file 字段 / send_message 路由统一 留待办）
+
 ## 2026-08-26（续 9）：Swarm 待办前三项落地（mailbox 协议 + 权限双轨 + shutdown 模型决策）
 
 对照架构 §9.4「Swarm 后续待办」，实现前 3 项（[packages/plugins/swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：

@@ -847,9 +847,9 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] **mailbox 协作协议类型扩展**：`MailboxMessageType` 扩至 15 种（permission/sandbox/plan_approval/shutdown/idle_notification/task_assignment/team_permission_update/mode_set_request/task_notification）+ `isStructuredProtocolMessage` 路由（结构化消息不进普通 LLM 上下文）+ 协议 helper（`createPermissionRequest/Response`、`createShutdownRequest/Decision`、`generateRequestId`，requestId/replyTo 配对）
 - [x] **权限 mailbox 双轨 fallback**：`requestSwarmPermission`——有 leader 桥走 confirm queue（workerBadge）；无桥且提供 mailbox 时降级（`sendPermissionRequestViaMailbox` 写 permission_request → `registerPermissionCallback` 挂起回调 → leader 写回 response → `processMailboxPermissionResponse` 命中 requestId 配对 resolve）；双轨皆无 fail-closed 拒绝
 - [x] **shutdown 模型决策**：`runTeammateTick` 对 shutdown_request 不直接关停，注入 query 由模型调用 `approve_shutdown`/`reject_shutdown` 工具决策；工具回发 shutdown_approved/shutdown_rejected（replyTo=requestId），approve 时插件按 memberName 查 registry abort + 置 shutdown
-- [ ] **inbox poller 优先级**：shutdown 最高（防 peer 消息饿死）→ lead 消息 > peer 消息（FIFO）→ `tryClaimNextTask`；投递成功后才 markRead（防丢消息）
-- [ ] **task 依赖与认领锁**：`blockedBy` 依赖未解决不可认领 + claim 文件级锁防 TOCTOU（tasks.ts `claimTaskWithBusyCheck`）
-- [ ] **idle_notification**：teammate 每轮结束向 leader 发空闲通知（idleReason: available/interrupted/failed + peer DM 摘要）
+- [x] **inbox poller 优先级**：`sortMessagesByPriority`（shutdown 最高防 peer 消息饿死 → lead 消息 > peer 消息，同级 FIFO）——poller 与 `runTeammateTick` 共用；投递成功后才 markRead（失败留未读，下轮重试，防丢消息）
+- [x] **task 依赖与认领锁**：`SwarmTask.blockedBy`（任务创建可选）+ `claim` 锁内 busy-check——依赖任务全部 completed 才可认领（指向不存在的任务视为未解决），`withLock` 文件锁防 TOCTOU；`tryClaimNextTask` 跳过依赖未解决/已被并发认领的任务
+- [x] **idle_notification**：`createIdleNotification` + `runTeammateTick` 每轮结束向 leader 发空闲通知（idleReason: available/interrupted/failed + 处理摘要）；消息循环中途被中断（approve_shutdown 触发关停）时发 interrupted 且不再认领任务
 - [ ] **plan approval 自动批准 + permissionMode 继承**（leader 侧自动批准 plan_approval_request 并回写，含 leader 权限模式继承）
 - [ ] **tmux/iTerm2 进程后端**：out-of-process teammate（pane + CLI 传身份 + 初始 prompt 投 mailbox），与 in-process 分流（`handleSpawn`）
 - [ ] **team file 字段补全**：joinedAt / tmuxPaneId / cwd / subscriptions；`setLeaderTeamName` 让 `getTaskListId()` 指向 team 目录（多后端共享任务池）
