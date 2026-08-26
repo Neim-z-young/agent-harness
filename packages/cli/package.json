@@ -13,21 +13,24 @@
     }
   },
   "dependencies": {
-    "@harness/core": "workspace:*",
-    "@harness/plugin": "workspace:*",
-    "@harness/bus": "workspace:*",
-    "@harness/tool": "workspace:*",
     "@harness/agent": "workspace:*",
-    "@harness/session": "workspace:*",
-    "@harness/permission": "workspace:*",
-    "@harness/provider-mock": "workspace:*",
-    "@harness/provider-anthropic": "workspace:*",
-    "@harness/tools-builtin": "workspace:*",
-    "@harness/subagent": "workspace:*",
+    "@harness/bus": "workspace:*",
     "@harness/coordinator": "workspace:*",
-    "@harness/swarm": "workspace:*",
+    "@harness/core": "workspace:*",
+    "@harness/permission": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/provider-anthropic": "workspace:*",
+    "@harness/provider-mock": "workspace:*",
+    "@harness/revert": "workspace:*",
+    "@harness/session": "workspace:*",
     "@harness/snapshot": "workspace:*",
-    "@harness/revert": "workspace:*"
+    "@harness/subagent": "workspace:*",
+    "@harness/swarm": "workspace:*",
+    "@harness/tool": "workspace:*",
+    "@harness/tools-builtin": "workspace:*",
+    "@opentui/core": "^0.5.8",
+    "@opentui/react": "^0.5.8",
+    "react": "^19.2.8"
   },
   "scripts": {
     "dev": "bun run ./src/index.ts repl",
@@ -35,5 +38,8 @@
     "start": "bun run ./src/index.ts repl",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18"
   }
 }

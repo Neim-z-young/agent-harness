@@ -1,5 +1,30 @@
 # Agent Harness 开发日志
 
+## 2026-08-26（续 15）：TUI 渲染层迁移 OpenTUI（Bun 原生 Zig 渲染核心）
+
+### 背景
+
+自研 ANSI TUI（续 13）满足基础需求，但要做到 Claude Code / opencode 级别的功能齐全（代码高亮、Markdown 渲染、多面板布局、鼠标支持、选区复制等），自研成本过高。对比主流 TUI 方案后选定 **@opentui/core + @opentui/react**：
+
+- **ink**：react-reconciler 方案，但终端重建需 ink 自己的渲染管线，对 Bun 支持一般，且零依赖风格冲突
+- **OpenTUI**：Bun 原生（Zig 渲染核心 + Yoga flexbox 布局），`@opentui/react` 提供 React 组件树（box/text/input/scrollbox），自带 `<code>`/`<markdown>` 语法高亮等扩展能力；官方提供 `createTestRenderer` 测试方案，可直接 mock 按键断言帧内容
+
+### 实现（[tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）
+
+1. **t1 渲染层重写**：`KeyDecoder`/`TuiScreen` 自研 ANSI 全部移除，替换为 `TuiApp` React 组件（状态栏 + scrollbox 日志区自动滚动 + 底部 input 行）；`startTuiRepl` 改为 `createCliRenderer()` + `createRoot(renderer).render(<TuiApp/>)`；**会话内核 `createProcessLine` 原样保留**，TUI 与 REPL 依然共用同一套处理逻辑
+2. **t2 三处真实 bug 修复**：
+   - `processLineRef` 改为渲染期同步初始化（`createProcessLine` 是纯工厂），避免 Enter 提交早于 mount effect 执行时 ref 为 null
+   - `<input onSubmit>` 不再读 React 状态闭包（快速输入时状态滞后于输入框内部文本），改用事件携带的 `currentValue`
+   - **mount effect 覆盖竞态（pty 冒烟暴露）**：初始欢迎语/状态栏若用 `useEffect` 设置，而 processLine 已同步初始化，用户首个输入可在 effect 前被处理——回复内容先 append 进 logs，随后 effect 的 `setLogs([...欢迎语...])` 整体覆盖丢弃。修复：logs/status 直接用 `useState` 初始值，删除 mount effect
+3. **t3 工程适配**：cli 新增依赖 `@opentui/core` / `@opentui/react` / `react`；tsconfig 配置 `jsx: react-jsx` + `jsxImportSource: @opentui/react`；文件名 `tui.ts` → `tui.tsx`、`tui.test.ts` → `tui.test.tsx`
+4. **t4 测试重写**：旧 21 用例（KeyDecoder/TuiScreen/scriptedKeys）替换为 `@opentui/core/testing` 的 `createTestRenderer` + `mockInput` 驱动 `TuiApp`（10 用例：appendLog 4 / 集成 4 / --tui 2）；测试渲染器需手动 pump `renderer.loop()` 产出帧（waitForFrame 不驱动循环）
+
+### 验证
+
+- cli 38 用例全绿（含 TuiApp 输入提交流式渲染 / Ctrl-C / /exit 集成），全仓 25 包 typecheck 通过
+- python pty 真实终端冒烟：`🧑 hi` 回显 → `🤖 (Mock Provider) 你好，我是测试助手。` 流式渲染 → `⏱️` 计时行 → 状态栏 session/agent 显示；注意 OpenTUI 增量渲染对变化单元格逐格写 ANSI 色码，字节流子串匹配需按单字符断言
+- 保留能力：`harness repl --tui` 全屏交互、与 REPL 共用 /命令与插件 hook、自动续轮注入
+
 ## 2026-08-26（续 14）：TUI 输入修复——真实终端无法输入字符
 
 ### 现象
