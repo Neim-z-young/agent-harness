@@ -1,5 +1,38 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 23）：电脑控制 MCP server 插件 + MCP Server Registry
+
+### 背景
+
+用户希望基于 `reference/电脑控制mcp 功能.md` 实现一个「电脑控制」MCP server 插件：插件加载时自动启动并注册到 MCP，连接统一由 mcp-client 管理。为避免与 core 集成，注册机制采用独立的 `mcp-server-registry` 插件：所有 mcp server 相关插件都依赖它去启动，提高复用度。后端选「真实 macOS 自动化」（osascript）。
+
+### 实现
+
+**1. `@harness/mcp-server-registry`（[mcp-server-registry/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/mcp-server-registry/src/index.ts)）**
+
+- `McpServerRegistry`：`register / unregister / has / list / clear`，支持两条注册路径：
+  - `config`：外部 server（stdio/http/sse），用 `@harness/mcp-client` 的 `defaultTransportFactory` 拉起
+  - `createTransport`：进程内 / 自定义启动器，返回 `@harness/mcp-client` 的 `McpTransport`
+- `registerMcpServer() / unregisterMcpServer() / listRegisteredMcpServers()`：模块级默认注册表
+- `createMcpServerRegistryPlugin()`：在 `harness.start` 连接所有已注册 server（`McpClient` + `connect`）、`tool.pool.assemble` 暴露 `convertMcpToolToHarnessTool` 转出的工具、提供 `/mcp [servers | tools]` 命令、unload 时断开
+
+**2. `@harness/computer-use`（[computer-use/src/mac.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/computer-use/src/mac.ts) + [server.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/computer-use/src/server.ts) + [index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/computer-use/src/index.ts)）**
+
+- `ComputerUseBackend`：通过 `/usr/bin/osascript`（System Events）+ `/usr/sbin/screencapture` 实现 11 种电脑操作（check_permissions / list_apps / get_app_state / click / scroll / drag / type_text / press_key / perform_action / set_value / select_text），执行器可注入（测试 mock）
+- `ComputerUseMcpServer`：进程内 MCP JSON-RPC server（initialize / tools/list / tools/call），把后端方法映射为 MCP 工具，工具 schema 对齐参考文档
+- `createComputerUseServerTransport()`：把进程内 server 包装为 `McpTransport`，供 registry 连接
+- `createComputerUsePlugin()`：`dependsOn ['mcp.server-registry']`，`install` 时 `registerMcpServer` 注册进程内 server，`harness.init` 时经 `output.harness.skillManager.register` 注册一个 `loadedFrom: 'plugin'` 的「Computer Use」操作指南技能
+
+**3. 装配（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）**
+
+- CLI 默认安装 `createMcpServerRegistryPlugin()` + `createComputerUsePlugin()`，实现「注册 → harness.start 自动启动进程内 server 并通过 mcp-client 连接 → 工具进工具池」
+
+### 验证
+
+- mcp-server-registry 4 用例：注册表 CRUD、harness.start 连接 + assemble 暴露工具 + 工具可调用（pass-through）、`/mcp servers|tools`、config 缺失 command 不阻塞其余
+- computer-use 9 用例：JSON-RPC initialize / tools/list（11 工具）/ tools/call 分发与报错 / 通知无响应 / 未知方法 / transport 对接 McpClient 连通性 / 插件注册 server + 注册 plugin 来源 Skill
+- cli 111 用例全绿（接入新插件后无回归）；全部 26 包 typecheck 通过
+
 ## 2026-08-28（续 22）：插件 / 技能管理（enable / disable / reload + 技能来源标注）
 
 ### 背景

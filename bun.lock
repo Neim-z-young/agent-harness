@@ -26,8 +26,10 @@
       "dependencies": {
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
+        "@harness/computer-use": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/mcp-server-registry": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/provider-anthropic": "workspace:*",
@@ -76,6 +78,15 @@
         "@harness/bus": "workspace:*",
       },
     },
+    "packages/plugins/computer-use": {
+      "name": "@harness/computer-use",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/mcp-server-registry": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/skill": "workspace:*",
+      },
+    },
     "packages/plugins/coordinator": {
       "name": "@harness/coordinator",
       "version": "0.1.0",
@@ -95,6 +106,15 @@
       "dependencies": {
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/mcp-server-registry": {
+      "name": "@harness/mcp-server-registry",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/mcp-client": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -276,11 +296,15 @@
 
     "@harness/cli": ["@harness/cli@workspace:packages/cli"],
 
+    "@harness/computer-use": ["@harness/computer-use@workspace:packages/plugins/computer-use"],
+
     "@harness/coordinator": ["@harness/coordinator@workspace:packages/plugins/coordinator"],
 
     "@harness/core": ["@harness/core@workspace:packages/core"],
 
     "@harness/mcp-client": ["@harness/mcp-client@workspace:packages/plugins/mcp-client"],
+
+    "@harness/mcp-server-registry": ["@harness/mcp-server-registry@workspace:packages/plugins/mcp-server-registry"],
 
     "@harness/permission": ["@harness/permission@workspace:packages/permission"],
 

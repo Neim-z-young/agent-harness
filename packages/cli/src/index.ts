@@ -43,6 +43,8 @@ import { createProviderGeminiPlugin, GeminiProviderConfig } from '@harness/provi
 import { createProviderGlmPlugin, GlmProviderConfig } from '@harness/provider-glm'
 import { createProviderQwenPlugin, QwenProviderConfig } from '@harness/provider-qwen'
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
+import { createMcpServerRegistryPlugin } from '@harness/mcp-server-registry'
+import { createComputerUsePlugin } from '@harness/computer-use'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import {
@@ -1128,6 +1130,9 @@ export class HarnessApp {
     }
     providerPlugins.push(chosenProvider)
     providerPlugins.push(toolsBuiltinPlugin)
+    // MCP Server Registry + 电脑控制：进程内 MCP server（依赖 registry 启动连接）
+    providerPlugins.push(createMcpServerRegistryPlugin())
+    providerPlugins.push(createComputerUsePlugin())
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
     if (this.options.extraPlugins?.length) providerPlugins.push(...this.options.extraPlugins)
 
