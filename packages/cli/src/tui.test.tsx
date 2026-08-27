@@ -19,6 +19,8 @@ import {
   applyStreamEvent,
   findFileReferences,
   collectFileReferences,
+  createFileRefIndex,
+  indexFileReferences,
   initialChatState,
   initialChatWithWelcome,
   TuiApp,
@@ -171,6 +173,42 @@ describe('findFileReferences / collectFileReferences', () => {
   })
 })
 
+describe('FileRefIndex 增量文件引用索引', () => {
+  it('空索引初始为空', () => {
+    expect(createFileRefIndex().ordered).toEqual([])
+  })
+  it('文本未增长时原样返回同一引用', () => {
+    const idx = createFileRefIndex()
+    const after = indexFileReferences(idx, 1, 'src/a.ts')
+    expect(after.ordered).toEqual(['src/a.ts'])
+    // 同长文本再入 → 返回同一引用，不重复扫描
+    expect(indexFileReferences(after, 1, 'src/a.ts')).toBe(after)
+  })
+  it('追加增量仅扫描新增尾部，累积去重', () => {
+    let idx = createFileRefIndex()
+    // 第一次：整段扫描，得到 src/a.ts
+    idx = indexFileReferences(idx, 1, '改动 src/a.ts 后继续')
+    expect(idx.ordered).toEqual(['src/a.ts'])
+    // 追加内容含第二个路径 → 增量扫描尾部识别 src/b.ts
+    idx = indexFileReferences(idx, 1, '改动 src/a.ts 后继续 并让 src/b.ts:3 更新')
+    expect(idx.ordered).toEqual(['src/a.ts', 'src/b.ts:3'])
+  })
+  it('跨增量拼接的路径也能被完整捕获（回看窗口）', () => {
+    let idx = createFileRefIndex()
+    // 前缀部分跨过增量边界，靠 REF_SCAN_OVERLAP 回看完整捕获
+    const first = '这是一段很长的铺垫文本。'.repeat(8) // 足够长使增量边界落在路径前部之外
+    idx = indexFileReferences(idx, 1, first + '见 ')
+    idx = indexFileReferences(idx, 1, first + '见 src/c.ts')
+    expect(idx.ordered).toContain('src/c.ts')
+  })
+  it('同文件不同行号归并，保留首次形态；限量 max', () => {
+    let idx = createFileRefIndex()
+    idx = indexFileReferences(idx, 1, 'src/x.ts:5')
+    idx = indexFileReferences(idx, 2, 'src/x.ts:9 与 src/y.ts')
+    expect(idx.ordered).toEqual(['src/x.ts:5', 'src/y.ts'])
+  })
+})
+
 // ------------------------------------------------------------------------
 // TuiApp 集成（mock provider + OpenTUI 测试渲染器）
 // ------------------------------------------------------------------------
@@ -183,7 +221,12 @@ interface TuiFixture {
 
 const activeFixtures: Array<() => Promise<void>> = []
 
-async function mountTui(extra: { responses?: Array<{ match: RegExp; response: string }> } = {}): Promise<TuiFixture> {
+async function mountTui(
+  extra: {
+    responses?: Array<{ match: string | RegExp; response: string }>
+    openFile?: (path: string, line?: number) => void
+  } = {},
+): Promise<TuiFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-tui-test-'))
   const app = new HarnessApp({
     cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
@@ -198,7 +241,7 @@ async function mountTui(extra: { responses?: Array<{ match: RegExp; response: st
   const root = createRoot(setup.renderer)
   let resolveExit!: (r: TuiReplExit) => void
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
-  root.render(<TuiApp options={{ app, harness, session, provider: 'mock' }} onExit={resolveExit} />)
+  root.render(<TuiApp options={{ app, harness, session, provider: 'mock', openFile: extra.openFile }} onExit={resolveExit} />)
 
   let cleaned = false
   const cleanup = async () => {
@@ -288,6 +331,58 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.setup.mockInput.typeText('/exit')
     f.setup.mockInput.pressEnter()
     expect(await waitExit(f)).toBe('exit')
+    await f.cleanup()
+  })
+})
+
+describe('TuiApp 文件引用导航（Tab / 上下键选中 / Enter 打开）', () => {
+  it('Tab 进入引用列表，Esc 返回输入，期间不触发打开', async () => {
+    const opened: Array<{ path: string; line?: number }> = []
+    const f = await mountTui({
+      responses: [{ match: /file/, response: '见 src/foo.ts:12 与 docs/readme.md' }],
+      openFile: (path, line) => opened.push({ path, line }),
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('file')
+    f.setup.mockInput.pressEnter()
+    // 回复流入 → 侧栏出现文件引用
+    await waitFrame(f.setup, (frame) => frame.includes('src/foo.ts:12'))
+
+    // Tab 进入引用列表
+    f.setup.mockInput.pressTab()
+    await waitFrame(f.setup, (frame) => frame.includes('▸'))
+
+    // Esc 返回输入，列表模式退出
+    f.setup.mockInput.pressEscape()
+    await waitFrame(f.setup, (frame) => !frame.includes('▸'))
+
+    expect(opened).toEqual([]) // 未按 Enter，不触发打开
+    await f.cleanup()
+  })
+
+  it('Tab 进入后按方向键下移选中、Enter 打开并解析 :行号', async () => {
+    const opened: Array<{ path: string; line?: number }> = []
+    const f = await mountTui({
+      responses: [{ match: /bar/, response: '改动 src/foo.ts:12 与 src/bar.ts:3' }],
+      openFile: (path, line) => opened.push({ path, line }),
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('bar')
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (frame) => frame.includes('src/foo.ts:12'))
+
+    // Tab 进入并等待 fileMode 生效（否则方向键会落入非列表分支）
+    f.setup.mockInput.pressTab()
+    await waitFrame(f.setup, (frame) => frame.includes('▸'))
+
+    // 下移一次选中第二项 src/bar.ts:3
+    f.setup.mockInput.pressArrow('down')
+    await new Promise((r) => setTimeout(r, 10))
+    // 打开选中项 → 退出列表模式
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (frame) => !frame.includes('▸'))
+
+    expect(opened).toContainEqual({ path: 'src/bar.ts', line: 3 })
     await f.cleanup()
   })
 })

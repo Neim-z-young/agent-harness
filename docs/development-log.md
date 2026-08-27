@@ -1,5 +1,26 @@
 # Agent Harness 开发日志
 
+## 2026-08-27（续 16）：文件引用跳转验证 + Markdown 长文本流式性能优化
+
+### 背景
+
+续 15 已实现 Claude Code 风格界面能力：Markdown 流式渲染、代码块高亮、多面板侧栏、文件引用提取、状态栏扩展。本次一起推进两块收尾工作：
+
+1. **文件引用跳转，从「能提取」到「可操作」的验证**：此前只做了引用提取与侧栏渲染，未验证「Tab 进入列表 → 上下键选中 → Enter 打开」这一导航链路在组件层面真正可达、且 `openFile(path, line)` 被以正确解析参数调用
+2. **Markdown 长文本流式性能**：assistant 正文流式时文本不断向同一块追加，旧实现 `collectFileReferences(state)` 每次 state 变化都对全部块文本做 O(总文本) 正则重扫，随回复增长代价递增
+
+### 实现（[tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx) / [tui.test.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.test.tsx)）
+
+1. **增量文件引用索引 FileRefIndex**：从「每块记录已扫描长度」出发，`indexFileReferences(index, blockId, text)` 只对新增尾部（回看 `REF_SCAN_OVERLAP=64` 窗口以捕获跨增量边界的路径）增量扫描并归一化去重，使单批成本从 O(总文本) 降到 O(增量)。`TuiApp` 侧栏改为对该索引做只增 append（useMemo + ref），而非每次全量重算
+2. **导航集成测试补全**：`mountTui` 扩展支持注入 `responses` 与 `openFile` spy；新增用例验证——Tab 进入列表出现 `▸` 选中标记、Esc 退出列表、未 Enter 不触发打开；以及下移选中第二项后 Enter 以 `{path, line}` 正确调用 openFile
+3. **FileRefIndex 纯函数单测**：空索引、文本未增长同引用短路、增量尾部识别、跨边界回看窗口捕获、同文件不同行号归并
+4. **导航语义修正**：非列表模式下 Tab 进入、列表模式下非导航键均 `return true`（preventDefault 语义），避免列表模式按键误键入输入框
+
+### 验证
+
+- cli 66 用例全绿（含 2 个新导航集成 + 5 个 FileRefIndex 单测），全仓 26 包 typecheck 通过
+- 导航链路：mock 回复 `改动 src/foo.ts:12 与 src/bar.ts:3` → Tab → down → Enter → `openFile('src/bar.ts', 3)` 被调用，:行号解析正确
+
 ## 2026-08-26（续 15）：TUI 渲染层迁移 OpenTUI（Bun 原生 Zig 渲染核心）
 
 ### 背景
