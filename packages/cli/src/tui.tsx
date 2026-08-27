@@ -133,6 +133,8 @@ function upsertStreamBlock(state: ChatState, kind: 'thinking' | 'assistant', tex
 }
 
 function finalizeStream(state: ChatState): ChatState {
+  // 无流式块时原样返回，避免 done 触发无谓重渲染
+  if (state.assistantIdx === -1 && state.thinkingIdx === -1) return state
   const blocks = state.blocks.slice()
   if (state.assistantIdx !== -1) blocks[state.assistantIdx] = { ...blocks[state.assistantIdx], streaming: false }
   if (state.thinkingIdx !== -1) blocks[state.thinkingIdx] = { ...blocks[state.thinkingIdx], streaming: false }

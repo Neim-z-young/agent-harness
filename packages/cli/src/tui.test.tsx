@@ -52,6 +52,15 @@ describe('classifyConsoleLine 控制台行归类', () => {
     expect(classifyConsoleLine('⏱️  12ms | agent=default').kind).toBe('system')
     expect(classifyConsoleLine('普通提示').kind).toBe('system')
   })
+  it('空串 / 空格 / 行首单空格 → system', () => {
+    expect(classifyConsoleLine('')).toEqual({ kind: 'system', text: '' })
+    expect(classifyConsoleLine('  ')).toEqual({ kind: 'system', text: ' ' })
+    expect(classifyConsoleLine(' hello')).toEqual({ kind: 'system', text: 'hello' })
+  })
+  it('前缀后无空格仍按前缀归类（正文可后续展开）', () => {
+    expect(classifyConsoleLine('🤖你好').kind).toBe('assistant')
+    expect(classifyConsoleLine('🔧t1 args').kind).toBe('tool')
+  })
 })
 
 describe('pushConsole 追加控制台文本', () => {
@@ -66,6 +75,15 @@ describe('pushConsole 追加控制台文本', () => {
     const next = pushConsole(prev, 'hello')
     expect(prev.blocks).toHaveLength(0)
     expect(next.blocks).toHaveLength(1)
+  })
+  it('仅空行/空白不产生块，末尾换行不追加空块', () => {
+    expect(pushConsole(initialChatState, '\n  \n\n').blocks).toHaveLength(0)
+    expect(pushConsole(initialChatState, 'a\n').blocks).toHaveLength(1)
+  })
+  it('多前缀混排各行各自成块，ID 连续递增', () => {
+    const s = pushConsole(initialChatState, '🤖  你好\n⏱️  3ms\n💭  想想')
+    expect(s.blocks.map((b) => b.kind)).toEqual(['assistant', 'system', 'thinking'])
+    expect(s.nextId).toBe(4)
   })
 })
 
@@ -95,6 +113,28 @@ describe('applyStreamEvent 结构化流', () => {
     expect(s2.blocks).toHaveLength(2)
     expect(s2.assistantIdx).toBe(1)
   })
+  it('done 无流式块时无操作，保持原状态引用', () => {
+    const s = initialChatState
+    expect(applyStreamEvent(s, { type: 'done', message: undefined })).toBe(s)
+  })
+  it('未知事件类型原样返回，不崩溃', () => {
+    const s = initialChatState
+    expect(applyStreamEvent(s, { type: 'tool_call_start', toolId: 't1', input: {} } as never)).toBe(s)
+  })
+  it('reasoning 与 text 交错各自成块，done 一并收尾，新一轮续接', () => {
+    let s = applyStreamEvent(initialChatState, { type: 'reasoning_delta', text: '想' })
+    s = applyStreamEvent(s, { type: 'text_delta', text: '答' })
+    expect(s.blocks.map((b) => b.kind)).toEqual(['thinking', 'assistant'])
+    expect(s.blocks.every((b) => b.streaming)).toBe(true)
+    s = applyStreamEvent(s, { type: 'done', message: undefined })
+    expect(s.blocks.every((b) => b.streaming)).toBe(false)
+    const s2 = applyStreamEvent(s, { type: 'reasoning_delta', text: '再想' })
+    expect(s2.blocks.map((b) => [b.kind, b.text])).toEqual([
+      ['thinking', '想'],
+      ['assistant', '答'],
+      ['thinking', '再想'],
+    ])
+  })
 })
 
 describe('findFileReferences / collectFileReferences', () => {
@@ -111,6 +151,23 @@ describe('findFileReferences / collectFileReferences', () => {
     state = pushConsole(state, '见 src/a.ts 和 src/b.ts')
     const byBlock = { ...state, blocks: [...state.blocks, { id: 99, kind: 'tool' as const, text: 'src/a.ts:2 src/c.ts:3' }] }
     expect(collectFileReferences(byBlock)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts:3'])
+  })
+  it('含 - _ . 的扩展名路径识别；行区间 :10-20 仅保留起始行', () => {
+    expect(findFileReferences('交割 lib/util.helper.mts 见 src/a.ts:10-20').map((r) => r.path))
+      .toEqual(['lib/util.helper.mts', 'src/a.ts:10'])
+  })
+  it('邮箱/端口号/纯目录不误报', () => {
+    expect(findFileReferences('联系 app@example.com 或 localhost:3000 或 src')).toEqual([])
+  })
+  it('同文件不同行号跨块归并，保留首次出现的原始形态', () => {
+    let s = pushConsole(initialChatState, '见 src/x.ts:5')
+    const s2 = pushConsole(s, '再提 src/x.ts:10 与 src/x.ts:5')
+    expect(collectFileReferences(s2)).toEqual(['src/x.ts:5'])
+  })
+  it('无引用时返回空数组；尊重自定义 max 限量', () => {
+    expect(collectFileReferences(initialChatState)).toEqual([])
+    let s = pushConsole(initialChatState, 'src/a.ts src/b.ts src/c.ts')
+    expect(collectFileReferences(s, 2)).toEqual(['src/a.ts', 'src/b.ts'])
   })
 })
 
