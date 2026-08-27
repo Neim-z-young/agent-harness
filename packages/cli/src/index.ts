@@ -30,6 +30,7 @@ import {
   ChatProvider,
   PermissionDecision,
 } from '@harness/core'
+import type { AgentStreamEvent } from '@harness/core'
 import type { AgentPlugin, PluginContext } from '@harness/plugin'
 import {
   createProviderMockPlugin,
@@ -631,6 +632,12 @@ export interface ProcessLineOptions {
   out: (s: string) => void
   /** 收到普通用户输入时回调（REPL 回显前触发） */
   onLine?: (line: string) => Promise<void> | void
+  /**
+   * TUI 结构化事件回传：reasoning/text/tool/done 逐帧透传。
+   * 提供时，推理与正文增量不再经 `out`（由调用方按其格式渲染，如 markdown 流）；
+   * 用户回显 / 工具行 / 命令输出 / 计时等仍走 `out`。
+   */
+  onEvent?: (ev: AgentStreamEvent) => void
   /** /new 换绑新会话后回调（让调用方同步自身会话引用） */
   setSession?: (session: Session) => void
 }
@@ -651,6 +658,7 @@ export type ProcessLineResult = 'continue' | 'exit'
 export function createProcessLine(options: ProcessLineOptions): (raw: string) => Promise<ProcessLineResult> {
   const { app, harness } = options
   const out = options.out
+  const onEvent = options.onEvent
   let current = options.session
 
   return async (raw) => {
@@ -865,15 +873,28 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       for await (const ev of gen) {
         switch (ev.type) {
           case 'reasoning_delta':
-            if (!inReasoning) { out('💭  '); inReasoning = true }
-            out(ev.text ?? '')
+            // TUI 结构化模式（onEvent）：推理增量直接回传，由 TUI 渲染成 thinking 块；
+            // REPL（无 onEvent）：保留原前缀「💭  增量」打印行为。
+            if (onEvent) {
+              inReasoning = true
+              onEvent(ev)
+            } else {
+              if (!inReasoning) { out('💭  '); inReasoning = true }
+              out(ev.text ?? '')
+            }
             break
           case 'text_delta':
-            if (!inText) { if (inReasoning) out('\n'); out('🤖  '); inText = true }
-            out(ev.text ?? '')
+            if (onEvent) {
+              inText = true
+              onEvent(ev)
+            } else {
+              if (!inText) { if (inReasoning) out('\n'); out('🤖  '); inText = true }
+              out(ev.text ?? '')
+            }
             break
           case 'tool_call_start':
             if (inText || inReasoning) { out('\n'); inText = false; inReasoning = false }
+            onEvent?.(ev)
             out(`🔧  ${ev.toolId} ${JSON.stringify(ev.input).slice(0, 60)}...\n`)
             break
           case 'tool_call_result': {
@@ -881,15 +902,18 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             const preview = typeof ev.result === 'string'
               ? ev.result.slice(0, 120)
               : JSON.stringify(ev.result ?? '').slice(0, 120)
+            onEvent?.(ev)
             out(`${status}  → ${preview}\n`)
             break
           }
           case 'done':
             assistant = ev.message
+            onEvent?.(ev)
             break
         }
       }
-      if (inText || inReasoning) out('\n') // 换行收尾
+      // 结构化模式（onEvent）下收尾换行由 TUI 负责，避免向控制台混入空行
+      if (!onEvent && (inText || inReasoning)) out('\n') // 换行收尾
     } catch (err: any) {
       out(`\n❌  发送失败：${err?.message ?? String(err)}\n`)
       return 'continue'
@@ -1129,7 +1153,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       }
     }
     if (args.tui) {
-      await startTuiRepl({ app, harness, session })
+      await startTuiRepl({ app, harness, session, provider })
     } else {
       await startRepl({ app, harness, session })
     }

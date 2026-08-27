@@ -3,8 +3,9 @@
  *
  * 用 @opentui/core/testing 的 createTestRenderer + mockInput 模拟按键，
  * 直接渲染 <TuiApp> 组件树（不依赖真实 tty）：
- * - appendLog：日志追加纯函数
- * - TuiApp：输入提交 → createProcessLine → mock 回复流式渲染；Ctrl-C / /exit 退出
+ * - classifyConsoleLine / pushConsole / applyStreamEvent / findFileReferences：结构化块纯函数
+ * - TuiApp：输入提交 → createProcessLine（onEvent）→ mock 回复以 markdown 流式渲染；
+ *   Ctrl-B 切换侧栏；Ctrl-C / /exit 退出
  * - parseCliArgs --tui
  */
 import { describe, it, expect, afterEach } from 'bun:test'
@@ -12,35 +13,104 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { HarnessApp, parseCliArgs } from './index'
-import { appendLog, TuiApp, type TuiReplExit } from './tui'
+import {
+  classifyConsoleLine,
+  pushConsole,
+  applyStreamEvent,
+  findFileReferences,
+  collectFileReferences,
+  initialChatState,
+  initialChatWithWelcome,
+  TuiApp,
+  type TuiReplExit,
+} from './tui'
 import { createRoot } from '@opentui/react'
 import { createTestRenderer, type TestRendererSetup } from '@opentui/core/testing'
 import type { Harness } from '@harness/core'
 import type { Session } from '@harness/session'
 
 // ------------------------------------------------------------------------
-// appendLog：日志追加纯函数
+// 结构化块纯函数
 // ------------------------------------------------------------------------
 
-describe('appendLog 日志追加', () => {
-  it('首行直接入栈；后续文本拼接最后一行', () => {
-    expect(appendLog([], 'a')).toEqual(['a'])
-    expect(appendLog(['a'], 'b')).toEqual(['ab'])
+describe('classifyConsoleLine 控制台行归类', () => {
+  it('🧑 开头 → user，去掉前缀', () => {
+    expect(classifyConsoleLine('🧑  hello')).toEqual({ kind: 'user', text: 'hello' })
   })
-
-  it('\n 拆分多行', () => {
-    expect(appendLog([], 'a\nb\nc')).toEqual(['a', 'b', 'c'])
+  it('💭 开头 → thinking，去掉前缀', () => {
+    expect(classifyConsoleLine('💭  思考中')).toEqual({ kind: 'thinking', text: '思考中' })
   })
-
-  it('超过 maxLines 只保留最近 N 行', () => {
-    expect(appendLog([], '1\n2\n3\n4', 3)).toEqual(['2', '3', '4'])
+  it('🤖 开头 → assistant，去掉前缀', () => {
+    expect(classifyConsoleLine('🤖  你好')).toEqual({ kind: 'assistant', text: '你好' })
   })
+  it('🔧 / ✅ / ❌ 开头 → tool，保留原文', () => {
+    expect(classifyConsoleLine('🔧  t1 {"a":1}...').kind).toBe('tool')
+    expect(classifyConsoleLine('✅  → ok').kind).toBe('tool')
+    expect(classifyConsoleLine('❌  → err').kind).toBe('tool')
+  })
+  it('⏱️ 开头 / 其他 → system', () => {
+    expect(classifyConsoleLine('⏱️  12ms | agent=default').kind).toBe('system')
+    expect(classifyConsoleLine('普通提示').kind).toBe('system')
+  })
+})
 
+describe('pushConsole 追加控制台文本', () => {
+  it('按 \\n 拆行归类为新块，跳过空行', () => {
+    const s = pushConsole(initialChatState, '\n🧑  hi\n\n🔧  t1 x...\n')
+    expect(s.blocks.map((b) => b.kind)).toEqual(['user', 'tool'])
+    expect(s.blocks[0].text).toBe('hi')
+    expect(s.blocks[1].text).toBe('🔧  t1 x...')
+  })
   it('不修改原数组', () => {
-    const prev = ['x']
-    const next = appendLog(prev, 'y')
-    expect(prev).toEqual(['x'])
-    expect(next).toEqual(['xy'])
+    const prev = initialChatState
+    const next = pushConsole(prev, 'hello')
+    expect(prev.blocks).toHaveLength(0)
+    expect(next.blocks).toHaveLength(1)
+  })
+})
+
+describe('applyStreamEvent 结构化流', () => {
+  it('text_delta 累积成流式 assistant 块', () => {
+    let s = initialChatState
+    s = applyStreamEvent(s, { type: 'text_delta', text: '你好' })
+    s = applyStreamEvent(s, { type: 'text_delta', text: '，世界' })
+    expect(s.blocks).toHaveLength(1)
+    expect(s.blocks[0].kind).toBe('assistant')
+    expect(s.blocks[0].text).toBe('你好，世界')
+    expect(s.blocks[0].streaming).toBe(true)
+  })
+  it('reasoning_delta 生成 thinking 块', () => {
+    const s = applyStreamEvent(initialChatState, { type: 'reasoning_delta', text: '我先想想' })
+    expect(s.blocks[0].kind).toBe('thinking')
+    expect(s.blocks[0].text).toBe('我先想想')
+  })
+  it('done 收尾：流式标记清除、下标归位', () => {
+    let s = applyStreamEvent(initialChatState, { type: 'text_delta', text: 'a' })
+    expect(s.blocks[0].streaming).toBe(true)
+    s = applyStreamEvent(s, { type: 'done', message: undefined })
+    expect(s.blocks[0].streaming).toBe(false)
+    expect(s.assistantIdx).toBe(-1)
+    // 新一轮 text_delta 生成新块
+    const s2 = applyStreamEvent(s, { type: 'text_delta', text: 'b' })
+    expect(s2.blocks).toHaveLength(2)
+    expect(s2.assistantIdx).toBe(1)
+  })
+})
+
+describe('findFileReferences / collectFileReferences', () => {
+  it('提取 packages/cli/src/tui.tsx:12 这样的路径引用', () => {
+    const refs = findFileReferences('见 packages/cli/src/tui.tsx:12 与 src/utils/parse.ts:1:2')
+    expect(refs.map((r) => r.path)).toEqual(['packages/cli/src/tui.tsx:12', 'src/utils/parse.ts:1:2'])
+  })
+  it('缺失后缀/非路径不误报，去重', () => {
+    const refs = findFileReferences('x docs/readme.md y docs/readme.md')
+    expect(refs).toEqual([{ path: 'docs/readme.md', start: 2, end: 17 }])
+  })
+  it('collectFileReferences 汇总各块并限量', () => {
+    let state = initialChatState
+    state = pushConsole(state, '见 src/a.ts 和 src/b.ts')
+    const byBlock = { ...state, blocks: [...state.blocks, { id: 99, kind: 'tool', text: 'src/a.ts:2 src/c.ts:3' }] }
+    expect(collectFileReferences(byBlock)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts:3'])
   })
 })
 
@@ -71,7 +141,7 @@ async function mountTui(extra: { responses?: Array<{ match: RegExp; response: st
   const root = createRoot(setup.renderer)
   let resolveExit!: (r: TuiReplExit) => void
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
-  root.render(<TuiApp options={{ app, harness, session }} onExit={resolveExit} />)
+  root.render(<TuiApp options={{ app, harness, session, provider: 'mock' }} onExit={resolveExit} />)
 
   let cleaned = false
   const cleanup = async () => {
@@ -104,7 +174,7 @@ async function waitFrame(setup: TestRendererSetup, predicate: (frame: string) =>
     if (predicate(frame)) return frame
     await new Promise((r) => setTimeout(r, 3))
   }
-  throw new Error('waitFrame 超时，最后一帧:\n' + JSON.stringify(frame))
+  throw new Error('waitFrame 超时，最后一帧:\n' + JSON.stringify(frame.slice(0, 400)))
 }
 
 async function waitExit(f: TuiFixture, maxPasses = 600): Promise<TuiReplExit> {
@@ -119,21 +189,37 @@ async function waitExit(f: TuiFixture, maxPasses = 600): Promise<TuiReplExit> {
 }
 
 describe('TuiApp 集成（mock provider）', () => {
-  it('输入 hello + Enter → 回显 + mock 回复流式渲染进日志区', async () => {
+  it('初始：状态栏 + 侧栏「会话上下文」渲染', async () => {
     const f = await mountTui()
-    await waitFrame(f.setup, (frame) => frame.includes('Harness TUI'))
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    expect(frame).toContain('mock')
+    await f.cleanup()
+  })
+
+  it('输入 hello + Enter → echo + mock 回复以 markdown 流式渲染', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('hello')
     f.setup.mockInput.pressEnter()
-    // 用户输入回显（processLine 输出 🧑 前缀）
-    await waitFrame(f.setup, (frame) => frame.includes('🧑') && frame.includes('hello'))
-    // mock 回复流式渲染（🤖 前缀 + 文本）
-    await waitFrame(f.setup, (frame) => frame.includes('🤖') && frame.includes('你好，我是 TUI 助手。'))
+    // 用户回显（user 块：❯ hello）
+    await waitFrame(f.setup, (frame) => frame.includes('❯') && frame.includes('hello'))
+    // assistant 正文经 onEvent → markdown 渲染
+    await waitFrame(f.setup, (frame) => frame.includes('你好，我是 TUI 助手。'))
+    await f.cleanup()
+  })
+
+  it('Ctrl-B 切换侧栏面板', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKey('b', { ctrl: true })
+    // 侧栏隐藏后「会话上下文」标题消失
+    await waitFrame(f.setup, (frame) => !frame.includes('会话上下文'))
     await f.cleanup()
   })
 
   it('Ctrl-C → exit', async () => {
     const f = await mountTui()
-    await waitFrame(f.setup, (frame) => frame.includes('Harness TUI'))
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     f.setup.mockInput.pressCtrlC()
     expect(await waitExit(f)).toBe('exit')
     await f.cleanup()
@@ -141,20 +227,10 @@ describe('TuiApp 集成（mock provider）', () => {
 
   it('/exit 命令 → exit（与 REPL 共用 createProcessLine）', async () => {
     const f = await mountTui()
-    await waitFrame(f.setup, (frame) => frame.includes('Harness TUI'))
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('/exit')
     f.setup.mockInput.pressEnter()
     expect(await waitExit(f)).toBe('exit')
-    await f.cleanup()
-  })
-
-  it('输入与回车分块到达（真实模式时序）也能提交处理', async () => {
-    const f = await mountTui()
-    await waitFrame(f.setup, (frame) => frame.includes('Harness TUI'))
-    await f.setup.mockInput.typeText('hi')
-    f.setup.mockInput.pressEnter()
-    await waitFrame(f.setup, (frame) => frame.includes('🧑') && frame.includes('hi'))
-    await waitFrame(f.setup, (frame) => frame.includes('🤖') && frame.includes('你好，我是 TUI 助手。'))
     await f.cleanup()
   })
 })
