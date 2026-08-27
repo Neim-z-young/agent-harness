@@ -20,6 +20,33 @@
 
 - cli 74 用例全绿（新增 `--model` 解析、ConfigStore 往返/坏 JSON、resolveConfig 优先级、REPL `/model` 查看+切换+落盘、TUI 状态栏初始模型展示共 8 个），cli typecheck 通过
 
+## 2026-08-27（续 19）：多 Provider 配置健壮性增强
+
+### 背景
+
+续 18 的多 Provider 支持存在静默失败路径（重复 id 静默覆盖、未知 type 静默丢弃、默认 provider 缺失误导提示），apiKey 只能明文落盘。用户确认增强：启动显式校验、apiKey 环境变量引用 + 加密存储、配置自检命令。
+
+### 实现
+
+1. **显式校验（boot 一次性报错）**（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+   - `validateProviderConfigs`：重复 id / 未知 type / 默认 provider 未定义（非内置 mock/anthropic）→ 收集全部问题
+   - `ConfigValidationError`：boot 时输出所有问题后抛错，不再静默跳过或误导提示
+2. **密钥加密存储**：`SecretCipher`（AES-256-GCM）
+   - 主密钥：`HARNESS_CONFIG_KEY` 环境变量（sha256 派生）→ `<data-dir>/.config-key` 文件（首次自动生成，chmod 600）
+   - 格式 `enc:v1:<iv>:<tag>:<ct>`（base64），明文不落盘
+   - `resolveSecret`：`${ENV_VAR}` 环境变量引用 / `enc:v1:` 解密 / 明文透传；未设置变量或解密失败报 ConfigValidationError
+3. **config 子命令**：`harness config set-key <providerId> <apiKey>` 加密写入；`get-key <providerId>` 解密查看；`check` 校验 + 概览
+4. **自检命令**：`--check-config`（等价 `config check`）打印 Provider/模型概览（apiKey 状态脱敏展示：已配置 / 已加密 / env(名称) / 未配置）+ 校验，REPL 新增 `/config`
+5. **接入 GLM / Qwen 预设 Provider**（[packages/plugins/provider-glm](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/provider-glm/src/index.ts) / [provider-qwen](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/provider-qwen/src/index.ts)）
+   - CLI `ProviderConfig.type` 支持 `glm` / `qwen`：预设 baseUrl/apiPath/默认模型（GLM=bigmodel，Qwen=dashscope），apiKey 环境变量 ZHIPU_API_KEY / DASHSCOPE_API_KEY
+   - 插件 providerId 可覆盖、插件 id 随 providerId 派生（同 openai 多实例不冲突）
+6. **parseCliArgs**：`config` 子命令（arg=子命令，rest=剩余非选项参数）+ `--check-config`
+
+### 验证
+
+- 新增测试：SecretCipher 往返/主密钥优先级、resolveSecret（env 展开/未设置报错/解密）、validateProviderConfigs（重复/未知/默认缺失）、buildConfigOverview 脱敏、boot 显式报错（一次性输出）、glm/qwen 注册分发、${ENV} boot 展开、main config set-key/get-key/check、--check-config 通过与报错
+- cli 94 用例全绿，glm/qwen/cli 三包 typecheck 通过；真实 CLI 冒烟：check 概览、set-key 加密落盘、get-key 还原、错误配置一次性报错且退出码 1
+
 ## 2026-08-27（续 18）：多 Provider 自由切换（自定义模型配置）
 
 ### 背景

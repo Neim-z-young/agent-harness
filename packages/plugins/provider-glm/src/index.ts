@@ -37,6 +37,8 @@ export interface GlmProviderConfig {
   timeoutMs?: number
   /** 当模型输出空时是否报错 */
   strictEmptyContent?: boolean
+  /** Provider ID（默认 'glm'；配置多 GLM 端点时可覆盖为不同 id） */
+  providerId?: string
 }
 
 function toOpenAIConfig(cfg: GlmProviderConfig): OpenAIProviderConfig {
@@ -50,7 +52,7 @@ function toOpenAIConfig(cfg: GlmProviderConfig): OpenAIProviderConfig {
     maxTokens: cfg.maxTokens,
     timeoutMs: cfg.timeoutMs,
     strictEmptyContent: cfg.strictEmptyContent,
-    providerId: 'glm',
+    providerId: cfg.providerId ?? 'glm',
   }
 }
 
@@ -63,14 +65,18 @@ export function createProviderGlmPlugin(config?: GlmProviderConfig): AgentPlugin
 } {
   let provider: OpenAIChatProvider | undefined
 
+  // 插件 id 随 providerId 派生，使多个 GLM 端点可在同一进程内各自注册而不冲突
+  const providerId = config?.providerId ?? 'glm'
+  const pluginId = `provider.${providerId}`
+
   const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
-    id: 'provider.glm',
+    id: pluginId,
     version: '0.1.0',
     name: 'GLM Provider',
     description: '对接智谱 GLM（BigModel OpenAI 兼容 API）的 Provider 插件',
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<GlmProviderConfig>('provider.glm')
+      const storeCfg = ctx.config.get<GlmProviderConfig>(pluginId)
       const merged: GlmProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
 
       provider = new OpenAIChatProvider(toOpenAIConfig(merged), () => [])

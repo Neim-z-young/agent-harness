@@ -401,6 +401,17 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 - **插件安装**：`HarnessApp.boot()` 依次安装非默认 Provider 插件，默认 Provider 最后安装作兜底；openai 插件 id 随 `providerId` 派生（`provider.{providerId}`），多个兼容端点不冲突
 - **切换持久化**：`/model <provider/model>` 校验 provider 已注册后更新 Agent 并写入 `config.json`（provider + model）作为下次启动默认
 
+**配置健壮性（显式校验 / 密钥加密 / 自检）：**
+
+- **启动显式校验**：`validateProviderConfigs` 检查重复 id / 未知 type / 默认 provider 未定义（非内置 mock/anthropic），boot 时一次性输出所有问题并抛 `ConfigValidationError`（不再静默覆盖/丢弃或误导提示）
+- **apiKey 三种形式**（`resolveSecret` 统一解析）：
+  - 明文（向后兼容）
+  - `${ENV_VAR}` 环境变量引用（未设置报错）
+  - `enc:v1:<iv>:<tag>:<ct>` 加密值（AES-256-GCM，主密钥 `HARNESS_CONFIG_KEY` 环境变量或 `<data-dir>/.config-key` 文件）
+- **密钥管理命令**：`harness config set-key <providerId> <apiKey>` 加密写入；`get-key <providerId>` 解密查看；`check`（或 `--check-config`）打印 Provider/模型概览（apiKey 状态脱敏：已配置/已加密/env(名称)/未配置）并校验；REPL `/config` 查看概览
+- **同 URL 不同 key**：注册表按 `id` 分发，两个端点只要 `id` 不同即可共存（如 `gateway-a`/`gateway-b` 指向同一 baseUrl），`/model gateway-a/gpt-4o` 与 `/model gateway-b/gpt-4o` 各自使用对应 apiKey
+- **GLM / Qwen 预设**：`type: "glm"` / `type: "qwen"` 使用预设端点与默认模型（智谱 BigModel / 阿里 DashScope），apiKey 默认读 `ZHIPU_API_KEY` / `DASHSCOPE_API_KEY`；或统一用 `type: "openai"` 手动填 baseUrl/apiPath
+
 ---
 
 ### 3.5 Skill Layer：双轨技能系统

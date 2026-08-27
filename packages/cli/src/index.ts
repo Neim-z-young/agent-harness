@@ -40,6 +40,8 @@ import {
 import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatProvider } from '@harness/provider-anthropic'
 import { createProviderOpenAIPlugin, OpenAIProviderConfig } from '@harness/provider-openai'
 import { createProviderGeminiPlugin, GeminiProviderConfig } from '@harness/provider-gemini'
+import { createProviderGlmPlugin, GlmProviderConfig } from '@harness/provider-glm'
+import { createProviderQwenPlugin, QwenProviderConfig } from '@harness/provider-qwen'
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -61,6 +63,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile, writeFile, mkdir, unlink, readdir } from 'node:fs/promises'
+import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto'
 import { createInterface } from 'node:readline'
 
 // ========================================================================
@@ -68,10 +71,12 @@ import { createInterface } from 'node:readline'
 // ========================================================================
 
 export interface CliArgs {
-  /** 子命令：repl / start / list-sessions / resume / run / teammate */
-  command: 'repl' | 'list-sessions' | 'resume' | 'run' | 'teammate' | 'help'
-  /** resume / run 的参数 */
+  /** 子命令：repl / start / list-sessions / resume / run / teammate / config */
+  command: 'repl' | 'list-sessions' | 'resume' | 'run' | 'teammate' | 'config' | 'help'
+  /** resume / run / config 的参数（config 为子命令如 set-key / get-key / check） */
   arg?: string
+  /** config 子命令的剩余参数（如 set-key 后的 <providerId> <apiKey>） */
+  rest?: string[]
   /** 选项 */
   cwd?: string
   agentId?: string
@@ -89,6 +94,8 @@ export interface CliArgs {
   verbose?: boolean
   /** 以 TUI（alt-screen 全屏）模式启动 REPL */
   tui?: boolean
+  /** 仅校验 config.json 配置并打印概览后退出 */
+  checkConfig?: boolean
   showHelp?: boolean
 }
 
@@ -110,11 +117,18 @@ export function parseCliArgs(raw: string[]): CliArgs {
     else if (cmd === 'list-sessions') command = 'list-sessions'
     else if (cmd === 'resume') command = 'resume'
     else if (cmd === 'run') command = 'run'
+    else if (cmd === 'config') command = 'config'
     else if (cmd === 'teammate') command = 'teammate'
     else if (cmd === 'help' || cmd === '--help' || cmd === '-h') { out.showHelp = true; command = 'help' }
     else { arg = cmd } // 非标准：直接填 arg 用于 run 无命令场景
     if ((command === 'resume' || command === 'run') && args.length > 0 && !args[0].startsWith('-')) {
       arg = args.shift()!
+    }
+    if (command === 'config' && args.length > 0 && !args[0].startsWith('-')) {
+      arg = args.shift()!
+      const rest: string[] = []
+      while (args.length > 0 && !args[0].startsWith('-')) rest.push(args.shift()!)
+      out.rest = rest
     }
     out.command = command
     out.arg = arg
@@ -125,6 +139,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     if (a === '-h' || a === '--help') { out.showHelp = true; continue }
     if (a === '-v' || a === '--verbose') { out.verbose = true; continue }
     if (a === '--tui') { out.tui = true; continue }
+    if (a === '--check-config') { out.checkConfig = true; continue }
     const [k, v] = a.startsWith('--')
       ? a.slice(2).split('=', 2) as [string, string | undefined]
       : (() => {
@@ -260,8 +275,8 @@ export interface HarnessConfig {
 export interface ProviderConfig {
   /** 唯一 ID：运行时 `provider/model` 前缀据此分发（如 anthropic / openai / deepseek / ollama / glm / qwen） */
   id: string
-  /** Provider 类型（决定用哪个插件的实现；anthropic / gemini 使用原生协议，openai 可对接任意 OpenAI 兼容端点） */
-  type: 'anthropic' | 'openai' | 'gemini' | 'mock'
+  /** Provider 类型（决定用哪个插件的实现；anthropic / gemini / glm / qwen 使用各自预设协议，openai 可对接任意 OpenAI 兼容端点） */
+  type: 'anthropic' | 'openai' | 'gemini' | 'glm' | 'qwen' | 'mock'
   /** API 根路径（如 api.openai.com / api.deepseek.com / http://localhost:11434（Ollama）） */
   baseUrl?: string
   /** API Key */
@@ -327,6 +342,158 @@ export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
     model: args.model ?? cfg.model,
     anthropicApiKey: cfg.anthropicApiKey,
   }
+}
+
+// ------------------------------------------------------------------------
+// 2.2 密钥加密存储 + 配置校验（多 Provider 健壮性）
+// ------------------------------------------------------------------------
+
+/** 配置校验/密钥解析失败（含定位信息），启动时一次性抛出 */
+export class ConfigValidationError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConfigValidationError'
+  }
+}
+
+/**
+ * API Key 加密（AES-256-GCM）。主密钥来源（优先级从高到低）：
+ * 1. HARNESS_CONFIG_KEY 环境变量（sha256 派生 32 字节）
+ * 2. <data-dir>/.config-key 文件（首次自动生成 64 位 hex，chmod 600）
+ */
+export class SecretCipher {
+  constructor(public readonly dataDir: string) {}
+
+  private keyFile(): string {
+    return join(this.dataDir, '.config-key')
+  }
+
+  async masterKey(): Promise<Buffer> {
+    const env = typeof process !== 'undefined' ? process.env.HARNESS_CONFIG_KEY : undefined
+    if (env && env.length >= 8) return createHash('sha256').update(env).digest()
+    const p = this.keyFile()
+    if (existsSync(p)) return Buffer.from((await readFile(p, 'utf-8')).trim(), 'hex')
+    const key = randomBytes(32).toString('hex')
+    await mkdir(this.dataDir, { recursive: true })
+    await writeFile(p, key, { mode: 0o600 })
+    return Buffer.from(key, 'hex')
+  }
+
+  /** 加密为 `enc:v1:<iv>:<tag>:<ct>`（base64） */
+  async encrypt(plain: string): Promise<string> {
+    const key = await this.masterKey()
+    const iv = randomBytes(12)
+    const cipher = createCipheriv('aes-256-gcm', key, iv)
+    const ct = Buffer.concat([cipher.update(plain, 'utf-8'), cipher.final()])
+    const tag = cipher.getAuthTag()
+    return `enc:v1:${iv.toString('base64')}:${tag.toString('base64')}:${ct.toString('base64')}`
+  }
+
+  /** 解密 enc:v1 值；非 enc: 前缀原样返回 */
+  async decrypt(token: string): Promise<string> {
+    if (!token.startsWith('enc:v1:')) return token
+    const parts = token.split(':')
+    const ivB64 = parts[2]
+    const tagB64 = parts[3]
+    const ctB64 = parts.slice(4).join(':')
+    if (!ivB64 || !tagB64 || !ctB64) {
+      throw new ConfigValidationError(`无效的加密密钥格式：${token.slice(0, 24)}…`)
+    }
+    try {
+      const key = await this.masterKey()
+      const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64'))
+      decipher.setAuthTag(Buffer.from(tagB64, 'base64'))
+      return Buffer.concat([decipher.update(Buffer.from(ctB64, 'base64')), decipher.final()]).toString('utf-8')
+    } catch (err: any) {
+      throw new ConfigValidationError(
+        `加密密钥解密失败（HARNESS_CONFIG_KEY / .config-key 与写入时不一致？）：${err?.message ?? String(err)}`,
+      )
+    }
+  }
+}
+
+/**
+ * apiKey 值解析：
+ * - `${ENV_VAR}` → 环境变量（未设置时抛 ConfigValidationError）
+ * - `enc:v1:...` → SecretCipher 解密
+ * - 其他 → 原样明文返回
+ */
+export async function resolveSecret(value: string | undefined, cipher: SecretCipher): Promise<string | undefined> {
+  if (!value) return undefined
+  const trimmed = value.trim()
+  const m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(trimmed)
+  if (m) {
+    const v = typeof process !== 'undefined' ? process.env[m[1]] : undefined
+    if (v === undefined) {
+      throw new ConfigValidationError(`环境变量 ${m[1]} 未设置（apiKey 引用了它）`)
+    }
+    return v
+  }
+  if (trimmed.startsWith('enc:v1:')) return cipher.decrypt(trimmed)
+  return value
+}
+
+/** providers 配置校验问题（index=-1 表示非数组内问题，如默认 provider 未定义） */
+export interface ProviderConfigIssue {
+  index: number
+  message: string
+}
+
+/**
+ * 校验 providers 数组与默认 provider：
+ * - id 缺失 / 重复 → 报错（避免静默覆盖注册）
+ * - type 未知 → 报错（列出支持的类型）
+ * - 默认 provider 指向未定义的 id（非内置 mock/anthropic）→ 报错
+ */
+export function validateProviderConfigs(providers: ProviderConfig[], defaultProviderId: string): ProviderConfigIssue[] {
+  const issues: ProviderConfigIssue[] = []
+  const seen = new Set<string>()
+  const knownTypes = new Set(['anthropic', 'openai', 'gemini', 'glm', 'qwen', 'mock'])
+  providers.forEach((pc, i) => {
+    if (!pc.id?.trim()) {
+      issues.push({ index: i, message: `providers[${i}] 缺少 id（必须唯一）` })
+      return
+    }
+    if (seen.has(pc.id)) {
+      issues.push({ index: i, message: `providers[${i}].id "${pc.id}" 与前面的 provider 重复（id 必须唯一，否则后注册的会被覆盖）` })
+    }
+    seen.add(pc.id)
+    if (!knownTypes.has(pc.type as any)) {
+      issues.push({ index: i, message: `providers[${i}].type "${pc.type}" 未知（支持：anthropic / openai / gemini / glm / qwen / mock）` })
+    }
+  })
+  if (defaultProviderId && defaultProviderId !== 'mock' && defaultProviderId !== 'anthropic' && !seen.has(defaultProviderId)) {
+    issues.push({ index: -1, message: `默认 provider "${defaultProviderId}" 未在 providers 数组中定义（type 支持：anthropic / openai / gemini / glm / qwen / mock）` })
+  }
+  return issues
+}
+
+/** 配置概览（--check-config / /config 共用），maskKey 为 true 时隐藏明文 apiKey */
+export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string, maskKey = true): string {
+  const lines: string[] = []
+  lines.push(`默认 provider：${cfg.provider ?? defaultProviderId}`)
+  if (cfg.model) lines.push(`默认 model：${cfg.model}`)
+  const providers = cfg.providers ?? []
+  if (!providers.length) {
+    lines.push('providers：（未配置，使用内置 mock / anthropic）')
+    return lines.join('\n')
+  }
+  lines.push('providers：')
+  for (const pc of providers) {
+    const api = pc.apiKey
+      ? pc.apiKey.startsWith('enc:v1:')
+        ? '已加密'
+        : /^\$\{.*\}$/.test(pc.apiKey.trim())
+          ? `env(${pc.apiKey.trim().slice(2, -1)})`
+          : maskKey
+            ? '已配置'
+            : pc.apiKey
+      : '（未配置）'
+    const isDefault = pc.id === (cfg.provider ?? defaultProviderId) ? ' ← 默认' : ''
+    const path = [pc.type, pc.baseUrl ?? '（默认端点）', pc.apiPath ?? ''].filter(Boolean).join(' · ')
+    lines.push(`  - ${pc.id}${isDefault}  type=${path}  model=${pc.model ?? '（Provider 默认）'}  apiKey=${api}`)
+  }
+  return lines.join('\n')
 }
 
 // ========================================================================
@@ -530,6 +697,10 @@ export class HarnessApp {
     switch (pc.type) {
       case 'openai':
         return createProviderOpenAIPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id })
+      case 'glm':
+        return createProviderGlmPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id } as GlmProviderConfig)
+      case 'qwen':
+        return createProviderQwenPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id } as QwenProviderConfig)
       case 'anthropic':
         // 兼容：config 里未带 key 时回退 anthropicProviderOptions / 环境变量
         return createProviderAnthropicPlugin({
@@ -576,8 +747,27 @@ export class HarnessApp {
     // 2) 默认 Provider 最后注册 —— 作为无 provider 前缀模型的兜底（也是运行时 /model 落盘的默认 provider）
     // ------------------------------------------------------------------
     const cfg = await this.configStore.load()
-    const providerConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
+    const rawProviderConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
     const defaultProviderId = this.options.provider ?? cfg.provider ?? 'anthropic'
+
+    // 显式校验 + 密钥解析（错误一次性汇总，避免静默跳过/误导）
+    const cipher = new SecretCipher(this.options.dataDir)
+    const configIssues: string[] = []
+    const providerConfigs: ProviderConfig[] = []
+    for (const pc of rawProviderConfigs) {
+      try {
+        providerConfigs.push({ ...pc, apiKey: await resolveSecret(pc.apiKey, cipher) })
+      } catch (err: any) {
+        configIssues.push(`providers[${rawProviderConfigs.indexOf(pc)}]（id=${pc.id ?? '?'}）：${err?.message ?? String(err)}`)
+      }
+    }
+    for (const iss of validateProviderConfigs(rawProviderConfigs, defaultProviderId)) {
+      configIssues.push(iss.message)
+    }
+    if (configIssues.length) {
+      this.options.stdout?.write?.('配置错误（config.json → providers）：\n' + configIssues.map((s) => `  - ${s}`).join('\n') + '\n')
+      throw new ConfigValidationError(configIssues.join('；'))
+    }
 
     // 默认 Provider 若是命名 Provider（非 mock/anthropic），从配置中找到它（避免重复注册，放到最后作默认）
     const isCustomDefault = defaultProviderId !== 'mock' && defaultProviderId !== 'anthropic'
@@ -622,9 +812,16 @@ export class HarnessApp {
     } else {
       // anthropic（或无 key 时 fallback mock）
       const envKey = typeof process !== 'undefined' ? process.env.ANTHROPIC_API_KEY : undefined
+      let mergedApiKey = this.options.anthropicProviderConfig?.apiKey ?? cfg.anthropicApiKey ?? envKey
+      try {
+        mergedApiKey = await resolveSecret(mergedApiKey, cipher)
+      } catch (err: any) {
+        this.options.stdout?.write?.(`配置错误：${err?.message ?? String(err)}\n`)
+        throw new ConfigValidationError(err?.message ?? String(err))
+      }
       const mergedAnthropic = {
         ...(this.options.anthropicProviderConfig ?? {}),
-        apiKey: this.options.anthropicProviderConfig?.apiKey ?? cfg.anthropicApiKey ?? envKey,
+        apiKey: mergedApiKey,
         defaultModel: this.options.anthropicProviderConfig?.defaultModel ?? (parseModelSpec(this.options.model ?? '').modelId || undefined),
       }
       const hasKey = !!mergedAnthropic.apiKey
@@ -762,7 +959,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/model', '/save', '/compact']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/model', '/config', '/save', '/compact']
 
 // ========================================================================
 // 5.1 后台任务面板（P1-4 前端事件驱动展示）
@@ -918,6 +1115,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /model             查看当前模型\n')
           out('  /model <spec>      切换模型：provider/modelId 跨 Provider（如 /model openai/gpt-4o）\n')
           out('  /model ?           列出已注册 Provider\n')
+          out('  /config            查看 Provider / 模型配置概览（config.json）\n')
           out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
@@ -998,6 +1196,17 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           const ok = await app.setModel(agentId, arg.trim())
           if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
           out(`已切换模型 ${arg.trim()}（agent=${agentId}，影响下次 send；已写入 config.json）\n`)
+          return 'continue'
+        }
+        case '/config': {
+          const cfg = await app.configStore.load()
+          const agentId = current.agentId ?? 'default'
+          out(`当前 agent=${agentId}\n`)
+          const prods = app.listProviders()
+          out(`已注册 Provider：${prods.length ? prods.join(' / ') : '（默认 mock/anthropic）'}\n`)
+          const m = app.getModel(agentId)
+          if (m) out(`当前模型：${m}\n`)
+          out(buildConfigOverview(cfg, cfg.provider ?? 'anthropic') + '\n')
           return 'continue'
         }
         case '/compact': {
@@ -1279,6 +1488,9 @@ export const HELP_TEXT = `harness — Agent Harness CLI
   harness resume <sessionId> [opt]      恢复指定会话进入 REPL
   harness run "<prompt>" [opt]          一次性执行 prompt，输出结果后退出
   harness teammate --team <t> --name <n> [opt]   以 out-of-process teammate 身份运行（终端后端 spawn）
+  harness config set-key <providerId> <apiKey>   加密写入 provider 的 apiKey（enc:v1 密文）
+  harness config get-key <providerId>            解密查看 provider 的 apiKey
+  harness config check [options]       校验 config.json 并打印 Provider/模型概览
   harness help | -h | --help            显示帮助
 
 teammate 选项:
@@ -1295,6 +1507,7 @@ teammate 选项:
       --permission <mode>  allow-all / ask（默认 ask）
   -v, --verbose            输出调试信息
       --tui                以 TUI（alt-screen 全屏）模式启动 REPL
+      --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
 
 多 Provider（config.json → providers）:
   [
@@ -1370,6 +1583,64 @@ export async function runTeammateCli(options: {
   return 0
 }
 
+/**
+ * config 子命令：密钥管理与配置自检。
+ *   harness config set-key <providerId> <apiKey>   加密 apiKey 并写入 config.json（enc:v1 密文）
+ *   harness config get-key <providerId>            解密输出指定 provider 的 apiKey
+ *   harness config check                           校验配置并打印概览（等价 --check-config）
+ */
+export async function runConfigCommand(options: {
+  args: CliArgs
+  dataDir: string
+  write: (s: string) => void
+}): Promise<number> {
+  const { args, dataDir, write } = options
+  const sub = args.arg
+  const store = new ConfigStore(dataDir)
+  const cfg = await store.load()
+  const cipher = new SecretCipher(dataDir)
+  const providers = cfg.providers ?? []
+
+  if (sub === 'set-key') {
+    const [providerId, key] = args.rest ?? []
+    if (!providerId || !key) { write('用法: harness config set-key <providerId> <apiKey>\n'); return 1 }
+    const idx = providers.findIndex((p) => p.id === providerId)
+    if (idx < 0) { write(`Provider "${providerId}" 不在 config.json → providers 中。\n`); return 1 }
+    const encrypted = await cipher.encrypt(key)
+    providers[idx] = { ...providers[idx], apiKey: encrypted }
+    await store.save({ ...cfg, providers })
+    write(`已加密写入 "${providerId}" 的 apiKey（config.json 中为 enc:v1 密文，主密钥见 HARNESS_CONFIG_KEY / <data-dir>/.config-key）。\n`)
+    return 0
+  }
+
+  if (sub === 'get-key') {
+    const [providerId] = args.rest ?? []
+    if (!providerId) { write('用法: harness config get-key <providerId>\n'); return 1 }
+    const idx = providers.findIndex((p) => p.id === providerId)
+    if (idx < 0) { write(`Provider "${providerId}" 不在 config.json → providers 中。\n`); return 1 }
+    const raw = providers[idx]?.apiKey
+    if (!raw) { write(`Provider "${providerId}" 未配置 apiKey。\n`); return 0 }
+    const plain = await cipher.decrypt(raw)
+    write(plain + '\n')
+    return 0
+  }
+
+  if (sub === 'check') {
+    const defaultProviderId = cfg.provider ?? 'anthropic'
+    const issues = validateProviderConfigs(providers, defaultProviderId)
+    write(buildConfigOverview(cfg, defaultProviderId) + '\n')
+    if (issues.length) {
+      write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')
+      return 1
+    }
+    write('配置校验通过。\n')
+    return 0
+  }
+
+  write('用法: harness config <set-key|get-key|check> ...\n')
+  return 1
+}
+
 export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<number> {
   const args = parseCliArgs(rawArgs)
   const stdout: { write: (s: string) => void } = process.stdout
@@ -1394,6 +1665,21 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       const when = new Date(s.updatedAt).toLocaleString()
       write(`${s.id}\t${s.title ?? ''}\t${s.messageCount} msgs\t${when}\n`)
     }
+    return 0
+  }
+
+  if (args.command === 'config') {
+    return runConfigCommand({ args, dataDir, write })
+  }
+
+  if (args.checkConfig) {
+    const issues = validateProviderConfigs(cfg.providers ?? [], provider)
+    write(buildConfigOverview(cfg, provider) + '\n')
+    if (issues.length) {
+      write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')
+      return 1
+    }
+    write('配置校验通过。\n')
     return 0
   }
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -11,6 +11,11 @@ import {
   resolveConfig,
   parseModelSpec,
   formatModel,
+  ConfigValidationError,
+  SecretCipher,
+  resolveSecret,
+  validateProviderConfigs,
+  buildConfigOverview,
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
@@ -73,6 +78,21 @@ describe('parseCliArgs 命令解析', () => {
     expect(parseCliArgs(['run', 'hi', '-m=model-x']).model).toBe('model-x')
     expect(parseCliArgs(['repl']).model).toBeUndefined()
   })
+
+  it('config 子命令：set-key/get-key/check + 剩余参数', () => {
+    const a = parseCliArgs(['config', 'set-key', 'openai', 'sk-123'])
+    expect(a.command).toBe('config')
+    expect(a.arg).toBe('set-key')
+    expect(a.rest).toEqual(['openai', 'sk-123'])
+    expect(parseCliArgs(['config', 'check'])).toMatchObject({ command: 'config', arg: 'check' })
+    expect(parseCliArgs(['config'])).toMatchObject({ command: 'config', arg: undefined })
+  })
+
+  it('--check-config 解析为 checkConfig: true', () => {
+    expect(parseCliArgs(['--check-config']).checkConfig).toBe(true)
+    expect(parseCliArgs(['--check-config', '-d', '/x'])).toMatchObject({ checkConfig: true, dataDir: '/x' })
+    expect(parseCliArgs(['repl']).checkConfig).toBeUndefined()
+  })
 })
 
 describe('ConfigStore 全局配置（config.json）', () => {
@@ -112,6 +132,110 @@ describe('ConfigStore 全局配置（config.json）', () => {
     expect(out.agentId).toBe('default')
     expect(out.provider).toBe('anthropic')
     expect(out.model).toBeUndefined()
+  })
+})
+
+describe('SecretCipher / resolveSecret 密钥处理', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-secret-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('encrypt → decrypt 往返还原明文；非 enc 原样返回', async () => {
+    const cipher = new SecretCipher(dir)
+    const enc = await cipher.encrypt('sk-secret-abc')
+    expect(enc.startsWith('enc:v1:')).toBe(true)
+    expect(enc).not.toContain('sk-secret-abc') // 明文不落盘
+    expect(await cipher.decrypt(enc)).toBe('sk-secret-abc')
+    expect(await cipher.decrypt('plain-value')).toBe('plain-value')
+  })
+
+  it('主密钥来源：HARNESS_CONFIG_KEY 环境变量优先于 .config-key 文件', async () => {
+    const prev = process.env.HARNESS_CONFIG_KEY
+    try {
+      process.env.HARNESS_CONFIG_KEY = 'my-master-secret-key'
+      const cipher = new SecretCipher(dir)
+      const enc = await cipher.encrypt('k1')
+      const cipher2 = new SecretCipher(dir) // 同 env → 可解密
+      expect(await cipher2.decrypt(enc)).toBe('k1')
+      // 不同 env → 解密失败（ConfigValidationError）
+      process.env.HARNESS_CONFIG_KEY = 'different-master-key'
+      await expect(cipher2.decrypt(enc)).rejects.toThrow(ConfigValidationError)
+    } finally {
+      if (prev === undefined) delete process.env.HARNESS_CONFIG_KEY
+      else process.env.HARNESS_CONFIG_KEY = prev
+    }
+  })
+
+  it('resolveSecret：${ENV_VAR} 展开 / 未设置报错 / enc 解密 / 明文透传', async () => {
+    const cipher = new SecretCipher(dir)
+    const prev = process.env.HARNESS_TEST_KEY
+    try {
+      process.env.HARNESS_TEST_KEY = 'env-value'
+      expect(await resolveSecret('${HARNESS_TEST_KEY}', cipher)).toBe('env-value')
+      expect(await resolveSecret('plain-key', cipher)).toBe('plain-key')
+      expect(await resolveSecret(undefined, cipher)).toBeUndefined()
+      const enc = await cipher.encrypt('enc-secret')
+      expect(await resolveSecret(enc, cipher)).toBe('enc-secret')
+    } finally {
+      if (prev === undefined) delete process.env.HARNESS_TEST_KEY
+      else process.env.HARNESS_TEST_KEY = prev
+    }
+    await expect(resolveSecret('${HARNESS_TEST_NONEXISTENT_XYZ}', cipher)).rejects.toThrow(ConfigValidationError)
+  })
+})
+
+describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
+  it('重复 id / 未知 type / 默认 provider 未定义 → 报错', () => {
+    const issues = validateProviderConfigs(
+      [
+        { id: 'openai', type: 'openai' },
+        { id: 'openai', type: 'openai' },
+        { id: 'bad', type: 'wat' as any },
+      ],
+      'deepseek',
+    )
+    expect(issues.length).toBe(3)
+    expect(issues.some((i) => i.message.includes('重复'))).toBe(true)
+    expect(issues.some((i) => i.message.includes('未知'))).toBe(true)
+    expect(issues.some((i) => i.message.includes('"deepseek" 未在 providers'))).toBe(true)
+  })
+
+  it('缺 id 报错；合法配置（含 mock/anthropic 默认）无问题', () => {
+    expect(validateProviderConfigs([{ id: '', type: 'openai' }], 'mock').length).toBe(1)
+    expect(validateProviderConfigs(
+      [
+        { id: 'glm', type: 'glm' },
+        { id: 'qwen', type: 'qwen' },
+        { id: 'gemini', type: 'gemini' },
+      ],
+      'glm',
+    )).toEqual([])
+    // 内置 mock/anthropic 作为默认不要求出现在 providers
+    expect(validateProviderConfigs([], 'mock')).toEqual([])
+    expect(validateProviderConfigs([], 'anthropic')).toEqual([])
+  })
+
+  it('buildConfigOverview：输出默认标记、端点与 apiKey 状态（默认脱敏）', () => {
+    const overview = buildConfigOverview(
+      {
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        providers: [
+          { id: 'openai', type: 'openai', baseUrl: 'https://api.openai.com', apiKey: 'sk-plain', model: 'gpt-4o' },
+          { id: 'deepseek', type: 'openai', baseUrl: 'https://api.deepseek.com', apiKey: '${DEEPSEEK_KEY}', model: 'deepseek-chat' },
+        ],
+      },
+      'deepseek',
+    )
+    expect(overview).toInclude('默认 provider：deepseek')
+    expect(overview).toInclude('默认 model：deepseek-chat')
+    expect(overview).toInclude('openai')
+    expect(overview).toInclude('deepseek ← 默认')
+    expect(overview).toInclude('apiKey=已配置')     // 明文被脱敏
+    expect(overview).toInclude('apiKey=env(DEEPSEEK_KEY)') // 环境变量引用显式展示
+    expect(overview).not.toContain('sk-plain')      // 明文不输出
+    // maskKey=false 时输出明文
+    expect(buildConfigOverview({ providers: [{ id: 'a', type: 'openai', apiKey: 'sk-x' }] }, 'a', false)).toContain('sk-x')
   })
 })
 
@@ -345,6 +469,119 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('同 baseUrl 不同 apiKey 的 Provider：不同 id 各自分发，key 互不干扰', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'gateway-a',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'gateway-a', type: 'openai', baseUrl: 'https://gw.example.com/v1', apiKey: 'key-a', model: 'gpt-4o' },
+        { id: 'gateway-b', type: 'openai', baseUrl: 'https://gw.example.com/v1', apiKey: 'key-b', model: 'gpt-4o' },
+      ],
+    })
+    const { harness } = await app.boot()
+    expect(app.listProviders()).toEqual(expect.arrayContaining(['gateway-a', 'gateway-b']))
+    const h = harness as unknown as { resolveChatProvider: (id?: string) => { id?: string; config?: { apiKey?: string; baseUrl?: string } } }
+    const a = h.resolveChatProvider('gateway-a')
+    const b = h.resolveChatProvider('gateway-b')
+    expect(a?.id).toBe('gateway-a')
+    expect(a?.config?.apiKey).toBe('key-a')
+    expect(b?.id).toBe('gateway-b')
+    expect(b?.config?.apiKey).toBe('key-b')
+    // 未注册 id 回退默认（gateway-a）
+    expect(h.resolveChatProvider('nope')?.id).toBe('gateway-a')
+    await app.shutdown()
+  })
+
+  it('boot 显式校验：重复 id / 未知 type / 默认 provider 未定义 → ConfigValidationError', async () => {
+    const stdout = { write: () => {} }
+    // 重复 id
+    await expect(new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'openai',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'openai', type: 'openai', baseUrl: 'http://x' },
+        { id: 'openai', type: 'openai', baseUrl: 'http://y' },
+      ],
+    }).boot()).rejects.toThrow(ConfigValidationError)
+    // 未知 type
+    await expect(new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'openai',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [{ id: 'openai', type: 'wat' as any, baseUrl: 'http://x' }],
+    }).boot()).rejects.toThrow(ConfigValidationError)
+    // 默认 provider 未在 providers 中定义
+    await expect(new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'my-gw',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [{ id: 'openai', type: 'openai', baseUrl: 'http://x' }],
+    }).boot()).rejects.toThrow(/未在 providers/)
+  })
+
+  it('boot 校验错误会一次性输出所有问题（重复 id + 默认缺失同时报出）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    await expect(new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'nope',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'a', type: 'openai' },
+        { id: 'a', type: 'openai' },
+      ],
+    }).boot()).rejects.toThrow(ConfigValidationError)
+    expect(chunks.join('')).toInclude('配置错误（config.json → providers）')
+    expect(chunks.join('')).toInclude('"a" 与前面的 provider 重复')
+    expect(chunks.join('')).toInclude('"nope" 未在 providers')
+  })
+
+  it('type=glm / type=qwen：预设端点插件注册并可按 id 分发', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'glm',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'glm', type: 'glm', apiKey: 'glm-key' },
+        { id: 'qwen', type: 'qwen', apiKey: 'qwen-key' },
+      ],
+    })
+    const { harness } = await app.boot()
+    expect(app.listProviders()).toEqual(expect.arrayContaining(['glm', 'qwen']))
+    const h = harness as unknown as { resolveChatProvider: (id?: string) => { id?: string; config?: { apiKey?: string; baseUrl?: string } } }
+    const glm = h.resolveChatProvider('glm')
+    const qwen = h.resolveChatProvider('qwen')
+    expect(glm?.id).toBe('glm')
+    expect(glm?.config?.apiKey).toBe('glm-key')
+    expect(glm?.config?.baseUrl).toContain('bigmodel') // 预设端点
+    expect(qwen?.id).toBe('qwen')
+    expect(qwen?.config?.apiKey).toBe('qwen-key')
+    expect(qwen?.config?.baseUrl).toContain('dashscope') // 预设端点
+    await app.shutdown()
+  })
+
+  it('apiKey 支持 ${ENV_VAR} 引用：boot 时展开', async () => {
+    const prev = process.env.HARNESS_TEST_OPENAI_KEY
+    try {
+      process.env.HARNESS_TEST_OPENAI_KEY = 'env-openai-key'
+      const stdout = { write: () => {} }
+      const app = new HarnessApp({
+        cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'openai',
+        permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+        providers: [
+          { id: 'openai', type: 'openai', baseUrl: 'http://x', apiKey: '${HARNESS_TEST_OPENAI_KEY}' },
+        ],
+      })
+      const { harness } = await app.boot()
+      const h = harness as unknown as { resolveChatProvider: (id?: string) => { id?: string; config?: { apiKey?: string } } }
+      expect(h.resolveChatProvider('openai')?.config?.apiKey).toBe('env-openai-key')
+      await app.shutdown()
+    } finally {
+      if (prev === undefined) delete process.env.HARNESS_TEST_OPENAI_KEY
+      else process.env.HARNESS_TEST_OPENAI_KEY = prev
+    }
+  })
+
   it('main run 子命令执行 prompt 并输出文本', async () => {
     const chunks: string[] = []
     const originalWrite = process.stdout.write.bind(process.stdout) as any
@@ -388,6 +625,95 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
       const code = await main(['--help'])
       expect(code).toBe(0)
       expect(chunks.join('')).toInclude(HELP_TEXT.slice(0, 20))
+    } finally {
+      process.stdout.write = originalWrite
+    }
+  })
+
+  it('main config set-key / get-key：apiKey 加密落盘并可解密还原', async () => {
+    const dd = join(dir, '.harness')
+    mkdirSync(dd, { recursive: true })
+    // 预置 providers 配置（openai 无 key）
+    const cfg: Record<string, unknown> = {
+      provider: 'openai',
+      model: 'gpt-4o',
+      providers: [{ id: 'openai', type: 'openai', baseUrl: 'https://api.openai.com' }],
+    }
+    writeFileSync(join(dd, 'config.json'), JSON.stringify(cfg, null, 2))
+
+    const chunks: string[] = []
+    const originalWrite = process.stdout.write.bind(process.stdout) as any
+    process.stdout.write = ((s: any) => { chunks.push(String(s)); return true }) as any
+    try {
+      const code = await main(['config', 'set-key', 'openai', 'sk-live-abc', '-d', dd])
+      expect(code).toBe(0)
+      expect(chunks.join('')).toInclude('已加密写入')
+    } finally {
+      process.stdout.write = originalWrite
+    }
+
+    // config.json 中是 enc:v1 密文，不落明文
+    const saved = JSON.parse(readFileSync(join(dd, 'config.json'), 'utf-8'))
+    expect(saved.providers[0].apiKey).toMatch(/^enc:v1:/)
+    expect(saved.providers[0].apiKey).not.toContain('sk-live-abc')
+
+    // get-key 解密还原
+    const chunks2: string[] = []
+    process.stdout.write = ((s: any) => { chunks2.push(String(s)); return true }) as any
+    try {
+      const code = await main(['config', 'get-key', 'openai', '-d', dd])
+      expect(code).toBe(0)
+      expect(chunks2.join('')).toInclude('sk-live-abc')
+    } finally {
+      process.stdout.write = originalWrite
+    }
+  })
+
+  it('main config check / --check-config：合法配置打印概览并校验通过', async () => {
+    const dd = join(dir, '.harness')
+    mkdirSync(dd, { recursive: true })
+    writeFileSync(join(dd, 'config.json'), JSON.stringify({
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+      providers: [
+        { id: 'openai', type: 'openai', baseUrl: 'https://api.openai.com', apiKey: 'sk-1', model: 'gpt-4o' },
+        { id: 'deepseek', type: 'openai', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat' },
+      ],
+    }, null, 2))
+    for (const argv of [['config', 'check'], ['--check-config']]) {
+      const chunks: string[] = []
+      const originalWrite = process.stdout.write.bind(process.stdout) as any
+      process.stdout.write = ((s: any) => { chunks.push(String(s)); return true }) as any
+      try {
+        const code = await main([...argv, '-d', dd])
+        expect(code).toBe(0)
+        const out = chunks.join('')
+        expect(out).toInclude('默认 provider：deepseek')
+        expect(out).toInclude('deepseek ← 默认')
+        expect(out).toInclude('配置校验通过')
+      } finally {
+        process.stdout.write = originalWrite
+      }
+    }
+  })
+
+  it('main --check-config：配置错误 → 返回 1 并输出错误', async () => {
+    const dd = join(dir, '.harness')
+    mkdirSync(dd, { recursive: true })
+    writeFileSync(join(dd, 'config.json'), JSON.stringify({
+      provider: 'deepseek',
+      providers: [{ id: 'openai', type: 'openai' }, { id: 'openai', type: 'openai' }],
+    }, null, 2))
+    const chunks: string[] = []
+    const originalWrite = process.stdout.write.bind(process.stdout) as any
+    process.stdout.write = ((s: any) => { chunks.push(String(s)); return true }) as any
+    try {
+      const code = await main(['--check-config', '-d', dd])
+      expect(code).toBe(1)
+      const out = chunks.join('')
+      expect(out).toInclude('配置错误（config.json → providers）')
+      expect(out).toInclude('重复')
+      expect(out).toInclude('"deepseek" 未在 providers')
     } finally {
       process.stdout.write = originalWrite
     }

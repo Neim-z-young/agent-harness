@@ -37,6 +37,8 @@ export interface QwenProviderConfig {
   timeoutMs?: number
   /** 当模型输出空时是否报错 */
   strictEmptyContent?: boolean
+  /** Provider ID（默认 'qwen'；配置多 Qwen 端点时可覆盖为不同 id） */
+  providerId?: string
 }
 
 function toOpenAIConfig(cfg: QwenProviderConfig): OpenAIProviderConfig {
@@ -50,7 +52,7 @@ function toOpenAIConfig(cfg: QwenProviderConfig): OpenAIProviderConfig {
     maxTokens: cfg.maxTokens,
     timeoutMs: cfg.timeoutMs,
     strictEmptyContent: cfg.strictEmptyContent,
-    providerId: 'qwen',
+    providerId: cfg.providerId ?? 'qwen',
   }
 }
 
@@ -63,14 +65,18 @@ export function createProviderQwenPlugin(config?: QwenProviderConfig): AgentPlug
 } {
   let provider: OpenAIChatProvider | undefined
 
+  // 插件 id 随 providerId 派生，使多个 Qwen 端点可在同一进程内各自注册而不冲突
+  const providerId = config?.providerId ?? 'qwen'
+  const pluginId = `provider.${providerId}`
+
   const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
-    id: 'provider.qwen',
+    id: pluginId,
     version: '0.1.0',
     name: 'Qwen Provider',
     description: '对接通义千问 Qwen（DashScope OpenAI 兼容模式）的 Provider 插件',
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<QwenProviderConfig>('provider.qwen')
+      const storeCfg = ctx.config.get<QwenProviderConfig>(pluginId)
       const merged: QwenProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
 
       provider = new OpenAIChatProvider(toOpenAIConfig(merged), () => [])
