@@ -363,6 +363,20 @@ interface AgentDefinition {
 }
 ```
 
+**模型配置与运行时切换（@harness/cli）：**
+
+模型取值优先级（CLI > `config.json` > 环境变量）：
+
+```
+CLI:  harness --model <modelId>            # 或 -m
+config.json: { "model": "...", "provider": "...", "agentId": "...", "anthropicApiKey": "..." }  # <data-dir>/config.json
+env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
+```
+
+- `--model` 写入默认 Agent 定义 `model.modelId`；运行时每次推理 `llmIn.modelId` 按 `input.model → agent.model → provider.defaultModel` 取（SubagentTool 派出子 Agent 可用 `input.model` 覆盖）
+- `config.json` 由 `ConfigStore` 读写（缺文件/坏 JSON 幂等返回空），提供运行时 `/model` 落盘默认模型
+- 运行时 `/model`：`/model` 查看当前模型，`/model <modelId>` 更新当前 Agent 的 model 并写入 `config.json`（影响下次 send）；TUI 状态栏/侧栏初始即展示配置模型，首轮回复后刷新为实际命中模型
+
 ---
 
 ### 3.5 Skill Layer：双轨技能系统

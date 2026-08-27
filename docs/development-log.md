@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-08-27（续 17）：模型配置及切换
+
+### 背景
+
+模型缺失统一的配置入口与运行时切换能力：此前只能通过 Provider 插件传入（anthropic 的 `defaultModel` 或 Agent 定义 `model.modelId`），命令行/会话运行时无法便捷查看与切换模型。本次补齐「配置 → 运行时切换 → 状态展示」闭环。
+
+### 实现（[index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts) / [tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）
+
+1. **配置来源统一（优先级：CLI > config.json > 环境变量）**
+   - `ConfigStore`（dataDir/config.json）：读写 `agentId / provider / model / anthropicApiKey`，缺文件/坏 JSON 幂等返回空
+   - `resolveConfig`：main() 里把 CLI 参数与 config 合并（CLI 优先），代理/mock 测试注入不受影响
+2. **CLI `-m, --model <modelId>`**：写入默认 Agent 定义 `model.modelId`（运行时 llmIn 取 `agent.model.modelId`），并作为 provider 的 `defaultModel` 兜底
+3. **运行时 `/model` 命令**：`/model` 查看当前模型；`/model <modelId>` 更新当前 Agent 的 model 并持久化 config.json（影响下次 send）；列入 `/help` 与 REPL_COMMANDS
+4. **TUI 状态展示**：`TuiReplOptions.model` 传入后，状态栏/侧栏初始即显示配置模型（此前要到首轮 done 才显示实际命中模型）
+5. **boot() provider 合并**：anthropic 分支可按 config.json 的 `anthropicApiKey` 直接提供 key（显式配置 > config > 环境变量）
+
+### 验证
+
+- cli 74 用例全绿（新增 `--model` 解析、ConfigStore 往返/坏 JSON、resolveConfig 优先级、REPL `/model` 查看+切换+落盘、TUI 状态栏初始模型展示共 8 个），cli typecheck 通过
+
 ## 2026-08-27（续 16）：文件引用跳转验证 + Markdown 长文本流式性能优化
 
 ### 背景

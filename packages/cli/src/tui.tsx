@@ -39,6 +39,8 @@ export interface TuiReplOptions {
   session: Session
   /** provider 名称（状态栏展示；未传时显示 auto） */
   provider?: string
+  /** 默认模型 ID（状态栏/侧栏初始展示；发送完成后以实际命中的模型刷新） */
+  model?: string
   /** 侧栏文件引用跳转：按 Enter 打开指定（含可选行号）文件。未传则禁用该项交互。 */
   openFile?: (path: string, line?: number) => Promise<void> | void
   /** 收到普通用户输入时回调（REPL 回显前触发） */
@@ -294,7 +296,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   )
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [model, setModel] = useState<string | undefined>(undefined)
+  const [model, setModel] = useState<string | undefined>(options.model)
   const [showSidebar, setShowSidebar] = useState(true)
   // 侧栏文件引用导航：fileMode 时输入框让出焦点，↑/↓ 移动选中，Enter 打开
   const [fileMode, setFileMode] = useState(false)

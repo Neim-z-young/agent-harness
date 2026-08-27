@@ -78,6 +78,8 @@ export interface CliArgs {
   /** teammate 子命令：成员名（sanitize 后） */
   name?: string
   provider?: 'mock' | 'anthropic'
+  /** 默认模型 ID（如 claude-3-5-sonnet），覆盖 config.json 与 Provider 默认 */
+  model?: string
   sessionId?: string
   dataDir?: string
   permissionMode?: 'allow-all' | 'ask'
@@ -148,6 +150,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
       case 'team': out.team = value; break
       case 'name': out.name = value; break
       case 'p': case 'provider': out.provider = value === 'mock' ? 'mock' : value === 'anthropic' ? 'anthropic' : undefined; break
+      case 'm': case 'model': out.model = value; break
       case 's': case 'session': out.sessionId = value; break
       case 'd': case 'data-dir': out.dataDir = value; break
       case 'permission': out.permissionMode = value === 'allow-all' ? 'allow-all' : 'ask'; break
@@ -231,6 +234,63 @@ export class SessionFileStore {
 }
 
 // ========================================================================
+// 2.1 全局配置（model / agent / provider / apiKey 持久化到 config.json）
+// ========================================================================
+// 配置来源优先级（从高到低）：CLI 参数 > config.json > 环境变量。
+// HarnessApp 只依赖 boot() 时已解析好的 options；config.json 在 main() 里
+// 与 CLI 参数合并后传入，保证两者优先级正确。
+
+export interface HarnessConfig {
+  /** 默认 Agent ID */
+  agentId?: string
+  /** 默认 Provider */
+  provider?: 'mock' | 'anthropic'
+  /** 默认模型 ID（如 claude-3-5-sonnet） */
+  model?: string
+  /** Anthropic API Key（可选，便于命令行快捷配置） */
+  anthropicApiKey?: string
+}
+
+/** dataDir/config.json 读写（保持幂等：文件缺失 / 解析失败均返回空配置） */
+export class ConfigStore {
+  constructor(public readonly dataDir: string) {}
+
+  private path(): string {
+    return join(this.dataDir, 'config.json')
+  }
+
+  async load(): Promise<HarnessConfig> {
+    const p = this.path()
+    if (!existsSync(p)) return {}
+    try {
+      return JSON.parse(await readFile(p, 'utf-8')) as HarnessConfig
+    } catch {
+      return {}
+    }
+  }
+
+  async save(cfg: HarnessConfig): Promise<void> {
+    await mkdir(this.dataDir, { recursive: true })
+    await writeFile(this.path(), JSON.stringify(cfg, null, 2))
+  }
+}
+
+/** 合并 CLI 参数与 config.json（CLI 优先），供 main() 汇总默认值 */
+export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
+  agentId: string
+  provider: 'mock' | 'anthropic'
+  model?: string
+  anthropicApiKey?: string
+} {
+  return {
+    agentId: args.agentId ?? cfg.agentId ?? 'default',
+    provider: args.provider ?? cfg.provider ?? 'anthropic',
+    model: args.model ?? cfg.model,
+    anthropicApiKey: cfg.anthropicApiKey,
+  }
+}
+
+// ========================================================================
 // 3. 权限交互（CLI 提示符：allow / deny / always）
 // ========================================================================
 
@@ -307,6 +367,8 @@ export interface HarnessAppOptions {
   dataDir: string
   agentId: string
   provider: 'mock' | 'anthropic'
+  /** 默认模型 ID（设置到默认 Agent 的 model，运行时可用 /model 查看/切换） */
+  model?: string
   sessionId?: string
   permissionMode?: 'allow-all' | 'ask'
   /** 测试注入 */
@@ -330,6 +392,8 @@ export interface HarnessAppOptions {
 export class HarnessApp {
   public readonly sessionStore: SessionFileStore
   public readonly permissionStorePath: string
+  /** 全局配置读写（config.json：model / provider / apiKey 持久化） */
+  public readonly configStore: ConfigStore
   /** 文件快照服务（options.snapshot 开启时创建，供 createHarness 注入与 /revert 命令） */
   public readonly snapshotService: SnapshotService | undefined
   private harness!: Harness
@@ -340,6 +404,7 @@ export class HarnessApp {
     this.options = { ...options, cwd, dataDir: resolve(options.dataDir), agentId: options.agentId, provider: options.provider }
     this.sessionStore = new SessionFileStore(this.options.dataDir)
     this.permissionStorePath = join(this.options.dataDir, 'permissions.json')
+    this.configStore = new ConfigStore(this.options.dataDir)
     if (options.snapshot) {
       this.snapshotService = createSnapshotService({ worktree: cwd })
     }
@@ -360,9 +425,9 @@ export class HarnessApp {
     await writeFile(this.permissionStorePath, JSON.stringify({ rules }, null, 2))
   }
 
-  /** 默认 Agent 定义（无 agent 指定时使用） */
+  /** 默认 Agent 定义（无 agent 指定时使用）；含 CLI/config 解析出的默认模型 */
   defaultAgent(): AgentDefinition {
-    return {
+    const def: AgentDefinition = {
       id: this.options.agentId,
       name: 'Harness Agent',
       description: 'CLI 默认 Agent',
@@ -374,6 +439,28 @@ export class HarnessApp {
         'Be concise and precise.',
       ],
     }
+    if (this.options.model) def.model = { modelId: this.options.model }
+    return def
+  }
+
+  /** 当前生效模型：优先读取活动 Agent 定义的 model.modelId，回退 options.model */
+  getModel(agentId: string): string | undefined {
+    const a = this.harness?.agent?.get?.(agentId)
+    return a?.model?.modelId ?? this.options.model
+  }
+
+  /**
+   * 运行时切换模型：更新指定 Agent 的 model.modelId（影响下次 send），
+   * 并持久化到 config.json 作为下次启动的默认模型。
+   */
+  async setModel(agentId: string, modelId: string): Promise<boolean> {
+    const a = this.harness?.agent?.get?.(agentId)
+    if (!a) return false
+    a.model = { ...(a.model ?? {}), modelId }
+    // 持久化到全局配置
+    const cfg = await this.configStore.load()
+    await this.configStore.save({ ...cfg, model: modelId })
+    return true
   }
 
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
@@ -399,10 +486,17 @@ export class HarnessApp {
         ...(this.options.mockProviderConfig ?? {}),
       })
     } else {
+      // provider.anthropic 配置：显式传入 > config.json(anthropicApiKey) > 环境变量
       const envKey = typeof process !== 'undefined' ? process.env.ANTHROPIC_API_KEY : undefined
-      const hasKey = !!(this.options.anthropicProviderConfig?.apiKey ?? envKey)
+      const cfg = await this.configStore.load()
+      const mergedAnthropic = {
+        ...(this.options.anthropicProviderConfig ?? {}),
+        apiKey: this.options.anthropicProviderConfig?.apiKey ?? cfg.anthropicApiKey ?? envKey,
+        defaultModel: this.options.anthropicProviderConfig?.defaultModel ?? this.options.model,
+      }
+      const hasKey = !!mergedAnthropic.apiKey
       if (hasKey) {
-        chosenProvider = createProviderAnthropicPlugin(this.options.anthropicProviderConfig) as any
+        chosenProvider = createProviderAnthropicPlugin(mergedAnthropic) as any
       } else {
         // 自动 fallback mock 并打印提示
         this.options.stdout?.write?.(
@@ -525,7 +619,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/save', '/compact']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/model', '/save', '/compact']
 
 // ========================================================================
 // 5.1 后台任务面板（P1-4 前端事件驱动展示）
@@ -678,6 +772,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /save              手动保存当前会话\n')
           out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
           out('  /switch ?          列出已注册 Agent\n')
+          out('  /model             查看当前模型\n')
+          out('  /model <modelId>   切换模型（下一条 send 生效，写入 config.json）\n')
           out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
@@ -732,6 +828,21 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           const cur = (await harness.session.get(current.id))!
           cur.agentId = arg
           out(`已切换到 Agent ${arg}（影响下次 send）\n`)
+          return 'continue'
+        }
+        case '/model': {
+          const agentId = current.agentId ?? 'default'
+          const agent = harness.agent.get(agentId)
+          if (!arg || arg === '?') {
+            const m = app.getModel(agentId)
+            if (m) out(`当前模型：${m}（agent=${agentId}）\n`)
+            else out(`Agent "${agentId}" 未绑定模型，使用 Provider 默认。\n`)
+            if (agent?.model?.options) out(`模型附加选项：${JSON.stringify(agent.model.options)}\n`)
+            return 'continue'
+          }
+          const ok = await app.setModel(agentId, arg.trim())
+          if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
+          out(`已切换模型 ${arg.trim()}（agent=${agentId}，影响下次 send）\n`)
           return 'continue'
         }
         case '/compact': {
@@ -1023,11 +1134,15 @@ teammate 选项:
   -c, --cwd <dir>            工作目录（默认当前目录）
   -a, --agent <id>           默认 Agent ID（默认 default）
   -p, --provider <name>      mock / anthropic（默认 anthropic，无 key 时自动 fallback mock）
+  -m, --model <modelId>      默认模型 ID（覆盖 config.json；运行时可用 /model 切换）
   -s, --session <id>         指定会话 ID（用于 resume/run 时复用历史）
   -d, --data-dir <dir>       持久化目录（默认 ~/.harness）
       --permission <mode>    allow-all / ask（默认 ask）
   -v, --verbose              输出调试信息
       --tui                  以 TUI（alt-screen 全屏）模式启动 REPL
+
+配置优先级（model / provider / agent）:
+  CLI 参数 > <data-dir>/config.json > 环境变量（ANTHROPIC_API_KEY）
 `
 
 // ========================================================================
@@ -1097,11 +1212,13 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   if (args.command === 'help' || args.showHelp) { write(HELP_TEXT); return 0 }
 
   const cwd = args.cwd ?? process.cwd()
-  const agentId = args.agentId ?? 'default'
-  const provider = args.provider ?? 'anthropic'
   const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
   const dataDir = args.dataDir ?? join(home, '.harness')
   const permissionMode = args.permissionMode ?? 'ask'
+
+  // 加载 config.json 并与 CLI 合并：CLI > config
+  const cfg = await new ConfigStore(dataDir).load()
+  const { agentId, provider, model, anthropicApiKey } = resolveConfig(args, cfg)
 
   if (args.command === 'list-sessions') {
     const store = new SessionFileStore(dataDir)
@@ -1119,7 +1236,8 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   }
 
   const app = new HarnessApp({
-    cwd, dataDir, agentId, provider,
+    cwd, dataDir, agentId, provider, model,
+    anthropicProviderConfig: anthropicApiKey ? { apiKey: anthropicApiKey } : undefined,
     sessionId: args.command === 'resume' ? args.arg ?? args.sessionId : args.sessionId,
     permissionMode, verbose: args.verbose,
   })
@@ -1153,7 +1271,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       }
     }
     if (args.tui) {
-      await startTuiRepl({ app, harness, session, provider })
+      await startTuiRepl({ app, harness, session, provider, model })
     } else {
       await startRepl({ app, harness, session })
     }

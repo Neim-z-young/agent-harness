@@ -7,6 +7,8 @@ import {
   SessionFileStore,
   CliPermissionEngine,
   HarnessApp,
+  ConfigStore,
+  resolveConfig,
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
@@ -62,6 +64,52 @@ describe('parseCliArgs 命令解析', () => {
     expect(a.name).toBe('bob')
     expect(a.agentId).toBe('researcher')
     expect(a.dataDir).toBe('/x')
+  })
+
+  it('--model / -m 解析模型 ID', () => {
+    expect(parseCliArgs(['repl', '--model', 'claude-3-5-sonnet']).model).toBe('claude-3-5-sonnet')
+    expect(parseCliArgs(['run', 'hi', '-m=model-x']).model).toBe('model-x')
+    expect(parseCliArgs(['repl']).model).toBeUndefined()
+  })
+})
+
+describe('ConfigStore 全局配置（config.json）', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-config-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('文件缺失 → 空配置', async () => {
+    expect(await new ConfigStore(join(dir, 'nope')).load()).toEqual({})
+  })
+
+  it('save 后 load 往返一致', async () => {
+    const store = new ConfigStore(dir)
+    await store.save({ agentId: 'researcher', provider: 'mock', model: 'claude-3-5-sonnet' })
+    expect(await store.load()).toEqual({ agentId: 'researcher', provider: 'mock', model: 'claude-3-5-sonnet' })
+  })
+
+  it('损坏 JSON → 空配置（幂等友好）', async () => {
+    const store = new ConfigStore(dir)
+    writeFileSync(join(dir, 'config.json'), '{broken')
+    expect(await store.load()).toEqual({})
+  })
+
+  it('resolveConfig：CLI 参数优先于 config', () => {
+    const argCfg = { agentId: undefined, provider: 'mock' as const, model: 'cli-model' }
+    const out = resolveConfig(argCfg as Parameters<typeof resolveConfig>[0], {
+      agentId: 'cfg-agent', provider: 'anthropic', model: 'cfg-model', anthropicApiKey: 'sk-x',
+    })
+    expect(out.agentId).toBe('cfg-agent') // CLI 未给 → 用 config
+    expect(out.provider).toBe('mock')     // CLI 给了 → 覆盖 config
+    expect(out.model).toBe('cli-model')   // CLI 给了 → 覆盖 config
+    expect(out.anthropicApiKey).toBe('sk-x')
+  })
+
+  it('resolveConfig：无任何来源 → 默认 default/anthropic', () => {
+    const out = resolveConfig({} as Parameters<typeof resolveConfig>[0], {})
+    expect(out.agentId).toBe('default')
+    expect(out.provider).toBe('anthropic')
+    expect(out.model).toBeUndefined()
   })
 })
 
@@ -191,6 +239,38 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     expect(output).toInclude('Harness CLI')
     expect(output).toInclude('你好')
     // /exit 之前会 exit，所以 /save 没有被执行完是正常的
+    await app.shutdown()
+  })
+
+  it('/model 查看与切换模型：更新 Agent.model + 持久化 config.json', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      model: 'claude-3-5-sonnet', // 初始默认模型（权限 allow-all 以便静默交互）
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    // 初始：默认 Agent 已绑定默认模型
+    expect(harness.agent.get('default')?.model?.modelId).toBe('claude-3-5-sonnet')
+
+    const r = await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/model', '/model claude-3-7-sonnet', '/model', '/exit'],
+    })
+    expect(r).toBe('exit')
+
+    const output = chunks.join('')
+    expect(output).toInclude('当前模型：claude-3-5-sonnet')
+    expect(output).toInclude('已切换模型 claude-3-7-sonnet')
+    // 运行时切换已写入 Agent 定义 → 影响下次 send
+    expect(harness.agent.get('default')?.model?.modelId).toBe('claude-3-7-sonnet')
+    expect(app.getModel('default')).toBe('claude-3-7-sonnet')
+    // config.json 已持久化
+    const cfg = await app.configStore.load()
+    expect(cfg.model).toBe('claude-3-7-sonnet')
+
     await app.shutdown()
   })
 

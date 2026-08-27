@@ -225,11 +225,13 @@ async function mountTui(
   extra: {
     responses?: Array<{ match: string | RegExp; response: string }>
     openFile?: (path: string, line?: number) => void
+    model?: string
   } = {},
 ): Promise<TuiFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-tui-test-'))
   const app = new HarnessApp({
     cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+    model: extra.model,
     permissionMode: 'allow-all',
     mockProviderConfig: {
       defaultResponse: '你好，我是 TUI 助手。',
@@ -241,7 +243,7 @@ async function mountTui(
   const root = createRoot(setup.renderer)
   let resolveExit!: (r: TuiReplExit) => void
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
-  root.render(<TuiApp options={{ app, harness, session, provider: 'mock', openFile: extra.openFile }} onExit={resolveExit} />)
+  root.render(<TuiApp options={{ app, harness, session, provider: 'mock', model: extra.model, openFile: extra.openFile }} onExit={resolveExit} />)
 
   let cleaned = false
   const cleanup = async () => {
@@ -293,6 +295,14 @@ describe('TuiApp 集成（mock provider）', () => {
     const f = await mountTui()
     const frame = await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
     expect(frame).toContain('mock')
+    await f.cleanup()
+  })
+
+  it('配置的 model 初始展示在状态栏/侧栏', async () => {
+    const f = await mountTui({ model: 'claude-3-5-sonnet' })
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('model=claude-3-5-sonnet'))
+    expect(frame).toContain('model=claude-3-5-sonnet')
+    expect(frame).toContain('claude-3-5-sonnet')
     await f.cleanup()
   })
 
