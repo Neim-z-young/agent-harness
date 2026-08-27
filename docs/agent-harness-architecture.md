@@ -416,16 +416,22 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 
 - `ProviderConfig.type` 是开放字符串；内置类型（openai/anthropic/gemini/glm/qwen/mock）只是「已注册」的默认项
 - `ProviderTypeRegistry`（`type → createPlugin(config)`）替代 CLI 硬编码 switch；`HarnessApp.providerTypes` 公开，boot 前可注入自定义类型
-- 外部插件多级加载：`~/.harness/provider-plugins`（user）→ `<project>/.harness/provider-plugins`（project，后加载覆盖）。插件模块约定导出：
+- 外部插件多级加载：`~/.harness/plugins`（user）→ `<project>/.harness/plugins`（project，后加载覆盖）。插件目录统一承载各种插件，一个 `.ts/.js/.mjs` 模块可同时导出：
+  - **Provider 类型工厂**（扩展 `config.type`）：`providerTypeFactory` 或 `providerType`+`createProviderPlugin` 约定
+  - **通用 AgentPlugin**（Hooks 生命周期插件）：`default` / `plugin` / `plugins` 任何形态；通用插件按插件 `id` 去重，project 覆盖 user
 
 ```typescript
+// providers 类型工厂约定（注册进 ProviderTypeRegistry）
 export const providerType = 'my-gw'
 export function createProviderPlugin(config) {
   // 返回 AgentPlugin：install 内通过 harness.init hook 调用 _setChatProvider 注册 ChatProvider
 }
+
+// 通用 Hooks 插件约定（这两者可在同一模块同时导出）
+export default { id: 'ext.example', version: '1.0.0', name: 'Example', async install() { return { /* hooks */ } } }
 ```
 
-- 配置校验按注册表动态进行，未知 type 报错时列出已注册类型并提示 provider-plugins 扩展方式；`--check-config` / `config check` 加载外部插件后校验
+- 配置校验按注册表动态进行，未知 type 报错时列出已注册类型并提示 plugins 目录扩展方式；`--check-config` / `config check` 加载外部插件后校验
 
 ---
 

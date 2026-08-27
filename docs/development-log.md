@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-08-27（续 21）：统一 plugins 插件目录（支持各类插件）
+
+### 背景
+
+续 20 的 `provider-plugins` 专用目录只承担「Provider 类型工厂」一种插件约定，无法承载通用 AgentPlugin（Hooks 生命周期插件），且目录命名与「插件」的通用语义不符。用户要求统一为 `plugins` 文件夹，在一个目录里支持加载各种插件类型。
+
+### 实现（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+
+1. **目录统一**：`~/.harness/provider-plugins` / `.harness/provider-plugins` → `~/.harness/plugins` / `.harness/plugins`（user → project，后加载覆盖）
+2. **`loadPluginDirs(registry, dirs, log?)`** 取代 `loadProviderPluginDirs`，返回 `PluginLoadResult { plugins }`；一个模块可同时导出两类插件：
+   - **通用 AgentPlugin**（Hooks 插件）：`default` / `plugin` / `plugins` 三种形态（含一层 default 包装）；按插件 `id` 去重，project 覆盖 user，最终随 `internalPlugins` 安装进 Harness
+   - **Provider 类型工厂**（扩展 `config.type`）：`providerTypeFactory` 或 `providerType`+`createProviderPlugin`，注册进 `ProviderTypeRegistry`
+3. **校验/自检联动**：`buildCheckRegistry` 与 boot 均改用 `loadPluginDirs`；未知 type 报错与帮助文案改指 `plugins` 目录
+4. 坏模块（既无 AgentPlugin 也无 Provider 工厂）忽略并告警，不静默、不崩溃
+
+### 验证
+
+- CLI 测试重构为 64 个：新增 `providerTypeFactory` 形态、通用 AgentPlugin（default/plugin/plugins）、通用插件按 id 去重（project 覆盖 user）等用例
+- cli 64 用例全绿，cli typecheck 通过
+
 ## 2026-08-27（续 17）：模型配置及切换
 
 ### 背景

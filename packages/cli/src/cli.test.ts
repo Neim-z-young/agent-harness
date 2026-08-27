@@ -18,7 +18,7 @@ import {
   buildConfigOverview,
   ProviderTypeRegistry,
   registerBuiltinProviderTypes,
-  loadProviderPluginDirs,
+  loadPluginDirs,
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
@@ -280,8 +280,8 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     expect(reg.list().sort()).toEqual(['anthropic', 'gemini', 'glm', 'mock', 'openai', 'qwen'])
   })
 
-  it('loadProviderPluginDirs：从目录加载外部插件（providerType + createProviderPlugin 约定）', async () => {
-    const pluginDir = join(dir, 'provider-plugins')
+  it('loadPluginDirs：从 plugins 目录加载 Provider 类型工厂（providerType + createProviderPlugin 约定）', async () => {
+    const pluginDir = join(dir, 'plugins')
     mkdirSync(pluginDir, { recursive: true })
     writeFileSync(join(pluginDir, 'my-gw.ts'), `
       export const providerType = 'my-gw'
@@ -291,32 +291,70 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     `)
     const reg = new ProviderTypeRegistry()
     registerBuiltinProviderTypes(reg, {})
-    await loadProviderPluginDirs(reg, [pluginDir])
+    const result = await loadPluginDirs(reg, [pluginDir])
     expect(reg.list()).toContain('my-gw')
     const plugin = reg.resolve('my-gw')!.createPlugin({ id: 'gw', type: 'my-gw', baseUrl: 'http://x', apiKey: 'k' })!
     expect(plugin.id).toBe('provider.my-gw')
+    // Provider 类型工厂不产生通用插件
+    expect(result.plugins).toEqual([])
   })
 
-  it('loadProviderPluginDirs：project 目录后加载覆盖 user（多级插件化）', async () => {
+  it('loadPluginDirs：providerTypeFactory 形态同样可加载', async () => {
+    const pluginDir = join(dir, 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'factory.ts'), `
+      export const providerTypeFactory = {
+        type: 'local-gw',
+        createPlugin: (c) => ({ id: 'provider.local-gw', version: '1.0.0', name: 'LocalGW', async install() { return {} } }),
+      }
+    `)
+    const reg = new ProviderTypeRegistry()
+    await loadPluginDirs(reg, [pluginDir])
+    expect(reg.resolve('local-gw')?.createPlugin({ id: 'x', type: 'local-gw' })?.id).toBe('provider.local-gw')
+  })
+
+  it('loadPluginDirs：plugins 目录同时加载通用 AgentPlugin（default/plugin/plugins）', async () => {
+    const pluginDir = join(dir, 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'gen.ts'), `
+      export const statusPlugin = { id: 'ext.status', version: '1', name: 'Status', async install() { return {} } }
+      export const helloPlugin = { id: 'ext.hello', version: '1', name: 'Hello', async install() { return {} } }
+      export default { id: 'ext.default', version: '1', name: 'Default', async install() { return {} } }
+      export const plugin = { id: 'ext.named', version: '1', name: 'Named', async install() { return {} } }
+      export const plugins = [ { id: 'ext.arr', version: '1', name: 'Arr', async install() { return {} } } ]
+    `)
+    const reg = new ProviderTypeRegistry()
+    const result = await loadPluginDirs(reg, [pluginDir])
+    const ids = result.plugins.map((p) => p.id).sort()
+    expect(ids).toEqual(['ext.arr', 'ext.default', 'ext.named'])
+  })
+
+  it('loadPluginDirs：project 目录后加载覆盖 user（多级插件化，通用插件按 id 去重）', async () => {
     const userDir = join(dir, 'user-plugins')
     const projDir = join(dir, 'proj-plugins')
     mkdirSync(userDir, { recursive: true })
     mkdirSync(projDir, { recursive: true })
     writeFileSync(join(userDir, 'p.ts'), `export const providerType = 'dup'; export function createProviderPlugin(c){ return { id: 'provider.dup.user', version: '1', name: 'user', async install(){} } }`)
     writeFileSync(join(projDir, 'p.ts'), `export const providerType = 'dup'; export function createProviderPlugin(c){ return { id: 'provider.dup.proj', version: '1', name: 'proj', async install(){} } }`)
+    writeFileSync(join(userDir, 'gen.ts'), `export default { id: 'ext.same', version: '1', name: 'user', async install(){} }`)
+    writeFileSync(join(projDir, 'gen.ts'), `export default { id: 'ext.same', version: '2', name: 'proj', async install(){} }`)
     const reg = new ProviderTypeRegistry()
-    await loadProviderPluginDirs(reg, [userDir, projDir])
+    const result = await loadPluginDirs(reg, [userDir, projDir])
     expect(reg.resolve('dup')!.createPlugin({ id: 'x', type: 'dup' })!.id).toBe('provider.dup.proj')
+    // 通用插件：project 覆盖 user（name=proj，且只保留一份）
+    expect(result.plugins).toHaveLength(1)
+    expect(result.plugins[0].name).toBe('proj')
   })
 
-  it('loadProviderPluginDirs：缺 providerType/createProviderPlugin 的坏文件被跳过并告警', async () => {
-    const pluginDir = join(dir, 'provider-plugins')
+  it('loadPluginDirs：无有效导出的坏文件被忽略并告警', async () => {
+    const pluginDir = join(dir, 'plugins')
     mkdirSync(pluginDir, { recursive: true })
     writeFileSync(join(pluginDir, 'bad.ts'), `export const foo = 1`)
     const warns: string[] = []
     const reg = new ProviderTypeRegistry()
-    await loadProviderPluginDirs(reg, [pluginDir], (s) => warns.push(s))
-    expect(warns.some((w) => w.includes('缺少 providerType'))).toBe(true)
+    const result = await loadPluginDirs(reg, [pluginDir], (s) => warns.push(s))
+    expect(warns.some((w) => w.includes('已忽略'))).toBe(true)
+    expect(result.plugins).toEqual([])
   })
 })
 
@@ -670,7 +708,7 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
       permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
       providers: [{ id: 'my-gw', type: 'my-gw', baseUrl: 'http://gw', apiKey: 'gw-key' }],
     })
-    // 插件注册：boot 前注入自定义 type 工厂（等价 ~/.harness/provider-plugins 插件加载）
+    // 插件注册：boot 前注入自定义 type 工厂（等价 ~/.harness/plugins 插件加载）
     app.providerTypes.register({
       type: 'my-gw',
       createPlugin: (pc) => ({
