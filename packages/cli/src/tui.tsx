@@ -159,14 +159,16 @@ export function findFileReferences(text: string): Array<{ path: string; start: n
   return out
 }
 
-/** 汇总所有块中的文件引用（去重、限量） */
+/** 汇总所有块中的文件引用（按基础路径去重、限量；保留首次出现的原始形态） */
 export function collectFileReferences(state: ChatState, max = MAX_FILE_REFS): string[] {
   const seen = new Set<string>()
   const out: string[] = []
   for (const b of state.blocks) {
     for (const f of findFileReferences(b.text)) {
-      if (!seen.has(f.path)) {
-        seen.add(f.path)
+      // 归一化：去掉 :行[:列] 后缀后按同文件去重，避免同文件不同行号重复展示
+      const base = f.path.replace(/:\d+(?::\d+)?$/, '')
+      if (!seen.has(base)) {
+        seen.add(base)
         out.push(f.path)
         if (out.length >= max) return out
       }

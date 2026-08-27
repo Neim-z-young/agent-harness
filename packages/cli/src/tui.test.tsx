@@ -104,12 +104,12 @@ describe('findFileReferences / collectFileReferences', () => {
   })
   it('缺失后缀/非路径不误报，去重', () => {
     const refs = findFileReferences('x docs/readme.md y docs/readme.md')
-    expect(refs).toEqual([{ path: 'docs/readme.md', start: 2, end: 17 }])
+    expect(refs).toEqual([{ path: 'docs/readme.md', start: 2, end: 16 }])
   })
   it('collectFileReferences 汇总各块并限量', () => {
     let state = initialChatState
     state = pushConsole(state, '见 src/a.ts 和 src/b.ts')
-    const byBlock = { ...state, blocks: [...state.blocks, { id: 99, kind: 'tool', text: 'src/a.ts:2 src/c.ts:3' }] }
+    const byBlock = { ...state, blocks: [...state.blocks, { id: 99, kind: 'tool' as const, text: 'src/a.ts:2 src/c.ts:3' }] }
     expect(collectFileReferences(byBlock)).toEqual(['src/a.ts', 'src/b.ts', 'src/c.ts:3'])
   })
 })
