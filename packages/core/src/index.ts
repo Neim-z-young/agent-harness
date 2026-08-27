@@ -1046,7 +1046,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       readonly session: SessionManager
       readonly toolRegistry: ToolRegistry
       readonly toolPipeline: ToolPipeline
-      readonly chatProvider: () => ChatProvider
+      readonly chatProvider: (providerId?: string) => ChatProvider
       readonly permission: PermissionEngine
       readonly triggerPlugin: <N extends keyof Hooks>(
         name: N,
@@ -1198,7 +1198,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     await this.deps.triggerPlugin('llm.params', llmIn, params)
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
 
-    const provider = this.deps.chatProvider()
+    const provider = this.deps.chatProvider(llmIn.providerId)
     const completion = await provider.complete({
       providerId: llmIn.providerId,
       modelId: llmIn.modelId,
@@ -1277,6 +1277,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
     params: LLMParams
     headers: Record<string, string>
     allowedTools: Tool[]
+    providerId: string
+    modelId?: string
   }> {
     const { sessionId, message } = input
     const agentId = input.agentId ?? this.defaultAgentId
@@ -1347,12 +1349,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
     await this.deps.triggerPlugin('llm.params', llmIn, params)
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
 
-    return { agentId, sessionId, finalMessages, params, headers, allowedTools }
+    return { agentId, sessionId, finalMessages, params, headers, allowedTools, providerId: llmIn.providerId, modelId: llmIn.modelId }
   }
 
   async *queryStream(input: AgentQueryInput): AsyncGenerator<AgentStreamEvent, void, unknown> {
-    const { agentId, sessionId, finalMessages, params, headers, allowedTools } = await this._prepareQuery(input)
-    const provider = this.deps.chatProvider()
+    const { agentId, sessionId, finalMessages, params, headers, allowedTools, providerId, modelId } = await this._prepareQuery(input)
+    const provider = this.deps.chatProvider(providerId)
 
     // 本轮开始时自动 capture 快照（挂到 assistant 消息 meta.snapshot）
     const snap = await this.captureForMessage(sessionId)
@@ -1368,8 +1370,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
     if (provider.stream) {
       // 流式路径
       const gen = provider.stream({
-        providerId: finalMessages[0]?.role === 'system' ? (agentId === 'default' ? 'default' : agentId) : agentId,
-        modelId: this.agents.get(agentId)?.model?.modelId,
+        providerId: providerId,
+        modelId: modelId,
         messages: finalMessages,
         params,
         headers,
@@ -1411,8 +1413,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
     } else {
       // Fallback：非流式 complete()，模拟单次 yield
       const completion = await provider.complete({
-        providerId: agentId === 'default' ? 'default' : agentId,
-        modelId: this.agents.get(agentId)?.model?.modelId,
+        providerId: providerId,
+        modelId: modelId,
         messages: finalMessages,
         params,
         headers,
@@ -1700,7 +1702,7 @@ export class HarnessImpl implements Harness {
       session: this.session,
       toolRegistry: this.tools,
       toolPipeline: this.toolPipeline,
-      chatProvider: () => (this.context.resolve<ChatProvider>('chat.provider') ?? this.chatProvider),
+      chatProvider: (providerId?: string) => this.resolveChatProvider(providerId),
       permission: this.permission,
       triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
       bus: this.bus,
@@ -1858,11 +1860,27 @@ export class HarnessImpl implements Harness {
   async suspend(): Promise<void> { /* MVP: placeholder */ }
   async resume(): Promise<void> { /* MVP: placeholder */ }
 
+  // ----- Provider 注册表：支持多 Provider，按 providerId 分发 -----
+
+  /** 已注册的 ChatProvider（key = provider.id）。支持多 Provider 自由切换。 */
+  private readonly chatProviders = new Map<string, ChatProvider>()
+
+  /** 按 providerId 解析 ChatProvider：命中注册表返回之，否则回退默认 Provider。 */
+  resolveChatProvider(providerId?: string): ChatProvider {
+    // 上下文可能记录了最新的默认 provider（_setChatProvider / 插件注册）
+    const ctxProvider = this.context.resolve<ChatProvider>('chat.provider')
+    if (providerId && providerId !== 'default' && this.chatProviders.has(providerId)) {
+      return this.chatProviders.get(providerId)!
+    }
+    return ctxProvider ?? this.chatProvider
+  }
+
   // ----- 内部工具：替换 ChatProvider（供 Plugin 使用） -----
-  /** @internal 替换默认 ChatProvider（Provider 插件 install 时调用） */
+  /** @internal 替换默认 ChatProvider（Provider 插件 install 时调用）；同时按 Provider.id 注册到注册表 */
   _setChatProvider(p: ChatProvider): void {
     this.chatProvider = p
     this.context.register('chat.provider', p)
+    if (p?.id) this.chatProviders.set(p.id, p)
   }
 }
 

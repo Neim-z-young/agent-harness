@@ -9,6 +9,8 @@ import {
   HarnessApp,
   ConfigStore,
   resolveConfig,
+  parseModelSpec,
+  formatModel,
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
@@ -271,6 +273,75 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     const cfg = await app.configStore.load()
     expect(cfg.model).toBe('claude-3-7-sonnet')
 
+    await app.shutdown()
+  })
+
+  it('parseModelSpec / formatModel：provider/model 规格解析', () => {
+    expect(parseModelSpec('openai/gpt-4o')).toEqual({ providerId: 'openai', modelId: 'gpt-4o' })
+    expect(parseModelSpec('claude-3-5-sonnet')).toEqual({ providerId: undefined, modelId: 'claude-3-5-sonnet' })
+    expect(parseModelSpec('')).toEqual({ providerId: undefined, modelId: '' })
+    expect(formatModel('openai', 'gpt-4o')).toBe('openai/gpt-4o')
+    expect(formatModel(undefined, 'gpt-4o')).toBe('gpt-4o')
+    expect(formatModel('openai', undefined)).toBeUndefined()
+  })
+
+  it('--model provider/model：默认 Agent 绑定 providerId（跨 Provider）', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'openai',
+      model: 'openai/gpt-4o',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [{ id: 'openai', type: 'openai', baseUrl: 'http://x', model: 'gpt-4o' }],
+    })
+    const { harness } = await app.boot()
+    expect(harness.agent.get('default')?.model?.providerId).toBe('openai')
+    expect(harness.agent.get('default')?.model?.modelId).toBe('gpt-4o')
+    expect(app.getModel('default')).toBe('openai/gpt-4o')
+    await app.shutdown()
+  })
+
+  it('setModel 跨 Provider 切换：openai/gpt-4o → 更新 providerId+modelId 并持久化', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'openai', type: 'openai', baseUrl: 'http://x', model: 'gpt-4o' },
+        { id: 'deepseek', type: 'openai', baseUrl: 'http://y', model: 'deepseek-chat' },
+      ],
+    })
+    await app.boot()
+    const ok = await app.setModel('default', 'deepseek/deepseek-chat')
+    expect(ok).toBe(true)
+    expect(app.getModel('default')).toBe('deepseek/deepseek-chat')
+    const cfg = await app.configStore.load()
+    expect(cfg.provider).toBe('deepseek')
+    expect(cfg.model).toBe('deepseek-chat')
+    await app.shutdown()
+  })
+
+  it('boot 多 Provider 注册：config.providers 逐项注册，按 id 分发', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'deepseek',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'openai', type: 'openai', baseUrl: 'http://openai', model: 'gpt-4o' },
+        { id: 'deepseek', type: 'openai', baseUrl: 'http://deepseek', model: 'deepseek-chat' },
+      ],
+    })
+    const { harness } = await app.boot()
+    expect(app.listProviders()).toEqual(expect.arrayContaining(['openai', 'deepseek']))
+    // 默认 provider = deepseek（最后安装，作为兜底）
+    const h = harness as unknown as { resolveChatProvider: (id?: string) => { id?: string } }
+    const impl = (id?: string) => h.resolveChatProvider(id)
+    expect(impl('deepseek')?.id).toBe('deepseek')
+    expect(impl('openai')?.id).toBe('openai')
+    // 'default' / 未知 id 回退默认（deepseek）
+    expect(impl('default')?.id).toBe('deepseek')
     await app.shutdown()
   })
 

@@ -20,6 +20,34 @@
 
 - cli 74 用例全绿（新增 `--model` 解析、ConfigStore 往返/坏 JSON、resolveConfig 优先级、REPL `/model` 查看+切换+落盘、TUI 状态栏初始模型展示共 8 个），cli typecheck 通过
 
+## 2026-08-27（续 18）：多 Provider 自由切换（自定义模型配置）
+
+### 背景
+
+用户确认「自定义模型配置」期望的能力范围 = 多 Provider 自由切换：config.json 定义多个 provider（anthropic / openai / glm / qwen / gemini + 任意 OpenAI 兼容端点如 Ollama / DeepSeek），每个含 baseUrl / apiKey / model，`-m` / `/model` 可跨 Provider 任意切换。
+
+### 实现
+
+1. **core：ChatProvider 注册表**（[packages/core/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts)）
+   - `chatProviders: Map<providerId, ChatProvider>`：`_setChatProvider` 按 `p.id` 入表
+   - `resolveChatProvider(providerId)`：命中注册表 → 该 Provider；否则回退默认（context 记的 `chat.provider` / `chatProvider`）
+   - AgentRuntime 调用点改为 `this.deps.chatProvider(llmIn.providerId)`，`provider.complete({ providerId, modelId, ... })` 动态分发
+2. **CLI：providers 多配置 + 规格解析**
+   - `HarnessConfig.providers: ProviderConfig[]`（config.json），`ProviderConfig = { id, type, baseUrl?, apiKey?, model?, apiPath?, maxTokens?, timeoutMs? }`
+   - `parseModelSpec` / `formatModel`：`provider/modelId` 规格解析与格式化
+   - `HarnessApp.boot()` 动态安装：非默认 Provider 先注册，默认 Provider 最后注册作兜底；`buildProviderPlugin()` 按 type 构造 openai / anthropic / gemini / mock 插件，openai 可对接任意兼容端点（DeepSeek / Ollama / GLM 等）
+3. **修复 PluginDuplicateIdError**（[packages/plugins/provider-openai/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/provider-openai/src/index.ts)）
+   - openai 插件 id 由写死的 `provider.openai` 改为随 `config.providerId` 派生（`provider.{providerId}`），使多个 OpenAI 兼容 Provider 不冲突
+4. **`-m, --model <provider/model>`**：CLI 解析 `provider/model` 绑定 Agent 的 `providerId + modelId`，同时作为默认 Provider 的 `defaultModel` 兜底
+5. **`/model` 支持跨 Provider**：`/model openai/gpt-4o` 校验 provider 是否注册 → 更新 Agent 并持久化（provider + model）到 config.json；`/model` / `/model ?` 展示已注册 Provider 列表
+6. **listProviders()**：汇总 config.providers 显式 id + 默认 provider（供状态栏 / /model 展示）
+
+### 验证
+
+- 新增核心测试：多 Provider 按 `agent.model.providerId` 分发 / 回退默认 / 未知 id 回退默认
+- 新增 CLI 测试：`parseModelSpec` / `formatModel`、`-m provider/model` 绑定、`setModel` 跨 Provider 切换 + 落盘、多 Provider 注册按 id 分发
+- 修复 openai 插件重复注册冲突 + 测试绑定丢失 `this` 的问题；cli 78 用例全绿，core 29 用例全绿，core / cli / provider-openai 三包 typecheck 通过
+
 ## 2026-08-27（续 16）：文件引用跳转验证 + Markdown 长文本流式性能优化
 
 ### 背景

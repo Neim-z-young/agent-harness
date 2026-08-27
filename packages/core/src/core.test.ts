@@ -709,4 +709,81 @@ describe('@harness/core', () => {
       await h.stop()
     })
   })
+
+  describe('多 Provider 自由切换（按 providerId 分发）', () => {
+    function providerWithHit(id: string, hits: Record<string, number>): ChatProvider & { calls: any[]; id: string } {
+      return {
+        id,
+        calls: [],
+        async complete(params) {
+          hits[id] = (hits[id] ?? 0) + 1
+          return {
+            content: `来自 ${id} 的回复`,
+            model: `${id}-v1`,
+            tokenUsage: { input: 1, output: 1 },
+          }
+        },
+        async *stream(params) {
+          hits[id] = (hits[id] ?? 0) + 1
+          yield { type: 'text_delta', text: '流' }
+          yield { type: 'done', model: `${id}-v1`, tokenUsage: { input: 1, output: 1 } }
+        },
+      }
+    }
+
+    it('agent.model.providerId 决定命中哪个 ChatProvider；无 providerId 回退默认', async () => {
+      const hits: Record<string, number> = {}
+      const pAlpha = providerWithHit('alpha', hits)
+      const pBeta = providerWithHit('beta', hits)
+      const pGamma = providerWithHit('gamma', hits)
+
+      const h = await createHarness({
+        agents: [
+          makeAgent({ id: 'use-alpha', model: { providerId: 'alpha', modelId: 'm-alpha' } }),
+          makeAgent({ id: 'use-beta', model: { providerId: 'beta', modelId: 'm-beta' } }),
+          makeAgent({ id: 'use-gamma', model: { providerId: 'gamma', modelId: 'm-gamma' } }),
+          // 无 providerId：回退默认（最后注册的 beta）
+          makeAgent({ id: 'use-default', model: { modelId: 'm-bare' } }),
+        ],
+        chatProvider: pAlpha,
+      })
+      // 模拟多个 Provider 插件逐个注册（注册表按 id 分发，最后注册的作为默认）
+      ;(h as unknown as HarnessImpl)._setChatProvider(pAlpha)
+      ;(h as unknown as HarnessImpl)._setChatProvider(pBeta)
+      ;(h as unknown as HarnessImpl)._setChatProvider(pGamma)
+      // 显式指定默认 = beta（覆盖 context 中最后注册的 gamma）
+      ;(h as unknown as HarnessImpl)._setChatProvider(pBeta)
+
+      await h.start()
+      const sess = await h.session.create()
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-alpha', message: 'hi' })
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-beta', message: 'hi' })
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-gamma', message: 'hi' })
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-default', message: 'hi' })
+      await h.stop()
+
+      expect(hits.alpha).toBe(1)
+      expect(hits.beta).toBe(2) // use-beta 显式分发 + use-default 回退默认
+      expect(hits.gamma).toBe(1)
+    })
+
+    it('resolveChatProvider：命中注册表 / 回退默认 / 未知 id 回退默认', () => {
+      const hits: Record<string, number> = {}
+      const pAlpha = providerWithHit('alpha', hits)
+      const pBeta = providerWithHit('beta', hits)
+      const pLegacy = providerWithHit('legacy', hits)
+      const impl = new HarnessImpl({
+        cwd: process.cwd(),
+        chatProvider: pLegacy,
+      } as any)
+      impl._setChatProvider(pAlpha)
+      impl._setChatProvider(pBeta)
+      expect(impl.resolveChatProvider('alpha')).toBe(pAlpha)
+      expect(impl.resolveChatProvider('beta')).toBe(pBeta)
+      // 'default' 与未注册 id 均回退默认（最后注册的 beta）
+      expect(impl.resolveChatProvider('default')).toBe(pBeta)
+      expect(impl.resolveChatProvider('nonexistent')).toBe(pBeta)
+      expect(impl.resolveChatProvider(undefined)).toBe(pBeta)
+    })
+  })
 })

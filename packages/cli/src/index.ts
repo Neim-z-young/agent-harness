@@ -38,6 +38,8 @@ import {
   MockChatProvider,
 } from '@harness/provider-mock'
 import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatProvider } from '@harness/provider-anthropic'
+import { createProviderOpenAIPlugin, OpenAIProviderConfig } from '@harness/provider-openai'
+import { createProviderGeminiPlugin, GeminiProviderConfig } from '@harness/provider-gemini'
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -77,8 +79,9 @@ export interface CliArgs {
   team?: string
   /** teammate 子命令：成员名（sanitize 后） */
   name?: string
-  provider?: 'mock' | 'anthropic'
-  /** 默认模型 ID（如 claude-3-5-sonnet），覆盖 config.json 与 Provider 默认 */
+  /** 默认 Provider id（如 anthropic / openai / gemini / 自定义） */
+  provider?: string
+  /** 默认模型 ID（如 claude-3-5-sonnet，或 provider/model 跨 Provider 指定），覆盖 config.json */
   model?: string
   sessionId?: string
   dataDir?: string
@@ -149,7 +152,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
       case 'a': case 'agent': out.agentId = value; break
       case 'team': out.team = value; break
       case 'name': out.name = value; break
-      case 'p': case 'provider': out.provider = value === 'mock' ? 'mock' : value === 'anthropic' ? 'anthropic' : undefined; break
+      case 'p': case 'provider': out.provider = value || undefined; break
       case 'm': case 'model': out.model = value; break
       case 's': case 'session': out.sessionId = value; break
       case 'd': case 'data-dir': out.dataDir = value; break
@@ -243,12 +246,48 @@ export class SessionFileStore {
 export interface HarnessConfig {
   /** 默认 Agent ID */
   agentId?: string
-  /** 默认 Provider */
-  provider?: 'mock' | 'anthropic'
-  /** 默认模型 ID（如 claude-3-5-sonnet） */
+  /** 默认 Provider id（如 anthropic / openai / gemini / 自定义，来自 config.providers） */
+  provider?: string
+  /** 默认模型 ID（如 claude-3-5-sonnet，或 openai/gpt-4o 跨 Provider 指定） */
   model?: string
   /** Anthropic API Key（可选，便于命令行快捷配置） */
   anthropicApiKey?: string
+  /** 多 Provider 定义：可同时注册多个（anthropic / openai / gemini / mock + 任意 OpenAI 兼容端点如 DeepSeek / Ollama） */
+  providers?: ProviderConfig[]
+}
+
+/** 单个 Provider 定义（config.json 的 providers 数组元素） */
+export interface ProviderConfig {
+  /** 唯一 ID：运行时 `provider/model` 前缀据此分发（如 anthropic / openai / deepseek / ollama / glm / qwen） */
+  id: string
+  /** Provider 类型（决定用哪个插件的实现；anthropic / gemini 使用原生协议，openai 可对接任意 OpenAI 兼容端点） */
+  type: 'anthropic' | 'openai' | 'gemini' | 'mock'
+  /** API 根路径（如 api.openai.com / api.deepseek.com / http://localhost:11434（Ollama）） */
+  baseUrl?: string
+  /** API Key */
+  apiKey?: string
+  /** 该 Provider 默认模型（运行时无 `provider/model` 前缀且未绑定到具体模型时使用） */
+  model?: string
+  /** OpenAI 类型专用：API 路径（默认 /v1/chat/completions；智谱等兼容 API 可改 /chat/completions） */
+  apiPath?: string
+  /** max_tokens 默认值（默认 Provider 内部值，如 4096） */
+  maxTokens?: number
+  /** 请求超时（ms，默认 120_000） */
+  timeoutMs?: number
+}
+
+/** 解析 `[provider/]modelId` 规格。示例：'openai/gpt-4o' → { providerId:'openai', modelId:'gpt-4o' }；'claude-3-5-sonnet' → { modelId:'claude-3-5-sonnet' } */
+export function parseModelSpec(spec: string): { providerId?: string; modelId: string } {
+  const s = spec.trim()
+  const idx = s.indexOf('/')
+  if (idx <= 0) return { providerId: undefined, modelId: s }
+  return { providerId: s.slice(0, idx).trim() || undefined, modelId: s.slice(idx + 1).trim() || s }
+}
+
+/** 格式化显示 `provider/modelId`（无 providerId 时仅返回 modelId） */
+export function formatModel(providerId: string | undefined, modelId: string | undefined): string | undefined {
+  if (!modelId) return undefined
+  return providerId ? `${providerId}/${modelId}` : modelId
 }
 
 /** dataDir/config.json 读写（保持幂等：文件缺失 / 解析失败均返回空配置） */
@@ -278,7 +317,7 @@ export class ConfigStore {
 /** 合并 CLI 参数与 config.json（CLI 优先），供 main() 汇总默认值 */
 export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
   agentId: string
-  provider: 'mock' | 'anthropic'
+  provider: string
   model?: string
   anthropicApiKey?: string
 } {
@@ -366,14 +405,16 @@ export interface HarnessAppOptions {
   cwd: string
   dataDir: string
   agentId: string
-  provider: 'mock' | 'anthropic'
-  /** 默认模型 ID（设置到默认 Agent 的 model，运行时可用 /model 查看/切换） */
+  provider: string
+  /** 默认模型 ID（如 claude-3-5-sonnet，或 provider/model 跨 Provider 指定），设置到默认 Agent 的 model */
   model?: string
   sessionId?: string
   permissionMode?: 'allow-all' | 'ask'
   /** 测试注入 */
   mockProviderConfig?: Parameters<typeof createProviderMockPlugin>[0]
   anthropicProviderConfig?: any
+  /** 多 Provider 定义（来自 config.json 的 providers；boot 时逐项安装，支持运行时跨 Provider 切换） */
+  providers?: ProviderConfig[]
   askPrompt?: (q: string) => Promise<string>
   stdout?: NodeJS.WritableStream | { write: (s: string) => void }
   verbose?: boolean
@@ -439,28 +480,80 @@ export class HarnessApp {
         'Be concise and precise.',
       ],
     }
-    if (this.options.model) def.model = { modelId: this.options.model }
+    if (this.options.model) {
+      const spec = parseModelSpec(this.options.model)
+      def.model = { providerId: spec.providerId, modelId: spec.modelId }
+    }
     return def
   }
 
-  /** 当前生效模型：优先读取活动 Agent 定义的 model.modelId，回退 options.model */
+  /** 当前生效模型（`provider/model` 展示）：优先读取活动 Agent 定义的 model，回退 options.model */
   getModel(agentId: string): string | undefined {
     const a = this.harness?.agent?.get?.(agentId)
-    return a?.model?.modelId ?? this.options.model
+    if (a?.model?.modelId) return formatModel(a.model.providerId, a.model.modelId)
+    return this.options.model
   }
 
   /**
-   * 运行时切换模型：更新指定 Agent 的 model.modelId（影响下次 send），
-   * 并持久化到 config.json 作为下次启动的默认模型。
+   * 运行时切换模型：接受 `[provider/]modelId` 规格（如 `openai/gpt-4o` 跨 Provider 切换），
+   * 更新指定 Agent 的 model 并持久化到 config.json（provider + model）作为下次启动默认。
    */
-  async setModel(agentId: string, modelId: string): Promise<boolean> {
+  async setModel(agentId: string, spec: string): Promise<boolean> {
     const a = this.harness?.agent?.get?.(agentId)
     if (!a) return false
-    a.model = { ...(a.model ?? {}), modelId }
-    // 持久化到全局配置
+    const parsed = parseModelSpec(spec.trim())
+    a.model = {
+      ...(a.model ?? {}),
+      ...(parsed.providerId ? { providerId: parsed.providerId } : {}),
+      modelId: parsed.modelId,
+    }
+    // 持久化：provider 前缀命中则更新默认 provider；model 仅存 modelId（前缀在 /model 已显式跨 Provider 时由 provider 字段接管）
     const cfg = await this.configStore.load()
-    await this.configStore.save({ ...cfg, model: modelId })
+    const provider = parsed.providerId ?? this.options.provider ?? cfg.provider ?? a.model?.providerId
+    await this.configStore.save({ ...cfg, provider, model: parsed.modelId })
     return true
+  }
+
+  /**
+   * 根据一条 ProviderConfig 构造对应 Provider 插件（type → 插件工厂）。
+   * type=openai 支持任意 OpenAI 兼容端点（DeepSeek / Ollama / GLM/Qwen 兼容 API），
+   * anthropic / gemini / mock 使用各自原生协议（id 固定为其标准值）。
+   */
+  private buildProviderPlugin(pc: ProviderConfig): AgentPlugin | undefined {
+    const common = {
+      baseUrl: pc.baseUrl,
+      apiKey: pc.apiKey,
+      defaultModel: pc.model,
+      maxTokens: pc.maxTokens,
+      timeoutMs: pc.timeoutMs,
+    }
+    switch (pc.type) {
+      case 'openai':
+        return createProviderOpenAIPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id })
+      case 'anthropic':
+        // 兼容：config 里未带 key 时回退 anthropicProviderOptions / 环境变量
+        return createProviderAnthropicPlugin({
+          ...common,
+          apiKey: pc.apiKey ?? this.options.anthropicProviderConfig?.apiKey,
+        }) as any
+      case 'gemini':
+        return createProviderGeminiPlugin({ ...common } as GeminiProviderConfig)
+      case 'mock':
+        return createProviderMockPlugin({ ...pc, defaultResponse: pc.model ? undefined : '(Mock Provider) 你好，我是测试助手。' })
+      default:
+        return undefined
+    }
+  }
+
+  /** 列出当前已注册 Provider id（供 /model ? /状态栏） */
+  listProviders(): string[] {
+    const ids: string[] = []
+    // config 里显式定义的 Provider id 优先
+    for (const pc of this.options.providers ?? []) if (!ids.includes(pc.id)) ids.push(pc.id)
+    // 默认 provider（mock/anthropic 或自定义）放最前
+    const def = this.options.provider ?? 'anthropic'
+    if (!ids.includes(def)) ids.unshift(def)
+    return ids
   }
 
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
@@ -477,28 +570,78 @@ export class HarnessApp {
       },
     })
 
-    // Provider 插件：优先用户选项；anthropic 无 key 时 fallback mock
+    // ------------------------------------------------------------------
+    // Provider 装配：支持多 Provider 自由切换
+    // 1) 优先安装 config.providers 里显式定义的多 Provider（按顺序注册到注册表，供跨 Provider 分发）
+    // 2) 默认 Provider 最后注册 —— 作为无 provider 前缀模型的兜底（也是运行时 /model 落盘的默认 provider）
+    // ------------------------------------------------------------------
+    const cfg = await this.configStore.load()
+    const providerConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
+    const defaultProviderId = this.options.provider ?? cfg.provider ?? 'anthropic'
+
+    // 默认 Provider 若是命名 Provider（非 mock/anthropic），从配置中找到它（避免重复注册，放到最后作默认）
+    const isCustomDefault = defaultProviderId !== 'mock' && defaultProviderId !== 'anthropic'
+    const defaultPc = isCustomDefault
+      ? providerConfigs.find((p) => p.id === defaultProviderId)
+      : undefined
+
     const providerPlugins: AgentPlugin[] = []
     let chosenProvider: AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } }
-    if (this.options.provider === 'mock') {
+
+    // 1) 其他（非默认）Provider
+    const builtIds = new Set<string>()
+    const pushBuilt = (plugin: AgentPlugin | undefined, id: string) => {
+      if (!plugin || builtIds.has(id)) return
+      builtIds.add(id)
+      providerPlugins.push(plugin)
+    }
+    for (const pc of providerConfigs) {
+      if (defaultPc && pc.id === defaultPc.id) continue // 默认放到最后
+      pushBuilt(this.buildProviderPlugin(pc), pc.id)
+    }
+
+    // 2) 默认 Provider（最后注册 → 作为无前缀模型的兜底）
+    if (defaultPc) {
+      // 默认 Provider 的默认模型优先取 --model / config.model 指定的模型（去 provider 前缀）
+      const defaultModel = parseModelSpec(this.options.model ?? '').modelId || defaultPc.model
+      const plugin = this.buildProviderPlugin({ ...defaultPc, model: defaultModel })
+      if (!plugin) {
+        this.options.stdout?.write?.(`⚠️  未能构造默认 Provider "${defaultProviderId}"（未知 type）。\n\n`)
+        chosenProvider = createProviderMockPlugin({
+          defaultResponse: '(Mock Provider) 你好，我是测试助手。',
+          ...(this.options.mockProviderConfig ?? {}),
+        })
+      } else {
+        chosenProvider = plugin as any
+      }
+    } else if (defaultProviderId === 'mock') {
       chosenProvider = createProviderMockPlugin({
         defaultResponse: '(Mock Provider) 你好，我是测试助手。',
         ...(this.options.mockProviderConfig ?? {}),
       })
     } else {
-      // provider.anthropic 配置：显式传入 > config.json(anthropicApiKey) > 环境变量
+      // anthropic（或无 key 时 fallback mock）
       const envKey = typeof process !== 'undefined' ? process.env.ANTHROPIC_API_KEY : undefined
-      const cfg = await this.configStore.load()
       const mergedAnthropic = {
         ...(this.options.anthropicProviderConfig ?? {}),
         apiKey: this.options.anthropicProviderConfig?.apiKey ?? cfg.anthropicApiKey ?? envKey,
-        defaultModel: this.options.anthropicProviderConfig?.defaultModel ?? this.options.model,
+        defaultModel: this.options.anthropicProviderConfig?.defaultModel ?? (parseModelSpec(this.options.model ?? '').modelId || undefined),
       }
       const hasKey = !!mergedAnthropic.apiKey
-      if (hasKey) {
+      if (hasKey && (defaultProviderId === 'anthropic' || this.options.provider === undefined)) {
         chosenProvider = createProviderAnthropicPlugin(mergedAnthropic) as any
+      } else if (hasKey && defaultProviderId !== 'anthropic') {
+        // 默认 provider 是自定义 id 但未在 providers 中配置 → 提示并 fallback mock
+        this.options.stdout?.write?.(
+          `ℹ️  未在 config.json → providers 中找到默认 Provider "${defaultProviderId}"，` +
+          `自动 fallback 到 Mock Provider。\n` +
+          `   可在 <data-dir>/config.json 的 providers 数组中定义它（type=openai/anthropic/gemini）。\n\n`
+        )
+        chosenProvider = createProviderMockPlugin({
+          defaultResponse: '(Mock Provider) 你好，我是测试助手。',
+          ...(this.options.mockProviderConfig ?? {}),
+        })
       } else {
-        // 自动 fallback mock 并打印提示
         this.options.stdout?.write?.(
           'ℹ️  未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider。\n' +
           '   如要使用真实 Claude，请 export ANTHROPIC_API_KEY=xxx。\n\n'
@@ -773,7 +916,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
           out('  /switch ?          列出已注册 Agent\n')
           out('  /model             查看当前模型\n')
-          out('  /model <modelId>   切换模型（下一条 send 生效，写入 config.json）\n')
+          out('  /model <spec>      切换模型：provider/modelId 跨 Provider（如 /model openai/gpt-4o）\n')
+          out('  /model ?           列出已注册 Provider\n')
           out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
@@ -832,17 +976,28 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         }
         case '/model': {
           const agentId = current.agentId ?? 'default'
-          const agent = harness.agent.get(agentId)
           if (!arg || arg === '?') {
+            const prods = app.listProviders()
+            out('已注册 Provider：' + (prods.length ? prods.join(' / ') : '（默认 mock/anthropic）') + '\n')
             const m = app.getModel(agentId)
             if (m) out(`当前模型：${m}（agent=${agentId}）\n`)
             else out(`Agent "${agentId}" 未绑定模型，使用 Provider 默认。\n`)
-            if (agent?.model?.options) out(`模型附加选项：${JSON.stringify(agent.model.options)}\n`)
+            if (harness.agent.get(agentId)?.model?.options) {
+              out(`模型附加选项：${JSON.stringify(harness.agent.get(agentId)!.model!.options)}\n`)
+            }
+            return 'continue'
+          }
+          // 校验：跨 Provider 切换时目标 provider 需已注册/配置
+          const parsed = parseModelSpec(arg.trim())
+          const providers = app.listProviders()
+          if (parsed.providerId && !providers.includes(parsed.providerId)) {
+            out(`Provider "${parsed.providerId}" 未注册。可用：${providers.join(' / ') || '（默认）'}\n`)
+            out('   可在 <data-dir>/config.json → providers 中定义后重新启动。\n')
             return 'continue'
           }
           const ok = await app.setModel(agentId, arg.trim())
           if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
-          out(`已切换模型 ${arg.trim()}（agent=${agentId}，影响下次 send）\n`)
+          out(`已切换模型 ${arg.trim()}（agent=${agentId}，影响下次 send；已写入 config.json）\n`)
           return 'continue'
         }
         case '/compact': {
@@ -1133,13 +1288,24 @@ teammate 选项:
 选项:
   -c, --cwd <dir>            工作目录（默认当前目录）
   -a, --agent <id>           默认 Agent ID（默认 default）
-  -p, --provider <name>      mock / anthropic（默认 anthropic，无 key 时自动 fallback mock）
-  -m, --model <modelId>      默认模型 ID（覆盖 config.json；运行时可用 /model 切换）
-  -s, --session <id>         指定会话 ID（用于 resume/run 时复用历史）
-  -d, --data-dir <dir>       持久化目录（默认 ~/.harness）
-      --permission <mode>    allow-all / ask（默认 ask）
-  -v, --verbose              输出调试信息
-      --tui                  以 TUI（alt-screen 全屏）模式启动 REPL
+  -p, --provider <id>      默认 Provider id：mock / anthropic，或 config.providers 中定义的自定义 id（默认 anthropic，无 key 时 fallback mock）
+  -m, --model <spec>       默认模型：provider/modelId 跨 Provider 指定（如 openai/gpt-4o）。运行时可用 /model 切换
+  -s, --session <id>       指定会话 ID（用于 resume/run 时复用历史）
+  -d, --data-dir <dir>     持久化目录（默认 ~/.harness）
+      --permission <mode>  allow-all / ask（默认 ask）
+  -v, --verbose            输出调试信息
+      --tui                以 TUI（alt-screen 全屏）模式启动 REPL
+
+多 Provider（config.json → providers）:
+  [
+    { "id": "openai",   "type": "openai",    "baseUrl": "https://api.openai.com", "apiKey": "...", "model": "gpt-4o" },
+    { "id": "deepseek", "type": "openai",    "baseUrl": "https://api.deepseek.com", "apiKey": "...", "model": "deepseek-chat" },
+    { "id": "ollama",   "type": "openai",    "baseUrl": "http://localhost:11434", "model": "qwen2.5" },
+    { "id": "glm",      "type": "openai",    "baseUrl": "https://open.bigmodel.cn", "apiPath": "/api/paas/v4/chat/completions", "model": "glm-4" },
+    { "id": "gemini",   "type": "gemini",    "apiKey": "...", "model": "gemini-2.0-flash" },
+    { "id": "anthropic","type": "anthropic", "apiKey": "...", "model": "claude-3-5-sonnet" }
+  ]
+  运行时用 provider/modelId 前缀自由切换，如：/model openai/gpt-4o、/model deepseek/deepseek-chat、/model ollama/qwen2.5
 
 配置优先级（model / provider / agent）:
   CLI 参数 > <data-dir>/config.json > 环境变量（ANTHROPIC_API_KEY）
@@ -1160,7 +1326,7 @@ export async function runTeammateCli(options: {
   args: CliArgs
   cwd: string
   dataDir: string
-  provider: 'mock' | 'anthropic'
+  provider: string
   agentId: string
   permissionMode: 'allow-all' | 'ask'
 }): Promise<number> {
@@ -1237,6 +1403,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
 
   const app = new HarnessApp({
     cwd, dataDir, agentId, provider, model,
+    providers: cfg.providers,
     anthropicProviderConfig: anthropicApiKey ? { apiKey: anthropicApiKey } : undefined,
     sessionId: args.command === 'resume' ? args.arg ?? args.sessionId : args.sessionId,
     permissionMode, verbose: args.verbose,

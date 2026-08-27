@@ -729,14 +729,19 @@ export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): Agent
 } {
   let provider: OpenAIChatProvider | undefined
 
+  // 插件 id 随 providerId 派生，使多个 OpenAI 兼容端点（openai/deepseek/ollama/glm/qwen…）
+  // 可在同一进程内各自注册而不冲突（PluginDuplicateIdError）。
+  const providerId = config?.providerId ?? 'openai'
+  const pluginId = `provider.${providerId}`
+
   const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
-    id: 'provider.openai',
+    id: pluginId,
     version: '0.1.0',
     name: 'OpenAI Provider',
     description: '对接 OpenAI Chat Completions API 的 Provider 插件',
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<OpenAIProviderConfig>('provider.openai')
+      const storeCfg = ctx.config.get<OpenAIProviderConfig>(pluginId)
       const merged: OpenAIProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
 
       provider = new OpenAIChatProvider(merged, () => [])

@@ -377,6 +377,30 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 - `config.json` 由 `ConfigStore` 读写（缺文件/坏 JSON 幂等返回空），提供运行时 `/model` 落盘默认模型
 - 运行时 `/model`：`/model` 查看当前模型，`/model <modelId>` 更新当前 Agent 的 model 并写入 `config.json`（影响下次 send）；TUI 状态栏/侧栏初始即展示配置模型，首轮回复后刷新为实际命中模型
 
+**多 Provider 自由切换（自定义模型配置）：**
+
+`config.json` 的 `providers` 数组可同时定义多个 provider（anthropic / openai / gemini / mock + 任意 OpenAI 兼容端点如 DeepSeek / Ollama / GLM / Qwen），每个含 baseUrl / apiKey / model：
+
+```json
+{
+  "provider": "openai",
+  "model": "gpt-4o",
+  "providers": [
+    { "id": "openai",   "type": "openai",    "baseUrl": "https://api.openai.com",      "apiKey": "...", "model": "gpt-4o" },
+    { "id": "deepseek", "type": "openai",    "baseUrl": "https://api.deepseek.com",    "apiKey": "...", "model": "deepseek-chat" },
+    { "id": "ollama",   "type": "openai",    "baseUrl": "http://localhost:11434",       "model": "qwen2.5" },
+    { "id": "glm",      "type": "openai",    "baseUrl": "https://open.bigmodel.cn",     "apiPath": "/api/paas/v4/chat/completions", "model": "glm-4" },
+    { "id": "gemini",   "type": "gemini",    "apiKey": "...", "model": "gemini-2.0-flash" },
+    { "id": "anthropic","type": "anthropic", "apiKey": "...", "model": "claude-3-5-sonnet" }
+  ]
+}
+```
+
+- **分发**：core 维护 `chatProviders` 注册表，`resolveChatProvider(providerId)` 按 `agent.model.providerId` 路由请求到对应 Provider；无 providerId 或未知 id 回退默认 Provider（配置的 `provider`，未注册时 fallback mock）
+- **规格**：`provider/modelId` 前缀跨 Provider 指定模型，如 `-m openai/gpt-4o`、`/model deepseek/deepseek-chat`、`/model ollama/qwen2.5`；`parseModelSpec` 拆分 providerId 与 modelId，`formatModel` 拼回展示
+- **插件安装**：`HarnessApp.boot()` 依次安装非默认 Provider 插件，默认 Provider 最后安装作兜底；openai 插件 id 随 `providerId` 派生（`provider.{providerId}`），多个兼容端点不冲突
+- **切换持久化**：`/model <provider/model>` 校验 provider 已注册后更新 Agent 并写入 `config.json`（provider + model）作为下次启动默认
+
 ---
 
 ### 3.5 Skill Layer：双轨技能系统
