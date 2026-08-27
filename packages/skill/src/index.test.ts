@@ -3,6 +3,7 @@ import {
   skillFromMarkdown,
   createSkillManager,
   formatSkillForPrompt,
+  formatSkillSource,
   type Skill,
   type SkillSource,
 } from './index'
@@ -352,6 +353,118 @@ body`)
     await mgr.load(tmpDir, 'user')
     expect(mgr.get('u')!.loadedFrom).toBe('user')
     expect(mgr.get('u')!.allowEmbedShell).toBe(true)
+  })
+})
+
+// ===== 技能来源标注 / 管理（disable / enable / reload 状态保持）测试 =====
+
+describe('formatSkillSource', () => {
+  it('所有来源都有中文标注', () => {
+    expect(formatSkillSource('bundled')).toBe('内置')
+    expect(formatSkillSource('user')).toBe('用户')
+    expect(formatSkillSource('project')).toBe('项目')
+    expect(formatSkillSource('mcp')).toBe('MCP')
+    expect(formatSkillSource('plugin')).toBe('插件')
+  })
+})
+
+describe('SkillManager 禁用 / 启用 / 重载', () => {
+  it('disable：从可用列表移除，可从 `all()`/`get()` 不可见，isDisabled 为 true', () => {
+    const mgr = createSkillManager([{
+      id: 's1', name: 'S1', description: '', loadedFrom: 'project', content: '',
+      userInvocable: true, allowEmbedShell: true,
+    }])
+    expect(mgr.get('s1')).toBeDefined()
+    expect(mgr.all()).toHaveLength(1)
+
+    const ok = mgr.disable('s1')
+    expect(ok).toBe(true)
+    expect(mgr.isDisabled('s1')).toBe(true)
+    expect(mgr.get('s1')).toBeUndefined()
+    expect(mgr.all()).toHaveLength(0)
+  })
+
+  it('disable 一个不存在的技能返回 false', () => {
+    const mgr = createSkillManager()
+    expect(mgr.disable('none')).toBe(false)
+    expect(mgr.isDisabled('none')).toBe(false)
+  })
+
+  it('重复 disable 返回 false（幂等）', () => {
+    const mgr = createSkillManager([{
+      id: 's', name: 'S', description: '', loadedFrom: 'project', content: '',
+    }])
+    expect(mgr.disable('s')).toBe(true)
+    expect(mgr.disable('s')).toBe(false)
+  })
+
+  it('enable：恢复被禁用的技能', async () => {
+    const mgr = createSkillManager([{
+      id: 's', name: 'S', description: '', loadedFrom: 'project', content: '原始内容',
+    }])
+    mgr.disable('s')
+    const restored = await mgr.enable('s')
+    expect(restored!.id).toBe('s')
+    expect(mgr.get('s')!).toBeDefined()
+    expect(mgr.isDisabled('s')).toBe(false)
+    expect(mgr.get('s')!.content).toBe('原始内容')
+  })
+
+  it('已启用技能 enable 幂等返回该技能', async () => {
+    const mgr = createSkillManager([{
+      id: 's', name: 'S', description: '', loadedFrom: 'project', content: '',
+    }])
+    const ret = await mgr.enable('s')
+    expect(ret!.id).toBe('s')
+  })
+
+  it('reload 时保持原禁用状态：禁用技能重载后仍不可见', async () => {
+    const tmpDir = `/tmp/harness-skill-reload-disabled-${Date.now()}`
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    mkdirSync(tmpDir, { recursive: true })
+    writeFileSync(`${tmpDir}/dskill.md`, `---
+name: dskill
+---
+旧内容`)
+
+    const mgr = createSkillManager()
+    await mgr.load(tmpDir)
+    mgr.disable('dskill')
+
+    writeFileSync(`${tmpDir}/dskill.md`, `---
+name: dskill
+---
+新内容`)
+    const reloaded = await mgr.reload('dskill')
+    expect(reloaded!.content).toBe('新内容')
+    // 重载保持禁用：仍不在 all/get 中，isDisabled 仍为 true
+    expect(mgr.get('dskill')).toBeUndefined()
+    expect(mgr.isDisabled('dskill')).toBe(true)
+
+    // 但 enable 能恢复为最新内容
+    const restored = await mgr.enable('dskill')
+    expect(restored!.content).toBe('新内容')
+  })
+
+  it('reload 启用中的技能：状态保持启用', async () => {
+    const tmpDir = `/tmp/harness-skill-reload-enabled-${Date.now()}`
+    const { mkdirSync, writeFileSync } = await import('node:fs')
+    mkdirSync(tmpDir, { recursive: true })
+    writeFileSync(`${tmpDir}/eskill.md`, `---
+name: eskill
+---
+v1`)
+
+    const mgr = createSkillManager()
+    await mgr.load(tmpDir)
+    writeFileSync(`${tmpDir}/eskill.md`, `---
+name: eskill
+---
+v2`)
+    const reloaded = await mgr.reload('eskill')
+    expect(reloaded!.content).toBe('v2')
+    expect(mgr.isDisabled('eskill')).toBe(false)
+    expect(mgr.get('eskill')!.content).toBe('v2')
   })
 })
 

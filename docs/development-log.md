@@ -1,5 +1,42 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 22）：插件 / 技能管理（enable / disable / reload + 技能来源标注）
+
+### 背景
+
+续 21 统一 `plugins` 目录后可加载各种插件，但缺少对插件与技能的运行时管理能力，也无法从插件注册技能、标注技能的加载来源。本次补齐「插件管理 + 技能管理 + 插件来源技能 + 来源标注」闭环。
+
+### 实现
+
+**1. 技能来源标注（[packages/skill/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/skill/src/index.ts)）**
+
+- `SkillSource` 增加 `'plugin'`（插件注册来源），与 `bundled / user / project / mcp` 并列为五来源
+- 新增 `formatSkillSource(source)`：五来源的中文标注（内置 / 用户 / 项目 / MCP / 插件），供 `/skills` 界面展示
+
+**2. SkillManager 管理能力（同文件）**
+
+- 接口与实现新增 `disable(id)`、`enable(id)`、`isDisabled(id)`
+  - `disable`：从可用列表移除，缓存到 `disabled`（enable 可恢复），重复禁用幂等返回 `false`
+  - `enable`：从禁用缓存恢复；未在缓存中则回落到 `reload`（从来源文件重载，等价新增技能启用）
+  - `reload` 保持原启用/禁用状态：禁用技能重载后仍不可见，启用技能重载后仍可见
+
+**3. core 暴露 skillManager（[packages/core/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts)）**
+
+- `Harness` 接口与实现新增 `readonly skillManager?: SkillManager`；插件可在 `harness.init` hook 中通过 `output.harness.skillManager.register(...)` 注册 `plugin` 来源的技能
+
+**4. CLI 管理命令（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）**
+
+- `HarnessApp` 新增 `pluginRegistry`（boot 时登记「可管理」插件对象：Provider / 插件目录 / extraPlugins，排除 `toolsBuiltin` 与 `core.*`）
+- 插件管理 API：`pluginInfos()`、`disablePlugin()`（unload）、`enablePlugin()`（按登记对象重装）、`reloadPlugin()`（hotReload）
+- 技能管理 API：`skillInfos()`（含 `sourceLabel` 中文标注）、`disableSkill()`、`enableSkill()`、`reloadSkill()`
+- REPL 新增 `/plugins` 与 `/skills` 命令（`enable | disable | reload` + 列表），并加入 `REPL_COMMANDS`（`/help` 可见）
+
+### 验证
+
+- skill 包新增 `formatSkillSource`、disable/enable/reload 状态保持与禁用心得等用例；skill 29 用例全绿
+- cli 新增 `/plugins`、`/skills` 命令（列表/禁用/启用/未知来源/help）等用例；cli 72 用例全绿
+- core / plugin 61 用例全绿；全部 26 包 typecheck 通过
+
 ## 2026-08-27（续 21）：统一 plugins 插件目录（支持各类插件）
 
 ### 背景

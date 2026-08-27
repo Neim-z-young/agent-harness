@@ -25,8 +25,20 @@ export type Awaitable<T> = T | Promise<T>
  * - user：用户全局配置（~/.harness/skills）
  * - project：项目级（.harness/skills）
  * - mcp：MCP Server 提供（安全限制：禁用 shell embed）
+ * - plugin：由插件（.harness/plugins）在其 install/harness.init 时注册
  */
-export type SkillSource = 'bundled' | 'user' | 'project' | 'mcp'
+export type SkillSource = 'bundled' | 'user' | 'project' | 'mcp' | 'plugin'
+
+/** 技能来源的中文标注（供 /skills 等管理界面展示） */
+export function formatSkillSource(source: SkillSource): string {
+  switch (source) {
+    case 'bundled': return '内置'
+    case 'user': return '用户'
+    case 'project': return '项目'
+    case 'mcp': return 'MCP'
+    case 'plugin': return '插件'
+  }
+}
 
 /** 任务预估（给 coordinator 参考，用于任务派发优先级） */
 export type SkillEffort = 'low' | 'medium' | 'high'
@@ -113,6 +125,12 @@ export interface SkillManager {
   filterByAgent(agentId: string): Skill[]
   /** 重载技能（热更新） */
   reload(id: string): Promise<Skill | undefined>
+  /** 禁用技能（从可用列表移除，可被 enable 恢复） */
+  disable(id: string): boolean
+  /** 恢复先前禁用（或仍存源的）技能 */
+  enable(id: string): Promise<Skill | undefined>
+  /** 是否已禁用 */
+  isDisabled(id: string): boolean
 }
 
 // ===== Frontmatter 解析（简化 YAML，自包含无依赖）=====
@@ -327,6 +345,8 @@ function extractEmbeds(body: string): SkillEmbed[] {
  */
 export class SkillManagerImpl implements SkillManager {
   private skills = new Map<string, Skill>()
+  /** 已禁用技能缓存（enable 时恢复） */
+  private disabled = new Map<string, Skill>()
   /** 来源目录映射（用于 reload） */
   private sourceDirs = new Map<string, { dir: string; source: SkillSource }>()
 
@@ -439,7 +459,7 @@ export class SkillManagerImpl implements SkillManager {
 
   /** 重载技能（从原始来源目录重新加载） */
   async reload(id: string): Promise<Skill | undefined> {
-    const existing = this.skills.get(id)
+    const existing = this.skills.get(id) ?? this.disabled.get(id)
     if (!existing) return undefined
 
     // 查找原始加载目录
@@ -450,7 +470,9 @@ export class SkillManagerImpl implements SkillManager {
         try {
           const content = readFileSync(dirPath, 'utf-8')
           const skill = skillFromMarkdown(content, id, source)
-          this.skills.set(id, skill)
+          // 重载保持原启用/禁用状态
+          if (this.disabled.has(id)) this.disabled.set(id, skill)
+          else this.skills.set(id, skill)
           return skill
         } catch { /* fallthrough */ }
       }
@@ -460,14 +482,40 @@ export class SkillManagerImpl implements SkillManager {
         try {
           const content = readFileSync(filePath, 'utf-8')
           const skill = skillFromMarkdown(content, id, source)
-          this.skills.set(id, skill)
+          if (this.disabled.has(id)) this.disabled.set(id, skill)
+          else this.skills.set(id, skill)
           return skill
         } catch { /* fallthrough */ }
       }
     }
 
-    // bundled 来源无法从文件重载，返回现有
+    // bundled / plugin / mcp 来源无法从文件重载，返回现有
     return existing
+  }
+
+  /** 禁用技能：从可用列表移除，保留到 cache 以便 enable 恢复；重复禁用返回 false */
+  disable(id: string): boolean {
+    const s = this.skills.get(id)
+    if (!s) return false
+    this.skills.delete(id)
+    this.disabled.set(id, s)
+    return true
+  }
+
+  /** 恢复被禁用（或仍存源文件）的技能 */
+  async enable(id: string): Promise<Skill | undefined> {
+    const cached = this.disabled.get(id)
+    if (cached) {
+      this.disabled.delete(id)
+      this.skills.set(id, cached)
+      return cached
+    }
+    // 未在禁用缓存中：尝试从来源文件重载（新增的技能）
+    return this.reload(id)
+  }
+
+  isDisabled(id: string): boolean {
+    return this.disabled.has(id)
   }
 }
 

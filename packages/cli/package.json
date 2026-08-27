@@ -27,6 +27,7 @@
     "@harness/provider-qwen": "workspace:*",
     "@harness/revert": "workspace:*",
     "@harness/session": "workspace:*",
+    "@harness/skill": "workspace:*",
     "@harness/snapshot": "workspace:*",
     "@harness/subagent": "workspace:*",
     "@harness/swarm": "workspace:*",

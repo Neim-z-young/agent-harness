@@ -1190,3 +1190,150 @@ describe('/revert 命令', () => {
     await app.shutdown()
   })
 })
+
+// ===== /plugins 插件管理命令 =====
+
+describe('/plugins 插件管理', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-cli-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  async function bootApp() {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    expect(app.pluginInfos().length).toBeGreaterThan(0)
+    return { app, harness, session, stdout, chunks }
+  }
+
+  it('列表展示已加载插件（含 mock provider，来源 + 可管理标记）', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/plugins', '/exit'] })
+    const out = chunks.join('')
+    expect(out).toInclude('provider.mock')
+    expect(out).toInclude('可管理')
+    expect(out).toInclude('用法：/plugins')
+    await app.shutdown()
+  })
+
+  it('查找未登记插件提示不受管理', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/plugins disable no-such', '/exit'] })
+    expect(chunks.join('')).toInclude('不受管理')
+    await app.shutdown()
+  })
+
+  it('enable/disable 插件幂等往返', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    const id = 'provider.mock'
+    expect(app.pluginInfos().some((p) => p.id === id)).toBe(true)
+
+    // disable → 从列表移除
+    const disableErr = await app.disablePlugin(id)
+    expect(disableErr).toBeUndefined()
+    expect(app.pluginInfos().some((p) => p.id === id)).toBe(false)
+
+    // 重复 disable → 返回不受管理（已不在 plugin.list，但 registry 仍在 → 实际走到 enable 分支逻辑）
+    // 这里改用 enable 恢复
+    const enableErr = await app.enablePlugin(id)
+    expect(enableErr).toBeUndefined()
+    expect(app.pluginInfos().some((p) => p.id === id)).toBe(true)
+
+    // 再次 enable → 已是启用状态
+    const again = await app.enablePlugin(id)
+    expect(again).toInclude('已是启用状态')
+    await app.shutdown()
+  })
+
+  it('/help 列表包含 /plugins', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/help', '/exit'] })
+    expect(chunks.join('')).toInclude('/plugins')
+    await app.shutdown()
+  })
+})
+
+// ===== /skills 技能管理命令 =====
+
+describe('/skills 技能管理', () => {
+  let dir: string
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'harness-cli-test-'))
+    // 项目级技能：.harness/skills/<id>.md（boot 会以 project 来源加载）
+    mkdirSync(join(dir, '.harness', 'skills'), { recursive: true })
+    writeFileSync(join(dir, '.harness', 'skills', 'greet.md'), `---
+name: greet
+description: 问候技能
+---
+你好，这是一条问候。
+`)
+  })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  async function bootApp() {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    return { app, harness, session, stdout, chunks }
+  }
+
+  it('列表展示已加载技能并标注来源', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    expect(app.skillInfos().some((s) => s.id === 'greet' && s.sourceLabel === '项目')).toBe(true)
+
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/skills', '/exit'] })
+    const out = chunks.join('')
+    expect(out).toInclude('greet')
+    expect(out).toInclude('项目(project)')
+    expect(out).toInclude('用法：/skills')
+    await app.shutdown()
+  })
+
+  it('/skills disable + enable 往返', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+
+    const disable = await app.disableSkill('greet')
+    expect(disable.ok).toBe(true)
+    expect(app.skillInfos().some((s) => s.id === 'greet')).toBe(false)
+
+    const enable = await app.enableSkill('greet')
+    expect(enable.ok).toBe(true)
+    expect(app.skillInfos().some((s) => s.id === 'greet')).toBe(true)
+
+    // 已启用时 enable → 提示已启用
+    const again = await app.enableSkill('greet')
+    expect(again.ok).toBe(false)
+    expect(again.message).toInclude('已是启用状态')
+
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/skills disable greet', '/skills enable greet', '/exit'] })
+    const out = chunks.join('')
+    expect(out).toInclude('已禁用技能 "greet"')
+    expect(out).toInclude('已启用技能 "greet"')
+    await app.shutdown()
+  })
+
+  it('/skills disable 不存在的技能返回失败', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    const res = await app.disableSkill('nope')
+    expect(res.ok).toBe(false)
+    expect(res.message).toInclude('不存在')
+    await app.shutdown()
+  })
+
+  it('/help 列表包含 /skills', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/help', '/exit'] })
+    expect(chunks.join('')).toInclude('/skills')
+    await app.shutdown()
+  })
+})

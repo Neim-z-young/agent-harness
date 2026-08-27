@@ -1532,6 +1532,8 @@ export interface Harness {
   readonly tools: ToolRegistry
   readonly toolPipeline: ToolPipeline
   readonly permission: PermissionEngine
+  /** Skill 管理器（加载/查询/禁用/重载技能；插件可在 harness.init 中通过此注册 plugin 来源技能） */
+  readonly skillManager?: SkillManager
 }
 
 /** createHarness() 参数 */

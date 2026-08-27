@@ -57,6 +57,7 @@ import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import { startTuiRepl } from './tui'
 import type { Message, Session } from '@harness/session'
+import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
 
 import { homedir } from 'node:os'
@@ -791,6 +792,8 @@ export class HarnessApp {
   public readonly providerTypes: ProviderTypeRegistry
   /** 文件快照服务（options.snapshot 开启时创建，供 createHarness 注入与 /revert 命令） */
   public readonly snapshotService: SnapshotService | undefined
+  /** 插件管理：boot 时登记的「可管理」插件对象（pluginId → AgentPlugin），供 /plugins enable 重新安装 */
+  readonly pluginRegistry = new Map<string, AgentPlugin>()
   private harness!: Harness
   private options: Required<Pick<HarnessAppOptions, 'cwd' | 'dataDir' | 'agentId' | 'provider'>> & HarnessAppOptions
 
@@ -870,6 +873,106 @@ export class HarnessApp {
     const provider = parsed.providerId ?? this.options.provider ?? cfg.provider ?? a.model?.providerId
     await this.configStore.save({ ...cfg, provider, model: parsed.modelId })
     return true
+  }
+
+  // ------------------------------------------------------------------
+  // 插件管理（/plugins）与技能管理（/skills）
+  // ------------------------------------------------------------------
+
+  /** 插件信息（供 /plugins 展示） */
+  pluginInfos(): Array<{ id: string; name: string; version: string; source: string; manageable: boolean; enabled: boolean }> {
+    if (!this.harness) return []
+    return this.harness.plugin.list().map((lp) => ({
+      id: lp.plugin.id,
+      name: lp.plugin.name,
+      version: lp.plugin.version,
+      source: lp.source,
+      manageable: this.pluginRegistry.has(lp.plugin.id),
+      enabled: true,
+    }))
+  }
+
+  /** 禁用插件（仅可管理插件可禁用；返回错误消息或 undefined 表示成功） */
+  async disablePlugin(id: string): Promise<string | undefined> {
+    const obj = this.pluginRegistry.get(id)
+    if (!obj) return `插件 "${id}" 不受管理（内置/未登记插件不可禁用）。`
+    try {
+      await this.harness.plugin.unload(id)
+    } catch (err: any) {
+      return `禁用插件 "${id}" 失败：${err?.message ?? String(err)}`
+    }
+    return undefined
+  }
+
+  /** 启用插件：将登记的原插件对象重新安装进 Harness */
+  async enablePlugin(id: string): Promise<string | undefined> {
+    const obj = this.pluginRegistry.get(id)
+    if (!obj) return `插件 "${id}" 不受管理（内置/未登记插件不可启用）。`
+    try {
+      // 已启用则幂等成功
+      const already = this.harness.plugin.list().find((p) => p.plugin.id === id)
+      if (already) return `${id} 已是启用状态。`
+      await this.harness.plugin.loadInternal([obj])
+    } catch (err: any) {
+      return `启用插件 "${id}" 失败：${err?.message ?? String(err)}`
+    }
+    return undefined
+  }
+
+  /** 重载插件 */
+  async reloadPlugin(id: string): Promise<string | undefined> {
+    if (!this.harness.plugin.list().some((p) => p.plugin.id === id)) return `插件 "${id}" 未加载。`
+    try {
+      await this.harness.plugin.hotReload(id)
+    } catch (err: any) {
+      return `重载插件 "${id}" 失败：${err?.message ?? String(err)}`
+    }
+    return undefined
+  }
+
+  /** 技能信息（供 /skills 展示，来源中文标注） */
+  skillInfos(): Array<{ id: string; name: string; source: string; sourceLabel: string; enabled: boolean }> {
+    const mgr = this.harness?.skillManager
+    if (!mgr) return []
+    return mgr.all().map((s) => ({
+      id: s.id,
+      name: s.name,
+      source: s.loadedFrom,
+      sourceLabel: formatSkillSource(s.loadedFrom),
+      enabled: true,
+    }))
+  }
+
+  /** 禁用技能 */
+  async disableSkill(id: string): Promise<{ ok: boolean; message: string }> {
+    const mgr = this.harness?.skillManager
+    if (!mgr) return { ok: false, message: '技能系统未启用。' }
+    if (!mgr.get(id)) return { ok: false, message: `技能 "${id}" 不存在。` }
+    const ok = mgr.disable(id)
+    return ok
+      ? { ok: true, message: `已禁用技能 "${id}"（可在 /skills enable ${id} 恢复）。` }
+      : { ok: false, message: `技能 "${id}" 已是禁用状态。` }
+  }
+
+  /** 启用技能 */
+  async enableSkill(id: string): Promise<{ ok: boolean; message: string }> {
+    const mgr = this.harness?.skillManager
+    if (!mgr) return { ok: false, message: '技能系统未启用。' }
+    if (mgr.get(id)) return { ok: false, message: `技能 "${id}" 已是启用状态。` }
+    const s = await mgr.enable(id)
+    return s
+      ? { ok: true, message: `已启用技能 "${id}"（来源：${formatSkillSource(s.loadedFrom)}）。` }
+      : { ok: false, message: `技能 "${id}" 不存在且无可恢复来源。` }
+  }
+
+  /** 重载技能 */
+  async reloadSkill(id: string): Promise<{ ok: boolean; message: string }> {
+    const mgr = this.harness?.skillManager
+    if (!mgr) return { ok: false, message: '技能系统未启用。' }
+    const s = await mgr.reload(id)
+    return s
+      ? { ok: true, message: `已重载技能 "${id}"（来源：${formatSkillSource(s.loadedFrom)}）。` }
+      : { ok: false, message: `技能 "${id}" 不存在。` }
   }
 
   /**
@@ -1028,6 +1131,15 @@ export class HarnessApp {
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
     if (this.options.extraPlugins?.length) providerPlugins.push(...this.options.extraPlugins)
 
+    // 登记「可管理」插件（/plugins enable 需要对象引用重新安装）：
+    // 排除 core 内置工具插件（toolsBuiltin）与后续由 core 内部注册的 core.*（skill-injection 等），
+    // 仅管理用户装配的 Provider / 插件目录 / extraPlugins。
+    this.pluginRegistry.clear()
+    for (const p of providerPlugins) {
+      if (p.id === toolsBuiltinPlugin.id) continue
+      this.pluginRegistry.set(p.id, p)
+    }
+
     // 创建 Harness
     const harness = await createHarness({
       cwd: this.options.cwd,
@@ -1133,7 +1245,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/model', '/config', '/save', '/compact']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills']
 
 // ========================================================================
 // 5.1 后台任务面板（P1-4 前端事件驱动展示）
@@ -1295,6 +1407,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
           out('  /export [sessionId]  导出会话为 Markdown（默认当前会话）\n')
           out('  /revert <sub>         文件快照回滚：stage/clear/commit/status/help\n')
+          out('  /plugins              列出已加载插件（含来源/是否可管理）\n')
+          out('  /plugins <op> <id>    enable|disable|reload 插件（如 /plugins reload my-gw）\n')
+          out('  /skills               列出所有技能（含来源标注）\n')
+          out('  /skills <op> <id>     enable|disable|reload 技能（如 /skills disable foo）\n')
           // 收集插件注册的命令
           try {
             const cmdInput = { commands: [] as Array<{ command: string; description: string; usage?: string }> }
@@ -1483,6 +1599,52 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             out(`回滚失败：${err?.message ?? String(err)}\n`)
             return 'continue'
           }
+        }
+        case '/plugins': {
+          const parts = line.split(/\s+/).map((s) => s.trim()).filter(Boolean)
+          const op = parts[1]
+          const pid = parts[2]
+          if (!op || !pid || !['enable', 'disable', 'reload'].includes(op)) {
+            const infos = app.pluginInfos()
+            if (infos.length === 0) { out('（未加载任何插件）\n'); return 'continue' }
+            for (const p of infos) {
+              const manage = p.manageable ? '可管理' : '内置'
+              out(`  ${p.id.padEnd(28)}${p.name}  v${p.version}  来源=${p.source}  [${manage}]\n`)
+            }
+            if (parts.length === 1) { out('\n用法：/plugins <enable|disable|reload> <pluginId>\n'); return 'continue' }
+            out('用法：/plugins <enable|disable|reload> <pluginId>\n')
+            return 'continue'
+          }
+          const msg = op === 'disable'
+            ? await app.disablePlugin(pid)
+            : op === 'enable'
+              ? await app.enablePlugin(pid)
+              : await app.reloadPlugin(pid)
+          out((msg ?? `${op === 'reload' ? '已重载' : `已${op === 'enable' ? '启用' : '禁用'}`}插件 "${pid}"。`) + '\n')
+          return 'continue'
+        }
+        case '/skills': {
+          const parts = line.split(/\s+/).map((s) => s.trim()).filter(Boolean)
+          const op = parts[1]
+          const sid = parts[2]
+          if (!op || !sid || !['enable', 'disable', 'reload'].includes(op)) {
+            const infos = app.skillInfos()
+            if (infos.length === 0) { out('（未加载任何技能）\n'); return 'continue' }
+            out('已加载技能（来源标注）：\n')
+            for (const s of infos) {
+              out(`  ${s.id.padEnd(24)}${s.name}  [${s.sourceLabel}(${s.source})]\n`)
+            }
+            if (parts.length === 1) { out('\n用法：/skills <enable|disable|reload> <skillId>\n'); return 'continue' }
+            out('用法：/skills <enable|disable|reload> <skillId>\n')
+            return 'continue'
+          }
+          const res = op === 'disable'
+            ? await app.disableSkill(sid)
+            : op === 'enable'
+              ? await app.enableSkill(sid)
+              : await app.reloadSkill(sid)
+          out(`${res.ok ? '✅' : '❌'}  ${res.message}\n`)
+          return 'continue'
         }
         default: {
           // 尝试交给插件处理

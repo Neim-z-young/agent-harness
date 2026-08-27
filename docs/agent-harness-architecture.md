@@ -447,8 +447,8 @@ interface Skill {
   name: string
   description: string                     // AI 何时使用的触发说明
 
-  // === 来源（三来源同 Claude Code） ===
-  loadedFrom: 'bundled' | 'user' | 'project' | 'mcp'
+  // === 来源（五来源：三来源 + mcp + plugin） ===
+  loadedFrom: 'bundled' | 'user' | 'project' | 'mcp' | 'plugin'
 
   // === 条件触发（Claude Code paths 精髓） ===
   paths?: string[]                        // glob 匹配：修改这些文件时自动注入上下文
@@ -472,6 +472,15 @@ interface SkillEmbed {
   // 安全：loadedFrom === 'mcp' 时 shell embed 跳过执行
 }
 ```
+
+**技能来源标注 `formatSkillSource(source)`：** `'bundled'→内置` / `'user'→用户` / `'project'→项目` / `'mcp'→MCP` / `'plugin'→插件`，供管理界面展示来源。
+
+**SkillManager 管理能力（enable / disable / reload）：**
+- `disable(id)`：从可用列表移除并缓存，可被 `enable` 恢复；重复禁用幂等返回 `false`
+- `enable(id)`：从禁用缓存恢复；未在缓存中则回落 `reload`（等价启用新增技能）
+- `isDisabled(id)`：查询禁用状态
+- `reload(id)`：从原始来源文件热更新，且保持原启用/禁用状态
+- 插件可在 `harness.init` hook 中通过 `harness.skillManager.register(...)` 注册 `'plugin'` 来源技能
 
 ---
 
