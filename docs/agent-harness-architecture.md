@@ -412,6 +412,21 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 - **同 URL 不同 key**：注册表按 `id` 分发，两个端点只要 `id` 不同即可共存（如 `gateway-a`/`gateway-b` 指向同一 baseUrl），`/model gateway-a/gpt-4o` 与 `/model gateway-b/gpt-4o` 各自使用对应 apiKey
 - **GLM / Qwen 预设**：`type: "glm"` / `type: "qwen"` 使用预设端点与默认模型（智谱 BigModel / 阿里 DashScope），apiKey 默认读 `ZHIPU_API_KEY` / `DASHSCOPE_API_KEY`；或统一用 `type: "openai"` 手动填 baseUrl/apiPath
 
+**Provider 类型插件化（type 不再硬编码）：**
+
+- `ProviderConfig.type` 是开放字符串；内置类型（openai/anthropic/gemini/glm/qwen/mock）只是「已注册」的默认项
+- `ProviderTypeRegistry`（`type → createPlugin(config)`）替代 CLI 硬编码 switch；`HarnessApp.providerTypes` 公开，boot 前可注入自定义类型
+- 外部插件多级加载：`~/.harness/provider-plugins`（user）→ `<project>/.harness/provider-plugins`（project，后加载覆盖）。插件模块约定导出：
+
+```typescript
+export const providerType = 'my-gw'
+export function createProviderPlugin(config) {
+  // 返回 AgentPlugin：install 内通过 harness.init hook 调用 _setChatProvider 注册 ChatProvider
+}
+```
+
+- 配置校验按注册表动态进行，未知 type 报错时列出已注册类型并提示 provider-plugins 扩展方式；`--check-config` / `config check` 加载外部插件后校验
+
 ---
 
 ### 3.5 Skill Layer：双轨技能系统

@@ -20,6 +20,29 @@
 
 - cli 74 用例全绿（新增 `--model` 解析、ConfigStore 往返/坏 JSON、resolveConfig 优先级、REPL `/model` 查看+切换+落盘、TUI 状态栏初始模型展示共 8 个），cli typecheck 通过
 
+## 2026-08-27（续 20）：Provider 类型插件化（去掉硬编码 type 枚举）
+
+### 背景
+
+`ProviderConfig.type` 之前是硬编码枚举（anthropic/openai/gemini/glm/qwen/mock），CLI 内部 switch 分发，新增 Provider 类型必须改 CLI 代码——违背系统插件化理念。本次改为注册表 + 多级插件目录加载。
+
+### 实现（[packages/cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+
+1. **`ProviderConfig.type` 开放为任意字符串**：内置类型只是「已注册」的默认项，不再是枚举限制
+2. **`ProviderTypeRegistry`**：`type → createPlugin(config)` 工厂注册表，`resolve/list` 动态解析（替代硬编码 switch）
+   - `registerBuiltinProviderTypes(registry, options)`：内置 openai/anthropic/gemini/glm/qwen/mock 以注册方式装配（anthropic 仍捕获 options 兜底 key）
+   - `HarnessApp.providerTypes` 公开注册表，第三方可在 boot 前注入自定义 type
+3. **外部插件多级加载**：`loadProviderPluginDirs` 扫描 `~/.harness/provider-plugins`（user）→ `<project>/.harness/provider-plugins`（project，后加载覆盖）
+   - 插件模块约定导出 `providerType: string` + `createProviderPlugin(config): AgentPlugin`（或 `providerTypeFactory` / default 同构）
+   - 缺声明/加载失败 → 告警跳过（不静默、不崩溃）
+4. **校验动态化**：`validateProviderConfigs(providers, defaultId, knownTypes)` 已知类型由注册表提供，未知 type 报错时列出已注册类型并提示 provider-plugins 扩展方式
+5. **自检联动**：`--check-config` / `config check` 通过 `buildCheckRegistry` 加载外部插件后再校验
+
+### 验证
+
+- 新增测试：ProviderTypeRegistry（register/resolve/list/覆盖）、内置 6 类型齐全、loadProviderPluginDirs（约定加载/多级覆盖/坏文件告警）、校验按注册表动态、自定义 type 经注册表装配并参与分发
+- cli 101 用例全绿，cli typecheck 通过；真实冒烟：`.harness/provider-plugins` 放 my-gw 插件 → `--check-config` 识别 `type=my-gw` 并校验通过
+
 ## 2026-08-27（续 19）：多 Provider 配置健壮性增强
 
 ### 背景

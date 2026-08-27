@@ -65,6 +65,7 @@ import { existsSync } from 'node:fs'
 import { readFile, writeFile, mkdir, unlink, readdir } from 'node:fs/promises'
 import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto'
 import { createInterface } from 'node:readline'
+import { pathToFileURL } from 'node:url'
 
 // ========================================================================
 // 1. 参数解析
@@ -275,8 +276,8 @@ export interface HarnessConfig {
 export interface ProviderConfig {
   /** 唯一 ID：运行时 `provider/model` 前缀据此分发（如 anthropic / openai / deepseek / ollama / glm / qwen） */
   id: string
-  /** Provider 类型（决定用哪个插件的实现；anthropic / gemini / glm / qwen 使用各自预设协议，openai 可对接任意 OpenAI 兼容端点） */
-  type: 'anthropic' | 'openai' | 'gemini' | 'glm' | 'qwen' | 'mock'
+  /** Provider 类型：内置支持 anthropic / openai / gemini / glm / qwen / mock；可通过 provider-plugins 插件扩展任意自定义 type（插件化） */
+  type: string
   /** API 根路径（如 api.openai.com / api.deepseek.com / http://localhost:11434（Ollama）） */
   baseUrl?: string
   /** API Key */
@@ -345,7 +346,130 @@ export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
 }
 
 // ------------------------------------------------------------------------
-// 2.2 密钥加密存储 + 配置校验（多 Provider 健壮性）
+// 2.2 Provider 类型注册表（插件化扩展点）
+// ------------------------------------------------------------------------
+
+/** Provider 类型工厂：`config.type` → 插件构造。第三方插件可注册任意 type */
+export interface ProviderTypeFactory {
+  /** 对应 ProviderConfig.type 的值 */
+  type: string
+  /** 根据 ProviderConfig 构造 Provider 插件（返回 undefined 表示该配置不可用） */
+  createPlugin: (config: ProviderConfig) => AgentPlugin | undefined
+}
+
+/** Provider 类型注册表：内置类型 + 外部 provider-plugins 插件按 type 动态解析（替代硬编码 switch） */
+export class ProviderTypeRegistry {
+  private readonly factories = new Map<string, ProviderTypeFactory>()
+
+  register(factory: ProviderTypeFactory): void {
+    this.factories.set(factory.type, factory)
+  }
+
+  resolve(type: string): ProviderTypeFactory | undefined {
+    return this.factories.get(type)
+  }
+
+  list(): string[] {
+    return [...this.factories.keys()]
+  }
+}
+
+/** 注册 CLI 内置 Provider 类型工厂（openai / anthropic / gemini / glm / qwen / mock） */
+export function registerBuiltinProviderTypes(
+  registry: ProviderTypeRegistry,
+  options: { anthropicProviderConfig?: any } = {},
+): void {
+  registry.register({
+    type: 'openai',
+    createPlugin: (pc) => createProviderOpenAIPlugin({
+      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
+    }),
+  })
+  registry.register({
+    type: 'glm',
+    createPlugin: (pc) => createProviderGlmPlugin({
+      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
+    } as GlmProviderConfig),
+  })
+  registry.register({
+    type: 'qwen',
+    createPlugin: (pc) => createProviderQwenPlugin({
+      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
+    } as QwenProviderConfig),
+  })
+  registry.register({
+    type: 'gemini',
+    createPlugin: (pc) => createProviderGeminiPlugin({
+      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs,
+    } as GeminiProviderConfig),
+  })
+  registry.register({
+    type: 'anthropic',
+    createPlugin: (pc) => createProviderAnthropicPlugin({
+      baseUrl: pc.baseUrl,
+      apiKey: pc.apiKey ?? options.anthropicProviderConfig?.apiKey,
+      defaultModel: pc.model,
+      maxTokens: pc.maxTokens,
+      timeoutMs: pc.timeoutMs,
+    }) as any,
+  })
+  registry.register({
+    type: 'mock',
+    createPlugin: (pc) => createProviderMockPlugin({
+      ...pc,
+      defaultResponse: pc.model ? undefined : '(Mock Provider) 你好，我是测试助手。',
+    }),
+  })
+}
+
+/**
+ * 从多级目录加载外部 Provider 插件（user → project，后加载覆盖先加载）。
+ * 每个 .ts/.js/.mjs 文件是一个插件模块，约定导出：
+ *   providerType: string                     —— 支持的 type
+ *   createProviderPlugin(config) => AgentPlugin
+ * （或导出 providerTypeFactory: { type, createPlugin } / default 同构）
+ */
+export async function loadProviderPluginDirs(
+  registry: ProviderTypeRegistry,
+  dirs: Array<string | { dir: string; source?: 'user' | 'project' }>,
+  log?: (s: string) => void,
+): Promise<void> {
+  const out = log ?? ((s: string) => { if (typeof process !== 'undefined') process.stderr.write(s + '\n') })
+  for (const entry of dirs) {
+    const dir = typeof entry === 'string' ? entry : entry.dir
+    if (!existsSync(dir)) continue
+    let files: string[]
+    try { files = await readdir(dir) } catch { continue }
+    for (const file of files) {
+      if (!/\.(ts|js|mjs)$/.test(file)) continue
+      const full = join(dir, file)
+      try {
+        const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
+        const defaultHolder = (mod.default ?? {}) as Record<string, unknown>
+        const holder = (mod.providerTypeFactory ?? defaultHolder) as Record<string, unknown>
+        const type = (holder.type ?? mod.providerType ?? defaultHolder.providerType) as string | undefined
+        const createPlugin =
+          (holder.createPlugin ?? mod.createProviderPlugin ?? defaultHolder.createProviderPlugin) as
+            | ((config: ProviderConfig) => AgentPlugin | undefined)
+            | undefined
+        if (!type || typeof createPlugin !== 'function') {
+          out(`Provider 插件缺少 providerType / createProviderPlugin：${full}`)
+          continue
+        }
+        registry.register({ type, createPlugin })
+      } catch (err) {
+        out(`Provider 插件加载失败 ${full}：${(err as Error)?.message ?? String(err)}`)
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------------
+// 2.3 密钥加密存储 + 配置校验（多 Provider 健壮性）
 // ------------------------------------------------------------------------
 
 /** 配置校验/密钥解析失败（含定位信息），启动时一次性抛出 */
@@ -440,15 +564,20 @@ export interface ProviderConfigIssue {
 }
 
 /**
- * 校验 providers 数组与默认 provider：
+ * 校验 providers 数组与默认 provider（已知类型由 ProviderTypeRegistry 动态提供，插件化）：
  * - id 缺失 / 重复 → 报错（避免静默覆盖注册）
- * - type 未知 → 报错（列出支持的类型）
+ * - type 未知 → 报错（列出已注册类型）
  * - 默认 provider 指向未定义的 id（非内置 mock/anthropic）→ 报错
  */
-export function validateProviderConfigs(providers: ProviderConfig[], defaultProviderId: string): ProviderConfigIssue[] {
+export function validateProviderConfigs(
+  providers: ProviderConfig[],
+  defaultProviderId: string,
+  knownTypes: Iterable<string>,
+): ProviderConfigIssue[] {
   const issues: ProviderConfigIssue[] = []
   const seen = new Set<string>()
-  const knownTypes = new Set(['anthropic', 'openai', 'gemini', 'glm', 'qwen', 'mock'])
+  const known = new Set(knownTypes)
+  const knownTypesText = [...known].join(' / ') || '（无已注册类型）'
   providers.forEach((pc, i) => {
     if (!pc.id?.trim()) {
       issues.push({ index: i, message: `providers[${i}] 缺少 id（必须唯一）` })
@@ -458,12 +587,12 @@ export function validateProviderConfigs(providers: ProviderConfig[], defaultProv
       issues.push({ index: i, message: `providers[${i}].id "${pc.id}" 与前面的 provider 重复（id 必须唯一，否则后注册的会被覆盖）` })
     }
     seen.add(pc.id)
-    if (!knownTypes.has(pc.type as any)) {
-      issues.push({ index: i, message: `providers[${i}].type "${pc.type}" 未知（支持：anthropic / openai / gemini / glm / qwen / mock）` })
+    if (!pc.type || !known.has(pc.type)) {
+      issues.push({ index: i, message: `providers[${i}].type "${pc.type}" 未知（已注册类型：${knownTypesText}；可通过 ~/.harness/provider-plugins 或 .harness/provider-plugins 插件扩展）` })
     }
   })
   if (defaultProviderId && defaultProviderId !== 'mock' && defaultProviderId !== 'anthropic' && !seen.has(defaultProviderId)) {
-    issues.push({ index: -1, message: `默认 provider "${defaultProviderId}" 未在 providers 数组中定义（type 支持：anthropic / openai / gemini / glm / qwen / mock）` })
+    issues.push({ index: -1, message: `默认 provider "${defaultProviderId}" 未在 providers 数组中定义（已注册类型：${knownTypesText}）` })
   }
   return issues
 }
@@ -602,6 +731,8 @@ export class HarnessApp {
   public readonly permissionStorePath: string
   /** 全局配置读写（config.json：model / provider / apiKey 持久化） */
   public readonly configStore: ConfigStore
+  /** Provider 类型注册表（内置 + 外部 provider-plugins 插件；config.type 据此动态解析） */
+  public readonly providerTypes: ProviderTypeRegistry
   /** 文件快照服务（options.snapshot 开启时创建，供 createHarness 注入与 /revert 命令） */
   public readonly snapshotService: SnapshotService | undefined
   private harness!: Harness
@@ -613,6 +744,10 @@ export class HarnessApp {
     this.sessionStore = new SessionFileStore(this.options.dataDir)
     this.permissionStorePath = join(this.options.dataDir, 'permissions.json')
     this.configStore = new ConfigStore(this.options.dataDir)
+    // Provider 类型注册表：注册内置类型（openai/anthropic/gemini/glm/qwen/mock），
+    // boot() 时再加载外部 provider-plugins 插件补充自定义 type
+    this.providerTypes = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(this.providerTypes, this.options)
     if (options.snapshot) {
       this.snapshotService = createSnapshotService({ worktree: cwd })
     }
@@ -682,38 +817,13 @@ export class HarnessApp {
   }
 
   /**
-   * 根据一条 ProviderConfig 构造对应 Provider 插件（type → 插件工厂）。
-   * type=openai 支持任意 OpenAI 兼容端点（DeepSeek / Ollama / GLM/Qwen 兼容 API），
-   * anthropic / gemini / mock 使用各自原生协议（id 固定为其标准值）。
+   * 根据一条 ProviderConfig 构造对应 Provider 插件。
+   * 通过 ProviderTypeRegistry 按 config.type 动态解析（内置类型 + 外部 provider-plugins 插件），
+   * 不再硬编码 switch —— 新增 Provider 类型无需改 CLI 代码。
+   * type=openai 支持任意 OpenAI 兼容端点（DeepSeek / Ollama / GLM/Qwen 兼容 API）。
    */
   private buildProviderPlugin(pc: ProviderConfig): AgentPlugin | undefined {
-    const common = {
-      baseUrl: pc.baseUrl,
-      apiKey: pc.apiKey,
-      defaultModel: pc.model,
-      maxTokens: pc.maxTokens,
-      timeoutMs: pc.timeoutMs,
-    }
-    switch (pc.type) {
-      case 'openai':
-        return createProviderOpenAIPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id })
-      case 'glm':
-        return createProviderGlmPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id } as GlmProviderConfig)
-      case 'qwen':
-        return createProviderQwenPlugin({ ...common, apiPath: pc.apiPath, providerId: pc.id } as QwenProviderConfig)
-      case 'anthropic':
-        // 兼容：config 里未带 key 时回退 anthropicProviderOptions / 环境变量
-        return createProviderAnthropicPlugin({
-          ...common,
-          apiKey: pc.apiKey ?? this.options.anthropicProviderConfig?.apiKey,
-        }) as any
-      case 'gemini':
-        return createProviderGeminiPlugin({ ...common } as GeminiProviderConfig)
-      case 'mock':
-        return createProviderMockPlugin({ ...pc, defaultResponse: pc.model ? undefined : '(Mock Provider) 你好，我是测试助手。' })
-      default:
-        return undefined
-    }
+    return this.providerTypes.resolve(pc.type)?.createPlugin(pc)
   }
 
   /** 列出当前已注册 Provider id（供 /model ? /状态栏） */
@@ -750,6 +860,13 @@ export class HarnessApp {
     const rawProviderConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
     const defaultProviderId = this.options.provider ?? cfg.provider ?? 'anthropic'
 
+    // 加载外部 Provider 插件（user ~/.harness/provider-plugins → project .harness/provider-plugins，后加载覆盖先加载）
+    const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
+    await loadProviderPluginDirs(this.providerTypes, [
+      { dir: join(home, '.harness', 'provider-plugins'), source: 'user' },
+      { dir: join(this.options.cwd, '.harness', 'provider-plugins'), source: 'project' },
+    ], (s) => this.options.stdout?.write?.(s + '\n'))
+
     // 显式校验 + 密钥解析（错误一次性汇总，避免静默跳过/误导）
     const cipher = new SecretCipher(this.options.dataDir)
     const configIssues: string[] = []
@@ -761,7 +878,7 @@ export class HarnessApp {
         configIssues.push(`providers[${rawProviderConfigs.indexOf(pc)}]（id=${pc.id ?? '?'}）：${err?.message ?? String(err)}`)
       }
     }
-    for (const iss of validateProviderConfigs(rawProviderConfigs, defaultProviderId)) {
+    for (const iss of validateProviderConfigs(rawProviderConfigs, defaultProviderId, this.providerTypes.list())) {
       configIssues.push(iss.message)
     }
     if (configIssues.length) {
@@ -854,7 +971,6 @@ export class HarnessApp {
     if (this.options.extraPlugins?.length) providerPlugins.push(...this.options.extraPlugins)
 
     // 创建 Harness
-    const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
     const harness = await createHarness({
       cwd: this.options.cwd,
       defaultAgentId: this.options.agentId,
@@ -1520,6 +1636,13 @@ teammate 选项:
   ]
   运行时用 provider/modelId 前缀自由切换，如：/model openai/gpt-4o、/model deepseek/deepseek-chat、/model ollama/qwen2.5
 
+Provider 类型插件扩展（插件化，无需改 CLI）:
+  providers[].type 不限于内置类型。在 ~/.harness/provider-plugins（user）或 <project>/.harness/provider-plugins（project）
+  放置 .ts/.js 插件，约定导出:
+    export const providerType = 'my-gw'
+    export function createProviderPlugin(config) { /* 返回 AgentPlugin，install 内注册 ChatProvider */ }
+  config.json 中即可使用 { "id": "my-gw", "type": "my-gw", "baseUrl": "...", "apiKey": "..." }
+
 配置优先级（model / provider / agent）:
   CLI 参数 > <data-dir>/config.json > 环境变量（ANTHROPIC_API_KEY）
 `
@@ -1583,6 +1706,18 @@ export async function runTeammateCli(options: {
   return 0
 }
 
+/** 构造用于配置自检的 Provider 类型注册表（内置 + 外部 provider-plugins 插件） */
+export async function buildCheckRegistry(cwd: string, log: (s: string) => void): Promise<ProviderTypeRegistry> {
+  const registry = new ProviderTypeRegistry()
+  registerBuiltinProviderTypes(registry, {})
+  const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
+  await loadProviderPluginDirs(registry, [
+    { dir: join(home, '.harness', 'provider-plugins'), source: 'user' },
+    { dir: join(cwd, '.harness', 'provider-plugins'), source: 'project' },
+  ], log)
+  return registry
+}
+
 /**
  * config 子命令：密钥管理与配置自检。
  *   harness config set-key <providerId> <apiKey>   加密 apiKey 并写入 config.json（enc:v1 密文）
@@ -1592,9 +1727,10 @@ export async function runTeammateCli(options: {
 export async function runConfigCommand(options: {
   args: CliArgs
   dataDir: string
+  cwd: string
   write: (s: string) => void
 }): Promise<number> {
-  const { args, dataDir, write } = options
+  const { args, dataDir, cwd, write } = options
   const sub = args.arg
   const store = new ConfigStore(dataDir)
   const cfg = await store.load()
@@ -1626,8 +1762,9 @@ export async function runConfigCommand(options: {
   }
 
   if (sub === 'check') {
+    const registry = await buildCheckRegistry(cwd, write)
     const defaultProviderId = cfg.provider ?? 'anthropic'
-    const issues = validateProviderConfigs(providers, defaultProviderId)
+    const issues = validateProviderConfigs(providers, defaultProviderId, registry.list())
     write(buildConfigOverview(cfg, defaultProviderId) + '\n')
     if (issues.length) {
       write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')
@@ -1669,11 +1806,12 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   }
 
   if (args.command === 'config') {
-    return runConfigCommand({ args, dataDir, write })
+    return runConfigCommand({ args, dataDir, cwd, write })
   }
 
   if (args.checkConfig) {
-    const issues = validateProviderConfigs(cfg.providers ?? [], provider)
+    const registry = await buildCheckRegistry(cwd, write)
+    const issues = validateProviderConfigs(cfg.providers ?? [], provider, registry.list())
     write(buildConfigOverview(cfg, provider) + '\n')
     if (issues.length) {
       write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')

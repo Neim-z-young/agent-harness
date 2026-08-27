@@ -16,6 +16,9 @@ import {
   resolveSecret,
   validateProviderConfigs,
   buildConfigOverview,
+  ProviderTypeRegistry,
+  registerBuiltinProviderTypes,
+  loadProviderPluginDirs,
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
@@ -185,14 +188,17 @@ describe('SecretCipher / resolveSecret 密钥处理', () => {
 })
 
 describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
+  const TYPES = ['anthropic', 'openai', 'gemini', 'glm', 'qwen', 'mock']
+
   it('重复 id / 未知 type / 默认 provider 未定义 → 报错', () => {
     const issues = validateProviderConfigs(
       [
         { id: 'openai', type: 'openai' },
         { id: 'openai', type: 'openai' },
-        { id: 'bad', type: 'wat' as any },
+        { id: 'bad', type: 'wat' },
       ],
       'deepseek',
+      TYPES,
     )
     expect(issues.length).toBe(3)
     expect(issues.some((i) => i.message.includes('重复'))).toBe(true)
@@ -201,7 +207,7 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
   })
 
   it('缺 id 报错；合法配置（含 mock/anthropic 默认）无问题', () => {
-    expect(validateProviderConfigs([{ id: '', type: 'openai' }], 'mock').length).toBe(1)
+    expect(validateProviderConfigs([{ id: '', type: 'openai' }], 'mock', TYPES).length).toBe(1)
     expect(validateProviderConfigs(
       [
         { id: 'glm', type: 'glm' },
@@ -209,10 +215,22 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
         { id: 'gemini', type: 'gemini' },
       ],
       'glm',
+      TYPES,
     )).toEqual([])
     // 内置 mock/anthropic 作为默认不要求出现在 providers
-    expect(validateProviderConfigs([], 'mock')).toEqual([])
-    expect(validateProviderConfigs([], 'anthropic')).toEqual([])
+    expect(validateProviderConfigs([], 'mock', TYPES)).toEqual([])
+    expect(validateProviderConfigs([], 'anthropic', TYPES)).toEqual([])
+  })
+
+  it('已知类型由注册表动态提供：注册自定义 type 后校验通过（插件化）', () => {
+    const registry = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(registry, {})
+    registry.register({ type: 'my-gw', createPlugin: () => undefined })
+    // 未注册 → 未知 type 报错
+    expect(validateProviderConfigs([{ id: 'gw', type: 'my-gw' }], 'my-gw', registry.list()).length).toBe(1)
+    registry.register({ type: 'gw' as any, createPlugin: () => undefined })
+    // 注册后通过
+    expect(validateProviderConfigs([{ id: 'gw', type: 'gw' }], 'gw', registry.list())).toEqual([])
   })
 
   it('buildConfigOverview：输出默认标记、端点与 apiKey 状态（默认脱敏）', () => {
@@ -236,6 +254,69 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(overview).not.toContain('sk-plain')      // 明文不输出
     // maskKey=false 时输出明文
     expect(buildConfigOverview({ providers: [{ id: 'a', type: 'openai', apiKey: 'sk-x' }] }, 'a', false)).toContain('sk-x')
+  })
+})
+
+describe('ProviderTypeRegistry / 插件化扩展', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-plugin-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('register / resolve / list 基本行为', () => {
+    const reg = new ProviderTypeRegistry()
+    reg.register({ type: 'a', createPlugin: () => undefined })
+    reg.register({ type: 'b', createPlugin: () => undefined })
+    expect(reg.list()).toEqual(expect.arrayContaining(['a', 'b']))
+    expect(reg.resolve('a')?.type).toBe('a')
+    expect(reg.resolve('nope')).toBeUndefined()
+    // 后注册覆盖
+    reg.register({ type: 'a', createPlugin: () => undefined })
+    expect(reg.resolve('a')).toBeDefined()
+  })
+
+  it('registerBuiltinProviderTypes：内置 6 类型齐全', () => {
+    const reg = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(reg, {})
+    expect(reg.list().sort()).toEqual(['anthropic', 'gemini', 'glm', 'mock', 'openai', 'qwen'])
+  })
+
+  it('loadProviderPluginDirs：从目录加载外部插件（providerType + createProviderPlugin 约定）', async () => {
+    const pluginDir = join(dir, 'provider-plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'my-gw.ts'), `
+      export const providerType = 'my-gw'
+      export function createProviderPlugin(config) {
+        return { id: 'provider.my-gw', version: '1.0.0', name: 'MyGW Provider', async install() { return {} } }
+      }
+    `)
+    const reg = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(reg, {})
+    await loadProviderPluginDirs(reg, [pluginDir])
+    expect(reg.list()).toContain('my-gw')
+    const plugin = reg.resolve('my-gw')!.createPlugin({ id: 'gw', type: 'my-gw', baseUrl: 'http://x', apiKey: 'k' })!
+    expect(plugin.id).toBe('provider.my-gw')
+  })
+
+  it('loadProviderPluginDirs：project 目录后加载覆盖 user（多级插件化）', async () => {
+    const userDir = join(dir, 'user-plugins')
+    const projDir = join(dir, 'proj-plugins')
+    mkdirSync(userDir, { recursive: true })
+    mkdirSync(projDir, { recursive: true })
+    writeFileSync(join(userDir, 'p.ts'), `export const providerType = 'dup'; export function createProviderPlugin(c){ return { id: 'provider.dup.user', version: '1', name: 'user', async install(){} } }`)
+    writeFileSync(join(projDir, 'p.ts'), `export const providerType = 'dup'; export function createProviderPlugin(c){ return { id: 'provider.dup.proj', version: '1', name: 'proj', async install(){} } }`)
+    const reg = new ProviderTypeRegistry()
+    await loadProviderPluginDirs(reg, [userDir, projDir])
+    expect(reg.resolve('dup')!.createPlugin({ id: 'x', type: 'dup' })!.id).toBe('provider.dup.proj')
+  })
+
+  it('loadProviderPluginDirs：缺 providerType/createProviderPlugin 的坏文件被跳过并告警', async () => {
+    const pluginDir = join(dir, 'provider-plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'bad.ts'), `export const foo = 1`)
+    const warns: string[] = []
+    const reg = new ProviderTypeRegistry()
+    await loadProviderPluginDirs(reg, [pluginDir], (s) => warns.push(s))
+    expect(warns.some((w) => w.includes('缺少 providerType'))).toBe(true)
   })
 })
 
@@ -580,6 +661,45 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
       if (prev === undefined) delete process.env.HARNESS_TEST_OPENAI_KEY
       else process.env.HARNESS_TEST_OPENAI_KEY = prev
     }
+  })
+
+  it('插件化：自定义 type 经注册表装配并参与分发（无需改 CLI 代码）', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'my-gw',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [{ id: 'my-gw', type: 'my-gw', baseUrl: 'http://gw', apiKey: 'gw-key' }],
+    })
+    // 插件注册：boot 前注入自定义 type 工厂（等价 ~/.harness/provider-plugins 插件加载）
+    app.providerTypes.register({
+      type: 'my-gw',
+      createPlugin: (pc) => ({
+        id: 'provider.my-gw',
+        version: '1.0.0',
+        name: 'MyGW Provider',
+        async install() {
+          const provider = {
+            id: pc.id,
+            async complete(p: any) {
+              return { content: `gw:${pc.apiKey}`, model: 'gw-1', tokenUsage: { input: 1, output: 1 } }
+            },
+            async *stream(p: any) {
+              yield { type: 'done', model: 'gw-1', tokenUsage: { input: 1, output: 1 } }
+            },
+          }
+          return {
+            async 'harness.init'(_i: unknown, output: any) {
+              output?.harness?._setChatProvider?.(provider as any)
+            },
+          } as any
+        },
+      }),
+    })
+    const { harness } = await app.boot()
+    expect(app.listProviders()).toContain('my-gw')
+    const h = harness as unknown as { resolveChatProvider: (id?: string) => { id?: string } }
+    expect(h.resolveChatProvider('my-gw')?.id).toBe('my-gw')
+    await app.shutdown()
   })
 
   it('main run 子命令执行 prompt 并输出文本', async () => {
