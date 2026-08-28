@@ -802,12 +802,30 @@ export interface ProviderTypeFactory {
   createPlugin: (config: ProviderConfig) => AgentPlugin | undefined | Promise<AgentPlugin | undefined>
 }
 
+/** Provider 类型展示元信息：用于 help / config check 等"无需加载 Provider 模块"即可友好展示的场景 */
+export interface ProviderTypeMeta {
+  /** 对应 ProviderTypeFactory.type */
+  type: string
+  /** 人读描述 */
+  description?: string
+  /** 该类型默认模型 */
+  defaultModel?: string
+  /** 是否需要 apiKey（用于提示） */
+  requiresApiKey?: boolean
+  /** 是否为内置类型（随应用打包） */
+  builtin?: boolean
+  /** 人机交互用法示例（如 `/model openai/gpt-4o`） */
+  usage?: string
+}
+
 /** Provider 类型注册表：按 type 动态解析工厂（内置 + 外部插件注册，替代硬编码 switch） */
 export class ProviderTypeRegistry {
   private readonly factories = new Map<string, ProviderTypeFactory>()
+  private readonly metas = new Map<string, ProviderTypeMeta>()
 
-  register(factory: ProviderTypeFactory): void {
+  register(factory: ProviderTypeFactory, meta?: Partial<ProviderTypeMeta>): void {
     this.factories.set(factory.type, factory)
+    if (meta) this.metas.set(factory.type, { type: factory.type, ...meta })
   }
 
   resolve(type: string): ProviderTypeFactory | undefined {
@@ -818,8 +836,19 @@ export class ProviderTypeRegistry {
     return [...this.factories.keys()]
   }
 
+  /** 指定 type 的展示元信息（未登记则为 undefined） */
+  meta(type: string): ProviderTypeMeta | undefined {
+    return this.metas.get(type)
+  }
+
+  /** 全部已注册类型的展示元信息；未登记 meta 的类型也返回仅含 type 的占位，保证清单完整 */
+  listMeta(): ProviderTypeMeta[] {
+    return [...this.factories.keys()].map((t) => this.metas.get(t) ?? { type: t })
+  }
+
   clear(): void {
     this.factories.clear()
+    this.metas.clear()
   }
 }
 

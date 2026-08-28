@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 28）：惰性 Provider 展示元信息 — help/config check 未加载插件即可列出
+
+### 背景
+
+Provider 已惰性加载（续 26 / 续 27），但 help 只静态硬编码示例、`/model?` 只列运行时已配置 id；依赖 Provider 模块 import 才能展示的类型清单在 help 场景出现缺口。用户要求：help 里列出可支持的 provider 时，即使插件未完全加载，也应能展示，且人机交互友好（附描述/默认模型/用法，调用时再自动加载）。
+
+### 改动
+
+1. **抽象层 `@harness/plugin` 增加展示元信息通道**（[plugin/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugin/src/index.ts)）
+   - 新增 `ProviderTypeMeta`：`type/description/defaultModel/requiresApiKey/builtin/usage`。
+   - `ProviderTypeRegistry.register(factory, meta?)` 可附带登记元信息；新增 `meta(type)` 与 `listMeta()`（未登记 meta 的类型也返回仅含 type 的占位，保证清单完整）。
+   - 元信息在 register 时同步写入，**不调用 createPlugin、不 import 任何 Provider 模块**。
+2. **cli 内置元信息表 + 惰性注册同步登记**（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）
+   - 新增 `BUILTIN_PROVIDER_META`（anthropic/openai/gemini/glm/qwen/mock 的描述、默认模型、是否需 key、用法示例），`registerBuiltinProviderType` 注册惰性工厂的同时登记该元信息。
+   - 新增 `formatProviderTypeList(registry, includeUsage)` 与 `buildProviderTypesSection(registry)`：从 listMeta 生成友好清单（`[内置]`/`[插件]` 标注、需 key 提示、默认模型、`/model` 用法），纯元信息驱动、零模块加载。
+3. **接线展示**：`main` 的 `help` 分支追加 `buildProviderTypesSection`（同步登记内置元信息即可展示）；`config config check` 在概览后追加含外部插件的完整清单（`buildCheckRegistry` 已加载 plugins）。
+4. 测试：`@harness/plugin` 增加 registry meta/listMeta（含占位）用例；cli 增加"同步注册后 listMeta 即可列出、无需加载模块"与 `formatProviderTypeList`/`buildProviderTypesSection` 输出用例。
+
+### 验证
+
+- 全 28 包 typecheck 通过；`@harness/plugin` 38 例、`@harness/cli` 116 例全绿。
+- 惰性语义不变：`resolve(type).createPlugin` 仍按需 dynamic import；列表展示仅读元信息，不触发 Provider 模块加载。
+
 ## 2026-08-28（续 27）：抽象层扩至运行时能力（subagent / swarm），消除 cli 对业务插件的依赖倒置残留
 
 ### 背景

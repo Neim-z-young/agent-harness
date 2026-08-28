@@ -561,6 +561,24 @@ describe('@harness/plugin', () => {
       expect(reg.list()).toEqual([])
     })
 
+    it('ProviderTypeRegistry：注册可附带展示元信息，listMeta 无需加载模块即可列出（含占位）', () => {
+      const reg = new ProviderTypeRegistry()
+      reg.register({ type: 'openai', createPlugin: () => undefined }, {
+        description: 'OpenAI 兼容端点', defaultModel: 'gpt-4o', requiresApiKey: true, builtin: true, usage: '/model openai/gpt-4o',
+      })
+      // 未附带 meta 的类型（如外部插件）也能被完整列出，仅为占位
+      reg.register({ type: 'my-gw', createPlugin: () => undefined })
+
+      expect(reg.meta('openai')).toMatchObject({ type: 'openai', defaultModel: 'gpt-4o', builtin: true })
+      expect(reg.meta('my-gw')).toBeUndefined()
+      expect(reg.listMeta()).toEqual([
+        { type: 'openai', description: 'OpenAI 兼容端点', defaultModel: 'gpt-4o', requiresApiKey: true, builtin: true, usage: '/model openai/gpt-4o' },
+        { type: 'my-gw' },
+      ])
+      reg.clear()
+      expect(reg.listMeta()).toEqual([])
+    })
+
     it('resolveProviderTypeFactory：直接导出 providerTypeFactory 形态', () => {
       const mod = {
         providerTypeFactory: {

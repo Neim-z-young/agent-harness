@@ -31,7 +31,7 @@ import {
   PermissionDecision,
 } from '@harness/core'
 import type { AgentStreamEvent } from '@harness/core'
-import type { AgentPlugin, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
+import type { AgentPlugin, PluginContext, ProviderConfig, ProviderTypeFactory, ProviderTypeMeta } from '@harness/plugin'
 import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
 // 运行时能力抽象契约（@harness/plugin）：cli 仅经下方面向 subagent / swarm 的抽象接口交互，
 // 不依赖具体实现类型。具体能力对象（subagentCapability / swarmCapability）由插件包导出并在组合根装配。
@@ -332,23 +332,39 @@ export async function lazyImport<T extends Record<string, unknown>>(specifier: s
 }
 
 /**
+ * 内置 Provider 类型的展示元信息（惰性注册时同步登记，不加载 Provider 模块即可在 help / config check 中展示）。
+ */
+const BUILTIN_PROVIDER_META: Record<string, ProviderTypeMeta> = {
+  anthropic: { type: 'anthropic', description: 'Anthropic Claude', defaultModel: 'claude-3-5-sonnet', requiresApiKey: true, builtin: true, usage: '/model anthropic/claude-3-5-sonnet' },
+  openai: { type: 'openai', description: 'OpenAI 及任意 OpenAI 兼容端点（DeepSeek / Ollama / 智谱 GLM / 通义等）', defaultModel: 'gpt-4o', requiresApiKey: false, builtin: true, usage: '/model openai/gpt-4o' },
+  gemini: { type: 'gemini', description: 'Google Gemini', defaultModel: 'gemini-2.0-flash', requiresApiKey: true, builtin: true, usage: '/model gemini/gemini-2.0-flash' },
+  glm: { type: 'glm', description: '智谱 GLM', defaultModel: 'glm-4', requiresApiKey: true, builtin: true, usage: '/model glm/glm-4' },
+  qwen: { type: 'qwen', description: '阿里通义千问', defaultModel: 'qwen-max', requiresApiKey: true, builtin: true, usage: '/model qwen/qwen-max' },
+  mock: { type: 'mock', description: '内置 Mock（无网络，测试 / 兜底）', defaultModel: 'mock', requiresApiKey: false, builtin: true, usage: '/model mock/…' },
+}
+
+/**
  * 注册一个内置 Provider 类型工厂（惰性）。
  * 只登记「type → 惰性 createPlugin」描述符；createPlugin 在按 config.type 真正解析 Provider 时
  * 才 dynamic import 对应 provider-* 模块、取其 providerTypeFactory（抽象层契约）构造插件。
  * 因此即使配置里只用某一种 Provider，其余模块也不会被加载，尽量不影响启动速度。
+ * 同时登记展示元信息（BUILTIN_PROVIDER_META），help / config check 无需加载模块即可列出。
  */
 function registerBuiltinProviderType(registry: ProviderTypeRegistry, type: string, specifier: string): void {
-  registry.register({
-    type,
-    async createPlugin(config: ProviderConfig) {
-      const mod = await lazyImport<Record<string, unknown>>(specifier)
-      const factory = resolveProviderTypeFactory(mod)
-      if (!factory) {
-        throw new Error(`内置 Provider 模块 "${specifier}" 未导出 providerTypeFactory（抽象层契约）`)
-      }
-      return factory.createPlugin(config)
+  registry.register(
+    {
+      type,
+      async createPlugin(config: ProviderConfig) {
+        const mod = await lazyImport<Record<string, unknown>>(specifier)
+        const factory = resolveProviderTypeFactory(mod)
+        if (!factory) {
+          throw new Error(`内置 Provider 模块 "${specifier}" 未导出 providerTypeFactory（抽象层契约）`)
+        }
+        return factory.createPlugin(config)
+      },
     },
-  })
+    BUILTIN_PROVIDER_META[type],
+  )
 }
 
 /**
@@ -687,9 +703,35 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   return lines.join('\n')
 }
 
-// ========================================================================
-// 3. 权限交互（CLI 提示符：allow / deny / always）
-// ========================================================================
+/**
+ * 生成"可用的 Provider 类型"清单（从 ProviderTypeRegistry 展示元信息构建）。
+ * 关键：只读 registry.listMeta()，不触发任何 Provider 模块加载；因此即使插件未完全加载
+ * （惰性描述符已登记），help / config check 也能列出并给人机交互友好的用法提示。
+ */
+export function formatProviderTypeList(registry: ProviderTypeRegistry, includeUsage = true): string {
+  const metas = registry.listMeta()
+  if (!metas.length) return '（无已注册 Provider 类型）'
+  const width = Math.max(...metas.map((m) => m.type.length), 1)
+  return metas
+    .map((m) => {
+      const label = m.type.padEnd(width)
+      const tag = m.builtin ? '[内置]' : '[插件]'
+      const key = m.requiresApiKey ? '（需 apiKey）' : ''
+      const model = m.defaultModel ? `默认模型 ${m.defaultModel}` : '默认模型未指定'
+      let line = `  ${label}  ${tag} ${m.description ?? m.type}${key}，${model}`
+      if (includeUsage && m.usage) line += `，例 ${m.usage}`
+      return line
+    })
+    .join('\n')
+}
+
+/** help / config check 结束时追加"可用的 Provider 类型"段落（含用法提示，不加载 Provider 模块） */
+export function buildProviderTypesSection(registry: ProviderTypeRegistry): string {
+  return `可用的 Provider 类型（未完全加载即可展示；调用对应 provider 时自动加载模块）：
+${formatProviderTypeList(registry)}
+  更多类型：在 ~/.harness/plugins 或 <project>/.harness/plugins 中用插件导出 providerTypeFactory 扩展；运行 \`harness config check\` 查看含插件的完整清单。
+`
+}
 
 /** 规则持久化（dataDir/permissions.json） */
 export interface PermissionStoreFile {
@@ -1993,6 +2035,8 @@ export async function runConfigCommand(options: {
     const defaultProviderId = cfg.provider ?? 'anthropic'
     const issues = validateProviderConfigs(providers, defaultProviderId, registry.list())
     write(buildConfigOverview(cfg, defaultProviderId) + '\n')
+    // 展示含外部插件的完整 Provider 类型清单（含用法提示）
+    write(buildProviderTypesSection(registry) + '\n')
     if (issues.length) {
       write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')
       return 1
@@ -2010,7 +2054,14 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   const stdout: { write: (s: string) => void } = process.stdout
   const write = (s: string) => stdout.write(s)
 
-  if (args.command === 'help' || args.showHelp) { write(HELP_TEXT); return 0 }
+  if (args.command === 'help' || args.showHelp) {
+    write(HELP_TEXT)
+    // 追加"可用的 Provider 类型"清单：仅同步登记内置元信息，不加载任何 Provider 模块
+    const registry = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(registry)
+    write('\n' + buildProviderTypesSection(registry))
+    return 0
+  }
 
   const cwd = args.cwd ?? process.cwd()
   const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'

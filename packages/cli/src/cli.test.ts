@@ -22,6 +22,8 @@ import {
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
+  formatProviderTypeList,
+  buildProviderTypesSection,
   HELP_TEXT,
   main,
 } from './index'
@@ -279,6 +281,33 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     const reg = new ProviderTypeRegistry()
     registerBuiltinProviderTypes(reg)
     expect(reg.list().sort()).toEqual(['anthropic', 'gemini', 'glm', 'mock', 'openai', 'qwen'])
+  })
+
+  it('惰性展示元信息：同步注册后 listMeta 即可列出，无需加载任何 Provider 模块', () => {
+    const reg = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(reg)
+    const metas = reg.listMeta()
+    expect(metas).toHaveLength(6)
+    const openai = metas.find((m) => m.type === 'openai')!
+    // 未触发 createPlugin / 未 import 模块时也有描述与用法提示（人机交互友好）
+    expect(openai.description).toContain('OpenAI')
+    expect(openai.usage).toContain('/model openai/')
+    expect(openai.builtin).toBe(true)
+    expect(reg.meta('mock')?.requiresApiKey).toBe(false)
+    expect(reg.meta('anthropic')?.requiresApiKey).toBe(true)
+  })
+
+  it('formatProviderTypeList / buildProviderTypesSection：展示友好清单并提示自动加载', () => {
+    const reg = new ProviderTypeRegistry()
+    registerBuiltinProviderTypes(reg)
+    const section = buildProviderTypesSection(reg)
+    expect(section).toContain('可用的 Provider 类型')
+    expect(section).toContain('[内置]')
+    expect(section).toContain('openai')
+    expect(section).toContain('自动加载')
+    expect(section).toContain('/model openai/')
+    // 关闭用法提示时不再出现例示
+    expect(formatProviderTypeList(reg, false)).not.toContain('/model openai/')
   })
 
   it('内置插件惰性加载：resolve(type).createPlugin 才 import，返回真实 Provider 插件', async () => {
