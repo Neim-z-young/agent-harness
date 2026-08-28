@@ -763,3 +763,88 @@ export class PluginManagerImpl implements PluginManager {
 export function createPluginManager(options: PluginManagerOptions): PluginManager {
   return new PluginManagerImpl(options)
 }
+
+// ===== Provider 契约（抽象层，供 core / cli 消费、Provider 插件实现）=====
+// 依赖方向：core / cli -----> @harness/plugin（本抽象层）；Provider 插件 -----> @harness/plugin
+// 具体 Provider 实现（provider-* 包）通过导出 providerTypeFactory 实现下方契约，
+// 上层只经 ProviderTypeRegistry 按 type 解析，不感知具体实现。
+
+/** 单个 Provider 定义（config.json 的 providers 数组元素 / cli 传入） */
+export interface ProviderConfig {
+  /** 唯一 ID：运行时 `provider/model` 前缀据此分发（如 anthropic / openai / deepseek / ollama） */
+  id: string
+  /** Provider 类型：内置支持 anthropic / openai / gemini / glm / qwen / mock；可经插件扩展任意自定义 type */
+  type: string
+  /** API 根路径（如 api.openai.com / api.deepseek.com / http://localhost:11434） */
+  baseUrl?: string
+  /** API Key */
+  apiKey?: string
+  /** 该 Provider 默认模型 */
+  model?: string
+  /** OpenAI 类型专用：API 路径（默认 /v1/chat/completions；智谱等兼容 API 可改 /chat/completions） */
+  apiPath?: string
+  /** max_tokens 默认值 */
+  maxTokens?: number
+  /** 请求超时（ms） */
+  timeoutMs?: number
+  /** 额外透传字段（供特定 Provider 自定义配置，如 mock 的 defaultResponse） */
+  [key: string]: unknown
+}
+
+/**
+ * Provider 类型工厂：`config.type` → 插件构造。
+ * Provider 插件实现该接口并导出 providerTypeFactory；`createPlugin` 可为惰性的（内部 await import()），
+ * 返回值允许为 Promise（返回 undefined 表示该配置不可用）。
+ */
+export interface ProviderTypeFactory {
+  /** 对应 ProviderConfig.type 的值 */
+  type: string
+  createPlugin: (config: ProviderConfig) => AgentPlugin | undefined | Promise<AgentPlugin | undefined>
+}
+
+/** Provider 类型注册表：按 type 动态解析工厂（内置 + 外部插件注册，替代硬编码 switch） */
+export class ProviderTypeRegistry {
+  private readonly factories = new Map<string, ProviderTypeFactory>()
+
+  register(factory: ProviderTypeFactory): void {
+    this.factories.set(factory.type, factory)
+  }
+
+  resolve(type: string): ProviderTypeFactory | undefined {
+    return this.factories.get(type)
+  }
+
+  list(): string[] {
+    return [...this.factories.keys()]
+  }
+
+  clear(): void {
+    this.factories.clear()
+  }
+}
+
+/**
+ * 从插件模块导出中提取 Provider 类型工厂。
+ * 支持三种形态：`providerTypeFactory`、`providerType`+`createProviderPlugin`、`default` 带上述字段。
+ * 找不到时返回 undefined。
+ */
+export function resolveProviderTypeFactory(mod: Record<string, unknown>): ProviderTypeFactory | undefined {
+  const holder = (mod.default && typeof mod.default === 'object' ? mod.default : {}) as Record<string, unknown>
+  const probe = (o: Record<string, unknown>): ProviderTypeFactory | undefined => {
+    if (o.providerTypeFactory && typeof (o.providerTypeFactory as ProviderTypeFactory).createPlugin === 'function') {
+      return o.providerTypeFactory as ProviderTypeFactory
+    }
+    if (
+      typeof o.providerType === 'string' &&
+      typeof (o as { createProviderPlugin?: unknown }).createProviderPlugin === 'function'
+    ) {
+      const { providerType, createProviderPlugin } = o as {
+        providerType: string
+        createProviderPlugin: (config: ProviderConfig) => AgentPlugin | undefined | Promise<AgentPlugin | undefined>
+      }
+      return { type: providerType, createPlugin: createProviderPlugin }
+    }
+    return undefined
+  }
+  return probe(mod) ?? probe(holder) ?? undefined
+}

@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 26）：Provider 抽象层，消除 core/cli 对具体 Provider 的依赖倒置
+
+### 背景
+
+续 20 已用 `ProviderTypeRegistry` 替代硬编码 `type` 枚举，但抽象契约仍定义在 cli 内部（cli 自建 `ProviderTypeFactory`/`ProviderTypeRegistry`、`registerBuiltinProviderTypes` 逐个 `import()` 具体 `provider-*` 包并做各自的配置映射）。这仍是**高层（core/cli）直接依赖低层具体 Provider 实现**，违背依赖倒置。要求：建立一层抽象层，core 和 cli 只使用抽象层接口，插件（Provider 包）实现抽象层，core 只经抽象层交互。
+
+### 改动
+
+1. **抽象层落位 `@harness/plugin`**（[plugin/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugin/src/index.ts)）：
+   - 新增 `ProviderConfig`（含 `[key: string]: unknown` 透传）契约；
+   - 新增 `ProviderTypeFactory`（`type` + 可异步的 `createPlugin`）契约；
+   - 新增 `ProviderTypeRegistry`（`register/resolve/list/clear`）注册表；
+   - 新增 `resolveProviderTypeFactory(mod)`：统一从插件模块导出识别三种工厂形态（`providerTypeFactory` / `providerType`+`createProviderPlugin` / `default` 包装）。
+2. **6 个 Provider 包实现抽象层**（`provider-*`）：
+   - 各包新增导出 `providerTypeFactory`，`createPlugin(config: ProviderConfig)` 在**包内部**完成「`ProviderConfig` → 该 Provider 配置结构」的映射（`model`→`defaultModel`、`id`→`providerId` 等），把原本散落在 cli 的逐类型映射下沉到实现方。
+3. **cli 只消费抽象层**（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：
+   - 删除 cli 本地重复的 `ProviderTypeFactory` 接口、`ProviderTypeRegistry` 类、`ProviderConfig` 接口，改用 `@harness/plugin` 导入；
+   - 删除对 `@harness/provider-openai/gemini/glm/qwen` 的具体配置类型导入；
+   - `registerBuiltinProviderTypes` 重写为**通用惰性登记**：只登记「`type` → 模块 specifier」，`createPlugin` 时 `lazyImport()` + `resolveProviderTypeFactory()` 解析出实现方工厂并委托，**不再含任何具体 Provider 配置结构/工厂的硬编码映射**，仍保持惰性加载不影响启动速度。
+   - `registerBuiltinProviderTypes` 签名收敛为单参数 `(registry)`，两处调用点与 cli 测试同步更新。
+
+### 验证
+
+- 全量 26 包 typecheck 通过
+- `@harness/plugin` 37 例全绿（新增：`ProviderTypeRegistry`、`resolveProviderTypeFactory` 三种形态 + 无契约回退 5 例）
+- `@harness/cli` 114 例全绿（新增：内置 6 个 `provider-*` 包装 `providerTypeFactory` 契约逐包校验 1 例）
+- 6 个 `provider-*` 包各自用例全绿
+- 注：根目录 `bun test` 会扫描未装依赖的 `reference/` 私有目录产生大量既有失败（含 `tools-builtin`/`Ctrl-B` 环境性 flaky），与本次改动无关；本改动未触碰这些文件
+
 ## 2026-08-28（续 25）：内置插件统一注册 + 惰性加载
 
 ### 背景

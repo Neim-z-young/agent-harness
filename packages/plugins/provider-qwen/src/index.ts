@@ -16,7 +16,7 @@
  */
 
 import type { ChatProvider } from '@harness/core'
-import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
+import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
 import { OpenAIChatProvider, type OpenAIProviderConfig } from '@harness/provider-openai'
 
@@ -124,3 +124,22 @@ export function createProviderQwenPlugin(config?: QwenProviderConfig): AgentPlug
 /** 默认导出：无配置常量（配置来自 config store 与环境变量） */
 export const providerQwenPlugin: AgentPlugin & { readonly provider: OpenAIChatProvider } =
   createProviderQwenPlugin()
+
+// ========================================================================
+// Provider 类型工厂（抽象层契约：@harness/plugin → ProviderTypeFactory）
+// 上层（core/cli）只经 ProviderTypeRegistry 按 type 解析，不感知本模块具体配置结构。
+// ========================================================================
+
+export const providerTypeFactory: ProviderTypeFactory = {
+  type: 'qwen',
+  createPlugin: (config: ProviderConfig): AgentPlugin =>
+    createProviderQwenPlugin({
+      baseUrl: config.baseUrl,
+      apiKey: config.apiKey,
+      defaultModel: config.model,
+      maxTokens: config.maxTokens,
+      timeoutMs: config.timeoutMs,
+      apiPath: config.apiPath,
+      providerId: config.id,
+    }),
+}

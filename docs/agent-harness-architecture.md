@@ -415,6 +415,7 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 **Provider 类型插件化（type 不再硬编码）：**
 
 - `ProviderConfig.type` 是开放字符串；内置类型（openai/anthropic/gemini/glm/qwen/mock）只是「已注册」的默认项
+- **抽象层**：`ProviderConfig` / `ProviderTypeFactory` / `ProviderTypeRegistry` / `resolveProviderTypeFactory` 契约统一落在 `@harness/plugin`；core / cli **只经此抽象层接口**与 Provider 插件交互。`provider-*` 包各自导出 `providerTypeFactory` 实现该契约（在包内完成 `ProviderConfig` → 自身配置结构映射）；cli 的 `registerBuiltinProviderTypes` 只登记「`type` → 模块 specifier」，`createPlugin` 时惰性 `import()` + `resolveProviderTypeFactory()` 委托实现方
 - `ProviderTypeRegistry`（`type → createPlugin(config)`）替代 CLI 硬编码 switch；`HarnessApp.providerTypes` 公开，boot 前可注入自定义类型
 - 外部插件多级加载：`~/.harness/plugins`（user）→ `<project>/.harness/plugins`（project，后加载覆盖）。插件目录统一承载各种插件，一个 `.ts/.js/.mjs` 模块可同时导出：
   - **Provider 类型工厂**（扩展 `config.type`）：`providerTypeFactory` 或 `providerType`+`createProviderPlugin` 约定

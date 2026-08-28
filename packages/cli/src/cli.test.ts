@@ -16,7 +16,6 @@ import {
   resolveSecret,
   validateProviderConfigs,
   buildConfigOverview,
-  ProviderTypeRegistry,
   registerBuiltinProviderTypes,
   getBuiltinRegistry,
   loadPluginDirs,
@@ -30,6 +29,7 @@ import { SubagentEvents } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import type { PermissionDecision } from '@harness/permission'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
+import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
 
 describe('parseCliArgs 命令解析', () => {
   it('默认 repl 命令', () => {
@@ -225,7 +225,7 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
 
   it('已知类型由注册表动态提供：注册自定义 type 后校验通过（插件化）', () => {
     const registry = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(registry, {})
+    registerBuiltinProviderTypes(registry)
     registry.register({ type: 'my-gw', createPlugin: () => undefined })
     // 未注册 → 未知 type 报错
     expect(validateProviderConfigs([{ id: 'gw', type: 'my-gw' }], 'my-gw', registry.list()).length).toBe(1)
@@ -277,15 +277,33 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
 
   it('registerBuiltinProviderTypes：内置 6 类型齐全', () => {
     const reg = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(reg, {})
+    registerBuiltinProviderTypes(reg)
     expect(reg.list().sort()).toEqual(['anthropic', 'gemini', 'glm', 'mock', 'openai', 'qwen'])
   })
 
   it('内置插件惰性加载：resolve(type).createPlugin 才 import，返回真实 Provider 插件', async () => {
     const reg = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(reg, {})
+    registerBuiltinProviderTypes(reg)
     const plugin = (await reg.resolve('openai')!.createPlugin({ id: 'deepseek', type: 'openai', baseUrl: 'http://x', apiKey: 'k' }))!
     expect(plugin.id).toBe('provider.deepseek')
+  })
+
+  it('内置 provider-* 包导出 providerTypeFactory（抽象层契约），type 正确且可构造插件', async () => {
+    const cases: Array<[string, string]> = [
+      ['@harness/provider-anthropic', 'anthropic'],
+      ['@harness/provider-openai', 'openai'],
+      ['@harness/provider-gemini', 'gemini'],
+      ['@harness/provider-glm', 'glm'],
+      ['@harness/provider-qwen', 'qwen'],
+      ['@harness/provider-mock', 'mock'],
+    ]
+    for (const [spec, type] of cases) {
+      const mod = await import(spec)
+      const factory = resolveProviderTypeFactory(mod as Record<string, unknown>)!
+      expect(factory.type).toBe(type)
+      const plugin = factory.createPlugin({ id: type, type })
+      expect(plugin).toBeDefined()
+    }
   })
 
   it('BuiltinPluginRegistry：内置通用插件统一登记并惰性加载（tools-builtin 可解析出真实插件）', async () => {
@@ -307,7 +325,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
       }
     `)
     const reg = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(reg, {})
+    registerBuiltinProviderTypes(reg)
     const result = await loadPluginDirs(reg, [pluginDir])
     expect(reg.list()).toContain('my-gw')
     const plugin = (await reg.resolve('my-gw')!.createPlugin({ id: 'gw', type: 'my-gw', baseUrl: 'http://x', apiKey: 'k' }))!

@@ -12,7 +12,9 @@ import {
   PluginMissingDependencyError,
   PluginNotFoundError,
   PluginUninstallError,
+  ProviderTypeRegistry,
   createPluginManager,
+  resolveProviderTypeFactory,
   topologicalSortPlugins,
 } from './index'
 
@@ -541,6 +543,61 @@ describe('@harness/plugin', () => {
       reg.unregister('p')
       expect(reg.has('harness.start')).toBe(false)
       expect(reg.listFor('harness.init').map((r: any) => r.pluginId)).toEqual(['q'])
+    })
+  })
+
+  describe('Provider 抽象契约（ProviderTypeRegistry / resolveProviderTypeFactory）', () => {
+    it('ProviderTypeRegistry：register / resolve / list / clear', () => {
+      const reg = new ProviderTypeRegistry()
+      reg.register({ type: 'a', createPlugin: () => undefined })
+      reg.register({ type: 'b', createPlugin: () => undefined })
+      expect(reg.list().sort()).toEqual(['a', 'b'])
+      expect(reg.resolve('a')?.type).toBe('a')
+      expect(reg.resolve('nope')).toBeUndefined()
+      // 后注册覆盖
+      reg.register({ type: 'a', createPlugin: () => undefined })
+      expect(reg.resolve('a')).toBeDefined()
+      reg.clear()
+      expect(reg.list()).toEqual([])
+    })
+
+    it('resolveProviderTypeFactory：直接导出 providerTypeFactory 形态', () => {
+      const mod = {
+        providerTypeFactory: {
+          type: 'gw',
+          createPlugin: (c: any) => ({ id: 'provider.gw' }),
+        },
+      }
+      const factory = resolveProviderTypeFactory(mod)
+      expect(factory?.type).toBe('gw')
+      expect(factory?.createPlugin({ id: 'x', type: 'gw' })).toEqual({ id: 'provider.gw' })
+    })
+
+    it('resolveProviderTypeFactory：providerType + createProviderPlugin 形态', () => {
+      const mod = {
+        providerType: 'gw2',
+        createProviderPlugin: (c: any) => ({ id: 'provider.gw2' }),
+      }
+      const factory = resolveProviderTypeFactory(mod)!
+      expect(factory.type).toBe('gw2')
+      expect(factory.createPlugin({ id: 'x', type: 'gw2' })).toEqual({ id: 'provider.gw2' })
+    })
+
+    it('resolveProviderTypeFactory：default 包装内亦能识别', () => {
+      const mod = {
+        default: {
+          providerTypeFactory: {
+            type: 'gw3',
+            createPlugin: (c: any) => undefined,
+          },
+        },
+      }
+      expect(resolveProviderTypeFactory(mod)?.type).toBe('gw3')
+    })
+
+    it('resolveProviderTypeFactory：无契约模块返回 undefined', () => {
+      expect(resolveProviderTypeFactory({ foo: 1 })).toBeUndefined()
+      expect(resolveProviderTypeFactory({ providerTypeFactory: 42 })).toBeUndefined()
     })
   })
 })

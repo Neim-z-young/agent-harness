@@ -28,7 +28,7 @@
  */
 
 import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
-import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
+import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message } from '@harness/session'
 
 // ===== 配置类型 =====
@@ -329,3 +329,20 @@ export function createProviderMockPlugin(config?: MockProviderConfig): AgentPlug
 
 /** 默认导出：无配置的 Mock Provider 插件（配置从 config store 读取） */
 export const providerMockPlugin: AgentPlugin & { readonly provider: MockChatProvider } = createProviderMockPlugin()
+
+// ========================================================================
+// Provider 类型工厂（抽象层契约：@harness/plugin → ProviderTypeFactory）
+// 上层（core/cli）只经 ProviderTypeRegistry 按 type 解析，不感知本模块具体配置结构。
+// ========================================================================
+
+export const providerTypeFactory: ProviderTypeFactory = {
+  type: 'mock',
+  createPlugin: (config: ProviderConfig): AgentPlugin => {
+    const defaultResponse = config.defaultResponse as string | undefined
+    return createProviderMockPlugin({
+      ...(config as MockProviderConfig),
+      // 未指定默认响应（且未绑定具体模型）时给一个兜底文案，与 CLI 旧行为保持一致
+      defaultResponse: defaultResponse ?? (config.model ? undefined : '(Mock Provider) 你好，我是测试助手。'),
+    })
+  },
+}

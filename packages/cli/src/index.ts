@@ -31,14 +31,11 @@ import {
   PermissionDecision,
 } from '@harness/core'
 import type { AgentStreamEvent } from '@harness/core'
-import type { AgentPlugin, PluginContext } from '@harness/plugin'
+import type { AgentPlugin, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
+import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
 // 内置 Provider 模块与 tools-builtin 一律惰性加载（见 lazyImport / registerBuiltinProviderTypes）：
 // 这里只保留类型导入，运行时值经动态 import() 在真正用到时才加载，避免拖慢启动。
 import type { MockProviderConfig } from '@harness/provider-mock'
-import type { OpenAIProviderConfig } from '@harness/provider-openai'
-import type { GeminiProviderConfig } from '@harness/provider-gemini'
-import type { GlmProviderConfig } from '@harness/provider-glm'
-import type { QwenProviderConfig } from '@harness/provider-qwen'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import {
@@ -269,25 +266,8 @@ export interface HarnessConfig {
   providers?: ProviderConfig[]
 }
 
-/** 单个 Provider 定义（config.json 的 providers 数组元素） */
-export interface ProviderConfig {
-  /** 唯一 ID：运行时 `provider/model` 前缀据此分发（如 anthropic / openai / deepseek / ollama / glm / qwen） */
-  id: string
-  /** Provider 类型：内置支持 anthropic / openai / gemini / glm / qwen / mock；可通过 plugins 插件导出 providerTypeFactory 扩展任意自定义 type（插件化） */
-  type: string
-  /** API 根路径（如 api.openai.com / api.deepseek.com / http://localhost:11434（Ollama）） */
-  baseUrl?: string
-  /** API Key */
-  apiKey?: string
-  /** 该 Provider 默认模型（运行时无 `provider/model` 前缀且未绑定到具体模型时使用） */
-  model?: string
-  /** OpenAI 类型专用：API 路径（默认 /v1/chat/completions；智谱等兼容 API 可改 /chat/completions） */
-  apiPath?: string
-  /** max_tokens 默认值（默认 Provider 内部值，如 4096） */
-  maxTokens?: number
-  /** 请求超时（ms，默认 120_000） */
-  timeoutMs?: number
-}
+/** 单个 Provider 定义（config.json 的 providers 数组元素）——复用 @harness/plugin 抽象层契约 */
+export type { ProviderConfig } from '@harness/plugin'
 
 /** 解析 `[provider/]modelId` 规格。示例：'openai/gpt-4o' → { providerId:'openai', modelId:'gpt-4o' }；'claude-3-5-sonnet' → { modelId:'claude-3-5-sonnet' } */
 export function parseModelSpec(spec: string): { providerId?: string; modelId: string } {
@@ -345,34 +325,9 @@ export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
 // ------------------------------------------------------------------------
 // 2.2 Provider 类型注册表（插件化扩展点）
 // ------------------------------------------------------------------------
-
-/** Provider 类型工厂：`config.type` → 插件构造。第三方插件可注册任意 type */
-export interface ProviderTypeFactory {
-  /** 对应 ProviderConfig.type 的值 */
-  type: string
-  /**
-   * 根据 ProviderConfig 构造 Provider 插件（返回 undefined 表示该配置不可用）。
-   * 工厂可为惰性的（内部 await import() 内置 Provider 模块）——返回值允许为 Promise。
-   */
-  createPlugin: (config: ProviderConfig) => AgentPlugin | undefined | Promise<AgentPlugin | undefined>
-}
-
-/** Provider 类型注册表：内置类型 + 外部 plugins 插件注册的工厂按 type 动态解析（替代硬编码 switch） */
-export class ProviderTypeRegistry {
-  private readonly factories = new Map<string, ProviderTypeFactory>()
-
-  register(factory: ProviderTypeFactory): void {
-    this.factories.set(factory.type, factory)
-  }
-
-  resolve(type: string): ProviderTypeFactory | undefined {
-    return this.factories.get(type)
-  }
-
-  list(): string[] {
-    return [...this.factories.keys()]
-  }
-}
+// 抽象层契约（ProviderTypeFactory / ProviderTypeRegistry / resolveProviderTypeFactory）
+// 定义于 @harness/plugin —— 本模块（CLI）只经此抽象层与 Provider 插件交互，
+// 不直接依赖任何具体 provider-* 包；具体 Provider 包通过导出 providerTypeFactory 实现该契约。
 
 /** 惰性 import 一个随应用打包的模块并返回其命名导出（内置插件的统一惰性加载入口） */
 export async function lazyImport<T extends Record<string, unknown>>(specifier: string): Promise<T> {
@@ -380,79 +335,37 @@ export async function lazyImport<T extends Record<string, unknown>>(specifier: s
 }
 
 /**
- * 注册 CLI 内置 Provider 类型工厂（openai / anthropic / gemini / glm / qwen / mock）。
- *
- * 全部惰性加载：这里只登记「type → 惰性 createPlugin」描述符，
- * createPlugin 在按 config.type 真正解析 Provider 时才 dynamic import 对应模块。
- * 因此即使配置里只用 openai，anthropic/gemini/glm/qwen 模块也不会被加载，尽量不影响启动速度。
+ * 注册一个内置 Provider 类型工厂（惰性）。
+ * 只登记「type → 惰性 createPlugin」描述符；createPlugin 在按 config.type 真正解析 Provider 时
+ * 才 dynamic import 对应 provider-* 模块、取其 providerTypeFactory（抽象层契约）构造插件。
+ * 因此即使配置里只用某一种 Provider，其余模块也不会被加载，尽量不影响启动速度。
  */
-export function registerBuiltinProviderTypes(
-  registry: ProviderTypeRegistry,
-  options: { anthropicProviderConfig?: any } = {},
-): void {
+function registerBuiltinProviderType(registry: ProviderTypeRegistry, type: string, specifier: string): void {
   registry.register({
-    type: 'openai',
-    async createPlugin(pc) {
-      const { createProviderOpenAIPlugin } = await lazyImport<{ createProviderOpenAIPlugin: (c: OpenAIProviderConfig) => AgentPlugin }>('@harness/provider-openai')
-      return createProviderOpenAIPlugin({
-        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
-      })
+    type,
+    async createPlugin(config: ProviderConfig) {
+      const mod = await lazyImport<Record<string, unknown>>(specifier)
+      const factory = resolveProviderTypeFactory(mod)
+      if (!factory) {
+        throw new Error(`内置 Provider 模块 "${specifier}" 未导出 providerTypeFactory（抽象层契约）`)
+      }
+      return factory.createPlugin(config)
     },
   })
-  registry.register({
-    type: 'glm',
-    async createPlugin(pc) {
-      const { createProviderGlmPlugin } = await lazyImport<{ createProviderGlmPlugin: (c: GlmProviderConfig) => AgentPlugin }>('@harness/provider-glm')
-      return createProviderGlmPlugin({
-        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
-      } as GlmProviderConfig)
-    },
-  })
-  registry.register({
-    type: 'qwen',
-    async createPlugin(pc) {
-      const { createProviderQwenPlugin } = await lazyImport<{ createProviderQwenPlugin: (c: QwenProviderConfig) => AgentPlugin }>('@harness/provider-qwen')
-      return createProviderQwenPlugin({
-        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
-      } as QwenProviderConfig)
-    },
-  })
-  registry.register({
-    type: 'gemini',
-    async createPlugin(pc) {
-      const { createProviderGeminiPlugin } = await lazyImport<{ createProviderGeminiPlugin: (c: GeminiProviderConfig) => AgentPlugin }>('@harness/provider-gemini')
-      return createProviderGeminiPlugin({
-        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs,
-      } as GeminiProviderConfig)
-    },
-  })
-  registry.register({
-    type: 'anthropic',
-    async createPlugin(pc) {
-      const { createProviderAnthropicPlugin } = await lazyImport<{ createProviderAnthropicPlugin: (c: unknown) => AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } } }>('@harness/provider-anthropic')
-      return createProviderAnthropicPlugin({
-        baseUrl: pc.baseUrl,
-        apiKey: pc.apiKey ?? options.anthropicProviderConfig?.apiKey,
-        defaultModel: pc.model,
-        maxTokens: pc.maxTokens,
-        timeoutMs: pc.timeoutMs,
-      }) as any
-    },
-  })
-  registry.register({
-    type: 'mock',
-    async createPlugin(pc) {
-      const { createProviderMockPlugin } = await lazyImport<{ createProviderMockPlugin: (c?: MockProviderConfig) => AgentPlugin }>('@harness/provider-mock')
-      return createProviderMockPlugin({
-        ...pc,
-        defaultResponse: pc.model ? undefined : '(Mock Provider) 你好，我是测试助手。',
-      }) as AgentPlugin
-    },
-  })
+}
+
+/**
+ * 注册 CLI 内置 Provider 类型工厂（anthropic / openai / gemini / glm / qwen / mock）。
+ * 全部经 provider-* 包的 providerTypeFactory（@harness/plugin 抽象层契约）惰性加载，
+ * 本函数不含任何具体 Provider 配置结构 / 工厂的硬编码映射。
+ */
+export function registerBuiltinProviderTypes(registry: ProviderTypeRegistry): void {
+  registerBuiltinProviderType(registry, 'anthropic', '@harness/provider-anthropic')
+  registerBuiltinProviderType(registry, 'openai', '@harness/provider-openai')
+  registerBuiltinProviderType(registry, 'gemini', '@harness/provider-gemini')
+  registerBuiltinProviderType(registry, 'glm', '@harness/provider-glm')
+  registerBuiltinProviderType(registry, 'qwen', '@harness/provider-qwen')
+  registerBuiltinProviderType(registry, 'mock', '@harness/provider-mock')
 }
 
 // ------------------------------------------------------------------------
@@ -901,7 +814,7 @@ export class HarnessApp {
     // Provider 类型注册表：注册内置类型（openai/anthropic/gemini/glm/qwen/mock），
     // boot() 时再加载外部 plugins 插件注册的自定义 type
     this.providerTypes = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(this.providerTypes, this.options)
+    registerBuiltinProviderTypes(this.providerTypes)
     if (options.snapshot) {
       this.snapshotService = createSnapshotService({ worktree: cwd })
     }
@@ -2029,7 +1942,7 @@ export async function runTeammateCli(options: {
 /** 构造用于配置自检的 Provider 类型注册表（内置 + 外部 plugins 插件注册的 Provider 类型工厂） */
 export async function buildCheckRegistry(cwd: string, log: (s: string) => void): Promise<ProviderTypeRegistry> {
   const registry = new ProviderTypeRegistry()
-  registerBuiltinProviderTypes(registry, {})
+  registerBuiltinProviderTypes(registry)
   const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
   await loadPluginDirs(registry, [
     { dir: join(home, '.harness', 'plugins'), source: 'user' },
