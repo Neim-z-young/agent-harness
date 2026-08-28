@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 24）：消除 CLI 对业务插件的依赖倒置
+
+### 背景
+
+项目约束强调"插件化、所有插件可插拔、不与项目本身耦合"。续 23 中电脑控制实现把 `mcp-server-registry` 与 `computer-use` 硬编码进 CLI，属高层（CLI）直接依赖低层具体插件，违背依赖倒置原则，本次修正。
+
+### 改动
+
+1. **移除 CLI 硬编码依赖**（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：
+   - 删除 `import { createMcpServerRegistryPlugin } from '@harness/mcp-server-registry'`、`import { createComputerUsePlugin } from '@harness/computer-use'`
+   - 删除 `providerPlugins.push(createMcpServerRegistryPlugin()); providerPlugins.push(createComputerUsePlugin())`
+   - 移除 cli/package.json 中 `@harness/computer-use`、`@harness/mcp-server-registry` 依赖
+2. **改为项目级可插拔插件**（[.harness/plugins/mcp.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/.harness/plugins/mcp.ts)）：经既有 `loadPluginDirs`（user `~/.harness/plugins` → project `.harness/plugins`）加载，`export const plugins = [createMcpServerRegistryPlugin(), createComputerUsePlugin()]`；删除该文件即可停用，无需改动 CLI/core
+3. **消除误报警告**（cli/src/index.ts `registerProviderTypeFactory`）：已导出通用 AgentPlugin 的模块直接返回，不再打印"未导出 Provider 工厂，已忽略"的误导日志
+
+### 验证
+
+- `loadPluginDirs` 实际加载 `.harness/plugins/mcp.ts` → 得到 `mcp.server-registry`、`computer-use` 两个插件，无警告
+- cli 111 用例全绿；全量 26 包 typecheck 通过
+
 ## 2026-08-28（续 23）：电脑控制 MCP server 插件 + MCP Server Registry
 
 ### 背景

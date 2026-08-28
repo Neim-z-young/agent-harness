@@ -43,8 +43,6 @@ import { createProviderGeminiPlugin, GeminiProviderConfig } from '@harness/provi
 import { createProviderGlmPlugin, GlmProviderConfig } from '@harness/provider-glm'
 import { createProviderQwenPlugin, QwenProviderConfig } from '@harness/provider-qwen'
 import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
-import { createMcpServerRegistryPlugin } from '@harness/mcp-server-registry'
-import { createComputerUsePlugin } from '@harness/computer-use'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import {
@@ -470,6 +468,8 @@ function registerProviderTypeFactory(
   full: string,
   out: (s: string) => void,
 ): void {
+  // 该模块已导出通用 AgentPlugin → 是「通用插件」，无需因缺少 Provider 工厂而报警告
+  if (collectAgentPlugins(mod).length > 0) return
   const defaultHolder = (mod.default && typeof mod.default === 'object' ? mod.default : {}) as Record<string, unknown>
   const holders = [mod, defaultHolder] as const
   for (const holder of holders) {
@@ -1130,9 +1130,8 @@ export class HarnessApp {
     }
     providerPlugins.push(chosenProvider)
     providerPlugins.push(toolsBuiltinPlugin)
-    // MCP Server Registry + 电脑控制：进程内 MCP server（依赖 registry 启动连接）
-    providerPlugins.push(createMcpServerRegistryPlugin())
-    providerPlugins.push(createComputerUsePlugin())
+    // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
+    // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
     if (this.options.extraPlugins?.length) providerPlugins.push(...this.options.extraPlugins)
 
