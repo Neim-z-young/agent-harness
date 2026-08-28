@@ -32,17 +32,13 @@ import {
 } from '@harness/core'
 import type { AgentStreamEvent } from '@harness/core'
 import type { AgentPlugin, PluginContext } from '@harness/plugin'
-import {
-  createProviderMockPlugin,
-  providerMockPlugin,
-  MockChatProvider,
-} from '@harness/provider-mock'
-import { createProviderAnthropicPlugin, providerAnthropicPlugin, AnthropicChatProvider } from '@harness/provider-anthropic'
-import { createProviderOpenAIPlugin, OpenAIProviderConfig } from '@harness/provider-openai'
-import { createProviderGeminiPlugin, GeminiProviderConfig } from '@harness/provider-gemini'
-import { createProviderGlmPlugin, GlmProviderConfig } from '@harness/provider-glm'
-import { createProviderQwenPlugin, QwenProviderConfig } from '@harness/provider-qwen'
-import { toolsBuiltinPlugin, createToolsBuiltinPlugin } from '@harness/tools-builtin'
+// 内置 Provider 模块与 tools-builtin 一律惰性加载（见 lazyImport / registerBuiltinProviderTypes）：
+// 这里只保留类型导入，运行时值经动态 import() 在真正用到时才加载，避免拖慢启动。
+import type { MockProviderConfig } from '@harness/provider-mock'
+import type { OpenAIProviderConfig } from '@harness/provider-openai'
+import type { GeminiProviderConfig } from '@harness/provider-gemini'
+import type { GlmProviderConfig } from '@harness/provider-glm'
+import type { QwenProviderConfig } from '@harness/provider-qwen'
 import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import {
@@ -354,8 +350,11 @@ export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
 export interface ProviderTypeFactory {
   /** 对应 ProviderConfig.type 的值 */
   type: string
-  /** 根据 ProviderConfig 构造 Provider 插件（返回 undefined 表示该配置不可用） */
-  createPlugin: (config: ProviderConfig) => AgentPlugin | undefined
+  /**
+   * 根据 ProviderConfig 构造 Provider 插件（返回 undefined 表示该配置不可用）。
+   * 工厂可为惰性的（内部 await import() 内置 Provider 模块）——返回值允许为 Promise。
+   */
+  createPlugin: (config: ProviderConfig) => AgentPlugin | undefined | Promise<AgentPlugin | undefined>
 }
 
 /** Provider 类型注册表：内置类型 + 外部 plugins 插件注册的工厂按 type 动态解析（替代硬编码 switch） */
@@ -375,56 +374,150 @@ export class ProviderTypeRegistry {
   }
 }
 
-/** 注册 CLI 内置 Provider 类型工厂（openai / anthropic / gemini / glm / qwen / mock） */
+/** 惰性 import 一个随应用打包的模块并返回其命名导出（内置插件的统一惰性加载入口） */
+export async function lazyImport<T extends Record<string, unknown>>(specifier: string): Promise<T> {
+  return (await import(specifier)) as T
+}
+
+/**
+ * 注册 CLI 内置 Provider 类型工厂（openai / anthropic / gemini / glm / qwen / mock）。
+ *
+ * 全部惰性加载：这里只登记「type → 惰性 createPlugin」描述符，
+ * createPlugin 在按 config.type 真正解析 Provider 时才 dynamic import 对应模块。
+ * 因此即使配置里只用 openai，anthropic/gemini/glm/qwen 模块也不会被加载，尽量不影响启动速度。
+ */
 export function registerBuiltinProviderTypes(
   registry: ProviderTypeRegistry,
   options: { anthropicProviderConfig?: any } = {},
 ): void {
   registry.register({
     type: 'openai',
-    createPlugin: (pc) => createProviderOpenAIPlugin({
-      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
-    }),
+    async createPlugin(pc) {
+      const { createProviderOpenAIPlugin } = await lazyImport<{ createProviderOpenAIPlugin: (c: OpenAIProviderConfig) => AgentPlugin }>('@harness/provider-openai')
+      return createProviderOpenAIPlugin({
+        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
+      })
+    },
   })
   registry.register({
     type: 'glm',
-    createPlugin: (pc) => createProviderGlmPlugin({
-      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
-    } as GlmProviderConfig),
+    async createPlugin(pc) {
+      const { createProviderGlmPlugin } = await lazyImport<{ createProviderGlmPlugin: (c: GlmProviderConfig) => AgentPlugin }>('@harness/provider-glm')
+      return createProviderGlmPlugin({
+        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
+      } as GlmProviderConfig)
+    },
   })
   registry.register({
     type: 'qwen',
-    createPlugin: (pc) => createProviderQwenPlugin({
-      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
-    } as QwenProviderConfig),
+    async createPlugin(pc) {
+      const { createProviderQwenPlugin } = await lazyImport<{ createProviderQwenPlugin: (c: QwenProviderConfig) => AgentPlugin }>('@harness/provider-qwen')
+      return createProviderQwenPlugin({
+        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs, apiPath: pc.apiPath, providerId: pc.id,
+      } as QwenProviderConfig)
+    },
   })
   registry.register({
     type: 'gemini',
-    createPlugin: (pc) => createProviderGeminiPlugin({
-      baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
-      maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs,
-    } as GeminiProviderConfig),
+    async createPlugin(pc) {
+      const { createProviderGeminiPlugin } = await lazyImport<{ createProviderGeminiPlugin: (c: GeminiProviderConfig) => AgentPlugin }>('@harness/provider-gemini')
+      return createProviderGeminiPlugin({
+        baseUrl: pc.baseUrl, apiKey: pc.apiKey, defaultModel: pc.model,
+        maxTokens: pc.maxTokens, timeoutMs: pc.timeoutMs,
+      } as GeminiProviderConfig)
+    },
   })
   registry.register({
     type: 'anthropic',
-    createPlugin: (pc) => createProviderAnthropicPlugin({
-      baseUrl: pc.baseUrl,
-      apiKey: pc.apiKey ?? options.anthropicProviderConfig?.apiKey,
-      defaultModel: pc.model,
-      maxTokens: pc.maxTokens,
-      timeoutMs: pc.timeoutMs,
-    }) as any,
+    async createPlugin(pc) {
+      const { createProviderAnthropicPlugin } = await lazyImport<{ createProviderAnthropicPlugin: (c: unknown) => AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } } }>('@harness/provider-anthropic')
+      return createProviderAnthropicPlugin({
+        baseUrl: pc.baseUrl,
+        apiKey: pc.apiKey ?? options.anthropicProviderConfig?.apiKey,
+        defaultModel: pc.model,
+        maxTokens: pc.maxTokens,
+        timeoutMs: pc.timeoutMs,
+      }) as any
+    },
   })
   registry.register({
     type: 'mock',
-    createPlugin: (pc) => createProviderMockPlugin({
-      ...pc,
-      defaultResponse: pc.model ? undefined : '(Mock Provider) 你好，我是测试助手。',
-    }),
+    async createPlugin(pc) {
+      const { createProviderMockPlugin } = await lazyImport<{ createProviderMockPlugin: (c?: MockProviderConfig) => AgentPlugin }>('@harness/provider-mock')
+      return createProviderMockPlugin({
+        ...pc,
+        defaultResponse: pc.model ? undefined : '(Mock Provider) 你好，我是测试助手。',
+      }) as AgentPlugin
+    },
   })
+}
+
+// ------------------------------------------------------------------------
+// 2.2.1 内置（随应用打包）通用插件统一注册表 —— 惰性加载，来源=builtin
+// ------------------------------------------------------------------------
+
+/** 内置通用插件描述符：登记随应用打包的通用插件（如 tools-builtin），统一惰性加载 */
+export interface BuiltinGeneralPlugin {
+  id: string
+  name: string
+  description: string
+  source: 'builtin'
+  /** 惰性加载：首次用到（boot 装配 / /plugins 管理）才 dynamic import，返回 AgentPlugin 实例 */
+  load: () => Promise<AgentPlugin>
+}
+
+/** 内置通用插件注册表：`内置插件也要支持加载`的统一入口（与外部插件目录 loadPluginDirs 并列） */
+export class BuiltinPluginRegistry {
+  private readonly items = new Map<string, BuiltinGeneralPlugin>()
+
+  register(p: BuiltinGeneralPlugin): void {
+    this.items.set(p.id, p)
+  }
+  get(id: string): BuiltinGeneralPlugin | undefined {
+    return this.items.get(id)
+  }
+  has(id: string): boolean {
+    return this.items.has(id)
+  }
+  list(): BuiltinGeneralPlugin[] {
+    return [...this.items.values()]
+  }
+}
+
+let defaultBuiltinRegistry: BuiltinPluginRegistry | undefined
+
+/** 全局默认内置通用插件注册表（登记 tools-builtin 等随应用打包的插件，惰性加载） */
+export function getBuiltinRegistry(): BuiltinPluginRegistry {
+  if (!defaultBuiltinRegistry) {
+    defaultBuiltinRegistry = new BuiltinPluginRegistry()
+    defaultBuiltinRegistry.register({
+      id: 'tools-builtin',
+      name: 'Builtin Tools',
+      description: '内置工作台工具（文件读写 + Shell）',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ toolsBuiltinPlugin: AgentPlugin }>('@harness/tools-builtin')).toolsBuiltinPlugin,
+    })
+  }
+  return defaultBuiltinRegistry
+}
+
+/**
+ * 惰性构造 Mock Provider 插件（默认 provider 兜底时使用；Mock 模块用时才加载）。
+ */
+async function lazyMockProvider(config?: MockProviderConfig): Promise<AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } }> {
+  const { createProviderMockPlugin } = await lazyImport<{ createProviderMockPlugin: (c?: MockProviderConfig) => AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } } }>('@harness/provider-mock')
+  return createProviderMockPlugin(config) as any
+}
+
+/**
+ * 惰性构造 Anthropic Provider 插件（默认 provider=anthropic 且已配置 key 时使用；模块用时才加载）。
+ */
+async function lazyAnthropicProvider(config: unknown): Promise<AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } }> {
+  const { createProviderAnthropicPlugin } = await lazyImport<{ createProviderAnthropicPlugin: (c: unknown) => AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } } }>('@harness/provider-anthropic')
+  return createProviderAnthropicPlugin(config as any) as any
 }
 
 /** 插件目录加载结果：通用 AgentPlugin（Hooks 插件）列表；Provider 类型工厂已注册进 registry */
@@ -766,7 +859,7 @@ export interface HarnessAppOptions {
   sessionId?: string
   permissionMode?: 'allow-all' | 'ask'
   /** 测试注入 */
-  mockProviderConfig?: Parameters<typeof createProviderMockPlugin>[0]
+  mockProviderConfig?: MockProviderConfig
   anthropicProviderConfig?: any
   /** 多 Provider 定义（来自 config.json 的 providers；boot 时逐项安装，支持运行时跨 Provider 切换） */
   providers?: ProviderConfig[]
@@ -983,7 +1076,7 @@ export class HarnessApp {
    * 不再硬编码 switch —— 新增 Provider 类型无需改 CLI 代码。
    * type=openai 支持任意 OpenAI 兼容端点（DeepSeek / Ollama / GLM/Qwen 兼容 API）。
    */
-  private buildProviderPlugin(pc: ProviderConfig): AgentPlugin | undefined {
+  private async buildProviderPlugin(pc: ProviderConfig): Promise<AgentPlugin | undefined> {
     return this.providerTypes.resolve(pc.type)?.createPlugin(pc)
   }
 
@@ -1066,17 +1159,17 @@ export class HarnessApp {
     }
     for (const pc of providerConfigs) {
       if (defaultPc && pc.id === defaultPc.id) continue // 默认放到最后
-      pushBuilt(this.buildProviderPlugin(pc), pc.id)
+      pushBuilt(await this.buildProviderPlugin(pc), pc.id)
     }
 
     // 2) 默认 Provider（最后注册 → 作为无前缀模型的兜底）
     if (defaultPc) {
       // 默认 Provider 的默认模型优先取 --model / config.model 指定的模型（去 provider 前缀）
       const defaultModel = parseModelSpec(this.options.model ?? '').modelId || defaultPc.model
-      const plugin = this.buildProviderPlugin({ ...defaultPc, model: defaultModel })
+      const plugin = await this.buildProviderPlugin({ ...defaultPc, model: defaultModel })
       if (!plugin) {
         this.options.stdout?.write?.(`⚠️  未能构造默认 Provider "${defaultProviderId}"（未知 type）。\n\n`)
-        chosenProvider = createProviderMockPlugin({
+        chosenProvider = await lazyMockProvider({
           defaultResponse: '(Mock Provider) 你好，我是测试助手。',
           ...(this.options.mockProviderConfig ?? {}),
         })
@@ -1084,7 +1177,7 @@ export class HarnessApp {
         chosenProvider = plugin as any
       }
     } else if (defaultProviderId === 'mock') {
-      chosenProvider = createProviderMockPlugin({
+      chosenProvider = await lazyMockProvider({
         defaultResponse: '(Mock Provider) 你好，我是测试助手。',
         ...(this.options.mockProviderConfig ?? {}),
       })
@@ -1105,7 +1198,7 @@ export class HarnessApp {
       }
       const hasKey = !!mergedAnthropic.apiKey
       if (hasKey && (defaultProviderId === 'anthropic' || this.options.provider === undefined)) {
-        chosenProvider = createProviderAnthropicPlugin(mergedAnthropic) as any
+        chosenProvider = await lazyAnthropicProvider(mergedAnthropic)
       } else if (hasKey && defaultProviderId !== 'anthropic') {
         // 默认 provider 是自定义 id 但未在 providers 中配置 → 提示并 fallback mock
         this.options.stdout?.write?.(
@@ -1113,7 +1206,7 @@ export class HarnessApp {
           `自动 fallback 到 Mock Provider。\n` +
           `   可在 <data-dir>/config.json 的 providers 数组中定义它（type=openai/anthropic/gemini）。\n\n`
         )
-        chosenProvider = createProviderMockPlugin({
+        chosenProvider = await lazyMockProvider({
           defaultResponse: '(Mock Provider) 你好，我是测试助手。',
           ...(this.options.mockProviderConfig ?? {}),
         })
@@ -1122,14 +1215,16 @@ export class HarnessApp {
           'ℹ️  未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider。\n' +
           '   如要使用真实 Claude，请 export ANTHROPIC_API_KEY=xxx。\n\n'
         )
-        chosenProvider = createProviderMockPlugin({
+        chosenProvider = await lazyMockProvider({
           defaultResponse: '(Mock Provider) 你好，我是测试助手。',
           ...(this.options.mockProviderConfig ?? {}),
         })
       }
     }
     providerPlugins.push(chosenProvider)
-    providerPlugins.push(toolsBuiltinPlugin)
+    // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载
+    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load()
+    providerPlugins.push(toolsBuiltin)
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
@@ -1140,7 +1235,7 @@ export class HarnessApp {
     // 仅管理用户装配的 Provider / 插件目录 / extraPlugins。
     this.pluginRegistry.clear()
     for (const p of providerPlugins) {
-      if (p.id === toolsBuiltinPlugin.id) continue
+      if (p.id === toolsBuiltin.id) continue
       this.pluginRegistry.set(p.id, p)
     }
 

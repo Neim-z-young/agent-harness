@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 25）：内置插件统一注册 + 惰性加载
+
+### 背景
+
+内置 Provider 模块（anthropic/openai/gemini/glm/qwen/mock）与 `tools-builtin` 此前在 cli 顶部**静态 import**，进程一启动就全部求值，既不"支持加载"（无法与外部插件统一管理/装卸），也拖慢启动。要求：**随应用打包的内部插件也要支持加载**，且**插件加载支持惰性加载**，尽量不影响启动速度。
+
+### 改动
+
+1. **内置 Provider 类型惰性化**（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：
+   - `registerBuiltinProviderTypes` 改为登记「`type` → 惰性 `createPlugin`」，`createPlugin` 内部经 `lazyImport()` 在真正按 `config.type` 解析 Provider 时才 `import()` 对应模块；`type` 名仍在启动时登记（供配置校验）。
+   - `ProviderTypeFactory.createPlugin` 返回值放宽为 `AgentPlugin | undefined | Promise<AgentPlugin | undefined>`，`buildProviderPlugin` 改为异步；`mock`/`anthropic` 兜底改用 `lazyMockProvider()`/`lazyAnthropicProvider()`。
+   - 顶部仅保留 `import type`（配置类型），移除运行时静态 import。
+2. **内置通用插件统一注册表**（新增 `BuiltinPluginRegistry` / `getBuiltinRegistry` / `BuiltinGeneralPlugin`）：登记「id + 描述 + source=`builtin` + 惰性 `load()`」，`tools-builtin` 经此惰性加载（boot 时才 import），与外部插件目录 `loadPluginDirs` 并列，满足"内部插件也要支持加载"。
+3. **启动速度**：`harness --help` / `--check-config` 不再加载任何 Provider 模块；repl 也只在真正用到对应 type 时加载所需 Provider，未用到的 anthropic/gemini/glm/qwen 不会加载。
+
+### 验证
+
+- cli 113 用例全绿（新增：内置 Provider 惰性解析、BuiltinPluginRegistry 惰性加载 2 例）；全量 26 包 typecheck 通过
+- 注：`Ctrl-B 切换侧栏` TUI 用例为既有偶发 flaky（原代码上复现），与本次改动无关
+
 ## 2026-08-28（续 24）：消除 CLI 对业务插件的依赖倒置
 
 ### 背景
