@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 29）：`/model` 补全列出插件注册的 Provider — `listProviders` 合并注册表类型
+
+### 背景
+
+`/model` 命令只列出 `config.providers` 显式定义的实例 id 与默认 provider，未查询 `ProviderTypeRegistry`。用户通过插件（`~/.harness/plugins` / `.harness/plugins` 导出 `providerTypeFactory`）注册的自定义 type，即使 boot 时已由 `loadPluginDirs` 注入注册表，也无法在 `/model` 候选列表中出现，导致无法选中或切换。
+
+### 根因
+
+并非惰性加载所致（boot 时 `loadPluginDirs` 已把自定义 type 注册进 `this.providerTypes`），而是 `listProviders()` 的候选枚举来源没有包括注册表里的已注册类型。
+
+### 改动
+
+1. **`listProviders()` 合并注册表类型**（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：候选顺序为 `config.providers` 实例 id → 默认 provider → `this.providerTypes.list()`（内置 + 插件扩展的自定义 type）。后两者不依赖该 type 是否已在 config 定义实例，因此插件注册的 type 也能在 `/model` 展示与校验。
+2. 测试：新增 "listProviders 合并插件注册的自定义 type" 集成用例，boot 一个带 `.harness/plugins` 的自定义 provider 插件，断言 `listProviders()` 同时包含默认 provider、内置注册表类型（anthropic）与插件自定义类型（my-gw）。
+
+### 验证
+
+- `@harness/cli` 78 例全绿（含新增用例）；typecheck 通过。
+- 惰性语义不变：仍不主动 import 任何 Provider 模块，仅同步读取注册表类型。
+
 ## 2026-08-28（续 28）：惰性 Provider 展示元信息 — help/config check 未加载插件即可列出
 
 ### 背景

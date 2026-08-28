@@ -652,6 +652,29 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('listProviders 合并插件注册的自定义 type：boot 时 loadPluginDirs 注入，/model 可列出', async () => {
+    const stdout = { write: () => {} }
+    // 项目级插件目录 .harness/plugins，存放导出 providerTypeFactory 的 provider 插件
+    const pluginDir = join(dir, '.harness', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'my-gw.ts'), `
+      export const providerTypeFactory = {
+        type: 'my-gw',
+        createPlugin: (c) => ({ id: 'provider.my-gw', version: '1.0.0', name: 'MyGW', async install() { return {} } }),
+      }
+    `)
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    await app.boot()
+    expect(app.listProviders()).toContain('mock')           // 默认 provider
+    expect(app.listProviders()).toContain('anthropic')      // 内置注册表类型
+    expect(app.listProviders()).toContain('my-gw')          // 插件注册的自定义 type
+    await app.shutdown()
+  })
+
   it('同 baseUrl 不同 apiKey 的 Provider：不同 id 各自分发，key 互不干扰', async () => {
     const stdout = { write: () => {} }
     const app = new HarnessApp({

@@ -1032,14 +1032,20 @@ export class HarnessApp {
     return this.providerTypes.resolve(pc.type)?.createPlugin(pc)
   }
 
-  /** 列出当前已注册 Provider id（供 /model ? /状态栏） */
+  /**
+   * 列出当前可切换的 Provider 候选（供 /model ? / /config ?）：config.providers 的实例 id +
+   * 默认 provider + 注册表里已注册的 Provider 类型（含插件扩展的自定义 type）。
+   * 后两者不依赖该 type 是否已在 config 定义实例，因此插件注册的 type 也能在 /model 中展示与校验。
+   */
   listProviders(): string[] {
     const ids: string[] = []
-    // config 里显式定义的 Provider id 优先
+    // config 里显式定义的 Provider 实例 id 优先
     for (const pc of this.options.providers ?? []) if (!ids.includes(pc.id)) ids.push(pc.id)
     // 默认 provider（mock/anthropic 或自定义）放最前
     const def = this.options.provider ?? 'anthropic'
     if (!ids.includes(def)) ids.unshift(def)
+    // 合并注册表里已注册的 Provider 类型（内置 + 外部插件自定义 type，来自 providerTypes）
+    for (const t of this.providerTypes.list()) if (!ids.includes(t)) ids.push(t)
     return ids
   }
 
