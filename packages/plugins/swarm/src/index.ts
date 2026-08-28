@@ -36,7 +36,7 @@ import { spawn } from 'node:child_process'
 import { open, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
-import type { AgentPlugin } from '@harness/plugin'
+import type { AgentPlugin, SwarmCapability } from '@harness/plugin'
 import type { AgentRuntime, SessionManager } from '@harness/core'
 import { defineTool, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
 
@@ -2038,4 +2038,38 @@ export function createSwarmManagers(teamsDir?: string): {
     mailbox: new TeammateMailbox(dir),
     taskPlane: new TaskListPlane(dir),
   }
+}
+
+// ===== 运行时能力（抽象层契约）=====
+// cli 等宿主只经 @harness/plugin 的 SwarmCapability 抽象接口交互，不依赖具体实现类型。
+// mailbox / taskPlane 创建、teammate 状态与循环细节全部封装在此，宿主仅传必要参数。
+
+/** swarm 插件能力：团队成员协作子命令（实现 @harness/plugin.SwarmCapability） */
+export const swarmCapability: SwarmCapability = {
+  sanitizeName,
+  formatAgentId,
+  startTeammateLoop(deps) {
+    const { mailbox, taskPlane } = createSwarmManagers(deps.teamsDir)
+    const state: TeammateTaskState = {
+      agentId: formatAgentId(deps.name, deps.team),
+      identity: { team: deps.team, name: deps.name, agentId: deps.agentId },
+      sessionId: deps.sessionId,
+      status: 'running',
+      prompt: '',
+      abortController: new AbortController(),
+      createdAt: Date.now(),
+    }
+    const loopDeps: TeammateTickDeps = {
+      harness: deps.harness as HarnessLike,
+      mailbox,
+      taskPlane,
+      team: deps.team,
+      name: deps.name,
+    }
+    const loop = startTeammateLoop(state, loopDeps, { intervalMs: 1000 })
+    return {
+      isDone: () => !loop.running,
+      stop: () => loop.stop(),
+    }
+  },
 }

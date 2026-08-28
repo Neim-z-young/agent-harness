@@ -848,3 +848,79 @@ export function resolveProviderTypeFactory(mod: Record<string, unknown>): Provid
   }
   return probe(mod) ?? probe(holder) ?? undefined
 }
+
+// ===== 运行时能力服务契约（抽象层，供 cli 消费、subagent / swarm 插件实现）=====
+// 依赖方向：cli -----> @harness/plugin（本抽象层）；subagent / swarm 插件 -----> @harness/plugin
+// 具体能力对象（subagentCapability / swarmCapability）由插件包导出并在运行期注入（组合根装配），
+// cli 只经下方抽象接口与之交互，不依赖具体插件的实现细节类型。
+// 抽象接口均取"最小结构契约"，实现类天然结构兼容，避免抽象层反向依赖具体插件。
+
+// --- 后台任务监控（subagent 插件实现）---
+
+/** 后台任务进度条目（结构兼容 subagent.BackgroundTaskProgress） */
+export interface BackgroundProgressLike {
+  toolUseId: string
+  toolName: string
+  toolStatus: 'running' | 'completed' | 'failed'
+  summary: string
+}
+
+/** 后台任务只读快照（结构兼容 subagent.BackgroundTaskView） */
+export interface BackgroundTaskViewLike {
+  taskId: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  agentId?: string
+  agentName?: string
+  description?: string
+  result?: string
+  durationMs?: number
+  error?: { code?: string; message?: string }
+  progress?: BackgroundProgressLike[]
+}
+
+/** 后台任务变更订阅回调 */
+export type BackgroundTaskListenerLike = (tasks: readonly BackgroundTaskViewLike[]) => void
+
+/** 后台任务监控器抽象：subagent 插件的 BackgroundTaskMonitor 实现本接口 */
+export interface BackgroundTaskMonitorLike {
+  subscribe(listener: BackgroundTaskListenerLike): () => void
+  dispose(): void
+}
+
+/** subagent 插件能力：创建后台任务监控器（cli 持此抽象，不依赖具体实现） */
+export interface SubagentCapability {
+  createMonitor(options: { bus: Bus; parentSessionIds?: string[] }): BackgroundTaskMonitorLike
+}
+
+// --- 团队成员协作子命令能力（swarm 插件实现）---
+
+/** 团队成员协作循环参数（cli 只传必要参数，mailbox/taskPlane 创建与循环细节由 swarm 插件封装） */
+export interface SwarmLoopDeps {
+  /** 团队共享数据目录（mailbox / taskPlane 都在此创建） */
+  teamsDir: string
+  /** 团队名（已规范化） */
+  team: string
+  /** 成员名（已规范化） */
+  name: string
+  /** 成员 agentId（agent 定义 id） */
+  agentId: string
+  /** 关联会话 id */
+  sessionId: string
+  /** 运行时 harness（接入总线 / 会话） */
+  harness: unknown
+}
+
+/** 团队成员协作循环句柄 */
+export interface SwarmLoopHandle {
+  /** 是否已收到 shutdown 决策 / 外部停止请求 */
+  isDone(): boolean
+  /** 停止循环（幂等） */
+  stop(): Promise<void>
+}
+
+/** swarm 插件能力：团队成员子命令（cli 持此抽象，不依赖具体实现） */
+export interface SwarmCapability {
+  sanitizeName(name: string): string
+  formatAgentId(name: string, team: string): string
+  startTeammateLoop(deps: SwarmLoopDeps): SwarmLoopHandle
+}

@@ -434,6 +434,12 @@ export default { id: 'ext.example', version: '1.0.0', name: 'Example', async ins
 
 - 配置校验按注册表动态进行，未知 type 报错时列出已注册类型并提示 plugins 目录扩展方式；`--check-config` / `config check` 加载外部插件后校验
 
+**运行时能力服务契约（subagent / swarm 抽象）：**
+
+- 与 Provider 同理，cli 对 `@harness/subagent` / `@harness/swarm` 的直连残留也收敛到抽象层：抽象契约（`BackgroundTaskMonitorLike`、`SubagentCapability`、`SwarmCapability` / `SwarmLoopDeps` / `SwarmLoopHandle`）统一落在 `@harness/plugin`，全部为最小结构契约，抽象层不反向依赖具体插件
+- 具体能力对象由插件包各自导出并实现契约：subagent 导出 `subagentCapability`（`createMonitor` → `BackgroundTaskMonitor`）；swarm 导出 `swarmCapability`（`sanitizeName/formatAgentId/startTeammateLoop`，内部封装 `createSwarmManagers` + teammate 状态 + 循环，并把底层 `TeammateLoopHandle` 适配为抽象 `SwarmLoopHandle`）
+- cli 业务逻辑只经抽象接口交互（如 `attachBackgroundTaskPanel` 用 `subagentCapability.createMonitor`、`runTeammateCli` 用 `swarmCapability.startTeammateLoop` 并以 `loop.isDone()` 收尾），不再 import 具体实现类型；组合根仅导入插件导出的能力对象注入（「组合根直连内置插件」为接受的干净架构常态）
+
 ---
 
 ### 3.5 Skill Layer：双轨技能系统

@@ -33,7 +33,7 @@
  */
 
 import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
-import type { AgentPlugin, Hooks, CliCommandInput } from '@harness/plugin'
+import type { AgentPlugin, Hooks, CliCommandInput, SubagentCapability } from '@harness/plugin'
 import type { AgentDefinition, AgentPermissionConfig } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
 import type { Message } from '@harness/session'
@@ -1671,3 +1671,11 @@ export function createBackgroundTaskMonitor(options: BackgroundTaskMonitorOption
 
 /** 默认导出（无子 Agent 配置，需要通过 harness.start 后外部注册） */
 export const subagentPlugin = createSubagentPlugin()
+
+// ===== 运行时能力（抽象层契约）=====
+// cli 等宿主只经 @harness/plugin 的 SubagentCapability 抽象接口交互，不依赖具体实现类型。
+
+/** subagent 插件能力：创建后台任务监控器（实现 @harness/plugin.SubagentCapability） */
+export const subagentCapability: SubagentCapability = {
+  createMonitor: (options) => new BackgroundTaskMonitor(options),
+}

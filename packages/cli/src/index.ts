@@ -33,19 +33,16 @@ import {
 import type { AgentStreamEvent } from '@harness/core'
 import type { AgentPlugin, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
+// 运行时能力抽象契约（@harness/plugin）：cli 仅经下方面向 subagent / swarm 的抽象接口交互，
+// 不依赖具体实现类型。具体能力对象（subagentCapability / swarmCapability）由插件包导出并在组合根装配。
+import type { BackgroundTaskViewLike } from '@harness/plugin'
 // 内置 Provider 模块与 tools-builtin 一律惰性加载（见 lazyImport / registerBuiltinProviderTypes）：
 // 这里只保留类型导入，运行时值经动态 import() 在真正用到时才加载，避免拖慢启动。
 import type { MockProviderConfig } from '@harness/provider-mock'
-import { BackgroundTaskMonitor, type BackgroundTaskView } from '@harness/subagent'
+// subagent / swarm 均为内置插件（组合根直连），cli 经其导出的能力对象（抽象契约）交互
+import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
-import {
-  createSwarmManagers,
-  formatAgentId,
-  sanitizeName,
-  startTeammateLoop,
-  type TeammateTaskState,
-  type TeammateTickDeps,
-} from '@harness/swarm'
+import { swarmCapability } from '@harness/swarm'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import { startTuiRepl } from './tui'
@@ -1279,8 +1276,8 @@ export interface BackgroundTaskPanelOptions {
  * 增量打印到 stdout（⏳ 开始 / ✅ 完成 / ❌ 失败 + 结果预览），
  * 用户无需执行 /tasks、无需大模型主动查询。
  *
- * UI 无关：本函数只做"事件 → 文本行"的渲染，底层状态由
- * @harness/subagent 的 BackgroundTaskMonitor 维护。
+ * UI 无关：本函数只做"事件 → 文本行"的渲染，底层状态由 subagent 插件能力
+ * （@harness/plugin.SubagentCapability.createMonitor）维护。
  *
  * @returns 卸载函数（取消订阅 + 释放 monitor）
  */
@@ -1289,12 +1286,12 @@ export function attachBackgroundTaskPanel(options: BackgroundTaskPanelOptions): 
   if (!harness.bus) return () => {}
   const out = (s: string) => (options.stdout ?? process.stdout).write(s)
 
-  const monitor = new BackgroundTaskMonitor({
+  const monitor = subagentCapability.createMonitor({
     bus: harness.bus,
     parentSessionIds: options.parentSessionIds,
   })
   /** taskId → 已打印的状态（增量渲染，同一状态只打印一次） */
-  const printed = new Map<string, BackgroundTaskView['status']>()
+  const printed = new Map<string, BackgroundTaskViewLike['status']>()
   /** 已打印的进度条目（taskId:toolUseId:toolStatus，P1-5） */
   const printedProgress = new Set<string>()
 
@@ -1887,8 +1884,8 @@ Provider 类型插件扩展（插件化，无需改 CLI）:
 /**
  * teammate 子命令：以 out-of-process teammate 身份运行（终端后端 spawn 的独立 CLI 进程）。
  *
- * 复用 HarnessApp.boot（provider/harness/会话），从团队共享目录读取 mailbox/taskPlane，
- * 启动 startTeammateLoop 持续轮询 mailbox + 认领任务，直到收到 shutdown
+ * 复用 HarnessApp.boot（provider/harness/会话），经 swarm 插件能力（SwarmCapability）
+ * 从团队共享目录启动 teammate 循环持续轮询 mailbox + 认领任务，直到收到 shutdown
  * （approve_shutdown 决策 / 外部 stop）退出。
  */
 export async function runTeammateCli(options: {
@@ -1910,27 +1907,24 @@ export async function runTeammateCli(options: {
 
   const app = new HarnessApp({ cwd, dataDir, agentId, provider, permissionMode, verbose: args.verbose })
   const { harness, session } = await app.boot()
-  const { mailbox, taskPlane } = createSwarmManagers(join(dataDir, 'teams'))
 
-  const memberTeam = sanitizeName(team)
-  const memberName = sanitizeName(name)
-  const state: TeammateTaskState = {
-    agentId: formatAgentId(name, team),
-    identity: { team: memberTeam, name: memberName, agentId },
+  const memberTeam = swarmCapability.sanitizeName(team)
+  const memberName = swarmCapability.sanitizeName(name)
+  // mailbox/taskPlane 创建、teammate 状态与循环细节均由 swarm 插件能力封装
+  const loop = swarmCapability.startTeammateLoop({
+    teamsDir: join(dataDir, 'teams'),
+    team: memberTeam,
+    name: memberName,
+    agentId,
     sessionId: session.id,
-    status: 'running',
-    prompt: '',
-    abortController: new AbortController(),
-    createdAt: Date.now(),
-  }
-  const deps: TeammateTickDeps = { harness, mailbox, taskPlane, team: memberTeam, name: memberName }
+    harness,
+  })
   write(`[teammate] ${memberName}@${memberTeam} 已上线（session=${session.id}），开始轮询 mailbox...\n`)
 
-  const loop = startTeammateLoop(state, deps, { intervalMs: 1000 })
   // 挂起直到 shutdown（approve_shutdown / stop 将状态置 shutdown）
   await new Promise<void>((resolve) => {
     const poll = setInterval(() => {
-      if (state.status === 'shutdown') { clearInterval(poll); resolve() }
+      if (loop.isDone()) { clearInterval(poll); resolve() }
     }, 300)
   })
   await loop.stop()

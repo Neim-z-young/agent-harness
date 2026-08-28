@@ -5,6 +5,7 @@ import {
   createSubagentTool,
   BackgroundTaskRegistry,
   BackgroundTaskMonitor,
+  subagentCapability,
   SubagentEvents,
   formatTaskNotification,
   isAgentDenied,
@@ -2258,6 +2259,30 @@ describe('BackgroundTaskMonitor', () => {
     const tu1 = t.progress!.find((p) => p.toolUseId === 'tu-1')!
     expect(tu1.toolStatus).toBe('completed')
     expect(tu1.summary).toBe('file content')
+    monitor.dispose()
+  })
+})
+
+// ===== 抽象层能力契约 =====
+describe('subagentCapability（@harness/plugin.SubagentCapability）', () => {
+  it('createMonitor 返回结构兼容 BackgroundTaskMonitor 的监控器并接收 Bus 事件', async () => {
+    const bus = createBus()
+    const monitor = subagentCapability.createMonitor({ bus, parentSessionIds: ['s_parent'] })
+
+    const snapshots: Array<ReadonlyArray<{ taskId: string; status: string }>> = []
+    monitor.subscribe((tasks) => snapshots.push(tasks.map((t) => ({ taskId: t.taskId, status: t.status }))))
+
+    await bus.publish(SubagentEvents.started, {
+      agentId: 'coder', agentName: 'Coder', subSessionId: 's_sub', parentSessionId: 's_parent',
+      parentAgentId: 'default', parentMessageId: 'm1', toolUseId: 't1', prompt: '写测试',
+      description: '写测试', isContinuation: false, startedAt: Date.now(), taskId: 'cap-1',
+      background: true,
+    } as any)
+
+    expect(snapshots.length).toBeGreaterThanOrEqual(1)
+    const latest = snapshots[snapshots.length - 1]
+    expect(latest).toEqual([{ taskId: 'cap-1', status: 'running' }])
+
     monitor.dispose()
   })
 })

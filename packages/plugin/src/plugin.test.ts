@@ -565,22 +565,23 @@ describe('@harness/plugin', () => {
       const mod = {
         providerTypeFactory: {
           type: 'gw',
-          createPlugin: (c: any) => ({ id: 'provider.gw' }),
+          // 仅关心类型解析，返回体以 AgentPlugin 最小桩满足契约即可
+          createPlugin: (c: any) => ({ id: 'provider.gw' } as any),
         },
       }
       const factory = resolveProviderTypeFactory(mod)
       expect(factory?.type).toBe('gw')
-      expect(factory?.createPlugin({ id: 'x', type: 'gw' })).toEqual({ id: 'provider.gw' })
+      expect((factory?.createPlugin as any)({ id: 'x', type: 'gw' })).toEqual({ id: 'provider.gw' })
     })
 
     it('resolveProviderTypeFactory：providerType + createProviderPlugin 形态', () => {
       const mod = {
         providerType: 'gw2',
-        createProviderPlugin: (c: any) => ({ id: 'provider.gw2' }),
+        createProviderPlugin: (c: any) => ({ id: 'provider.gw2' } as any),
       }
       const factory = resolveProviderTypeFactory(mod)!
       expect(factory.type).toBe('gw2')
-      expect(factory.createPlugin({ id: 'x', type: 'gw2' })).toEqual({ id: 'provider.gw2' })
+      expect((factory.createPlugin as any)({ id: 'x', type: 'gw2' })).toEqual({ id: 'provider.gw2' })
     })
 
     it('resolveProviderTypeFactory：default 包装内亦能识别', () => {

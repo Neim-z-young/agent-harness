@@ -1,5 +1,32 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 27）：抽象层扩至运行时能力（subagent / swarm），消除 cli 对业务插件的依赖倒置残留
+
+### 背景
+
+续 26 已把 Provider 依赖倒置消除。cli 仍残留对两个业务插件的直连：`attachBackgroundTaskPanel` 直接 `import { BackgroundTaskMonitor }` 自 `@harness/subagent`，`runTeammateCli` 直接 `import { createSwarmManagers/startTeammateLoop/TeammateTaskState/… }` 自 `@harness/swarm`。经与用户确认：「组合根直连内置插件」作为干净架构常态基线被接受，但该处残留按「完整抽象：swarm+subagent」推进。因此抽象层持续下垫：cli 业务逻辑只经抽象接口交互，具体能力对象由插件包导出并在组合根装配。
+
+### 改动
+
+1. **抽象契约落位 `@harness/plugin`**（[plugin/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugin/src/index.ts)）新增「运行时能力服务契约」，全部取最小结构契约，抽象层不反向依赖具体插件：
+   - `BackgroundProgressLike` / `BackgroundTaskViewLike` / `BackgroundTaskListenerLike` / `BackgroundTaskMonitorLike`：后台任务监控的最小结构视图（与 subagent `BackgroundTaskProgress/View/Listener/Monitor` 结构兼容）。
+   - `SubagentCapability`（`createMonitor({ bus, parentSessionIds? })`）。
+   - `SwarmLoopDeps` / `SwarmLoopHandle`（`isDone/stop`）/ `SwarmCapability`（`sanitizeName/formatAgentId/startTeammateLoop`）。
+2. **subagent 插件实现抽象并导出能力**（[subagent/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/subagent/src/index.ts)）：新增 `subagentCapability: SubagentCapability`，内部 `new BackgroundTaskMonitor(options)`。
+3. **swarm 插件实现抽象并导出能力**（[swarm/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/swarm/src/index.ts)）：新增 `swarmCapability: SwarmCapability`，`startTeammateLoop(deps)` 内部完成 `createSwarmManagers`、teammate 状态构建与循环封装，并把底层 `TeammateLoopHandle` 适配为抽象 `SwarmLoopHandle`（`isDone = !running`）。
+4. **cli 只消费抽象层**（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）：
+   - 删除对 `BackgroundTaskMonitor`/`BackgroundTaskView`/`createSwarmManagers`/`startTeammateLoop`/`TeammateTaskState`/`TeammateTickDeps` 等具体实现类型的直接引用；cli 业务函数不再 import 这些类型。
+   - `attachBackgroundTaskPanel` 改经 `subagentCapability.createMonitor(...)`，打印状态映射改用抽象 `BackgroundTaskViewLike['status']`。
+   - `runTeammateCli` 改经 `swarmCapability.sanitizeName/formatAgentId/startTeammateLoop`，等待收尾改用 `loop.isDone()` 而非读取具体 `state.status`。
+   - 组合根仅导入具体插件导出的能力对象（`subagentCapability` / `swarmCapability`），属「组合根直连内置插件」基线内。
+5. 附带修复 `@harness/plugin` 的 `plugin.test.ts` 两处既有类型错误：`resolveProviderTypeFactory` 用例的 `createPlugin` 返回体补齐 AgentPlugin 最小桩，因抽象契约已把返回类型收紧为 `AgentPlugin | undefined`。
+
+### 验证
+
+- 全量 28 包 typecheck 通过
+- `@harness/plugin` 37 例、`@harness/subagent` 93 例（新增 capability 1 例）、`@harness/swarm` 65 例（新增 capability 2 例）、`@harness/cli` 114 例均全绿
+- 注：根目录 `bun test` 扫描未装依赖的 `reference/` 私有目录产生的既有失败与本改动无关
+
 ## 2026-08-28（续 26）：Provider 抽象层，消除 core/cli 对具体 Provider 的依赖倒置
 
 ### 背景

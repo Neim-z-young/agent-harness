@@ -51,6 +51,7 @@ import {
   spawnTeammate,
   spawnTerminalTeammate,
   startTeammateLoop,
+  swarmCapability,
   TaskListPlane,
   TeammateMailbox,
   TeamManager,
@@ -1112,5 +1113,32 @@ describe('createSwarmPlugin', () => {
       'team_delete',
       'team_status',
     ])
+  })
+})
+
+// ===== 抽象层能力契约 =====
+
+describe('swarmCapability（@harness/plugin.SwarmCapability）', () => {
+  it('sanitize / formatAgentId 与底层函数行为一致', () => {
+    expect(swarmCapability.sanitizeName('Bob Wang')).toBe(sanitizeName('Bob Wang'))
+    expect(swarmCapability.formatAgentId('bob', 'my team')).toBe(formatAgentId('bob', 'my team'))
+  })
+
+  it('startTeammateLoop 返回 SwarmLoopHandle；stop 后 isDone 为 true', async () => {
+    const dir = await makeDir('swarm-cap-')
+    const { harness } = makeMockHarness()
+    const loop = swarmCapability.startTeammateLoop({
+      teamsDir: dir,
+      team: 'alpha',
+      name: 'bob',
+      agentId: 'researcher',
+      sessionId: 's1',
+      harness,
+    })
+    expect(typeof loop.isDone).toBe('function')
+    expect(typeof loop.stop).toBe('function')
+    expect(loop.isDone()).toBe(false)
+    await loop.stop()
+    expect(loop.isDone()).toBe(true)
   })
 })
