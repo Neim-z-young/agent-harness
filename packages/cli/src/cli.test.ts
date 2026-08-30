@@ -1051,6 +1051,28 @@ describe('插件 CLI 命令扩展', () => {
     expect(output).toInclude('未知命令')
     await app.shutdown()
   })
+
+  it('/stats 与 /stats-export（无参数）正常工作且不崩溃', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/stats', '/stats-export', '/stats-export json', '/stats-export md', '/exit'],
+    })
+    const output = chunks.join('')
+    expect(output).toInclude('LLM 调用')
+    expect(output).toInclude('# 会话用量统计报告')
+    expect(output).toInclude('"llmCalls"')
+    expect(output).not.toInclude('执行失败') // 不触发命令异常防护
+    expect(output).not.toInclude('TypeError')
+    await app.shutdown()
+  })
 })
 
 describe('后台任务面板 attachBackgroundTaskPanel（P1-4）', () => {

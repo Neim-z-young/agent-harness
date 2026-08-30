@@ -1479,6 +1479,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     // 特殊命令
     if (line.startsWith('/')) {
       const [cmd, arg] = line.split(/\s+/, 2)
+      try {
       switch (cmd) {
         case '/help':
           out('命令列表：\n')
@@ -1638,7 +1639,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         }
         case '/stats-export': {
           const u = await resolveCurrentUsage(harness, current)
-          const [fmtArg, pathArg] = arg.trim().split(/\s+/)
+          const [fmtArg, pathArg] = (arg ?? '').trim().split(/\s+/)
           const isJson = fmtArg === 'json' || fmtArg === '--json'
           const content = isJson
             ? exportStatsJson(u, { sessionId: current.id, title: current.title })
@@ -1794,6 +1795,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out(`未知命令：${line}，输入 /help 查看。\n`)
           return 'continue'
         }
+      }
+      } catch (err: any) {
+        out(`❌  /${cmd} 执行失败：${err?.message ?? String(err)}\n`)
+        return 'continue'
       }
     }
 
