@@ -463,13 +463,16 @@ export function latestAssistantText(blocks: readonly ChatBlock[]): string {
 /** 复制到系统剪贴板（macOS pbcopy）。失败静默（不打断 TUI 交互） */
 export function copyTextToClipboard(text: string): void {
   if (!text) return
+  let child
   try {
-    const child = spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
-    if (child.stdin) {
-      child.stdin.write(text)
-      child.stdin.end()
-    }
-  } catch { /* 剪贴板不可用静默忽略 */ }
+    child = spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
+  } catch { /* pbcopy 不可用（如非 macOS）静默忽略 */ return }
+  // pbcopy 缺失时 ENOENT 以异步 error 事件抛出，必须挂处理，否则成为未捕获异常中断交互
+  child.on('error', () => { /* 剪贴板命令失败静默忽略 */ })
+  if (child.stdin) {
+    child.stdin.write(text)
+    child.stdin.end()
+  }
 }
 
 // ------------------------------------------------------------------------
@@ -528,6 +531,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [histIdx, setHistIdx] = useState(-1) // -1 表示不在回看历史
   // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
   const [helpOpen, setHelpOpen] = useState(false)
+  // 鼠标复制（模块 D3）：正在展示「✓ 已复制」提示的块 id（临时高亮，配合 onMouseUp 复制）
+  const [copiedId, setCopiedId] = useState<number | null>(null)
   // 统计面板计时起点：组件挂载时刻
   const startTimeRef = useRef(Date.now())
 
@@ -743,6 +748,25 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current)
 
   const renderBlock = (b: ChatBlock) => {
+    // 对话消息（用户/助手且非空）在正文下加一行鼠标「复制」按钮
+    const copyable = (b.kind === 'user' || b.kind === 'assistant') && b.text.trim().length > 0
+    if (copyable) {
+      return (
+        <box key={b.id} flexDirection="column">
+          {renderBlockBody(b)}
+          <text
+            attributes={createTextAttributes(copiedId === b.id ? { reverse: true, bold: true } : { dim: true, underline: true })}
+            onMouseUp={(e) => { e.preventDefault(); setCopiedId(b.id); copyTextToClipboard(b.text) }}
+          >
+            {copiedId === b.id ? '✓ 已复制' : '⧉ 复制'}
+          </text>
+        </box>
+      )
+    }
+    return renderBlockBody(b)
+  }
+
+  const renderBlockBody = (b: ChatBlock) => {
     switch (b.kind) {
       case 'assistant':
         return (
@@ -926,7 +950,8 @@ function openInEditor(path: string, line?: number): void {
  * - Ctrl-C / /exit 退出；Coordinator 自动续轮注入 `<continue/>` 触发下一轮
  */
 export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit> {
-  const renderer: CliRenderer = await createCliRenderer()
+  // useMouse：启用 SGR 鼠标协议，支持消息复制按钮点击
+  const renderer: CliRenderer = await createCliRenderer({ useMouse: true })
   const root = createRoot(renderer)
   // 未显式提供 openFile 时，用本机编辑器打开文件引用
   const opts: TuiReplOptions = options.openFile ? options : { ...options, openFile: openInEditor }

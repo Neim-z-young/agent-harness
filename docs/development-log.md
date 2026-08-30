@@ -53,6 +53,31 @@
 - 新增 TuiStats 纯函数测试与集成测试（帮助开关、统计随块更新），修正统计初始断言（欢迎语 system 块计入字符，故初始 chars≠0）。
 - cli+tui 全量 132 用例通过、`tsc --noEmit` 通过。
 
+## 2026-08-30（续 33）：TUI 鼠标复制 — 每条消息增加可点击「复制」按钮
+
+### 背景
+
+模块 D1 已有 `Ctrl-Y` 复制最近助理回复，但需逐条复制历史消息时不够顺手。本续将复制能力下沉到单条消息，实现鼠标点击复制，作为 `Ctrl-Y` 的鼠标替代方案。
+
+### 实现（[tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）
+
+- `startTuiRepl` 创建渲染器时开启 `createCliRenderer({ useMouse: true })`，启用 SGR 鼠标协议（测试渲染器 `createTestRenderer` 亦 `useMouse: true`）。
+- `TuiApp` 新增 `copiedId` 状态：标记当前已复制的块 id，用于「✓ 已复制」临时高亮。
+- `renderBlock`：对非空 user/assistant 块，在正文下方渲染一行 `<text>` 复制按钮，绑定 `onMouseUp`：
+  - 点击即 `preventDefault()` + `setCopiedId(b.id)` + `copyTextToClipboard(b.text)`（复用 D1 的 pbcopy 实现）。
+  - 按钮文案 `⧉ 复制` ⇄ `✓ 已复制`（`copiedId === b.id` 反色加粗切换，dim+underline 常态）。
+  - 复用 `copyTextToClipboard`：为其补上 `child.on('error')` 处理 —— pbcopy 缺失（非 macOS / PATH 异常）时 ENOENT 以异步 `error` 事件抛出，原 try/catch 只接同步 `spawn` 抛错，二者叠加可完全静默失败、不中断 TUI 交互。
+
+### 测试（[tui.test.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.test.tsx)）
+
+- 新增 `locateChar` 助手：在整宽字符帧（每行按终端宽度空格填充）中用 `indexOf` 定位任意子串的 0-based 单元格坐标，供 `mockMouse.click` 使用。
+- 新增集成测试「鼠标点击消息复制按钮 → 变 ✓ 已复制」：发送消息 → 帧中出现 `⧉ 复制` → 定位其坐标 → `mockMouse.click(x, y)` → 断言该按钮翻转为 `✓ 已复制`（证明 `onMouseUp` 触发、状态更新）。
+- 首轮测试暴露 pbcopy 在测试环境不可用（PATH 异常导致 `error`），正是上文 `child.on('error')` 修复的验证用例。
+
+### 验证
+
+- cli+tui 全量 **133** 用例通过（含新增鼠标复制集成测试）、`tsc --noEmit` 通过。
+
 ## 2026-08-28（续 29）：`/model` 补全列出插件注册的 Provider — `listProviders` 合并注册表类型
 
 ### 背景

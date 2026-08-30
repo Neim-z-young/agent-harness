@@ -396,7 +396,7 @@ async function mountTui(
     },
   })
   const { harness, session } = await app.boot()
-  const setup = await createTestRenderer({ width: 80, height: 24 })
+  const setup = await createTestRenderer({ width: 80, height: 24, useMouse: true })
   const root = createRoot(setup.renderer)
   let resolveExit!: (r: TuiReplExit) => void
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
@@ -434,6 +434,16 @@ async function waitFrame(setup: TestRendererSetup, predicate: (frame: string) =>
     await new Promise((r) => setTimeout(r, 3))
   }
   throw new Error('waitFrame 超时，最后一帧:\n' + JSON.stringify(frame.slice(0, 400)))
+}
+
+/** 在整宽字符帧中定位首个目标子串的 0-based 单元格坐标（行整宽填充空格，故 indexOf 即列位） */
+function locateChar(frame: string, needle: string): { x: number; y: number } | null {
+  const lines = frame.split('\n')
+  for (let y = 0; y < lines.length; y++) {
+    const x = lines[y].indexOf(needle)
+    if (x >= 0) return { x, y }
+  }
+  return null
 }
 
 async function waitExit(f: TuiFixture, maxPasses = 600): Promise<TuiReplExit> {
@@ -521,6 +531,22 @@ describe('TuiApp 集成（mock provider）', () => {
     f.setup.mockInput.pressEnter()
     await waitFrame(f.setup, (frame) => frame.includes('你好，我是 TUI 助手。'))
     await waitFrame(f.setup, (frame) => frame.includes('消息') && frame.includes('1u'))
+    await f.cleanup()
+  })
+
+  it('鼠标点击消息「复制」按钮 → 变「✓ 已复制」（onMouseUp 触发 clipboard 写入）', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('复制测试')
+    f.setup.mockInput.pressEnter()
+    // 用户回显 + assistant 回复各生成一个「⧉ 复制」按钮
+    await waitFrame(f.setup, (frame) => frame.includes('你好，我是 TUI 助手。'))
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('⧉ 复制'))
+    const pos = locateChar(frame, '⧉ 复制')
+    expect(pos).not.toBeNull()
+    // 点击该按钮单元格坐标（0-based），触发 onMouseUp 复制并临时高亮
+    await f.setup.mockMouse.click(pos!.x, pos!.y)
+    await waitFrame(f.setup, (fr) => fr.includes('✓ 已复制'))
     await f.cleanup()
   })
 })
