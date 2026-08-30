@@ -78,6 +78,35 @@
 
 - cli+tui 全量 **133** 用例通过（含新增鼠标复制集成测试）、`tsc --noEmit` 通过。
 
+## 2026-08-30（续 34）：选区复制 + 欢迎页
+
+### 背景
+
+续 33 实现了每条消息的鼠标点击「复制」按钮，但尚未覆盖"鼠标拖拽选区后复制"这类交互（此前已确认可选择文本会自动建立 OpenTUI 选区，但缺少读取入口）。同时 TUI 启动时只有一行欢迎语，缺少面向新手的欢迎页引导。
+
+### 实现（[tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）
+
+**选区复制（模块 D4）**
+
+- 经 `@opentui/react` 的 `useAppContext()` 在 `TuiApp` 内取到全局 `renderer`（`createRoot` 已以 `AppContext.Provider` 注入 `{ renderer }`），从而读取 `renderer.getSelection()`。
+- 新增纯函数 `selectionTextFrom(renderer)`：结构性读取 `getSelection().getSelectedText()`；无 renderer/无选区/空选取均返回空串，便于单测。
+- Ctrl-Y 语义升级：**有选区先复制选区并 `clearSelection()`，否则回落复制最近 assistant 回复**（`HELP_LINES` 同步更新说明）。
+
+**欢迎页（WelcomePanel）**
+
+- `HARNESS_LETTERS` 5×5 字模 + `buildWelcomeBanner()`：横向拼接 "HARNESS" 生成 5 行字标（每行 ≤60 列，适配 80 列 + 26 列侧栏后的主区宽度）。
+- `WelcomePanel` 组件：贯穿渲染"欢迎"头部、字标、provider/model、快捷键列表、上手引导。
+- `TuiApp` 新增 `hasChat = blocks.some(b => b.kind !== 'system')`；主区 scrollbox 在会话开始前渲染 `WelcomePanel`，首条消息后切换为对话块列表（复用既有 `initialChatWithWelcome`，此处仅做可视化替换）。
+
+### 测试（[tui.test.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.test.tsx)）
+
+- 单测：`buildWelcomeBanner` 返回 5 行且宽度可控并含字模横笔画；`selectionTextFrom` 各无选区/有选区分支。
+- 集成：欢迎页在初始（仅 system 块）展示字标与引导、首条消息后消失并切换为对话块。
+
+### 验证
+
+- cli+tui 全量 **136** 用例通过（新增 3 例）、`tsc --noEmit` 通过。
+
 ## 2026-08-28（续 29）：`/model` 补全列出插件注册的 Provider — `listProviders` 合并注册表类型
 
 ### 背景

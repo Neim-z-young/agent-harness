@@ -23,7 +23,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer } from '@opentui/core'
-import { createRoot, useKeyboard } from '@opentui/react'
+import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, listReplCommands } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
@@ -64,7 +64,7 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: 'Ctrl-C', desc: '退出 TUI' },
   { key: 'Ctrl-B', desc: '切换右侧面板' },
   { key: 'Ctrl-/ 或 ?', desc: '打开/关闭帮助面板' },
-  { key: 'Ctrl-Y', desc: '复制最近一条回复' },
+  { key: 'Ctrl-Y', desc: '复制鼠标选中的文字；无选区则复制最近回复' },
   { key: 'Tab', desc: '进入文件引用/会话列表' },
   { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
   { key: 'Enter', desc: '提交输入 / 确认选中' },
@@ -475,6 +475,16 @@ export function copyTextToClipboard(text: string): void {
   }
 }
 
+/**
+ * 读出当前活动选区文本（OpenTUI 鼠标拖拽选区）。无 renderer / 无选区 / 空选取
+ * 均返回空串。结构性类型，仅依赖 getSelection().getSelectedText() 形状，便于单测。
+ */
+export function selectionTextFrom(
+  renderer: { getSelection?: () => { getSelectedText?: () => string } | null } | null | undefined,
+): string {
+  return renderer?.getSelection?.()?.getSelectedText?.() ?? ''
+}
+
 // ------------------------------------------------------------------------
 // 主题：markdown / 代码高亮配色（GitHub Dark 系）
 // ------------------------------------------------------------------------
@@ -498,6 +508,55 @@ const markdownStyle = SyntaxStyle.fromStyles({
   variable: { fg: RGBA.fromHex('#E6EDF3') },
   default: { fg: RGBA.fromHex('#E6EDF3') },
 })
+
+// ------------------------------------------------------------------------
+// 欢迎页：ASCII 字标 + 启动信息 + 快捷键提示（会话开始前展示在主对话区）
+// ------------------------------------------------------------------------
+
+// 5×5 字模，"HARNESS" 逐字母横向拼接（字母间 2 空格），供欢迎页 Banner 展示。
+const HARNESS_LETTERS: Record<string, string[]> = {
+  H: ['H   H', 'H   H', 'HHHHH', 'H   H', 'H   H'],
+  A: [' AAA ', 'A   A', 'AAAAA', 'A   A', 'A   A'],
+  R: ['RRRR ', 'R   R', 'RRRR ', 'R R  ', 'R  RR'],
+  N: ['N   N', 'NN  N', 'N N N', 'N  NN', 'N   N'],
+  E: ['EEEEE', 'E    ', 'EEE  ', 'E    ', 'EEEEE'],
+  S: [' SSS ', 'S    ', ' SSS ', '    S', ' SSS '],
+}
+
+/** 拼接 "HARNESS" 字标，返回若干行最大宽度 ≤60 的分串（行间用 2 空格分隔字母） */
+export function buildWelcomeBanner(word = 'HARNESS'): string[] {
+  const letters = [...word].map((c) => HARNESS_LETTERS[c] ?? HARNESS_LETTERS.H)
+  const rows: string[] = []
+  for (let r = 0; r < 5; r++) rows.push(letters.map((l) => l[r]).join('  '))
+  return rows
+}
+
+/** 欢迎页 ASCII 字标（多行字符串，供整块渲染/测试） */
+export const WELCOME_BANNER = buildWelcomeBanner().join('\n')
+
+/** 会话开始前的主对话区欢迎页组件（替换初始欢迎 system 块的可视化呈现） */
+export function WelcomePanel({ provider, model }: { provider: string; model?: string }) {
+  return (
+    <box flexDirection="column" style={{ flexGrow: 1 }}>
+      <text attributes={createTextAttributes({ reverse: true, bold: true })}>
+        welcome to agent-harness
+      </text>
+      {WELCOME_BANNER.split('\n').map((line, i) => (
+        <text key={i} attributes={createTextAttributes({ bold: true })}>{line || '\u00A0'}</text>
+      ))}
+      <text attributes={createTextAttributes({ dim: true })}>{'\u00A0'}</text>
+      <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+        交互式会话 · provider={provider} · model={model ?? '-'}
+      </text>
+      <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+        {HELP_LINES.map((l) => l.key).join(' · ')}
+      </text>
+      <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+        直接输入问题开始对话；输入 /help 查看特殊命令；Ctrl-C 或 /exit 退出。
+      </text>
+    </box>
+  )
+}
 
 // ------------------------------------------------------------------------
 // TuiApp：OpenTUI React 组件树（状态栏 + 主对话 + 侧栏面板 + 输入）
@@ -535,6 +594,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [copiedId, setCopiedId] = useState<number | null>(null)
   // 统计面板计时起点：组件挂载时刻
   const startTimeRef = useRef(Date.now())
+  // 选区复制（模块 D4）：读全局 renderer，Ctrl-Y 优先复制鼠标选中的文字
+  const { renderer } = useAppContext()
+  // 会话开始前（仅剩 system 块）展示欢迎页；发起首条消息后切换为对话块列表
+  const hasChat = state.blocks.some((b) => b.kind !== 'system')
 
   // 会话处理内核（与 REPL 共用）：结构化 onEvent 驱动 markdown 流，out 归类控制台文本。
   // onEvent 增量被缓冲并按宏任务批合并提交，避免高频 chunk 逐次全量重解析 markdown。
@@ -655,10 +718,14 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     // 模块 D：帮助面板开关。Ctrl+/ 与 Ctrl+_ 均发 0x1F（OpenTUI 解码为 name '_'）;
     // 部分终端将 Ctrl+/ 上报为 '?'。三者等效触发。
     if (key.ctrl && (key.name === '/' || key.name === '_' || key.name === '?')) { setHelpOpen(true); return true }
-    // 模块 D：复制最近 assistant 块（Ctrl-y）
+    // 模块 D：复制 —— 有选区先复制选区，否则复制最近 assistant 块（Ctrl-y）
     if (key.ctrl && key.name === 'y') {
-      const t = latestAssistantText(state.blocks)
-      if (t) copyTextToClipboard(t)
+      const sel = selectionTextFrom(renderer)
+      const t = sel.trim() ? sel : latestAssistantText(state.blocks)
+      if (t) {
+        copyTextToClipboard(t)
+        if (sel.trim()) renderer?.clearSelection?.()
+      }
       return true
     }
     const refs = fileRefs
@@ -817,7 +884,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       <box flexDirection="row" style={{ flexGrow: 1 }}>
         {/* ScrollBox 原生粘底滚动：日志追加时自动滚到底部（避免手动 scrollTop 竞态） */}
         <scrollbox stickyScroll stickyStart="bottom" style={{ flexGrow: 1, border: true, padding: 1 }}>
-          {state.blocks.map(renderBlock)}
+          {hasChat ? state.blocks.map(renderBlock) : <WelcomePanel provider={provider} model={model} />}
         </scrollbox>
         {showSidebar && (
           <scrollbox style={{ width: SIDEBAR_WIDTH, border: true, padding: 1, flexShrink: 0 }}>

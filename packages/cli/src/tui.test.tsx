@@ -36,6 +36,9 @@ import {
   formatDuration,
   latestAssistantText,
   HELP_LINES,
+  buildWelcomeBanner,
+  WELCOME_BANNER,
+  selectionTextFrom,
   type SessionRow,
   type ChatBlock,
   type TuiReplExit,
@@ -364,6 +367,30 @@ describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
     expect(text).toContain('Ctrl-C')
     expect(text).toContain('Ctrl-B')
   })
+
+  it('buildWelcomeBanner：5 行字标，每行宽度可控且含全部字母行', () => {
+    const rows = buildWelcomeBanner()
+    expect(rows.length).toBe(5)
+    for (const r of rows) {
+      expect(r.length).toBeGreaterThan(0)
+      expect(r.length).toBeLessThanOrEqual(60)
+    }
+    // H/A/R/N/E/R/N/E/S/S… 逐行应出现字模竖笔画与横杠，能拼出全部行
+    expect(rows[2]).toContain('HHHHH') // 第 4 行（'H' 中横）
+    expect(rows[4]).toContain('EEEEE') // 第 5 行（'E' 底横）
+    expect(WELCOME_BANNER).toContain('HHHHH')
+  })
+
+  it('selectionTextFrom：无 renderer/无选区返回空串，有选区返回文本', () => {
+    expect(selectionTextFrom(null)).toBe('')
+    expect(selectionTextFrom(undefined)).toBe('')
+    expect(selectionTextFrom({})).toBe('')
+    expect(selectionTextFrom({ getSelection: () => null })).toBe('')
+    expect(selectionTextFrom({ getSelection: () => ({ getSelectedText: () => '' }) })).toBe('')
+    expect(
+      selectionTextFrom({ getSelection: () => ({ getSelectedText: () => '选中的文字' }) }),
+    ).toBe('选中的文字')
+  })
 })
 
 // ------------------------------------------------------------------------
@@ -462,6 +489,22 @@ describe('TuiApp 集成（mock provider）', () => {
     const f = await mountTui()
     const frame = await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
     expect(frame).toContain('mock')
+    await f.cleanup()
+  })
+
+  it('欢迎页：会话开始前展示字标与引导，首条消息后消失', async () => {
+    const f = await mountTui()
+    // 初始（仅 system 块）→ 展示欢迎页（字标 + 引导 + provider）
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('welcome to agent-harness'))
+    expect(frame).toContain('HARNESS'.charAt(0))       // 字标首字母 'H'
+    expect(frame).toContain('交互式会话')
+    expect(frame).toContain('provider=mock')
+    expect(frame).toContain('输入问题开始对话')
+    // 首条消息后欢迎页被对话块替换
+    await f.setup.mockInput.typeText('hello')
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    await waitFrame(f.setup, (fr) => !fr.includes('welcome to agent-harness'))
     await f.cleanup()
   })
 
