@@ -619,6 +619,20 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
+  it('命令输入回显为 user 块，并触发欢迎页切换', async () => {
+    const f = await mountTui()
+    // 初始欢迎页
+    await waitFrame(f.setup, (fr) => fr.includes('welcome to agent-harness'))
+    // 执行命令：应回显命令并让欢迎页消失（命令算作新会话活动）
+    await f.setup.mockInput.typeText('/stats')
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (fr) => fr.includes('/stats'))
+    await waitFrame(f.setup, (fr) => !fr.includes('welcome to agent-harness'))
+    // 命令输出（stats 文本）也进入聊天区
+    await waitFrame(f.setup, (fr) => fr.includes('LLM 调用'))
+    await f.cleanup()
+  })
+
   it('配置的 model 初始展示在状态栏/侧栏', async () => {
     const f = await mountTui({ model: 'claude-3-5-sonnet' })
     const frame = await waitFrame(f.setup, (fr) => fr.includes('model=claude-3-5-sonnet'))

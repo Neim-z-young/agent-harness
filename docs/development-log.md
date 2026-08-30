@@ -1,5 +1,23 @@
 # Agent Harness 开发日志
 
+## 2026-08-30（续 38）：TUI 命令输入回显 — 命令进入对话历史并触发欢迎页切换
+
+用户反馈：TUI 对话历史里看不到 `/` 命令发送记录；新会话执行命令时欢迎页不消失，只有发普通消息才切换。
+
+### 根因
+
+`createProcessLine` 命令分支只输出命令结果，不回显命令输入。TUI 捕获按键生成输入（不经过终端原生回显），因此命令从未作为 user 块进入聊天区。而欢迎页切换条件 `hasChat = blocks.some(kind !== 'system')` —— 命令结果多为 system/文本块，无法触发切换。
+
+### 修复
+
+- `createProcessLine` 命令分支开头，在 TUI 模式（`options.onEvent` 存在，REPL 靠终端原生显示不重复回显）回显 `🧑  ${line}` 为 user 块：
+  - 命令输入随之出现在对话历史；
+  - 产生非 system 块 → 欢迎页在执行首个命令时即切换（与发消息一致）。
+
+### 验证
+
+- cli+tui 新增「命令输入回显为 user 块，并触发欢迎页切换」集成测试；全量 **144 用例通过**，typecheck 通过。
+
 ## 2026-08-30（续 37）：修复 `/resume` 恢复会话后发送报 `Session not found`
 
 TUI/REPL 中用 `/resume` 恢复持久化会话后，发送消息报 `Session "<id>" not found`（会话恢复成功但无法继续对话）。

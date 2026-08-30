@@ -1479,6 +1479,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     // 特殊命令
     if (line.startsWith('/')) {
       const [cmd, arg] = line.split(/\s+/, 2)
+      // TUI 模式：回显命令输入为 user 块，使其出现在对话历史、并在欢迎页状态下触发切换
+      if (options.onEvent) out(`\n🧑  ${line}\n`)
       try {
       switch (cmd) {
         case '/help':
