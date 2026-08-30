@@ -1304,6 +1304,22 @@ export interface ReplOptions {
 /** 特殊 REPL 命令（以 / 开头） */
 const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills']
 
+/**
+ * 收集 TUI `/` 命令补全候选：内置 REPL 命令 + 插件经 `cli.commands` hook 注册的命令。
+ * TUI 输入以 `/` 开头时据此渲染命令菜单弹层。
+ */
+export async function listReplCommands(harness: Harness): Promise<Array<{ command: string; description: string }>> {
+  const names = REPL_COMMANDS.map((cmd) => ({ command: cmd, description: '' }))
+  try {
+    const cmdInput = { commands: [] as Array<{ command: string; description: string; usage?: string }> }
+    await harness.plugin.trigger('cli.commands', cmdInput)
+    for (const c of cmdInput.commands) {
+      if (!names.some((n) => n.command === `/${c.command}`)) names.push({ command: `/${c.command}`, description: c.description })
+    }
+  } catch { /* 忽略插件 hook 错误 */ }
+  return names
+}
+
 // ========================================================================
 // 5.1 后台任务面板（P1-4 前端事件驱动展示）
 // ========================================================================

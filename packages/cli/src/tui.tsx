@@ -24,7 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer } from '@opentui/core'
 import { createRoot, useKeyboard } from '@opentui/react'
-import { createProcessLine } from './index'
+import { createProcessLine, listReplCommands } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { Message, Session } from '@harness/session'
@@ -424,6 +424,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [sessionSel, setSessionSel] = useState(0)
   // 会话分发互斥：任一列表模式激活时输入框让出焦点
   const listMode = fileMode || sessionMode
+  // 模块 C：/命令菜单补全 + 输入历史
+  const [allCommands, setAllCommands] = useState<Array<{ command: string; description: string }>>([])
+  const [cmdSel, setCmdSel] = useState(0)
+  const [history, setHistory] = useState<string[]>([])
+  const [histIdx, setHistIdx] = useState(-1) // -1 表示不在回看历史
 
   // 会话处理内核（与 REPL 共用）：结构化 onEvent 驱动 markdown 流，out 归类控制台文本。
   // onEvent 增量被缓冲并按宏任务批合并提交，避免高频 chunk 逐次全量重解析 markdown。
@@ -482,6 +487,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }, [options.app])
   useEffect(() => { void refreshSessions() }, [refreshSessions])
 
+  // 模块 C：加载 / 命令补全候选（内置 REPL 命令 + 插件注册命令）
+  useEffect(() => {
+    void listReplCommands(options.harness).then(setAllCommands).catch(() => { /* 忽略加载失败 */ })
+  }, [options.harness])
+
   const finish = useCallback((reason: TuiReplExit) => {
     if (exitRef.current) return
     exitRef.current = true
@@ -503,12 +513,26 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
   const submit = useCallback((value: string) => {
     if (exitRef.current) return
+    const v = value.trim()
     setInput('')
-    if (value.trim()) {
-      pendingLines.current.push(value)
+    setHistIdx(-1)
+    if (v) {
+      // 模块 C：提交成功后入栈输入历史（去重相邻、限长，最新的在后）
+      setHistory((prev) => {
+        const trimmed = prev.filter((h) => h !== v).slice(-99)
+        return [...trimmed, v]
+      })
+      pendingLines.current.push(v)
       void drain()
     }
   }, [drain])
+
+  // 模块 C：/ 命令补全候选 —— 输入以 / 开头时，按前缀过滤命令菜单
+  const cmdCandidates = useMemo(() => {
+    if (!input.startsWith('/')) return []
+    return allCommands.filter((c) => c.command.startsWith(input))
+  }, [input, allCommands])
+  const cmdMenuOpen = cmdCandidates.length > 0
 
   // 全局快捷键：Ctrl-C 退出、Ctrl-B 切换侧栏；列表模式 Tab 进入、↑/↓ 选中、Enter 触发、Esc 返回。
   // 两个列表互斥：优先会话模式；退出文件引用 Tab。useKeyboard 底层用 useEffectEvent 包裹，回调闭包每次渲染刷新。
@@ -519,6 +543,30 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     if (key.ctrl && key.name === 'b') return setShowSidebar((v) => !v)
     const refs = fileRefs
     const openFile = options.openFile
+    // 模块 C：/ 命令菜单 —— 输入以 / 开头且有候选时，↑/↓ 选中、Tab 补全、Enter 提交、Esc 关闭
+    if (!listMode && cmdMenuOpen) {
+      const last = cmdCandidates.length - 1
+      if (key.name === 'up') { setCmdSel((s) => Math.max(0, s - 1)); return }
+      if (key.name === 'down') { setCmdSel((s) => Math.min(last, s + 1)); return }
+      if (key.name === 'tab') {
+        const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
+        setInput(c.command + (c.command.endsWith(' ') ? '' : ' '))
+        setCmdSel(0)
+        return
+      }
+      if (key.name === 'escape') { setInput(prev => prev.split(/\s+/)[0] ?? prev); setCmdSel(0); return }
+      if (key.name === 'return') {
+        const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
+        submitRef.current(c.command)
+        return
+      }
+      return true // 命令菜单吞掉其余按键
+    }
+    // 模块 C：输入历史 —— 输入为空、无命令菜单时，↑ 回看 / ↓ 前进，Enter 用回看值提交
+    if (!listMode && !cmdMenuOpen && input === '' && history.length > 0) {
+      if (key.name === 'up') { setHistIdx((i) => (i === -1 ? history.length - 1 : Math.max(0, i - 1))); return }
+      if (key.name === 'down') { setHistIdx((i) => (i === -1 ? -1 : Math.min(history.length - 1, i + 1))); return }
+    }
     // 会话列表模式：↑/↓ 移动、Enter 恢复、Tab/Esc 返回输入
     if (sessionMode && sessions.length > 0) {
       if (key.name === 'tab' || key.name === 'escape') { setSessionMode(false); return }
@@ -686,13 +734,31 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       </box>
 
       {/* 底部输入：列表模式让出焦点（由 useKeyboard 接管上下/回车） */}
-      <input
-        focused={!listMode}
-        value={input}
-        onInput={setInput}
-        onSubmit={(value: unknown) => submit(String(value))}
-        placeholder="❯ "
-      />
+      <box flexDirection="column" style={{ flexShrink: 0 }}>
+        {/* 模块 C：/ 命令补全菜单弹层（出现在输入框上方，随输入前缀过滤） */}
+        {!listMode && cmdMenuOpen && cmdCandidates.length > 0 && (
+          <box style={{ border: true, maxHeight: 8 }}>
+            {cmdCandidates.slice(0, 8).map((c, i) => {
+              const active = i === Math.min(Math.max(cmdSel, 0), cmdCandidates.length - 1)
+              const attrs = active
+                ? createTextAttributes({ reverse: true, bold: true })
+                : createTextAttributes({ dim: true })
+              return (
+                <text key={c.command} attributes={attrs} wrapMode="word">
+                  {c.command}{c.description ? `  —  ${c.description}` : ''}
+                </text>
+              )
+            })}
+          </box>
+        )}
+        <input
+          focused={!listMode}
+          value={histIdx >= 0 && histIdx < history.length ? history[histIdx] : input}
+          onInput={(v) => { setInput(v); setHistIdx(-1) }}
+          onSubmit={(value: unknown) => submit(String(value))}
+          placeholder="❯ "
+        />
+      </box>
     </box>
   )
 }
