@@ -1250,10 +1250,10 @@ export class HarnessApp {
         // 将 session.id 改为 sid（通过直接操作 manager 内部）：这里简单使用默认 ID，但把 messages 写回去
         for (const m of saved.messages) await sm.addMessage(session.id, m)
         // 若用户明确 --session sid，实际文件 id ≠ sid，做个 save 用正确 id
-        ;(session as any).id = sid
+        await sm.setId(session.id, sid)
       } else {
         session = await sm.create({ title: sid, agentId: this.options.agentId, cwd: this.options.cwd })
-        ;(session as any).id = sid
+        await sm.setId(session.id, sid)
       }
     } else {
       session = await sm.create({ agentId: this.options.agentId, cwd: this.options.cwd })
@@ -1555,7 +1555,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           // 与 boot() resume 一致：create 新会话 + 回填消息 + 复写 id 为原会话 id
           const next = await harness.session.create({ title: saved.title, agentId: saved.agentId, cwd: saved.cwd, meta: saved.meta })
           for (const m of saved.messages) await harness.session.addMessage(next.id, m)
-          ;(next as any).id = saved.id
+          await harness.session.setId(next.id, saved.id)
           current = next
           options.setSession?.(next)
           out(`已恢复会话 ${saved.id}（${saved.messages.length} 条消息）\n`)

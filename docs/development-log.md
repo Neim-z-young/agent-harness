@@ -1,5 +1,24 @@
 # Agent Harness 开发日志
 
+## 2026-08-30（续 37）：修复 `/resume` 恢复会话后发送报 `Session not found`
+
+TUI/REPL 中用 `/resume` 恢复持久化会话后，发送消息报 `Session "<id>" not found`（会话恢复成功但无法继续对话）。
+
+### 根因
+
+`SessionManager` 用 `Map<id, Session>` 索引会话，键是 `create()` 生成的临时 id。CLI 恢复会话时先 `create` + `addMessage` 回填，再 `(session as any).id = savedId` 裸改对象 id —— **只改了对象属性、未同步 Map 键**。因此按 `savedId` 调用 `promptStream`/`prompt` 时 `get(savedId)` 返回 undefined 抛出 `Session not found`。`boot()` 的 `--session` 恢复路径存在同样的隐患。
+
+### 修复
+
+- `@harness/session` `SessionManager` 新增 `setId(oldId, newId)`：校验存在后同步删除旧键、改写 `session.id`、设新键，返回重命名后的会话。
+- `@harness/core` `DefaultSessionManager.setId` 实现；`packages/revert` 的 `FakeSessionManager` 补齐该接口。
+- `packages/cli` `boot()` 与 `/resume` 命令用 `await session.setId(tmpId, savedId)` 替代裸改 `(session as any).id = savedId`。
+
+### 验证
+
+- core 新增 `setId` 单测（重命名后新 id 命中/旧 id 失效 + 不存在抛错）；cli 新增 `/resume 恢复后发送` 集成回归测试。
+- cli **143 用例**、core 31、revert 10 全通过，全 repo typecheck 通过。
+
 ## 2026-08-30（续 36）：统计命令健壮性修复 — `/stats-export` 无参数崩溃 + 报错信息可复制
 
 续 35 交付后，用户反馈：`/stats-export` 命令报错，且 TUI 中报错堆栈渲染到了聊天框、报错信息无法复制。

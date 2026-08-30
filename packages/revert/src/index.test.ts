@@ -33,6 +33,14 @@ class FakeSessionManager implements SessionManager {
   async get(sessionId: string): Promise<Session | undefined> {
     return this.sessions.get(sessionId)
   }
+  async setId(oldId: string, newId: string): Promise<Session> {
+    const sess = this.sessions.get(oldId)
+    if (!sess) throw new Error('not found')
+    this.sessions.delete(oldId)
+    sess.id = newId
+    this.sessions.set(newId, sess)
+    return sess
+  }
   async create(): Promise<Session> {
     throw new Error('not implemented')
   }

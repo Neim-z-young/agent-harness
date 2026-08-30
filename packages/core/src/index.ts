@@ -510,6 +510,18 @@ export class DefaultSessionManager implements SessionManager {
     return this.sessions.get(sessionId)
   }
 
+  async setId(oldId: string, newId: string): Promise<Session> {
+    const sess = this.sessions.get(oldId)
+    if (!sess) throw new Error(`Session "${oldId}" not found`)
+    if (oldId !== newId) {
+      // 同步更新内部索引键，避免只改对象 id 导致后续按 newId 查不到
+      this.sessions.delete(oldId)
+      sess.id = newId
+      this.sessions.set(newId, sess)
+    }
+    return sess
+  }
+
   async list(options?: SessionListOptions): Promise<Session[]> {
     const items = Array.from(this.sessions.values())
     if (!options) return items

@@ -786,4 +786,27 @@ describe('@harness/core', () => {
       expect(impl.resolveChatProvider(undefined)).toBe(pBeta)
     })
   })
+
+  describe('SessionManager.setId 重命名会话', () => {
+    it('setId 同步更新内部索引，按新 id 可查得同一会话', async () => {
+      const h = await createHarness({ chatProvider: mockChatProvider() })
+      const sess = await h.session.create({ title: 'tmp' })
+      const oldId = sess.id
+      await h.session.addMessage(sess.id, { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'a' }], createdAt: Date.now() })
+      const renamed = await h.session.setId(oldId, 's_custom')
+      expect(renamed.id).toBe('s_custom')
+      // 旧 id 不再命中，新 id 命中且消息保留
+      expect(await h.session.get(oldId)).toBeUndefined()
+      const found = await h.session.get('s_custom')
+      expect(found?.id).toBe('s_custom')
+      expect(found?.messages).toHaveLength(1)
+      await h.stop()
+    })
+
+    it('setId 不存在的会话抛错', async () => {
+      const h = await createHarness({ chatProvider: mockChatProvider() })
+      await expect(h.session.setId('nope', 'new')).rejects.toThrow('nope')
+      await h.stop()
+    })
+  })
 })

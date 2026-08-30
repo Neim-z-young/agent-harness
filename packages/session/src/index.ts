@@ -269,6 +269,13 @@ export interface SessionManager {
   create(options?: SessionCreateOptions): Promise<Session>
   /** 获取会话 */
   get(sessionId: string): Promise<Session | undefined>
+  /**
+   * 重命名会话 ID（同步更新会话对象与内部索引）。
+   * 用于「恢复持久化会话」：create 新会话获得临时 id 后，改为磁盘上的真实 id，
+   * 从而后续 prompt/send 能按真实 id 查得该会话。
+   * @returns 重命名后的会话（id 已更新）
+   */
+  setId(oldId: string, newId: string): Promise<Session>
   /** 列出会话 */
   list(options?: SessionListOptions): Promise<Session[]>
   /** 关键词搜索会话（匹配消息文本，大小写不敏感） */

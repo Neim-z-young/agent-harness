@@ -1073,6 +1073,32 @@ describe('插件 CLI 命令扩展', () => {
     expect(output).not.toInclude('TypeError')
     await app.shutdown()
   })
+
+  it('/resume 恢复会话后发送不再报 Session not found（setId 同步索引）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    // 在默认会话产生历史并持久化，作为待恢复的会话
+    await app.send(session.id, 'hello')
+    await app.sessionStore.save((await harness.session.get(session.id))!)
+    // 另起一个会话作为当前 REPL 会话，再 /resume 回已持久化会话并继续发送
+    const other = await harness.session.create({ agentId: 'default' })
+    await startRepl({
+      app, harness, session: other, stdout,
+      scriptedStdin: [`/resume ${session.id}`, 'hi there', '/exit'],
+    })
+    const output = chunks.join('')
+    expect(output).toInclude(`已恢复会话 ${session.id}`)
+    expect(output).not.toInclude('Session ')
+    expect(output).not.toInclude('not found')
+    expect(output).not.toInclude('发送失败')
+    await app.shutdown()
+  })
 })
 
 describe('后台任务面板 attachBackgroundTaskPanel（P1-4）', () => {
