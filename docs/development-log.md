@@ -1,5 +1,24 @@
 # Agent Harness 开发日志
 
+## 2026-08-28（续 30）：TUI 交互增强（开工 + 模块 A/B 落地）— 方案定案并推进
+
+用户盘点 TUI 缺口后，确认本期覆盖四项：后台任务实时面板、会话列表切换、输入体验（/命令菜单 + 历史）、帮助面板 + 复制辅助。鼠标点击/选区复制与 OpenTUI 多行输入依赖底层 API，列入后续增强。方案细节（能力边界、各模块落点、验证计划）已写入 [architecture §十一](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agent-harness-architecture.md#L1024-L1070)。实现按模块 A→B→C→D 推进，每模块补 `tui.test.tsx` / `cli.test.tsx` 用例并 typecheck。
+
+### 模块 A：侧栏后台任务实时面板（完成）
+
+- `tui.tsx` 订阅 `subagentCapability.createMonitor`，任务状态并入 React state 滑入侧栏「后台任务」块；`⏳/✅/❌` + taskId + agentName + 进度步数，进行中置顶限量。
+- 纯函数 `applyBackgroundTaskSnapshot` / `bgTaskRow` / `splitBgTasks` 便于单测，`tui.test.tsx` 覆盖。
+
+### 模块 B：TUI 会话列表展示与切换（完成）
+
+- `createProcessLine` 新增 `/resume <sessionId>`：`sessionStore.load` 恢复 → `harness.session.create` 回填 → 换绑 `current` + `setSession`（[index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts)）。
+- `tui.tsx` 侧栏「会话」块列出持久化会话，`sessionMode`（Tab 进入，文件引用之后）↑/↓ 选中、Enter 触发 `/resume <id>` 切换。
+- `setSession` 回调用 `messagesToBlocks` 把新会话历史还原为对话块刷新聊天区。
+- 纯函数 `messageText` / `roleToKind` / `messagesToBlocks` / `toSessionRows` / `sessionRowText` + 5 项 `tui.test.tsx` 用例。
+- cli+tui 全量 126 用例通过、typecheck 通过。
+
+下一步：模块 C（/命令菜单补全 + 输入历史）、模块 D（帮助面板 + 复制辅助）。
+
 ## 2026-08-28（续 29）：`/model` 补全列出插件注册的 Provider — `listProviders` 合并注册表类型
 
 ### 背景

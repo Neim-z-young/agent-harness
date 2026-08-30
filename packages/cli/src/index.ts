@@ -1302,7 +1302,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills']
 
 // ========================================================================
 // 5.1 后台任务面板（P1-4 前端事件驱动展示）
@@ -1452,6 +1452,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /exit, /quit       退出 REPL\n')
           out('  /sessions          列出持久化会话\n')
           out('  /new               新建会话（保留当前历史到磁盘）\n')
+          out('  /resume <id>       恢复持久化会话继续交互（/sessions 查看 id）\n')
           out('  /save              手动保存当前会话\n')
           out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
           out('  /switch ?          列出已注册 Agent\n')
@@ -1504,6 +1505,23 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           current = next
           options.setSession?.(next)
           out(`已新建会话 ${next.id}\n`)
+          return 'continue'
+        }
+        case '/resume': {
+          if (!arg || !arg.trim()) { out('用法：/resume <sessionId> 恢复持久化会话继续交互\n'); return 'continue' }
+          const saved = await app.sessionStore.load(arg)
+          if (!saved) { out(`会话 "${arg}" 不存在（可用 /sessions 查看）。\n`); return 'continue' }
+          if (saved.id === current.id) { out(`已在会话 ${arg}\n`); return 'continue' }
+          // 先保存当前会话历史
+          const cur = await harness.session.get(current.id)
+          if (cur) await app.sessionStore.save(cur)
+          // 与 boot() resume 一致：create 新会话 + 回填消息 + 复写 id 为原会话 id
+          const next = await harness.session.create({ title: saved.title, agentId: saved.agentId, cwd: saved.cwd, meta: saved.meta })
+          for (const m of saved.messages) await harness.session.addMessage(next.id, m)
+          ;(next as any).id = saved.id
+          current = next
+          options.setSession?.(next)
+          out(`已恢复会话 ${saved.id}（${saved.messages.length} 条消息）\n`)
           return 'continue'
         }
         case '/switch': {

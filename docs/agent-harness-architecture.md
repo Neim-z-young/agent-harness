@@ -1018,3 +1018,53 @@ Claude Code 文件副本方案保留为**非 git 项目 fallback**（见 10.4 �
   - file 后端：快照链超出 `maxSnapshots` shift 最旧快照；`gc()` 清理快照链中不再被引用的 `@v{n}` 备份（被淘汰快照独有 → 删除；被保留快照复用的 → 保留）
 
 **验证**：snapshot 包 25 用例全绿（原 11 用例 + git 后端 gc/上限 3 用例 + file 后端全流程/上限淘汰/gc/.gitignore/enabled 8 用例 + 工厂后端选择 3 用例）；core/revert/cli 既有用例无回归；全仓 25 包 typecheck 通过。
+
+---
+
+## 十一、TUI 交互增强计划（P-0）
+
+> 记录日期：2026-08-28。基于 `@harness/cli` TUI（OpenTUI 渲染层，见 [tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）。已具备 Markdown 流式渲染 / 语法高亮 / 文件引用侧栏导航 / 状态栏 / 流式增量批合并。本计划补足「输入体验 + 侧栏信息 + 后台任务」类交互。
+
+### 11.1 能力边界（可落地性确认）
+
+四项增强均基于现有 `useKeyboard` + React state + 既有组件（box/text/input/scrollbox）实现，**不依赖未知 OpenTUI 内部 API**。以下能力留作**后续增强**（不强行占用本批范围）：
+
+- OpenTUI 多行输入（input 内嵌换行编辑）
+- 鼠标点击 / 选区复制（依赖 OpenTUI 底层选区事件，待确认）
+
+### 11.2 模块 A：侧栏后台任务实时面板
+
+**目标**：架构 §8.1 点3「前端事件驱动展示」在 TUI 侧闭环——REPL 已有 `attachBackgroundTaskPanel`，TUI 改为把任务状态渲染为侧栏实时面板。
+
+**落点**（[tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）：
+- 复用 `subagentCapability.createMonitor`（与 `attachBackgroundTaskPanel` 同一来源）订阅 `subagent.started/completed/failed`，把任务状态/进度存入 React state。
+- 侧栏新增「后台任务」块：`⏳/✅/❌` + taskId + agentName + 进度行（P1-5）。
+- 纯函数 `applyBackgroundTaskSnapshot(index, tasks)` 归并状态，便于单测。
+
+### 11.3 模块 B：会话列表展示与切换
+
+**目标**：侧栏列出持久化会话（`app.sessionStore.list()`），可选中切换。
+
+**落点**：
+- 新增 REPL/TUI 共用命令 `/resume <sessionId>`（[index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts) `createProcessLine`）：从 `sessionStore.load` 恢复 → `harness.session.create({title,agentId,cwd,meta})`（与 `main()` resume 一致）→ 换绑 `current` + `setSession` 回调。
+- TUI 侧栏「会话」块列出会话，选中后触发 `processLine('/resume <id>')`；切换前 `save` 当前。
+- 纯函数 `messagesToBlocks(messages)` 把已加载会话历史渲染成 ChatBlock（供 TuiApp 在 `setSession` 时刷新）。
+
+### 11.4 模块 C：输入体验 — /命令菜单补全 + 输入历史
+
+**落点**（[tui.tsx](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx)）：
+- 命令菜单：输入以 `/` 开头时，基于 `REPL_COMMANDS` + 插件 `cli.commands`（导出供 TUI 复用）生成候选菜单弹层，↑/↓ 选中、Tab/Enter 补全。
+- 输入历史：维护 `history[]`，↑/↓ 在无命令菜单时回看/下滚已提交输入；提交成功后入栈。
+
+### 11.5 模块 D：帮助面板 + 复制辅助
+
+**落点**：
+- 帮助面板：按 `?`（或 `Ctrl-/`）显示快捷键帮助 overlay（box 弹层），再按任意键关闭。
+- 复制辅助：提供快捷键把最近的 assistant 块文本复制到系统剪贴板（spawn `pbcopy`），不依赖 OpenTUI 选区。
+- 鼠标滚动/点击选区复制列为后续增强。
+
+### 11.6 验证
+
+- `tui.test.tsx`：新增覆盖（1）后台任务快照归并、（2）`/resume` 换绑会话 + `messagesToBlocks`、（3）命令菜单候选/补全、（4）输入历史上滚、（5）帮助面板开关、（6）`/copy` 复制最近 assistant 块。
+- `cli.test.tsx`：`/resume` 命令在 REPL 层行为。
+- cli 全量用例 + typecheck 通过；development-log 记收尾。

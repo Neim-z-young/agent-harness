@@ -24,12 +24,22 @@ import {
   initialChatState,
   initialChatWithWelcome,
   TuiApp,
+  applyBackgroundTaskSnapshot,
+  bgTaskRow,
+  splitBgTasks,
+  messageText,
+  roleToKind,
+  messagesToBlocks,
+  toSessionRows,
+  sessionRowText,
+  type SessionRow,
   type TuiReplExit,
 } from './tui'
 import { createRoot } from '@opentui/react'
 import { createTestRenderer, type TestRendererSetup } from '@opentui/core/testing'
 import type { Harness } from '@harness/core'
-import type { Session } from '@harness/session'
+import type { Message, Session } from '@harness/session'
+import type { BackgroundTaskViewLike } from '@harness/plugin'
 
 // ------------------------------------------------------------------------
 // 结构化块纯函数
@@ -210,7 +220,103 @@ describe('FileRefIndex 增量文件引用索引', () => {
 })
 
 // ------------------------------------------------------------------------
-// TuiApp 集成（mock provider + OpenTUI 测试渲染器）
+// 后台任务快照（模块 A：TUI 侧栏实时面板纯函数）
+// ------------------------------------------------------------------------
+
+describe('后台任务快照', () => {
+  const T = (partial: Partial<BackgroundTaskViewLike>): BackgroundTaskViewLike =>
+    ({ taskId: 'tsk', status: 'running', agentName: 'researcher', ...partial })
+
+  it('applyBackgroundTaskSnapshot 以最新全量为准（浅拷贝，不原地改）', () => {
+    const prev = [T({ taskId: 'a', status: 'running' })]
+    const next = [
+      T({ taskId: 'a', status: 'completed', result: 'done', durationMs: 42 }),
+      T({ taskId: 'b', status: 'failed', error: { message: 'boom' } }),
+    ]
+    const out = applyBackgroundTaskSnapshot(prev, next)
+    expect(out).toEqual(next)
+    expect(out).not.toBe(prev)
+  })
+
+  it('bgTaskRow：图标 + agentName；长 taskId 截断为 8 位', () => {
+    const row = bgTaskRow(T({ taskId: 'task-very-long-my-task-id', status: 'completed', result: 'hello world' }))
+    expect(row).toContain('✅')
+    expect(row).toContain('task-ver…')
+    expect(row).toContain('researcher')
+    expect(row).toContain('hello world')
+  })
+
+  it('bgTaskRow：running 带进度步数；failed 用 ❌', () => {
+    expect(bgTaskRow(T({ taskId: 'x', status: 'running', progress: [{ toolName: 'read_file', toolUseId: 'u', toolStatus: 'running', summary: 'reading' }] }))).toContain('1步')
+    expect(bgTaskRow(T({ taskId: 'y', status: 'failed' }))).toContain('❌')
+  })
+
+  it('splitBgTasks：pending+running 归 running，completed/failed 归 finished', () => {
+    const { running, finished } = splitBgTasks([
+      T({ taskId: 'p', status: 'pending' }),
+      T({ taskId: 'r', status: 'running' }),
+      T({ taskId: 'c', status: 'completed' }),
+      T({ taskId: 'f', status: 'failed' }),
+    ])
+    expect(running.map((t) => t.taskId).sort()).toEqual(['p', 'r'])
+    expect(finished.map((t) => t.taskId).sort()).toEqual(['c', 'f'])
+  })
+})
+
+describe('会话历史渲染（模块 B）', () => {
+  const m = (role: Message['role'], text: string): Message =>
+    ({ id: 'm', role, createdAt: 0, parts: [{ type: 'text', text }] })
+
+  it('messageText 拼接 text part，追加 reasoning', () => {
+    const msg: Message = {
+      id: 'm', role: 'assistant', createdAt: 0,
+      parts: [
+        { type: 'text', text: '你好' },
+        { type: 'reasoning', text: '思考' },
+        { type: 'tool', toolUseId: 'u', toolId: 't', input: {} },
+      ],
+    }
+    expect(messageText(msg)).toBe('你好\n💭思考')
+  })
+
+  it('roleToKind：user/assistant/tool 各归其类，其余 system', () => {
+    expect(roleToKind('user')).toBe('user')
+    expect(roleToKind('assistant')).toBe('assistant')
+    expect(roleToKind('tool')).toBe('tool')
+    expect(roleToKind('system')).toBe('system')
+  })
+
+  it('messagesToBlocks：各角色成块、跳过空消息、ID 连续递增', () => {
+    const cs = messagesToBlocks([
+      m('user', '问'),
+      m('assistant', '答'),
+      m('tool', '🔧  t1 args'),
+      m('system', ''),
+      m('assistant', ''),
+    ])
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['user', 'assistant', 'tool'])
+    expect(cs.nextId).toBe(4)
+  })
+
+  it('toSessionRows：title 缺失用 id 兜底', () => {
+    const rows = toSessionRows([
+      { id: 'a', updatedAt: 10, messageCount: 2 },
+      { id: 'b', title: '会话B', updatedAt: 20, messageCount: 3 },
+    ])
+    expect(rows[0].title).toBe('a')
+    expect(rows[1].title).toBe('会话B')
+  })
+
+  it('sessionRowText：消息数 + 时间缩写，长标题截断', () => {
+    const r: SessionRow = { id: 'x', title: '这是一个非常长的会话标题超过十六个字', messageCount: 5, updatedAt: 0 }
+    expect(sessionRowText(r, 3_600_000)).toContain('5条')
+    expect(sessionRowText(r, 3_600_000)).toContain('1h')
+    expect(sessionRowText(r, 3_600_000)).toContain('…')
+  })
+})
+
+// ------------------------------------------------------------------------
+// TuiApp 渲染 / 状态集成（OpenTUI createTestRenderer）
 // ------------------------------------------------------------------------
 
 interface TuiFixture {

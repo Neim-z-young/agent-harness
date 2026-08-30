@@ -20,14 +20,16 @@
  * 测试用 @opentui/core/testing 的 createTestRenderer + mockInput 模拟按键。
  */
 
-import { useCallback, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer } from '@opentui/core'
 import { createRoot, useKeyboard } from '@opentui/react'
 import { createProcessLine } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
-import type { Session } from '@harness/session'
+import type { Message, Session } from '@harness/session'
+import type { BackgroundTaskViewLike } from '@harness/plugin'
+import { subagentCapability } from '@harness/subagent'
 
 // ------------------------------------------------------------------------
 // 类型
@@ -261,6 +263,119 @@ export function batchReduceStream(state: ChatState, events: AgentStreamEvent[]):
 }
 
 // ------------------------------------------------------------------------
+// 后台任务快照（模块 A：TUI 侧栏实时面板）
+// ------------------------------------------------------------------------
+// 架构 §8.1 点3「前端事件驱动展示」在 TUI 侧闭环：侧栏订阅 subagent 插件
+// 的 BackgroundTaskMonitor（与 REPL attachBackgroundTaskPanel 同源，但不打印
+// stdout，而是渲染为 React state 的实时面板）。status 图标 / 缩写 taskId / 行
+// 文本为纯函数，可单测。
+
+/** 后台任务在侧栏的单节展示上限（running + finished 各限几个） */
+const MAX_RUNNING_BG = 3
+const MAX_FINISHED_BG = 3
+
+/**
+ * 归并一次后台任务快照：monitor 每次回调携带全量最新任务（含已完成的存档），
+ * 直接以最新全量为准做浅拷贝归一化（trading 稳定 vs 归并叠加，优先取全量最新）。
+ */
+export function applyBackgroundTaskSnapshot(
+  _prev: readonly BackgroundTaskViewLike[],
+  tasks: readonly BackgroundTaskViewLike[],
+): BackgroundTaskViewLike[] {
+  return [...tasks]
+}
+
+/** 后台任务状态图标 */
+export const BG_STATUS_ICON: Record<BackgroundTaskViewLike['status'], string> = {
+  pending: '○', running: '⏳', completed: '✅', failed: '❌',
+}
+
+/** 一行后台任务摘要（侧栏展示长文本会 wrap，故缩写 taskId） */
+export function bgTaskRow(t: BackgroundTaskViewLike): string {
+  const icon = BG_STATUS_ICON[t.status] ?? '·'
+  const name = t.agentName ?? t.agentId ?? 'agent'
+  const id = t.taskId.length > 10 ? `${t.taskId.slice(0, 8)}…` : t.taskId
+  const progress = t.status === 'running' && t.progress?.length ? ` ${t.progress.length}步` : ''
+  const result = t.status === 'completed' && t.result ? ` ~ ${t.result.slice(0, 18)}` : ''
+  return `${icon} ${id} ${name}${progress}${result}`
+}
+
+/** 把快照分成「进行中」与「已结束」两组（渲染分别限量，进行中优先置顶） */
+export function splitBgTasks(tasks: readonly BackgroundTaskViewLike[]): {
+  running: BackgroundTaskViewLike[]
+  finished: BackgroundTaskViewLike[]
+} {
+  const running: BackgroundTaskViewLike[] = []
+  const finished: BackgroundTaskViewLike[] = []
+  for (const t of tasks) (t.status === 'running' || t.status === 'pending' ? running : finished).push(t)
+  return { running, finished }
+}
+
+// ------------------------------------------------------------------------
+// 会话历史渲染（模块 B：会话切换时把消息历史转成对话块）
+// ------------------------------------------------------------------------
+// 切换会话（/resume）后，TuiApp 用 setSession 回调把新会话的 messages
+// 还原为指定字体的块，重新展示历史对话。text / reasoning part 拼为正文，
+// 空消息、工具调用 part 跳过。
+
+/** 提取一条消息的纯文本（text part 拼接 + reasoning 追加，工具/文件/图片跳过） */
+export function messageText(msg: Message): string {
+  let out = ''
+  for (const p of msg.parts) {
+    if (p.type === 'text' && (p as { text?: string }).text) out += (p as { text?: string }).text
+    else if (p.type === 'reasoning' && (p as { text?: string }).text) out += '\n💭' + (p as { text?: string }).text
+  }
+  return out
+}
+
+/** 按角色推导对话块类型 */
+export function roleToKind(role: Message['role']): ChatBlockKind {
+  if (role === 'user') return 'user'
+  if (role === 'assistant') return 'assistant'
+  if (role === 'tool') return 'tool'
+  return 'system'
+}
+
+/** 把会话历史转成 ChatState：user/assistant/tool 各成一个块，跳过空消息 */
+export function messagesToBlocks(messages: Message[]): ChatState {
+  const blocks: ChatBlock[] = []
+  let nextId = 1
+  for (const m of messages) {
+    const text = messageText(m)
+    if (!text.trim()) continue
+    blocks.push({ id: nextId, kind: roleToKind(m.role), text })
+    nextId++
+  }
+  return { blocks, nextId, thinkingIdx: -1, assistantIdx: -1 }
+}
+
+/** 侧栏会话列表行（来自 store.list） */
+export interface SessionRow {
+  id: string
+  title: string
+  messageCount: number
+  updatedAt: number
+}
+
+/** 把 store.list 结果转成侧栏展示行（标题缺失用会话 id 兜底） */
+export function toSessionRows(
+  items: Array<{ id: string; title?: string; updatedAt: number; messageCount: number }>,
+): SessionRow[] {
+  return items.map((s) => ({ id: s.id, title: s.title || s.id, messageCount: s.messageCount, updatedAt: s.updatedAt }))
+}
+
+/** 一行会话摘要（侧栏展示，标题/时间缩写） */
+export function sessionRowText(r: SessionRow, now: number): string {
+  const when = now - r.updatedAt
+  const ago =
+    when < 60_000 ? `${Math.floor(when / 1000)}s`
+      : when < 3_600_000 ? `${Math.floor(when / 60_000)}m`
+        : when < 86_400_000 ? `${Math.floor(when / 3_600_000)}h`
+          : `${Math.floor(when / 86_400_000)}d`
+  return `${r.messageCount}条 ${ago} ${r.title.length > 16 ? r.title.slice(0, 15) + '…' : r.title}`
+}
+
+// ------------------------------------------------------------------------
 // 主题：markdown / 代码高亮配色（GitHub Dark 系）
 // ------------------------------------------------------------------------
 
@@ -298,9 +413,17 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [busy, setBusy] = useState(false)
   const [model, setModel] = useState<string | undefined>(options.model)
   const [showSidebar, setShowSidebar] = useState(true)
+  // 后台任务实时面板（模块 A）：由 subagent 监控器回调驱动，直接渲染到侧栏
+  const [bgTasks, setBgTasks] = useState<BackgroundTaskViewLike[]>([])
   // 侧栏文件引用导航：fileMode 时输入框让出焦点，↑/↓ 移动选中，Enter 打开
   const [fileMode, setFileMode] = useState(false)
   const [sel, setSel] = useState(0)
+  // 模块 B：侧栏会话列表 —— sessionMode 时输入框让出焦点，↑/↓ 选中、Enter 恢复
+  const [sessions, setSessions] = useState<SessionRow[]>([])
+  const [sessionMode, setSessionMode] = useState(false)
+  const [sessionSel, setSessionSel] = useState(0)
+  // 会话分发互斥：任一列表模式激活时输入框让出焦点
+  const listMode = fileMode || sessionMode
 
   // 会话处理内核（与 REPL 共用）：结构化 onEvent 驱动 markdown 流，out 归类控制台文本。
   // onEvent 增量被缓冲并按宏任务批合并提交，避免高频 chunk 逐次全量重解析 markdown。
@@ -334,9 +457,30 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         }, 0)
       },
       onLine: options.onLine,
-      setSession: (s) => { options.session = s },
+      // 模块 B：会话切换（/resume /new 等）后换绑外层会话指针，并用 messagesToBlocks
+      // 把新会话历史还原为对话块刷新聊天区；空会话则回落初始欢迎态。
+      setSession: (s) => {
+        options.session = s
+        setState(messagesToBlocks(s.messages))
+      },
     })
   }
+
+  // 模块 A：后台任务实时面板 —— 订阅 subagent 监控器，状态并入侧栏
+  useEffect(() => {
+    const monitor = subagentCapability.createMonitor({ bus: options.harness.bus })
+    const off = monitor.subscribe((tasks) => setBgTasks((prev) => applyBackgroundTaskSnapshot(prev, tasks)))
+    return () => { off(); monitor.dispose() }
+  }, [options.harness])
+
+  // 模块 B：加载持久化会话列表（进入 session 模式与启动时各取一次）
+  const refreshSessions = useCallback(async () => {
+    try {
+      const list = await options.app.sessionStore.list()
+      setSessions(toSessionRows(list))
+    } catch { /* 读取失败保持空列表 */ }
+  }, [options.app])
+  useEffect(() => { void refreshSessions() }, [refreshSessions])
 
   const finish = useCallback((reason: TuiReplExit) => {
     if (exitRef.current) return
@@ -366,16 +510,36 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     }
   }, [drain])
 
-  // 全局快捷键：Ctrl-C 退出、Ctrl-B 切换侧栏；文件引用列表 Tab 进入、↑/↓ 选中、Enter 打开。
-  // useKeyboard 底层用 useEffectEvent 包裹，回调闭包每次渲染刷新，读取 state 不过期。
+  // 全局快捷键：Ctrl-C 退出、Ctrl-B 切换侧栏；列表模式 Tab 进入、↑/↓ 选中、Enter 触发、Esc 返回。
+  // 两个列表互斥：优先会话模式；退出文件引用 Tab。useKeyboard 底层用 useEffectEvent 包裹，回调闭包每次渲染刷新。
+  const submitRef = useRef(submit)
+  submitRef.current = submit
   useKeyboard((key) => {
     if (key.ctrl && key.name === 'c') return finish('exit')
     if (key.ctrl && key.name === 'b') return setShowSidebar((v) => !v)
     const refs = fileRefs
     const openFile = options.openFile
-    // 文件列表模式：↑/↓ 移动、Enter 打开、Tab/Esc 返回输入
+    // 会话列表模式：↑/↓ 移动、Enter 恢复、Tab/Esc 返回输入
+    if (sessionMode && sessions.length > 0) {
+      if (key.name === 'tab' || key.name === 'escape') { setSessionMode(false); return }
+      if (key.name === 'up') { setSessionSel((s) => Math.max(0, s - 1)); return }
+      if (key.name === 'down') { setSessionSel((s) => Math.min(sessions.length - 1, s + 1)); return }
+      if (key.name === 'return') {
+        const s = sessions[Math.min(Math.max(sessionSel, 0), sessions.length - 1)]
+        setSessionMode(false)
+        void refreshSessions()
+        submitRef.current(`/resume ${s.id}`)
+        return
+      }
+      return true
+    }
+    // 文件列表模式：↑/↓ 移动、Enter 打开、Tab 切换到会话列表、Esc 返回输入
     if (fileMode && refs.length > 0 && openFile) {
-      if (key.name === 'tab' || key.name === 'escape') { setFileMode(false); return }
+      if (key.name === 'escape') { setFileMode(false); return }
+      if (key.name === 'tab') {
+        if (sessions.length > 0) { setFileMode(false); setSessionSel(0); setSessionMode(true); return }
+        setFileMode(false); return
+      }
       if (key.name === 'up') { setSel((s) => Math.max(0, s - 1)); return }
       if (key.name === 'down') { setSel((s) => Math.min(refs.length - 1, s + 1)); return }
       if (key.name === 'return') {
@@ -387,11 +551,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       }
       return true // 列表模式吞掉其余按键（preventDefault），避免误键入输入框
     }
-    // 非列表模式、有可用引用与 openFile：Tab 进入文件列表
-    if (!fileMode && key.name === 'tab' && refs.length > 0 && openFile) {
-      setSel(0)
-      setFileMode(true)
-      return true
+    // 非列表模式：Tab 进入优先的列表（文件引用优先，其次会话）
+    if (!listMode && key.name === 'tab') {
+      if (refs.length > 0 && openFile) { setSel(0); setFileMode(true); return true }
+      if (sessions.length > 0) { setSessionSel(0); setSessionMode(true); return true }
     }
   })
 
@@ -410,6 +573,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const statusText =
     `${busy ? '●' : '○'} ${provider} | agent=${options.session.agentId ?? 'default'}` +
     ` | model=${model ?? '-'} | session=${options.session.id} | [^B]面板 [^C]退出${hint}`
+  // 后台任务分组（模块 A）：进行中置顶、已结束收尾，各自限量
+  const { running: bgRunning, finished: bgFinished } = splitBgTasks(bgTasks)
 
   const renderBlock = (b: ChatBlock) => {
     switch (b.kind) {
@@ -472,6 +637,36 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             <text attributes={createTextAttributes({ dim: true })} wrapMode="word">agent={options.session.agentId ?? 'default'}</text>
             <text attributes={createTextAttributes({ dim: true })} wrapMode="word">provider={provider}</text>
             <text attributes={createTextAttributes({ dim: true })} wrapMode="word">model={model ?? '-'}</text>
+            <text attributes={createTextAttributes({ bold: true })}>会话</text>
+            {sessions.length === 0
+              ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
+              : sessions.map((s, i) => {
+                  const active = sessionMode && i === sessionSel
+                  const attrs = active
+                    ? createTextAttributes({ reverse: true, bold: true })
+                    : createTextAttributes({ dim: true, bold: s.id === options.session.id })
+                  return (
+                    <text key={s.id} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
+                      {sessionMode ? (active ? '▸ ' : '  ') : ''}{sessionRowText(s, Date.now())}
+                    </text>
+                  )
+                })}
+            <text attributes={createTextAttributes({ bold: true })}>后台任务</text>
+            {bgTasks.length === 0
+              ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
+              : [...bgRunning.slice(0, MAX_RUNNING_BG), ...bgFinished.slice(0, MAX_FINISHED_BG)].map((t) => (
+                  <text
+                    key={t.taskId}
+                    attributes={createTextAttributes({
+                      dim: t.status !== 'running',
+                      reverse: t.status === 'running',
+                    })}
+                    wrapMode="word"
+                    width={SIDEBAR_WIDTH - 4}
+                  >
+                    {bgTaskRow(t)}
+                  </text>
+                ))}
             <text attributes={createTextAttributes({ dim: true })}>文件引用</text>
             {fileRefs.length === 0
               ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
@@ -490,9 +685,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         )}
       </box>
 
-      {/* 底部输入：文件列表模式让出焦点（由 useKeyboard 接管上下/回车） */}
+      {/* 底部输入：列表模式让出焦点（由 useKeyboard 接管上下/回车） */}
       <input
-        focused={!fileMode}
+        focused={!listMode}
         value={input}
         onInput={setInput}
         onSubmit={(value: unknown) => submit(String(value))}
