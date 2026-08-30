@@ -37,6 +37,22 @@
 
 下一步：模块 D（帮助面板 + 鼠标/复制辅助，视 OpenTUI 能力）。
 
+## 2026-08-30（续 32）：TUI 交互增强 — 模块 D（帮助面板 + 复制辅助）与侧栏统计面板落地
+
+### 模块 D1：帮助面板 + Ctrl-Y 复制辅助（完成）
+
+- `tui.tsx` 新增 `HELP_LINES` 常量（快捷键 → 说明映射：Ctrl-C 退出 / Ctrl-B 切换面板 / Ctrl-/ 帮助 / Ctrl-Y 复制 / Tab / ↑↓ / Enter / Esc / /help）。
+- 帮助面板：`Ctrl-/` 触发 `helpOpen`，在输入框上方渲染带边框的 modal 弹层，任意键关闭（`useKeyboard` 顶部拦截）。实测 OpenTUI 将 `Ctrl+/`（0x1F）解码为 `key.name === '_'`（ctl+_），故快捷键判断同时匹配 `'/'`、`'_'`、`'?'`，与真实终端上报一致。
+- 复制辅助：`Ctrl-Y` 触发 — `latestAssistantText(blocks)` 取最近 assistant 块纯文本，`copyTextToClipboard` 用 `spawn('pbcopy')` 写入系统剪贴板（macOS），失败静默不打断交互。
+
+### 模块 D2：侧栏统计面板（完成）
+
+- 新增纯函数 `computeTuiStats`（按角色块计数 users/assistants/thinking/tools + 字符数 + token 估算 chars/4 + 后台任务进行中/已结束 + 会话已运行毫秒）、`formatDuration`（s / m s / h m 友好时长）。
+- 侧栏新增「统计」区：`消息 Nu/a Nt/ T`、`字符 N · ~N tok`、`任务 ⏳N/✅N · 时长`，随对话块与后台任务实时归并。
+- 侧栏外层容器由 `<box>` 升级为 `<scrollbox>`，塞入统计块后内容不再溢出塌陷；状态栏精简至 80 列内（移除冗余 session 字段，`·` 分隔）。
+- 新增 TuiStats 纯函数测试与集成测试（帮助开关、统计随块更新），修正统计初始断言（欢迎语 system 块计入字符，故初始 chars≠0）。
+- cli+tui 全量 132 用例通过、`tsc --noEmit` 通过。
+
 ## 2026-08-28（续 29）：`/model` 补全列出插件注册的 Provider — `listProviders` 合并注册表类型
 
 ### 背景

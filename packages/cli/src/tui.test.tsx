@@ -32,7 +32,12 @@ import {
   messagesToBlocks,
   toSessionRows,
   sessionRowText,
+  computeTuiStats,
+  formatDuration,
+  latestAssistantText,
+  HELP_LINES,
   type SessionRow,
+  type ChatBlock,
   type TuiReplExit,
 } from './tui'
 import { createRoot } from '@opentui/react'
@@ -315,6 +320,52 @@ describe('会话历史渲染（模块 B）', () => {
   })
 })
 
+describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
+  const b = (kind: ChatBlock['kind'], text: string): ChatBlock => ({ id: 0, kind, text })
+
+  it('computeTuiStats：按角色计数 + charset + token 估算（/4）', () => {
+    const s = computeTuiStats(
+      [b('user', 'abc'), b('assistant', '你好世界'), b('thinking', 't'), b('tool', 'x')],
+      [
+        { taskId: 't1', status: 'running' } as BackgroundTaskViewLike,
+        { taskId: 't2', status: 'completed' } as BackgroundTaskViewLike,
+      ],
+      65000,
+    )
+    expect(s.users).toBe(1)
+    expect(s.assistants).toBe(1)
+    expect(s.thinking).toBe(1)
+    expect(s.tools).toBe(1)
+    // 3 + 4 + 1 + 1 = 9 字符
+    expect(s.chars).toBe(9)
+    expect(s.tokens).toBe(2) // round(9/4)
+    expect(s.tasksRunning).toBe(1)
+    expect(s.tasksDone).toBe(1)
+    expect(s.elapsedMs).toBe(65000)
+  })
+
+  it('formatDuration：秒 / 分秒 / 时分 各格式', () => {
+    expect(formatDuration(12_000)).toBe('12s')
+    expect(formatDuration(3 * 60_000 + 5_000)).toBe('3m5s')
+    expect(formatDuration(65 * 60_000)).toBe('1h05m')
+    expect(formatDuration(0)).toBe('0s')
+  })
+
+  it('latestAssistantText：取最近的 assistant 块', () => {
+    expect(latestAssistantText([b('user', 'q'), b('assistant', '旧的'), b('tool', 'x'), b('assistant', '新的')])).toBe('新的')
+    expect(latestAssistantText([b('user', 'q')])).toBe('')
+    expect(latestAssistantText([])).toBe('')
+  })
+
+  it('HELP_LINES：包含核心快捷键（帮助/复制/退出/面板）', () => {
+    const text = HELP_LINES.map((l) => l.key).join(' ')
+    expect(text).toContain('Ctrl-/')
+    expect(text).toContain('Ctrl-Y')
+    expect(text).toContain('Ctrl-C')
+    expect(text).toContain('Ctrl-B')
+  })
+})
+
 // ------------------------------------------------------------------------
 // TuiApp 渲染 / 状态集成（OpenTUI createTestRenderer）
 // ------------------------------------------------------------------------
@@ -447,6 +498,29 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.setup.mockInput.typeText('/exit')
     f.setup.mockInput.pressEnter()
     expect(await waitExit(f)).toBe('exit')
+    await f.cleanup()
+  })
+
+  it('Ctrl-/ 弹出帮助面板，任意键关闭', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKey('/', { ctrl: true })
+    // 帮助面板 overlay 出现
+    await waitFrame(f.setup, (frame) => frame.includes('打开/关闭帮助面板'))
+    // 任意键关闭（Esc）
+    f.setup.mockInput.pressEscape()
+    await waitFrame(f.setup, (frame) => !frame.includes('打开/关闭帮助面板'))
+    await f.cleanup()
+  })
+
+  it('侧栏统计面板：消息数 + token 估算 + 任务 + 用时', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('统计') && frame.includes('字符') && frame.includes('tok'))
+    // 发送一条回复后，统计随块更新（assistant 块 + 用户块）
+    await f.setup.mockInput.typeText('统计测试')
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (frame) => frame.includes('你好，我是 TUI 助手。'))
+    await waitFrame(f.setup, (frame) => frame.includes('消息') && frame.includes('1u'))
     await f.cleanup()
   })
 })

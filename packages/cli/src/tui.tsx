@@ -57,6 +57,22 @@ const SIDEBAR_WIDTH = 26
 const MAX_FILE_REFS = 8
 
 // ------------------------------------------------------------------------
+// 模块 D：帮助面板内容（Ctrl-/ 或 ? 弹出；/help 查看命令列表并在 REPL 层列出）
+// ------------------------------------------------------------------------
+/** 帮助面板行：{ key: 键位, desc: 说明 } */
+export const HELP_LINES: Array<{ key: string; desc: string }> = [
+  { key: 'Ctrl-C', desc: '退出 TUI' },
+  { key: 'Ctrl-B', desc: '切换右侧面板' },
+  { key: 'Ctrl-/ 或 ?', desc: '打开/关闭帮助面板' },
+  { key: 'Ctrl-Y', desc: '复制最近一条回复' },
+  { key: 'Tab', desc: '进入文件引用/会话列表' },
+  { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
+  { key: 'Enter', desc: '提交输入 / 确认选中' },
+  { key: 'Esc', desc: '关闭菜单或帮助' },
+  { key: '/help', desc: '查看特殊命令' },
+]
+
+// ------------------------------------------------------------------------
 // 结构化块模型（纯函数可单测）
 // ------------------------------------------------------------------------
 
@@ -376,6 +392,87 @@ export function sessionRowText(r: SessionRow, now: number): string {
 }
 
 // ------------------------------------------------------------------------
+// 统计面板（模块 D2）：侧栏「统计」块 —— 会话消息/字符/token/任务/用时
+// ------------------------------------------------------------------------
+// 纯函数便于单测。token 估算沿用压缩阈值口径（字符数 / 4）。
+
+export interface TuiStats {
+  /** 各角色块计数 */
+  users: number
+  assistants: number
+  thinking: number
+  tools: number
+  /** 全部块字符数 */
+  chars: number
+  /** token 估算 = chars / 4 */
+  tokens: number
+  /** 后台任务进行中 / 已结束 */
+  tasksRunning: number
+  tasksDone: number
+  /** 会话已运行毫秒 */
+  elapsedMs: number
+}
+
+/** 从对话块 + 后台任务归并出侧栏统计指标 */
+export function computeTuiStats(
+  blocks: readonly ChatBlock[],
+  bgTasks: readonly BackgroundTaskViewLike[],
+  elapsedMs: number,
+): TuiStats {
+  let users = 0
+  let assistants = 0
+  let thinking = 0
+  let tools = 0
+  let chars = 0
+  for (const b of blocks) {
+    chars += b.text.length
+    if (b.kind === 'user') users++
+    else if (b.kind === 'assistant') assistants++
+    else if (b.kind === 'thinking') thinking++
+    else if (b.kind === 'tool') tools++
+  }
+  let tasksRunning = 0
+  let tasksDone = 0
+  for (const t of bgTasks) (t.status === 'running' || t.status === 'pending' ? tasksRunning++ : tasksDone++)
+  return { users, assistants, thinking, tools, chars, tokens: Math.round(chars / 4), tasksRunning, tasksDone, elapsedMs }
+}
+
+/** 转友好时长：<60s → "12s"；<60m → "3m12s"；否则 "1h05m" */
+export function formatDuration(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`
+  if (m > 0) return `${m}m${s}s`
+  return `${s}s`
+}
+
+// ------------------------------------------------------------------------
+// 复制辅助（模块 D1）：把文本写入系统剪贴板（macOS pbcopy，不依赖 OpenTUI 选区）
+// ------------------------------------------------------------------------
+
+/** 取最近的 assistant 块纯文本（用于 /copy 快捷键与 /copy 命令） */
+export function latestAssistantText(blocks: readonly ChatBlock[]): string {
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i].kind === 'assistant') return blocks[i].text
+  }
+  return ''
+}
+
+/** 复制到系统剪贴板（macOS pbcopy）。失败静默（不打断 TUI 交互） */
+export function copyTextToClipboard(text: string): void {
+  if (!text) return
+  try {
+    const child = spawn('pbcopy', [], { stdio: ['pipe', 'ignore', 'ignore'] })
+    if (child.stdin) {
+      child.stdin.write(text)
+      child.stdin.end()
+    }
+  } catch { /* 剪贴板不可用静默忽略 */ }
+}
+
+// ------------------------------------------------------------------------
 // 主题：markdown / 代码高亮配色（GitHub Dark 系）
 // ------------------------------------------------------------------------
 
@@ -429,6 +526,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [cmdSel, setCmdSel] = useState(0)
   const [history, setHistory] = useState<string[]>([])
   const [histIdx, setHistIdx] = useState(-1) // -1 表示不在回看历史
+  // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
+  const [helpOpen, setHelpOpen] = useState(false)
+  // 统计面板计时起点：组件挂载时刻
+  const startTimeRef = useRef(Date.now())
 
   // 会话处理内核（与 REPL 共用）：结构化 onEvent 驱动 markdown 流，out 归类控制台文本。
   // onEvent 增量被缓冲并按宏任务批合并提交，避免高频 chunk 逐次全量重解析 markdown。
@@ -539,8 +640,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const submitRef = useRef(submit)
   submitRef.current = submit
   useKeyboard((key) => {
+    // 模块 D：帮助面板 modal —— 任意键关闭（Esc/Ctrl-/ 均可，回车等同）
+    if (helpOpen) {
+      setHelpOpen(false)
+      return true
+    }
     if (key.ctrl && key.name === 'c') return finish('exit')
     if (key.ctrl && key.name === 'b') return setShowSidebar((v) => !v)
+    // 模块 D：帮助面板开关。Ctrl+/ 与 Ctrl+_ 均发 0x1F（OpenTUI 解码为 name '_'）;
+    // 部分终端将 Ctrl+/ 上报为 '?'。三者等效触发。
+    if (key.ctrl && (key.name === '/' || key.name === '_' || key.name === '?')) { setHelpOpen(true); return true }
+    // 模块 D：复制最近 assistant 块（Ctrl-y）
+    if (key.ctrl && key.name === 'y') {
+      const t = latestAssistantText(state.blocks)
+      if (t) copyTextToClipboard(t)
+      return true
+    }
     const refs = fileRefs
     const openFile = options.openFile
     // 模块 C：/ 命令菜单 —— 输入以 / 开头且有候选时，↑/↓ 选中、Tab 补全、Enter 提交、Esc 关闭
@@ -617,12 +732,15 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }, [state])
 
   const provider = options.provider ?? 'auto'
-  const hint = options.openFile && fileRefs.length > 0 ? ' [Tab]引用' : ''
+  const hint = options.openFile && fileRefs.length > 0 ? ' ·[Tab]引用' : ''
+  // 状态栏行需在 ≤80 列内（测试 renderer 固定 80 宽）；session 已在侧栏展示，故不在此重复。
   const statusText =
     `${busy ? '●' : '○'} ${provider} | agent=${options.session.agentId ?? 'default'}` +
-    ` | model=${model ?? '-'} | session=${options.session.id} | [^B]面板 [^C]退出${hint}`
+    ` | model=${model ?? '-'} | [^B]面板·[^/]帮助·[^Y]复制·[^C]退出${hint}`
   // 后台任务分组（模块 A）：进行中置顶、已结束收尾，各自限量
   const { running: bgRunning, finished: bgFinished } = splitBgTasks(bgTasks)
+  // 模块 D：统计面板 —— 由对话块 + 后台任务实时归并（elapsed 用挂载起点）
+  const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current)
 
   const renderBlock = (b: ChatBlock) => {
     switch (b.kind) {
@@ -678,7 +796,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           {state.blocks.map(renderBlock)}
         </scrollbox>
         {showSidebar && (
-          <box flexDirection="column" style={{ width: SIDEBAR_WIDTH, border: true, padding: 1, flexShrink: 0 }}>
+          <scrollbox style={{ width: SIDEBAR_WIDTH, border: true, padding: 1, flexShrink: 0 }}>
             <text attributes={createTextAttributes({ bold: true })}>会话上下文</text>
             <text attributes={createTextAttributes({ dim: true })} wrapMode="word">session={options.session.id}</text>
             <text attributes={createTextAttributes({ dim: true })} wrapMode="word">消息数={options.session.messages.length}</text>
@@ -729,12 +847,33 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                     </text>
                   )
                 })}
-          </box>
+            {/* 模块 D：统计面板 —— 消息/字符/token/任务/用时 */}
+            <text attributes={createTextAttributes({ bold: true })}>统计</text>
+            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+              消息 {stats.users}u/{stats.assistants}a {stats.thinking}t/{stats.tools}T
+            </text>
+            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+              字符 {stats.chars} · ~{stats.tokens} tok
+            </text>
+            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+              任务 {BG_STATUS_ICON.running}{stats.tasksRunning} / {BG_STATUS_ICON.completed}{stats.tasksDone} · {formatDuration(stats.elapsedMs)}
+            </text>
+          </scrollbox>
         )}
       </box>
 
       {/* 底部输入：列表模式让出焦点（由 useKeyboard 接管上下/回车） */}
       <box flexDirection="column" style={{ flexShrink: 0 }}>
+        {/* 模块 D：帮助面板 overlay —— modal，输入框让出焦点，任意键关闭 */}
+        {helpOpen && (
+          <box style={{ border: true, padding: 1, maxHeight: 12 }}>
+            {HELP_LINES.map((l) => (
+              <text key={l.key} attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                {l.key.padEnd(18)}{l.desc}
+              </text>
+            ))}
+          </box>
+        )}
         {/* 模块 C：/ 命令补全菜单弹层（出现在输入框上方，随输入前缀过滤） */}
         {!listMode && cmdMenuOpen && cmdCandidates.length > 0 && (
           <box style={{ border: true, maxHeight: 8 }}>
