@@ -1,5 +1,39 @@
 # Agent Harness 开发日志
 
+## 2026-08-30（续 35）：用量统计增强 — 会话级持久化 + 多维度时序 + 报告导出 + 侧栏图标 tab
+
+在既有「侧栏统计面板」（本地估算 + 消息数/token/任务/用时）基础上，将统计从「本地估算」升级为「本地 + API 实际用量 + 多维归并」，并新增会话级持久化与报告导出，同时把侧栏各模块改为顶部图标 tab 切换。
+
+### M1：扩展 TokenUsage 缓存明细并贯通链路
+
+- `@harness/core` `TokenUsage` 新增 `cacheRead`（命中缓存输入 token）、`cacheWrite`（写入缓存输入 token），`query` / `queryStream` 的 done 事件透出；未命中缓存 = `input - cacheRead - cacheWrite`。
+- provider 映射各自的缓存字段：anthropic（`usage.cache_read_input_tokens` / `cache_creation_input_tokens`）、openai/gemini/qwen（`prompt_tokens_details.cached_tokens` 等）、mock 支持模拟缓存。
+
+### M2：UsageStats 累积器（`packages/cli/src/usage-stats.ts`）
+
+- 统计粒度：**单轮 llm 对话**（每条 done = 一次 `llmCalls`）→ **一次 agent 任务**（agents 维度 `calls`/`tasksDone`）→ **会话级别**（整体聚合）→ **工具维度 token 用量**（本轮用量归并到紧随的工具调用）。
+- 维度：`models[]` / `agents[]` / `tools[]`（含失败数）/ `hourly[]`（小时时序）。
+- 纯函数 `emptyUsage` / `recordCall` / `recordTool` / `recordTaskDone` / `uncachedInput` 及格式化 `modelUsageRow` / `toolUsageRow` / `agentUsageRow` / `hourLabel` / `hourlyRow` / `sparkline`，便于单测。
+
+### M3：TUI 接线 + 侧栏渲染
+
+- `TuiApp.onEvent` 累积：`done` → `recordCall`（读 `message.meta.model` / `tokenUsage`）；`tool_call_result` → `recordTool`（含 `isError`，失败只计错误数）；agent 任务完成 → `recordTaskDone`。
+- 统计面板展示：LLM 调用、缓存命中/写入/未命中、按模型、按 agent/任务、按工具、按小时迷你条形时序。
+
+### M4：会话级持久化 + `/stats` 与 `/stats-export`
+
+- 用量变化时写入 `session.meta[usageStats]` 并防抖（800ms）落盘，恢复/切换会话后 `/stats` 仍能读到历史。
+- `/stats` 输出纯文本报告；`/stats-export [md|json] [path]` 导出 Markdown/JSON（默认打印，给定 path 写文件）。`usageFromMeta` / `usageFromMessages` 供未走 TUI onEvent 的场景反推统计。
+
+### M5：侧栏顶部图标 tab
+
+- 侧栏各模块（会话上下文/会话/任务/文件/统计）改为顶部图标 tab + 左右切换（◀/▶）与 Tab 进入列表的互斥逻辑。
+
+### 设备与验证
+
+- cli+tui 全量 **141 用例通过**、全 repo typecheck 通过。
+- 修复两个 TUI 集成测试竞态：初始渲染后被动 effect（`useKeyboard` 订阅）异步 flush，`mountTui` 新增 `settleEffects` 统一 pump 拍数，消除「按下按键时钩子未注册」导致的 `Ctrl-B 切换侧栏面板` 失败。
+
 ## 2026-08-28（续 30）：TUI 交互增强（开工 + 模块 A/B 落地）— 方案定案并推进
 
 用户盘点 TUI 缺口后，确认本期覆盖四项：后台任务实时面板、会话列表切换、输入体验（/命令菜单 + 历史）、帮助面板 + 复制辅助。鼠标点击/选区复制与 OpenTUI 多行输入依赖底层 API，列入后续增强。方案细节（能力边界、各模块落点、验证计划）已写入 [architecture §十一](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agent-harness-architecture.md#L1024-L1070)。实现按模块 A→B→C→D 推进，每模块补 `tui.test.tsx` / `cli.test.tsx` 用例并 typecheck。

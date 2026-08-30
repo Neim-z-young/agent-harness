@@ -35,10 +35,23 @@ import {
   computeTuiStats,
   formatDuration,
   latestAssistantText,
+  emptyUsage,
+  recordCall,
+  recordTool,
+  recordTaskDone,
+  uncachedInput,
+  modelUsageRow,
+  toolUsageRow,
+  agentUsageRow,
+  hourLabel,
+  hourlyRow,
+  sparkline,
   HELP_LINES,
   buildWelcomeBanner,
   WELCOME_BANNER,
   selectionTextFrom,
+  __KEYLOG,
+  __resetKeyLog,
   type SessionRow,
   type ChatBlock,
   type TuiReplExit,
@@ -347,6 +360,92 @@ describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
     expect(s.elapsedMs).toBe(65000)
   })
 
+  it('computeTuiStats：整合实际用量（usage）按多维归并字段', () => {
+    let u = recordCall(emptyUsage(), { model: 'gpt-4o', input: 100, output: 20, cacheRead: 10, ts: 1_700_000_000_000 })
+    u = recordCall(u, { model: 'gpt-4o', input: 50, output: 10, ts: 1_700_000_000_000 })
+    u = recordCall(u, { model: 'deepseek', agentId: 'sub', input: 200, output: 30, ts: 1_700_003_600_000 })
+    u = recordTool(u, 'readFile', { input: 100, output: 20 })
+    u = recordTool(u, 'readFile')
+    u = recordTool(u, 'shell', { isError: true })
+    const s = computeTuiStats([b('user', 'q')], [], 1000, u)
+    const us = s.usage
+    expect(us.llmCalls).toBe(3)
+    expect(us.inputTokens).toBe(350)
+    expect(us.outputTokens).toBe(60)
+    expect(us.cacheReadTokens).toBe(10)
+    expect(us.models).toEqual([
+      { model: 'gpt-4o', calls: 2, inputTokens: 150, outputTokens: 30, cacheRead: 10, cacheWrite: 0 },
+      { model: 'deepseek', calls: 1, inputTokens: 200, outputTokens: 30, cacheRead: 0, cacheWrite: 0 },
+    ])
+    // 工具归并：首个工具归入紧随 LLM 用量 100/20，失败只计错误
+    expect(us.tools).toEqual([
+      { tool: 'readFile', count: 2, errors: 0, inputTokens: 100, outputTokens: 20 },
+      { tool: 'shell', count: 0, errors: 1, inputTokens: 0, outputTokens: 0 },
+    ])
+    // agent 维度：root 与 sub 各自归并（deepseek 属于 sub）
+    expect(us.agents).toEqual([
+      { agentId: 'root', calls: 2, inputTokens: 150, outputTokens: 30, tasksDone: 0 },
+      { agentId: 'sub', calls: 1, inputTokens: 200, outputTokens: 30, tasksDone: 0 },
+    ])
+    // 小时时序：两个不同小时桶，升序
+    expect(us.hourly).toHaveLength(2)
+    expect(us.hourly[0].calls + us.hourly[1].calls).toBe(3)
+    expect(us.hourly[0].hour).toBeLessThan(us.hourly[1].hour)
+  })
+
+  it('recordCall：按模型归并调用与用量，缺省模型回退 unknown，含缓存与agent', () => {
+    let u = recordCall(emptyUsage(), { model: 'm1', input: 10, output: 2, cacheRead: 3 })
+    u = recordCall(u, { model: 'm1', input: 5, output: 3 })
+    u = recordCall(u, { input: 7, output: 1 })
+    expect(u.llmCalls).toBe(3)
+    expect(u.inputTokens).toBe(22)
+    expect(u.outputTokens).toBe(6)
+    expect(u.cacheReadTokens).toBe(3)
+    expect(u.models).toEqual([
+      { model: 'm1', calls: 2, inputTokens: 15, outputTokens: 5, cacheRead: 3, cacheWrite: 0 },
+      { model: 'unknown', calls: 1, inputTokens: 7, outputTokens: 1, cacheRead: 0, cacheWrite: 0 },
+    ])
+    // 缺省用量默认 0，不影响累计
+    expect(recordCall(emptyUsage(), { model: 'm2' }).models[0]).toEqual(
+      { model: 'm2', calls: 1, inputTokens: 0, outputTokens: 0, cacheRead: 0, cacheWrite: 0 },
+    )
+  })
+
+  it('recordTool：失败不计调用次数、只计错误；同名归并；token归并仅成功时', () => {
+    let u = emptyUsage()
+    u = recordTool(u, 'readFile', { input: 100, output: 20 })
+    u = recordTool(u, 'readFile', { isError: true })
+    u = recordTool(u, 'shell', { isError: true, input: 999, output: 999 })
+    expect(u.tools).toEqual([
+      { tool: 'readFile', count: 1, errors: 1, inputTokens: 100, outputTokens: 20 },
+      { tool: 'shell', count: 0, errors: 1, inputTokens: 0, outputTokens: 0 },
+    ])
+    expect(recordTool(emptyUsage(), '').tools[0].tool).toBe('tool')
+  })
+
+  it('recordTaskDone / uncachedInput：agent任务完成计数与未命中缓存计算', () => {
+    let u = recordCall(emptyUsage(), { model: 'm', input: 100, cacheRead: 30, cacheWrite: 20 })
+    u = recordTaskDone(u, 'root')
+    expect(u.agents[0].tasksDone).toBe(1)
+    expect(uncachedInput(u)).toBe(50) // 100 - 30 - 20
+    u = recordCall(u, { model: 'm', input: 10, cacheRead: 10 })
+    expect(uncachedInput(u)).toBe(50) // 110 - 40 - 20
+  })
+
+  it('modelUsageRow / toolUsageRow / agentUsageRow / hourlyRow：格式化统计行', () => {
+    expect(modelUsageRow({ model: 'gpt-4o', calls: 2, inputTokens: 150, outputTokens: 30, cacheRead: 10, cacheWrite: 0 }))
+      .toBe('gpt-4o ×2 · ⚡10/w0 in150/out30')
+    expect(modelUsageRow({ model: 'deepseek', calls: 1, inputTokens: 200, outputTokens: 30, cacheRead: 0, cacheWrite: 0 }))
+      .toBe('deepseek ×1 · in200/out30')
+    expect(toolUsageRow({ tool: 'readFile', count: 3, errors: 0, inputTokens: 0, outputTokens: 0 })).toBe('readFile ×3')
+    expect(toolUsageRow({ tool: 'shell', count: 1, errors: 2, inputTokens: 90, outputTokens: 30 }))
+      .toBe('shell ×1 (2❌) · 90/30')
+    expect(agentUsageRow({ agentId: 'sub', calls: 4, inputTokens: 400, outputTokens: 100, tasksDone: 2 }))
+      .toBe('sub ×4 ✓2 · 400/100')
+    expect(hourLabel(1_700_003_700_000)).toMatch(/^\d{2}:00$/)
+    expect(sparkline(50, 100, 4)).toBe('██░░')
+  })
+
   it('formatDuration：秒 / 分秒 / 时分 各格式', () => {
     expect(formatDuration(12_000)).toBe('12s')
     expect(formatDuration(3 * 60_000 + 5_000)).toBe('3m5s')
@@ -429,6 +528,10 @@ async function mountTui(
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
   root.render(<TuiApp options={{ app, harness, session, provider: 'mock', model: extra.model, openFile: extra.openFile }} onExit={resolveExit} />)
 
+  // 首次渲染后被动 effect（useKeyboard / 后台任务订阅 / 会话列表刷新等）异步 flush，
+  // 先 pump 一拍并等待，确保后续交互测试按键时各钩子已注册（消除竞态）。
+  await settleEffects(setup)
+
   let cleaned = false
   const cleanup = async () => {
     if (cleaned) return
@@ -452,6 +555,14 @@ async function pumpOnce(setup: TestRendererSetup): Promise<void> {
   try { await setup.renderOnce() } catch { /* 无调度工作时 loop 可能直接返回 */ }
 }
 
+/** 挂载后 pump 若干拍 + 短延，确保 React 被动 effect（useKeyboard 订阅等）已 flush。 */
+async function settleEffects(setup: TestRendererSetup): Promise<void> {
+  for (let i = 0; i < 15; i++) {
+    await pumpOnce(setup)
+    await new Promise((r) => setTimeout(r, 2))
+  }
+}
+
 async function waitFrame(setup: TestRendererSetup, predicate: (frame: string) => boolean, maxPasses = 600): Promise<string> {
   let frame = ''
   for (let i = 0; i < maxPasses; i++) {
@@ -460,7 +571,7 @@ async function waitFrame(setup: TestRendererSetup, predicate: (frame: string) =>
     if (predicate(frame)) return frame
     await new Promise((r) => setTimeout(r, 3))
   }
-  throw new Error('waitFrame 超时，最后一帧:\n' + JSON.stringify(frame.slice(0, 400)))
+  throw new Error('waitFrame 超时，最后一帧:\n' + JSON.stringify(frame.slice(0, 2000)) + '\nKEYLOG=' + JSON.stringify(__KEYLOG))
 }
 
 /** 在整宽字符帧中定位首个目标子串的 0-based 单元格坐标（行整宽填充空格，故 indexOf 即列位） */
@@ -531,6 +642,7 @@ describe('TuiApp 集成（mock provider）', () => {
   it('Ctrl-B 切换侧栏面板', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    __resetKeyLog()
     f.setup.mockInput.pressKey('b', { ctrl: true })
     // 侧栏隐藏后「会话上下文」标题消失
     await waitFrame(f.setup, (frame) => !frame.includes('会话上下文'))
@@ -568,6 +680,9 @@ describe('TuiApp 集成（mock provider）', () => {
 
   it('侧栏统计面板：消息数 + token 估算 + 任务 + 用时', async () => {
     const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    // 侧栏改图标 tab：主菜单按 ▶ 循环切换（context→sessions→tasks→files→stats）
+    for (let i = 0; i < 4; i++) f.setup.mockInput.pressArrow('right')
     await waitFrame(f.setup, (frame) => frame.includes('统计') && frame.includes('字符') && frame.includes('tok'))
     // 发送一条回复后，统计随块更新（assistant 块 + 用户块）
     await f.setup.mockInput.typeText('统计测试')

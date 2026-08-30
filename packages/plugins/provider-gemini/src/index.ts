@@ -101,6 +101,7 @@ type GeminiResponseBody = {
     promptTokenCount: number
     candidatesTokenCount: number
     totalTokenCount: number
+    cachedContentTokenCount?: number
   }
   error?: { code: number; message: string; status: string }
 }
@@ -452,6 +453,7 @@ export class GeminiChatProvider implements ChatProvider {
               input: usage.promptTokenCount,
               output: usage.candidatesTokenCount,
               total: usage.totalTokenCount,
+              ...(usage.cachedContentTokenCount != null ? { cacheRead: usage.cachedContentTokenCount } : {}),
             }
           : undefined,
         raw: parsed,
@@ -537,7 +539,7 @@ export class GeminiChatProvider implements ChatProvider {
       const decoder = new TextDecoder()
       let buf = ''
       let modelOut: string | undefined
-      let tokenUsage: { input: number; output: number; total?: number } | undefined
+      let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number } | undefined
       // functionCall 在 stream 中可能跨 chunk，用 id 累积
       const pendingToolCalls: Map<string, { id: string; name: string; args: unknown }> = new Map()
 
@@ -597,6 +599,7 @@ export class GeminiChatProvider implements ChatProvider {
                 input: json.usageMetadata.promptTokenCount ?? 0,
                 output: json.usageMetadata.candidatesTokenCount ?? 0,
                 total: json.usageMetadata.totalTokenCount,
+                ...(json.usageMetadata.cachedContentTokenCount != null ? { cacheRead: json.usageMetadata.cachedContentTokenCount } : {}),
               }
             }
           }

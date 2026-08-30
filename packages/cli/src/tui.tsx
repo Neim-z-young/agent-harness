@@ -30,10 +30,32 @@ import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
 import { subagentCapability } from '@harness/subagent'
+import {
+  emptyUsage,
+  recordCall,
+  recordTool,
+  recordTaskDone,
+  uncachedInput,
+  modelUsageRow,
+  toolUsageRow,
+  agentUsageRow,
+  hourLabel,
+  hourlyRow,
+  sparkline,
+  USAGE_STATS_KEY,
+  type UsageStats,
+} from './usage-stats'
 
 // ------------------------------------------------------------------------
 // 类型
 // ------------------------------------------------------------------------
+
+/** 测试观测：记录到达全局键盘 handler 的键（仅调试用） */
+export const __KEYLOG: string[] = []
+/** 仅供测试重置 */
+export function __resetKeyLog(): void {
+  __KEYLOG.length = 0
+}
 
 export interface TuiReplOptions {
   app: HarnessApp
@@ -67,10 +89,31 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: 'Ctrl-Y', desc: '复制鼠标选中的文字；无选区则复制最近回复' },
   { key: 'Tab', desc: '进入文件引用/会话列表' },
   { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
+  { key: '◀ / ▶', desc: '侧栏模块切换（输入为空时）' },
   { key: 'Enter', desc: '提交输入 / 确认选中' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
   { key: '/help', desc: '查看特殊命令' },
 ]
+
+// ------------------------------------------------------------------------
+// 模块 4：侧栏图标 tab（每次展示一个面板，点击图标切换）
+// ------------------------------------------------------------------------
+export type SidebarTabId = 'context' | 'sessions' | 'tasks' | 'files' | 'stats'
+
+export const SIDEBAR_TABS: Array<{ id: SidebarTabId; icon: string; label: string }> = [
+  { id: 'context', icon: '⌂', label: '会话上下文' },
+  { id: 'sessions', icon: '💬', label: '会话' },
+  { id: 'tasks', icon: '⚙', label: '任务' },
+  { id: 'files', icon: '🔗', label: '文件' },
+  { id: 'stats', icon: '📊', label: '统计' },
+]
+
+/** 侧栏 tab 索引（供 ◀/▶ 循环切换） */
+export function nextSidebarTab(current: SidebarTabId, delta: 1 | -1): SidebarTabId {
+  const i = SIDEBAR_TABS.findIndex((t) => t.id === current)
+  const n = SIDEBAR_TABS.length
+  return SIDEBAR_TABS[(((i < 0 ? 0 : i) + delta) % n + n) % n].id
+}
 
 // ------------------------------------------------------------------------
 // 结构化块模型（纯函数可单测）
@@ -395,6 +438,36 @@ export function sessionRowText(r: SessionRow, now: number): string {
 // 统计面板（模块 D2）：侧栏「统计」块 —— 会话消息/字符/token/任务/用时
 // ------------------------------------------------------------------------
 // 纯函数便于单测。token 估算沿用压缩阈值口径（字符数 / 4）。
+// 用量累积（UsageStats / recordCall / recordTool …）见 ./usage-stats.ts，这里 re-export 保持既有出口。
+
+export type {
+  UsageStats,
+  ModelUsage,
+  ToolUsage,
+  AgentUsage,
+  HourlyUsage,
+  CallRecord,
+  ToolRecord,
+} from './usage-stats'
+export {
+  emptyUsage,
+  recordCall,
+  recordTool,
+  recordTaskDone,
+  uncachedInput,
+  modelUsageRow,
+  toolUsageRow,
+  agentUsageRow,
+  hourLabel,
+  hourlyRow,
+  sparkline,
+  USAGE_STATS_KEY,
+  usageFromMeta,
+  usageFromMessages,
+  renderStatsText,
+  exportStatsJson,
+  exportStatsMarkdown,
+} from './usage-stats'
 
 export interface TuiStats {
   /** 各角色块计数 */
@@ -404,20 +477,23 @@ export interface TuiStats {
   tools: number
   /** 全部块字符数 */
   chars: number
-  /** token 估算 = chars / 4 */
+  /** 本地 token 估算 = chars / 4 */
   tokens: number
   /** 后台任务进行中 / 已结束 */
   tasksRunning: number
   tasksDone: number
   /** 会话已运行毫秒 */
   elapsedMs: number
+  /** 完整用量累积器（会话级，含模型/tools/agents/hourly/缓存明细） */
+  usage: UsageStats
 }
 
-/** 从对话块 + 后台任务归并出侧栏统计指标 */
+/** 从对话块 + 后台任务归并出侧栏统计指标；usage 为事件累积的实际用量（可缺省） */
 export function computeTuiStats(
   blocks: readonly ChatBlock[],
   bgTasks: readonly BackgroundTaskViewLike[],
   elapsedMs: number,
+  usage: UsageStats = emptyUsage(),
 ): TuiStats {
   let users = 0
   let assistants = 0
@@ -434,7 +510,10 @@ export function computeTuiStats(
   let tasksRunning = 0
   let tasksDone = 0
   for (const t of bgTasks) (t.status === 'running' || t.status === 'pending' ? tasksRunning++ : tasksDone++)
-  return { users, assistants, thinking, tools, chars, tokens: Math.round(chars / 4), tasksRunning, tasksDone, elapsedMs }
+  return {
+    users, assistants, thinking, tools, chars, tokens: Math.round(chars / 4), tasksRunning, tasksDone, elapsedMs,
+    usage,
+  }
 }
 
 /** 转友好时长：<60s → "12s"；<60m → "3m12s"；否则 "1h05m" */
@@ -594,6 +673,13 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [copiedId, setCopiedId] = useState<number | null>(null)
   // 统计面板计时起点：组件挂载时刻
   const startTimeRef = useRef(Date.now())
+  // 实际用量累积器（onEvent 驱动）：LLM 调用 token / 模型 / 工具粒度
+  const [usage, setUsage] = useState<UsageStats>(emptyUsage())
+  // 模块 4：侧栏各模块改为顶部图标 tab + 左右切换（每次仅展示一个面板）
+  const [sidebarTab, setSidebarTab] = useState<SidebarTabId>('context')
+  // 工具token归并状态：暂存本轮 LLM 用量，仅归并到紧随的第一个工具
+  const pendingToolAttrRef = useRef<{ input: number; output: number } | null>(null)
+  const toolAttributedRef = useRef(false)
   // 选区复制（模块 D4）：读全局 renderer，Ctrl-Y 优先复制鼠标选中的文字
   const { renderer } = useAppContext()
   // 会话开始前（仅剩 system 块）展示欢迎页；发起首条消息后切换为对话块列表
@@ -615,7 +701,38 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         // 轻量副作用立即处理（不触渲染重解析）
         if (ev.type === 'done') {
           setBusy(false)
-          setModel(ev.message?.meta?.model)
+          const msg = ev.message
+          setModel(msg?.meta?.model)
+          // 记录一次 LLM 调用与 API 实际返回的 token 用量（含缓存命中/写入），
+          // 按模型 / agent / 小时归并；本轮 LLM 用量暂存，归并到紧随的下一个工具。
+          const m = msg?.meta
+          pendingToolAttrRef.current = {
+            input: m?.tokenUsage?.input ?? 0,
+            output: m?.tokenUsage?.output ?? 0,
+          }
+          toolAttributedRef.current = false
+          setUsage((prev) => recordCall(prev, {
+            model: m?.model,
+            agentId: msg?.agentId,
+            input: m?.tokenUsage?.input,
+            output: m?.tokenUsage?.output,
+            cacheRead: m?.tokenUsage?.cacheRead,
+            cacheWrite: m?.tokenUsage?.cacheWrite,
+          }))
+        } else if (ev.type === 'tool_call_result') {
+          // 每次工具/技能完成累计一次调用（含失败标记 + 本轮紧随 LLM 用量的归并，仅首次）
+          const tool = ev.toolId ?? ev.toolUseId ?? 'tool'
+          const attr = pendingToolAttrRef.current
+          if (!toolAttributedRef.current && attr) {
+            toolAttributedRef.current = true
+            setUsage((prev) => recordTool(prev, tool, { isError: ev.isError, input: attr.input, output: attr.output }))
+          } else {
+            setUsage((prev) => recordTool(prev, tool, { isError: ev.isError }))
+          }
+          // 一次 agent 任务：subagent 派生工具成功完成 = 一个子任务结束（agent 维度 tasksDone）
+          if (tool === 'subagent' && !ev.isError) {
+            setUsage((prev) => recordTaskDone(prev, (ev as { agentId?: string }).agentId))
+          }
         } else if (ev.type === 'text_delta' || ev.type === 'reasoning_delta' || ev.type === 'tool_call_start') {
           setBusy(true)
         }
@@ -655,6 +772,20 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     } catch { /* 读取失败保持空列表 */ }
   }, [options.app])
   useEffect(() => { void refreshSessions() }, [refreshSessions])
+
+  // 模块 4：会话级持久化统计 —— 用量变化时写入 session.meta[usageStats] 并防抖落盘。
+  // 这样切换/恢复会话后，/stats 与 /stats-export 都能从 meta 读到历史累计。
+  const saveUsageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  useEffect(() => {
+    const sess = options.session
+    if (!sess) return
+    sess.meta = { ...(sess.meta ?? {}), [USAGE_STATS_KEY]: usage }
+    if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current)
+    saveUsageTimerRef.current = setTimeout(() => {
+      void options.app.sessionStore.save(sess).catch(() => { /* 落盘失败静默 */ })
+    }, 800)
+    return () => { if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current) }
+  }, [usage, options.session, options.app])
 
   // 模块 C：加载 / 命令补全候选（内置 REPL 命令 + 插件注册命令）
   useEffect(() => {
@@ -714,6 +845,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       return true
     }
     if (key.ctrl && key.name === 'c') return finish('exit')
+    __KEYLOG.push(`${key.name}:${key.ctrl ? 'C' : ''}`)
     if (key.ctrl && key.name === 'b') return setShowSidebar((v) => !v)
     // 模块 D：帮助面板开关。Ctrl+/ 与 Ctrl+_ 均发 0x1F（OpenTUI 解码为 name '_'）;
     // 部分终端将 Ctrl+/ 上报为 '?'。三者等效触发。
@@ -754,6 +886,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       if (key.name === 'up') { setHistIdx((i) => (i === -1 ? history.length - 1 : Math.max(0, i - 1))); return }
       if (key.name === 'down') { setHistIdx((i) => (i === -1 ? -1 : Math.min(history.length - 1, i + 1))); return }
     }
+    // 模块 4：侧栏 tab 切换 —— 输入为空、非列表模式时，◀/▶ 循环切换侧栏模块
+    if (!listMode && !cmdMenuOpen && input === '' && showSidebar) {
+      if (key.name === 'left') { setSidebarTab((t) => nextSidebarTab(t, -1)); return }
+      if (key.name === 'right') { setSidebarTab((t) => nextSidebarTab(t, 1)); return }
+    }
     // 会话列表模式：↑/↓ 移动、Enter 恢复、Tab/Esc 返回输入
     if (sessionMode && sessions.length > 0) {
       if (key.name === 'tab' || key.name === 'escape') { setSessionMode(false); return }
@@ -772,7 +909,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     if (fileMode && refs.length > 0 && openFile) {
       if (key.name === 'escape') { setFileMode(false); return }
       if (key.name === 'tab') {
-        if (sessions.length > 0) { setFileMode(false); setSessionSel(0); setSessionMode(true); return }
+        if (sessions.length > 0) { setFileMode(false); setSessionSel(0); setSessionMode(true); setSidebarTab('sessions'); return }
         setFileMode(false); return
       }
       if (key.name === 'up') { setSel((s) => Math.max(0, s - 1)); return }
@@ -786,10 +923,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       }
       return true // 列表模式吞掉其余按键（preventDefault），避免误键入输入框
     }
-    // 非列表模式：Tab 进入优先的列表（文件引用优先，其次会话）
+    // 非列表模式：Tab 进入优先的列表（文件引用优先，其次会话）—— 同时切到对应侧栏 tab
     if (!listMode && key.name === 'tab') {
-      if (refs.length > 0 && openFile) { setSel(0); setFileMode(true); return true }
-      if (sessions.length > 0) { setSessionSel(0); setSessionMode(true); return true }
+      if (refs.length > 0 && openFile) { setSel(0); setFileMode(true); setSidebarTab('files'); return true }
+      if (sessions.length > 0) { setSessionSel(0); setSessionMode(true); setSidebarTab('sessions'); return true }
     }
   })
 
@@ -812,7 +949,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   // 后台任务分组（模块 A）：进行中置顶、已结束收尾，各自限量
   const { running: bgRunning, finished: bgFinished } = splitBgTasks(bgTasks)
   // 模块 D：统计面板 —— 由对话块 + 后台任务实时归并（elapsed 用挂载起点）
-  const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current)
+  const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current, usage)
 
   const renderBlock = (b: ChatBlock) => {
     // 对话消息（用户/助手且非空）在正文下加一行鼠标「复制」按钮
@@ -887,69 +1024,147 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           {hasChat ? state.blocks.map(renderBlock) : <WelcomePanel provider={provider} model={model} />}
         </scrollbox>
         {showSidebar && (
-          <scrollbox style={{ width: SIDEBAR_WIDTH, border: true, padding: 1, flexShrink: 0 }}>
-            <text attributes={createTextAttributes({ bold: true })}>会话上下文</text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">session={options.session.id}</text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">消息数={options.session.messages.length}</text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">agent={options.session.agentId ?? 'default'}</text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">provider={provider}</text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">model={model ?? '-'}</text>
-            <text attributes={createTextAttributes({ bold: true })}>会话</text>
-            {sessions.length === 0
-              ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
-              : sessions.map((s, i) => {
-                  const active = sessionMode && i === sessionSel
-                  const attrs = active
-                    ? createTextAttributes({ reverse: true, bold: true })
-                    : createTextAttributes({ dim: true, bold: s.id === options.session.id })
-                  return (
-                    <text key={s.id} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
-                      {sessionMode ? (active ? '▸ ' : '  ') : ''}{sessionRowText(s, Date.now())}
+          <box flexDirection="column" style={{ width: SIDEBAR_WIDTH, border: true, flexShrink: 0 }}>
+            {/* 模块 4：顶部图标 tab 行 —— 点击图标切换，仅展示一个面板 */}
+            <box flexDirection="row" style={{ width: SIDEBAR_WIDTH, flexShrink: 0 }}>
+              {SIDEBAR_TABS.map((t) => {
+                const active = sidebarTab === t.id
+                return (
+                  <box key={t.id} style={{ flexShrink: 0 }}>
+                    <text
+                      width={5}
+                      attributes={createTextAttributes(active ? { reverse: true, bold: true } : { dim: true })}
+                      onMouseUp={(e) => { e.preventDefault(); setSidebarTab(t.id) }}
+                    >
+                      {t.icon}
                     </text>
-                  )
-                })}
-            <text attributes={createTextAttributes({ bold: true })}>后台任务</text>
-            {bgTasks.length === 0
-              ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
-              : [...bgRunning.slice(0, MAX_RUNNING_BG), ...bgFinished.slice(0, MAX_FINISHED_BG)].map((t) => (
-                  <text
-                    key={t.taskId}
-                    attributes={createTextAttributes({
-                      dim: t.status !== 'running',
-                      reverse: t.status === 'running',
-                    })}
-                    wrapMode="word"
-                    width={SIDEBAR_WIDTH - 4}
-                  >
-                    {bgTaskRow(t)}
+                  </box>
+                )
+              })}
+            </box>
+            <text attributes={createTextAttributes({ bold: true, dim: sidebarTab !== 'stats' })} style={{ flexShrink: 0 }}>
+              {SIDEBAR_TABS.find((t) => t.id === sidebarTab)?.label ?? sidebarTab}
+            </text>
+            <scrollbox style={{ flexGrow: 1, width: SIDEBAR_WIDTH }}>
+              {/* 面板：会话上下文 */}
+              {sidebarTab === 'context' && (
+                <>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">session={options.session.id}</text>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">消息数={options.session.messages.length}</text>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">agent={options.session.agentId ?? 'default'}</text>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">provider={provider}</text>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">model={model ?? '-'}</text>
+                </>
+              )}
+              {/* 面板：会话列表 */}
+              {sidebarTab === 'sessions' && (sessions.length === 0
+                ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
+                : sessions.map((s, i) => {
+                    const active = sessionMode && i === sessionSel
+                    const attrs = active
+                      ? createTextAttributes({ reverse: true, bold: true })
+                      : createTextAttributes({ dim: true, bold: s.id === options.session.id })
+                    return (
+                      <text key={s.id} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
+                        {sessionMode ? (active ? '▸ ' : '  ') : ''}{sessionRowText(s, Date.now())}
+                      </text>
+                    )
+                  }))}
+              {/* 面板：后台任务 */}
+              {sidebarTab === 'tasks' && (bgTasks.length === 0
+                ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
+                : [...bgRunning.slice(0, MAX_RUNNING_BG), ...bgFinished.slice(0, MAX_FINISHED_BG)].map((t) => (
+                    <text
+                      key={t.taskId}
+                      attributes={createTextAttributes({
+                        dim: t.status !== 'running',
+                        reverse: t.status === 'running',
+                      })}
+                      wrapMode="word"
+                      width={SIDEBAR_WIDTH - 4}
+                    >
+                      {bgTaskRow(t)}
+                    </text>
+                  )))}
+              {/* 面板：文件引用 */}
+              {sidebarTab === 'files' && (fileRefs.length === 0
+                ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
+                : fileRefs.map((p, i) => {
+                    const active = fileMode && options.openFile != null && i === sel
+                    const attrs = active
+                      ? createTextAttributes({ reverse: true, bold: true })
+                      : createTextAttributes({ dim: true, underline: true })
+                    return (
+                      <text key={p} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
+                        {fileMode && options.openFile ? (active ? '▸' : ' ') : ''}{p}
+                      </text>
+                    )
+                  }))}
+              {/* 面板：统计 —— 本地估算 + 实际 API 用量 + 模型/工具/token/缓存/小时时序 */}
+              {sidebarTab === 'stats' && (
+                <>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                    消息 {stats.users}u/{stats.assistants}a {stats.thinking}t/{stats.tools}T
                   </text>
-                ))}
-            <text attributes={createTextAttributes({ dim: true })}>文件引用</text>
-            {fileRefs.length === 0
-              ? <text attributes={createTextAttributes({ dim: true })}>（无）</text>
-              : fileRefs.map((p, i) => {
-                  const active = fileMode && options.openFile != null && i === sel
-                  const attrs = active
-                    ? createTextAttributes({ reverse: true, bold: true })
-                    : createTextAttributes({ dim: true, underline: true })
-                  return (
-                    <text key={p} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
-                      {fileMode && options.openFile ? (active ? '▸' : ' ') : ''}{p}
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                    字符 {stats.chars} · ~{stats.tokens} tok
+                  </text>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                    任务 {stats.tasksRunning}进行/{stats.tasksDone}完成 · {formatDuration(stats.elapsedMs)}
+                  </text>
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                    LLM {stats.usage.llmCalls}次 · in{stats.usage.inputTokens}/out{stats.usage.outputTokens}
+                  </text>
+                  {(stats.usage.cacheReadTokens > 0 || stats.usage.cacheWriteTokens > 0) && (
+                    <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                      缓存⚡{stats.usage.cacheReadTokens} · 未命中{uncachedInput(stats.usage)}
                     </text>
-                  )
-                })}
-            {/* 模块 D：统计面板 —— 消息/字符/token/任务/用时 */}
-            <text attributes={createTextAttributes({ bold: true })}>统计</text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
-              消息 {stats.users}u/{stats.assistants}a {stats.thinking}t/{stats.tools}T
-            </text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
-              字符 {stats.chars} · ~{stats.tokens} tok
-            </text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
-              任务 {BG_STATUS_ICON.running}{stats.tasksRunning} / {BG_STATUS_ICON.completed}{stats.tasksDone} · {formatDuration(stats.elapsedMs)}
-            </text>
-          </scrollbox>
+                  )}
+                  {stats.usage.models.length > 0 && (
+                    <>
+                      <text attributes={createTextAttributes({ bold: true })}>模型</text>
+                      {stats.usage.models.map((m) => (
+                        <text key={m.model} attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                          {modelUsageRow(m)}
+                        </text>
+                      ))}
+                    </>
+                  )}
+                  {stats.usage.agents.length > 0 && (
+                    <>
+                      <text attributes={createTextAttributes({ bold: true })}>agent/任务</text>
+                      {stats.usage.agents.map((a) => (
+                        <text key={a.agentId} attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                          {agentUsageRow(a)}
+                        </text>
+                      ))}
+                    </>
+                  )}
+                  {stats.usage.tools.length > 0 && (
+                    <>
+                      <text attributes={createTextAttributes({ bold: true })}>工具</text>
+                      {stats.usage.tools.map((t) => (
+                        <text key={t.tool} attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                          {toolUsageRow(t)}
+                        </text>
+                      ))}
+                    </>
+                  )}
+                  {stats.usage.hourly.length > 1 && (
+                    <>
+                      <text attributes={createTextAttributes({ bold: true })}>小时时序</text>
+                      {stats.usage.hourly.map((h) => (
+                        <text key={h.hour} attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                          {hourlyRow(h, Math.max(...stats.usage.hourly.map((x) => x.inputTokens + x.outputTokens), 1))}
+                        </text>
+                      ))}
+                    </>
+                  )}
+                  <text attributes={createTextAttributes({ dim: true })} wrapMode="word">── /stats 详情 · /stats-export 报告 ──</text>
+                </>
+              )}
+            </scrollbox>
+          </box>
         )}
       </box>
 

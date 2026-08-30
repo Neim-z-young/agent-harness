@@ -59,8 +59,8 @@ export interface MockProviderConfig {
   defaultReasoning?: string
   /** 模型名（默认 "mock-v1"） */
   model?: string
-  /** token 用量（默认 { input: 10, output: 5 }） */
-  tokenUsage?: { input: number; output: number }
+  /** token 用量（默认 { input: 10, output: 5 }，可含缓存命中/写入） */
+  tokenUsage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number }
   /** 按关键词匹配的响应规则列表 */
   responses?: MockResponseRule[]
   /** 是否记录调用历史（默认 true） */
@@ -167,11 +167,18 @@ export class MockChatProvider implements ChatProvider {
     const model = rule?.model ?? this.config.model
     const toolCalls = rule?.toolCalls
     const tokenUsage = this.config.tokenUsage
+    const outUsage = {
+      input: tokenUsage.input,
+      output: tokenUsage.output,
+      total: tokenUsage.input + tokenUsage.output,
+      ...(tokenUsage.cacheRead != null ? { cacheRead: tokenUsage.cacheRead } : {}),
+      ...(tokenUsage.cacheWrite != null ? { cacheWrite: tokenUsage.cacheWrite } : {}),
+    }
 
     const output: ChatCompletionOutput = {
       content: response,
       model,
-      tokenUsage: { input: tokenUsage.input, output: tokenUsage.output, total: tokenUsage.input + tokenUsage.output },
+      tokenUsage: outUsage,
     }
     if (reasoning) output.reasoning = reasoning
     if (toolCalls && toolCalls.length > 0) output.toolCalls = toolCalls
@@ -247,7 +254,13 @@ export class MockChatProvider implements ChatProvider {
     yield {
       type: 'done',
       model,
-      tokenUsage: { input: tokenUsage.input, output: tokenUsage.output, total: tokenUsage.input + tokenUsage.output },
+      tokenUsage: {
+        input: tokenUsage.input,
+        output: tokenUsage.output,
+        total: tokenUsage.input + tokenUsage.output,
+        ...(tokenUsage.cacheRead != null ? { cacheRead: tokenUsage.cacheRead } : {}),
+        ...(tokenUsage.cacheWrite != null ? { cacheWrite: tokenUsage.cacheWrite } : {}),
+      },
     }
   }
 

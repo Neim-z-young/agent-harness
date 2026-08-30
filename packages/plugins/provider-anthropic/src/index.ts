@@ -95,7 +95,12 @@ type AnthropicRequestBody = {
   stream?: false
 }
 
-type AnthropicUsage = { input_tokens: number; output_tokens: number }
+type AnthropicUsage = {
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens?: number
+  cache_creation_input_tokens?: number
+}
 
 type AnthropicResponseBody = {
   id: string
@@ -399,6 +404,8 @@ export class AnthropicChatProvider implements ChatProvider {
           input: parsed.usage.input_tokens,
           output: parsed.usage.output_tokens,
           total: parsed.usage.input_tokens + parsed.usage.output_tokens,
+          ...(parsed.usage.cache_read_input_tokens != null ? { cacheRead: parsed.usage.cache_read_input_tokens } : {}),
+          ...(parsed.usage.cache_creation_input_tokens != null ? { cacheWrite: parsed.usage.cache_creation_input_tokens } : {}),
         },
         raw: parsed,
       }
@@ -502,7 +509,7 @@ export class AnthropicChatProvider implements ChatProvider {
       const decoder = new TextDecoder()
       let buf = ''
       let modelOut: string | undefined
-      let tokenUsage: { input: number; output: number; total?: number } | undefined
+      let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number; cacheWrite?: number } | undefined
       // 当前 content block 的 index → 类型映射
       const blockTypes: Map<number, 'text' | 'tool_use'> = new Map()
 
@@ -531,7 +538,12 @@ export class AnthropicChatProvider implements ChatProvider {
               case 'message_start': {
                 modelOut = json.message?.model
                 const u = json.message?.usage
-                if (u) tokenUsage = { input: u.input_tokens ?? 0, output: u.output_tokens ?? 0 }
+                if (u) tokenUsage = {
+                  input: u.input_tokens ?? 0,
+                  output: u.output_tokens ?? 0,
+                  ...(u.cache_read_input_tokens != null ? { cacheRead: u.cache_read_input_tokens } : {}),
+                  ...(u.cache_creation_input_tokens != null ? { cacheWrite: u.cache_creation_input_tokens } : {}),
+                }
                 break
               }
               case 'content_block_start': {

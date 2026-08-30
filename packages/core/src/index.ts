@@ -320,6 +320,19 @@ export class DefaultPermissionEngine implements PermissionEngine {
 // 3. ChatProvider（LLM 抽象）+ llm.params Hook 桥
 // ========================================================================
 
+/** LLM token 用量统计（含缓存命中/未命中明细） */
+export interface TokenUsage {
+  /** 输入 token（含缓存部分） */
+  input: number
+  /** 输出 token */
+  output: number
+  total?: number
+  /** 命中缓存的输入 token（Anthropic cache_read_input_tokens / OpenAI prompt_tokens_details.cached_tokens / Gemini cachedContentTokenCount） */
+  cacheRead?: number
+  /** 写入缓存（未命中但计入缓存）的输入 token（Anthropic cache_creation_input_tokens） */
+  cacheWrite?: number
+}
+
 /** LLM 完成消息（文本或流式） */
 export interface ChatCompletionOutput {
   /** 文本内容 */
@@ -335,7 +348,7 @@ export interface ChatCompletionOutput {
   /** 模型名 */
   model?: string
   /** token 统计 */
-  tokenUsage?: { input: number; output: number; total?: number }
+  tokenUsage?: TokenUsage
   /** 原始响应，透传给插件 */
   raw?: unknown
 }
@@ -362,7 +375,7 @@ export interface ChatStreamChunk {
   /** done 时的模型名 */
   model?: string
   /** done 时的 token 统计 */
-  tokenUsage?: { input: number; output: number; total?: number }
+  tokenUsage?: TokenUsage
   /** done 时的原始响应 */
   raw?: unknown
 }
@@ -1225,6 +1238,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
         tokenUsage: completion.tokenUsage ? {
           input: completion.tokenUsage.input,
           output: completion.tokenUsage.output,
+          ...(completion.tokenUsage.cacheRead !== undefined ? { cacheRead: completion.tokenUsage.cacheRead } : {}),
+          ...(completion.tokenUsage.cacheWrite !== undefined ? { cacheWrite: completion.tokenUsage.cacheWrite } : {}),
         } : undefined,
         ...(snap ? { snapshot: { start: snap.start, files: snap.files } } : {}),
       },
@@ -1364,7 +1379,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     let reasoningBuf = ''
     const toolCalls: Array<{ toolUseId: string; toolId: string; inputParts: string[] }> = []
     let model: string | undefined
-    let tokenUsage: { input: number; output: number; total?: number } | undefined
+    let tokenUsage: TokenUsage | undefined
     let raw: unknown
 
     if (provider.stream) {
@@ -1446,7 +1461,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
       agentId,
       meta: {
         model,
-        tokenUsage: tokenUsage ? { input: tokenUsage.input, output: tokenUsage.output } : undefined,
+        tokenUsage: tokenUsage ? {
+          input: tokenUsage.input,
+          output: tokenUsage.output,
+          ...(tokenUsage.cacheRead !== undefined ? { cacheRead: tokenUsage.cacheRead } : {}),
+          ...(tokenUsage.cacheWrite !== undefined ? { cacheWrite: tokenUsage.cacheWrite } : {}),
+        } : undefined,
         ...(snap ? { snapshot: { start: snap.start, files: snap.files } } : {}),
       },
     }

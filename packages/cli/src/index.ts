@@ -46,6 +46,15 @@ import { swarmCapability } from '@harness/swarm'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import { startTuiRepl } from './tui'
+import {
+  emptyUsage,
+  usageFromMeta,
+  usageFromMessages,
+  renderStatsText,
+  exportStatsJson,
+  exportStatsMarkdown,
+  type UsageStats,
+} from './usage-stats'
 import type { Message, Session } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
@@ -1302,7 +1311,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills', '/stats', '/stats-export']
 
 /**
  * 收集 TUI `/` 命令补全候选：内置 REPL 命令 + 插件经 `cli.commands` hook 注册的命令。
@@ -1437,6 +1446,15 @@ export interface ProcessLineOptions {
 
 export type ProcessLineResult = 'continue' | 'exit'
 
+/** 解析当前会话用量统计：优先读 session.meta 持久化值；无则从消息历史重建 */
+async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
+  const fromMeta = usageFromMeta(current.meta)
+  if (fromMeta) return fromMeta
+  const sess = current.messages?.length ? current : await harness.session.get(current.id)
+  if (sess && sess.messages) return usageFromMessages(sess.messages)
+  return emptyUsage()
+}
+
 /**
  * 创建「处理一行输入」的函数（REPL 与 TUI 共用同一套会话处理逻辑）。
  *
@@ -1483,8 +1501,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /revert <sub>         文件快照回滚：stage/clear/commit/status/help\n')
           out('  /plugins              列出已加载插件（含来源/是否可管理）\n')
           out('  /plugins <op> <id>    enable|disable|reload 插件（如 /plugins reload my-gw）\n')
-          out('  /skills               列出所有技能（含来源标注）\n')
+          out('  /skills              列出所有技能（含来源标注）\n')
           out('  /skills <op> <id>     enable|disable|reload 技能（如 /skills disable foo）\n')
+          out('  /stats               查看本会话用量统计（LLM/token/模型/工具/小时时序/缓存）\n')
+          out('  /stats-export [md|json] [path] 导出统计报告（默认 md 打印，给定 path 写文件）\n')
           // 收集插件注册的命令
           try {
             const cmdInput = { commands: [] as Array<{ command: string; description: string; usage?: string }> }
@@ -1608,6 +1628,26 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             out(`累计压缩次数=${info.meta?.count ?? 0}，累计压缩消息=${info.meta?.totalPrunedMessages ?? 0}\n`)
             out(`本轮：前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}；摘要轮次=${info.memory?.round ?? 0}\n`)
             if (info.memory?.summaryText) out(`摘要（前 400 字）：${info.memory.summaryText.slice(0, 400)}\n`)
+          }
+          return 'continue'
+        }
+        case '/stats': {
+          const u = await resolveCurrentUsage(harness, current)
+          out(renderStatsText(u) + '\n')
+          return 'continue'
+        }
+        case '/stats-export': {
+          const u = await resolveCurrentUsage(harness, current)
+          const [fmtArg, pathArg] = arg.trim().split(/\s+/)
+          const isJson = fmtArg === 'json' || fmtArg === '--json'
+          const content = isJson
+            ? exportStatsJson(u, { sessionId: current.id, title: current.title })
+            : exportStatsMarkdown(u, { sessionId: current.id, title: current.title })
+          if (pathArg) {
+            await writeFile(pathArg, content)
+            out(`已导出统计报告 → ${pathArg}\n`)
+          } else {
+            out(content + '\n')
           }
           return 'continue'
         }

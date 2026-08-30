@@ -98,6 +98,8 @@ type OpenAIUsage = {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  prompt_tokens_details?: { cached_tokens?: number }
+  completion_tokens_details?: { reasoning_tokens?: number }
 }
 
 type OpenAIChoice = {
@@ -518,6 +520,7 @@ export class OpenAIChatProvider implements ChatProvider {
           input: parsed.usage.prompt_tokens,
           output: parsed.usage.completion_tokens,
           total: parsed.usage.total_tokens,
+          ...(parsed.usage.prompt_tokens_details?.cached_tokens != null ? { cacheRead: parsed.usage.prompt_tokens_details.cached_tokens } : {}),
         },
         raw: parsed,
       }
@@ -601,7 +604,7 @@ export class OpenAIChatProvider implements ChatProvider {
       const decoder = new TextDecoder()
       let buf = ''
       let modelOut: string | undefined
-      let tokenUsage: { input: number; output: number; total?: number } | undefined
+      let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number } | undefined
 
       // tool_calls 增量累积状态：index → { id?, name?, argsBuf }
       const toolCallState: Map<number, { id?: string; name?: string; argsBuf: string; started: boolean }> = new Map()
@@ -644,6 +647,7 @@ export class OpenAIChatProvider implements ChatProvider {
                 input: json.usage.prompt_tokens ?? 0,
                 output: json.usage.completion_tokens ?? 0,
                 total: json.usage.total_tokens,
+                ...(json.usage.prompt_tokens_details?.cached_tokens != null ? { cacheRead: json.usage.prompt_tokens_details.cached_tokens } : {}),
               }
             }
 

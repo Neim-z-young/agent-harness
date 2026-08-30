@@ -9,6 +9,7 @@
  */
 
 import type { Awaitable } from '@harness/bus'
+import type { TokenUsage } from '@harness/core'
 
 // ===== Part 类型 =====
 
@@ -113,8 +114,8 @@ export interface Message {
   meta?: {
     /** 模型名 */
     model?: string
-    /** token 用量 */
-    tokenUsage?: { input: number; output: number }
+    /** token 用量（含缓存命中/未命中明细） */
+    tokenUsage?: TokenUsage
     [key: string]: unknown
   }
 }
