@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-08-31（续 41）：bash 宿主回退前权限确认（requireHostApproval）
+
+(user-request) 宿主 bash 回退会把"沙箱约束已批准"的命令提升到更特权环境执行，需在 ask 模式提示确认。
+
+### 实现（tools-builtin）
+
+- `BashSandboxConfig` 新增 `requireHostApproval?: boolean`（默认 true）。
+- 新增 `confirmHostRun(input, ctx, config)`：宿主回退前调用 `ctx.requestPermission`，复用 bash 权限 key，pattern 前缀 `host:` 标识宿主回退执行；`decision.behavior === 'deny'` 拦截（返回 `SANDBOX_HOST_DENIED`），否则放行。无 `requestPermission`（纯工具调用）或 `requireHostApproval=false` 时静默放行。
+- 白名单拦截回退、沙箱非零退出回退两个分支均接入确认；危险命令检测仍前置硬性拒绝、不进入确认环节。
+
+### 行为
+
+- ask 模式：宿主回退再次询问用户；allow：静默放行；deny：拦截宿主回退。
+
+### 测试与验证
+
+- 新增 3 条用例：requestPermission deny 拦截返回 SANDBOX_HOST_DENIED / allow 放行并标 viaHost / requireHostApproval=false 即使 deny 也宿主回退。
+- tools-builtin 49 用例 + typecheck 通过。
+
+### 相关文档
+
+- [AGENTS.md](AGENTS.md)、[docs/agent-harness-architecture.md](docs/agent-harness-architecture.md) §十三
+
 ## 2026-08-31（续 40）：补全架构文档 + 工作区管理调研 + bash 沙箱宿主回退
 
 (user-request) 三项：①将最近提交中未记录的功能补进架构文档、提取规则到 AGENTS.md；②调研工作区管理模块并输出开发文档；③沙箱非破坏性命令失败后尝试提升宿主 bash 执行。

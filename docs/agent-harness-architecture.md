@@ -1131,6 +1131,8 @@ TUI 通过 `app.permission.setAskPrompt(cb)` 接管 `ask` 交互，渲染审批�
 
 宿主回退放开白名单与 env 隔离、使用用户完备环境（含系统 `PATH`）。`bash` 工具 `ok` 语义保持「执行成功即 ok，命令自身结果由 `exitCode` 反映」，仅在 spawn 失败或 AbortSignal 中断时 `ok: false`。
 
+**宿主回退独立确认（`requireHostApproval`，默认 true）**：宿主回退会把"在沙箱约束下已批准"的命令提升到更特权环境执行，因此在回退前再经权限引擎确认——复用 `bash` 权限 key，pattern 前缀 `host:` 标识宿主回退执行；ask 模式会再次询问用户，allow 静默放行，deny 拦截（返回 `SANDBOX_HOST_DENIED`）。危险命令检测仍前置硬性拒绝，不进入确认环节。
+
 ## 十四、TUI 增强落地补全（续 33~38 + 续 35）
 
 > 记录日期：2026-08-31。十一为「计划」，本节约这些计划之外后续交付的落地特性。

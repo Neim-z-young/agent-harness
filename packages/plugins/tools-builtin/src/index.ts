@@ -22,7 +22,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, Tool, ToolResult, Schema, ToolContext, PermissionRequest } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
@@ -303,6 +303,8 @@ export interface BashSandboxConfig {
   /** 沙箱回退：非破坏性命令在沙箱内执行失败（被白名单拦截 / 遇 spawn/env 问题 / 命令非零退出）时，
    *  尝试提升到宿主 bash 重跑（放开白名单与 env 隔离、补充系统 PATH）。默认 false 关闭。 */
   fallbackToHost?: boolean
+  /** 宿主回退前是否经权限引擎确认：ask 模式会询问用户，allow 静默放行，deny 拦截。默认 true。 */
+  requireHostApproval?: boolean
 }
 
 /** 默认危险命令正则表（命中即拒绝执行） */
@@ -469,7 +471,16 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         )
         if (!allowlisted) {
           // 白名单拦截但允许宿主回退：非破坏性命令提升到宿主 bash 执行
-          if (config.fallbackToHost) return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
+          if (config.fallbackToHost) {
+            const confirmed = await confirmHostRun(input, ctx, config)
+            if (!confirmed) {
+              return {
+                ok: false,
+                error: { message: `命令不在沙箱白名单内，宿主回退被拒绝：${firstCmd}`, code: 'SANDBOX_HOST_DENIED' },
+              }
+            }
+            return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
+          }
           return {
             ok: false,
             error: { message: `命令不在沙箱白名单内，已拒绝：${firstCmd}`, code: 'SANDBOX_ALLOWLIST' },
@@ -484,6 +495,13 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
 
       // ---- 回退兜底：非破坏性命令在沙箱内未按预期执行（spawn 失败 / env 隔离开致命令非零退出）时提升到宿主 bash ----
       if (!sandboxResult.interrupted && sandboxResult.output?.exitCode !== 0 && config.fallbackToHost) {
+        const confirmed = await confirmHostRun(input, ctx, config)
+        if (!confirmed) {
+          return {
+            ok: false,
+            error: { message: `命令在沙箱内执行失败，宿主回退被拒绝`, code: 'SANDBOX_HOST_DENIED' },
+          }
+        }
         return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
       }
 
@@ -493,7 +511,29 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
 }
 
 /**
- * 执行一条 bash 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
+ * 宿主回退前的权限确认。
+ *
+ * 洞开沙箱（白名单/env 隔离）在宿主 bash 执行的命令，需要一次独立确认：
+ * - 复用 bash 权限 key，pattern 前缀 `host:` 标识"宿主回退执行"；
+ * - 权限引擎按规则/mode 决策：ask 模式会询问用户，allow 静默放行，deny 拦截；
+ * - 无 requestPermission（纯工具调用）或 requireHostApproval=false 时静默放行。
+ */
+async function confirmHostRun(
+  input: BashInput,
+  ctx: ToolContext,
+  config: BashSandboxConfig,
+): Promise<boolean> {
+  if (config.requireHostApproval === false || !ctx.requestPermission) return true
+  const req: PermissionRequest = {
+    toolKey: 'bash',
+    patterns: [`host:\n${input.command}`],
+    input,
+  }
+  const decision = await ctx.requestPermission(req)
+  return decision.behavior !== 'deny'
+}
+
+/** 执行一条 bash 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
  * viaHost=true 时在返回的 BashOutput 上标注，表示这次是宿主 bash 回退执行（放开白名单与 env 隔离）。
  */
 function runBash(opts: {

@@ -347,6 +347,47 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.viaHost).toBe(true)
     })
 
+    it('sandbox 回退：宿主回退前 requestPermission 拒绝时拦截，返回 SANDBOX_HOST_DENIED', async () => {
+      const tool = createBashTool({ allowlist: ['echo'], fallbackToHost: true })
+      const res = await tool.call(
+        { command: 'ls', cwd: TMP_DIR },
+        makeCtx({
+          requestPermission: async (req) => {
+            expect(req.toolKey).toBe('bash')
+            expect(req.patterns[0]).toContain('host:')
+            expect(req.patterns[0]).toContain('ls')
+            return { behavior: 'deny' as const }
+          },
+        }),
+      )
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_HOST_DENIED')
+    })
+
+    it('sandbox 回退：requestPermission 允许时宿主回退放行并标注 viaHost', async () => {
+      const tool = createBashTool({ allowlist: ['echo'], fallbackToHost: true })
+      const res = await tool.call(
+        { command: 'ls', cwd: TMP_DIR },
+        makeCtx({
+          requestPermission: async () => ({ behavior: 'allow' as const }),
+        }),
+      )
+      expect(res.ok).toBe(true)
+      expect(res.output!.viaHost).toBe(true)
+    })
+
+    it('sandbox 回退：requireHostApproval=false 跳过确认，即使引擎 deny 也宿主回退', async () => {
+      const tool = createBashTool({ allowlist: ['echo'], fallbackToHost: true, requireHostApproval: false })
+      const res = await tool.call(
+        { command: 'ls', cwd: TMP_DIR },
+        makeCtx({
+          requestPermission: async () => ({ behavior: 'deny' as const }),
+        }),
+      )
+      expect(res.ok).toBe(true)
+      expect(res.output!.viaHost).toBe(true)
+    })
+
     it('env 隔离：过滤敏感变量，保留必要变量', async () => {
       const tool = createBashTool()
       // 模拟敏感 + 保留变量
