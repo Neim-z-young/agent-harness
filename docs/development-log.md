@@ -1,5 +1,65 @@
 # Agent Harness 开发日志
 
+## 2026-08-31（续 42）开发计划：/tools 工具管理命令
+
+> 状态：计划（待实现）。用户已确认范围：查看 + 启停 + 其他；启停作用域双轨（当前 Agent 白名单持久化 + 全局工具池运行时）；仅 REPL、暂不 TUI 面板。
+
+### 目标
+
+提供 REPL 工具管理命令 `/tools`，查看可用工具、查看详情、按 Agent 白名单或全局启停、并提供结构化/权限联动等扩展。
+
+### 命令语法
+
+```
+/tools                          # 列出当前 Agent 可用工具（filterByWhitelist(agent.tools)）
+/tools --all                    # 列出全局注册的全部工具（harness.tools.list()）
+/tools --json                   # 与上一视图同，JSON 结构化输出
+/tools <toolId>                 # 详情：描述/文档/别名/权限key/安全声明/来源/启用态
+/tools <toolId> on              # 作用域A：加入当前 agent.tools 并持久化（已在则幂等）
+/tools <toolId> off             # 作用域A：从当前 agent.tools 移除并持久化
+/tools <toolId> --global on|off # 作用域B：全局工具池运行时 register/unregister（本次进程生效）
+/tools --permission <key>       # 联动查看某权限 key 的规则（读 permissions.json）
+```
+
+### 查看字段与局限
+
+- 列表列：`id`、描述（截断）、来源（内置/插件，见下）、权限 key、安全声明（isReadOnly / isDestructive / isConcurrencySafe）、启用态（agent 白名单禁用 / 全局禁用 / 正常）。
+- 详情额外：`documentation`、`aliases`。
+- **局限**：内置工具 inputSchema 为 `makeSchema` 轻量透传（非 zod），无法内省字段结构，schema 字段暂不展示。
+
+### 作用域 A — Agent 白名单持久化（on/off 默认路径）
+
+- 复用 `setModel` 模式：读 `harness.agent.get(agentId)` → 改 `def.tools` → 持久化到 config 中对应 agent 定义的 `tools`（同在 configStore 装配 agents）。
+- `off`：`def.tools` 非 `'*'` 时 `filter(t => t !== id)`；为 `'*'` 时转为显式 `['*', ...]` 后再剔除，或提示先转显式白名单。
+- `on`：`def.tools` 为 `'*'` 或已含 id 则幂等；否则加入 `def.tools` 并持久化。
+
+### 作用域 B — 全局工具池运行时（--global on|off）
+
+- HarnessApp 新增 `setToolGlobalEnabled(id, on)`：`off` → `harness.tools.unregister(id)` 并缓存原 Tool 至内存 Map；`on` → `register(缓存对象)`。
+- 仅本次进程生效、不持久化；与作用域 A 正交独立。
+
+### 来源标注
+
+- 第一版：从注册登记表/插件清单匹配工具 id 推断「内置 / 插件」，或扩展 `tool.pool.assemble` 记录来源；下限不强制精确，先标 registry 维度。
+
+### 实施步骤
+
+1. `packages/cli/src/index.ts`：`HarnessApp` 增 `toolInfos(opts)`、`setAgentToolsTool(id, on)`、`setToolGlobalEnabled(id, on)` 三个方法 + 工具来源推断 helper。
+2. REPL dispatch 增 `case '/tools'`，解析子命令（list / <id> / on / off / --global / --all / --json / --permission）。
+3. 持久化：定位 config 中 agents 的 `tools` 读写（对齐 `/model` 持久化机制），实现 Agent 白名单落盘。
+4. 测试（`cli.test.tsx`）：`/tools` 列出内置工具 / 详情 / `<id> off` 持久化到 agent def 与 config / `--global off` 从 registry 移除且可 `on` 恢复 / `--all` 清单 / `--json`。
+5. 文档：记录本计划到 development-log；实现完成后在 AGENTS.md 补 `/tools` 约定。
+6. 全量 typecheck + test（跑测试补 `PATH=/bin:/usr/bin`）。
+
+### 安全注意
+
+- 全局 off 影响所有 agent，需明确提示。
+- 不禁止标注：是否允许禁用 read_file/write_file/bash/edit_file 等核心工具由用户决定，不在命令层强制。
+
+### 相关文档
+
+- [docs/agent-harness-architecture.md](docs/agent-harness-architecture.md)
+
 ## 2026-08-31（续 41）：bash 宿主回退前权限确认（requireHostApproval）
 
 (user-request) 宿主 bash 回退会把"沙箱约束已批准"的命令提升到更特权环境执行，需在 ask 模式提示确认。
