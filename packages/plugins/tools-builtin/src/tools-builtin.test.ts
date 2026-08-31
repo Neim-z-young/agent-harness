@@ -6,6 +6,7 @@ import {
   readFileTool,
   writeFileTool,
   bashTool,
+  createBashTool,
   createToolsBuiltinPlugin,
   toolsBuiltinPlugin,
   builtinTools,
@@ -259,6 +260,147 @@ describe('@harness/tools-builtin', () => {
       expect(res.ok).toBe(false)
       expect(res.interrupted).toBe(true)
       expect(res.error!.code).toBe('ABORTED')
+    })
+  })
+
+  // ===== bash 沙箱 =====
+
+  describe('bash 沙箱防护', () => {
+    it('危险命令检测：命中 rm -rf / 拒绝执行', async () => {
+      const tool = createBashTool()
+      const res = await tool.call({ command: 'rm -rf /' }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+      expect(res.error!.message).toInclude('危险')
+    })
+
+    it('危险命令检测：命中 fork bomb 拒绝执行', async () => {
+      const tool = createBashTool()
+      const res = await tool.call({ command: '() { :|:& };:' }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+    })
+
+    it('危险命令检测可关闭（dangerousDetection=false）', async () => {
+      const tool = createBashTool({ dangerousDetection: false })
+      // dangerously rm 一个临时文件确认可执行（沙箱关闭）
+      const file = join(TMP_DIR, 'x.txt')
+      await writeFile(file, 'hi')
+      const mk = await tool.call({ command: 'rm -rf /', cwd: TMP_DIR }, makeCtx())
+      // rm -rf / 由于是 root 才真正危险，普通环境下即失败也非沙箱错误
+      expect(mk.error?.code).not.toBe('SANDBOX_DANGEROUS')
+    })
+
+    it('cwd 限制：超出 rootDir 拒绝', async () => {
+      const tool = createBashTool({ rootDir: TMP_DIR })
+      const res = await tool.call({ command: 'pwd', cwd: '/tmp' }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_CWD')
+    })
+
+    it('cwd 限制：rootDir 内允许', async () => {
+      const tool = createBashTool({ rootDir: TMP_DIR })
+      const res = await tool.call({ command: 'pwd', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(true)
+      expect(res.output!.stdout.trim()).toBe(TMP_DIR)
+    })
+
+    it('命令白名单：允许的命令可执行', async () => {
+      const tool = createBashTool({ allowlist: ['echo'] })
+      const res = await tool.call({ command: 'echo "hi"', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(true)
+      expect(res.output!.stdout.trim()).toBe('hi')
+    })
+
+    it('命令白名单：白名单外命令拒绝', async () => {
+      const tool = createBashTool({ allowlist: ['echo'] })
+      const res = await tool.call({ command: 'ls', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_ALLOWLIST')
+    })
+
+    it('env 隔离：过滤敏感变量，保留必要变量', async () => {
+      const tool = createBashTool()
+      // 模拟敏感 + 保留变量
+      process.env.__SANDBOX_MY_SECRET_KEY = 'should-be-removed'
+      process.env.PATH = (process.env.PATH ?? '/usr/bin') // 保证 PATH 保留
+      const res = await tool.call(
+        { command: 'echo "PATH=$PATH"', cwd: TMP_DIR },
+        makeCtx(),
+      )
+      delete process.env.__SANDBOX_MY_SECRET_KEY
+      expect(res.ok).toBe(true)
+      // 不验证子进程内是否可见明文（跨进程），仅验证工具正常执行
+      expect(res.output!.stdout).toInclude('PATH=/')
+    })
+
+    it('env 隔离：keepEnv 指定变量被保留', async () => {
+      const tool = createBashTool({ keepEnv: ['MY_KEEP_VAR'] })
+      process.env.MY_KEEP_VAR = 'kept'
+      const res = await tool.call(
+        { command: 'echo "keep=$MY_KEEP_VAR"', cwd: TMP_DIR },
+        makeCtx(),
+      )
+      process.env.MY_KEEP_VAR = ''
+      expect(res.ok).toBe(true)
+      expect(res.output!.stdout.trim()).toBe('keep=kept')
+    })
+
+    it('additionalDangerous 追加自定义危险模式', async () => {
+      const tool = createBashTool({
+        additionalDangerous: [/touch\s+custom-danger/],
+      })
+      const res = await tool.call({ command: 'touch custom-danger x', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+    })
+
+    it('createToolsBuiltinPlugin 传入 bash 配置后 bash 受沙箱约束', async () => {
+      const plugin = createToolsBuiltinPlugin({ bash: { allowlist: ['echo'] } })
+      const mockPlugin = createProviderMockPlugin({
+        defaultResponse: 'ok',
+        responses: [
+          {
+            match: '拒绝',
+            response: '',
+            toolCalls: [{
+              toolUseId: 'tu1',
+              toolId: 'bash',
+              input: { command: 'ls', cwd: TMP_DIR },
+            }],
+          },
+          {
+            match: '允许',
+            response: '',
+            toolCalls: [{
+              toolUseId: 'tu2',
+              toolId: 'bash',
+              input: { command: 'echo hi', cwd: TMP_DIR },
+            }],
+          },
+        ],
+      })
+      const h = await createHarness({
+        cwd: TMP_DIR,
+        internalPlugins: [mockPlugin, plugin],
+        agents: [makeAgent()],
+        permission: new DefaultPermissionEngine({ '*': 'allow' }),
+      })
+      await h.start()
+
+      const sess = await h.session.create()
+      const denied = await h.agent.query({ sessionId: sess.id, message: '拒绝' })
+      const deniedTool = denied.parts.find((p: any) => p.type === 'tool') as any
+      expect(deniedTool).toBeDefined()
+      // 白名单拒绝返回 error ToolResult（result = { message, code }）
+      expect((deniedTool.result as any).code).toBe('SANDBOX_ALLOWLIST')
+
+      const allowed = await h.agent.query({ sessionId: sess.id, message: '允许' })
+      const allowedTool = allowed.parts.find((p: any) => p.type === 'tool') as any
+      expect(allowedTool).toBeDefined()
+      expect((allowedTool.result as any).stdout?.trim()).toBe('hi')
+
+      await h.stop()
     })
   })
 

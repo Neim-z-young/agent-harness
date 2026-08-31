@@ -1,5 +1,44 @@
 # Agent Harness 开发日志
 
+## 2026-08-31（续 39）：命令审批交互 + bash 沙箱安全防护
+
+(user-request: 完善沙箱功能及命令审批) 本轮补齐「命令审批」的完整交互链路与「bash 沙箱」的多层安全防护。
+
+### 权限链路：check → ask 两步判定 + 工具异常兜底
+
+- `core` 新增 `resolvePermission`：先 `engine.check(req)`，命中非 ask 直接返回；需询问时调 `engine.ask(req)` 交上层交互。
+- 三处工具执行入口（agent loop 内联工具调用 + 后置 parsed 工具调用 + `HarnessImpl` 的 `ToolPipeline.checkPermission`）统一改走 `resolvePermission`，权限请求不再止步于 `check`。
+- `core` 新增 `safeExecuteTool`：把权限拒绝 / 未知异常归一化为失败的 `ToolResult`（`PERMISSION_DENIED` / `TOOL_ERROR`），作为 tool error 反馈 LLM 而非中断 agent 流；用错误名判定 `ToolPermissionDeniedError`，避免依赖类绑定。
+
+### CLI 权限引擎
+
+- `CliPermissionEngine` 支持 `allow-all / ask / deny-all` 三模式；`ask` 时交互支持 `allow / deny / always(a) / deny-always(d)`，永久选择写回规则并落盘 `permissions.json`。
+- 新增 `setAskPrompt` 允许上层替换默认 readline 行内提问（给 TUI 注入模态审批用）；新增 `/permission` 命令查看/切换模式、设置规则、reset。
+
+### TUI 审批模态
+
+- `TuiApp` 注入 TUI 版 `askPrompt`：权限引擎 `ask()` 触发时把问题投递为审批弹窗并挂起 Promise。
+- 全局快捷键在审批挂起期间吞掉所有按键，仅响应 `y`（允许）/ `n`/`Esc`（拒绝）/ `Shift-y`（始终允许）/ `Shift-n`（始终拒绝）。
+
+### bash 沙箱（tools-builtin，`createBashTool(config)` 工厂）
+
+- **危险命令检测**：默认正则表拦截 `rm -rf /`、fork bomb、`mkfs.*`、裸盘 `dd`/重定向、`shutdown/reboot`、`curl|bash`、`sudo rm -rf` 等；支持 `additionalDangerous` 追加并可用 `dangerousDetection:false` 关闭。
+- **cwd 限制**：cwd 必须位于 `rootDir`（默认 `ctx.cwd`）内，防路径逃逸，命中返回 `SANDBOX_CWD`。
+- **env 隔离**：从继承环境过滤敏感变量（AWS/GitHub/OpenAI/API_KEY/PASSWORD/PRIVATE_KEY 等），可 `keepEnv` 保留必要变量、`sanitizeEnv:false` 关闭。
+- **命令白名单**：配置 `allowlist` 后仅首命令名或完整片段命中的命令可执行，其余返回 `SANDBOX_ALLOWLIST`。
+- 导出 `createBashTool` 工厂后，原 `bashTool` 改为默认实例，插件可通过 `createToolsBuiltinPlugin({ bash: config })` 注入受限配置。
+
+### 测试与踩坑
+
+- tools-builtin 新增「bash 沙箱防护」套件：危险命令检测 / cwd 限制 / 白名单 / env 隔离（含 keepEnv）/ 插件级 bash 配置注入 / 端到端。
+- cli 新增「/permission」命令用例与 TUI 审批模态用例（ask 弹窗 → `y` 允许后工具执行、`n` 拒绝后工具被拒）。
+- TUI 审批模态用例一度超时：mock 工具型回复 `response:''`，工具执行后**没有**后续 assistant 正文，而断言误等「你好」；改为断言工具结果的 `stdout`（允许）与 `权限被拒绝`（拒绝）后稳定通过。
+- 某终端 `PATH` 被精简（缺 `/bin`），`spawn('bash')` 报 `Executable not found in $PATH`，纯环境问题，非代码缺陷；跑片段用完整 PATH 验证。
+
+### 相关文档
+
+- [docs/agent-harness-architecture.md](docs/agent-harness-architecture.md)
+
 ## 2026-08-30（续 38）：TUI 命令输入回显 — 命令进入对话历史并触发欢迎页切换
 
 用户反馈：TUI 对话历史里看不到 `/` 命令发送记录；新会话执行命令时欢迎页不消失，只有发普通消息才切换。

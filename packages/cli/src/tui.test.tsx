@@ -50,6 +50,7 @@ import {
   buildWelcomeBanner,
   WELCOME_BANNER,
   selectionTextFrom,
+  approvalLine,
   __KEYLOG,
   __resetKeyLog,
   type SessionRow,
@@ -506,16 +507,17 @@ const activeFixtures: Array<() => Promise<void>> = []
 
 async function mountTui(
   extra: {
-    responses?: Array<{ match: string | RegExp; response: string }>
+    responses?: Array<{ match: string | RegExp; response: string; toolCalls?: Array<{ toolUseId: string; toolId: string; input: unknown }> }>
     openFile?: (path: string, line?: number) => void
     model?: string
+    permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   } = {},
 ): Promise<TuiFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-tui-test-'))
   const app = new HarnessApp({
     cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
     model: extra.model,
-    permissionMode: 'allow-all',
+    permissionMode: extra.permissionMode ?? 'allow-all',
     mockProviderConfig: {
       defaultResponse: '你好，我是 TUI 助手。',
       responses: extra.responses ?? [],
@@ -690,6 +692,42 @@ describe('TuiApp 集成（mock provider）', () => {
     f.setup.mockInput.pressEscape()
     await waitFrame(f.setup, (frame) => !frame.includes('打开/关闭帮助面板'))
     await f.cleanup()
+  })
+
+  it('权限审批模态：ask 模式工具调用触发弹窗，y 允许后继续', async () => {
+    const f = await mountTui({
+      permissionMode: 'ask',
+      responses: [{ match: 'hi', response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'echo ok' } }] }],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    // 输入触发 mock 返回工具调用 → 权限引擎 ask → 审批模态
+    f.setup.mockInput.pressKeys(['h', 'i'])
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (frame) => frame.includes('权限审批'))
+    // 按 y 允许单次
+    f.setup.mockInput.pressKey('y')
+    await waitFrame(f.setup, (frame) => !frame.includes('权限审批') && frame.includes('stdout'))
+    await f.cleanup()
+  })
+
+  it('权限审批模态：n 拒绝后工具被拒，会话正常收尾', async () => {
+    const f = await mountTui({
+      permissionMode: 'ask',
+      responses: [{ match: 'hi', response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'rm -rf /' } }] }],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKeys(['h', 'i'])
+    f.setup.mockInput.pressEnter()
+    await waitFrame(f.setup, (frame) => frame.includes('权限审批'))
+    f.setup.mockInput.pressKey('n')
+    await waitFrame(f.setup, (frame) => !frame.includes('权限审批') && frame.includes('权限被拒绝'))
+    await f.cleanup()
+  })
+
+  it('approvalLine 提炼权限问题主行', () => {
+    expect(approvalLine('\n⚠️ 权限请求 [bash] /etc/passwd\n  操作: allow / deny ... ')).toBe('⚠️ 权限请求 [bash] /etc/passwd')
+    expect(approvalLine('  权限请求 [write] src/x.ts  ')).toBe('权限请求 [write] src/x.ts')
+    expect(approvalLine('xx')).toBe('xx')
   })
 
   it('侧栏统计面板：消息数 + token 估算 + 任务 + 用时', async () => {

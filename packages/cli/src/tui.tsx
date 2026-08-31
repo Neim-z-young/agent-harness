@@ -641,6 +641,20 @@ export function WelcomePanel({ provider, model }: { provider: string; model?: st
 // TuiApp：OpenTUI React 组件树（状态栏 + 主对话 + 侧栏面板 + 输入）
 // ------------------------------------------------------------------------
 
+/**
+ * 从权限询问的原始文本中提炼一行展示文案（去掉行内选项后缀/首尾空白）。
+ * 权限引擎 ask() 的问题形如：`⚠️ 权限请求 [bash] /etc/passwd\n  操作: allow / deny ...`。
+ * 这里取含「权限请求」的主行，供审批模态简洁展示。
+ */
+export function approvalLine(q: string): string {
+  const lines = String(q)
+    .replace(/\n+$/, '')
+    .split('\n')
+    .map((s) => s.replace(/^\s+/, '').replace(/\s+$/, ''))
+    .filter(Boolean)
+  return lines.find((l) => l.includes('权限请求')) ?? lines[0] ?? q
+}
+
 export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (r: TuiReplExit) => void }) {
   // 初始状态直接在 useState 初始化：若用 mount effect 设置欢迎语，会覆盖
   // 已在 effect 之前开始处理的用户回复（processLine 于渲染期同步初始化，submit 可先于 effect）。
@@ -669,6 +683,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [histIdx, setHistIdx] = useState(-1) // -1 表示不在回看历史
   // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
   const [helpOpen, setHelpOpen] = useState(false)
+  // 模块 E：命令审批模态 —— 权限引擎 ask() 触发时弹出，等待 allow/deny/always/never
+  const [approvalQ, setApprovalQ] = useState<string | null>(null)
+  const approvalResolveRef = useRef<((ans: string) => void) | null>(null)
   // 鼠标复制（模块 D3）：正在展示「✓ 已复制」提示的块 id（临时高亮，配合 onMouseUp 复制）
   const [copiedId, setCopiedId] = useState<number | null>(null)
   // 统计面板计时起点：组件挂载时刻
@@ -692,6 +709,15 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const pendingEvsRef = useRef<AgentStreamEvent[]>([])
   const flushScheduledRef = useRef(false)
   if (processLineRef.current === null) {
+    // 模块 E：注入 TUI 命令审批模态 —— 替换默认 readline 行内提问。
+    // 询问由权限引擎 ask() 触发（含工具键与路径），此处把问题投递到 React 模态并挂起，
+    // 由全局按键（Y/N/Shift-Y/Shift-N）回填答案；每次仅一个待决审批。
+    options.app.permission.setAskPrompt((q) => {
+      return new Promise<string>((resolve) => {
+        approvalResolveRef.current = resolve
+        setApprovalQ(typeof q === 'string' && q.length ? q : '权限请求')
+      })
+    })
     processLineRef.current = createProcessLine({
       app: options.app,
       harness: options.harness,
@@ -843,6 +869,19 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     if (helpOpen) {
       setHelpOpen(false)
       return true
+    }
+    // 模块 E：命令审批模态 —— 审批期间吞掉所有按键，仅响应审批选项
+    if (approvalQ !== null) {
+      const submitApproval = (ans: string) => {
+        approvalResolveRef.current?.(ans)
+        approvalResolveRef.current = null
+        setApprovalQ(null)
+      }
+      if (key.name === 'y') submitApproval('allow')             // 本次允许
+      else if (key.name === 'n' || key.name === 'escape') submitApproval('deny') // 本次拒绝 / Esc=拒绝
+      else if (key.shift && key.name === 'y') submitApproval('always')           // 始终允许
+      else if (key.shift && key.name === 'n') submitApproval('never')            // 始终拒绝
+      return true // 其余按键在审批中一律吞掉
     }
     if (key.ctrl && key.name === 'c') return finish('exit')
     __KEYLOG.push(`${key.name}:${key.ctrl ? 'C' : ''}`)
@@ -1178,6 +1217,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                 {l.key.padEnd(18)}{l.desc}
               </text>
             ))}
+          </box>
+        )}
+        {/* 模块 E：命令审批模态 —— 权限询问弹出，Y=允许 N=拒绝 Shift-Y=始终允许 Shift-N=始终拒绝 */}
+        {approvalQ !== null && (
+          <box style={{ border: true, padding: 1 }}>
+            <text attributes={createTextAttributes({ bold: true, reverse: true })}>
+              {' 权限审批 '.padEnd(22)}
+            </text>
+            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+              {approvalLine(approvalQ)}
+            </text>
+            <text wrapMode="word">  [y] 允许    [n] 拒绝    [Shift-y] 始终允许    [Shift-n] 始终拒绝</text>
           </box>
         )}
         {/* 模块 C：/ 命令补全菜单弹层（出现在输入框上方，随输入前缀过滤） */}

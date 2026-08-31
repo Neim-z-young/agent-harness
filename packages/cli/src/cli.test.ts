@@ -462,6 +462,30 @@ describe('CliPermissionEngine', () => {
     expect(d.matchedRule).toBe('global')
   })
 
+  it('mode=deny-all 一律拒绝', async () => {
+    const e = new CliPermissionEngine({}, { mode: 'deny-all' })
+    const d = await e.ask({ toolKey: 'read', patterns: [] }) as PermissionDecision
+    expect(d.behavior).toBe('deny')
+    expect(d.matchedRule).toBe('global')
+  })
+
+  it('getMode/setMode 切换交互模式（含 deny-all）', async () => {
+    const e = new CliPermissionEngine({}, { mode: 'ask' })
+    expect(e.getMode()).toBe('ask')
+    e.setMode('allow-all')
+    expect(e.getMode()).toBe('allow-all')
+    expect((await e.ask({ toolKey: 'x', patterns: [] })).behavior).toBe('allow')
+    e.setMode('deny-all')
+    expect(e.getMode()).toBe('deny-all')
+    expect((await e.ask({ toolKey: 'x', patterns: [] })).behavior).toBe('deny')
+  })
+
+  it('parseCliArgs 识别 deny-all', () => {
+    expect(parseCliArgs(['--permission', 'deny-all'])).toMatchObject({ permissionMode: 'deny-all' })
+    expect(parseCliArgs(['--permission', 'ask'])).toMatchObject({ permissionMode: 'ask' })
+    expect(parseCliArgs(['--permission', 'unknown'])).toMatchObject({ permissionMode: 'ask' })
+  })
+
   it('mode=ask 按用户答案', async () => {
     const askPrompt = async (s: string) => {
       if (s.includes('read')) return 'a'
@@ -1360,6 +1384,43 @@ describe('/plugins 插件管理', () => {
     const { app, harness, session, stdout, chunks } = await bootApp()
     await startRepl({ app, harness, session, stdout, scriptedStdin: ['/plugins disable no-such', '/exit'] })
     expect(chunks.join('')).toInclude('不受管理')
+    await app.shutdown()
+  })
+
+  it('/permission：查看模式与规则 + 切换 deny-all + 设置规则并落盘', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: [
+        '/permission',
+        '/permission deny-all',
+        '/permission bash=deny',
+        '/permission',
+        '/exit',
+      ],
+    })
+    const out = chunks.join('')
+    // bootApp 默认 permissionMode=allow-all
+    expect(out).toInclude('权限交互模式：allow-all')
+    // 切换 deny-all
+    expect(out).toInclude('已切换权限交互模式为 deny-all')
+    expect(app.permission.getMode()).toBe('deny-all')
+    // 设置规则 bash=deny 已落盘
+    expect(out).toInclude('已设置规则 bash=deny')
+    expect((app.permission.getRules() as Record<string, unknown>).bash).toBe('deny')
+    const file = readFileSync(join(dir, '.harness', 'permissions.json'), 'utf-8')
+    expect(file).toInclude('"bash": "deny"')
+    await app.shutdown()
+  })
+
+  it('/permission reset 恢复全局 ask 并清空规则', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await app.setPermissionRules({ '*': 'ask', bash: 'deny' })
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/permission reset', '/exit'] })
+    const out = chunks.join('')
+    expect(out).toInclude('已重置权限')
+    expect(app.permission.getMode()).toBe('ask')
+    expect(app.permission.getRules()).toEqual({ '*': 'ask' })
     await app.shutdown()
   })
 

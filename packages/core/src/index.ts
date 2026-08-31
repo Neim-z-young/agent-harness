@@ -254,6 +254,37 @@ function defaultGlob(pattern: string, path: string): boolean {
   return new RegExp(`^${escaped}$`).test(path)
 }
 
+/**
+ * 权限判定两步走：先 check（不询问），若需询问则调用 ask()（交上层交互，
+ * 无交互器时引擎 ask() 默认 deny，保证安全）。工具执行统一经此入口拿到最终 allow/deny。
+ */
+async function resolvePermission(engine: PermissionEngine, req: ToolPermissionRequest): Promise<ToolPermissionDecision> {
+  const d = await engine.check(req)
+  if (d.behavior !== 'ask') return d
+  return engine.ask(req)
+}
+
+/**
+ * 工具执行兜底：把权限拒绝 / 未知异常归一化为「失败的 ToolResult」，
+ * 作为 tool error 反馈给 LLM（模型可据此调整），而不是中断整个 agent 流转发。
+ */
+async function safeExecuteTool(
+  pipeline: ToolPipeline,
+  tool: Tool,
+  input: unknown,
+  tctx: ToolContext,
+): Promise<ToolResult> {
+  try {
+    return await pipeline.execute(tool, input, tctx)
+  } catch (err: any) {
+    // 避免依赖 re-export 的类绑定，用错误名判定（tool 层 ToolPermissionDeniedError.name 固定）
+    if (err?.name === 'ToolPermissionDeniedError') {
+      return { ok: false, error: { message: `权限被拒绝：${err.message}`, code: 'PERMISSION_DENIED' }, interrupted: false }
+    }
+    return { ok: false, error: { message: err?.message ?? String(err), code: 'TOOL_ERROR' }, interrupted: false }
+  }
+}
+
 export class DefaultPermissionEngine implements PermissionEngine {
   private rules: PermissionRuleset
   constructor(rules: PermissionRuleset = { '*': 'ask' }) {
@@ -1283,9 +1314,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
           signal: new AbortController().signal,
           variables: {},
           cwd: this.deps.cwd,
-          requestPermission: (r) => this.deps.permission.check(r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
+          requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
         }
-        const res: ToolResult = await this.deps.toolPipeline.execute(tool, tc.input, tctx)
+        const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, tc.input, tctx)
         resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
         resultPart.isError = !res.ok
         assistant.parts.push(resultPart)
@@ -1518,9 +1549,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
         signal: new AbortController().signal,
         variables: {},
         cwd: this.deps.cwd,
-        requestPermission: (r) => this.deps.permission.check(r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
+        requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
       }
-      const res: ToolResult = await this.deps.toolPipeline.execute(tool, parsedInput, tctx)
+      const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, parsedInput, tctx)
       resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
       resultPart.isError = !res.ok
       assistant.parts.push(resultPart)
@@ -1719,7 +1750,7 @@ export class HarnessImpl implements Harness {
       return r
     }
     this.toolPipeline = new ToolPipeline({
-      checkPermission: (req) => this.permission.check(req as PermRequest) as Promise<ToolPermissionDecision>,
+      checkPermission: (req) => resolvePermission(this.permission, req as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
       preHooks: [preHook],
       postHooks: [postHook],
     })

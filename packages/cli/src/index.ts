@@ -15,7 +15,7 @@
  *   --provider <name>         mock / anthropic（默认 anthropic，未配 key 时自动 fallback mock）
  *   --session <id>            复用/新建指定 ID 的会话（如 resume）
  *   --data-dir <dir>          持久化目录（默认 ~/.harness）
- *   --permission <mode>       allow-all / ask（默认 ask）
+ *   --permission <mode>       allow-all / ask / deny-all（默认 ask）
  *   --tui                     以 TUI（alt-screen 全屏）模式启动 REPL
  *   --verbose                 输出调试信息
  *
@@ -91,7 +91,7 @@ export interface CliArgs {
   model?: string
   sessionId?: string
   dataDir?: string
-  permissionMode?: 'allow-all' | 'ask'
+  permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   verbose?: boolean
   /** 以 TUI（alt-screen 全屏）模式启动 REPL */
   tui?: boolean
@@ -172,7 +172,8 @@ export function parseCliArgs(raw: string[]): CliArgs {
       case 'm': case 'model': out.model = value; break
       case 's': case 'session': out.sessionId = value; break
       case 'd': case 'data-dir': out.dataDir = value; break
-      case 'permission': out.permissionMode = value === 'allow-all' ? 'allow-all' : 'ask'; break
+      case 'permission':
+        out.permissionMode = value === 'allow-all' ? 'allow-all' : value === 'deny-all' ? 'deny-all' : 'ask'; break
       case 'run': // "harness --run xxx" 场景
         out.command = 'run'; out.arg = value; break
       default: break // 忽略未知
@@ -752,7 +753,7 @@ export class CliPermissionEngine extends DefaultPermissionEngine {
     rules: Record<string, unknown> = { '*': 'ask' },
     private readonly options: {
       store?: PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }
-      mode?: 'allow-all' | 'ask'
+      mode?: 'allow-all' | 'ask' | 'deny-all'
       /** 测试注入：替换真实 readline 交互 */
       askPrompt?: (question: string) => Promise<string>
       stdout?: NodeJS.WritableStream | { write: (s: string) => void }
@@ -765,14 +766,28 @@ export class CliPermissionEngine extends DefaultPermissionEngine {
     ;(this.options.stdout ?? process.stdout).write(s)
   }
 
+  /** 当前交互模式（allow-all / ask / deny-all），供 /permission 查看与切换 */
+  getMode(): 'allow-all' | 'ask' | 'deny-all' {
+    return this.options.mode ?? 'ask'
+  }
+  /** 切换交互模式（不影响持久化规则，仅影响「询问型请求」的自动答复） */
+  setMode(mode: 'allow-all' | 'ask' | 'deny-all'): void {
+    this.options.mode = mode
+  }
+  /** 替换询问交互器（TUI 在启动后注入模态审批，替代默认 readline 行内提问） */
+  setAskPrompt(fn?: (question: string) => Promise<string>): void {
+    this.options.askPrompt = fn
+  }
+
   /** CLI 级 ask：默认 mode=allow-all 直接 allow；mode=ask 则 prompt 用户 */
   override async ask(req: any): Promise<PermissionDecision> {
     if (this.options.mode === 'allow-all') return { behavior: 'allow', matchedRule: 'global' }
+    if (this.options.mode === 'deny-all') return { behavior: 'deny', matchedRule: 'global' }
     const promptFn = this.options.askPrompt ?? defaultCliAsk(this.write)
     const pat = (req.patterns ?? []).slice(0, 3).join(', ') || '(无路径)'
     const q = `\n⚠️  权限请求 [${req.toolKey}] ${pat}\n` +
       `  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] `
-    const answer = (await promptFn(q)).trim()
+    const answer = ((await promptFn(q)) ?? '').trim()
     const low = answer.toLowerCase()
     // 先判断"永久"：answer 保留大小写（A/D 直接表示永久），否则"always"/"never"语义
     const permanentAllow = low === 'always' || low === 'all' || answer === 'A'
@@ -818,7 +833,7 @@ export interface HarnessAppOptions {
   /** 默认模型 ID（如 claude-3-5-sonnet，或 provider/model 跨 Provider 指定），设置到默认 Agent 的 model */
   model?: string
   sessionId?: string
-  permissionMode?: 'allow-all' | 'ask'
+  permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   /** 测试注入 */
   mockProviderConfig?: MockProviderConfig
   anthropicProviderConfig?: any
@@ -848,6 +863,8 @@ export class HarnessApp {
   public readonly providerTypes: ProviderTypeRegistry
   /** 文件快照服务（options.snapshot 开启时创建，供 createHarness 注入与 /revert 命令） */
   public readonly snapshotService: SnapshotService | undefined
+  /** 权限引擎（boot 时构建）。/permission 命令据此查看/切换交互模式与规则 */
+  public permission!: CliPermissionEngine
   /** 插件管理：boot 时登记的「可管理」插件对象（pluginId → AgentPlugin），供 /plugins enable 重新安装 */
   readonly pluginRegistry = new Map<string, AgentPlugin>()
   private harness!: Harness
@@ -881,6 +898,11 @@ export class HarnessApp {
   private async saveRules(rules: Record<string, unknown>): Promise<void> {
     await mkdir(this.options.dataDir, { recursive: true })
     await writeFile(this.permissionStorePath, JSON.stringify({ rules }, null, 2))
+  }
+  /** 更新权限引擎规则并落盘（/permission 使用） */
+  async setPermissionRules(rules: Record<string, unknown>): Promise<void> {
+    this.permission.updateRules(rules as any)
+    await this.saveRules(rules)
   }
 
   /** 默认 Agent 定义（无 agent 指定时使用）；含 CLI/config 解析出的默认模型 */
@@ -1071,6 +1093,7 @@ export class HarnessApp {
         save: (r) => this.saveRules(r),
       },
     })
+    this.permission = perm
 
     // ------------------------------------------------------------------
     // Provider 装配：支持多 Provider 自由切换
@@ -1311,7 +1334,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills', '/stats', '/stats-export']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills', '/stats', '/stats-export', '/permission']
 
 /**
  * 收集 TUI `/` 命令补全候选：内置 REPL 命令 + 插件经 `cli.commands` hook 注册的命令。
@@ -1497,6 +1520,9 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /model <spec>      切换模型：provider/modelId 跨 Provider（如 /model openai/gpt-4o）\n')
           out('  /model ?           列出已注册 Provider\n')
           out('  /config            查看 Provider / 模型配置概览（config.json）\n')
+          out('  /permission        查看权限交互模式与规则（permissions.json）\n')
+          out('  /permission <mode>  切换交互模式：allow-all | ask | deny-all\n')
+          out('  /permission <k>=<v> 设置工具规则：如 bash=deny、write=ask\n')
           out('  /compact [mode]    立即压缩会话：mode=prune/summary(默认)/agent\n')
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
@@ -1733,6 +1759,48 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             out(`回滚失败：${err?.message ?? String(err)}\n`)
             return 'continue'
           }
+        }
+        case '/permission': {
+          // 查看：/permission；设置：/permission <mode> 或 /permission <key>=<behavior>
+          if (!arg || arg.trim() === '?') {
+            out(`权限交互模式：${app.permission.getMode()}（allow-all / ask / deny-all）\n`)
+            out('当前规则（permissions.json）：\n')
+            const rules = app.permission.getRules() as Record<string, unknown>
+            const keys = Object.keys(rules)
+            if (keys.length === 0) { out('  （无规则，全局默认 ask）\n'); return 'continue' }
+            for (const k of keys) out(`  ${k.padEnd(14)}: ${JSON.stringify(rules[k])}\n`)
+            out('\n用法：/permission <allow-all|ask|deny-all>   切换交互模式\n')
+            out('      /permission <key>=<behavior>           设置工具规则，如 /permission bash=deny、/permission write=ask\n')
+            out('      /permission reset                      恢复为全局 ask 并清空规则\n')
+            return 'continue'
+          }
+          const t = arg.trim()
+          if (t === 'reset') {
+            await app.setPermissionRules({ '*': 'ask' })
+            app.permission.setMode('ask')
+            out('已重置权限：规则清空（全局 ask），交互模式=ask，并写回 permissions.json。\n')
+            return 'continue'
+          }
+          const eq = t.indexOf('=')
+          if (eq > 0) {
+            const key = t.slice(0, eq).trim()
+            const val = t.slice(eq + 1).trim()
+            if (!['allow', 'deny', 'ask'].includes(val)) {
+              out(`非法行为 "${val}"（allow / deny / ask）。\n`); return 'continue'
+            }
+            const current = app.permission.getRules() as Record<string, unknown>
+            const updated = { ...current, [key]: val }
+            await app.setPermissionRules(updated)
+            out(`已设置规则 ${key}=${val} 并写回 permissions.json。\n`)
+            return 'continue'
+          }
+          if (['allow-all', 'ask', 'deny-all'].includes(t)) {
+            app.permission.setMode(t as 'allow-all' | 'ask' | 'deny-all')
+            out(`已切换权限交互模式为 ${t}（作用于「询问型」请求；规则文件不变）。\n`)
+            return 'continue'
+          }
+          out(`无法解析 "${t}"。/permission 查看，/permission <mode> 或 /permission <key>=<behavior> 设置。\n`)
+          return 'continue'
         }
         case '/plugins': {
           const parts = line.split(/\s+/).map((s) => s.trim()).filter(Boolean)
@@ -1978,7 +2046,7 @@ teammate 选项:
   -m, --model <spec>       默认模型：provider/modelId 跨 Provider 指定（如 openai/gpt-4o）。运行时可用 /model 切换
   -s, --session <id>       指定会话 ID（用于 resume/run 时复用历史）
   -d, --data-dir <dir>     持久化目录（默认 ~/.harness）
-      --permission <mode>  allow-all / ask（默认 ask）
+      --permission <mode>  allow-all / ask / deny-all（默认 ask）
   -v, --verbose            输出调试信息
       --tui                以 TUI（alt-screen 全屏）模式启动 REPL
       --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
@@ -2023,7 +2091,7 @@ export async function runTeammateCli(options: {
   dataDir: string
   provider: string
   agentId: string
-  permissionMode: 'allow-all' | 'ask'
+  permissionMode: 'allow-all' | 'ask' | 'deny-all'
 }): Promise<number> {
   const { args, cwd, dataDir, provider, agentId, permissionMode } = options
   const write = (s: string) => process.stdout.write(s)

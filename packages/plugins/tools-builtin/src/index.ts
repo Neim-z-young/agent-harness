@@ -283,8 +283,81 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
 })
 
 // ========================================================================
-// 3. bash 工具
+// 3. bash 工具（含沙箱防护）
 // ========================================================================
+
+/** bash 沙箱配置 */
+export interface BashSandboxConfig {
+  /** 危险命令检测（默认 true） */
+  dangerousDetection?: boolean
+  /** 额外危险命令正则（追加到默认检测表） */
+  additionalDangerous?: RegExp[]
+  /** 工作目录根：cwd 必须在此目录内（默认 ctx.cwd，限制逃逸） */
+  rootDir?: string
+  /** 是否对继承环境做敏感变量隔离（默认 true） */
+  sanitizeEnv?: boolean
+  /** 环境隔离时额外保留的环境变量名 */
+  keepEnv?: string[]
+  /** 命令白名单（首命令名或完整命令片段，空/未设置则不限制） */
+  allowlist?: string[]
+}
+
+/** 默认危险命令正则表（命中即拒绝执行） */
+const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
+  /\(\)\s*\{[^{}]*\|[^{}]*\}/, // fork bomb（函数体启动即时递归 fork）
+  /\brm\s+(?:-[a-z]*f[a-z]*\s+)*\/\s*(?:\*|$|--)/m, // rm -rf / 或 rm -rf /*
+  /\brm\s+(-[a-z]*f[a-z]*\s*)*~\s/, // rm -rf ~
+  /\bmkfs\.\w+/, // mkfs.*
+  /\bdd\b.*\bof=\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/, // dd 写裸盘
+  /\b>(>>)?\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/, // 重定向裸设备
+  /\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b/, // 关机/重启
+  />\s*\/dev\/null\b|\/dev\/sda|format\s+\/\s*\/s\s*\/f\/q/, // 常见破坏性
+  /\bcurl\b[^|;]*\|\s*(bash|sh)\b|\bwget\b[^|;]*\|\s*(bash|sh)\b/, // curl|bash
+  /\bchmod\s+-R\s+777\s+\//, // 递归改根目录权限
+  /\bsudo\s+rm\s+-rf\s+(\/|\*)/, // sudo rm -rf /
+]
+
+/** 默认敏感环境变量名（隔离时从继承环境移除） */
+const DEFAULT_SENSITIVE_ENV = [
+  /AWS_ACCESS_KEY|AWS_SECRET|AWS_SESSION_TOKEN/,
+  /GITHUB_TOKEN|GITLAB_TOKEN|GH_TOKEN/,
+  /OPENAI|ANTHROPIC|DEEPSEEK|GOOGLE|AZURE|BEDROCK|GEMINI|MISTRAL|COHERE/i,
+  /API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN/,
+  /PASSWORD|PASSWD|CREDENTIAL/i,
+  /PRIVATE_KEY|PEM\b/,
+]
+
+/** 危险命令检测：返回命中的模式描述，未命中返回 null */
+function detectDangerous(command: string, patterns: RegExp[]): RegExp | null {
+  for (const re of patterns) {
+    if (re.test(command)) return re
+  }
+  return null
+}
+
+/** 环境隔离：过滤掉敏感变量，保留必要与 keepEnv 指定的变量 */
+function sanitizeEnv(env: NodeJS.ProcessEnv, keepEnv: string[]): Record<string, string> {
+  const result: Record<string, string> = {}
+  for (const key of Object.keys(env)) {
+    const value = env[key]
+    if (value === undefined) continue
+    if (keepEnv.includes(key)) {
+      result[key] = value
+      continue
+    }
+    const sensitive = DEFAULT_SENSITIVE_ENV.some((re) => re.test(key))
+    if (!sensitive) result[key] = value
+  }
+  return result
+}
+
+/** 从命令提取首个命令名（用于白名单匹配） */
+function extractFirstCommand(command: string): string {
+  const trimmed = command.trim().replace(/^[;&|\s]*/, '')
+  // 跳过前缀赋值（VAR=x cmd）与 sudo/env 前缀
+  let m = trimmed.match(/^(?:[A-Za-z_][\w]*=[^\s]*\s+)*(?:sudo\s+|env\s+)?([^\s|;&<>]+)/)
+  return m ? m[1] : trimmed.split(/\s+/)[0] ?? ''
+}
 
 /** bash 输入 */
 export interface BashInput {
@@ -320,7 +393,7 @@ const DEFAULT_BASH_TIMEOUT = 30_000
 const MAX_OUTPUT_CHARS = 64 * 1024 // 64KB
 
 /**
- * bash 工具：执行 shell 命令
+ * 创建 bash 工具（含沙箱防护）
  *
  * 安全声明：
  * - isReadOnly: false（可能有写副作用）
@@ -328,101 +401,139 @@ const MAX_OUTPUT_CHARS = 64 * 1024 // 64KB
  * - isDestructive: true（命令可能删除文件等）
  * - permission.key: 'bash'
  *
- * 使用 spawn 执行，支持超时、cwd、env。
- * stdout/stderr 各截断到 64KB。
+ * 沙箱能力（config 控制）：
+ * - 危险命令检测：命中默认/自定义危险正则即拒绝执行
+ * - cwd 限制：cwd 必须位于 rootDir（默认 ctx.cwd）内，防止路径逃逸
+ * - env 隔离：从继承环境过滤敏感变量（密钥/token/密码）
+ * - 命令白名单：配置后仅允许列出的命令
  */
-export const bashTool = defineTool<BashInput, BashOutput>({
-  id: 'bash',
-  description: '执行 shell 命令。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
-  inputSchema: makeSchema<BashInput>(),
-  isReadOnly: () => false,
-  isDestructive: () => true,
-  isConcurrencySafe: () => false,
-  permission: {
-    key: 'bash',
-    extractPatterns: (input) => [input.command],
-  },
-  async call(input, ctx): Promise<ToolResult<BashOutput>> {
-    const cwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : ctx.cwd
-    const timeoutMs = input.timeoutMs ?? DEFAULT_BASH_TIMEOUT
-    const startedAt = Date.now()
+export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, BashOutput> {
+  const dangerousPatterns = config.dangerousDetection === false
+    ? []
+    : [...DEFAULT_DANGEROUS_PATTERNS, ...(config.additionalDangerous ?? [])]
+  const allowlist = config.allowlist
+  const keepEnv = config.keepEnv ?? []
 
-    return new Promise((resolvePromise) => {
-      const env = { ...process.env, ...input.env }
-      const child = spawn('bash', ['-c', input.command], {
-        cwd,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
+  return defineTool<BashInput, BashOutput>({
+    id: 'bash',
+    description: '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
+    inputSchema: makeSchema<BashInput>(),
+    isReadOnly: () => false,
+    isDestructive: () => true,
+    isConcurrencySafe: () => false,
+    permission: {
+      key: 'bash',
+      extractPatterns: (input) => [input.command],
+    },
+    async call(input, ctx): Promise<ToolResult<BashOutput>> {
+      const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
 
-      let stdout = ''
-      let stderr = ''
-      let timedOut = false
-      let settled = false
-
-      const timer = setTimeout(() => {
-        if (!settled) {
-          timedOut = true
-          child.kill('SIGKILL')
-        }
-      }, timeoutMs)
-
-      child.stdout?.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString('utf-8')
-        if (stdout.length > MAX_OUTPUT_CHARS) {
-          stdout = stdout.slice(0, MAX_OUTPUT_CHARS) + '\n... [stdout 已截断]'
-        }
-      })
-
-      child.stderr?.on('data', (chunk: Buffer) => {
-        stderr += chunk.toString('utf-8')
-        if (stderr.length > MAX_OUTPUT_CHARS) {
-          stderr = stderr.slice(0, MAX_OUTPUT_CHARS) + '\n... [stderr 已截断]'
-        }
-      })
-
-      child.on('error', (err) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolvePromise({
-          ok: false,
-          error: { message: `无法执行命令: ${err.message}`, code: 'SPAWN_ERROR', cause: err },
-        })
-      })
-
-      child.on('close', (code) => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        resolvePromise({
-          ok: true,
-          output: {
-            stdout,
-            stderr,
-            exitCode: code ?? (timedOut ? 124 : -1),
-            timedOut,
-            durationMs: Date.now() - startedAt,
-            command: input.command,
-          },
-        })
-      })
-
-      // 支持 AbortSignal
-      if (ctx.signal) {
-        if (ctx.signal.aborted) {
-          if (!settled) {
-            settled = true
-            clearTimeout(timer)
-            child.kill('SIGKILL')
-            resolvePromise({
-              ok: false,
-              error: { message: '操作被中断', code: 'ABORTED' },
-              interrupted: true,
-            })
+      // ---- 沙箱防护 1：cwd 限制（防路径逃逸） ----
+      if (input.cwd) {
+        const absCwd = resolvePath(input.cwd, ctx.cwd)
+        if (!isWithinCwd(absCwd, rootDir)) {
+          return {
+            ok: false,
+            error: { message: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, code: 'SANDBOX_CWD' },
           }
-        } else {
-          ctx.signal.addEventListener('abort', () => {
+        }
+      }
+
+      // ---- 沙箱防护 2：危险命令检测 ----
+      if (dangerousPatterns.length > 0) {
+        const hit = detectDangerous(input.command, dangerousPatterns)
+        if (hit) {
+          return {
+            ok: false,
+            error: { message: `命令被沙箱判定为危险并拒绝执行（命中：${hit}）`, code: 'SANDBOX_DANGEROUS' },
+          }
+        }
+      }
+
+      // ---- 沙箱防护 3：命令白名单 ----
+      if (allowlist && allowlist.length > 0) {
+        const firstCmd = extractFirstCommand(input.command)
+        const allowed = allowlist.some((a) =>
+          firstCmd === a || input.command.trim().startsWith(a) || input.command.includes(a),
+        )
+        if (!allowed) {
+          return {
+            ok: false,
+            error: { message: `命令不在沙箱白名单内，已拒绝：${firstCmd}`, code: 'SANDBOX_ALLOWLIST' },
+          }
+        }
+      }
+
+      const cwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : rootDir
+      const timeoutMs = input.timeoutMs ?? DEFAULT_BASH_TIMEOUT
+      const startedAt = Date.now()
+
+      return new Promise((resolvePromise) => {
+        // ---- 沙箱防护 4：env 隔离（过滤敏感变量） ----
+        const inherited = config.sanitizeEnv === false ? process.env : sanitizeEnv(process.env, keepEnv)
+        const env = { ...inherited, ...input.env }
+        const child = spawn('bash', ['-c', input.command], {
+          cwd,
+          env,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+
+        let stdout = ''
+        let stderr = ''
+        let timedOut = false
+        let settled = false
+
+        const timer = setTimeout(() => {
+          if (!settled) {
+            timedOut = true
+            child.kill('SIGKILL')
+          }
+        }, timeoutMs)
+
+        child.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString('utf-8')
+          if (stdout.length > MAX_OUTPUT_CHARS) {
+            stdout = stdout.slice(0, MAX_OUTPUT_CHARS) + '\n... [stdout 已截断]'
+          }
+        })
+
+        child.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString('utf-8')
+          if (stderr.length > MAX_OUTPUT_CHARS) {
+            stderr = stderr.slice(0, MAX_OUTPUT_CHARS) + '\n... [stderr 已截断]'
+          }
+        })
+
+        child.on('error', (err) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolvePromise({
+            ok: false,
+            error: { message: `无法执行命令: ${err.message}`, code: 'SPAWN_ERROR', cause: err },
+          })
+        })
+
+        child.on('close', (code) => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          resolvePromise({
+            ok: true,
+            output: {
+              stdout,
+              stderr,
+              exitCode: code ?? (timedOut ? 124 : -1),
+              timedOut,
+              durationMs: Date.now() - startedAt,
+              command: input.command,
+            },
+          })
+        })
+
+        // 支持 AbortSignal
+        if (ctx.signal) {
+          if (ctx.signal.aborted) {
             if (!settled) {
               settled = true
               clearTimeout(timer)
@@ -433,12 +544,25 @@ export const bashTool = defineTool<BashInput, BashOutput>({
                 interrupted: true,
               })
             }
-          })
+          } else {
+            ctx.signal.addEventListener('abort', () => {
+              if (!settled) {
+                settled = true
+                clearTimeout(timer)
+                child.kill('SIGKILL')
+                resolvePromise({
+                  ok: false,
+                  error: { message: '操作被中断', code: 'ABORTED' },
+                  interrupted: true,
+                })
+              }
+            })
+          }
         }
-      }
-    })
-  },
-})
+      })
+    },
+  })
+}
 
 // ========================================================================
 // 4. edit_file 工具
@@ -582,6 +706,9 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
 // 5. AgentPlugin 入口
 // ========================================================================
 
+/** 默认 bash 工具（沙箱使用推荐配置） */
+export const bashTool: Tool<BashInput, BashOutput> = createBashTool()
+
 /** 内置工具列表（仅保留文件 I/O + Shell 四个原语；搜索类见 @harness/tools-search） */
 export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, editFileTool]
 
@@ -589,17 +716,19 @@ export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, edit
  * 内置 Tool 插件
  *
  * 通过 tool.pool.assemble Hook 把工具注入到工具池。
- * 可通过配置选择只注入部分工具。
+ * 可通过配置选择只注入部分工具，并配置 bash 沙箱。
  *
  * @param options.toolIds 可选：只注入指定 ID 的工具（默认全部）
+ * @param options.bash 可选：bash 沙箱配置（危险命令检测 / env 隔离 / cwd 限制 / 白名单）
  */
 export function createToolsBuiltinPlugin(options?: {
   toolIds?: string[]
+  bash?: BashSandboxConfig
 }): AgentPlugin {
   const toolIds = options?.toolIds
   const tools = toolIds
     ? builtinTools.filter((t) => toolIds.includes(t.id))
-    : builtinTools
+    : builtinTools.map((t) => t.id === 'bash' && options?.bash ? createBashTool(options.bash) : t)
 
   return {
     id: 'tools.builtin',
