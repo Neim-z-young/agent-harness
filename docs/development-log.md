@@ -1,5 +1,42 @@
 # Agent Harness 开发日志
 
+## 2026-08-31（续 40）：补全架构文档 + 工作区管理调研 + bash 沙箱宿主回退
+
+(user-request) 三项：①将最近提交中未记录的功能补进架构文档、提取规则到 AGENTS.md；②调研工作区管理模块并输出开发文档；③沙箱非破坏性命令失败后尝试提升宿主 bash 执行。
+
+### 架构文档补全（agent-harness-architecture.md）
+
+- 新增 §十二「命令审批交互链路」：check→ask 两步判定、safeExecuteTool 兜底、CliPermissionEngine、TUI 审批模态。
+- 新增 §十三「bash 沙箱安全防护与宿主回退」；新增 §十四「TUI 增强落地补全」（续 33~38 + 续 35：复制/选区/欢迎页/用量统计/命令回显）。
+- 新增 §十五「工作区 / 数据目录管理」（索引独立文档）。
+- 在 §十一 末尾补实现状态（模块 A~E 已落地）。
+
+### 提取规则到 AGENTS.md
+
+- 补充「check→ask 权限判定」「safeExecuteTool 兜底」「ToolPermissionDeniedError 用错误名判定」「permissions.json / /permission」「bash 沙箱 createBashTool 多层防护 + fallbackToHost 宿主回退 + viaHost」「bash ok 语义」「workspace 两级目录与 dataDir 约定」等规则。
+
+### 工作区管理模块调研（workspace-management.md）
+
+- 整理 dataDir（~/.harness）与 project（<cwd>/.harness）两级布局、各数据存储（sessions/config/permissions/.config-key/snapshot）、plugins/skills/agents 两级加载与覆盖规则。
+- 明确可抽成 `@harness/workspace` 的边界（只负责定位与解析，不含装配逻辑）。
+
+### bash 沙箱宿主回退（tools-builtin）
+
+- `createBashTool(config)` 新增 `fallbackToHost`：沙箱内非破坏性命令被白名单拦截 / spawn 失败 / 命令非零退出（如敏感 env 被隔离）时，提升到宿主 bash（放开白名单与 env 隔离、含系统 PATH）重跑，并在 `BashOutput.viaHost` 标注。
+- 危险命令检测前置硬性拒绝，宿主回退也不可豁免（安全红线）。
+- 修正 refactor 引入的 `ok` 语义：保持「执行成功即 ok:true，命令结果由 exitCode 反映」，回退触发改用 `exitCode !== 0` 判定，避免破坏既有用例（超时 kill、命令非零退出）。
+
+### 测试与验证
+
+- tools-builtin 新增回退用例：白名单外命令宿主回退 / 危险命令不可回退 / env 隔离致非零退出后宿主回退成功并标 viaHost。
+- tools-builtin 46 用例通过 + typecheck 通过（跑测试需补 `PATH=/bin:/usr/bin`，本机 shell PATH 被精简）。
+
+### 相关文档
+
+- [docs/agent-harness-architecture.md](docs/agent-harness-architecture.md)
+- [docs/workspace-management.md](docs/workspace-management.md)
+- [AGENTS.md](AGENTS.md)
+
 ## 2026-08-31（续 39）：命令审批交互 + bash 沙箱安全防护
 
 (user-request: 完善沙箱功能及命令审批) 本轮补齐「命令审批」的完整交互链路与「bash 沙箱」的多层安全防护。

@@ -1068,3 +1068,83 @@ Claude Code 文件副本方案保留为**非 git 项目 fallback**（见 10.4 �
 - `tui.test.tsx`：新增覆盖（1）后台任务快照归并、（2）`/resume` 换绑会话 + `messagesToBlocks`、（3）命令菜单候选/补全、（4）输入历史上滚、（5）帮助面板开关、（6）`/copy` 复制最近 assistant 块。
 - `cli.test.tsx`：`/resume` 命令在 REPL 层行为。
 - cli 全量用例 + typecheck 通过；development-log 记收尾。
+
+> **实现状态（2026-08-31 补录）**：模块 A/B/C/D 均已落地并收尾（development-log 续 30~34）。D 的两个"后续增强"项（鼠标点击复制、选区复制）也已实现：续 33 每消息「复制」按钮、续 34 选区复制 + 欢迎页。新增模块 E「侧栏用量统计面板」已在续 35 落地（见下）。
+
+## 十二、命令审批交互链路（续 39）
+
+> 记录日期：2026-08-31。权限从「规则匹配」升级为「可交互的审批链路」，并在 TUI 提供专属审批模态。核心代码：core [resolvePermission / safeExecuteTool](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts) + cli [CliPermissionEngine](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L751-L814) + TUI [审批模态](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx#L1222-L1232)。
+
+### 12.1 check → ask 两步判定
+
+`resolvePermission(engine, req)` 是工具调用的统一权限入口：
+
+- 先 `engine.check(req)`：按规则（tool 级/全局/路径级 glob）判定，返回 `allow | deny | ask`。
+- 只有当 `behavior === 'ask'` 时才调用 `engine.ask(req)`（交给上层交互器）。
+- 无交互器时引擎 `ask()` 默认 `deny`（保守拒绝），保证安全默认。
+
+### 12.2 工具执行兜底 safeExecuteTool
+
+`safeExecuteTool(pipeline, tool, input, tctx)` 捕获工具执行抛出的异常，归一化为「失败的 `ToolResult`」反馈给 LLM，避免权限拒绝等异常中断 agent 流：
+
+- 通过错误名 `err.name === 'ToolPermissionDeniedError'` 判定（不依赖类绑定），映射为 `code: 'PERMISSION_DENIED'`。
+- 其余异常映射为 `code: 'TOOL_ERROR'`。
+- 模型可据此调整行为，流程继续推进。
+
+### 12.3 CLI 权限引擎 CliPermissionEngine
+
+继承 `DefaultPermissionEngine`，为 REPL/TUI 提供可交互的 `ask()`，并支持规则持久化：
+
+- 交互模式 `mode`：`allow-all | ask | deny-all`，`ask` 模式下 prompt 用户选择 `allow / deny / always(save) / deny-always(save)`。
+- 永久规则写入 `dataDir/permissions.json`（`options.store.save`）。
+- `/permission` 命令：`/permission`（查看 mode 与规则）、`/permission allow-all|ask|deny-all`（切 mode）、`/permission <key>=<behavior>`（设工具规则，如 `bash=deny`）、`/permission reset`（恢复全局 ask 并清空规则）。
+
+### 12.4 TUI 审批模态
+
+TUI 通过 `app.permission.setAskPrompt(cb)` 接管 `ask` 交互，渲染审批弹层 + 全局快捷键：
+
+- 弹层提示命令与操作；`y/Shift-y` 允许/始终允许，`n/Shift-n` 拒绝/始终拒绝。
+- 每个时刻仅一个待决审批（`approvalResolveRef` 回填答案）。
+- 替换默认 readline 行内提问（REPL 环境的提问会被 TUI 覆盖），提升可见性与体验。
+
+## 十三、bash 沙箱安全防护与宿主回退
+
+> 记录日期：2026-08-31。内置 bash 工具通过 [createBashTool(config)](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/plugins/tools-builtin/src/index.ts#L414-L492) 工厂注入多层沙箱防护，并新增「宿主回退」提升非破坏性命令执行成功率。
+
+### 13.1 多层防护（config 控制）
+
+| 层 | 防护内容 | 关闭方式 |
+| --- | --- | --- |
+| 危险命令检测 | 命中默认/自定义危险正则（`rm -rf /`、fork bomb 等）即拒绝 | `dangerousDetection: false` |
+| cwd 限制 | cwd 必须位于 `rootDir`（默认 `ctx.cwd`）内，防路径逃逸 | — |
+| 命令白名单 | 配置后仅允许的首命令名/片段命令可执行 | `allowlist: []` |
+| env 隔离 | 过滤敏感变量（key/token/password/API key 等） | `sanitizeEnv: false` |
+
+危险命令检测**前置硬性拒绝**，即使开启宿主回退也不可豁免（安全红线）。
+
+### 13.2 宿主回退（fallbackToHost）
+
+`fallbackToHost: true` 时，沙箱内**非破坏性**命令出现以下情形会提升到宿主 bash 重跑，并在 `BashOutput.viaHost` 标注本次经宿主执行：
+
+- 被命令白名单拦截（白名单外非破坏性命令）→ 直接走宿主；
+- 沙箱内 spawn 失败或命令非零退出（如敏感 env 被隔离导致命令异常）→ 回退宿主重跑。
+
+宿主回退放开白名单与 env 隔离、使用用户完备环境（含系统 `PATH`）。`bash` 工具 `ok` 语义保持「执行成功即 ok，命令自身结果由 `exitCode` 反映」，仅在 spawn 失败或 AbortSignal 中断时 `ok: false`。
+
+## 十四、TUI 增强落地补全（续 33~38 + 续 35）
+
+> 记录日期：2026-08-31。十一为「计划」，本节约这些计划之外后续交付的落地特性。
+
+- **鼠标复制（续 33）**：每条消息提供可点击「复制」按钮，把 assistant 块文本写入系统剪贴板（spawn `pbcopy`）。
+- **选区复制 + 欢迎页（续 34）**：读取 OpenTUI 拖拽选区并复制；TUI 启动时无会话历史则显示欢迎页引导，`hasChat` 判定（`blocks.some(kind !== 'system'`）在产生任意用户/assistant/文本块时切换到对话布局。
+- **侧栏用量统计面板（续 35，模块 E）**：`packages/cli/src/usage-stats.ts` 累积 UsageStats（token 明细/维度时序），会话级持久化，`/stats` 与 `/stats-export` 报告导出，侧栏顶部图标 tab 实时展示。`/stats-export` 无参数补缺省时段、报错折叠为可复制文本（续 36 健壮性）。
+- **命令输入回显（续 38）**：REPL/TUI 命令分支在输出结果的同时回显 `🧑  ${line}` user 块，使命令进入对话历史并触发欢迎页切换，历史一致。
+- **/resume 修复（续 37）**：恢复会话后正确换绑 session，解决发送「Session not found」。
+
+## 十五、工作区 / 数据目录管理
+
+> 记录日期：2026-08-31。详见独立开发文档 [workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md)。本文档仅列出核心约定：
+
+- **两级加载**：user 级 `~/.harness/…` 与 project 级 `<cwd>/.harness/…`，project 覆盖 user。
+- **dataDir**：`args.dataDir ?? ~/.harness`，承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。
+- **可插拔目录**：`plugins` / `skills` / `agents` 均支持 user+project 两级，来源标注（内置/用户/项目/MCP/插件）。
