@@ -300,6 +300,9 @@ export interface BashSandboxConfig {
   keepEnv?: string[]
   /** 命令白名单（首命令名或完整命令片段，空/未设置则不限制） */
   allowlist?: string[]
+  /** 沙箱回退：非破坏性命令在沙箱内执行失败（被白名单拦截 / 遇 spawn/env 问题 / 命令非零退出）时，
+   *  尝试提升到宿主 bash 重跑（放开白名单与 env 隔离、补充系统 PATH）。默认 false 关闭。 */
+  fallbackToHost?: boolean
 }
 
 /** 默认危险命令正则表（命中即拒绝执行） */
@@ -385,6 +388,8 @@ export interface BashOutput {
   durationMs: number
   /** 执行的命令 */
   command: string
+  /** 是否经由沙箱回退到宿主 bash 执行（fallbackToHost 触发） */
+  viaHost?: boolean
 }
 
 /** 默认超时 30 秒 */
@@ -428,18 +433,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
 
-      // ---- 沙箱防护 1：cwd 限制（防路径逃逸） ----
-      if (input.cwd) {
-        const absCwd = resolvePath(input.cwd, ctx.cwd)
-        if (!isWithinCwd(absCwd, rootDir)) {
-          return {
-            ok: false,
-            error: { message: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, code: 'SANDBOX_CWD' },
-          }
-        }
-      }
-
-      // ---- 沙箱防护 2：危险命令检测 ----
+      // ---- 沙箱防护 2 前置：危险命令检测（无论是否回退都硬性拒绝，不可豁免） ----
       if (dangerousPatterns.length > 0) {
         const hit = detectDangerous(input.command, dangerousPatterns)
         if (hit) {
@@ -450,13 +444,32 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         }
       }
 
+      // ---- 沙箱防护 1：cwd 限制（防路径逃逸；回退到宿主同样不允许逃逸工作区根） ----
+      const requestedCwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : null
+      if (requestedCwd && !isWithinCwd(requestedCwd, rootDir)) {
+        return {
+          ok: false,
+          error: { message: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, code: 'SANDBOX_CWD' },
+        }
+      }
+
+      const timeoutMs = input.timeoutMs ?? DEFAULT_BASH_TIMEOUT
+      const cwd = requestedCwd ?? rootDir
+
+      // ---- 沙箱防护 4：env 隔离（过滤敏感变量） ----
+      const inherited = config.sanitizeEnv === false ? process.env : sanitizeEnv(process.env, keepEnv)
+      const sandboxEnv = { ...inherited, ...(input.env ?? {}) }
+
       // ---- 沙箱防护 3：命令白名单 ----
+      let allowlisted = true
       if (allowlist && allowlist.length > 0) {
         const firstCmd = extractFirstCommand(input.command)
-        const allowed = allowlist.some((a) =>
+        allowlisted = allowlist.some((a) =>
           firstCmd === a || input.command.trim().startsWith(a) || input.command.includes(a),
         )
-        if (!allowed) {
+        if (!allowlisted) {
+          // 白名单拦截但允许宿主回退：非破坏性命令提升到宿主 bash 执行
+          if (config.fallbackToHost) return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
           return {
             ok: false,
             error: { message: `命令不在沙箱白名单内，已拒绝：${firstCmd}`, code: 'SANDBOX_ALLOWLIST' },
@@ -464,103 +477,124 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         }
       }
 
-      const cwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : rootDir
-      const timeoutMs = input.timeoutMs ?? DEFAULT_BASH_TIMEOUT
-      const startedAt = Date.now()
+      // ---- 沙箱内执行 ----
+      const sandboxResult = await runBash({
+        command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal,
+      })
 
-      return new Promise((resolvePromise) => {
-        // ---- 沙箱防护 4：env 隔离（过滤敏感变量） ----
-        const inherited = config.sanitizeEnv === false ? process.env : sanitizeEnv(process.env, keepEnv)
-        const env = { ...inherited, ...input.env }
-        const child = spawn('bash', ['-c', input.command], {
-          cwd,
-          env,
-          stdio: ['ignore', 'pipe', 'pipe'],
-        })
+      // ---- 回退兜底：非破坏性命令在沙箱内未按预期执行（spawn 失败 / env 隔离开致命令非零退出）时提升到宿主 bash ----
+      if (!sandboxResult.interrupted && sandboxResult.output?.exitCode !== 0 && config.fallbackToHost) {
+        return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
+      }
 
-        let stdout = ''
-        let stderr = ''
-        let timedOut = false
-        let settled = false
+      return sandboxResult
+    },
+  })
+}
 
-        const timer = setTimeout(() => {
-          if (!settled) {
-            timedOut = true
-            child.kill('SIGKILL')
-          }
-        }, timeoutMs)
+/**
+ * 执行一条 bash 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
+ * viaHost=true 时在返回的 BashOutput 上标注，表示这次是宿主 bash 回退执行（放开白名单与 env 隔离）。
+ */
+function runBash(opts: {
+  command: string
+  cwd: string
+  env: Record<string, string | undefined>
+  timeoutMs: number
+  signal?: AbortSignal
+  viaHost?: boolean
+}): Promise<ToolResult<BashOutput>> {
+  const startedAt = Date.now()
+  return new Promise((resolvePromise) => {
+    const child = spawn('bash', ['-c', opts.command], {
+      cwd: opts.cwd,
+      env: opts.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
 
-        child.stdout?.on('data', (chunk: Buffer) => {
-          stdout += chunk.toString('utf-8')
-          if (stdout.length > MAX_OUTPUT_CHARS) {
-            stdout = stdout.slice(0, MAX_OUTPUT_CHARS) + '\n... [stdout 已截断]'
-          }
-        })
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    let settled = false
 
-        child.stderr?.on('data', (chunk: Buffer) => {
-          stderr += chunk.toString('utf-8')
-          if (stderr.length > MAX_OUTPUT_CHARS) {
-            stderr = stderr.slice(0, MAX_OUTPUT_CHARS) + '\n... [stderr 已截断]'
-          }
-        })
+    const timer = setTimeout(() => {
+      if (!settled) {
+        timedOut = true
+        child.kill('SIGKILL')
+      }
+    }, opts.timeoutMs)
 
-        child.on('error', (err) => {
-          if (settled) return
+    child.stdout?.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf-8')
+      if (stdout.length > MAX_OUTPUT_CHARS) {
+        stdout = stdout.slice(0, MAX_OUTPUT_CHARS) + '\n... [stdout 已截断]'
+      }
+    })
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf-8')
+      if (stderr.length > MAX_OUTPUT_CHARS) {
+        stderr = stderr.slice(0, MAX_OUTPUT_CHARS) + '\n... [stderr 已截断]'
+      }
+    })
+
+    child.on('error', (err) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolvePromise({
+        ok: false,
+        error: { message: `无法执行命令: ${err.message}`, code: 'SPAWN_ERROR', cause: err },
+      })
+    })
+
+    child.on('close', (code) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      // ok 语义：工具执行成功（命令实际跑起来），命令自身结果由 exitCode 反映。
+      // 仅在 spawn 失败或 AbortSignal 中断时才返回 ok:false。
+      resolvePromise({
+        ok: true as boolean,
+        output: {
+          stdout,
+          stderr,
+          exitCode: code ?? (timedOut ? 124 : -1),
+          timedOut,
+          durationMs: Date.now() - startedAt,
+          command: opts.command,
+          viaHost: opts.viaHost,
+        },
+      })
+    })
+
+    if (opts.signal) {
+      if (opts.signal.aborted) {
+        if (!settled) {
           settled = true
           clearTimeout(timer)
+          child.kill('SIGKILL')
           resolvePromise({
             ok: false,
-            error: { message: `无法执行命令: ${err.message}`, code: 'SPAWN_ERROR', cause: err },
+            error: { message: '操作被中断', code: 'ABORTED' },
+            interrupted: true,
           })
-        })
-
-        child.on('close', (code) => {
-          if (settled) return
-          settled = true
-          clearTimeout(timer)
-          resolvePromise({
-            ok: true,
-            output: {
-              stdout,
-              stderr,
-              exitCode: code ?? (timedOut ? 124 : -1),
-              timedOut,
-              durationMs: Date.now() - startedAt,
-              command: input.command,
-            },
-          })
-        })
-
-        // 支持 AbortSignal
-        if (ctx.signal) {
-          if (ctx.signal.aborted) {
-            if (!settled) {
-              settled = true
-              clearTimeout(timer)
-              child.kill('SIGKILL')
-              resolvePromise({
-                ok: false,
-                error: { message: '操作被中断', code: 'ABORTED' },
-                interrupted: true,
-              })
-            }
-          } else {
-            ctx.signal.addEventListener('abort', () => {
-              if (!settled) {
-                settled = true
-                clearTimeout(timer)
-                child.kill('SIGKILL')
-                resolvePromise({
-                  ok: false,
-                  error: { message: '操作被中断', code: 'ABORTED' },
-                  interrupted: true,
-                })
-              }
+        }
+      } else {
+        opts.signal.addEventListener('abort', () => {
+          if (!settled) {
+            settled = true
+            clearTimeout(timer)
+            child.kill('SIGKILL')
+            resolvePromise({
+              ok: false,
+              error: { message: '操作被中断', code: 'ABORTED' },
+              interrupted: true,
             })
           }
-        }
-      })
-    },
+        })
+      }
+    }
   })
 }
 

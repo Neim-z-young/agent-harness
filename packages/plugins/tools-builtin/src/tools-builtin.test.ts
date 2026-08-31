@@ -319,6 +319,34 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.code).toBe('SANDBOX_ALLOWLIST')
     })
 
+    it('sandbox 回退：fallbackToHost 时白名单外非破坏性命令提升到宿主 bash 执行', async () => {
+      const tool = createBashTool({ allowlist: ['echo'], fallbackToHost: true })
+      const res = await tool.call({ command: 'ls', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(true)
+      expect(res.output!.viaHost).toBe(true)
+    })
+
+    it('sandbox 回退：危险命令即使 fallbackToHost 也硬性拒绝（不可豁免）', async () => {
+      const tool = createBashTool({ fallbackToHost: true })
+      const res = await tool.call({ command: 'rm -rf /', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+    })
+
+    it('sandbox 回退：沙箱内非零退出（env 被隔离）时回退宿主 bash 后成功并标注 viaHost', async () => {
+      const tool = createBashTool({ fallbackToHost: true })
+      // 该变量名命中敏感 /API_KEY/，在沙箱内被隔离；宿主 bash 回退时用户完备 env 可读到
+      process.env.__FALLBACK_TEST_API_KEY = 'present'
+      const res = await tool.call(
+        { command: 'test -n "$__FALLBACK_TEST_API_KEY"' },
+        makeCtx(),
+      )
+      delete process.env.__FALLBACK_TEST_API_KEY
+      // 沙箱内因变量被隔离 → test 非零退出 → 回退宿主 bash（env 完备）→ 成功
+      expect(res.ok).toBe(true)
+      expect(res.output!.viaHost).toBe(true)
+    })
+
     it('env 隔离：过滤敏感变量，保留必要变量', async () => {
       const tool = createBashTool()
       // 模拟敏感 + 保留变量
