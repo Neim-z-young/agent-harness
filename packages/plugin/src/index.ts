@@ -189,6 +189,26 @@ export interface CliCommandsInput {
   commands: CliCommandDef[]
 }
 
+/**
+ * 内置工具静态元信息条目（多级加载 L1）。
+ * 由 cli 注入；工具本身（运行时模块 L2）未加载时也能据此展示描述/别名/安全声明/权限键。
+ */
+export interface ToolMetaEntry {
+  id: string
+  description?: string
+  aliases?: string[]
+  isReadOnly?: boolean
+  isDestructive?: boolean
+  isConcurrencySafe?: boolean
+  permissionKey?: string
+}
+
+/** cli 注入：内置工具静态元信息访问（按 id/别名查找、列出） */
+export interface ToolMetaLookup {
+  get(id: string): ToolMetaEntry | undefined
+  list(): ToolMetaEntry[]
+}
+
 /** cli.command hook 的输入 */
 export interface CliCommandInput {
   /** 原始命令行（不含前缀 /） */
@@ -216,6 +236,11 @@ export interface CliCommandInput {
    * cli 注入：harness 能力访问（工具启停等运行时操作）。具体子字段由消费插件自行类型化。
    */
   harness?: unknown
+  /**
+   * cli 注入：内置工具静态元信息查找（多级加载 L1）。
+   * 供工具管理命令在对应工具运行时模块未加载/懒加载时也能展示描述、别名、安全声明与权限键。
+   */
+  toolMeta?: ToolMetaLookup
 }
 
 // ===== AgentPlugin 接口 =====

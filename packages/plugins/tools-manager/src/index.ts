@@ -15,7 +15,7 @@
  * 作用域 B 在插件内部缓存被卸载的 Tool 以便 on 时恢复。
  */
 
-import type { CliCommandInput, AgentPlugin, Hooks } from '@harness/plugin'
+import type { CliCommandInput, AgentPlugin, Hooks, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
 
 /** cli 注入的 harness 能力视图（由消费侧类型化 harness?: unknown） */
@@ -40,12 +40,82 @@ type ToolsCtx = Omit<CliCommandInput, 'harness'> & {
 
 const FLAGS = new Set(['--all', '--json', '--global'])
 
-function formatTool(t: Tool): string {
+/** 归一化「运行时 Tool（isXxx 为函数）或静态元信息（isXxx 为布尔）」的安全声明到统一布尔视图 */
+function entryFlags(t: Tool | ToolMetaEntry): { readOnly: boolean; destructive: boolean; concurrent: boolean } {
+  const asTool = t as Tool
+  const readOnly = typeof t.isReadOnly === 'function' ? asTool.isReadOnly?.(undefined) : t.isReadOnly
+  const destructive = typeof t.isDestructive === 'function' ? asTool.isDestructive?.(undefined) : t.isDestructive
+  const concurrent = typeof t.isConcurrencySafe === 'function' ? asTool.isConcurrencySafe?.(undefined) : t.isConcurrencySafe
+  return { readOnly: !!readOnly, destructive: !!destructive, concurrent: !!concurrent }
+}
+
+/** 判断是否仅元信息（未加载运行时）——无 call 实现即视为 meta 占位 */
+function isMetaEntry(t: Tool | ToolMetaEntry): t is ToolMetaEntry {
+  return !('call' in t)
+}
+
+/** 合并「已加载运行时工具 + 内置静态元信息兜底」：未加载的内置工具也能展示，标记 (meta) */
+function unionTools(loaded: Tool[], meta: ToolMetaLookup | undefined): Array<Tool | ToolMetaEntry> {
+  const seen = new Set<string>()
+  const result: Array<Tool | ToolMetaEntry> = []
+  for (const t of loaded) {
+    result.push(t)
+    seen.add(t.id)
+  }
+  for (const m of meta?.list() ?? []) {
+    if (!seen.has(m.id)) {
+      result.push(m)
+      seen.add(m.id)
+    }
+  }
+  return result
+}
+
+function formatTool(t: Tool | ToolMetaEntry): string {
+  const { readOnly, destructive } = entryFlags(t)
   const flags: string[] = []
-  if (t.isReadOnly?.(undefined)) flags.push('只读')
-  if (t.isDestructive?.(undefined)) flags.push('危险')
+  if (readOnly) flags.push('只读')
+  if (destructive) flags.push('危险')
   const meta = flags.length ? ` [${flags.join(',')}]` : ''
-  return `  ${t.id.padEnd(22)}${(t.description ?? '').slice(0, 42)}${meta}`
+  const suffix = isMetaEntry(t) ? ' (meta)' : ''
+  return `  ${t.id.padEnd(22)}${(t.description ?? '').slice(0, 42)}${meta}${suffix}`
+}
+
+/** 详情视图的安全声明文本 */
+function formatSafety(t: Tool | ToolMetaEntry): string {
+  const { readOnly, destructive, concurrent } = entryFlags(t)
+  return [
+    readOnly ? '只读' : '可写',
+    destructive ? '危险' : '',
+    concurrent === false ? '非并发' : '',
+  ].filter(Boolean).join(' / ') || '-'
+}
+
+/** 详情视图：优先运行时工具；未加载则回退内置静态元信息（并标注） */
+function renderDetail(inp: ToolsCtx, toolArg: string): void {
+  const harness = inp.harness
+  const t = harness.tools.get(toolArg)
+  const out = inp.out
+  if (!t) {
+    const m = inp.toolMeta?.get(toolArg)
+    if (m) {
+      out(`工具：${m.id}（运行时未加载，以下为内置静态元信息）\n`
+        + `  描述：${m.description ?? ''}\n`
+        + `  别名：${m.aliases?.join(', ') ?? '-'}\n`
+        + `  权限键：${m.permissionKey ?? '-'}\n`
+        + `  安全：${formatSafety(m)}\n`)
+      return
+    }
+    out(`工具 "${toolArg}" 未找到（先看 /tools --all 确认 id）。\n`)
+    return
+  }
+  const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
+  const enabled = agentTools.includes('*') || harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
+  out(`工具：${t.id}\n`
+    + `  描述：${t.description ?? ''}\n`
+    + `  别名：${t.aliases?.join(', ') ?? '-'}\n`
+    + `  安全：${formatSafety(t)}\n`
+    + `  当前 Agent 启用：${enabled ? '是' : '否'}\n`)
 }
 
 export function createToolsManagerPlugin(): AgentPlugin {
@@ -76,16 +146,18 @@ export function createToolsManagerPlugin(): AgentPlugin {
         // 列表视图
         if (body.length === 0) {
           if (hasAll || hasJson) {
-            const all = harness.tools.list()
+            // 合并未加载的运行时工具：以内置静态元信息兜底，保证懒加载时也能看到全部内置工具
+            const all = unionTools(harness.tools.list(), inp.toolMeta)
             if (hasJson) {
               out(JSON.stringify(all.map((t) => ({
                 id: t.id, description: t.description, aliases: t.aliases,
-                isReadOnly: t.isReadOnly?.(undefined) ?? false,
-                isDestructive: t.isDestructive?.(undefined) ?? false,
-                isConcurrencySafe: t.isConcurrencySafe?.(undefined) ?? false,
+                isReadOnly: t.isReadOnly ? (typeof t.isReadOnly === 'function' ? (t as Tool).isReadOnly?.(undefined) ?? false : t.isReadOnly) : false,
+                isDestructive: t.isDestructive ? (typeof t.isDestructive === 'function' ? (t as Tool).isDestructive?.(undefined) ?? false : t.isDestructive) : false,
+                isConcurrencySafe: t.isConcurrencySafe ? (typeof t.isConcurrencySafe === 'function' ? (t as Tool).isConcurrencySafe?.(undefined) ?? false : t.isConcurrencySafe) : false,
+                permissionKey: (t as { permission?: { key?: string } }).permission?.key,
               })), null, 2) + '\n')
             } else {
-              out(`全局注册 ${all.length} 个工具：\n${all.map(formatTool).join('\n')}\n`)
+              out(`全局注册 ${all.length} 个工具（含未加载的静态元信息）：\n${all.map(formatTool).join('\n')}\n`)
             }
             return
           }
@@ -136,22 +208,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
 
         // 详情视图（无动作）
         if (!action) {
-          const t = harness.tools.get(toolArg)
-          if (!t) {
-            out(`工具 "${toolArg}" 未找到（先看 /tools --all 确认 id）。\n`)
-            return
-          }
-          const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
-          const enabled = agentTools.includes('*') || harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
-          out(`工具：${t.id}\n`
-            + `  描述：${t.description ?? ''}\n`
-            + `  别名：${t.aliases?.join(', ') ?? '-'}\n`
-            + `  安全：${[
-              t.isReadOnly?.(undefined) ? '只读' : '可写',
-              t.isDestructive?.(undefined) ? '危险' : '',
-              t.isConcurrencySafe?.(undefined) === false ? '非并发' : '',
-            ].filter(Boolean).join(' / ') || '-'}\n`
-            + `  当前 Agent 启用：${enabled ? '是' : '否'}\n`)
+          renderDetail(inp, toolArg)
           return
         }
 

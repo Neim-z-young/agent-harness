@@ -35,10 +35,14 @@ import type { AgentPlugin, PluginContext, ProviderConfig, ProviderTypeFactory, P
 import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
 // 运行时能力抽象契约（@harness/plugin）：cli 仅经下方面向 subagent / swarm 的抽象接口交互，
 // 不依赖具体实现类型。具体能力对象（subagentCapability / swarmCapability）由插件包导出并在组合根装配。
-import type { BackgroundTaskViewLike } from '@harness/plugin'
+import type { BackgroundTaskViewLike, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
 // 内置 Provider 模块与 tools-builtin 一律惰性加载（见 lazyImport / registerBuiltinProviderTypes）：
 // 这里只保留类型导入，运行时值经动态 import() 在真正用到时才加载，避免拖慢启动。
+// 例外：tools-builtin 的「静态元信息」（meta）为纯数据、无副作用，可提前加载（多级加载 L1，
+// 见 BuiltinToolRegistry）；对应的运行时工具模块（L2）仍经 getBuiltinRegistry().load() 惰性/后台加载。
 import type { MockProviderConfig } from '@harness/provider-mock'
+// 内置工具静态元信息（多级加载 L1）：不含运行时工具实现，可提前登记供 /tools 等展示
+import { builtinToolMetas, type BuiltinToolMeta } from '@harness/tools-builtin/meta'
 // subagent / swarm 均为内置插件（组合根直连），cli 经其导出的能力对象（抽象契约）交互
 import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -450,6 +454,58 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
     })
   }
   return defaultBuiltinRegistry
+}
+
+// ------------------------------------------------------------------------
+// 2.2.2 内置工具静态元信息注册表 —— 多级加载 L1（描述可提前加载，运行时模块 L2 保持惰性/后台）
+// ------------------------------------------------------------------------
+
+/**
+ * 内置工具静态元信息注册表（多级加载 L1）。
+ *
+ * 在 boot 早期同步登记全部内置工具的 meta（描述/别名/安全声明/权限键），
+ * 无需加载对应的运行时工具模块（L2），即可供 REPL `/tools`、help 等展示。
+ * 实现 `ToolMetaLookup` 契约，注入 cli.command 输入供工具管理插件合并展示。
+ */
+export class BuiltinToolRegistry implements ToolMetaLookup {
+  private readonly byId = new Map<string, BuiltinToolMeta>()
+
+  register(m: BuiltinToolMeta): void {
+    this.byId.set(m.id, m)
+  }
+  registerAll(metas: BuiltinToolMeta[]): void {
+    for (const m of metas) this.register(m)
+  }
+  has(id: string): boolean {
+    return this.byId.has(id)
+  }
+  get(id: string): BuiltinToolMeta | undefined {
+    if (this.byId.has(id)) return this.byId.get(id)
+    for (const m of this.byId.values()) {
+      if (m.aliases?.includes(id)) return m
+    }
+    return undefined
+  }
+  list(): BuiltinToolMeta[] {
+    return [...this.byId.values()]
+  }
+  get size(): number {
+    return this.byId.size
+  }
+}
+
+let defaultToolMetaRegistry: BuiltinToolRegistry | undefined
+
+/**
+ * 全局默认内置工具元信息注册表：首次调用时同步登记 builtinToolMetas（纯数据，即时可用）。
+ * 供 boot boot 早期调用，保证 /tools 等命令在任何运行时模块加载前即可展示内置工具描述。
+ */
+export function getBuiltinToolRegistry(): BuiltinToolRegistry {
+  if (!defaultToolMetaRegistry) {
+    defaultToolMetaRegistry = new BuiltinToolRegistry()
+    defaultToolMetaRegistry.registerAll(builtinToolMetas)
+  }
+  return defaultToolMetaRegistry
 }
 
 /**
@@ -864,6 +920,8 @@ export interface HarnessAppOptions {
    * 并挂载 meta.snapshot），REPL 提供 /revert stage|clear|commit|status。
    */
   snapshot?: boolean
+  /** 是否启用 boot 末尾的后台静默预加载内置插件/工具（多级加载 L2，默认 true）。设为 false 关闭。 */
+  backgroundPreload?: boolean
 }
 
 export class HarnessApp {
@@ -1126,6 +1184,10 @@ export class HarnessApp {
 
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
   async boot(): Promise<{ harness: Harness; session: Session }> {
+    // 多级加载 L1：早期同步登记内置工具静态元信息（描述/别名/安全），
+    // 保证后续 /tools 等命令在任何运行时工具模块（L2）加载前即可展示内置工具描述。
+    getBuiltinToolRegistry()
+
     const rules = await this.loadRules()
     const mode = this.options.permissionMode ?? 'ask'
     const perm = new CliPermissionEngine(rules, {
@@ -1309,6 +1371,10 @@ export class HarnessApp {
     await harness.start()
     this.harness = harness
 
+    // 多级加载 L2：boot 末尾后台静默预加载内置插件/工具（fire-and-forget，
+    // allSettled，失败仅记录日志，不阻塞 boot、不向上抛错）。
+    this.scheduleBuiltinPreload()
+
     // 会话：恢复 / 新建
     const sm = harness.session
     let session: Session
@@ -1361,6 +1427,34 @@ export class HarnessApp {
     const sess = await this.harness.session.list({ limit: 1 })
     if (sess?.[0]) await this.sessionStore.save(sess[0])
     await this.harness.stop()
+  }
+
+  /**
+   * 多级加载 L2 —— boot 末尾后台静默预加载内置插件/工具。
+   *
+   * fire-and-forget：不阻塞 boot、不向上抛错；经 Promise.allSettled 采集结果，
+   * 失败仅向 stdout 写一条 WARN 日志。职责：
+   * 1) 预热已登记的内置插件（tools-builtin / tools-manager 等，动态 import 已被运行时缓存，重复调用开销极低）；
+   * 2) 为后续追加到 BuiltinPluginRegistry 的可选插件提供统一的静默后台加载机制。
+   */
+  private scheduleBuiltinPreload(): void {
+    const stdout = this.options.stdout
+    const verbose = this.options.verbose
+    if (this.options.backgroundPreload === false) return
+    const items = getBuiltinRegistry().list()
+    if (!items.length) return
+    void (async () => {
+      const results = await Promise.allSettled(items.map((p) => p.load()))
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i]!
+        const r = results[i]!
+        if (r.status === 'rejected') {
+          stdout?.write?.(`[WARN] 内置插件「${item.id}」后台预加载失败：${(r.reason as Error)?.message ?? String(r.reason)}\n`)
+        } else if (verbose) {
+          stdout?.write?.(`[INFO] 内置插件「${item.id}」已后台预热。\n`)
+        }
+      }
+    })()
   }
 
   get _harness(): Harness { return this.harness }
@@ -1897,11 +1991,12 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           return 'continue'
         }
         default: {
-          // 尝试交给插件处理（注入 harness / 当前 agentId / 持久化工具白名单接口）
+          // 尝试交给插件处理（注入 harness / 当前 agentId / 持久化工具白名单接口 / 工具静态元信息）
           const cmdInput: {
             raw: string; command: string; arg: string; out: (s: string) => void; sessionId: string;
             harness: Harness; agentId?: string;
             setAgentTools: (agentId: string, tools: string[]) => Promise<void>;
+            toolMeta: ToolMetaLookup;
             result?: 'continue' | 'exit'
           } = {
             raw: line.slice(1),
@@ -1912,6 +2007,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             harness,
             agentId: current.agentId,
             setAgentTools: (id, tools) => app.setAgentTools(id, tools),
+            toolMeta: getBuiltinToolRegistry(),
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)

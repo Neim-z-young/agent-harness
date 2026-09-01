@@ -18,6 +18,8 @@ import {
   buildConfigOverview,
   registerBuiltinProviderTypes,
   getBuiltinRegistry,
+  getBuiltinToolRegistry,
+  BuiltinToolRegistry,
   loadPluginDirs,
   startRepl,
   attachBackgroundTaskPanel,
@@ -342,6 +344,53 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     const p = await reg.get('tools-builtin')!.load()
     expect(p.id).toBeDefined()
     expect(typeof p.install).toBe('function')
+  })
+
+  it('BuiltinToolRegistry（多级加载 L1）：同步登记内置工具元信息，无需加载运行时模块即可描述', () => {
+    const reg = getBuiltinToolRegistry()
+    expect(reg instanceof BuiltinToolRegistry).toBe(true)
+    // 覆盖全部内置原语工具
+    for (const id of ['read_file', 'write_file', 'bash', 'edit_file']) {
+      expect(reg.has(id)).toBe(true)
+    }
+    // 描述可提前取得（运行时模块是否加载都无关）
+    const bash = reg.get('bash')!
+    expect(bash.description).toContain('shell')
+    expect(bash.permissionKey).toBe('bash')
+    expect(bash.isDestructive).toBe(true)
+    // 别名在未加载时也能查到
+    const reg2 = new BuiltinToolRegistry()
+    reg2.register({ id: 'x_file', aliases: ['xf'], description: 'x' })
+    expect(reg2.get('xf')?.id).toBe('x_file')
+  })
+
+  it('boot 末尾后台静默预加载（fire-and-forget）：不阻塞 boot，verbose 下预热有日志、关闭开关则无', async () => {
+    const verboseChunks: string[] = []
+    const vApp = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', verbose: true,
+      stdout: { write: (s: string) => { verboseChunks.push(s) } },
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const vBoot = await vApp.boot() // boot 正常返回，不被后台预加载阻塞
+    expect(typeof vBoot.session.id).toBe('string')
+    // 等待 fire-and-forget 的 Promise.allSettled 完成
+    await new Promise((r) => setTimeout(r, 100))
+    expect(verboseChunks.some((s) => s.includes('已后台预热'))).toBe(true)
+    await vApp.shutdown()
+
+    // backgroundPreload:false → 不触发后台预加载，无预热日志
+    const quietChunks: string[] = []
+    const qApp = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', verbose: true, backgroundPreload: false,
+      stdout: { write: (s: string) => { quietChunks.push(s) } },
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    await qApp.boot()
+    await new Promise((r) => setTimeout(r, 50))
+    expect(quietChunks.some((s) => s.includes('已后台预热'))).toBe(false)
+    await qApp.shutdown()
   })
 
   it('loadPluginDirs：从 plugins 目录加载 Provider 类型工厂（providerType + createProviderPlugin 约定）', async () => {

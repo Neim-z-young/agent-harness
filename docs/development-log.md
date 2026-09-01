@@ -59,6 +59,41 @@
 - 修复：hook 用 `try/finally` 统一在 `finally` 置 `input.result = 'continue'`，任何分支（含空列表）都不会 fallthrough。
 - 测试：`run()` 返回 input，列表 / off 用例断言 `result === 'continue'`，防止回归。
 
+## 2026-09-02（续 46）优化懒加载：后台静默加载 + 多级加载（描述提前加载）
+
+> 承接续 45 的 `/tools`。目标是让启动更快、`/tools` 信息即时可看：把「静态元信息」与「运行时模块」拆成两级加载。
+
+### 问题
+
+- `/tools` 依赖运行时工具模块（L2）加载完成后才有 `harness.tools`，懒加载切换期间 `/tools` 未显示/滞后显示工具信息。
+- 内置插件用 `lazyImport` 惰性加载，但缺少"描述提前可用"与"失败静默"机制。
+
+### 设计：多级加载（L1 描述 / L2 模块）
+
+- **L1（静态元信息，启动即可用）**：新增 `packages/plugins/tools-builtin/src/meta.ts` —— 纯静态 `BUILTIN_TOOL_META`（id/描述/别名/安全声明/权限键），**无副作用、不 import index.ts**（保证不含 `node:child_process` 等重依赖）。经子路径 `@harness/tools-builtin/meta` 导出（package.json `exports` + 根 tsconfig `paths`）。
+- **L2（运行时模块，惰性/后台）**：`BuiltinPluginRegistry` 的 `load()` 动态 import 真正的工具实现，保持不变。
+- cli 新增 `BuiltinToolRegistry`（实现 `ToolMetaLookup`）：`boot()` 早期 `getBuiltinToolRegistry()` 同步登记全部内置工具 meta；REPL 的 `cli.command` 输入注入 `toolMeta`。
+
+### 后台静默加载
+
+- `HarnessApp.scheduleBuiltinPreload()`：boot 末尾 **fire-and-forget** 后台预加载内置插件/工具，经 `Promise.allSettled` 采集，失败仅写 `[WARN]`，不阻塞 boot、不抛错。`options.backgroundPreload === false` 可关闭。
+
+### tools-manager 合并展示
+
+- `/tools --all`/`--json`：`unionTools(已加载, toolMeta)` 合并未加载的内置工具（`(meta)` 标记）。
+- `/tools <id>` 详情：运行时未加载时回退内置 meta（标注"运行时未加载，以下为内置静态元信息"）。
+- 归一化 `entryFlags`：兼容运行时 `isXxx`（函数）与 meta `isXxx`（布尔）两种形态。
+
+### @harness/plugin 扩展
+
+- `CliCommandInput` 新增可选 `toolMeta?: ToolMetaLookup`；导出 `ToolMetaEntry` / `ToolMetaLookup` 类型。
+
+### 测试
+
+- tools-builtin `meta.test.ts` 4 例：登记表覆盖全 / 非空 / 长度一致 / 静态安全字段。
+- cli 新增 2 例：`BuiltinToolRegistry` 同步登记+别名查找；`backgroundPreload` 后台预热有日志、`false` 关闭无日志且 boot 不阻塞。
+- 全量 typecheck 通过；tools-builtin（60）/ tools-manager（7）/ cli（155）测试通过。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。
