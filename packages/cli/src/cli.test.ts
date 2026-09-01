@@ -372,6 +372,11 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     const reg2 = new BuiltinToolRegistry()
     reg2.register({ id: 'x_file', aliases: ['xf'], description: 'x' })
     expect(reg2.get('xf')?.id).toBe('x_file')
+    // ToolMetaSource 抽象契约：registerSource 合并来源 list() 元信息
+    const reg3 = new BuiltinToolRegistry()
+    reg3.registerSource({ id: 'src-a', description: 'a', list: () => [{ id: 'y_file', description: 'y' }] })
+    expect(reg3.has('y_file')).toBe(true)
+    expect(reg3.get('y_file')?.description).toBe('y')
   })
 
   it('boot 末尾后台静默预加载（fire-and-forget）：不阻塞 boot，verbose 下预热有日志、关闭开关则无', async () => {

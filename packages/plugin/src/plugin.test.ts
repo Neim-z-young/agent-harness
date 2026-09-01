@@ -14,6 +14,7 @@ import {
   PluginUninstallError,
   ProviderTypeRegistry,
   createPluginManager,
+  createToolMetaRegistry,
   resolveProviderTypeFactory,
   topologicalSortPlugins,
 } from './index'
@@ -617,6 +618,54 @@ describe('@harness/plugin', () => {
     it('resolveProviderTypeFactory：无契约模块返回 undefined', () => {
       expect(resolveProviderTypeFactory({ foo: 1 })).toBeUndefined()
       expect(resolveProviderTypeFactory({ providerTypeFactory: 42 })).toBeUndefined()
+    })
+  })
+
+  describe('ToolMetaRegistry（工具静态元信息抽象契约）', () => {
+    it('createToolMetaRegistry：登记来源合并其 list() 元信息', () => {
+      const reg = createToolMetaRegistry()
+      reg.registerSource({
+        id: 'src-a',
+        description: 'source a',
+        list: () => [
+          { id: 'a1', description: 'tool a1', permissionKey: 'read' },
+          { id: 'a2', description: 'tool a2', aliases: ['a2x'], isReadOnly: true },
+        ],
+      })
+      expect(reg.size).toBe(2)
+      expect(reg.list().map((m) => m.id).sort()).toEqual(['a1', 'a2'])
+    })
+
+    it('get：按 id 精确命中，别名亦可反查', () => {
+      const reg = createToolMetaRegistry()
+      reg.registerSource({
+        id: 'src-b',
+        list: () => [{ id: 'b1', description: 'b', aliases: ['b1alias'] }],
+      })
+      expect(reg.get('b1')?.description).toBe('b')
+      expect(reg.get('b1alias')?.id).toBe('b1')
+      expect(reg.get('missing')).toBeUndefined()
+    })
+
+    it('多来源登记互不干扰，后登记同 id 覆盖', () => {
+      const reg = createToolMetaRegistry()
+      reg.registerSource({ id: 's1', list: () => [{ id: 'x', description: 'v1' }] })
+      reg.registerSource({ id: 's2', list: () => [{ id: 'y', description: 'v2' }] })
+      expect(reg.size).toBe(2)
+      reg.registerSource({ id: 's3', list: () => [{ id: 'x', description: 'v3' }] })
+      expect(reg.get('x')?.description).toBe('v3')
+      expect(reg.size).toBe(2)
+    })
+
+    it('ToolMetaSource 可由纯静态数据实现（不依赖运行时模块）', () => {
+      const source = {
+        id: 'static',
+        description: 'static source',
+        list: () => [{ id: 's', description: 'static tool' }],
+      }
+      const reg = createToolMetaRegistry()
+      reg.registerSource(source)
+      expect(reg.get('s')?.id).toBe('s')
     })
   })
 })

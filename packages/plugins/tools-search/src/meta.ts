@@ -9,6 +9,7 @@
  */
 
 import type { BuiltinToolMeta } from '@harness/tools-builtin/meta'
+import type { ToolMetaSource } from '@harness/plugin'
 
 /** 搜索类工具：list_dir + grep_file */
 export const SEARCH_TOOL_META: BuiltinToolMeta[] = [
@@ -27,3 +28,10 @@ export const SEARCH_TOOL_META: BuiltinToolMeta[] = [
     permissionKey: 'read',
   },
 ]
+
+/** 搜索类工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
+export const toolMetaSource: ToolMetaSource = {
+  id: 'tools-search',
+  description: '搜索类工具插件：list_dir 目录列举 + grep_file 内容检索',
+  list: () => SEARCH_TOOL_META,
+}

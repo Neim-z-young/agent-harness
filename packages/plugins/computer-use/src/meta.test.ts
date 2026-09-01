@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { COMPUTER_USE_TOOL_META } from './meta'
+import { COMPUTER_USE_TOOL_META, toolMetaSource } from './meta'
 
 describe('computer-use 静态元信息（多级加载 L1）', () => {
   it('覆盖全部 MCP 工具，id 前缀 mcp__computer-use__', () => {
@@ -22,5 +22,10 @@ describe('computer-use 静态元信息（多级加载 L1）', () => {
     for (const m of COMPUTER_USE_TOOL_META.filter((m) => m.permissionKey === 'write')) expect(m.isReadOnly).toBe(false)
     // MCP 工具一律非并发安全（与 convertMcpToolToHarnessTool 的保守声明一致）
     for (const m of COMPUTER_USE_TOOL_META) expect(m.isConcurrencySafe).toBe(false)
+  })
+
+  it('toolMetaSource 实现 ToolMetaSource 抽象契约，list() 与元信息一致', () => {
+    expect(toolMetaSource.id).toBe('computer-use')
+    expect(toolMetaSource.list()).toEqual(COMPUTER_USE_TOOL_META)
   })
 })

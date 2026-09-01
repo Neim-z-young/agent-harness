@@ -35,19 +35,21 @@ import type { AgentPlugin, PluginContext, ProviderConfig, ProviderTypeFactory, P
 import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
 // 运行时能力抽象契约（@harness/plugin）：cli 仅经下方面向 subagent / swarm 的抽象接口交互，
 // 不依赖具体实现类型。具体能力对象（subagentCapability / swarmCapability）由插件包导出并在组合根装配。
-import type { BackgroundTaskViewLike, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
+import type { BackgroundTaskViewLike, ToolMetaEntry, ToolMetaLookup, ToolMetaRegistry, ToolMetaSource } from '@harness/plugin'
 // 内置 Provider 模块与 tools-builtin 一律惰性加载（见 lazyImport / registerBuiltinProviderTypes）：
 // 这里只保留类型导入，运行时值经动态 import() 在真正用到时才加载，避免拖慢启动。
 // 例外：tools-builtin 的「静态元信息」（meta）为纯数据、无副作用，可提前加载（多级加载 L1，
 // 见 BuiltinToolRegistry）；对应的运行时工具模块（L2）仍经 getBuiltinRegistry().load() 惰性/后台加载。
 import type { MockProviderConfig } from '@harness/provider-mock'
-// 内置工具静态元信息（多级加载 L1）：不含运行时工具实现，可提前登记供 /tools 等展示
-import { builtinToolMetas, type BuiltinToolMeta } from '@harness/tools-builtin/meta'
-import { SEARCH_TOOL_META as searchToolMetas } from '@harness/tools-search/meta'
-import { GLOB_TOOL_META as globToolMetas } from '@harness/tools-glob/meta'
-import { WEB_TOOL_META as webToolMetas } from '@harness/tools-web/meta'
-import { MEDIA_TOOL_META as mediaToolMetas } from '@harness/tools-media/meta'
-import { COMPUTER_USE_TOOL_META as computerUseToolMetas } from '@harness/computer-use/meta'
+// 内置工具静态元信息来源（多级加载 L1，抽象契约 ToolMetaSource）：
+// 各工具插件以 toolMetaSource 自描述，CLI 经 ToolMetaRegistry 统一登记，不硬编码各包的具体导出形态。
+// 仅消费抽象接口（@harness/plugin），不感知 BuiltinToolMeta 等具体数组结构。
+import { toolMetaSource as builtinToolSource } from '@harness/tools-builtin/meta'
+import { toolMetaSource as searchToolSource } from '@harness/tools-search/meta'
+import { toolMetaSource as globToolSource } from '@harness/tools-glob/meta'
+import { toolMetaSource as webToolSource } from '@harness/tools-web/meta'
+import { toolMetaSource as mediaToolSource } from '@harness/tools-media/meta'
+import { toolMetaSource as computerUseToolSource } from '@harness/computer-use/meta'
 // subagent / swarm 均为内置插件（组合根直连），cli 经其导出的能力对象（抽象契约）交互
 import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -501,28 +503,33 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
  *
  * 在 boot 早期同步登记全部内置工具的 meta（描述/别名/安全声明/权限键），
  * 无需加载对应的运行时工具模块（L2），即可供 REPL `/tools`、help 等展示。
- * 实现 `ToolMetaLookup` 契约，注入 cli.command 输入供工具管理插件合并展示。
+ * 实现 `ToolMetaRegistry` 抽象契约（@harness/plugin），内部存储统一为 `ToolMetaEntry`；
+ * 实现 `ToolMetaLookup`，注入 cli.command 输入供工具管理插件合并展示。
  */
-export class BuiltinToolRegistry implements ToolMetaLookup {
-  private readonly byId = new Map<string, BuiltinToolMeta>()
+export class BuiltinToolRegistry implements ToolMetaRegistry, ToolMetaLookup {
+  private readonly byId = new Map<string, ToolMetaEntry>()
 
-  register(m: BuiltinToolMeta): void {
+  register(m: ToolMetaEntry): void {
     this.byId.set(m.id, m)
   }
-  registerAll(metas: BuiltinToolMeta[]): void {
+  registerAll(metas: ToolMetaEntry[]): void {
     for (const m of metas) this.register(m)
+  }
+  /** 登记一个 ToolMetaSource：合并其 list() 元信息（抽象契约统一入口） */
+  registerSource(source: ToolMetaSource): void {
+    this.registerAll(source.list())
   }
   has(id: string): boolean {
     return this.byId.has(id)
   }
-  get(id: string): BuiltinToolMeta | undefined {
+  get(id: string): ToolMetaEntry | undefined {
     if (this.byId.has(id)) return this.byId.get(id)
     for (const m of this.byId.values()) {
       if (m.aliases?.includes(id)) return m
     }
     return undefined
   }
-  list(): BuiltinToolMeta[] {
+  list(): ToolMetaEntry[] {
     return [...this.byId.values()]
   }
   get size(): number {
@@ -533,23 +540,23 @@ export class BuiltinToolRegistry implements ToolMetaLookup {
 let defaultToolMetaRegistry: BuiltinToolRegistry | undefined
 
 /**
- * 全局默认内置工具元信息注册表：首次调用时同步登记 builtinToolMetas（纯数据，即时可用）。
+ * 全局默认内置工具元信息注册表：首次调用时经 `ToolMetaRegistry.registerSource` 统一登记
+ * 各随应用打包工具插件的 ToolMetaSource（纯数据，即时可用）。
  * 供 boot boot 早期调用，保证 /tools 等命令在任何运行时模块加载前即可展示内置工具描述。
  */
 export function getBuiltinToolRegistry(): BuiltinToolRegistry {
   if (!defaultToolMetaRegistry) {
     defaultToolMetaRegistry = new BuiltinToolRegistry()
-    // 登记全部随应用打包的工具插件静态元信息（L1，纯数据、实时可用）：
-    // 文件 I/O + Shell（tools-builtin）+ 场景化工具插件（search/glob/web/media）。
-    // 对应的运行时模块（L2）仍各自惰性/后台加载，此处仅预登记描述/别名/安全/权限键。
-    defaultToolMetaRegistry.registerAll([
-      ...builtinToolMetas,
-      ...searchToolMetas,
-      ...globToolMetas,
-      ...webToolMetas,
-      ...mediaToolMetas,
-      ...computerUseToolMetas,
-    ])
+    // 登记全部随应用打包工具插件的静态元信息来源（L1，纯数据、实时可用）：
+    // 文件 I/O + Shell（tools-builtin）+ 场景化工具插件（search/glob/web/media）+ computer-use。
+    // 各来源实现 ToolMetaSource 抽象契约，CLI 只经本注册表消费，不感知具体导出形态；
+    // 对应运行时模块（L2）仍各自惰性/后台加载，此处仅预登记描述/别名/安全/权限键。
+    defaultToolMetaRegistry.registerSource(builtinToolSource)
+    defaultToolMetaRegistry.registerSource(searchToolSource)
+    defaultToolMetaRegistry.registerSource(globToolSource)
+    defaultToolMetaRegistry.registerSource(webToolSource)
+    defaultToolMetaRegistry.registerSource(mediaToolSource)
+    defaultToolMetaRegistry.registerSource(computerUseToolSource)
   }
   return defaultToolMetaRegistry
 }

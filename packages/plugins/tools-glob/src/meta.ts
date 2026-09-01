@@ -9,6 +9,7 @@
  */
 
 import type { BuiltinToolMeta } from '@harness/tools-builtin/meta'
+import type { ToolMetaSource } from '@harness/plugin'
 
 /** 一个 glob 搜索工具 */
 export const GLOB_TOOL_META: BuiltinToolMeta[] = [
@@ -20,3 +21,10 @@ export const GLOB_TOOL_META: BuiltinToolMeta[] = [
     permissionKey: 'read',
   },
 ]
+
+/** glob 搜索工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
+export const toolMetaSource: ToolMetaSource = {
+  id: 'tools-glob',
+  description: 'Glob 搜索工具插件：glob 按模式匹配查找文件（含排除/大小/时间过滤）',
+  list: () => GLOB_TOOL_META,
+}

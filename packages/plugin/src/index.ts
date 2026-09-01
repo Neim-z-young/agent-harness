@@ -209,6 +209,54 @@ export interface ToolMetaLookup {
   list(): ToolMetaEntry[]
 }
 
+/**
+ * 工具静态元信息来源（多级加载 L1）。
+ *
+ * 插件包以统一契约暴露内置工具的静态元信息（描述/别名/安全声明/权限键），
+ * 供 CLI 展示层（/tools、help）在不加载对应运行时工具模块（L2）的前提下提前获取。
+ * CLI 只消费本抽象接口，不硬编码具体插件包的元信息导出。
+ */
+export interface ToolMetaSource {
+  /** 来源标识（一般为插件 id / 包名） */
+  id: string
+  /** 来源描述（供 /tools --all 或详情视图展示） */
+  description?: string
+  /** 该来源提供的静态元信息列表 */
+  list(): ToolMetaEntry[]
+}
+
+/** 工具静态元信息注册表（多级加载 L1）：CLI 经此抽象登记/查询内置工具元信息 */
+export interface ToolMetaRegistry {
+  registerSource(source: ToolMetaSource): void
+  /** 按 id 或别名查找 */
+  get(id: string): ToolMetaEntry | undefined
+  list(): ToolMetaEntry[]
+  readonly size: number
+}
+
+/** 默认内存实现：按 id（含别名）索引，登记来源时合并其元信息 */
+export function createToolMetaRegistry(): ToolMetaRegistry {
+  const byId = new Map<string, ToolMetaEntry>()
+  return {
+    registerSource(source) {
+      for (const m of source.list()) byId.set(m.id, m)
+    },
+    get(id) {
+      if (byId.has(id)) return byId.get(id)
+      for (const m of byId.values()) {
+        if (m.aliases?.includes(id)) return m
+      }
+      return undefined
+    },
+    list() {
+      return [...byId.values()]
+    },
+    get size() {
+      return byId.size
+    },
+  }
+}
+
 /** cli.command hook 的输入 */
 export interface CliCommandInput {
   /** 原始命令行（不含前缀 /） */

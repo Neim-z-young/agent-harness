@@ -10,6 +10,7 @@
  * 结构对齐 BuiltinToolMeta（字段为静态布尔/字符串）。
  */
 import type { BuiltinToolMeta } from '@harness/tools-builtin/meta'
+import type { ToolMetaSource } from '@harness/plugin'
 
 /** server 名，与 COMPUTER_USE_SERVER_NAME 保持一致 */
 const SERVER = 'computer-use'
@@ -30,3 +31,10 @@ export const COMPUTER_USE_TOOL_META: BuiltinToolMeta[] = [
   { id: `${ID}set_value`, description: '设置可写辅助功能元素的值。Electron 等应用可能拒写，可退回 click + type_text。', isReadOnly: false, isConcurrencySafe: false, permissionKey: 'write' },
   { id: `${ID}select_text`, description: '在元素内选中文本或定位光标（text | cursor_before | cursor_after）', isReadOnly: false, isConcurrencySafe: false, permissionKey: 'write' },
 ]
+
+/** computer-use 工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
+export const toolMetaSource: ToolMetaSource = {
+  id: 'computer-use',
+  description: '电脑控制 MCP server 工具（mcp__computer-use__*）',
+  list: () => COMPUTER_USE_TOOL_META,
+}

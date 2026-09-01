@@ -176,6 +176,32 @@
 - 新增 REPL 级集成测试：boot 后等待预加载完成直接 `/tools`，断言 `read_file` 与 `list_dir` 均显示「已加载」且非「仅元信息」；新增 TUI 历史导航集成测试（连按 ↑ 逐级回看 → ↓ 前进 → 底部 ↓ 退出回看）。
 - 根 `bun run typecheck` 全部通过；`@harness/cli`（cli.test + tui.test 共 158 例）、`@harness/core`（31）、`tools-manager`（9）、`tools-search`（15）、`tools-builtin`（60）测试全绿。
 
+## 2026-09-02（续 50）重构：工具元信息经抽象接口解耦（ToolMetaSource / ToolMetaRegistry）
+
+> 承接续 49。用户提出：core/cli 里直接 `import { builtinToolMetas, type BuiltinToolMeta } from '@harness/tools-builtin/meta'`、`import { SEARCH_TOOL_META as searchToolMetas } ...` 等 6 处硬编码元信息导入，可用抽象接口解耦。
+
+### 抽象契约（@harness/plugin）
+
+- 新增 `ToolMetaSource`：插件包以统一契约暴露内置工具静态元信息（`{ id, description?, list(): ToolMetaEntry[] }`），自描述、不暴露具体数组结构。
+- 新增 `ToolMetaRegistry` + `createToolMetaRegistry()`：CLI 经此抽象登记（`registerSource`）/查询（`get` 含别名反查 / `list` / `size`）。
+- `BuiltinToolMeta` 已结构兼容 `ToolMetaEntry`（`ToolMetaEntry.description` 可选），无需改元数据字段。
+
+### 各插件 meta 模块（L1，纯数据）
+
+- `tools-builtin` / `tools-search` / `tools-glob` / `tools-web` / `tools-media` / `computer-use` 各自新增导出 `toolMetaSource: ToolMetaSource`（`list()` 复用既有 `*_TOOL_META`/`builtinToolMetas`），原有数组导出保留供既有测试与引用使用。
+
+### cli（消费端）
+
+- 移除对具体数组/类型的硬编码导入（`builtinToolMetas`、`SEARCH_TOOL_META` 等、`type BuiltinToolMeta`），改为仅消费 `toolMetaSource` 抽象契约。
+- `BuiltinToolRegistry` 实现 `ToolMetaRegistry`（内部存储统一为 `ToolMetaEntry`），新增 `registerSource()`；`getBuiltinToolRegistry()` 改为逐个 `registerSource(...)` 登记 6 个来源，不再手工展开数组。
+
+### 测试
+
+- `@harness/plugin` 新增 4 例：`createToolMetaRegistry` 合并来源 / id+别名反查 / 多来源覆盖 / 纯静态来源实现契约。
+- 6 个插件包各新增 1 例：`toolMetaSource.id` 与 `list() === 既有元信息`。
+- cli `BuiltinToolRegistry` 测试补充 `registerSource` 合并断言。
+- 根 `bun run typecheck` 全部通过；`@harness/plugin`（42）、`@harness/cli`（158）、`tools-builtin`（61）、`tools-search`（16）、`tools-glob`（12）、`tools-web`（16）、`tools-media`（11）、`computer-use`（13）测试全绿（存量 reference/ 第三方测试失败与本批无关）。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。

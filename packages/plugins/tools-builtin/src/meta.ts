@@ -8,6 +8,8 @@
  * 约束：本模块必须保持自包含，不得 import 本包的 index.ts（否则会让"惰性加载"失效）。
  */
 
+import type { ToolMetaSource } from '@harness/plugin'
+
 /** 内置工具静态元信息：与运行时 Tool 的展示字段对齐，字段为静态布尔/字符串 */
 export interface BuiltinToolMeta {
   id: string
@@ -61,3 +63,13 @@ export const BUILTIN_TOOL_META: Record<string, BuiltinToolMeta> = {
 
 /** 内置工具元信息列表（顺序稳定，便于一次性登记） */
 export const builtinToolMetas: BuiltinToolMeta[] = Object.values(BUILTIN_TOOL_META)
+
+/**
+ * 内置工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource）。
+ * CLI 经 ToolMetaRegistry 统一登记本来源，不硬编码各包的具体导出形态。
+ */
+export const toolMetaSource: ToolMetaSource = {
+  id: 'tools-builtin',
+  description: '内置工作台工具（文件读写 + Shell）',
+  list: () => builtinToolMetas,
+}

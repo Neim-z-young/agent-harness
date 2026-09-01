@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test'
-import { BUILTIN_TOOL_META, builtinToolMetas } from './meta'
+import { BUILTIN_TOOL_META, builtinToolMetas, toolMetaSource } from './meta'
 
 describe('tools-builtin 静态元信息（多级加载 L1）', () => {
   it('登记表覆盖全部内置原语工具', () => {
@@ -27,5 +27,10 @@ describe('tools-builtin 静态元信息（多级加载 L1）', () => {
     const read = BUILTIN_TOOL_META['read_file']!
     expect(read.isReadOnly).toBe(true)
     expect(read.permissionKey).toBe('read')
+  })
+
+  it('toolMetaSource 实现 ToolMetaSource 抽象契约，list() 与元信息一致', () => {
+    expect(toolMetaSource.id).toBe('tools-builtin')
+    expect(toolMetaSource.list()).toEqual(builtinToolMetas)
   })
 })

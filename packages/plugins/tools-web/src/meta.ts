@@ -9,6 +9,7 @@
  */
 
 import type { BuiltinToolMeta } from '@harness/tools-builtin/meta'
+import type { ToolMetaSource } from '@harness/plugin'
 
 /** 一个网页抓取工具 */
 export const WEB_TOOL_META: BuiltinToolMeta[] = [
@@ -21,3 +22,10 @@ export const WEB_TOOL_META: BuiltinToolMeta[] = [
     permissionKey: 'network',
   },
 ]
+
+/** 网页抓取工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
+export const toolMetaSource: ToolMetaSource = {
+  id: 'tools-web',
+  description: '网页抓取工具插件：web_fetch HTTP(S) 抓取 URL 内容（文本/JSON/原始字节）',
+  list: () => WEB_TOOL_META,
+}

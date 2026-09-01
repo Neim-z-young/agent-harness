@@ -9,6 +9,7 @@
  */
 
 import type { BuiltinToolMeta } from '@harness/tools-builtin/meta'
+import type { ToolMetaSource } from '@harness/plugin'
 
 /** 一个图像读取工具 */
 export const MEDIA_TOOL_META: BuiltinToolMeta[] = [
@@ -20,3 +21,10 @@ export const MEDIA_TOOL_META: BuiltinToolMeta[] = [
     permissionKey: 'read',
   },
 ]
+
+/** 媒体类工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
+export const toolMetaSource: ToolMetaSource = {
+  id: 'tools-media',
+  description: '媒体类工具插件：view_image 读取本地图像为 base64（供多模态 LLM 识别）',
+  list: () => MEDIA_TOOL_META,
+}
