@@ -353,6 +353,16 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     for (const id of ['read_file', 'write_file', 'bash', 'edit_file']) {
       expect(reg.has(id)).toBe(true)
     }
+    // 覆盖随应用打包的场景化工具插件元信息（search/glob/web/media）
+    for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image']) {
+      expect(reg.has(id)).toBe(true)
+    }
+    const permByTool: Record<string, string> = {
+      web_fetch: 'network', list_dir: 'read', glob: 'read', view_image: 'read',
+    }
+    for (const [id, k] of Object.entries(permByTool)) {
+      expect(reg.get(id)?.permissionKey).toBe(k)
+    }
     // 描述可提前取得（运行时模块是否加载都无关）
     const bash = reg.get('bash')!
     expect(bash.description).toContain('shell')

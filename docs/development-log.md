@@ -94,6 +94,35 @@
 - cli 新增 2 例：`BuiltinToolRegistry` 同步登记+别名查找；`backgroundPreload` 后台预热有日志、`false` 关闭无日志且 boot 不阻塞。
 - 全量 typecheck 通过；tools-builtin（60）/ tools-manager（7）/ cli（155）测试通过。
 
+## 2026-09-02（续 47）补全工具元信息 + /tools 状态列（元信息可提前加载覆盖全场景插件）
+
+> 承接续 46 的多级加载（L1 元信息 / L2 运行时）。把"元信息可提前加载 + `/tools` 显示完整元信息"从工具内置原语扩展到全部随应用打包的场景化工具插件。
+
+### 补全其他插件的工具元信息（L1）
+
+- 新增 4 个场景工具插件各自的 `meta.ts`（纯数据、不 import 各自 index.ts，对齐 `@harness/tools-builtin/meta` 的 `BuiltinToolMeta` 结构）：
+  - `@harness/tools-search/meta`：`list_dir`、`grep_file`（只读，权限键 `read`）
+  - `@harness/tools-glob/meta`：`glob`（只读，权限键 `read`）
+  - `@harness/tools-web/meta`：`web_fetch`（非只读/非危险，权限键 `network`）
+  - `@harness/tools-media/meta`：`view_image`（只读，权限键 `read`）
+- 各 package.json `exports` 新增 `./meta` 子路径；根 `tsconfig.json` `paths` 注册 `@harness/tools-*/meta`。
+- cli `getBuiltinToolRegistry()` 启动早期一次性 `registerAll` 全部工具 meta（内置原语 + 场景插件），无需加载任意 L2 运行时模块即可在 `/tools` 展示描述/别名/安全声明/权限键。
+
+### /tools 列表：元信息 + 状态列
+
+- 列表改为对齐表格：`ID | 元信息(描述) | 权限键 | 状态`。
+- **状态列** = 启用/禁用（相对当前 Agent 白名单）· 加载状态（`已加载` / `仅元信息`）· 安全声明（只读/危险/非并发）：
+  - 未加载的元信息占位仅在 Agent 白名单为通配 `*` 时视为"启用"，否则"禁用"。
+- 详情视图补齐：已加载工具也输出 `权限键` 行；未加载工具回退静态元信息输出描述/别名/权限键/安全。
+- 归一化 `entryFlags` + 新增 `permKeyOf` / `entryLoaded` / `entryStatus` / `renderToolTable`。
+
+### 测试
+
+- 4 个场景插件各新增 `meta.test.ts`：覆盖工具 id/描述/只读/并发/权限键。
+- cli `BuiltinToolRegistry` 测试扩展断言 search/glob/web/media 工具及其权限键。
+- tools-manager 新增 2 例：列表含"状态/权限"列与 `启用·已加载`；`--all` 合并未加载元信息显示 `仅元信息` 且详情含权限键。
+- 本批涉及测试全部通过；全量 typecheck 通过（存量 TUI/dom 第三方测试失败与本批无关）。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。

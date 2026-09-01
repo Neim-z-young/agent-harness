@@ -43,6 +43,10 @@ import type { BackgroundTaskViewLike, ToolMetaEntry, ToolMetaLookup } from '@har
 import type { MockProviderConfig } from '@harness/provider-mock'
 // 内置工具静态元信息（多级加载 L1）：不含运行时工具实现，可提前登记供 /tools 等展示
 import { builtinToolMetas, type BuiltinToolMeta } from '@harness/tools-builtin/meta'
+import { SEARCH_TOOL_META as searchToolMetas } from '@harness/tools-search/meta'
+import { GLOB_TOOL_META as globToolMetas } from '@harness/tools-glob/meta'
+import { WEB_TOOL_META as webToolMetas } from '@harness/tools-web/meta'
+import { MEDIA_TOOL_META as mediaToolMetas } from '@harness/tools-media/meta'
 // subagent / swarm 均为内置插件（组合根直连），cli 经其导出的能力对象（抽象契约）交互
 import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -503,7 +507,16 @@ let defaultToolMetaRegistry: BuiltinToolRegistry | undefined
 export function getBuiltinToolRegistry(): BuiltinToolRegistry {
   if (!defaultToolMetaRegistry) {
     defaultToolMetaRegistry = new BuiltinToolRegistry()
-    defaultToolMetaRegistry.registerAll(builtinToolMetas)
+    // 登记全部随应用打包的工具插件静态元信息（L1，纯数据、实时可用）：
+    // 文件 I/O + Shell（tools-builtin）+ 场景化工具插件（search/glob/web/media）。
+    // 对应的运行时模块（L2）仍各自惰性/后台加载，此处仅预登记描述/别名/安全/权限键。
+    defaultToolMetaRegistry.registerAll([
+      ...builtinToolMetas,
+      ...searchToolMetas,
+      ...globToolMetas,
+      ...webToolMetas,
+      ...mediaToolMetas,
+    ])
   }
   return defaultToolMetaRegistry
 }

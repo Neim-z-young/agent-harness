@@ -71,14 +71,50 @@ function unionTools(loaded: Tool[], meta: ToolMetaLookup | undefined): Array<Too
   return result
 }
 
-function formatTool(t: Tool | ToolMetaEntry): string {
-  const { readOnly, destructive } = entryFlags(t)
-  const flags: string[] = []
-  if (readOnly) flags.push('只读')
-  if (destructive) flags.push('危险')
-  const meta = flags.length ? ` [${flags.join(',')}]` : ''
-  const suffix = isMetaEntry(t) ? ' (meta)' : ''
-  return `  ${t.id.padEnd(22)}${(t.description ?? '').slice(0, 42)}${meta}${suffix}`
+/** 从运行时 Tool 或静态元信息归一化出权限键 */
+function permKeyOf(t: Tool | ToolMetaEntry): string {
+  const asTool = t as Tool
+  const key = (asTool as { permission?: { key?: string } }).permission?.key ?? (t as ToolMetaEntry).permissionKey
+  return key ?? '-'
+}
+
+/** 是否已加载运行时实现（false = 仅静态元信息占位） */
+function entryLoaded(t: Tool | ToolMetaEntry): boolean {
+  return !isMetaEntry(t)
+}
+
+/**
+ * 状态串：启用/禁用（相对当前 Agent 白名单）+ 加载状态（已加载 / 仅元信息）。
+ * 未加载的元信息占位：仅在 Agent 白名单为通配 * 时视为启用，否则为禁用。
+ */
+function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry): string {
+  const agentTools = inp.harness.agent.get(inp.agentId)?.tools ?? ['*']
+  const wildcard = agentTools.length === 1 && agentTools[0] === '*'
+  const loaded = entryLoaded(t)
+  const enabled = wildcard
+    ? true
+    : !isMetaEntry(t) && inp.harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
+  const en = enabled ? '启用' : '禁用'
+  const ld = loaded ? '已加载' : '仅元信息'
+  return [en, ld].join('·')
+}
+
+/** 渲染工具表格：ID | 元信息(描述) | 权限键 | 状态（启用·加载·安全） */
+function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>): string {
+  const rows = entries.map((t) => {
+    const { readOnly, destructive, concurrent } = entryFlags(t)
+    const safety = [...(readOnly ? ['只读'] : []), ...(destructive ? ['危险'] : []), ...(concurrent === false ? ['非并发'] : [])]
+    const base = entryStatus(inp, t)
+    const status = safety.length ? `${base}·${safety.join(',')}` : base
+    return { id: t.id, desc: (t.description ?? '').slice(0, 38), perm: permKeyOf(t), status }
+  })
+  const idW = Math.max('ID'.length, ...rows.map((r) => r.id.length))
+  const descW = 40
+  const permW = Math.max('权限'.length, ...rows.map((r) => r.perm.length))
+  const statusW = Math.max('状态'.length, ...rows.map((r) => r.status.length))
+  const head = `  ${'ID'.padEnd(idW)}${'元信息(描述)'.padEnd(descW)}${'权限'.padEnd(permW)}  ${'状态'.padEnd(statusW)}`
+  const lines = [head, ...rows.map((r) => `  ${r.id.padEnd(idW)}${r.desc.padEnd(descW)}${r.perm.padEnd(permW)}  ${r.status.padEnd(statusW)}`)]
+  return lines.join('\n')
 }
 
 /** 详情视图的安全声明文本 */
@@ -114,6 +150,7 @@ function renderDetail(inp: ToolsCtx, toolArg: string): void {
   out(`工具：${t.id}\n`
     + `  描述：${t.description ?? ''}\n`
     + `  别名：${t.aliases?.join(', ') ?? '-'}\n`
+    + `  权限键：${permKeyOf(t)}\n`
     + `  安全：${formatSafety(t)}\n`
     + `  当前 Agent 启用：${enabled ? '是' : '否'}\n`)
 }
@@ -157,13 +194,13 @@ export function createToolsManagerPlugin(): AgentPlugin {
                 permissionKey: (t as { permission?: { key?: string } }).permission?.key,
               })), null, 2) + '\n')
             } else {
-              out(`全局注册 ${all.length} 个工具（含未加载的静态元信息）：\n${all.map(formatTool).join('\n')}\n`)
+              out(`全局注册 ${all.length} 个工具（含未加载的静态元信息）：\n${renderToolTable(inp, all)}\n`)
             }
             return
           }
           const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
           const usable = harness.tools.filterByWhitelist(agentTools)
-          out(`Agent「${inp.agentId}」可用工具（白名单：${agentTools.join(', ') || '(空)'}）：\n${usable.map(formatTool).join('\n')}\n`)
+          out(`Agent「${inp.agentId}」可用工具（白名单：${agentTools.join(', ') || '(空)'}）：\n${renderToolTable(inp, usable)}\n`)
           return
         }
 

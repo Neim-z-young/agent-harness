@@ -4,7 +4,14 @@ import type { Tool } from '@harness/tool'
 import { createToolsManagerPlugin } from './index'
 
 function mkTool(id: string): Tool {
-  return { id, description: `${id} 描述` } as Tool
+  return {
+    id,
+    description: `${id} 描述`,
+    call: async () => ({ ok: true, output: {} }),
+    isReadOnly: () => false,
+    isDestructive: () => false,
+    isConcurrencySafe: () => true,
+  } as unknown as Tool
 }
 
 function makeHarness(initTools: Tool[], agentTools: string[]) {
@@ -37,6 +44,7 @@ async function run(
   h: Hooks,
   arg: string,
   ctx: { harness: unknown; out: string[]; saved: Array<[string, string[]]> },
+  toolMeta?: { get(id: string): unknown; list(): unknown[] },
 ): Promise<CliCommandInput> {
   const input = {
     command: 'tools',
@@ -47,6 +55,7 @@ async function run(
     harness: ctx.harness,
     agentId: 'default',
     setAgentTools: async (id: string, tools: string[]) => { ctx.saved.push([id, tools]) },
+    ...(toolMeta ? { toolMeta } : {}),
   } as CliCommandInput
   await h['cli.command']?.(input)
   return input
@@ -110,5 +119,29 @@ describe('tools-manager 插件', () => {
     await run(h, 'nonexistent', { harness, out, saved })
     expect(out.join('')).toContain('未找到')
     expect((await run(h, '', { harness, out, saved })).result).toBe('continue')
+  })
+
+  it('列表含状态列：启用/禁用 + 加载状态；元信息含权限键', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
+    await run(h, '', { harness, out, saved })
+    const text = out.join('')
+    expect(text).toContain('状态')
+    expect(text).toContain('权限')
+    expect(text).toContain('启用·已加载')
+  })
+
+  it('--all 合并未加载工具元信息（状态为 仅元信息），详情回退静态元信息并含权限键', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
+    const meta = {
+      get: (id: string) => (id === 'glob' ? { id: 'glob', description: 'glob 描述', isReadOnly: true, permissionKey: 'read' } : undefined),
+      list: () => [{ id: 'glob', description: 'glob 描述', isReadOnly: true, permissionKey: 'read' }],
+    }
+    await run(h, '--all', { harness, out, saved }, meta)
+    const text = out.join('')
+    expect(text).toContain('glob')
+    expect(text).toContain('仅元信息')
+    expect(text).toContain('read')
   })
 })
