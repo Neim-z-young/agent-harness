@@ -549,6 +549,23 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('boot 回读 config.json 的 agents[].tools 覆盖到 Agent 白名单', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    // 预置 config.json：agents[].tools 指定 'bash','echo'（缺省 tools:['*'] 应被覆盖）
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(join(dataDir, 'config.json'), JSON.stringify({ agents: [{ id: 'default', tools: ['bash', 'echo'] }] }, null, 2))
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    expect(harness.agent.get('default')?.tools).toEqual(['bash', 'echo'])
+    await app.shutdown()
+  })
+
   it('startRepl 脚本模式：发送 prompt + /sessions + /new + /save + /exit 正常', async () => {
     const chunks: string[] = []
     const stdout = { write: (s: string) => { chunks.push(s) } }

@@ -271,6 +271,11 @@ export interface HarnessConfig {
   anthropicApiKey?: string
   /** 多 Provider 定义：可同时注册多个（anthropic / openai / gemini / mock + 任意 OpenAI 兼容端点如 DeepSeek / Ollama） */
   providers?: ProviderConfig[]
+  /**
+   * Agent 工具白名单覆盖：`[{ id, tools }]`，启动时按 id 覆盖合并到对应 Agent 的 tools 白名单。
+   * 由 `/tools` 等插件持久化；缺省 Agent 为 tools:['*']（全部），配置指定数组则收窄。
+   */
+  agents?: Array<{ id: string; tools: string[] }>
 }
 
 /** 单个 Provider 定义（config.json 的 providers 数组元素）——复用 @harness/plugin 抽象层契约 */
@@ -926,6 +931,21 @@ export class HarnessApp {
     return def
   }
 
+  /**
+   * 合并 config.json 的 agents[].tools 到已注册 Agent 定义（按 id 覆盖 tools 白名单）。
+   * 必须放在 createHarness 之后、query 之前：工具池在 query 时经 filterByWhitelist(agent.tools)
+   * 实时读白名单，因此覆盖任何来源（default / options.agents / agentDirs 的 md）的同名 Agent。
+   */
+  async applyConfigAgentTools(harness: Harness): Promise<void> {
+    const cfg = await this.configStore.load()
+    if (!cfg.agents?.length) return
+    for (const { id, tools } of cfg.agents) {
+      if (!tools?.length) continue
+      const existing = harness.agent.get(id)
+      if (existing) harness.agent.register({ ...existing, tools: [...tools] })
+    }
+  }
+
   /** 当前生效模型（`provider/model` 展示）：优先读取活动 Agent 定义的 model，回退 options.model */
   getModel(agentId: string): string | undefined {
     const a = this.harness?.agent?.get?.(agentId)
@@ -1258,6 +1278,8 @@ export class HarnessApp {
           : undefined,
       },
     })
+    // 回读 config.json 的 agents[].tools 白名单并覆盖到已注册 Agent（createHarness 全部组装完成后、query 前）
+    await this.applyConfigAgentTools(harness)
     await harness.start()
     this.harness = harness
 

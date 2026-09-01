@@ -1,5 +1,29 @@
 # Agent Harness 开发日志
 
+## 2026-09-01（续 44）config.json 的 agents[].tools 回读消费端
+
+> 归属「/tools 可插件化（方案 A：补 core/CLI 配置接口）」第一步。先打通 Agent 白名单持久化的读取端。
+
+### 调研结论（2026-09-01）
+
+- core 的 `Harness` 接口无配置持久化访问器；`PluginContext.config.get/set` 仅是 `initialConfig` 种子的**内存 map**，set 不写盘，且 cli 调 `createHarness` 未传 `config`，运行期为 `{}`。
+- config.json 唯一读写实现是 cli 私有 `ConfigStore`，不暴露给插件；`cli.command` 输入 `{raw,command,arg,out,sessionId}` 不含 dataDir/configStore。
+- **缺口**：`HarnessConfig` 原无 `agents[]`，即使插件写入 Agent 白名单，cli 启动回读也无消费端 → 死数据。须先补读取端。
+
+### 实现（cli）
+
+- `HarnessConfig` 新增 `agents?: Array<{ id: string; tools: string[] }>`（Agent 工具白名单覆盖）。
+- 新增 `HarnessApp.applyConfigAgentTools(harness)`：读 config.json → 对每项按 id 命中的已注册 Agent 用 `register({...existing, tools})` 覆盖 tools。**位置须在 createHarness 全部组装后、query 前**——工具池在 query 时经 `filterByWhitelist(agent.tools)` 实时读白名单，故可覆盖 default / options.agents / agentDirs（md）任何来源的同名 Agent。
+- boot() 中 createHarness 后、`harness.start()` 前调用。
+
+### 测试
+
+- cli.test.ts：预置 config.json `agents:[{id:'default',tools:['bash','echo']}]`，boot 后断言 `harness.agent.get('default').tools` 被覆盖（缺省 `tools:['*']`）。
+
+### 下一步
+
+- 写 `/tools` 插件持久化端（upsert config.json 的 agents[].tools）+ `--global` 运行时启停（方案 B 所见即所得）。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。
