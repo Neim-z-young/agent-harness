@@ -154,6 +154,28 @@
 
 - 根 `bun run typecheck` 全部通过；`@harness/cli`（88 例）、`@harness/tools-manager`（9 例）、`@harness/computer-use`（12 例）测试全绿。
 
+## 2026-09-02（续 49）修复：后台预加载仍未生效 + 命令历史仍只回看一条
+
+> 承接续 48。用户复测反馈两个问题仍未解决：1) `/tools` 一直显示「仅元信息」，手动发一条消息后才变「已加载」，且 `list_dir` 等场景化插件工具始终「仅元信息」；2) 命令历史 ↑ 仍只能取到最近一条。
+
+### 1) 后台预加载仍未生效：工具只在首条消息后才注册（core + cli）
+
+- 根因：续 48 的 `scheduleBuiltinPreload` 只 `lazyImport` **预热模块**（缓存 import），但**没有把预加载出的插件安装进 Harness，也没有触发工具注册**；而 `tool.pool.assemble` Hook 只在用户首条消息（query 内）才执行，故 `/tools` 一直停在「仅元信息」，`list_dir` 等场景插件也始终未注册。
+- 修复（core）：`Harness` 新增 `assembleTools()`——遍历所有 Agent 触发 `tool.pool.assemble`，把插件工具注册进全局 `ToolRegistry`（幂等，`DefaultToolPool.add` 只注册尚未注册的工具）。
+- 修复（cli）：`scheduleBuiltinPreload` 预加载完成后：① 把未安装的插件经 `harness.plugin.loadInternal()` 安装；② 调用 `harness.assembleTools()` 主动组装工具池。这样 boot 后无需首条消息，`/tools` 即显示「已加载」，`list_dir`/`grep_file`/`glob`/`web_fetch` 等开箱即用。
+- 场景化插件依赖补齐：cli `package.json` 增加 `@harness/tools-search|glob|web|media`，根 `tsconfig.json` 增加对应 `paths`（此前 `lazyImport` 报 `Cannot find module`）。
+
+### 2) 命令历史仍只回看一条：`__HISTLOG` 未定义导致每次 render 抛 ReferenceError（tui）
+
+- 根因：`tui.tsx` 残留调试用的 `__HISTLOG.push(...)`，但 `__HISTLOG` 从未定义，导致 `TuiApp` **每次 render 都抛 `ReferenceError: __HISTLOG is not defined`**，历史导航与整个 TUI 渲染实质失效（测试也因 `waitFrame` 捕获到该异常超时）。
+- 修复：移除三处 `__HISTLOG` 调试残留（submit / render 主体 / onInput）。
+- 同时保留续 48 的导航机制并补齐细节：`histIdxRef` 同步真源（连按/自动重复 ↑ 逐级回看）+ `programmaticValueRef` 区分程序式 value 变更与用户输入（避免 OpenTUI `InputRenderable` 的 value setter 触发 `onInput` 立即重置回看索引）；↓ 到底部退出回看恢复当前输入。
+
+### 测试与提交
+
+- 新增 REPL 级集成测试：boot 后等待预加载完成直接 `/tools`，断言 `read_file` 与 `list_dir` 均显示「已加载」且非「仅元信息」；新增 TUI 历史导航集成测试（连按 ↑ 逐级回看 → ↓ 前进 → 底部 ↓ 退出回看）。
+- 根 `bun run typecheck` 全部通过；`@harness/cli`（cli.test + tui.test 共 158 例）、`@harness/core`（31）、`tools-manager`（9）、`tools-search`（15）、`tools-builtin`（60）测试全绿。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。

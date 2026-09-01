@@ -681,6 +681,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [cmdSel, setCmdSel] = useState(0)
   const [history, setHistory] = useState<string[]>([])
   const [histIdx, setHistIdx] = useState(-1) // -1 表示不在回看历史
+  // 历史导航索引的同步真源（ref 镜像）：React 状态是异步提交的，连按/自动重复 ↑ 时若读
+  // state 会拿到上一次渲染的旧值（始终 -1），导致每次都跳到最近一条。ref 同步更新，
+  // 保证连续按键逐级回看；state 仅用于渲染输入框 value。
+  const histIdxRef = useRef(-1)
+  const setHistIdxSync = useCallback((i: number) => {
+    histIdxRef.current = i
+    setHistIdx(i)
+  }, [])
+  // 模块 C：历史回看程序式写入值。OpenTUI 的 InputRenderable 在 value prop 被程序式变更时
+  // 也会 emit('input')，onInput 据此识别该值为「回看导航」而非用户输入，避免回看索引被立即
+  // 重置（否则 ↑ 只能取到最近一条）。用 ref 保证跨渲染读取的是最新值。
+  const programmaticValueRef = useRef<string | null>(null)
   // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
   const [helpOpen, setHelpOpen] = useState(false)
   // 模块 E：命令审批模态 —— 权限引擎 ask() 触发时弹出，等待 allow/deny/always/never
@@ -840,8 +852,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const submit = useCallback((value: string) => {
     if (exitRef.current) return
     const v = value.trim()
+    programmaticValueRef.current = null
     setInput('')
-    setHistIdx(-1)
+    setHistIdxSync(-1)
     if (v) {
       // 模块 C：提交成功后入栈输入历史（去重相邻、限长，最新的在后）
       setHistory((prev) => {
@@ -851,7 +864,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       pendingLines.current.push(v)
       void drain()
     }
-  }, [drain])
+  }, [drain, setHistIdxSync])
 
   // 模块 C：/ 命令补全候选 —— 输入以 / 开头时，按前缀过滤命令菜单
   const cmdCandidates = useMemo(() => {
@@ -922,8 +935,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     }
     // 模块 C：输入历史 —— 无命令菜单时，↑ 回看 / ↓ 前进，Enter 用回看值提交（当前输入内容会被回看值覆盖，输入任意字符即取消回看）
     if (!listMode && !cmdMenuOpen && history.length > 0) {
-      if (key.name === 'up') { setHistIdx((i) => (i === -1 ? history.length - 1 : Math.max(0, i - 1))); return }
-      if (key.name === 'down') { setHistIdx((i) => (i === -1 ? -1 : Math.min(history.length - 1, i + 1))); return }
+      if (key.name === 'up') {
+        const cur = histIdxRef.current
+        const i = cur === -1 ? history.length - 1 : Math.max(0, cur - 1)
+        // 记录本次回看导航程序式写入的值，供 onInput 识别（见 programmaticValueRef 注释）
+        programmaticValueRef.current = history[i] ?? null
+        setHistIdxSync(i) // ref 同步更新，连按/自动重复也能逐级回看
+        return
+      }
+      if (key.name === 'down') {
+        const cur = histIdxRef.current
+        // 回看中 ↓ 前进一条；已到最近一条（cur + 1 >= history.length）时退出回看（恢复当前输入）
+        const i = cur === -1 || cur + 1 >= history.length ? -1 : cur + 1
+        programmaticValueRef.current = i >= 0 && i < history.length ? history[i]! : null
+        setHistIdxSync(i)
+        return
+      }
     }
     // 模块 4：侧栏 tab 切换 —— 输入为空、非列表模式时，◀/▶ 循环切换侧栏模块
     if (!listMode && !cmdMenuOpen && input === '' && showSidebar) {
@@ -1250,7 +1277,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         <input
           focused={!listMode}
           value={histIdx >= 0 && histIdx < history.length ? history[histIdx] : input}
-          onInput={(v) => { setInput(v); setHistIdx(-1) }}
+          onInput={(v) => {
+            // 历史回看：OpenTUI 的 InputRenderable 在 value prop 程序式变更时也会 emit('input')。
+            // 若新值正是回看导航写入的值（programmaticValueRef），视为程序式更新、保持回看状态；
+            // 否则为真实用户输入，取消回看（setInput + 重置 histIdx）。
+            if (v === programmaticValueRef.current) {
+              programmaticValueRef.current = null
+              return
+            }
+            programmaticValueRef.current = null
+            setInput(v)
+            setHistIdxSync(-1)
+          }}
           onSubmit={(value: unknown) => submit(String(value))}
           placeholder="❯ "
         />

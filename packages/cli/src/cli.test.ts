@@ -403,6 +403,55 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     await qApp.shutdown()
   })
 
+  it('后台预加载后插件工具已注册进 harness.tools（无需首条消息 /tools 即显示已加载）', async () => {
+    const dir2 = mkdtempSync(join(tmpdir(), 'harness-preload-tools-'))
+    const app = new HarnessApp({
+      cwd: dir2, dataDir: join(dir2, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all',
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    // 等待 fire-and-forget 预加载 + assembleTools 完成
+    await new Promise((r) => setTimeout(r, 300))
+    const ids = harness.tools.list().map((t) => t.id).sort()
+    // 内置原语 + 场景化插件工具应全部就位（list_dir 来自 tools-search 等）
+    expect(ids).toContain('read_file')
+    expect(ids).toContain('write_file')
+    expect(ids).toContain('list_dir')
+    expect(ids).toContain('grep_file')
+    expect(ids).toContain('glob')
+    expect(ids).toContain('web_fetch')
+    await app.shutdown()
+    rmSync(dir2, { recursive: true, force: true })
+  })
+
+  it('REPL /tools 在后台预加载完成后直接显示「已加载」（无需先发一条消息）', async () => {
+    const dir3 = mkdtempSync(join(tmpdir(), 'harness-repl-tools-'))
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir3, dataDir: join(dir3, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    // 等 fire-and-forget 预加载 + assembleTools 完成后再发 /tools（复现用户场景）
+    await new Promise((r) => setTimeout(r, 300))
+    const r = await startRepl({ app, harness, session, stdout, scriptedStdin: ['/tools', '/exit'] })
+    expect(r).toBe('exit')
+    const text = chunks.join('')
+    // 内置原语工具已加载
+    expect(text).toContain('read_file')
+    expect(text).toContain('已加载')
+    // list_dir 等场景化工具也已加载（不再是 仅元信息）
+    const line = text.split('\n').find((l) => l.includes('list_dir')) ?? ''
+    expect(line).toContain('list_dir')
+    expect(line).toContain('已加载')
+    expect(line).not.toContain('仅元信息')
+    await app.shutdown()
+    rmSync(dir3, { recursive: true, force: true })
+  })
+
   it('loadPluginDirs：从 plugins 目录加载 Provider 类型工厂（providerType + createProviderPlugin 约定）', async () => {
     const pluginDir = join(dir, 'plugins')
     mkdirSync(pluginDir, { recursive: true })

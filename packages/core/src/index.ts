@@ -1585,6 +1585,12 @@ export interface Harness {
   suspend(): Promise<void>
   /** 恢复（MVP：占位） */
   resume(): Promise<void>
+  /**
+   * 组装工具池：对每个已注册 Agent 触发 `tool.pool.assemble` Hook，把插件工具注册进全局
+   * ToolRegistry。幂等（ToolPool.add 仅注册尚未注册的工具）。供 boot 后台预加载插件后主动
+   * 预热，使 /tools 无需等待首条消息即可呈现「已加载」状态（query 内部仍会再触发一次）。
+   */
+  assembleTools(): Promise<void>
 
   // === 能力访问器 ===
   readonly session: SessionManager
@@ -1902,6 +1908,17 @@ export class HarnessImpl implements Harness {
     }
     this.started = true
     await this.bus.publish(HarnessEvents.started, { durationMs: Date.now() - startedAt }, { source: 'harness' })
+  }
+
+  /**
+   * 组装工具池（见 Harness.assembleTools 注释）。与 query 内联逻辑一致：新建
+   * DefaultToolPool 绑定全局 ToolRegistry，逐 Agent 触发 tool.pool.assemble Hook。
+   */
+  async assembleTools(): Promise<void> {
+    const pool = new DefaultToolPool(this.tools)
+    for (const def of this.agent.list()) {
+      await (this.plugin as any).trigger('tool.pool.assemble', { agentId: def.id } as ToolPoolAssembleInput, pool)
+    }
   }
 
   async stop(): Promise<void> {

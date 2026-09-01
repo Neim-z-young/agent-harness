@@ -1481,24 +1481,44 @@ export class HarnessApp {
    * fire-and-forget：不阻塞 boot、不向上抛错；经 Promise.allSettled 采集结果，
    * 失败仅向 stdout 写一条 WARN 日志。职责：
    * 1) 预热已登记的内置插件（tools-builtin / tools-manager 等，动态 import 已被运行时缓存，重复调用开销极低）；
-   * 2) 为后续追加到 BuiltinPluginRegistry 的可选插件提供统一的静默后台加载机制。
+   * 2) 将预加载出的插件模块安装进 Harness（跳过 boot 阶段已同步安装的），并触发
+   *    harness.assembleTools() 主动组装工具池——否则工具只在用户首条消息后（query 内
+   *    的 tool.pool.assemble）才注册，/tools 会一直停留在「仅元信息」，list_dir 等场景
+   *    工具也无法开箱即用。
    */
   private scheduleBuiltinPreload(): void {
     const stdout = this.options.stdout
     const verbose = this.options.verbose
     if (this.options.backgroundPreload === false) return
+    const harness = this.harness
     const items = getBuiltinRegistry().list()
-    if (!items.length) return
+    if (!items.length || !harness) return
     void (async () => {
       const results = await Promise.allSettled(items.map((p) => p.load()))
+      const installedIds = new Set(harness.plugin.list().map((lp) => lp.plugin.id))
+      const toInstall: AgentPlugin[] = []
       for (let i = 0; i < items.length; i++) {
         const item = items[i]!
         const r = results[i]!
         if (r.status === 'rejected') {
           stdout?.write?.(`[WARN] 内置插件「${item.id}」后台预加载失败：${(r.reason as Error)?.message ?? String(r.reason)}\n`)
-        } else if (verbose) {
-          stdout?.write?.(`[INFO] 内置插件「${item.id}」已后台预热。\n`)
+        } else {
+          const plugin = r.value
+          if (plugin && !installedIds.has(plugin.id)) toInstall.push(plugin)
+          if (verbose) stdout?.write?.(`[INFO] 内置插件「${item.id}」已后台预热。\n`)
         }
+      }
+      if (toInstall.length > 0) {
+        try {
+          await harness.plugin.loadInternal(toInstall)
+        } catch (err) {
+          stdout?.write?.(`[WARN] 内置插件安装失败：${(err as Error)?.message ?? String(err)}\n`)
+        }
+      }
+      try {
+        await harness.assembleTools()
+      } catch (err) {
+        stdout?.write?.(`[WARN] 工具池预热失败：${(err as Error)?.message ?? String(err)}\n`)
       }
     })()
   }

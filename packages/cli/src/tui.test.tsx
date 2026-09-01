@@ -597,6 +597,29 @@ async function waitExit(f: TuiFixture, maxPasses = 600): Promise<TuiReplExit> {
   throw new Error('exit 超时')
 }
 
+/** 取最后一帧最底部的输入行（空输入显示占位 ❯；有内容时显示值本身） */
+function inputLine(setup: TestRendererSetup): string {
+  const lines = setup.captureCharFrame().split('\n').map((l) => l.trim())
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (lines[i]) return lines[i]!
+  }
+  return ''
+}
+
+/**
+ * 发送一条消息（含输入历史回看所需的真实事件间隙）。typeText 与 pressEnter 若在同一同步帧内，
+ * React 会把所有 setState 批处理合并，value prop 从 '' 直接回到 ''（跳过中间键入值），
+ * InputRenderable 内部文本将无法被清空——真实逐键输入每个事件循环间隙都会提交，故此处
+ * typeText 后先让 React 提交键入值，再按 Enter，最后等待用户回显 + 输入框清空。
+ */
+async function sendMessageWithGap(setup: TestRendererSetup, text: string): Promise<void> {
+  setup.mockInput.typeText(text)
+  for (let i = 0; i < 12; i++) { await pumpOnce(setup); await new Promise((r) => setTimeout(r, 5)) }
+  setup.mockInput.pressEnter()
+  await waitFrame(setup, (fr) => fr.includes('❯ ' + text) && fr.trimEnd().endsWith('❯'))
+  for (let i = 0; i < 6; i++) await pumpOnce(setup)
+}
+
 describe('TuiApp 集成（mock provider）', () => {
   it('初始：状态栏 + 侧栏「会话上下文」渲染', async () => {
     const f = await mountTui()
@@ -809,6 +832,61 @@ describe('TuiApp 文件引用导航（Tab / 上下键选中 / Enter 打开）', 
     await waitFrame(f.setup, (frame) => !frame.includes('▸'))
 
     expect(opened).toContainEqual({ path: 'src/bar.ts', line: 3 })
+    await f.cleanup()
+  })
+})
+
+// ------------------------------------------------------------------------
+// TuiApp 输入历史导航（↑ 回看 / ↓ 前进 / 底部 ↓ 退出）
+// ------------------------------------------------------------------------
+
+describe('TuiApp 输入历史导航', () => {
+  it('连续 ↑ 逐级回看最近→更早，↓ 前进，底部 ↓ 退出回看', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    // 发送 3 条消息（每条之间等待输入清空，模拟真实用户）
+    for (const t of ['first message', 'second message', 'third message']) {
+      await sendMessageWithGap(f.setup, t)
+    }
+    // 输入框应已清空（不含任何历史消息）
+    expect(inputLine(f.setup)).toBe('❯')
+
+    // ↑ 第 1 次 → 最近一条（third）
+    f.setup.mockInput.pressArrow('up')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('third message'))
+    expect(inputLine(f.setup)).toBe('third message')
+
+    // ↑ 第 2 次 → second
+    f.setup.mockInput.pressArrow('up')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('second message'))
+    expect(inputLine(f.setup)).toBe('second message')
+
+    // ↑ 第 3 次 → first（最旧）
+    f.setup.mockInput.pressArrow('up')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('first message'))
+    expect(inputLine(f.setup)).toBe('first message')
+
+    // ↑ 第 4 次 → 仍是最旧
+    f.setup.mockInput.pressArrow('up')
+    await new Promise((r) => setTimeout(r, 30))
+    for (let i = 0; i < 6; i++) await pumpOnce(f.setup)
+    expect(inputLine(f.setup)).toBe('first message')
+
+    // ↓ 第 1 次 → second
+    f.setup.mockInput.pressArrow('down')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('second message'))
+    expect(inputLine(f.setup)).toBe('second message')
+
+    // ↓ 第 2 次 → third
+    f.setup.mockInput.pressArrow('down')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('third message'))
+    expect(inputLine(f.setup)).toBe('third message')
+
+    // ↓ 第 3 次（底部）→ 退出回看，输入框清空
+    f.setup.mockInput.pressArrow('down')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('❯'))
+    expect(inputLine(f.setup)).toBe('❯')
+
     await f.cleanup()
   })
 })
