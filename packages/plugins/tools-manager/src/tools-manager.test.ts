@@ -37,7 +37,7 @@ async function run(
   h: Hooks,
   arg: string,
   ctx: { harness: unknown; out: string[]; saved: Array<[string, string[]]> },
-) {
+): Promise<CliCommandInput> {
   const input = {
     command: 'tools',
     raw: arg,
@@ -49,6 +49,7 @@ async function run(
     setAgentTools: async (id: string, tools: string[]) => { ctx.saved.push([id, tools]) },
   } as CliCommandInput
   await h['cli.command']?.(input)
+  return input
 }
 
 describe('tools-manager 插件', () => {
@@ -62,9 +63,10 @@ describe('tools-manager 插件', () => {
   it('空参数列出当前 Agent 可用工具（白名单 * → 全部）', async () => {
     const h = await getHooks()
     const { harness, out, saved } = makeHarness([mkTool('bash'), mkTool('read_file')], ['*'])
-    await run(h, '', { harness, out, saved })
+    const input = await run(h, '', { harness, out, saved })
     expect(out.join('')).toContain('bash')
     expect(out.join('')).toContain('read_file')
+    expect(input.result).toBe('continue') // 关键：避免 cli fallthrough 到"未知命令"
   })
 
   it('--global off 卸载工具，--global on 恢复注册', async () => {
@@ -81,9 +83,10 @@ describe('tools-manager 插件', () => {
   it('作用域 A：off 从非通配白名单移除并持久化', async () => {
     const h = await getHooks()
     const { harness, out, saved } = makeHarness([mkTool('bash'), mkTool('read_file')], ['bash', 'read_file'])
-    await run(h, 'bash off', { harness, out, saved })
+    const input = await run(h, 'bash off', { harness, out, saved })
     expect(saved).toEqual([['default', ['read_file']]])
     expect(out.join('')).toContain('已禁用工具')
+    expect(input.result).toBe('continue')
   })
 
   it('作用域 A：on 追加到白名单并持久化', async () => {
@@ -106,5 +109,6 @@ describe('tools-manager 插件', () => {
     const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
     await run(h, 'nonexistent', { harness, out, saved })
     expect(out.join('')).toContain('未找到')
+    expect((await run(h, '', { harness, out, saved })).result).toBe('continue')
   })
 })

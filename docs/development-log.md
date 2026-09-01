@@ -52,6 +52,13 @@
 
 - tools-manager.test.ts 7 例：命令注册 / 空参列表 / `--global` off+on 往返 / 作用域 A off、on、通配展开 / 详情未找到。cli 86 例保持通过，全仓 typecheck 通过。
 
+### 修复：命令处理后 fallthrough 到"未知命令"（2026-09-02）
+
+- 现象：`/tools` 已输出工具列表，但 cli 仍打印 `未知命令：/tools`。
+- 根因：cli 的 `cli.command` dispatch 只在 `cmdInput.result === 'continue'` 时认为命令已处理，否则落到 `未知命令`；tools-manager 未设置 `result`。
+- 修复：hook 用 `try/finally` 统一在 `finally` 置 `input.result = 'continue'`，任何分支（含空列表）都不会 fallthrough。
+- 测试：`run()` 返回 input，列表 / off 用例断言 `result === 'continue'`，防止回归。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。
