@@ -47,6 +47,7 @@ import { SEARCH_TOOL_META as searchToolMetas } from '@harness/tools-search/meta'
 import { GLOB_TOOL_META as globToolMetas } from '@harness/tools-glob/meta'
 import { WEB_TOOL_META as webToolMetas } from '@harness/tools-web/meta'
 import { MEDIA_TOOL_META as mediaToolMetas } from '@harness/tools-media/meta'
+import { COMPUTER_USE_TOOL_META as computerUseToolMetas } from '@harness/computer-use/meta'
 // subagent / swarm 均为内置插件（组合根直连），cli 经其导出的能力对象（抽象契约）交互
 import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -456,6 +457,37 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       source: 'builtin',
       load: async () => (await lazyImport<{ createToolsManagerPlugin: () => AgentPlugin }>('@harness/tools-manager')).createToolsManagerPlugin(),
     })
+    // 场景化工具插件（search/glob/web/media，L1 meta 已在 getBuiltinToolRegistry 登记）：
+    // 登记进 BuiltinPluginRegistry 后，boot 末尾的后台预加载（scheduleBuiltinPreload）
+    // 就会真正预热这些运行时模块，使「后台加载」生效——不再停留在"仅元信息"。
+    defaultBuiltinRegistry.register({
+      id: 'tools-search',
+      name: 'Search Tools',
+      description: '搜索类工具插件：list_dir 目录列举 + grep_file 内容检索',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ toolsSearchPlugin: AgentPlugin }>('@harness/tools-search')).toolsSearchPlugin,
+    })
+    defaultBuiltinRegistry.register({
+      id: 'tools-glob',
+      name: 'Glob Tools',
+      description: 'glob 文件匹配工具插件',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ toolsGlobPlugin: AgentPlugin }>('@harness/tools-glob')).toolsGlobPlugin,
+    })
+    defaultBuiltinRegistry.register({
+      id: 'tools-web',
+      name: 'Web Tools',
+      description: 'Web 抓取工具插件：web_fetch',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ toolsWebPlugin: AgentPlugin }>('@harness/tools-web')).toolsWebPlugin,
+    })
+    defaultBuiltinRegistry.register({
+      id: 'tools-media',
+      name: 'Media Tools',
+      description: '媒体工具插件：view_image',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ toolsMediaPlugin: AgentPlugin }>('@harness/tools-media')).toolsMediaPlugin,
+    })
   }
   return defaultBuiltinRegistry
 }
@@ -516,6 +548,7 @@ export function getBuiltinToolRegistry(): BuiltinToolRegistry {
       ...globToolMetas,
       ...webToolMetas,
       ...mediaToolMetas,
+      ...computerUseToolMetas,
     ])
   }
   return defaultToolMetaRegistry

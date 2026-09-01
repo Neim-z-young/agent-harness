@@ -123,6 +123,37 @@
 - tools-manager 新增 2 例：列表含"状态/权限"列与 `启用·已加载`；`--all` 合并未加载元信息显示 `仅元信息` 且详情含权限键。
 - 本批涉及测试全部通过；全量 typecheck 通过（存量 TUI/dom 第三方测试失败与本批无关）。
 
+## 2026-09-02（续 48）修复：/tools 元信息、Agent 可用工具、computer-use 元信息、后台预加载、命令历史
+
+> 承接续 47。用户反馈 4 个问题：1) `/tools` 未打印元信息且 Agent 可用工具受懒加载影响；2) computer-use 的 MCP 工具元信息需补充；3) 懒加载的后台加载功能未生效；4) 命令历史无法上下切换。
+
+### 1) `/tools` 打印元信息 + Agent 可用工具不受懒加载影响（tools-manager）
+
+- 原列表默认走 `filterByWhitelist`，只输出**已加载**工具 → 懒加载期间大量工具"消失"、元信息缺失。
+- 新增 `agentUsableEntries(inp)`：合并「已加载且在白名单内的运行时工具」+「白名单内未加载的静态元信息」，补齐描述。
+  - 通配 `*` 白名单 → 全部静态元信息（`unionTools`）；显式白名单 → 仅补白名单内未加载的工具。
+- `entryStatus` 修正：未加载但显式在白名单的元信息工具标记为 `启用·仅元信息`（原只有通配 `*` 才算启用）。
+
+### 2) computer-use MCP 工具元信息补充（L1）
+
+- 新增 `packages/plugins/computer-use/src/meta.ts`：登记 11 个 MCP 工具（`mcp__computer-use__<toolName>`）的静态元信息（只读/可写、非并发、权限键）。
+- `package.json` `exports` 新增 `./meta` 子路径；根 `tsconfig.json` `paths` 注册 `@harness/computer-use/meta`。
+- cli `getBuiltinToolRegistry().registerAll` 追加 `COMPUTER_USE_TOOL_META`，使 `/tools` 在 server 未连接加载时也能展示其描述/安全/权限键。
+- 新增 `meta.test.ts` 覆盖 id 前缀/非空描述/只读语义/唯一性。
+
+### 3) 懒加载的后台加载功能未生效（cli）
+
+- 根因：`BuiltinPluginRegistry` 只登记 `tools-builtin` 与 `tools-manager`，而这两者已在 boot 早期被**急切加载**，故 `scheduleBuiltinPreload` 实际上"无事可预热"。
+- 修复：把随应用打包的场景化工具插件并入 `BuiltinPluginRegistry`（`tools-search` / `tools-glob` / `tools-web` / `tools-media`），使 boot 末尾的后台预加载真正 `lazyImport` 预热这些运行时模块，不再停留在"仅元信息"。
+
+### 4) 命令历史无法上下切换（TUI）
+
+- `tui.tsx` 模块 C：移除输入框为空的限制，允许输入内容时用 ↑ 回看 / ↓ 前进历史命令；输入任意字符即取消回看（`onInput` 重置 `histIdx`）。
+
+### 测试与提交
+
+- 根 `bun run typecheck` 全部通过；`@harness/cli`（88 例）、`@harness/tools-manager`（9 例）、`@harness/computer-use`（12 例）测试全绿。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。

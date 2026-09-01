@@ -920,8 +920,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       }
       return true // 命令菜单吞掉其余按键
     }
-    // 模块 C：输入历史 —— 输入为空、无命令菜单时，↑ 回看 / ↓ 前进，Enter 用回看值提交
-    if (!listMode && !cmdMenuOpen && input === '' && history.length > 0) {
+    // 模块 C：输入历史 —— 无命令菜单时，↑ 回看 / ↓ 前进，Enter 用回看值提交（当前输入内容会被回看值覆盖，输入任意字符即取消回看）
+    if (!listMode && !cmdMenuOpen && history.length > 0) {
       if (key.name === 'up') { setHistIdx((i) => (i === -1 ? history.length - 1 : Math.max(0, i - 1))); return }
       if (key.name === 'down') { setHistIdx((i) => (i === -1 ? -1 : Math.min(history.length - 1, i + 1))); return }
     }

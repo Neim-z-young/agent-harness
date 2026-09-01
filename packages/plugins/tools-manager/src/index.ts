@@ -71,6 +71,30 @@ function unionTools(loaded: Tool[], meta: ToolMetaLookup | undefined): Array<Too
   return result
 }
 
+/**
+ * 计算 Agent 的全部可用工具（不受懒加载影响）：
+ * 「已加载且在白名单内的运行时工具」+「白名单内未加载的静态元信息」。
+ * 通配（*）白名单时补全部静态元信息；显式白名单时仅补白名单内未加载的工具。
+ * 这样 /tools 列表在懒加载期间也能完整呈现 Agent 可用工具及其描述/状态。
+ */
+function agentUsableEntries(inp: ToolsCtx): Array<Tool | ToolMetaEntry> {
+  const harness = inp.harness
+  const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
+  const wildcard = agentTools.length === 1 && agentTools[0] === '*'
+  const loaded = harness.tools.filterByWhitelist(agentTools)
+  if (wildcard) return unionTools(loaded, inp.toolMeta)   // 全允许：补全部静态元信息
+  const meta = inp.toolMeta
+  if (!meta) return loaded
+  const result: Array<Tool | ToolMetaEntry> = [...loaded]
+  const seen = new Set(result.map((x) => x.id))
+  for (const id of agentTools) {
+    if (id === '*' || seen.has(id)) continue
+    const m = meta.get(id)
+    if (m) { result.push(m); seen.add(id) }
+  }
+  return result
+}
+
 /** 从运行时 Tool 或静态元信息归一化出权限键 */
 function permKeyOf(t: Tool | ToolMetaEntry): string {
   const asTool = t as Tool
@@ -93,7 +117,9 @@ function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry): string {
   const loaded = entryLoaded(t)
   const enabled = wildcard
     ? true
-    : !isMetaEntry(t) && inp.harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
+    : isMetaEntry(t)
+      ? agentTools.includes(t.id)                       // 未加载但显式在白名单 → 启用
+      : inp.harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
   const en = enabled ? '启用' : '禁用'
   const ld = loaded ? '已加载' : '仅元信息'
   return [en, ld].join('·')
@@ -199,7 +225,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
             return
           }
           const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
-          const usable = harness.tools.filterByWhitelist(agentTools)
+          const usable = agentUsableEntries(inp)
           out(`Agent「${inp.agentId}」可用工具（白名单：${agentTools.join(', ') || '(空)'}）：\n${renderToolTable(inp, usable)}\n`)
           return
         }
