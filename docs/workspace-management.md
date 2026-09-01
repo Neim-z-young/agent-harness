@@ -64,6 +64,25 @@ Provider：config.json → providers（显式多 Provider） + 默认 Provider �
 配置：  CLI > config.json > 环境变量
 ```
 
+## 5.5 索引 / AST：是否需要（调研结论）
+
+结合当前实现与演进方向，结论：**工作区管理模块本身不需要 AST，也不维护持久化的内容索引**。
+
+### 索引（Index）
+
+- **快照已借力 git 自身的 index**：GitSnapshotService 依赖 `~/.harness/snapshots/{worktree-hash}` 独立仓库的 staging index（`diff-files`/`ls-files`/`--cached`/`index.version=4`），与用户项目工作区**完全隔离**；FileSnapshotService 则以备份文件 + `snapshots.json` 快照链存储。两者都不在用户工作区建任何索引。
+- **无内容索引**：`grep_file` 等搜索按需遍历，未建全文/结构索引；skills/plugins/agents 每次启动现场扫描目录加载，未建持久化注册索引。
+- **是否需要**：对"定位与解析"职责不必要。若后续出现查找/重扫描性能瓶颈，再考虑两类轻量索引：
+  1. **资源注册索引**（skills/plugins/agents 的扫描结果缓存）——属于工作区模块的合理增强；
+  2. **文件内容索引**（全文/符号）——归 `tools-search` / 代码情报层，**不归**工作区模块。
+
+### AST（抽象语法树）
+
+- 全仓**无任何 AST 依赖**（未用 tree-sitter / acorn / babel-parser 等）。`edit_file` 为精确字符串替换，`grep_file` 为正则搜索。
+- **是否需要**：代码语义（符号、结构感知编辑、AST diff）与工作区存储定位是两回事，**工作区模块不需要 AST**。如需结构感知能力（结构编辑工具、符号索引、语义 diff），应作为**独立代码情报层/插件**（如 `@harness/codeintel`）实现，仅在该层内引入 AST，不污染工作区模块边界。
+
+> 结论速览：工作区管理 = 目录/数据/存储定位；**索引与 AST 均非其内部职责**。当前无实现缺口，无需引入。
+
 ## 6. 现状落点（代码索引）
 
 - CLI 入口与 `cwd/dataDir` 解析：[main()](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L2207-L2226)：`cwd = args.cwd ?? process.cwd()`；`dataDir = args.dataDir ?? ~/.harness`。
