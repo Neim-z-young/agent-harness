@@ -8,8 +8,9 @@
 
 核心原则：
 
-- **两级加载**：`user`（`~/.harness/…`，全局共享）× `project`（`<cwd>/.harness/…`，按项目）两级，**project 覆盖 user**。
-- **一个工作区 = 一个 cwd + 一个 dataDir**：`cwd` 决定 project 级目录；`dataDir` 决定全局数据落盘位置。
+* **两级加载**：`user`（`~/.harness/…`，全局共享）× `project`（`<cwd>/.harness/…`，按项目）两级，**project 覆盖 user**。
+
+* **一个工作区 = 一个 cwd + 一个 dataDir**：`cwd` 决定 project 级目录；`dataDir` 决定全局数据落盘位置。
 
 ## 2. 目录布局
 
@@ -32,25 +33,31 @@
 
 ## 3. 数据存储
 
-| 存储 | 路径 | 实现 | 说明 |
-| --- | --- | --- | --- |
-| 会话 | `dataDir/sessions` | `SessionFileStore` | 每会话一文件；`list/load` 支持恢复 |
-| 全局配置 | `dataDir/config.json` | `ConfigStore` | `model/provider/apiKey/providers` 幂等读写，缺失/解析失败返回空配置 |
-| 权限规则 | `dataDir/permissions.json` | `PermissionStoreFile` | 权限引擎规则落盘 |
-| 密钥 | `dataDir/.config-key` | `SecretCipher` | AES-256-GCM 加解密提供方，用于 `enc:v1:` 密钥解析（`resolveSecret`） |
-| 快照 | dataDir 下 | `SnapshotService` | 每轮 query 自动 capture + 挂载 `meta.snapshot`，支撑 `/revert` |
+| 存储   | 路径                         | 实现                    | 说明                                                    |
+| ---- | -------------------------- | --------------------- | ----------------------------------------------------- |
+| 会话   | `dataDir/sessions`         | `SessionFileStore`    | 每会话一文件；`list/load` 支持恢复                               |
+| 全局配置 | `dataDir/config.json`      | `ConfigStore`         | `model/provider/apiKey/providers` 幂等读写，缺失/解析失败返回空配置   |
+| 权限规则 | `dataDir/permissions.json` | `PermissionStoreFile` | 权限引擎规则落盘                                              |
+| 密钥   | `dataDir/.config-key`      | `SecretCipher`        | AES-256-GCM 加解密提供方，用于 `enc:v1:` 密钥解析（`resolveSecret`） |
+| 快照   | dataDir 下                  | `SnapshotService`     | 每轮 query 自动 capture + 挂载 `meta.snapshot`，支撑 `/revert` |
 
 ## 4. 可插拔目录加载（plugins / skills / agents）
 
 `plugins` 目录可承载任意插件类型（AgentPlugin 的 Hooks 生命周期插件 + Provider 类型工厂），来源标注 `user | project`。加载顺序 user → project，**后者覆盖前者**。
 
-- **plugins**：[loadPluginDirs](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1107-L1113) 依次加载
-  - `~/.harness/plugins`（user）→ `<cwd>/.harness/plugins`（project）
-  - 通用 AgentPlugin 汇总参与 Harness Hooks；Provider 类型工厂注册进 `ProviderTypeRegistry`，供 `config.type` 动态解析
-- **skills / agents**：[HarnessApp 装配](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1238-L1247) 传入 core
-  - `agentDirs`：`user` 目录在前 + `.harness/agents`（project）在后，同 ID 后加载覆盖先加载
-  - `skillDirs`：`user` 目录在前 + `.harness/skills`（project）在后，后加载覆盖先加载
-  - 技能/Agent 来源标注：内置 / 用户 / 项目 / MCP / 插件
+* **plugins**：[loadPluginDirs](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1107-L1113) 依次加载
+
+  * `~/.harness/plugins`（user）→ `<cwd>/.harness/plugins`（project）
+
+  * 通用 AgentPlugin 汇总参与 Harness Hooks；Provider 类型工厂注册进 `ProviderTypeRegistry`，供 `config.type` 动态解析
+
+* **skills / agents**：[HarnessApp 装配](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1238-L1247) 传入 core
+
+  * `agentDirs`：`user` 目录在前 + `.harness/agents`（project）在后，同 ID 后加载覆盖先加载
+
+  * `skillDirs`：`user` 目录在前 + `.harness/skills`（project）在后，后加载覆盖先加载
+
+  * 技能/Agent 来源标注：内置 / 用户 / 项目 / MCP / 插件
 
 > 注：`plugins` 目录由 CLI（`HarnessApp`）直接加载并以两用户域覆盖；`skills/agents` 两级目录由 core 的 `SkillManager`/Agent 装配消费。
 
@@ -70,37 +77,78 @@ Provider：config.json → providers（显式多 Provider） + 默认 Provider �
 
 ### 索引（Index）
 
-- **快照已借力 git 自身的 index**：GitSnapshotService 依赖 `~/.harness/snapshots/{worktree-hash}` 独立仓库的 staging index（`diff-files`/`ls-files`/`--cached`/`index.version=4`），与用户项目工作区**完全隔离**；FileSnapshotService 则以备份文件 + `snapshots.json` 快照链存储。两者都不在用户工作区建任何索引。
-- **无内容索引**：`grep_file` 等搜索按需遍历，未建全文/结构索引；skills/plugins/agents 每次启动现场扫描目录加载，未建持久化注册索引。
-- **是否需要**：对"定位与解析"职责不必要。若后续出现查找/重扫描性能瓶颈，再考虑两类轻量索引：
+* **快照已借力 git 自身的 index**：GitSnapshotService 依赖 `~/.harness/snapshots/{worktree-hash}` 独立仓库的 staging index（`diff-files`/`ls-files`/`--cached`/`index.version=4`），与用户项目工作区**完全隔离**；FileSnapshotService 则以备份文件 + `snapshots.json` 快照链存储。两者都不在用户工作区建任何索引。
+
+* **无内容索引**：`grep_file` 等搜索按需遍历，未建全文/结构索引；skills/plugins/agents 每次启动现场扫描目录加载，未建持久化注册索引。
+
+* **是否需要**：对"定位与解析"职责不必要。若后续出现查找/重扫描性能瓶颈，再考虑两类轻量索引：
+
   1. **资源注册索引**（skills/plugins/agents 的扫描结果缓存）——属于工作区模块的合理增强；
   2. **文件内容索引**（全文/符号）——归 `tools-search` / 代码情报层，**不归**工作区模块。
 
 ### AST（抽象语法树）
 
-- 全仓**无任何 AST 依赖**（未用 tree-sitter / acorn / babel-parser 等）。`edit_file` 为精确字符串替换，`grep_file` 为正则搜索。
-- **是否需要**：代码语义（符号、结构感知编辑、AST diff）与工作区存储定位是两回事，**工作区模块不需要 AST**。如需结构感知能力（结构编辑工具、符号索引、语义 diff），应作为**独立代码情报层/插件**（如 `@harness/codeintel`）实现，仅在该层内引入 AST，不污染工作区模块边界。
+* 全仓**无任何 AST 依赖**（未用 tree-sitter / acorn / babel-parser 等）。`edit_file` 为精确字符串替换，`grep_file` 为正则搜索。
+
+* **是否需要**：代码语义（符号、结构感知编辑、AST diff）与工作区存储定位是两回事，**工作区模块不需要 AST**。如需结构感知能力（结构编辑工具、符号索引、语义 diff），应作为**独立代码情报层/插件**（如 `@harness/codeintel`）实现，仅在该层内引入 AST，不污染工作区模块边界。
 
 > 结论速览：工作区管理 = 目录/数据/存储定位；**索引与 AST 均非其内部职责**。当前无实现缺口，无需引入。
 
 ## 6. 现状落点（代码索引）
 
-- CLI 入口与 `cwd/dataDir` 解析：[main()](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L2207-L2226)：`cwd = args.cwd ?? process.cwd()`；`dataDir = args.dataDir ?? ~/.harness`。
-- 存储类：[SessionFileStore / ConfigStore / SecretCipher](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L205-L312)。
-- 权限规则持久化：[CliPermissionEngine](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L751-L814)。
-- 插件多级加载：[loadPluginDirs](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts) + [HarnessApp 装配](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1238-L1247)。
-- core 侧多级加载：[options.agentDirs / options.skillDirs](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts#L1611-L1648)。
+* CLI 入口与 `cwd/dataDir` 解析：[main()](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L2207-L2226)：`cwd = args.cwd ?? process.cwd()`；`dataDir = args.dataDir ?? ~/.harness`。
 
-## 7. 演进边界（如需抽成独立模块 `@harness/workspace`）
+* 存储类：[SessionFileStore / ConfigStore / SecretCipher](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L205-L312)。
 
-当前逻辑与 `HarnessApp` 耦合，抽离时保持以下边界：
+* 权限规则持久化：[CliPermissionEngine](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L751-L814)。
 
-- `workspace` 模块只负责「定位与解析」，不持有 Provider/插件装配逻辑；`HarnessApp` 仍做组装。
-- 对外暴露：`resolveWorkspace({ cwd, dataDir? }) → { userDir, projectDir, paths }` + 各存储类工厂。
-- plugins/skills/agents 的「多级扫描 + 来源标注 + 覆盖」可收敛为通用 `MultiDirLoader`。
-- 密钥/快照仍走既有 `dataDir`，路径一律由 workspace 解析，避免散落 magic path。
+* 插件多级加载：[loadPluginDirs](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts) + [HarnessApp 装配](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1238-L1247)。
+
+* core 侧多级加载：[options.agentDirs / options.skillDirs](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts#L1611-L1648)。
+
+## 7. 插件化实现规划（`@harness/workspace`）
+
+按"全功能插件化"约束，工作区能力以\*\*「核心库 + 薄 AgentPlugin 壳」双形态\*\*实现，不与 core/CLI 主逻辑耦合：
+
+### 7.1 包形态
+
+* **核心库** **`packages/workspace`（`@harness/workspace`）**：只做「定位与解析 + 存储」，不含 Provider/插件装配。导出服务工厂（供 cli/core 启动期使用），不与插件钩子绑定——借鉴 `@harness/snapshot`、`createBashTool`（插件模块同时导出 helper 工厂与 Plugin）。
+
+* **薄壳 AgentPlugin** **`createWorkspacePlugin(opts)`**：复用 `harness.init`/`cli.commands` 等 Hooks 提供生命周期与 `/workspace` 查看命令；真正服务对象由核心库工厂预创建后注入。
+
+### 7.2 从 cli 抽离的服务
+
+| 服务                                                  | 现居地                                                                                                 | 抽离目标                                  |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------- |
+| `cwd` / `dataDir` 路径解析（→ userDir/projectDir + 各子路径） | [main()](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L2207-L2226) | `resolveWorkspace({ cwd, dataDir? })` |
+| `ConfigStore` / `SessionFileStore` / `SecretCipher` | [cli](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L205-L312)      | 各存储类工厂                                |
+| 权限规则持久化                                             | `CliPermissionEngine`                                                                               | 复用 workspace 的 `dataDir` 路径           |
+| 插件/技能/Agent 多级扫描+来源+覆盖                              | cli + core 重复                                                                                       | 收敛为通用 `MultiDirLoader` 归 workspace    |
+| 密钥/快照 `/revert`                                     | cli / snapshot                                                                                      | 路径统一由 workspace 解析，消灭 magic path      |
+
+### 7.3 启动时序说明（基础设施插件的特殊性）
+
+与"运行时注入工具"的普通插件不同，workspace 属**基础设施**，cli 需在创建 harness **之前**预创建服务（路径解析在插件装配前就要求可达）。因此：
+
+* cli 先 `import { resolveWorkspace } from '@harness/workspace'` 得基础路径；
+
+* 再 `createWorkspacePlugin({ resolve })` 作为 internal/builtin 插件装载；
+
+* harness/core 经 `harness.init` 输出消费解析结果。
+
+该"预创建 + 薄壳"模式同样适用于 snapshot 插件化。
+
+### 7.4 演进边界
+
+* `MultiDirLoader` 通用化后，skills/agents/plugins 加载路径与来源标注都收敛于此，避免 cli/core 各写一套。
+
+* codeintel（见 [codeintel-plugin.md](codeintel-plugin.md)）**不归属** workspace：它只消费 workspace 的根路径，引入 AST/索引。
 
 ## 8. 相关文档
 
-- 架构总览 [agent-harness-architecture.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agent-harness-architecture.md) §十五
-- 开发日志 [development-log.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/development-log.md)
+* 架构总览 [agent-harness-architecture.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agent-harness-architecture.md) §十五
+
+* 代码情报插件规划 [codeintel-plugin.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/codeintel-plugin.md)
+
+* 开发日志 [development-log.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/development-log.md)
+
