@@ -24,6 +24,34 @@
 
 - 写 `/tools` 插件持久化端（upsert config.json 的 agents[].tools）+ `--global` 运行时启停（方案 B 所见即所得）。
 
+## 2026-09-01（续 45）实现：/tools 工具管理插件
+
+> 承接续 44 的回读消费端，按「可插件化」落地 `/tools` 命令。新增插件包 `packages/plugins/tools-manager`（`@harness/tools-manager`）。
+
+### cli 侧注入能力
+
+- `PluginContext` 无持久化接口，故在 `CliCommandInput`（`@harness/plugin`）扩展可选字段：`agentId`、`setAgentTools(agentId, tools)`、`harness`（unknown，由消费插件自行类型化）。
+- `HarnessApp` 新增 `setAgentTools(agentId, tools)`：upsert config.json 的 `agents[].tools` 并即时 `register({...existing, tools})` 覆盖运行时（写盘 + 内存一次完成）。
+- REPL 内核构造 `cli.command` 输入时注入上述三字段。
+
+### tools-manager 插件（`/tools`）
+
+- 经 `cli.commands` / `cli.command` hook 注册，按"全功能插件化"约束实现，不耦合 cli/core。
+- 命令语义：
+  - `/tools` → 当前 Agent 可用工具（filterByWhitelist）；`/tools --all`/`--json` → 全局注册清单。
+  - `/tools <id>` → 详情（描述/别名/安全声明/启用态）。
+  - 作用域 A（默认）：`/tools <id> on|off` → 改 agent 白名单并 `setAgentTools` 持久化。`off` 遇 `*` 白名单展开为显式（除目标外全部注册工具）后持久化。
+  - 作用域 B：`/tools <id> --global on|off` → 运行时 `harness.tools.unregister/register`，插件内 `suspended` Map 缓存被卸载 Tool 供 on 恢复；不持久化，仅本轮进程。
+- 安全声明为函数（`isReadOnly(isDestructive)`），展示时 `?.(undefined)` 求值。
+
+### 注册
+
+- 根 tsconfig `paths`、cli `dependencies` 注册 `@harness/tools-manager`；经 `BuiltinPluginRegistry` + boot 惰性加载。
+
+### 测试
+
+- tools-manager.test.ts 7 例：命令注册 / 空参列表 / `--global` off+on 往返 / 作用域 A off、on、通配展开 / 详情未找到。cli 86 例保持通过，全仓 typecheck 通过。
+
 ## 2026-08-31（续 43）开发计划：workspace 与 codeintel 插件化
 
 > 状态：规划（待实现）。用户要求：workspace 与 codeintel 都规划成插件实现（对齐"全功能插件化"约束）。

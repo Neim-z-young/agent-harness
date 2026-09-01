@@ -26,6 +26,7 @@
       "@harness/revert": ["./packages/revert/src"],
       "@harness/provider-mock": ["./packages/plugins/provider-mock/src"],
       "@harness/tools-builtin": ["./packages/plugins/tools-builtin/src"],
+      "@harness/tools-manager": ["./packages/plugins/tools-manager/src"],
       "@harness/provider-anthropic": ["./packages/plugins/provider-anthropic/src"],
       "@harness/mcp-client": ["./packages/plugins/mcp-client/src"],
       "@harness/mcp-server-registry": ["./packages/plugins/mcp-server-registry/src"],

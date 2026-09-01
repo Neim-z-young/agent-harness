@@ -441,6 +441,13 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       source: 'builtin',
       load: async () => (await lazyImport<{ toolsBuiltinPlugin: AgentPlugin }>('@harness/tools-builtin')).toolsBuiltinPlugin,
     })
+    defaultBuiltinRegistry.register({
+      id: 'tools-manager',
+      name: 'Tools Manager',
+      description: '工具管理命令 /tools（查看 / Agent 白名单持久化 / --global 运行时启停）',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ createToolsManagerPlugin: () => AgentPlugin }>('@harness/tools-manager')).createToolsManagerPlugin(),
+    })
   }
   return defaultBuiltinRegistry
 }
@@ -946,6 +953,23 @@ export class HarnessApp {
     }
   }
 
+  /**
+   * 持久化某 Agent 的 tools 白名单到 config.json（upsert agents[].tools）并即时应用到运行时。
+   * 供 /tools 等插件调用：写入端 + 内存覆盖一次完成，重启后由 applyConfigAgentTools 回读生效。
+   */
+  async setAgentTools(agentId: string, tools: string[]): Promise<void> {
+    const cfg = await this.configStore.load()
+    const agents = [...(cfg.agents ?? [])]
+    const entry = { id: agentId, tools: [...tools] }
+    const idx = agents.findIndex((a) => a.id === agentId)
+    if (idx >= 0) agents[idx] = entry
+    else agents.push(entry)
+    await this.configStore.save({ ...cfg, agents })
+    // 即时覆盖运行时同名 Agent（query 时实时 filterByWhitelist(agent.tools)）
+    const existing = this.harness?.agent?.get?.(agentId)
+    if (existing) this.harness!.agent.register({ ...existing, tools: [...tools] })
+  }
+
   /** 当前生效模型（`provider/model` 展示）：优先读取活动 Agent 定义的 model，回退 options.model */
   getModel(agentId: string): string | undefined {
     const a = this.harness?.agent?.get?.(agentId)
@@ -1235,6 +1259,8 @@ export class HarnessApp {
     // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载
     const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load()
     providerPlugins.push(toolsBuiltin)
+    const toolsManager = await getBuiltinRegistry().get('tools-manager')!.load()
+    providerPlugins.push(toolsManager)
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
@@ -1871,13 +1897,21 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           return 'continue'
         }
         default: {
-          // 尝试交给插件处理
-          const cmdInput: { raw: string; command: string; arg: string; out: (s: string) => void; sessionId: string; result?: 'continue' | 'exit' } = {
+          // 尝试交给插件处理（注入 harness / 当前 agentId / 持久化工具白名单接口）
+          const cmdInput: {
+            raw: string; command: string; arg: string; out: (s: string) => void; sessionId: string;
+            harness: Harness; agentId?: string;
+            setAgentTools: (agentId: string, tools: string[]) => Promise<void>;
+            result?: 'continue' | 'exit'
+          } = {
             raw: line.slice(1),
             command: cmd.slice(1),
             arg: (arg ?? '').trim(),
             out,
             sessionId: current.id,
+            harness,
+            agentId: current.agentId,
+            setAgentTools: (id, tools) => app.setAgentTools(id, tools),
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)

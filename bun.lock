@@ -26,10 +26,8 @@
       "dependencies": {
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
-        "@harness/computer-use": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
-        "@harness/mcp-server-registry": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/provider-anthropic": "workspace:*",
@@ -46,6 +44,7 @@
         "@harness/swarm": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
+        "@harness/tools-manager": "workspace:*",
         "@opentui/core": "^0.5.8",
         "@opentui/react": "^0.5.8",
         "react": "^19.2.8",
@@ -230,6 +229,14 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/tools-manager": {
+      "name": "@harness/tools-manager",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/plugins/tools-media": {
       "name": "@harness/tools-media",
       "version": "0.1.0",
@@ -339,6 +346,8 @@
     "@harness/tools-builtin": ["@harness/tools-builtin@workspace:packages/plugins/tools-builtin"],
 
     "@harness/tools-glob": ["@harness/tools-glob@workspace:packages/plugins/tools-glob"],
+
+    "@harness/tools-manager": ["@harness/tools-manager@workspace:packages/plugins/tools-manager"],
 
     "@harness/tools-media": ["@harness/tools-media@workspace:packages/plugins/tools-media"],
 

@@ -33,6 +33,7 @@
     "@harness/swarm": "workspace:*",
     "@harness/tool": "workspace:*",
     "@harness/tools-builtin": "workspace:*",
+    "@harness/tools-manager": "workspace:*",
     "@opentui/core": "^0.5.8",
     "@opentui/react": "^0.5.8",
     "react": "^19.2.8"

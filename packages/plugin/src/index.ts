@@ -203,6 +203,19 @@ export interface CliCommandInput {
   sessionId: string
   /** 处理结果：插件设为 'continue' 或 'exit' 表示已处理 */
   result?: 'continue' | 'exit'
+  /**
+   * cli 注入：当前 Agent ID（命令归属的 Agent）
+   */
+  agentId?: string
+  /**
+   * cli 注入：持久化某 Agent 的 tools 白名单到 config.json（upsert agents[].tools）
+   * 并即时覆盖运行时；供 /tools 等命令管理插件使用。
+   */
+  setAgentTools?: (agentId: string, tools: string[]) => Promise<void>
+  /**
+   * cli 注入：harness 能力访问（工具启停等运行时操作）。具体子字段由消费插件自行类型化。
+   */
+  harness?: unknown
 }
 
 // ===== AgentPlugin 接口 =====
