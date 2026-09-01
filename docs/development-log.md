@@ -83,6 +83,17 @@
 
 * 不禁止标注：是否允许禁用 read\_file/write\_file/bash/edit\_file 等核心工具由用户决定，不在命令层强制。
 
+### 可插件化结论（调研 2026-08-31）
+
+`/tools` **可以做成可插拔插件**，且是更优形态（对齐"全功能插件化"，可经 `/plugins` 启停）：
+
+- **既定模式**：`mcp-client /mcp`、`subagent /tasks`、`mcp-server-registry` 已用 `cli.commands`（注册命令）+ `cli.command`（处理命令）实现，`/tools` 照此即可。
+- **harness 可达**：插件经 `harness.init` hook 捕获 `output.harness`，即可访问 `harness.tools`（register/unregister）与 `harness.agent`——查看 + `--global` 运行时启停全在插件内完成，不再需要 HarnessApp 私有方法。
+- **唯一张力 —— Agent 白名单持久化**：插件不持有 cli 的 `ConfigStore`（provider/model/permissions 专用），`on/off` 写回 config.json 需二选一：
+  1. **插件自持**：用 workspace 解析的 `dataDir` 直接读写 config.json 的 agent.tools（推荐，自包含，与 workspace 插件协作）；
+  2. 保留该子命令在 cli 内置，插件只做查看 + `--global`。
+- 落点调整：`toolInfos / setToolGlobalEnabled` 等 helper 移进 `/tools` 插件；HarnessApp 不再新增方法；REPL 内置不再加 `case '/tools'`。
+
 ### 相关文档
 
 * [docs/agent-harness-architecture.md](docs/agent-harness-architecture.md)
