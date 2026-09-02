@@ -19,6 +19,7 @@ import {
   registerBuiltinProviderTypes,
   getBuiltinRegistry,
   getBuiltinToolRegistry,
+  preloadBuiltinToolMetas,
   BuiltinToolRegistry,
   loadPluginDirs,
   startRepl,
@@ -346,17 +347,21 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     expect(typeof p.install).toBe('function')
   })
 
-  it('BuiltinToolRegistry（多级加载 L1）：同步登记内置工具元信息，无需加载运行时模块即可描述', () => {
+  it('BuiltinToolRegistry（多级加载 L1）：preload 后登记内置工具元信息，无需加载运行时模块即可描述', async () => {
+    await preloadBuiltinToolMetas()
     const reg = getBuiltinToolRegistry()
     expect(reg instanceof BuiltinToolRegistry).toBe(true)
     // 覆盖全部内置原语工具
     for (const id of ['read_file', 'write_file', 'bash', 'edit_file']) {
       expect(reg.has(id)).toBe(true)
     }
-    // 覆盖随应用打包的场景化工具插件元信息（search/glob/web/media）
-    for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image']) {
+    // 覆盖随应用打包的场景化工具插件元信息（search/glob/web/media）+ computer-use
+    for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image', 'mcp__computer-use__list_apps']) {
       expect(reg.has(id)).toBe(true)
     }
+    // metaOnly 插件（computer-use）仅登记元信息，不参与后台预加载实例化
+    const cuEntry = getBuiltinRegistry().get('computer-use')!
+    expect(cuEntry.metaOnly).toBe(true)
     const permByTool: Record<string, string> = {
       web_fetch: 'network', list_dir: 'read', glob: 'read', view_image: 'read',
     }

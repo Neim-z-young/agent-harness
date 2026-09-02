@@ -41,15 +41,9 @@ import type { BackgroundTaskViewLike, ToolMetaEntry, ToolMetaLookup, ToolMetaReg
 // 例外：tools-builtin 的「静态元信息」（meta）为纯数据、无副作用，可提前加载（多级加载 L1，
 // 见 BuiltinToolRegistry）；对应的运行时工具模块（L2）仍经 getBuiltinRegistry().load() 惰性/后台加载。
 import type { MockProviderConfig } from '@harness/provider-mock'
-// 内置工具静态元信息来源（多级加载 L1，抽象契约 ToolMetaSource）：
-// 各工具插件以 toolMetaSource 自描述，CLI 经 ToolMetaRegistry 统一登记，不硬编码各包的具体导出形态。
-// 仅消费抽象接口（@harness/plugin），不感知 BuiltinToolMeta 等具体数组结构。
-import { toolMetaSource as builtinToolSource } from '@harness/tools-builtin/meta'
-import { toolMetaSource as searchToolSource } from '@harness/tools-search/meta'
-import { toolMetaSource as globToolSource } from '@harness/tools-glob/meta'
-import { toolMetaSource as webToolSource } from '@harness/tools-web/meta'
-import { toolMetaSource as mediaToolSource } from '@harness/tools-media/meta'
-import { toolMetaSource as computerUseToolSource } from '@harness/computer-use/meta'
+// 内置工具静态元信息（多级加载 L1，抽象契约 ToolMetaSource）：各工具插件以 toolMetaSource 自描述，
+// 由 BuiltinGeneralPlugin.metaSource 自携带（惰性 dynamic import 对应 /meta 模块），
+// CLI 经 ToolMetaRegistry（preloadBuiltinToolMetas）统一登记，不硬编码各包的具体导出形态。
 // subagent / swarm 均为内置插件（组合根直连），cli 经其导出的能力对象（抽象契约）交互
 import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
@@ -419,6 +413,16 @@ export interface BuiltinGeneralPlugin {
   source: 'builtin'
   /** 惰性加载：首次用到（boot 装配 / /plugins 管理）才 dynamic import，返回 AgentPlugin 实例 */
   load: () => Promise<AgentPlugin>
+  /**
+   * 静态元信息来源（多级加载 L1）：插件自携带，惰性 dynamic import 对应 /meta 模块（纯数据、无副作用），
+   * 供 /tools 等在任何运行时模块（L2）加载前展示描述/别名/安全声明/权限键。
+   */
+  metaSource?: () => Promise<ToolMetaSource>
+  /**
+   * 仅登记 metaSource，不参与后台预加载/运行时实例化。用于 computer-use 这类进程内 MCP server 插件：
+   * 其工具经 mcp-client 连接后才可用，CLI 只预登记元信息（/tools 可展示），不自动 register server。
+   */
+  metaOnly?: boolean
 }
 
 /** 内置通用插件注册表：`内置插件也要支持加载`的统一入口（与外部插件目录 loadPluginDirs 并列） */
@@ -441,6 +445,11 @@ export class BuiltinPluginRegistry {
 
 let defaultBuiltinRegistry: BuiltinPluginRegistry | undefined
 
+/** 惰性取某工具插件 /meta 模块的 toolMetaSource（多级加载 L1，纯数据、无副作用） */
+function lazyToolMetaSource(specifier: string): () => Promise<ToolMetaSource> {
+  return async () => (await lazyImport<{ toolMetaSource?: ToolMetaSource }>(specifier)).toolMetaSource!
+}
+
 /** 全局默认内置通用插件注册表（登记 tools-builtin 等随应用打包的插件，惰性加载） */
 export function getBuiltinRegistry(): BuiltinPluginRegistry {
   if (!defaultBuiltinRegistry) {
@@ -451,6 +460,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       description: '内置工作台工具（文件读写 + Shell）',
       source: 'builtin',
       load: async () => (await lazyImport<{ toolsBuiltinPlugin: AgentPlugin }>('@harness/tools-builtin')).toolsBuiltinPlugin,
+      metaSource: lazyToolMetaSource('@harness/tools-builtin/meta'),
     })
     defaultBuiltinRegistry.register({
       id: 'tools-manager',
@@ -459,7 +469,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       source: 'builtin',
       load: async () => (await lazyImport<{ createToolsManagerPlugin: () => AgentPlugin }>('@harness/tools-manager')).createToolsManagerPlugin(),
     })
-    // 场景化工具插件（search/glob/web/media，L1 meta 已在 getBuiltinToolRegistry 登记）：
+    // 场景化工具插件（search/glob/web/media，metaSource 由各插件自携带）：
     // 登记进 BuiltinPluginRegistry 后，boot 末尾的后台预加载（scheduleBuiltinPreload）
     // 就会真正预热这些运行时模块，使「后台加载」生效——不再停留在"仅元信息"。
     defaultBuiltinRegistry.register({
@@ -468,6 +478,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       description: '搜索类工具插件：list_dir 目录列举 + grep_file 内容检索',
       source: 'builtin',
       load: async () => (await lazyImport<{ toolsSearchPlugin: AgentPlugin }>('@harness/tools-search')).toolsSearchPlugin,
+      metaSource: lazyToolMetaSource('@harness/tools-search/meta'),
     })
     defaultBuiltinRegistry.register({
       id: 'tools-glob',
@@ -475,6 +486,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       description: 'glob 文件匹配工具插件',
       source: 'builtin',
       load: async () => (await lazyImport<{ toolsGlobPlugin: AgentPlugin }>('@harness/tools-glob')).toolsGlobPlugin,
+      metaSource: lazyToolMetaSource('@harness/tools-glob/meta'),
     })
     defaultBuiltinRegistry.register({
       id: 'tools-web',
@@ -482,6 +494,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       description: 'Web 抓取工具插件：web_fetch',
       source: 'builtin',
       load: async () => (await lazyImport<{ toolsWebPlugin: AgentPlugin }>('@harness/tools-web')).toolsWebPlugin,
+      metaSource: lazyToolMetaSource('@harness/tools-web/meta'),
     })
     defaultBuiltinRegistry.register({
       id: 'tools-media',
@@ -489,6 +502,18 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       description: '媒体工具插件：view_image',
       source: 'builtin',
       load: async () => (await lazyImport<{ toolsMediaPlugin: AgentPlugin }>('@harness/tools-media')).toolsMediaPlugin,
+      metaSource: lazyToolMetaSource('@harness/tools-media/meta'),
+    })
+    // computer-use：进程内 MCP server，工具经 mcp-client 连接后才可用。仅携带 metaSource
+    // （/tools 可提前展示 mcp__computer-use__* 元信息），metaOnly=true 使其不被后台预加载实例化。
+    defaultBuiltinRegistry.register({
+      id: 'computer-use',
+      name: 'Computer Use',
+      description: '电脑控制 MCP server 插件（mcp__computer-use__*）',
+      source: 'builtin',
+      metaOnly: true,
+      load: async () => (await lazyImport<{ createComputerUsePlugin: () => AgentPlugin }>('@harness/computer-use')).createComputerUsePlugin(),
+      metaSource: lazyToolMetaSource('@harness/computer-use/meta'),
     })
   }
   return defaultBuiltinRegistry
@@ -540,25 +565,36 @@ export class BuiltinToolRegistry implements ToolMetaRegistry, ToolMetaLookup {
 let defaultToolMetaRegistry: BuiltinToolRegistry | undefined
 
 /**
- * 全局默认内置工具元信息注册表：首次调用时经 `ToolMetaRegistry.registerSource` 统一登记
- * 各随应用打包工具插件的 ToolMetaSource（纯数据，即时可用）。
- * 供 boot boot 早期调用，保证 /tools 等命令在任何运行时模块加载前即可展示内置工具描述。
+ * 全局默认内置工具元信息注册表（多级加载 L1）。注册表本体同步可访问；
+ * 具体来源由各随应用打包工具插件自携带（BuiltinGeneralPlugin.metaSource），
+ * 经 `preloadBuiltinToolMetas()` 异步登记。boot 早期 await 预载后，/tools 等命令
+ * 在任何运行时模块（L2）加载前即可展示内置工具描述。
  */
 export function getBuiltinToolRegistry(): BuiltinToolRegistry {
-  if (!defaultToolMetaRegistry) {
-    defaultToolMetaRegistry = new BuiltinToolRegistry()
-    // 登记全部随应用打包工具插件的静态元信息来源（L1，纯数据、实时可用）：
-    // 文件 I/O + Shell（tools-builtin）+ 场景化工具插件（search/glob/web/media）+ computer-use。
-    // 各来源实现 ToolMetaSource 抽象契约，CLI 只经本注册表消费，不感知具体导出形态；
-    // 对应运行时模块（L2）仍各自惰性/后台加载，此处仅预登记描述/别名/安全/权限键。
-    defaultToolMetaRegistry.registerSource(builtinToolSource)
-    defaultToolMetaRegistry.registerSource(searchToolSource)
-    defaultToolMetaRegistry.registerSource(globToolSource)
-    defaultToolMetaRegistry.registerSource(webToolSource)
-    defaultToolMetaRegistry.registerSource(mediaToolSource)
-    defaultToolMetaRegistry.registerSource(computerUseToolSource)
-  }
+  if (!defaultToolMetaRegistry) defaultToolMetaRegistry = new BuiltinToolRegistry()
   return defaultToolMetaRegistry
+}
+
+/**
+ * 预载全部随应用打包工具插件的静态元信息来源（L1）：
+ * 遍历 `getBuiltinRegistry().list()`，对每个携带 `metaSource` 的插件 dynamic import 其 /meta 模块
+ * （纯数据、无副作用）并登记到 `getBuiltinToolRegistry()`。plugin 自携带，CLI 不硬编码具体包导出。
+ * 失败按插件隔离，不阻塞整体登记（避免单个 meta 模块异常影响 boot）。
+ */
+export async function preloadBuiltinToolMetas(): Promise<void> {
+  const reg = getBuiltinToolRegistry()
+  const items = getBuiltinRegistry().list().filter((p) => p.metaSource)
+  await Promise.all(
+    items.map(async (p) => {
+      try {
+        const source = await p.metaSource!()
+        reg.registerSource(source)
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.warn(`[WARN] 内置插件「${p.id}」元信息来源预载失败：${(err as Error)?.message ?? String(err)}`)
+      }
+    }),
+  )
 }
 
 /**
@@ -1237,9 +1273,9 @@ export class HarnessApp {
 
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
   async boot(): Promise<{ harness: Harness; session: Session }> {
-    // 多级加载 L1：早期同步登记内置工具静态元信息（描述/别名/安全），
+    // 多级加载 L1：预载内置工具静态元信息（描述/别名/安全），由各工具插件自携带 metaSource，
     // 保证后续 /tools 等命令在任何运行时工具模块（L2）加载前即可展示内置工具描述。
-    getBuiltinToolRegistry()
+    await preloadBuiltinToolMetas()
 
     const rules = await this.loadRules()
     const mode = this.options.permissionMode ?? 'ask'
@@ -1501,11 +1537,14 @@ export class HarnessApp {
     const items = getBuiltinRegistry().list()
     if (!items.length || !harness) return
     void (async () => {
-      const results = await Promise.allSettled(items.map((p) => p.load()))
+      // metaOnly 插件（如 computer-use）仅预登记元信息（preloadBuiltinToolMetas 处理），
+      // 不在此实例化，避免自动 register MCP server。
+      const loadable = items.filter((p) => !p.metaOnly)
+      const results = await Promise.allSettled(loadable.map((p) => p.load()))
       const installedIds = new Set(harness.plugin.list().map((lp) => lp.plugin.id))
       const toInstall: AgentPlugin[] = []
-      for (let i = 0; i < items.length; i++) {
-        const item = items[i]!
+      for (let i = 0; i < loadable.length; i++) {
+        const item = loadable[i]!
         const r = results[i]!
         if (r.status === 'rejected') {
           stdout?.write?.(`[WARN] 内置插件「${item.id}」后台预加载失败：${(r.reason as Error)?.message ?? String(r.reason)}\n`)
