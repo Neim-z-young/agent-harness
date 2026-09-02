@@ -38,6 +38,7 @@
     "@harness/tools-glob": "workspace:*",
     "@harness/tools-web": "workspace:*",
     "@harness/tools-media": "workspace:*",
+    "@harness/workspace-shell": "workspace:*",
     "@harness/workspace": "workspace:*",
     "@opentui/core": "^0.5.8",
     "@opentui/react": "^0.5.8",

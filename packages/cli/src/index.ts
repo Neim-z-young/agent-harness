@@ -48,6 +48,7 @@ import type { MockProviderConfig } from '@harness/provider-mock'
 import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import { swarmCapability } from '@harness/swarm'
+import { createWorkspacePlugin } from '@harness/workspace-shell'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
 import {
   ConfigStore,
@@ -1242,6 +1243,8 @@ export class HarnessApp {
     providerPlugins.push(toolsBuiltin)
     const toolsManager = await getBuiltinRegistry().get('tools-manager')!.load()
     providerPlugins.push(toolsManager)
+    // 薄壳插件：/workspace 查看工作区布局（依赖 cli 注入的 workspace，见 cmdInput.workspace）
+    providerPlugins.push(createWorkspacePlugin())
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
@@ -1939,6 +1942,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             harness: Harness; agentId?: string;
             setAgentTools: (agentId: string, tools: string[]) => Promise<void>;
             toolMeta: ToolMetaLookup;
+            workspace: Workspace;
             result?: 'continue' | 'exit'
           } = {
             raw: line.slice(1),
@@ -1950,6 +1954,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             agentId: current.agentId,
             setAgentTools: (id, tools) => app.setAgentTools(id, tools),
             toolMeta: getBuiltinToolRegistry(),
+            workspace: app.workspace,
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)

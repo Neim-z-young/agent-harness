@@ -1,5 +1,30 @@
 # Agent Harness 开发日志
 
+## 2026-09-02（续 53）工作区管理（四）：薄壳插件 @harness/workspace-shell + /workspace 命令
+
+> 承接续 52。落实规划文档 §7.1/§7.3：用薄壳 AgentPlugin 把「解析好的 Workspace 布局」以 /workspace 命令展示在 REPL，业务能力经插件注入，不与 cli 主逻辑耦合。
+
+### 新增插件包 @harness/workspace-shell（packages/plugins/workspace-shell）
+
+* `renderWorkspace(ws, title?)`：纯函数，把 Workspace 渲染为文本——cwd/dataDir、dataDir 数据文件（config/permissions/sessions/.config-key）、两级（user×project）各 plugins/skills/agents 路径，`✓` 标记已存在路径，并注明「user → project 后者覆盖前者」加载顺序。
+* `createWorkspacePlugin(opts?)`：cli.commands 注册 /workspace；cli.command 命中则输出 renderWorkspace。数据来源优先级 `input.workspace`（cli 注入）→ `opts.workspace`（显式入参），两者皆无则提示「工作区未注入」（插件可独立安装/测试不炸）。处理完成设 `input.result='continue'`，未命中其他命令不设 result（fallthrough 交给别的插件）。
+* 依赖 `@harness/plugin` + `@harness/workspace`。
+
+### CLI 接入
+
+* boot 装配：`providerPlugins.push(createWorkspacePlugin())`（与 tools-manager 并列，随应用打包的内置插件）。
+* cmdInput 构造加注入 `workspace: app.workspace`（HarnessApp 已解析的 Workspace，见续 51），薄壳插件经 `input.workspace` 消费；类型由 cli 侧声明 `workspace: Workspace`。
+* 根 tsconfig paths 与 cli dependencies 注册 `@harness/workspace-shell`。
+
+### 测试与验证
+
+* 新增插件 8 用例（workspace-shell）：render 输出与 ✓ 标记、命中/未命中/未注入分支、cli.commands 注册、id 稳定。
+* cli 158 用例全过；全仓 20 包 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.1/§7.3
+
 ## 2026-09-02（续 52）工作区管理（三）：MultiDirLoader 通用多级目录加载器
 
 > 承接续 51。落实规划文档 §7.4 的第一步——把 cli 与 core 各自重复手写的「readdir + 来源(user/project)标注 + join(dir,name)」多级扫描骨架收敛为 workspace 通用原语 `MultiDirLoader`，并让 cli 装配改走解析好的 workspace 路径（消灭 magic path）。

@@ -50,6 +50,7 @@
         "@harness/tools-search": "workspace:*",
         "@harness/tools-web": "workspace:*",
         "@harness/workspace": "workspace:*",
+        "@harness/workspace-shell": "workspace:*",
         "@opentui/core": "^0.5.8",
         "@opentui/react": "^0.5.8",
         "react": "^19.2.8",
@@ -269,6 +270,14 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/workspace-shell": {
+      "name": "@harness/workspace-shell",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
+        "@harness/workspace": "workspace:*",
+      },
+    },
     "packages/revert": {
       "name": "@harness/revert",
       "version": "0.1.0",
@@ -368,6 +377,8 @@
     "@harness/tools-web": ["@harness/tools-web@workspace:packages/plugins/tools-web"],
 
     "@harness/workspace": ["@harness/workspace@workspace:packages/workspace"],
+
+    "@harness/workspace-shell": ["@harness/workspace-shell@workspace:packages/plugins/workspace-shell"],
 
     "@opentui/core": ["@opentui/core@0.5.8", "https://registry.npmmirror.com/@opentui/core/-/core-0.5.8.tgz", { "dependencies": { "bun-ffi-structs": "0.3.1", "diff": "9.0.0", "marked": "17.0.1", "string-width": "7.2.0", "strip-ansi": "7.1.2" }, "optionalDependencies": { "@opentui/core-darwin-arm64": "0.5.8", "@opentui/core-darwin-x64": "0.5.8", "@opentui/core-linux-arm64": "0.5.8", "@opentui/core-linux-arm64-musl": "0.5.8", "@opentui/core-linux-x64": "0.5.8", "@opentui/core-linux-x64-musl": "0.5.8", "@opentui/core-win32-arm64": "0.5.8", "@opentui/core-win32-x64": "0.5.8" }, "peerDependencies": { "web-tree-sitter": "0.25.10" } }, "sha512-GbZ+nSLYZqxj2Z5TU19Mx6IsAvVsn2+7WEXz+6OlMGoootvt3TxP3vWwfGI0jWk9qp1ftRlML1JPNEkzy+9I8g=="],
 
