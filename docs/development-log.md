@@ -1,5 +1,41 @@
 # Agent Harness 开发日志
 
+## 2026-09-02（续 45）工作区管理（一）：@harness/workspace 核心库 resolveWorkspace
+
+> 归属「工作区管理插件化」规划（docs/workspace-management.md §7）第一步——核心库「定位与解析」。用户选定先做 `resolveWorkspace`，其余存储工厂 / MultiDirLoader / 薄壳插件后续逐个推进。
+
+### 包形态
+
+* 新建 `packages/workspace`（`@harness/workspace`），仅做「定位与解析 + 目录布局」，不含 Provider/插件装配，不与 core/CLI 主逻辑耦合（对齐"全功能插件化"约束，借鉴 `@harness/snapshot`）。
+
+### 实现（workspace/src/index.ts）
+
+* `resolveWorkspace({ cwd?, dataDir? })`：`cwd` 缺省 process.cwd()、`dataDir` 缺省 ~/.harness，均 resolve 为绝对路径；项目级目录固定 `<cwd>/.harness`。
+* 返回结构：
+  * `cwd` / `dataDir`（用户级根）
+  * `user` / `project`：两级 `WorkspaceLevel`（root / plugins / skills / agents）
+  * `files`：dataDir 下全局数据文件/目录（config.json / permissions.json / sessions / .config-key / snapshots / file-snapshots / backups / teams）
+  * `loadDirs`：两级扫描路径对（plugins/skills/agents，user 在前、project 在后，后者覆盖）
+* 导出 helpers：`level(root)`、`dataFiles(dataDir)`、`defaultUserDir()`。
+
+### 接入（cli）
+
+* `main()` 删去硬编码 `dataDir = args.dataDir ?? join(home, '.harness')`，改用 `resolveWorkspace({ cwd, dataDir })` 取 cwd/dataDir，路径解析收敛至核心库。
+
+### 配置
+
+* `tsconfig.json` 增 `@harness/workspace` → `./packages/workspace/src` 路径映射。
+* 依赖序：workspace 不依赖其他包（纯 node path/os）。
+
+### 测试与验证
+
+* 新增 5 条用例（workspace.test.ts）：两级目录 + 数据文件路径绝对化 / 两级扫描覆盖序 / dataDir 缺省 / 项目级与用户级目录独立 / helpers。全部通过。
+* 全仓 typecheck 通过（含新包 + cli 接入）；@harness/cli 90 用例全过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.2/§7.3
+
 ## 2026-09-01（续 44）config.json 的 agents[].tools 回读消费端
 
 > 归属「/tools 可插件化（方案 A：补 core/CLI 配置接口）」第一步。先打通 Agent 白名单持久化的读取端。

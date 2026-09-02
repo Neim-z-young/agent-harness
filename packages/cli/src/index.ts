@@ -49,6 +49,7 @@ import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import { swarmCapability } from '@harness/swarm'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
+import { resolveWorkspace } from '@harness/workspace'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import { startTuiRepl } from './tui'
 import {
@@ -2482,9 +2483,9 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     return 0
   }
 
-  const cwd = args.cwd ?? process.cwd()
-  const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
-  const dataDir = args.dataDir ?? join(home, '.harness')
+  const ws = resolveWorkspace({ cwd: args.cwd, dataDir: args.dataDir })
+  const cwd = ws.cwd
+  const dataDir = ws.dataDir
   const permissionMode = args.permissionMode ?? 'ask'
 
   // 加载 config.json 并与 CLI 合并：CLI > config

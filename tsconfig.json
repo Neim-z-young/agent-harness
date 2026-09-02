@@ -23,6 +23,7 @@
       "@harness/agent": ["./packages/agent/src"],
       "@harness/session": ["./packages/session/src"],
       "@harness/snapshot": ["./packages/snapshot/src"],
+      "@harness/workspace": ["./packages/workspace/src"],
       "@harness/revert": ["./packages/revert/src"],
       "@harness/provider-mock": ["./packages/plugins/provider-mock/src"],
       "@harness/tools-builtin": ["./packages/plugins/tools-builtin/src"],
