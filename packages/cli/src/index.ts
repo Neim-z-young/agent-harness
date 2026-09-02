@@ -56,6 +56,8 @@ import {
   ConfigValidationError,
   resolveSecret,
   resolveWorkspace,
+  MultiDirLoader,
+  normalizeDirs,
   type Workspace,
 } from '@harness/workspace'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
@@ -73,10 +75,9 @@ import type { Message, Session } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
 
-import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
-import { readFile, writeFile, mkdir, unlink, readdir } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, unlink } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
 
@@ -605,25 +606,20 @@ export async function loadPluginDirs(
   log?: (s: string) => void,
 ): Promise<PluginLoadResult> {
   const out = log ?? ((s: string) => { if (typeof process !== 'undefined') process.stderr.write(s + '\n') })
-  // 通用插件按 id 去重：后加载覆盖先加载（project 覆盖 user）
+  // 枚举交给通用多级目录加载器（workspace 收敛「scan + 来源标注」），来源顺序 user → project
+  const items = new MultiDirLoader(normalizeDirs(dirs)).scan({ name: (n) => /\.(ts|js|mjs)$/.test(n) })
+  // 通用插件按 id 去重：后加载覆盖先加载（project 覆盖 user，扫描顺序即覆盖顺序）
   const byId = new Map<string, AgentPlugin>()
-  for (const entry of dirs) {
-    const dir = typeof entry === 'string' ? entry : entry.dir
-    if (!existsSync(dir)) continue
-    let files: string[]
-    try { files = await readdir(dir) } catch { continue }
-    for (const file of files) {
-      if (!/\.(ts|js|mjs)$/.test(file)) continue
-      const full = join(dir, file)
-      try {
-        const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
-        // 1) 通用 AgentPlugin
-        for (const p of collectAgentPlugins(mod)) byId.set(p.id, p)
-        // 2) Provider 类型工厂
-        registerProviderTypeFactory(registry, mod, full, out)
-      } catch (err) {
-        out(`插件加载失败 ${full}：${(err as Error)?.message ?? String(err)}`)
-      }
+  for (const item of items) {
+    const full = item.full
+    try {
+      const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
+      // 1) 通用 AgentPlugin
+      for (const p of collectAgentPlugins(mod)) byId.set(p.id, p)
+      // 2) Provider 类型工厂
+      registerProviderTypeFactory(registry, mod, full, out)
+    } catch (err) {
+      out(`插件加载失败 ${full}：${(err as Error)?.message ?? String(err)}`)
     }
   }
   return { plugins: [...byId.values()] }
@@ -1135,10 +1131,10 @@ export class HarnessApp {
 
     // 加载外部插件（user ~/.harness/plugins → project .harness/plugins，后加载覆盖先加载）：
     // 通用 AgentPlugin 汇总到 externalPlugins 参与 Hooks 生命周期；Provider 类型工厂注册进 providerTypes 供 config.type 动态解析
-    const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
+    // 路径统一来自解析好的 workspace（dataDir 支持 --data-dir 覆盖，非写死 $HOME）
     const externalPlugins = await loadPluginDirs(this.providerTypes, [
-      { dir: join(home, '.harness', 'plugins'), source: 'user' },
-      { dir: join(this.options.cwd, '.harness', 'plugins'), source: 'project' },
+      { dir: this.workspace.user.plugins, source: 'user' },
+      { dir: this.workspace.project.plugins, source: 'project' },
     ], (s) => this.options.stdout?.write?.(s + '\n'))
 
     // 显式校验 + 密钥解析（错误一次性汇总，避免静默跳过/误导）
@@ -1268,13 +1264,13 @@ export class HarnessApp {
       agents: [this.defaultAgent(), ...(this.options.agents ?? [])],
       // Agent 多级加载：user 全局目录在前，project 项目目录在后（后者覆盖前者）
       agentDirs: [
-        { dir: join(home, '.harness', 'agents'), source: 'user' },
-        '.harness/agents',
+        { dir: this.workspace.user.agents, source: 'user' },
+        this.workspace.project.agents,
       ],
       // Skill 多级加载：user 全局目录在前，project 项目目录在后（后者覆盖前者）
       skillDirs: [
-        { dir: join(home, '.harness', 'skills'), source: 'user' },
-        '.harness/skills',
+        { dir: this.workspace.user.skills, source: 'user' },
+        this.workspace.project.skills,
       ],
       permission: perm,
       snapshot: this.snapshotService ? () => this.snapshotService! : undefined,
@@ -2207,7 +2203,7 @@ export async function runTeammateCli(options: {
   const memberName = swarmCapability.sanitizeName(name)
   // mailbox/taskPlane 创建、teammate 状态与循环细节均由 swarm 插件能力封装
   const loop = swarmCapability.startTeammateLoop({
-    teamsDir: join(dataDir, 'teams'),
+    teamsDir: app.workspace.files.teams,
     team: memberTeam,
     name: memberName,
     agentId,
@@ -2232,10 +2228,10 @@ export async function runTeammateCli(options: {
 export async function buildCheckRegistry(cwd: string, log: (s: string) => void): Promise<ProviderTypeRegistry> {
   const registry = new ProviderTypeRegistry()
   registerBuiltinProviderTypes(registry)
-  const home = typeof process !== 'undefined' ? (process.env.HOME ?? homedir()) : '/tmp'
+  const ws = resolveWorkspace({ cwd })
   await loadPluginDirs(registry, [
-    { dir: join(home, '.harness', 'plugins'), source: 'user' },
-    { dir: join(cwd, '.harness', 'plugins'), source: 'project' },
+    { dir: ws.user.plugins, source: 'user' },
+    { dir: ws.project.plugins, source: 'project' },
   ], log)
   return registry
 }

@@ -1,5 +1,37 @@
 # Agent Harness 开发日志
 
+## 2026-09-02（续 52）工作区管理（三）：MultiDirLoader 通用多级目录加载器
+
+> 承接续 51。落实规划文档 §7.4 的第一步——把 cli 与 core 各自重复手写的「readdir + 来源(user/project)标注 + join(dir,name)」多级扫描骨架收敛为 workspace 通用原语 `MultiDirLoader`，并让 cli 装配改走解析好的 workspace 路径（消灭 magic path）。
+
+### 实现（@harness/workspace）
+
+* 新建 `packages/workspace/src/multi-dir.ts`：
+  * `DirSource = 'user' | 'project'`、`DirEntry{dir,source}`、`DirItem{source,name,full}`、`DirEntryInput`。
+  * `normalizeDirs(dirs, defaultSource?)`：字符串 → `{dir,source}` 归一（缺省 source 可配，默认 user）。
+  * `dirsFromPair([userDir, projectDir])`：`workspace.loadDirs` 目录对 → 两级 `DirEntry[]`。
+  * `MultiDirLoader`：`scan({name?})` 同步枚举全部目录项并标注来源（目录缺失/不可读跳过，不阻塞）；`collect(parse, key, filter?)` 异步收集 + 按 key 去重（后扫描覆盖先扫描 → project 覆盖 user），`parse` 返回 undefined 忽略（容错）。
+* `index.ts` 补 `export * from './multi-dir'`。
+
+### core 修正：目录解析 `join → resolve`
+
+* core 装配 agentDirs/skillDirs 用 `join(cwd, dirPath)` 解析——对**绝对路径会拼接在 cwd 下而错位**（`path.join('/a','/b') === '/a/b'`），导致 workspace 传入的绝对 user/project 目录不可达（并掩盖既有的 user 绝对目录 bug）。
+* 改为 `resolve(cwd, dirPath)`：相对目录仍正确落在 cwd 下（行为不变），绝对目录正确原样命中。属严格修复，对齐「workflow dataDir 绝对化」诉求。
+
+### 接入（cli）
+
+* `loadPluginDirs` 内部改用 `MultiDirLoader(normalizeDirs(dirs)).scan(...)` 枚举（保留既有「按 id 去重 / 单模块容错 / Provider 类型注册」语义），删去手写 readdir 循环与不用的 `readdir` 导入。
+* boot 装配外链插件 / agents / skills / buildCheckRegistry / teammate teamsDir：由 `join(home,'.harness','plugins')` 等硬编码改为 `this.workspace.user|project.{plugins,agents,skills}` 与 `app.workspace.files.teams`，`--data-dir` 覆盖真正生效；删去 cli 不再使用的 `homedir` 导入。
+
+### 测试与验证
+
+* 新增多级目录 8 条用例（multi-dir.test.ts）：normalize 缺省来源 / dirsFromPair / scan 枚举+来源标注+覆盖顺序 / filter.filter / 目录缺失跳过 / collect 去重覆盖 / parse undefined 忽略。workspace 共 13 用例全过。
+* @harness/cli 158、@harness/core 31 用例全过；全仓 20 包 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.2/§7.4
+
 ## 2026-09-02（续 51）存储类工厂迁移：配置/会话/密钥存储消费 Workspace 路径
 
 > 承接续 45 的 `resolveWorkspace`，落实「工作区管理（二）」：把 cli 里私有、硬编码 `join(dataDir, 'xxx')` 相对路径的 `ConfigStore` / `SessionFileStore` / `SecretCipher` / `ConfigValidationError` / `resolveSecret` 抽离到 `@harness/workspace`，改为消费 `Workspace` 解析出的路径（`ws.files.*`），消灭 magic path。

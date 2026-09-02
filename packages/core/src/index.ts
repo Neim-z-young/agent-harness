@@ -177,7 +177,7 @@ import type {
 import { agentFromMarkdown } from '@harness/agent'
 import { createSkillManager, formatSkillForPrompt, type SkillManager, type Skill, type SkillSource } from '@harness/skill'
 import { readdirSync, readFileSync, existsSync } from 'node:fs'
-import { join, basename, extname } from 'node:path'
+import { join, basename, extname, resolve } from 'node:path'
 import type {
   PermissionRuleset,
   PermissionEngine,
@@ -1789,7 +1789,7 @@ export class HarnessImpl implements Harness {
       // source 仅用于日志，AgentDefinition 没有 loadedFrom 字段
       // （多级覆盖通过加载顺序保证，user 在前 project 在后）
       const cwd = this.options.cwd ?? process.cwd()
-      const resolvedDir = join(cwd, dirPath)
+      const resolvedDir = resolve(cwd, dirPath)
       if (!existsSync(resolvedDir)) continue
       try {
         const entries = readdirSync(resolvedDir, { withFileTypes: true })
@@ -1840,7 +1840,7 @@ export class HarnessImpl implements Harness {
         for (const entry of this.options.skillDirs ?? []) {
           const dirPath = typeof entry === 'string' ? entry : entry.dir
           const sourceTag = typeof entry === 'string' ? 'project' : (entry.source ?? 'project')
-          const resolvedDir = join(cwd, dirPath)
+          const resolvedDir = resolve(cwd, dirPath)
           if (!existsSync(resolvedDir)) continue
           try {
             await this.skillManager.load(resolvedDir, sourceTag)
