@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-09-02（续 51）存储类工厂迁移：配置/会话/密钥存储消费 Workspace 路径
+
+> 承接续 45 的 `resolveWorkspace`，落实「工作区管理（二）」：把 cli 里私有、硬编码 `join(dataDir, 'xxx')` 相对路径的 `ConfigStore` / `SessionFileStore` / `SecretCipher` / `ConfigValidationError` / `resolveSecret` 抽离到 `@harness/workspace`，改为消费 `Workspace` 解析出的路径（`ws.files.*`），消灭 magic path。
+
+### 包形态（@harness/workspace）
+
+* 新建 `packages/workspace/src/storage.ts`（仅「定位 + 读写」，不含业务装配），并加依赖 `@harness/session`（`Message` / `Session` 类型）；`index.ts` `export * from './storage'` 收敛导出。
+* 导出（均构造于 `Workspace`）：
+  * `ConfigValidationError`
+  * `SessionFileStore`（`workspace.files.sessions`；`ensureDir/pathFor/toFile/save/load/list`）
+  * `ConfigStore<T extends object>`（`workspace.files.config`；`load` 幂等返回空对象）
+  * `SecretCipher`（`workspace.files.secretKey`；AES-256-GCM，主密钥来源 `HARNESS_CONFIG_KEY` 优先于 `.config-key`）
+  * `resolveSecret(value, cipher)`（`${ENV_VAR}` 展开 / `enc:v1:` 解密 / 明文透传）
+
+### 接入（cli）
+
+* 移除本地 `ConfigStore` / `ConfigValidationError` / `SecretCipher` / `resolveSecret` 定义（`SessionFileStore` 同前已删），改为从 `@harness/workspace` 导入并**统一重导出**（`export { ... } from '@harness/workspace'`），对外含测试接口不变；同时删去 cli 侧不再使用的 `node:crypto` 导入。
+* `HarnessApp` 新增 `workspace: Workspace`（`resolveWorkspace({ cwd, dataDir })` 构造），`sessionStore` / `permissionStorePath` / `configStore`（`ConfigStore<HarnessConfig>`）/ boot 的 `SecretCipher` 均改为消费 `this.workspace`。
+* `runConfigCommand` 入参由 `dataDir`/`cwd` 收敛为 `workspace: Workspace`（`check` 子命令改用 `workspace.cwd`）；`main()` 复用既有 `ws` 构造 `ConfigStore<HarnessConfig>` / `SessionFileStore`。
+
+### 测试与验证
+
+* cli.test.ts 存储相关构造由传 `dir` 改为 `resolveWorkspace({ dataDir: dir })`。
+* `@harness/workspace` 5 用例、`@harness/cli` 158 用例全部通过；两个包 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md)（工作区管理（二）存储工厂）
+
 ## 2026-09-02（续 45）工作区管理（一）：@harness/workspace 核心库 resolveWorkspace
 
 > 归属「工作区管理插件化」规划（docs/workspace-management.md §7）第一步——核心库「定位与解析」。用户选定先做 `resolveWorkspace`，其余存储工厂 / MultiDirLoader / 薄壳插件后续逐个推进。

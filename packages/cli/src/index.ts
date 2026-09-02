@@ -49,7 +49,15 @@ import { subagentCapability } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import { swarmCapability } from '@harness/swarm'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
-import { resolveWorkspace } from '@harness/workspace'
+import {
+  ConfigStore,
+  SessionFileStore,
+  SecretCipher,
+  ConfigValidationError,
+  resolveSecret,
+  resolveWorkspace,
+  type Workspace,
+} from '@harness/workspace'
 import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
 import { startTuiRepl } from './tui'
 import {
@@ -69,7 +77,6 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
 import { readFile, writeFile, mkdir, unlink, readdir } from 'node:fs/promises'
-import { createCipheriv, createDecipheriv, randomBytes, createHash } from 'node:crypto'
 import { createInterface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
 
@@ -192,80 +199,12 @@ export function parseCliArgs(raw: string[]): CliArgs {
 // ========================================================================
 // 2. 会话持久化（文件 JSON）
 // ========================================================================
+// 会话存储 / 配置 / 密钥存储已抽离至 @harness/workspace（消费 Workspace 解析路径），
+// 本模块统一重导出，保持对外（含测试）接口不变。
+export { SessionFileStore, type SessionFile } from '@harness/workspace'
+export { ConfigStore, SecretCipher, ConfigValidationError, resolveSecret } from '@harness/workspace'
 
-/** 会话存储结构（文件 = sessionId.json） */
-export interface SessionFile {
-  /** 会话元数据 */
-  id: string
-  title?: string
-  createdAt: number
-  updatedAt: number
-  agentId?: string
-  cwd?: string
-  meta?: Record<string, unknown>
-  /** 完整消息列表 */
-  messages: Message[]
-}
-
-export class SessionFileStore {
-  constructor(public readonly dataDir: string) {}
-
-  private sessionsDir(): string {
-    return join(this.dataDir, 'sessions')
-  }
-
-  async ensureDir(): Promise<void> {
-    await mkdir(this.sessionsDir(), { recursive: true })
-  }
-
-  /** 会话文件路径 */
-  pathFor(sessionId: string): string {
-    return join(this.sessionsDir(), `${sessionId}.json`)
-  }
-
-  /** 从 Session → 文件对象 */
-  toFile(s: Session): SessionFile {
-    return {
-      id: s.id, title: s.title, createdAt: s.createdAt, updatedAt: s.updatedAt,
-      agentId: s.agentId, cwd: s.cwd, meta: s.meta, messages: s.messages,
-    }
-  }
-
-  /** 持久化一个 Session */
-  async save(session: Session): Promise<void> {
-    await this.ensureDir()
-    await writeFile(this.pathFor(session.id), JSON.stringify(this.toFile(session), null, 2))
-  }
-
-  /** 从文件恢复为 Session 对象（未注入 SessionManager） */
-  async load(sessionId: string): Promise<SessionFile | undefined> {
-    const p = this.pathFor(sessionId)
-    if (!existsSync(p)) return undefined
-    return JSON.parse(await readFile(p, 'utf-8')) as SessionFile
-  }
-
-  /** 列出所有会话（按 updatedAt 倒序） */
-  async list(): Promise<Array<{ id: string; title?: string; updatedAt: number; messageCount: number }>> {
-    if (!existsSync(this.sessionsDir())) return []
-    const files = await readdir(this.sessionsDir())
-    const ids = files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5))
-    const items: Array<{ id: string; title?: string; updatedAt: number; messageCount: number }> = []
-    for (const id of ids) {
-      const s = await this.load(id)
-      if (s) items.push({ id, title: s.title, updatedAt: s.updatedAt, messageCount: s.messages.length })
-    }
-    items.sort((a, b) => b.updatedAt - a.updatedAt)
-    return items
-  }
-}
-
-// ========================================================================
-// 2.1 全局配置（model / agent / provider / apiKey 持久化到 config.json）
-// ========================================================================
-// 配置来源优先级（从高到低）：CLI 参数 > config.json > 环境变量。
-// HarnessApp 只依赖 boot() 时已解析好的 options；config.json 在 main() 里
-// 与 CLI 参数合并后传入，保证两者优先级正确。
-
+/** 全局配置（写 dataDir/config.json）与命令行参数合并、默认值收敛 */
 export interface HarnessConfig {
   /** 默认 Agent ID */
   agentId?: string
@@ -299,30 +238,6 @@ export function parseModelSpec(spec: string): { providerId?: string; modelId: st
 export function formatModel(providerId: string | undefined, modelId: string | undefined): string | undefined {
   if (!modelId) return undefined
   return providerId ? `${providerId}/${modelId}` : modelId
-}
-
-/** dataDir/config.json 读写（保持幂等：文件缺失 / 解析失败均返回空配置） */
-export class ConfigStore {
-  constructor(public readonly dataDir: string) {}
-
-  private path(): string {
-    return join(this.dataDir, 'config.json')
-  }
-
-  async load(): Promise<HarnessConfig> {
-    const p = this.path()
-    if (!existsSync(p)) return {}
-    try {
-      return JSON.parse(await readFile(p, 'utf-8')) as HarnessConfig
-    } catch {
-      return {}
-    }
-  }
-
-  async save(cfg: HarnessConfig): Promise<void> {
-    await mkdir(this.dataDir, { recursive: true })
-    await writeFile(this.path(), JSON.stringify(cfg, null, 2))
-  }
 }
 
 /** 合并 CLI 参数与 config.json（CLI 优先），供 main() 汇总默认值 */
@@ -718,91 +633,6 @@ export async function loadPluginDirs(
 // 2.3 密钥加密存储 + 配置校验（多 Provider 健壮性）
 // ------------------------------------------------------------------------
 
-/** 配置校验/密钥解析失败（含定位信息），启动时一次性抛出 */
-export class ConfigValidationError extends Error {
-  constructor(message: string) {
-    super(message)
-    this.name = 'ConfigValidationError'
-  }
-}
-
-/**
- * API Key 加密（AES-256-GCM）。主密钥来源（优先级从高到低）：
- * 1. HARNESS_CONFIG_KEY 环境变量（sha256 派生 32 字节）
- * 2. <data-dir>/.config-key 文件（首次自动生成 64 位 hex，chmod 600）
- */
-export class SecretCipher {
-  constructor(public readonly dataDir: string) {}
-
-  private keyFile(): string {
-    return join(this.dataDir, '.config-key')
-  }
-
-  async masterKey(): Promise<Buffer> {
-    const env = typeof process !== 'undefined' ? process.env.HARNESS_CONFIG_KEY : undefined
-    if (env && env.length >= 8) return createHash('sha256').update(env).digest()
-    const p = this.keyFile()
-    if (existsSync(p)) return Buffer.from((await readFile(p, 'utf-8')).trim(), 'hex')
-    const key = randomBytes(32).toString('hex')
-    await mkdir(this.dataDir, { recursive: true })
-    await writeFile(p, key, { mode: 0o600 })
-    return Buffer.from(key, 'hex')
-  }
-
-  /** 加密为 `enc:v1:<iv>:<tag>:<ct>`（base64） */
-  async encrypt(plain: string): Promise<string> {
-    const key = await this.masterKey()
-    const iv = randomBytes(12)
-    const cipher = createCipheriv('aes-256-gcm', key, iv)
-    const ct = Buffer.concat([cipher.update(plain, 'utf-8'), cipher.final()])
-    const tag = cipher.getAuthTag()
-    return `enc:v1:${iv.toString('base64')}:${tag.toString('base64')}:${ct.toString('base64')}`
-  }
-
-  /** 解密 enc:v1 值；非 enc: 前缀原样返回 */
-  async decrypt(token: string): Promise<string> {
-    if (!token.startsWith('enc:v1:')) return token
-    const parts = token.split(':')
-    const ivB64 = parts[2]
-    const tagB64 = parts[3]
-    const ctB64 = parts.slice(4).join(':')
-    if (!ivB64 || !tagB64 || !ctB64) {
-      throw new ConfigValidationError(`无效的加密密钥格式：${token.slice(0, 24)}…`)
-    }
-    try {
-      const key = await this.masterKey()
-      const decipher = createDecipheriv('aes-256-gcm', key, Buffer.from(ivB64, 'base64'))
-      decipher.setAuthTag(Buffer.from(tagB64, 'base64'))
-      return Buffer.concat([decipher.update(Buffer.from(ctB64, 'base64')), decipher.final()]).toString('utf-8')
-    } catch (err: any) {
-      throw new ConfigValidationError(
-        `加密密钥解密失败（HARNESS_CONFIG_KEY / .config-key 与写入时不一致？）：${err?.message ?? String(err)}`,
-      )
-    }
-  }
-}
-
-/**
- * apiKey 值解析：
- * - `${ENV_VAR}` → 环境变量（未设置时抛 ConfigValidationError）
- * - `enc:v1:...` → SecretCipher 解密
- * - 其他 → 原样明文返回
- */
-export async function resolveSecret(value: string | undefined, cipher: SecretCipher): Promise<string | undefined> {
-  if (!value) return undefined
-  const trimmed = value.trim()
-  const m = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/.exec(trimmed)
-  if (m) {
-    const v = typeof process !== 'undefined' ? process.env[m[1]] : undefined
-    if (v === undefined) {
-      throw new ConfigValidationError(`环境变量 ${m[1]} 未设置（apiKey 引用了它）`)
-    }
-    return v
-  }
-  if (trimmed.startsWith('enc:v1:')) return cipher.decrypt(trimmed)
-  return value
-}
-
 /** providers 配置校验问题（index=-1 表示非数组内问题，如默认 provider 未定义） */
 export interface ProviderConfigIssue {
   index: number
@@ -1015,10 +845,12 @@ export interface HarnessAppOptions {
 }
 
 export class HarnessApp {
+  /** 工作区布局（两级目录 + 数据文件路径），由 cwd/dataDir 解析而得 */
+  public readonly workspace: Workspace
   public readonly sessionStore: SessionFileStore
   public readonly permissionStorePath: string
   /** 全局配置读写（config.json：model / provider / apiKey 持久化） */
-  public readonly configStore: ConfigStore
+  public readonly configStore: ConfigStore<HarnessConfig>
   /** Provider 类型注册表（内置 + 外部 plugins 插件注册的工厂；config.type 据此动态解析） */
   public readonly providerTypes: ProviderTypeRegistry
   /** 文件快照服务（options.snapshot 开启时创建，供 createHarness 注入与 /revert 命令） */
@@ -1033,9 +865,10 @@ export class HarnessApp {
   constructor(options: HarnessAppOptions) {
     const cwd = resolve(options.cwd)
     this.options = { ...options, cwd, dataDir: resolve(options.dataDir), agentId: options.agentId, provider: options.provider }
-    this.sessionStore = new SessionFileStore(this.options.dataDir)
-    this.permissionStorePath = join(this.options.dataDir, 'permissions.json')
-    this.configStore = new ConfigStore(this.options.dataDir)
+    this.workspace = resolveWorkspace({ cwd, dataDir: this.options.dataDir })
+    this.sessionStore = new SessionFileStore(this.workspace)
+    this.permissionStorePath = this.workspace.files.permissions
+    this.configStore = new ConfigStore<HarnessConfig>(this.workspace)
     // Provider 类型注册表：注册内置类型（openai/anthropic/gemini/glm/qwen/mock），
     // boot() 时再加载外部 plugins 插件注册的自定义 type
     this.providerTypes = new ProviderTypeRegistry()
@@ -1056,7 +889,7 @@ export class HarnessApp {
     return { '*': 'ask' }
   }
   private async saveRules(rules: Record<string, unknown>): Promise<void> {
-    await mkdir(this.options.dataDir, { recursive: true })
+    await mkdir(this.workspace.dataDir, { recursive: true })
     await writeFile(this.permissionStorePath, JSON.stringify({ rules }, null, 2))
   }
   /** 更新权限引擎规则并落盘（/permission 使用） */
@@ -1309,7 +1142,7 @@ export class HarnessApp {
     ], (s) => this.options.stdout?.write?.(s + '\n'))
 
     // 显式校验 + 密钥解析（错误一次性汇总，避免静默跳过/误导）
-    const cipher = new SecretCipher(this.options.dataDir)
+    const cipher = new SecretCipher(this.workspace)
     const configIssues: string[] = []
     const providerConfigs: ProviderConfig[] = []
     for (const pc of rawProviderConfigs) {
@@ -2415,15 +2248,14 @@ export async function buildCheckRegistry(cwd: string, log: (s: string) => void):
  */
 export async function runConfigCommand(options: {
   args: CliArgs
-  dataDir: string
-  cwd: string
+  workspace: Workspace
   write: (s: string) => void
 }): Promise<number> {
-  const { args, dataDir, cwd, write } = options
+  const { args, workspace, write } = options
   const sub = args.arg
-  const store = new ConfigStore(dataDir)
+  const store = new ConfigStore<HarnessConfig>(workspace)
   const cfg = await store.load()
-  const cipher = new SecretCipher(dataDir)
+  const cipher = new SecretCipher(workspace)
   const providers = cfg.providers ?? []
 
   if (sub === 'set-key') {
@@ -2451,7 +2283,7 @@ export async function runConfigCommand(options: {
   }
 
   if (sub === 'check') {
-    const registry = await buildCheckRegistry(cwd, write)
+    const registry = await buildCheckRegistry(workspace.cwd, write)
     const defaultProviderId = cfg.provider ?? 'anthropic'
     const issues = validateProviderConfigs(providers, defaultProviderId, registry.list())
     write(buildConfigOverview(cfg, defaultProviderId) + '\n')
@@ -2489,11 +2321,11 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   const permissionMode = args.permissionMode ?? 'ask'
 
   // 加载 config.json 并与 CLI 合并：CLI > config
-  const cfg = await new ConfigStore(dataDir).load()
+  const cfg = await new ConfigStore<HarnessConfig>(ws).load()
   const { agentId, provider, model, anthropicApiKey } = resolveConfig(args, cfg)
 
   if (args.command === 'list-sessions') {
-    const store = new SessionFileStore(dataDir)
+    const store = new SessionFileStore(ws)
     const list = await store.list()
     if (list.length === 0) { write('（无持久化会话）\n'); return 0 }
     for (const s of list) {
@@ -2504,7 +2336,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   }
 
   if (args.command === 'config') {
-    return runConfigCommand({ args, dataDir, cwd, write })
+    return runConfigCommand({ args, workspace: ws, write })
   }
 
   if (args.checkConfig) {

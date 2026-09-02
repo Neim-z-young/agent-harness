@@ -15,5 +15,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@harness/session": "workspace:*"
+  }
 }

@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { resolveWorkspace } from '@harness/workspace'
 import {
   parseCliArgs,
   SessionFileStore,
@@ -110,17 +111,17 @@ describe('ConfigStore 全局配置（config.json）', () => {
   afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
   it('文件缺失 → 空配置', async () => {
-    expect(await new ConfigStore(join(dir, 'nope')).load()).toEqual({})
+    expect(await new ConfigStore(resolveWorkspace({ dataDir: join(dir, 'nope') })).load()).toEqual({})
   })
 
   it('save 后 load 往返一致', async () => {
-    const store = new ConfigStore(dir)
+    const store = new ConfigStore(resolveWorkspace({ dataDir: dir }))
     await store.save({ agentId: 'researcher', provider: 'mock', model: 'claude-3-5-sonnet' })
     expect(await store.load()).toEqual({ agentId: 'researcher', provider: 'mock', model: 'claude-3-5-sonnet' })
   })
 
   it('损坏 JSON → 空配置（幂等友好）', async () => {
-    const store = new ConfigStore(dir)
+    const store = new ConfigStore(resolveWorkspace({ dataDir: dir }))
     writeFileSync(join(dir, 'config.json'), '{broken')
     expect(await store.load()).toEqual({})
   })
@@ -150,7 +151,7 @@ describe('SecretCipher / resolveSecret 密钥处理', () => {
   afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 
   it('encrypt → decrypt 往返还原明文；非 enc 原样返回', async () => {
-    const cipher = new SecretCipher(dir)
+    const cipher = new SecretCipher(resolveWorkspace({ dataDir: dir }))
     const enc = await cipher.encrypt('sk-secret-abc')
     expect(enc.startsWith('enc:v1:')).toBe(true)
     expect(enc).not.toContain('sk-secret-abc') // 明文不落盘
@@ -162,9 +163,9 @@ describe('SecretCipher / resolveSecret 密钥处理', () => {
     const prev = process.env.HARNESS_CONFIG_KEY
     try {
       process.env.HARNESS_CONFIG_KEY = 'my-master-secret-key'
-      const cipher = new SecretCipher(dir)
+      const cipher = new SecretCipher(resolveWorkspace({ dataDir: dir }))
       const enc = await cipher.encrypt('k1')
-      const cipher2 = new SecretCipher(dir) // 同 env → 可解密
+      const cipher2 = new SecretCipher(resolveWorkspace({ dataDir: dir })) // 同 env → 可解密
       expect(await cipher2.decrypt(enc)).toBe('k1')
       // 不同 env → 解密失败（ConfigValidationError）
       process.env.HARNESS_CONFIG_KEY = 'different-master-key'
@@ -176,7 +177,7 @@ describe('SecretCipher / resolveSecret 密钥处理', () => {
   })
 
   it('resolveSecret：${ENV_VAR} 展开 / 未设置报错 / enc 解密 / 明文透传', async () => {
-    const cipher = new SecretCipher(dir)
+    const cipher = new SecretCipher(resolveWorkspace({ dataDir: dir }))
     const prev = process.env.HARNESS_TEST_KEY
     try {
       process.env.HARNESS_TEST_KEY = 'env-value'
@@ -545,7 +546,7 @@ describe('SessionFileStore 会话持久化', () => {
   let store: SessionFileStore
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'harness-cli-test-'))
-    store = new SessionFileStore(dir)
+    store = new SessionFileStore(resolveWorkspace({ dataDir: dir }))
   })
   afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
 

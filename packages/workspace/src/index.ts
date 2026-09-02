@@ -16,6 +16,8 @@
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
+export * from './storage'
+
 /** 单级目录根：plugin / skill / agent 三组可插拔资源目录 */
 export interface WorkspaceLevel {
   /** 该级根目录 */
