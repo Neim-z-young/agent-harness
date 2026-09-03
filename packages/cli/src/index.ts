@@ -228,6 +228,11 @@ export interface HarnessConfig {
   agents?: Array<{ id: string; tools: string[] }>
   /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
   snapshot?: boolean
+  /**
+   * 兼容的嵌套写法（表现同顶层 snapshot）：`{ "harness": { "snapshot": true } }`。
+   * 若顶层 snapshot 未填，则回退读此字段。
+   */
+  harness?: { snapshot?: boolean }
 }
 
 /** 单个 Provider 定义（config.json 的 providers 数组元素）——复用 @harness/plugin 抽象层契约 */
@@ -2096,7 +2101,7 @@ teammate 选项:
       --permission <mode>  allow-all / ask / deny-all（默认 ask）
   -v, --verbose            输出调试信息
       --tui                以 TUI（alt-screen 全屏）模式启动 REPL
-      --snapshot           开启文件快照 + /revert 能力（默认 false；可用 config.json harness.snapshot 常开）
+      --snapshot           开启文件快照 + /revert 能力（默认 false；config.json 设 "snapshot": true 或 harness.snapshot 常开）
       --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
 
 多 Provider（config.json → providers）:
@@ -2273,8 +2278,8 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   // 加载 config.json 并与 CLI 合并：CLI > config
   const cfg = await new ConfigStore<HarnessConfig>(ws).load()
   const { agentId, provider, model, anthropicApiKey } = resolveConfig(args, cfg)
-  // 快照优先级：CLI（--snapshot）> config.json（harness.snapshot）> 默认 false
-  const snapshot = args.snapshot ?? cfg.snapshot ?? false
+  // 快照优先级：CLI（--snapshot）> config.json（顶层 snapshot 或 harness.snapshot）> 默认 false
+  const snapshot = args.snapshot ?? cfg.snapshot ?? cfg.harness?.snapshot ?? false
 
   if (args.command === 'list-sessions') {
     const store = new SessionFileStore(ws)

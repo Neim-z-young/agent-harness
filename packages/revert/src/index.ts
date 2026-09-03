@@ -405,7 +405,7 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
       try {
         const snapshot = inp.snapshotService ?? opts.snapshotService
         if (!snapshot) {
-          inp.out('快照未启用：启动加 `--snapshot`，或 config.json 设 `"harness": { "snapshot": true }`。\n')
+          inp.out('快照未启用：启动加 `--snapshot`，或 config.json 设 `"snapshot": true`（亦可 `"harness": { "snapshot": true }`）。\n')
           return
         }
         const parts = input.raw.trim().split(/\s+/)

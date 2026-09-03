@@ -1,5 +1,15 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 58）修复 config.json 快照配置未生效（兼容嵌套 harness.snapshot）
+
+> 承接续 57。用户按帮助提示在 `~/.harness/config.json` 写了 `"harness": { "snapshot": true }` 但未生效——续 57 代码只读顶层 `cfg.snapshot`，而现有 config 为扁平结构，本身并无 `harness` 包裹层，是帮助文字给了嵌套写法示例导致的错配。
+
+* `HarnessConfig` 增加 `harness?: { snapshot?: boolean }`（文档标注为兼容写法）。
+* `main()` 快照解析改为 `args.snapshot ?? cfg.snapshot ?? cfg.harness?.snapshot ?? false`，兼容顶层与嵌套两种写法。
+* 帮助文字与 `/snapshot` 未启用提示统一：顶层 `"snapshot": true` 为主，嵌套 `"harness": { "snapshot": true }` 亦可用。
+
+`@harness/cli` 163 + `@harness/revert` 22 用例仍全过；全仓 typecheck 通过。
+
 ## 2026-09-03（续 57）快照功能开启 + `/snapshot` 信息命令（方案 A+B+C）
 
 > 承接续 55/56 调研结论落地：A（CLI `--snapshot` flag）+ B（config.json `harness.snapshot` 持久化，优先级 CLI>config>默认 false）+ C（新增薄壳 `/snapshot` 命令）。
