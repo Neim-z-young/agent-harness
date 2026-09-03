@@ -1,5 +1,14 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 61）文档：整理 /snapshot 命令清单与多工作区快照隔离说明
+
+> 承接续 59/60，把快照命令与隔离设计沉淀进 [workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.3。
+
+* §7.3.1：新增 `/snapshot` 命令清单表（查询/捕获/预览/回滚/维护五类 + 服务端方法映射），`status` 自省说明。
+* §7.3.2：多工作区快照隔离——git/file 两后端存储目录默认按 `sha256(worktree)[0:16]` 派生，天然隔离；显式隔离走 `gitDirectory`/`dataDir`，将来跨工作区共享可加按 workspace 解析存储根的一层 provider，不改两后端。
+
+纯文档，无代码变更；全仓 typecheck 不受影响。
+
 ## 2026-09-03（续 60）快照管理补全 preview/gc + status 增强（后端/启用/最新快照）
 
 > 承接续 59。按用户需求补上 `preview`、`gc` 命令，并把 `status` 从「一句已启用」增强为展示后端与启用态、快照计数、最新快照。
