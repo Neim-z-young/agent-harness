@@ -12,13 +12,19 @@ function makeWs(): { ws: ReturnType<typeof resolveWorkspace>; root: string } {
 }
 const cleanup = (r: string) => rmSync(r, { recursive: true, force: true })
 
-function cmdInput(partial: { command?: string; arg?: string; workspace?: unknown } = {}): CliCommandInput & {
+function cmdInput(
+  partial: { command?: string; arg?: string; workspace?: unknown; raw?: string } = {},
+): CliCommandInput & {
   workspace?: unknown
 } {
+  const command = partial.command ?? 'workspace'
+  // 模拟 cli 实际行为：arg 由整行 split(/\s+/,2) 取第二 token（如 'open'），完整参数在 raw。
+  const arg = partial.arg ?? ''
+  const full = `${command} ${arg}`.trim()
   const input: CliCommandInput & { workspace?: unknown } = {
-    raw: (partial.command ?? 'workspace') + (partial.arg ? ` ${partial.arg}` : ''),
-    command: partial.command ?? 'workspace',
-    arg: partial.arg ?? '',
+    raw: partial.raw ?? full,
+    command,
+    arg: full.split(/\s+/, 2)[1] ?? '',
     sessionId: 's1',
     result: undefined,
     out: () => {},
@@ -165,6 +171,19 @@ describe('createWorkspacePlugin · /workspace open 子命令', () => {
       await hooks['cli.command']!(cmdInput({ arg: 'open cwd', workspace: ws }))
       await hooks['cli.command']!(cmdInput({ arg: 'open project', workspace: ws }))
       expect(opened).toEqual([ws.cwd, ws.project.root])
+    } finally { cleanup(root) }
+  })
+
+  it('回归：cli 截断 arg 为第二 token（open），完整目标从 raw 解析 → cwd 打开工作目录而非 dataDir', async () => {
+    const { ws, root } = makeWs()
+    try {
+      const opened: string[] = []
+      const hooks = await hooksOf(createWorkspacePlugin({ open: (p) => { opened.push(p); return { ok: true } } }))
+      // cli 注入 arg='open'、raw='workspace open cwd'
+      const input = cmdInput({ arg: 'open cwd', workspace: ws })
+      expect(input.arg).toBe('open') // 断言 arg 确实被截断
+      await hooks['cli.command']!(input)
+      expect(opened).toEqual([ws.cwd]) // 应解析出 cwd，而非落到 dataDir
     } finally { cleanup(root) }
   })
 

@@ -141,9 +141,12 @@ export function createWorkspacePlugin(opts: WorkspaceShellOptions = {}): AgentPl
           inp.out('工作区未注入：通常由 cli 装配时提供；亦可 createWorkspacePlugin({ workspace }) 指定。\n')
           return
         }
-        // 子命令：open / help；其余（含空）渲染布局
-        const [sub, ...rest] = input.arg.trim().split(/\s+/)
-        const target = rest.join(' ')
+        // 子命令：open / help；其余（含空）渲染布局。
+        // 注意：cli 注入的 arg 只含第二个 token（如 'open'），完整参数在 raw（'workspace open cwd'）中，
+        // 故子命令与目标均从 raw 解析，避免 target 被截断而统一落到 dataDir。
+        const parts = input.raw.trim().split(/\s+/)
+        const sub = parts[1] ?? ''
+        const target = parts.slice(2).join(' ')
 
         if (sub === 'open') {
           const r = resolveOpenTarget(ws, target)
