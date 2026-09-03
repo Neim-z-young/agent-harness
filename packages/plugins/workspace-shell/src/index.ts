@@ -9,9 +9,56 @@
  * - 本插件只做「展示」，不解析/加载任何资源（文件/技能/插件装载由各资源模块负责），故为薄壳。
  */
 
+import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { resolve } from 'node:path'
 import type { AgentPlugin, Hooks, CliCommandInput, CliCommandsInput } from '@harness/plugin'
 import type { Workspace, WorkspaceLevel } from '@harness/workspace'
+
+/** 打开目录的结果（ok=false 时带错误说明） */
+export interface OpenResult {
+  ok: boolean
+  error?: string
+}
+
+/** 打开目录的实现签名（可注入，便于测试断言打开了哪个目录） */
+export type OpenDir = (path: string) => OpenResult | Promise<OpenResult>
+
+/**
+ * 系统默认打开目录的实现：按平台调用 `open` / `xdg-open` / `explorer`。
+ * 失败（进程 spawn 出错）返回 { ok: false, error }。
+ */
+export async function openInFileManager(path: string): Promise<OpenResult> {
+  const cmd =
+    process.platform === 'darwin' ? ['open', path] :
+    process.platform === 'win32' ? ['explorer', path] :
+    ['xdg-open', path]
+  return new Promise((res) => {
+    execFile(cmd[0], cmd.slice(1), (err) => {
+      if (err) return res({ ok: false, error: err.message })
+      res({ ok: true })
+    })
+  })
+}
+
+/**
+ * 解析 `/workspace open [target]` 目标对应的绝对路径。
+ * - 无 target / `user` / `data` → dataDir（用户级根）
+ * - `cwd` → 工作目录
+ * - `project` → 项目级根（<cwd>/.harness）
+ * - 其他 → 视为相对 cwd 的路径（resolve + 校验存在），不存在则返回 { error }
+ */
+export function resolveOpenTarget(
+  ws: Workspace,
+  target?: string,
+): { path: string } | { error: string } {
+  const t = (target ?? '').trim().toLowerCase()
+  if (t === '' || t === 'user' || t === 'data') return { path: ws.dataDir }
+  if (t === 'cwd') return { path: ws.cwd }
+  if (t === 'project') return { path: ws.project.root }
+  const p = resolve(ws.cwd, target!)
+  return existsSync(p) ? { path: p } : { error: `目录不存在：${p}` }
+}
 
 /** cli.command 输入 + cli 注入的 workspace 布局（运行时注入，插件 cast 消费） */
 export interface WorkspaceCmdInput extends CliCommandInput {
@@ -24,6 +71,8 @@ export interface WorkspaceShellOptions {
   workspace?: Workspace
   /** 渲染标题，缺省 '工作区' */
   title?: string
+  /** 打开目录的实现（缺省 openInFileManager，测试可注 spy） */
+  open?: OpenDir
 }
 
 /** 路径存在标记：✓ 已存在，空则尚未创建 */
@@ -73,12 +122,13 @@ export function renderWorkspace(ws: Workspace, title = '工作区'): string {
 }
 
 export function createWorkspacePlugin(opts: WorkspaceShellOptions = {}): AgentPlugin {
+  const openDir = opts.open ?? openInFileManager
   const hooks: Hooks = {
     'cli.commands'(input: CliCommandsInput) {
       input.commands.push({
         command: 'workspace',
         description: '查看工作区两级目录布局 + dataDir 数据文件路径',
-        usage: '/workspace',
+        usage: '/workspace [open [cwd|user|project|路径]]',
       })
     },
 
@@ -91,6 +141,28 @@ export function createWorkspacePlugin(opts: WorkspaceShellOptions = {}): AgentPl
           inp.out('工作区未注入：通常由 cli 装配时提供；亦可 createWorkspacePlugin({ workspace }) 指定。\n')
           return
         }
+        // 子命令：open / help；其余（含空）渲染布局
+        const [sub, ...rest] = input.arg.trim().split(/\s+/)
+        const target = rest.join(' ')
+
+        if (sub === 'open') {
+          const r = resolveOpenTarget(ws, target)
+          if ('error' in r) return void inp.out(r.error + '\n')
+          const res = await openDir(r.path)
+          inp.out(res.ok ? `已打开目录：${r.path}\n` : `打开失败：${res.error}\n`)
+          return
+        }
+        if (sub === 'help') {
+          inp.out(
+            '用法：\n' +
+            '  /workspace                     查看两级目录布局 + dataDir 数据文件路径\n' +
+            '  /workspace open [cwd|user|project|路径]  用系统文件管理器打开目录（缺省 dataDir/~）\n' +
+            '    cwd=工作目录  user/data=用户级根(~/.harness)  project=项目级根(<cwd>/.harness)\n' +
+            '  /workspace help                本帮助\n',
+          )
+          return
+        }
+
         inp.out(renderWorkspace(ws, opts.title ?? '工作区') + '\n')
       } finally {
         // 标记命令已处理，避免 cli fallthrough 到"未知命令"

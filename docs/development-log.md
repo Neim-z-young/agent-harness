@@ -1,5 +1,27 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 55）workspace-shell 扩展 `/workspace open` 子命令
+
+> 承接续 54。给薄壳插件 `@harness/workspace-shell` 增加子命令，用于用系统文件管理器打开各工作区目录，仍保持薄壳（仅展示 + 打开，不解析资源）。
+
+### 实现（@harness/workspace-shell）
+
+* `resolveOpenTarget(ws, target?)`：纯函数，解析 `/workspace open [target]` 目标路径——
+  * 缺省 / `user` / `data` → `dataDir`（用户级根 ~/.harness）
+  * `cwd` → 工作目录；`project` → 项目级根（<cwd>/.harness）
+  * 其他 → 相对 cwd resolve，存在返回路径、不存在返回 `{ error }`。
+* `openInFileManager(path)`：跨平台打开目录（darwin `open` / win32 `explorer` / Linux `xdg-open`），spawn 失败返回 `{ ok:false, error }`；签名 `OpenDir` 可注入（`opts.open`），测试注 spy。
+* `cli.command` handler 增加子命令解析：`open`（经 resolveOpenTarget → open，输出已打开/失败/目录不存在）、`help`（用法说明）；其余（含空）仍渲染布局。命令 `usage` 更新为 `/workspace [open [cwd|user|project|路径]]`。
+
+### 测试与验证
+
+* 新增 8 用例：resolveOpenTarget 三类（别名映射/相对路径/不存在）；open 子命令缺省目标、cwd/project、目录不存在、失败、help。
+* workspace-shell 共 16 用例全过；全仓 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.1
+
 ## 2026-09-03（续 54）core 的 agents/skills 内部加载改用 MultiDirLoader（扫描逻辑收敛）
 
 > 承接续 52/53。把 core 装配 agentDirs/skillDirs 时手写的 `readdir + 来源标注 + join` 骨架也收敛到 workspace 的 `MultiDirLoader`，消除 core 与 cli 的重复扫描逻辑。

@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveWorkspace } from '@harness/workspace'
 import type { CliCommandInput, Hooks } from '@harness/plugin'
-import { renderWorkspace, createWorkspacePlugin } from './index'
+import { renderWorkspace, createWorkspacePlugin, resolveOpenTarget, type OpenDir } from './index'
 
 function makeWs(): { ws: ReturnType<typeof resolveWorkspace>; root: string } {
   const root = mkdtempSync(join(tmpdir(), 'ws-shell-'))
@@ -12,11 +12,13 @@ function makeWs(): { ws: ReturnType<typeof resolveWorkspace>; root: string } {
 }
 const cleanup = (r: string) => rmSync(r, { recursive: true, force: true })
 
-function cmdInput(partial: { command?: string; workspace?: unknown } = {}): CliCommandInput {
+function cmdInput(partial: { command?: string; arg?: string; workspace?: unknown } = {}): CliCommandInput & {
+  workspace?: unknown
+} {
   const input: CliCommandInput & { workspace?: unknown } = {
-    raw: partial.command ?? 'workspace',
+    raw: (partial.command ?? 'workspace') + (partial.arg ? ` ${partial.arg}` : ''),
     command: partial.command ?? 'workspace',
-    arg: '',
+    arg: partial.arg ?? '',
     sessionId: 's1',
     result: undefined,
     out: () => {},
@@ -101,6 +103,111 @@ describe('createWorkspacePlugin · cli.command 处理', () => {
       const input = cmdInput({ command: 'tools' })
       await hooks['cli.command']!(input)
       expect(input.result).toBeUndefined()
+    } finally { cleanup(root) }
+  })
+})
+
+describe('resolveOpenTarget', () => {
+  it('缺省 target → dataDir；别名 user/data → dataDir', () => {
+    const { ws, root } = makeWs()
+    try {
+      expect(resolveOpenTarget(ws)).toEqual({ path: ws.dataDir })
+      expect(resolveOpenTarget(ws, 'user')).toEqual({ path: ws.dataDir })
+      expect(resolveOpenTarget(ws, 'data')).toEqual({ path: ws.dataDir })
+    } finally { cleanup(root) }
+  })
+
+  it('cwd / project 别名映射到对应根目录', () => {
+    const { ws, root } = makeWs()
+    try {
+      expect(resolveOpenTarget(ws, 'cwd')).toEqual({ path: ws.cwd })
+      expect(resolveOpenTarget(ws, 'project')).toEqual({ path: ws.project.root })
+    } finally { cleanup(root) }
+  })
+
+  it('普通路径：相对 cwd resolve，存在则返回、不存在返回 error', () => {
+    const { ws, root } = makeWs()
+    try {
+      mkdirSync(join(root, 'sub'), { recursive: true })
+      const p = join(root, 'sub')
+      expect(resolveOpenTarget(ws, 'sub')).toEqual({ path: p })
+      const miss = join(root, 'nope')
+      expect('error' in resolveOpenTarget(ws, 'nope')).toBe(true)
+      const r = resolveOpenTarget(ws, 'nope')
+      expect(r && 'error' in r ? (r as { error: string }).error : '').toContain(miss)
+    } finally { cleanup(root) }
+  })
+})
+
+describe('createWorkspacePlugin · /workspace open 子命令', () => {
+  it('open 缺省目标打开 dataDir，并设 result=continue', async () => {
+    const { ws, root } = makeWs()
+    try {
+      const opened: string[] = []
+      const fakeOpen: OpenDir = (p) => { opened.push(p); return { ok: true } }
+      const hooks = await hooksOf(createWorkspacePlugin({ open: fakeOpen }))
+      const out: string[] = []
+      const input = cmdInput({ arg: 'open' })
+      input.workspace = ws
+      input.out = (s) => void out.push(s)
+      await hooks['cli.command']!(input)
+      expect(opened).toEqual([ws.dataDir])
+      expect(out.join('')).toContain('已打开目录')
+      expect(input.result).toBe('continue')
+    } finally { cleanup(root) }
+  })
+
+  it('open cwd / project 打开对应目录', async () => {
+    const { ws, root } = makeWs()
+    try {
+      const opened: string[] = []
+      const hooks = await hooksOf(createWorkspacePlugin({ open: (p) => { opened.push(p); return { ok: true } } }))
+      await hooks['cli.command']!(cmdInput({ arg: 'open cwd', workspace: ws }))
+      await hooks['cli.command']!(cmdInput({ arg: 'open project', workspace: ws }))
+      expect(opened).toEqual([ws.cwd, ws.project.root])
+    } finally { cleanup(root) }
+  })
+
+  it('open 目录不存在 → 报错且不调用 open', async () => {
+    const { ws, root } = makeWs()
+    try {
+      const opened: string[] = []
+      const hooks = await hooksOf(createWorkspacePlugin({ open: (p) => { opened.push(p); return { ok: true } } }))
+      const out: string[] = []
+      const input = cmdInput({ arg: 'open nope' })
+      input.workspace = ws
+      input.out = (s) => void out.push(s)
+      await hooks['cli.command']!(input)
+      expect(opened).toEqual([])
+      expect(out.join('')).toContain('目录不存在')
+    } finally { cleanup(root) }
+  })
+
+  it('open 打不开 → 输出失败信息', async () => {
+    const { ws, root } = makeWs()
+    try {
+      const hooks = await hooksOf(createWorkspacePlugin({ open: () => ({ ok: false, error: 'boom' }) }))
+      const out: string[] = []
+      const input = cmdInput({ arg: 'open' })
+      input.workspace = ws
+      input.out = (s) => void out.push(s)
+      await hooks['cli.command']!(input)
+      expect(out.join('')).toContain('打开失败')
+      expect(input.result).toBe('continue')
+    } finally { cleanup(root) }
+  })
+
+  it('help 输出用法说明', async () => {
+    const { ws, root } = makeWs()
+    try {
+      const hooks = await hooksOf(createWorkspacePlugin())
+      const out: string[] = []
+      const input = cmdInput({ arg: 'help' })
+      input.workspace = ws
+      input.out = (s) => void out.push(s)
+      await hooks['cli.command']!(input)
+      expect(out.join('')).toContain('用法')
+      expect(out.join('')).toContain('/workspace open')
     } finally { cleanup(root) }
   })
 })

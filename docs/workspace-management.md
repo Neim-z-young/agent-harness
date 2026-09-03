@@ -114,7 +114,7 @@ Provider：config.json → providers（显式多 Provider） + 默认 Provider �
 
 * **核心库** **`packages/workspace`（`@harness/workspace`）**：只做「定位与解析 + 存储」，不含 Provider/插件装配。导出服务工厂（供 cli/core 启动期使用），不与插件钩子绑定——借鉴 `@harness/snapshot`、`createBashTool`（插件模块同时导出 helper 工厂与 Plugin）。
 
-* **薄壳 AgentPlugin** **`createWorkspacePlugin(opts)`**：复用 `harness.init`/`cli.commands` 等 Hooks 提供生命周期与 `/workspace` 查看命令；真正服务对象由核心库工厂预创建后注入。
+* **薄壳 AgentPlugin** **`createWorkspacePlugin(opts)`**：复用 `harness.init`/`cli.commands` 等 Hooks 提供生命周期与 `/workspace` 查看命令；真正服务对象由核心库工厂预创建后注入。支持子命令：`/workspace open [cwd|user|data|project|路径]` 调系统文件管理器打开目录（缺省 dataDir）、`/workspace help`。打开实现可经 `opt.open` 注入（默认按平台 `open`/`xdg-open`/`explorer`）。
 
 ### 7.2 从 cli 抽离的服务
 
