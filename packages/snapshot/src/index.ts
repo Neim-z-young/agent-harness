@@ -61,6 +61,10 @@ export interface SnapshotInfo {
 
 /** 快照服务公共接口（两后端一致） */
 export interface SnapshotService {
+  /** 实际后端：'git' | 'file'（工厂 auto 探测后解析的最终后端） */
+  readonly backend: 'git' | 'file'
+  /** 是否启用（false 时 capture 返回 undefined、restore/checkout 抛错） */
+  readonly enabled: boolean
   /** 快照当前文件系统状态，返回快照 ID；失败 best-effort 返回 undefined */
   capture(scope?: string): Promise<SnapshotID | undefined>
   /** 快照历史（最新在前）；git 读 snapshot-ids.json，file 读 snapshots.json */
@@ -367,10 +371,11 @@ function lineDiff(
 
 /** git 后端快照服务：独立 git 仓库 + content-addressed tree（对齐 OpenCode v2） */
 export class GitSnapshotService implements SnapshotService {
+  readonly backend = 'git' as const
+  readonly enabled: boolean
   private readonly repo: GitRepo
   private readonly mutex = new KeyedMutex()
   private readonly maximumUntrackedFileBytes: number
-  private readonly enabled: boolean
   private readonly maxSnapshots: number
   /** 快照 ID 注册表路径（记录已知快照，超上限淘汰最旧） */
   private readonly snapshotIdsPath: string
@@ -783,12 +788,13 @@ function compileIgnorePatterns(patterns: string[]): (rel: string) => boolean {
  * 变更检测三级降级：stat(mode/size) → mtime → 内容（对齐 Claude Code checkOriginFileChanged）。
  */
 export class FileSnapshotService implements SnapshotService {
+  readonly backend = 'file' as const
+  readonly enabled: boolean
   private readonly worktree: string
   private readonly dataDir: string
   private readonly backupsDir: string
   private readonly chainPath: string
   private readonly mutex = new KeyedMutex()
-  private readonly enabled: boolean
   private readonly maxSnapshots: number
   /** dataDir 若位于 worktree 内则跳过（避免快照存储被自身扫描） */
   private readonly dataDirInside: string | null

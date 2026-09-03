@@ -1,5 +1,31 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 60）快照管理补全 preview/gc + status 增强（后端/启用/最新快照）
+
+> 承接续 59。按用户需求补上 `preview`、`gc` 命令，并把 `status` 从「一句已启用」增强为展示后端与启用态、快照计数、最新快照。
+
+### 服务层自省（@harness/snapshot）
+
+* `SnapshotService` 接口新增只读自省字段：`backend: 'git' | 'file'`（工厂 auto 探测后两后端各自固定暴露）与 `enabled: boolean`。
+* `GitSnapshotService.backend='git'`、`FileSnapshotService.backend='file'`；`enabled` 由 `private` 提升为 `readonly` 公开。
+
+### 命令层（@harness/revert `createSnapshotPlugin`）
+
+* `status` 增强：输出「状态（已/未启用）/ 后端 / 快照数 / 最新快照 ID / 捕获时间」，无快照给出捕获指引。
+* 新增子命令：
+  * `preview <to> <path...>`：零副作用回滚预览——从快照 `<to>` 恢复指定文件的 diff（不落盘，复用服务端 `preview`）。
+  * `gc`：清理过期快照存储（git `git gc` / file 清理无引用备份）；后端不支持时提示。
+* 帮助文本与 usage 同步补全。
+
+### 测试
+
+* snapshot 新增自省字段用例（两后端 + disabled 语义）。
+* revert 新增 status 空快照、preview（含缺参 / diff 输出）、gc（含不支持回退）共 6 用例——revert 共 35、snapshot 共 28 用例全过；全仓 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.3
+
 ## 2026-09-03（续 59）快照管理命令扩展：list / diff / restore / checkout
 
 > 承接续 57/58，按用户需求「增加更多快照管理命令和回滚命令，如快照列表、内容 diff」，把 `/snapshot` 从只读信息命令扩成完整管理工具。

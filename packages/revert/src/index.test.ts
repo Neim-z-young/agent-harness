@@ -399,6 +399,8 @@ describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
 
   function fakeSvc(overrides: Record<string, unknown> = {}) {
     return {
+      enabled: true,
+      backend: 'git',
       capture: async (scope?: string) => scope ? `snap-${scope}` : 'snap-a',
       files: async (from: string, to: string) => to === 'to2' ? ['a.ts', 'b.ts'] : [],
       list: async () => [
@@ -409,6 +411,7 @@ describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
       preview: async () => [],
       restore: async () => {},
       checkout: async () => {},
+      gc: async () => {},
       ...overrides,
     } as any
   }
@@ -440,14 +443,13 @@ describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
     expect(input.result).toBe('continue')
   })
 
-  test('缺省子命令输出 status（已启用）', async () => {
+  test('缺省子命令输出 status（已启用 + 后端 + 最新快照）', async () => {
     const hooks = await hooksOf(createSnapshotPlugin())
-    const out: string[] = []
-    const input = cmdInput({ snapshotService: fakeSvc() })
-    input.out = (s) => void out.push(s)
-    await hooks['cli.command']!(input)
-    expect(out.join('')).toInclude('快照已启用')
-    expect(input.result).toBe('continue')
+    const out = await run(hooks, 'snapshot', fakeSvc())
+    expect(out).toInclude('状态：已启用')
+    expect(out).toInclude('后端：git')
+    expect(out).toInclude('快照数：2')
+    expect(out).toInclude('最新快照：snap-c')
   })
 
   test('capture 子命令输出快照 ID', async () => {
@@ -544,6 +546,54 @@ describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
   test('checkout 缺参提示用法', async () => {
     const hooks = await hooksOf(createSnapshotPlugin())
     expect(await run(hooks, 'snapshot checkout', fakeSvc())).toInclude('用法')
+  })
+
+  test('status 无快照时提示捕获', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const out = await run(hooks, 'snapshot status', fakeSvc({ list: async () => [] }))
+    expect(out).toInclude('状态：已启用')
+    expect(out).toInclude('快照数：0')
+    expect(out).toInclude('暂无')
+  })
+
+  test('preview 子命令零副作用输出 diff（不落盘）', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const previewed: Map<string, string> = new Map()
+    const svc = fakeSvc({
+      preview: async (files: Map<string, string>) => {
+        for (const [p, to] of files) previewed.set(p, to)
+        return [
+          { path: 'a.ts', status: 'modified', additions: 1, deletions: 1, patch: '@@ -1 +1 @@\n-old\n+new\n' },
+        ]
+      },
+    })
+    const out = await run(hooks, 'snapshot preview to2 a.ts', svc)
+    expect(out).toInclude('回滚预览')
+    expect(out).toInclude('修改')
+    expect(out).toInclude('+1/-1')
+    expect(out).toInclude('@@ -1 +1 @@')
+    expect(previewed.get('a.ts')).toBe('to2')
+  })
+
+  test('preview 缺参提示用法', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    expect(await run(hooks, 'snapshot preview to2', fakeSvc())).toInclude('用法')
+  })
+
+  test('gc 子命令触发清理并提示', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    let called = 0
+    const svc = fakeSvc({ gc: async () => { called++ } })
+    const out = await run(hooks, 'snapshot gc', svc)
+    expect(out).toInclude('已清理过期快照存储')
+    expect(called).toBe(1)
+  })
+
+  test('gc 后端不支持时提示', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const svc = fakeSvc()
+    delete svc.gc
+    expect(await run(hooks, 'snapshot gc', svc)).toInclude('不支持')
   })
 
   test('非 snapshot 命令不设 result', async () => {

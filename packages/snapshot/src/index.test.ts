@@ -220,6 +220,20 @@ describe('SnapshotService', () => {
     expect(await svc.capture()).toBeUndefined()
     await expect(svc.restore(new Map())).rejects.toBeInstanceOf(SnapshotError)
   })
+
+  test('backend/enabled 自省字段两后端一致暴露', async () => {
+    const { worktree, gitDir, dataDir } = await makeEnv()
+    const git = createSnapshotService({ worktree, gitDirectory: gitDir, backend: 'git' })
+    const file = createSnapshotService({ worktree, dataDir, backend: 'file' })
+    const disabled = createSnapshotService({ worktree, gitDirectory: gitDir, backend: 'git', enabled: false })
+
+    expect(git.backend).toBe('git')
+    expect(git.enabled).toBe(true)
+    expect(file.backend).toBe('file')
+    expect(file.enabled).toBe(true)
+    expect(disabled.backend).toBe('git')
+    expect(disabled.enabled).toBe(false)
+  })
 })
 
 describe('§10.4 GitSnapshotService 增强（gc + 上限淘汰）', () => {

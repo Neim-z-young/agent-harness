@@ -394,8 +394,8 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
     'cli.commands'(input: CliCommandsInput) {
       input.commands.push({
         command: 'snapshot',
-        description: '文件快照管理：status/list/capture/diff/restore/checkout/files/help',
-        usage: '/snapshot [status|list|capture [scope]|diff <from> <to>|<to> <path...>|checkout <to>|files <from> <to>|help]',
+        description: '文件快照管理：status/list/capture/diff/restore/checkout/preview/gc/help',
+        usage: '/snapshot [status|list|capture [scope]|diff <from> <to> [path]|restore <to> <path...>|checkout <to>|preview <to> <path...>|gc|help]',
       })
     },
 
@@ -414,18 +414,35 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
           case 'help':
             inp.out(
               '用法：\n' +
-              '  /snapshot                 查看快照启用状态\n' +
-              '  /snapshot status           同上\n' +
-              '  /snapshot list             列出快照历史（最新在前，含时间戳）\n' +
-              '  /snapshot capture [scope]  手动捕获当前文件系统快照（返回快照 ID）\n' +
-              '  /snapshot files <from> <to>    列出两个快照间的变更文件路径\n' +
+              '  /snapshot                   查看快照启用状态\n' +
+              '  /snapshot status            同上\n' +
+              '  /snapshot list              列出快照历史（最新在前，含时间戳）\n' +
+              '  /snapshot capture [scope]   手动捕获当前文件系统快照（返回快照 ID）\n' +
+              '  /snapshot files <from> <to>     列出两个快照间的变更文件路径\n' +
               '  /snapshot diff <from> <to> [path]   两个快照间的增量统计；给 path 时附 unified 补丁\n' +
-              '  /snapshot restore <to> <path...>    从快照 <to> 恢复指定文件（目标快照中不存在则删除）\n' +
-              '  /snapshot checkout <to>            整仓恢复到快照 <to>\n',
+              '  /snapshot preview <to> <path...>   零副作用预览：从快照 <to> 恢复指定文件的 diff（不落盘）\n' +
+              '  /snapshot restore <to> <path...>   从快照 <to> 恢复指定文件（目标快照中不存在则删除）\n' +
+              '  /snapshot checkout <to>           整仓恢复到快照 <to>\n' +
+              '  /snapshot gc                    清理过期快照存储\n',
             )
             return
           case 'status': {
-            inp.out('快照已启用。每轮 query 自动 capture 并挂载 meta.snapshot；可用 /revert 回滚文件变更。\n')
+            const infos = await snapshot.list()
+            const lines = [
+              `状态：${snapshot.enabled ? '已启用' : '未启用'}`,
+              `后端：${snapshot.backend}`,
+              `快照数：${infos.length}`,
+            ]
+            if (infos[0]) {
+              const ts = infos[0].timestamp
+                ? new Date(infos[0].timestamp).toLocaleString('zh-CN', { hour12: false })
+                : 'unknown'
+              lines.push(`最新快照：${infos[0].id}`)
+              lines.push(`捕获于：${ts}`)
+            } else {
+              lines.push('最新快照：（暂无，/snapshot capture 或任意一轮 query 会自动捕获）')
+            }
+            inp.out(`快照状态：\n${lines.map((l) => `  ${l}`).join('\n')}\n`)
             return
           }
           case 'list': {
@@ -474,6 +491,23 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
             if (!to) { inp.out('用法：/snapshot checkout <to>\n'); return }
             await snapshot.checkout(to as SnapshotID)
             inp.out(`已整仓恢复到快照 ${to}。\n`)
+            return
+          }
+          case 'preview': {
+            const to = parts[2], paths = parts.slice(3)
+            if (!to || paths.length === 0) { inp.out('用法：/snapshot preview <to> <path...>\n'); return }
+            const diffs = await snapshot.preview(new Map(paths.map((p) => [p, to as SnapshotID])))
+            const statusZh: Record<string, string> = { added: '新增', modified: '修改', deleted: '删除' }
+            const summary = diffs.map((d) => `  ${statusZh[d.status] ?? d.status}\t${d.path}\t+${d.additions}/-${d.deletions}`)
+            inp.out(`回滚预览（自快照 ${to}，不落盘）：\n`)
+            inp.out(summary.length ? `${summary.join('\n')}\n` : '（这些文件与快照内容一致，无变更）\n')
+            for (const d of diffs) if (d.patch) inp.out(d.patch)
+            return
+          }
+          case 'gc': {
+            if (!snapshot.gc) { inp.out('当前后端不支持 gc。\n'); return }
+            await snapshot.gc()
+            inp.out('已清理过期快照存储。\n')
             return
           }
           default: {
