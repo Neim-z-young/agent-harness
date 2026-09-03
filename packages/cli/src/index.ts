@@ -61,7 +61,7 @@ import {
   normalizeDirs,
   type Workspace,
 } from '@harness/workspace'
-import { createSessionRevert, RevertEvents, type RevertState } from '@harness/revert'
+import { createRevertPlugin } from '@harness/revert'
 import { startTuiRepl } from './tui'
 import {
   emptyUsage,
@@ -1245,6 +1245,8 @@ export class HarnessApp {
     providerPlugins.push(toolsManager)
     // 薄壳插件：/workspace 查看工作区布局（依赖 cli 注入的 workspace，见 cmdInput.workspace）
     providerPlugins.push(createWorkspacePlugin())
+    // 薄壳插件：/revert 文件快照回滚（依赖 cli 注入的 snapshotService 与 harness.session/bus，见 cmdInput）
+    providerPlugins.push(createRevertPlugin())
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
@@ -1614,7 +1616,6 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /compact auto      达到阈值才压缩（默认 80% 可用窗口才触发）\n')
           out('  /search <keyword>  关键词搜索会话（匹配消息文本）\n')
           out('  /export [sessionId]  导出会话为 Markdown（默认当前会话）\n')
-          out('  /revert <sub>         文件快照回滚：stage/clear/commit/status/help\n')
           out('  /plugins              列出已加载插件（含来源/是否可管理）\n')
           out('  /plugins <op> <id>    enable|disable|reload 插件（如 /plugins reload my-gw）\n')
           out('  /skills              列出所有技能（含来源标注）\n')
@@ -1785,68 +1786,6 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('\n')
           return 'continue'
         }
-        case '/revert': {
-          if (!app.snapshotService) {
-            out('快照未启用：构造 HarnessApp 时传 snapshot: true 后可用 /revert。\n')
-            return 'continue'
-          }
-          const revert = createSessionRevert({
-            session: harness.session,
-            snapshot: app.snapshotService,
-            bus: harness.bus,
-          })
-          const parts = line.split(/\s+/).filter(Boolean)
-          const sub = parts[1] ?? 'help'
-          const sid = current.id
-          try {
-            switch (sub) {
-              case 'help': {
-                out('用法：\n')
-                out('  /revert stage <messageID>  回滚该消息之后的文件变更（生成 diff）\n')
-                out('  /revert clear              撤销回滚（恢复回滚前状态）\n')
-                out('  /revert commit             接受回滚（文件保持回滚后状态）\n')
-                out('  /revert status             查看当前回滚状态\n')
-                return 'continue'
-              }
-              case 'status': {
-                const state = await revert.getState(sid)
-                if (!state) { out('（当前无进行中的回滚）\n'); return 'continue' }
-                out(`回滚状态：messageID=${state.messageID}\n`)
-                out(`快照：${state.snapshot}\n`)
-                const filesText = (state.files ?? []).map((f) => `${f.path} (+${f.additions}/-${f.deletions})`).join(', ')
-                out(`变更文件：${filesText || '（无）'}\n`)
-                return 'continue'
-              }
-              case 'clear': {
-                await revert.clear(sid)
-                out('已撤销回滚，文件恢复回滚前状态。\n')
-                return 'continue'
-              }
-              case 'commit': {
-                await revert.commit(sid)
-                out('已接受回滚，文件保持回滚后状态。\n')
-                return 'continue'
-              }
-              case 'stage': {
-                const messageID = parts[2]
-                if (!messageID) { out('用法：/revert stage <messageID>\n'); return 'continue' }
-                const state = await revert.stage({ sessionId: sid, messageID })
-                out(`已回滚 ${messageID} 之后的文件变更（${state.files?.length ?? 0} 个文件）：\n`)
-                for (const f of state.files ?? []) {
-                  out(`  ${f.status.padEnd(8)} ${f.path}  +${f.additions}/-${f.deletions}\n`)
-                  if (f.patch) out(`${f.patch.slice(0, 400)}${f.patch.length > 400 ? '...' : ''}\n`)
-                }
-                return 'continue'
-              }
-              default:
-                out(`未知子命令：${sub}，输入 /revert help 查看用法。\n`)
-                return 'continue'
-            }
-          } catch (err: any) {
-            out(`回滚失败：${err?.message ?? String(err)}\n`)
-            return 'continue'
-          }
-        }
         case '/permission': {
           // 查看：/permission；设置：/permission <mode> 或 /permission <key>=<behavior>
           if (!arg || arg.trim() === '?') {
@@ -1943,6 +1882,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             setAgentTools: (agentId: string, tools: string[]) => Promise<void>;
             toolMeta: ToolMetaLookup;
             workspace: Workspace;
+            snapshotService?: SnapshotService;
             result?: 'continue' | 'exit'
           } = {
             raw: line.slice(1),
@@ -1955,6 +1895,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             setAgentTools: (id, tools) => app.setAgentTools(id, tools),
             toolMeta: getBuiltinToolRegistry(),
             workspace: app.workspace,
+            snapshotService: app.snapshotService,
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)

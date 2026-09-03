@@ -1,5 +1,32 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 56）snapshot/revert 薄壳插件化：`createRevertPlugin`
+
+> 承接续 55，落实 workspace-management §7.3「预创建 + 薄壳」模式同样适用于 snapshot 插件化。把内联在 cli 的 `/revert` 命令抽成 `@harness/revert` 包内的薄壳 AgentPlugin，快照服务由 cli 预创建后经 cmdInput 注入，消灭 cli 内联回滚逻辑。
+
+### 实现（@harness/revert）
+
+* 新增 `createRevertPlugin(opts?)` 薄壳插件（id=`revert-shell`）：
+  * `cli.commands` 注册 `/revert` 命令定义（自动并入 `/help` 与 TUI 命令面板）。
+  * `cli.command` 提供 `stage|clear|commit|status|help` 五子命令，复用同包 `createSessionRevert` 三态控制器。
+  * 数据依赖全部来自 cli 注入：`input.snapshotService`（HarnessApp.snapshotService）+ `input.harness.session/bus`；未启用 snapshot 或未注入时给出提示不抛错。
+  * 子命令/参数从完整 `input.raw` 解析（cli 注入的 arg 只含第二 token，同 workspace-shell 处理）。
+* 新增 `@harness/plugin` 依赖。
+
+### cli 接入
+
+* `providerPlugins.push(createRevertPlugin())`（与 workspace-shell 并列）；cmdInput 注入 `snapshotService: app.snapshotService`。
+* 删除内联 `case '/revert'` 块与已不再使用的 `createSessionRevert/RevertEvents/RevertState` import；`/help` 里硬编码的 `/revert` 行移除，改由 `cli.commands` 自动列出（避免重复）。
+
+### 测试与验证
+
+* revert 新增薄壳插件 5 用例（命令注册 / 未启用提示 / session·bus 未注入提示 / 非 revert 不设 result / 稳定 id）——revert 共 15 用例全过。
+* cli 既有 6 条 `/revert` 集成用例经 boot+REPL 走插件路径仍全过（@harness/cli 158 用例全过）；全仓 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.3
+
 ## 2026-09-03（续 55）workspace-shell 扩展 `/workspace open` 子命令
 
 > 承接续 54。给薄壳插件 `@harness/workspace-shell` 增加子命令，用于用系统文件管理器打开各工作区目录，仍保持薄壳（仅展示 + 打开，不解析资源）。

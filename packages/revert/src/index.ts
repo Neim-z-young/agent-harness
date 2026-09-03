@@ -18,6 +18,7 @@ import { BusEvent } from '@harness/bus'
 import type { Bus } from '@harness/bus'
 import type { Session, SessionManager } from '@harness/session'
 import type { FileDiff, SnapshotID, SnapshotService } from '@harness/snapshot'
+import type { AgentPlugin, Hooks, CliCommandInput, CliCommandsInput } from '@harness/plugin'
 
 // ===== RevertState =====
 
@@ -256,4 +257,116 @@ export class SessionRevert {
 /** 便捷工厂 */
 export function createSessionRevert(options: SessionRevertOptions): SessionRevert {
   return new SessionRevert(options)
+}
+
+// ===== 薄壳插件：/revert 命令（cli.commands / cli.command） =====
+
+/** cli.command 输入 + cli 注入的 snapshot 服务（cli 装配时注入，插件 cast 消费） */
+export interface RevertCmdInput extends CliCommandInput {
+  /** cli 注入的 snapshot 服务（HarnessApp.snapshotService）；缺省回退 opts.snapshotService */
+  snapshotService?: SnapshotService
+}
+
+/** createRevertPlugin 入参 */
+export interface RevertShellOptions {
+  /** 注入的 snapshot 服务（缺省改读命令输入的 input.snapshotService） */
+  snapshotService?: SnapshotService
+}
+
+/**
+ * 薄壳 AgentPlugin：把 `/revert stage|clear|commit|status|help` 以 `cli.command` hook 提供。
+ * - 依赖 cli 注入的 `input.snapshotService` 与 `input.harness.session/bus`（见 cli cmdInput），
+ *   本插件不持有任何装配逻辑；`session`/`bus` 经 `input.harness` 读取（类型窄化见命令内 cast）。
+ * - 快照未启用（snapshotService 缺省）时给出提示，不抛错；复用同包 `createSessionRevert` 三态控制器。
+ */
+export function createRevertPlugin(opts: RevertShellOptions = {}): AgentPlugin {
+  const hooks: Hooks = {
+    'cli.commands'(input: CliCommandsInput) {
+      input.commands.push({
+        command: 'revert',
+        description: '文件快照回滚：stage/clear/commit/status',
+        usage: '/revert <sub> [messageID]',
+      })
+    },
+
+    async 'cli.command'(input: CliCommandInput) {
+      if (input.command !== 'revert') return
+      const inp = input as RevertCmdInput
+      try {
+        const snapshot = inp.snapshotService ?? opts.snapshotService
+        if (!snapshot) {
+          inp.out('快照未启用：构造 HarnessApp 时传 snapshot: true 后可用 /revert。\n')
+          return
+        }
+        const session = (inp.harness as { session?: SessionManager } | undefined)?.session
+        const bus = (inp.harness as { bus?: Bus } | undefined)?.bus
+        if (!session || !bus) {
+          inp.out('harness 未注入 session/bus，无法执行 /revert。\n')
+          return
+        }
+        const revert = createSessionRevert({ session, snapshot, bus })
+        // 子命令与参数从完整 raw 解析（cli 注入的 arg 只含第二个 token，见 workspace-shell 同款处理）
+        const parts = input.raw.trim().split(/\s+/)
+        const sub = parts[1] ?? 'help'
+        const sid = input.sessionId
+        try {
+          switch (sub) {
+            case 'help':
+              inp.out(
+                '用法：\n' +
+                '  /revert stage <messageID>  回滚该消息之后的文件变更（生成 diff）\n' +
+                '  /revert clear              撤销回滚（恢复回滚前状态）\n' +
+                '  /revert commit             接受回滚（文件保持回滚后状态）\n' +
+                '  /revert status             查看当前回滚状态\n',
+              )
+              return
+            case 'status': {
+              const state = await revert.getState(sid)
+              if (!state) { inp.out('（当前无进行中的回滚）\n'); return }
+              inp.out(`回滚状态：messageID=${state.messageID}\n`)
+              inp.out(`快照：${state.snapshot}\n`)
+              const filesText = (state.files ?? []).map((f) => `${f.path} (+${f.additions}/-${f.deletions})`).join(', ')
+              inp.out(`变更文件：${filesText || '（无）'}\n`)
+              return
+            }
+            case 'clear':
+              await revert.clear(sid)
+              inp.out('已撤销回滚，文件恢复回滚前状态。\n')
+              return
+            case 'commit':
+              await revert.commit(sid)
+              inp.out('已接受回滚，文件保持回滚后状态。\n')
+              return
+            case 'stage': {
+              const messageID = parts[2]
+              if (!messageID) { inp.out('用法：/revert stage <messageID>\n'); return }
+              const state = await revert.stage({ sessionId: sid, messageID })
+              inp.out(`已回滚 ${messageID} 之后的文件变更（${state.files?.length ?? 0} 个文件）：\n`)
+              for (const f of state.files ?? []) {
+                inp.out(`  ${f.status.padEnd(8)} ${f.path}  +${f.additions}/-${f.deletions}\n`)
+                if (f.patch) inp.out(`${f.patch.slice(0, 400)}${f.patch.length > 400 ? '...' : ''}\n`)
+              }
+              return
+            }
+            default:
+              inp.out(`未知子命令：${sub}，输入 /revert help 查看用法。\n`)
+          }
+        } catch (err: any) {
+          inp.out(`回滚失败：${err?.message ?? String(err)}\n`)
+        }
+      } finally {
+        // 标记命令已处理，避免 cli fallthrough 到"未知命令"
+        input.result = 'continue'
+      }
+    },
+  }
+
+  return {
+    id: 'revert-shell',
+    name: 'Revert Shell',
+    version: '0.1.0',
+    async install() {
+      return hooks
+    },
+  }
 }

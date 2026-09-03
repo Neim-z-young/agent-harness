@@ -18,6 +18,7 @@
   "dependencies": {
     "@harness/bus": "*",
     "@harness/session": "*",
-    "@harness/snapshot": "*"
+    "@harness/snapshot": "*",
+    "@harness/plugin": "*"
   }
 }

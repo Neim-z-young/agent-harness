@@ -136,7 +136,7 @@ Provider：config.json → providers（显式多 Provider） + 默认 Provider �
 
 * harness/core 经 `harness.init` 输出消费解析结果。
 
-该"预创建 + 薄壳"模式同样适用于 snapshot 插件化。
+该"预创建 + 薄壳"模式同样适用于 snapshot 插件化（已于 `@harness/revert` 落地，见开发日志续 56）。
 
 ### 7.4 演进边界
 

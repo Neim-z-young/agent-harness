@@ -16,9 +16,11 @@ import {
   attachSnapshotToMessage,
   collectSnapshotMap,
   createSessionRevert,
+  createRevertPlugin,
   RevertError,
   RevertEvents,
 } from './index'
+import type { CliCommandInput, Hooks } from '@harness/plugin'
 
 const tempDirs: string[] = []
 
@@ -311,5 +313,65 @@ describe('消息快照引用辅助', () => {
   test('collectSnapshotMap 边界消息不存在返回空 Map', async () => {
     const env = await makeEnv()
     expect(collectSnapshotMap(env.session, 'no-such')).toEqual(new Map())
+  })
+})
+
+describe('createRevertPlugin · 薄壳 /revert 命令', () => {
+  function cmdInput(partial: { raw?: string; snapshotService?: unknown; harness?: unknown } = {}): CliCommandInput & {
+    snapshotService?: unknown
+  } {
+    const raw = partial.raw ?? 'revert'
+    return {
+      raw,
+      command: raw.split(/\s+/)[0],
+      arg: raw.split(/\s+/, 2)[1] ?? '',
+      sessionId: 's1',
+      result: undefined,
+      out: () => {},
+      snapshotService: partial.snapshotService,
+      harness: partial.harness,
+    }
+  }
+
+  async function hooksOf(p: ReturnType<typeof createRevertPlugin>): Promise<NonNullable<Hooks>> {
+    return (await (p.install as (ctx?: unknown) => Promise<Hooks | void>)(undefined))!
+  }
+
+  test('命中 revert 时注册命令定义（cli.commands）', async () => {
+    const hooks = await hooksOf(createRevertPlugin())
+    const cmds: Array<{ command: string; description: string; usage?: string }> = []
+    await hooks['cli.commands']!({ commands: cmds })
+    expect(cmds.some((c) => c.command === 'revert')).toBe(true)
+  })
+
+  test('未配套 snapshot 时提示启用且设 result=continue', async () => {
+    const hooks = await hooksOf(createRevertPlugin())
+    const out: string[] = []
+    const input = cmdInput()
+    input.out = (s) => void out.push(s)
+    await hooks['cli.command']!(input)
+    expect(out.join('')).toInclude('快照未启用')
+    expect(input.result).toBe('continue')
+  })
+
+  test('snapshot 就绪但 harness 未注入 session/bus 时提示', async () => {
+    const hooks = await hooksOf(createRevertPlugin())
+    const out: string[] = []
+    const input = cmdInput({ snapshotService: {} })
+    input.out = (s) => void out.push(s)
+    await hooks['cli.command']!(input)
+    expect(out.join('')).toInclude('session/bus')
+    expect(input.result).toBe('continue')
+  })
+
+  test('非 revert 命令不设 result（留给别的插件）', async () => {
+    const hooks = await hooksOf(createRevertPlugin())
+    const input = cmdInput({ raw: 'workspace', snapshotService: {} })
+    await hooks['cli.command']!(input)
+    expect(input.result).toBeUndefined()
+  })
+
+  test('暴露稳定 id', () => {
+    expect(createRevertPlugin().id).toBe('revert-shell')
   })
 })
