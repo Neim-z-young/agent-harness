@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   createHarness,
   Harness,
@@ -807,6 +810,74 @@ describe('@harness/core', () => {
       const h = await createHarness({ chatProvider: mockChatProvider() })
       await expect(h.session.setId('nope', 'new')).rejects.toThrow('nope')
       await h.stop()
+    })
+  })
+
+  describe('多级目录加载（MultiDirLoader 收敛）', () => {
+    function makeAgentMd(name: string, tag: string): string {
+      return `---
+name: ${name}
+mode: primary
+tools: ['*']
+permission: allow
+---
+${tag} 版 body
+`
+    }
+
+    it('agentDirs：user → project 多级加载，同名 agent 后加载（project）覆盖先加载（user）', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'harness-agents-'))
+      try {
+        const userAgents = join(root, 'user', 'agents')
+        const projectAgents = join(root, 'project', 'agents')
+        mkdirSync(userAgents, { recursive: true })
+        mkdirSync(projectAgents, { recursive: true })
+        writeFileSync(join(userAgents, 'worker.md'), makeAgentMd('User Worker', 'user'))
+        writeFileSync(join(projectAgents, 'worker.md'), makeAgentMd('Project Worker', 'project'))
+        writeFileSync(join(userAgents, 'only-user.md'), makeAgentMd('Only User', 'user'))
+
+        const h = await createHarness({
+          chatProvider: mockChatProvider(),
+          agentDirs: [
+            { dir: userAgents, source: 'user' },
+            { dir: projectAgents, source: 'project' },
+          ],
+        })
+        // project 覆盖 user
+        expect(h.agent.get('worker')?.name).toBe('Project Worker')
+        // 仅 user 有的保留
+        expect(h.agent.get('only-user')?.name).toBe('Only User')
+        await h.stop()
+      } finally { rmSync(root, { recursive: true, force: true }) }
+    })
+
+    it('skillDirs：从目录加载 SKILL.md（目录形式 + 单文件形式）', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'harness-skills-'))
+      try {
+        const userSkills = join(root, 'user', 'skills')
+        const projectSkills = join(root, 'project', 'skills')
+        // 目录形式：greet/SKILL.md
+        mkdirSync(join(userSkills, 'greet'), { recursive: true })
+        writeFileSync(join(userSkills, 'greet', 'SKILL.md'), '---\nname: Greet\n---\n问候一下。\n')
+        // 单文件形式：summarize.md
+        writeFileSync(join(userSkills, 'summarize.md'), '---\nname: Summarize\n---\n总结。\n')
+        // project 同名覆盖 greet
+        mkdirSync(join(projectSkills, 'greet'), { recursive: true })
+        writeFileSync(join(projectSkills, 'greet', 'SKILL.md'), '---\nname: Greet Pro\n---\n专业问候。\n')
+
+        const h = await createHarness({
+          chatProvider: mockChatProvider(),
+          skillDirs: [
+            { dir: userSkills, source: 'user' },
+            { dir: projectSkills, source: 'project' },
+          ],
+        })
+        const all = h.skillManager?.all() ?? []
+        expect(all.some((s) => s.id === 'summarize')).toBe(true)
+        // 同名 greet 被 project 覆盖（name 取 project 版）
+        expect(all.find((s) => s.id === 'greet')?.name).toBe('Greet Pro')
+        await h.stop()
+      } finally { rmSync(root, { recursive: true, force: true }) }
     })
   })
 })

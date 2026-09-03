@@ -70,6 +70,7 @@
         "@harness/skill": "workspace:*",
         "@harness/snapshot": "workspace:*",
         "@harness/tool": "workspace:*",
+        "@harness/workspace": "workspace:*",
       },
     },
     "packages/permission": {

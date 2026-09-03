@@ -176,8 +176,9 @@ import type {
 } from '@harness/agent'
 import { agentFromMarkdown } from '@harness/agent'
 import { createSkillManager, formatSkillForPrompt, type SkillManager, type Skill, type SkillSource } from '@harness/skill'
-import { readdirSync, readFileSync, existsSync } from 'node:fs'
-import { join, basename, extname, resolve } from 'node:path'
+import { MultiDirLoader, normalizeDirs, type DirEntryInput, type DirSource } from '@harness/workspace'
+import { readFileSync } from 'node:fs'
+import { basename, extname, resolve } from 'node:path'
 import type {
   PermissionRuleset,
   PermissionEngine,
@@ -1784,30 +1785,20 @@ export class HarnessImpl implements Harness {
 
     // 从配置文件目录加载 Agent（支持多级来源：user → project，后加载覆盖先加载）
     // 参考 Claude Code loadAgentsDir 和 OpenCode config.ts loadAgent 逻辑
-    for (const entry of options.agentDirs ?? []) {
-      const dirPath = typeof entry === 'string' ? entry : entry.dir
-      // source 仅用于日志，AgentDefinition 没有 loadedFrom 字段
-      // （多级覆盖通过加载顺序保证，user 在前 project 在后）
-      const cwd = this.options.cwd ?? process.cwd()
-      const resolvedDir = resolve(cwd, dirPath)
-      if (!existsSync(resolvedDir)) continue
+    // 目录枚举/来源标注/覆盖顺序交由 MultiDirLoader（workspace 通用原语，收敛 readdir + source 骨架）；
+    // source 仅用于日志，AgentDefinition 没有 loadedFrom 字段（多级覆盖通过加载顺序保证，user 在前 project 在后）
+    const cwd = this.options.cwd ?? process.cwd()
+    const agentLoader = new MultiDirLoader(
+      normalizeDirs(options.agentDirs ?? [], 'project').map((e) => ({ dir: resolve(cwd, e.dir), source: e.source })),
+    )
+    for (const item of agentLoader.scan({ kind: 'file', name: (n) => extname(n) === '.md' })) {
       try {
-        const entries = readdirSync(resolvedDir, { withFileTypes: true })
-        for (const fileEntry of entries) {
-          if (!fileEntry.isFile() || extname(fileEntry.name) !== '.md') continue
-          const filePath = join(resolvedDir, fileEntry.name)
-          try {
-            const content = readFileSync(filePath, 'utf-8')
-            // 文件名（不含扩展名）作为 fallbackId
-            const fallbackId = basename(fileEntry.name, '.md')
-            const def = agentFromMarkdown(content, fallbackId)
-            agentImpl.register(def)
-          } catch (err) {
-            this.options.logger?.warn?.(`Agent 配置文件加载失败: ${filePath}: ${(err as Error)?.message ?? err}`)
-          }
-        }
+        const content = readFileSync(item.full, 'utf-8')
+        // 文件名（不含扩展名）作为 fallbackId
+        const def = agentFromMarkdown(content, basename(item.name, '.md'))
+        agentImpl.register(def)
       } catch (err) {
-        this.options.logger?.warn?.(`Agent 目录扫描失败: ${resolvedDir}: ${(err as Error)?.message ?? err}`)
+        this.options.logger?.warn?.(`Agent 配置文件加载失败: ${item.full}: ${(err as Error)?.message ?? err}`)
       }
     }
 
@@ -1835,17 +1826,20 @@ export class HarnessImpl implements Harness {
       if (this.skillManager) {
         // 1. 从 skillDirs 异步加载 SKILL.md（构造函数中不能 await，故延迟到 init）
         //    多级来源：按 skillDirs 数组顺序加载，后加载覆盖先加载（user → project）
-        //    支持 string（缺省 project）和 {dir, source} 对象形式
+        //    支持 string（缺省 project）和 {dir, source} 对象形式；目录归一化/来源标注交由 MultiDirLoader
         const cwd = this.options.cwd ?? process.cwd()
-        for (const entry of this.options.skillDirs ?? []) {
-          const dirPath = typeof entry === 'string' ? entry : entry.dir
-          const sourceTag = typeof entry === 'string' ? 'project' : (entry.source ?? 'project')
-          const resolvedDir = resolve(cwd, dirPath)
-          if (!existsSync(resolvedDir)) continue
+        const skillLoader = new MultiDirLoader(
+          normalizeDirs(
+            (this.options.skillDirs ?? []).map((e): DirEntryInput =>
+              typeof e === 'string' ? e : { dir: e.dir, source: e.source as DirSource }),
+            'project',
+          ).map((e) => ({ dir: resolve(cwd, e.dir), source: e.source })),
+        )
+        for (const { dir, source } of skillLoader.dirs) {
           try {
-            await this.skillManager.load(resolvedDir, sourceTag)
+            await this.skillManager.load(dir, source)
           } catch (err) {
-            this.options.logger?.warn?.(`Skill 目录加载失败: ${resolvedDir} (source=${sourceTag}): ${(err as Error)?.message ?? err}`)
+            this.options.logger?.warn?.(`Skill 目录加载失败: ${dir} (source=${source}): ${(err as Error)?.message ?? err}`)
           }
         }
 

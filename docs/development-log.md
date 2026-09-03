@@ -1,5 +1,30 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 54）core 的 agents/skills 内部加载改用 MultiDirLoader（扫描逻辑收敛）
+
+> 承接续 52/53。把 core 装配 agentDirs/skillDirs 时手写的 `readdir + 来源标注 + join` 骨架也收敛到 workspace 的 `MultiDirLoader`，消除 core 与 cli 的重复扫描逻辑。
+
+### MultiDirLoader 扩展（@harness/workspace）
+
+* `DirItem` 新增 `kind: 'file' | 'dir'` 字段（由 `readdirSync({withFileTypes:true})` 的 `Dirent.isDirectory()` 判定）。
+* `MultiDirFilter` 新增 `kind?: 'file' | 'dir'` 过滤条件，支持「仅枚举文件/仅枚举目录」的消费方（如 agent 加载只处理 .md 文件）。
+
+### core 接入
+
+* **Agent 加载**：`agentLoader.scan({ kind: 'file', name: n => extname(n) === '.md' })` 枚举 .md 文件并逐项容错解析，替换手写 readdir 循环；来源仅用于日志（AgentDefinition 无 loadedFrom，覆盖由加载顺序保证）。
+* **Skill 加载**：`normalizeDirs(skillDirs, 'project')` 归一（兼容 string / {dir,source} 对象），遍历 `skillLoader.dirs` 调 `skillManager.load(dir, source)`，每目录失败仅 warn 不阻塞。
+* 删除 core 不再使用的 `existsSync`/`readdirSync` 相关手工枚举导入；`@harness/workspace` 依赖已在 package.json 注册。
+
+### 测试与验证
+
+* MultiDirLoader 新增 `kind 标注 + kind 过滤（仅文件/仅目录）` 用例（workspace 共 14 用例全过）。
+* core 新增「多级目录加载」集成套件 2 例：agentDirs user→project 同名覆盖 + 仅 user 保留；skillDirs 目录式/单文件式加载 + 同名 project 覆盖（core 共 33 用例全过）。
+* 全仓 20 包 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.4
+
 ## 2026-09-02（续 53）工作区管理（四）：薄壳插件 @harness/workspace-shell + /workspace 命令
 
 > 承接续 52。落实规划文档 §7.1/§7.3：用薄壳 AgentPlugin 把「解析好的 Workspace 布局」以 /workspace 命令展示在 REPL，业务能力经插件注入，不与 cli 主逻辑耦合。

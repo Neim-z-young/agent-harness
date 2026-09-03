@@ -74,6 +74,23 @@ describe('MultiDirLoader.scan 枚举 + 来源标注 + 覆盖顺序', () => {
       expect(items.every((it) => it.source === 'project')).toBe(true)
     } finally { cleanup(t) }
   })
+
+  it('kind 标注 + kind 过滤（仅文件 / 仅目录）', () => {
+    const t = makeTree('kind')
+    try {
+      mkdirSync(join(t.user, 'nested'), { recursive: true })
+      const all = new MultiDirLoader(dirsFromPair([t.user, t.project])).scan()
+      expect(all.find((it) => it.name === 'nested')?.kind).toBe('dir')
+      expect(all.find((it) => it.name === 'a-plugin.ts')?.kind).toBe('file')
+      // 仅文件
+      const files = new MultiDirLoader(dirsFromPair([t.user, t.project])).scan({ kind: 'file' })
+      expect(files.some((it) => it.name === 'nested')).toBe(false)
+      // 仅目录
+      const dirs = new MultiDirLoader(dirsFromPair([t.user, t.project])).scan({ kind: 'dir' })
+      expect(dirs.every((it) => it.kind === 'dir')).toBe(true)
+      expect(dirs.some((it) => it.name === 'nested')).toBe(true)
+    } finally { cleanup(t) }
+  })
 })
 
 describe('MultiDirLoader.collect 后覆盖先去重', () => {

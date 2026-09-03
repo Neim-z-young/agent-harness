@@ -9,7 +9,7 @@
  * `readdir + 来源(user/project) + join(dir, name)` 的手写重复；本模块不 import 任何业务。
  */
 
-import { readdirSync } from 'node:fs'
+import { readdirSync, type Dirent } from 'node:fs'
 import { join } from 'node:path'
 
 /** 目录来源标注（两级加载：user 全局 × project 项目，后者覆盖前者） */
@@ -27,6 +27,8 @@ export interface DirItem {
   source: DirSource
   /** 文件名 / 目录名 */
   name: string
+  /** 条目类型（dirent 判定，供「仅文件/仅目录」消费方过滤） */
+  kind: 'file' | 'dir'
   /** 绝对路径（join(dir, name)） */
   full: string
 }
@@ -35,6 +37,8 @@ export interface DirItem {
 export interface MultiDirFilter {
   /** 仅保留 name 满足谓词的项 */
   name?: (name: string) => boolean
+  /** 仅保留指定类型条目（如 agent 加载只处理文件） */
+  kind?: 'file' | 'dir'
 }
 
 /** 允许 source 可缺省的输入（字符串 → 缺省 source；对象 source 可省） */
@@ -78,15 +82,17 @@ export class MultiDirLoader {
   scan(filter?: MultiDirFilter): DirItem[] {
     const out: DirItem[] = []
     for (const { dir, source } of this.dirs) {
-      let names: string[] | undefined
+      let entries: Dirent[] | undefined
       try {
-        names = readdirSync(dir, { withFileTypes: true }).map((d) => d.name)
+        entries = readdirSync(dir, { withFileTypes: true })
       } catch {
         continue // 目录缺失 / 不可读 → 跳过，不阻塞整体
       }
-      for (const name of names) {
-        if (filter?.name && !filter.name(name)) continue
-        out.push({ source, name, full: join(dir, name) })
+      for (const d of entries) {
+        const kind: DirItem['kind'] = d.isDirectory() ? 'dir' : 'file'
+        if (filter?.kind && filter.kind !== kind) continue
+        if (filter?.name && !filter.name(d.name)) continue
+        out.push({ source, name: d.name, kind, full: join(dir, d.name) })
       }
     }
     return out
