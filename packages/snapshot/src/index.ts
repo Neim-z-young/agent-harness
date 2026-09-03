@@ -51,10 +51,20 @@ export interface FileDiff {
 /** 快照后端选择 */
 export type SnapshotBackend = 'auto' | 'git' | 'file'
 
+/** 一条快照历史记录（list() 返回，最新在前） */
+export interface SnapshotInfo {
+  /** 快照 ID */
+  id: SnapshotID
+  /** 创建时间戳（ms）；git 后端旧格式注册表可能缺失 */
+  timestamp?: number
+}
+
 /** 快照服务公共接口（两后端一致） */
 export interface SnapshotService {
   /** 快照当前文件系统状态，返回快照 ID；失败 best-effort 返回 undefined */
   capture(scope?: string): Promise<SnapshotID | undefined>
+  /** 快照历史（最新在前）；git 读 snapshot-ids.json，file 读 snapshots.json */
+  list(): Promise<SnapshotInfo[]>
   /** 两个快照间变更的项目相对路径 */
   files(from: SnapshotID, to: SnapshotID): Promise<string[]>
   /** 两个快照间的结构化 per-file diff */
@@ -407,18 +417,38 @@ export class GitSnapshotService implements SnapshotService {
     await this.mutex.run('tree', () => this.gcUnlocked())
   }
 
-  /** 快照 ID 注册表：记录已知快照，超上限淘汰最旧（对象由后续 git gc 清理） */
+  /** 快照历史：读 snapshot-ids.json（最新在前），时间戳缺失的旧记录显示 unknown */
+  async list(): Promise<SnapshotInfo[]> {
+    const records = await this.readSnapshotRecords()
+    return records
+      .map((r) => ({ id: r.id as SnapshotID, timestamp: r.ts || undefined }))
+      .reverse()
+  }
+
+  /** 快照 ID 注册表记录（含 ts）；旧版纯字符串数组自动迁移 */
+  private async readSnapshotRecords(): Promise<Array<{ id: string; ts: number }>> {
+    try {
+      const raw = JSON.parse(await readFile(this.snapshotIdsPath, 'utf-8')) as unknown
+      if (!Array.isArray(raw)) return []
+      if (raw.length > 0 && typeof raw[0] === 'string') {
+        // 旧格式：'' 数组 → 迁移，ts 未知
+        return (raw as string[]).map((id) => ({ id, ts: 0 }))
+      }
+      return (raw as Array<{ id?: unknown; ts?: unknown }>)
+        .filter((r) => r && typeof r.id === 'string')
+        .map((r) => ({ id: r.id as string, ts: typeof r.ts === 'number' ? r.ts : 0 }))
+    } catch {
+      return []
+    }
+  }
+
+  /** 快照 ID 注册表：记录已知快照（含 ts），超上限淘汰最旧（对象由后续 git gc 清理） */
   private async recordSnapshotId(id: SnapshotID): Promise<void> {
     try {
-      let ids: string[] = []
-      try {
-        ids = JSON.parse(await readFile(this.snapshotIdsPath, 'utf-8')) as string[]
-      } catch {
-        // 首次使用，无注册表
-      }
-      ids.push(id)
-      while (ids.length > this.maxSnapshots) ids.shift()
-      await writeFile(this.snapshotIdsPath, JSON.stringify(ids), 'utf-8')
+      const records = await this.readSnapshotRecords()
+      records.push({ id, ts: Date.now() })
+      while (records.length > this.maxSnapshots) records.shift()
+      await writeFile(this.snapshotIdsPath, JSON.stringify(records), 'utf-8')
 
       // 自动 gc：每 gcEvery 次 capture 触发一次（prune 掉无引用的旧对象）
       this.captureCount++
@@ -842,6 +872,12 @@ export class FileSnapshotService implements SnapshotService {
         }
       }
     })
+  }
+
+  /** 快照历史：读 snapshots.json 链（最新在前） */
+  async list(): Promise<SnapshotInfo[]> {
+    const chain = await this.loadChain()
+    return chain.snapshots.map((s) => ({ id: s.id, timestamp: s.timestamp })).reverse()
   }
 
   /** 列出两个快照间变更的项目相对路径 */

@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 59）快照管理命令扩展：list / diff / restore / checkout
+
+> 承接续 57/58，按用户需求「增加更多快照管理命令和回滚命令，如快照列表、内容 diff」，把 `/snapshot` 从只读信息命令扩成完整管理工具。
+
+### 服务层（@harness/snapshot）
+
+* `SnapshotService` 接口新增 `list(): Promise<SnapshotInfo[]>`，返回快照历史（最新在前）。
+* 新增 `SnapshotInfo` 类型（`id` + 可选 `timestamp`），两后端一致：
+  * `GitSnapshotService.list()` 读 `snapshot-ids.json`，旧版纯字符串数组自动迁移（ts=unknown）。
+  * `FileSnapshotService.list()` 读 `snapshots.json` 快照链。
+
+### 命令层（@harness/revert `createSnapshotPlugin`）
+
+* 新增子命令：
+  * `list`：列出快照历史（最新在前，含本地化时间戳；无快照给出捕获指引）。
+  * `diff <from> <to> [path]`：两快照间增量统计（新增/修改/删除 + 行数）；给 path 时附 unified 补丁。
+  * `restore <to> <path...>`：从快照 `<to>` 选择性恢复指定文件（目标快照中不存在则删除）。
+  * `checkout <to>`：整仓恢复到快照 `<to>`。
+* 对齐助手补全 `/snapshot` 帮助文本与 usage（统一缩进对齐）。
+
+### 测试
+
+* revert 新增 list（含时间戳 / 空快照）、diff（摘要 + 补丁 / 缺参 / 无差异）、restore（恢复映射 / 缺参）、checkout（成功 / 缺参）等 8 用例——revert 共 30 用例全过。
+* snapshot、cli 用例仍全过；全仓 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.3
+
 ## 2026-09-03（续 58）修复 config.json 快照配置未生效（兼容嵌套 harness.snapshot）
 
 > 承接续 57。用户按帮助提示在 `~/.harness/config.json` 写了 `"harness": { "snapshot": true }` 但未生效——续 57 代码只读顶层 `cfg.snapshot`，而现有 config 为扁平结构，本身并无 `harness` 包裹层，是帮助文字给了嵌套写法示例导致的错配。

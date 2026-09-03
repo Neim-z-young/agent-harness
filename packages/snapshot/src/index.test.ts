@@ -223,6 +223,26 @@ describe('SnapshotService', () => {
 })
 
 describe('§10.4 GitSnapshotService 增强（gc + 上限淘汰）', () => {
+  test('list 返回快照历史（最新在前，含 ts）；旧版字符串注册表自动迁移', async () => {
+    const { worktree, gitDir } = await makeEnv()
+    const svc = createSnapshotService({ worktree, gitDirectory: gitDir })
+    await writeFile(path.join(worktree, 'a.txt'), 'v1\n')
+    const id1 = (await svc.capture())!
+    await writeFile(path.join(worktree, 'a.txt'), 'v2\n')
+    const id2 = (await svc.capture())!
+
+    const list = await svc.list()
+    expect(list.map((s) => s.id)).toEqual([id2, id1]) // 最新在前
+    expect(list[0]!.timestamp).toBeTypeOf('number')
+
+    // 兼容旧格式：把注册表改回纯字符串数组，list 不抛错且给出 unknown 时间
+    const idsPath = path.join(gitDir, 'snapshot-ids.json')
+    await writeFile(idsPath, JSON.stringify([id2, id1]), 'utf-8')
+    const migrated = await svc.list()
+    expect(migrated.map((s) => s.id)).toEqual([id1, id2])
+    expect(migrated[0]!.timestamp).toBeUndefined()
+  })
+
   test('maxSnapshots 淘汰注册表最旧快照 ID', async () => {
     const { worktree, gitDir } = await makeEnv()
     const svc = createSnapshotService({ worktree, gitDirectory: gitDir, maxSnapshots: 2 })
@@ -258,6 +278,19 @@ describe('§10.4 GitSnapshotService 增强（gc + 上限淘汰）', () => {
 })
 
 describe('FileSnapshotService（§10.4 非 git fallback）', () => {
+  test('list 返回快照链（最新在前，含 ts）', async () => {
+    const { worktree, dataDir } = await makeEnv()
+    const svc = createSnapshotService({ worktree, dataDir, backend: 'file' })
+    await writeFile(path.join(worktree, 'a.txt'), 'v1\n')
+    const id1 = (await svc.capture())!
+    await writeFile(path.join(worktree, 'a.txt'), 'v2\n')
+    const id2 = (await svc.capture())!
+
+    const list = await svc.list()
+    expect(list.map((s) => s.id)).toEqual([id2, id1]) // 最新在前
+    expect(list[0]!.timestamp).toBeTypeOf('number')
+  })
+
   test('capture/files/diff/restore 全流程', async () => {
     const { worktree, dataDir } = await makeEnv()
     const svc = createSnapshotService({ worktree, dataDir, backend: 'file' })

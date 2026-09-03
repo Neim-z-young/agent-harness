@@ -394,8 +394,8 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
     'cli.commands'(input: CliCommandsInput) {
       input.commands.push({
         command: 'snapshot',
-        description: '文件快照信息：status/capture/files/help',
-        usage: '/snapshot [status|capture [scope]|files <from> <to>|help]',
+        description: '文件快照管理：status/list/capture/diff/restore/checkout/files/help',
+        usage: '/snapshot [status|list|capture [scope]|diff <from> <to>|<to> <path...>|checkout <to>|files <from> <to>|help]',
       })
     },
 
@@ -414,14 +414,30 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
           case 'help':
             inp.out(
               '用法：\n' +
-              '  /snapshot                查看快照启用状态\n' +
-              '  /snapshot status          同上\n' +
-              '  /snapshot capture [scope] 手动捕获当前文件系统快照（返回快照 ID）\n' +
-              '  /snapshot files <from> <to>  列出两个快照间的变更文件路径\n',
+              '  /snapshot                 查看快照启用状态\n' +
+              '  /snapshot status           同上\n' +
+              '  /snapshot list             列出快照历史（最新在前，含时间戳）\n' +
+              '  /snapshot capture [scope]  手动捕获当前文件系统快照（返回快照 ID）\n' +
+              '  /snapshot files <from> <to>    列出两个快照间的变更文件路径\n' +
+              '  /snapshot diff <from> <to> [path]   两个快照间的增量统计；给 path 时附 unified 补丁\n' +
+              '  /snapshot restore <to> <path...>    从快照 <to> 恢复指定文件（目标快照中不存在则删除）\n' +
+              '  /snapshot checkout <to>            整仓恢复到快照 <to>\n',
             )
             return
           case 'status': {
             inp.out('快照已启用。每轮 query 自动 capture 并挂载 meta.snapshot；可用 /revert 回滚文件变更。\n')
+            return
+          }
+          case 'list': {
+            const infos = await snapshot.list()
+            if (infos.length === 0) { inp.out('（暂无快照，/snapshot capture 或任意一轮 query 会自动捕获。）\n'); return }
+            const lines = infos.map((s) => {
+              const ts = s.timestamp
+                ? new Date(s.timestamp).toLocaleString('zh-CN', { hour12: false })
+                : 'unknown'
+              return `  ${s.id}\t${ts}`
+            })
+            inp.out(`快照（${infos.length}）：\n${lines.join('\n')}\n`)
             return
           }
           case 'capture': {
@@ -434,6 +450,30 @@ export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlug
             if (!from || !to) { inp.out('用法：/snapshot files <from> <to>\n'); return }
             const paths = await snapshot.files(from as SnapshotID, to as SnapshotID)
             inp.out(paths.length ? `变更文件（${paths.length}）：\n${paths.join('\n')}\n` : '（两个快照间无差异）\n')
+            return
+          }
+          case 'diff': {
+            const from = parts[2], to = parts[3], target = parts[4]
+            if (!from || !to) { inp.out('用法：/snapshot diff <from> <to> [path]\n'); return }
+            const diffs = await snapshot.diff(from as SnapshotID, to as SnapshotID, target ? { paths: [target] } : undefined)
+            const statusZh: Record<string, string> = { added: '新增', modified: '修改', deleted: '删除' }
+            const summary = diffs.map((d) => `  ${statusZh[d.status] ?? d.status}\t${d.path}\t+${d.additions}/-${d.deletions}`)
+            inp.out(summary.length ? `差异：\n${summary.join('\n')}\n` : '（两个快照间无差异）\n')
+            if (target && diffs[0]?.patch) inp.out(diffs[0].patch)
+            return
+          }
+          case 'restore': {
+            const to = parts[2], paths = parts.slice(3)
+            if (!to || paths.length === 0) { inp.out('用法：/snapshot restore <to> <path...>\n'); return }
+            await snapshot.restore(new Map(paths.map((p) => [p, to as SnapshotID])))
+            inp.out(`已从快照 ${to} 恢复 ${paths.length} 个文件：${paths.join(', ')}\n`)
+            return
+          }
+          case 'checkout': {
+            const to = parts[2]
+            if (!to) { inp.out('用法：/snapshot checkout <to>\n'); return }
+            await snapshot.checkout(to as SnapshotID)
+            inp.out(`已整仓恢复到快照 ${to}。\n`)
             return
           }
           default: {

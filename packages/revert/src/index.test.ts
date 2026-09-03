@@ -401,12 +401,26 @@ describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
     return {
       capture: async (scope?: string) => scope ? `snap-${scope}` : 'snap-a',
       files: async (from: string, to: string) => to === 'to2' ? ['a.ts', 'b.ts'] : [],
+      list: async () => [
+        { id: 'snap-c', timestamp: 2000 },
+        { id: 'snap-b', timestamp: 1000 },
+      ],
       diff: async () => [],
       preview: async () => [],
       restore: async () => {},
       checkout: async () => {},
       ...overrides,
     } as any
+  }
+
+  /** 构造输入并运行子命令，捕获输出 */
+  async function run(hooks: Hooks, raw: string, svc: unknown): Promise<string> {
+    const out: string[] = []
+    const input = cmdInput({ raw, snapshotService: svc })
+    input.out = (s) => void out.push(s)
+    await hooks['cli.command']!(input)
+    expect(input.result).toBe('continue')
+    return out.join('')
   }
 
   test('命中 snapshot 时注册命令定义（cli.commands）', async () => {
@@ -458,6 +472,78 @@ describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
     b.out = (s) => void outB.push(s)
     await hooks['cli.command']!(b)
     expect(outB.join('')).toInclude('用法')
+  })
+
+  test('list 子命令输出快照历史（最新在前，含时间戳）', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const out = await run(hooks, 'snapshot list', fakeSvc())
+    expect(out).toInclude('快照（2）')
+    expect(out).toInclude('snap-c')
+    expect(out).toInclude('snap-b')
+    // 时间戳渲染为本地时间串
+    expect(out).toInclude('1970')
+  })
+
+  test('list 无快照时提示捕获', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const out = await run(hooks, 'snapshot list', fakeSvc({ list: async () => [] }))
+    expect(out).toInclude('暂无快照')
+  })
+
+  test('diff 子命令输出统计摘要；带 path 时附补丁', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const svc = fakeSvc({
+      diff: async (from: string, to: string) => [
+        { path: 'a.ts', status: 'modified', additions: 2, deletions: 1, patch: '@@ -1 +1 @@\n-old\n+new\n' },
+      ],
+    })
+    const summary = await run(hooks, 'snapshot diff f1 to2', svc)
+    expect(summary).toInclude('修改')
+    expect(summary).toInclude('a.ts')
+    expect(summary).toInclude('+2/-1')
+
+    const withPatch = await run(hooks, 'snapshot diff f1 to2 a.ts', svc)
+    expect(withPatch).toInclude('@@ -1 +1 @@')
+  })
+
+  test('diff 缺参提示用法；无差异时提示', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    expect(await run(hooks, 'snapshot diff', fakeSvc())).toInclude('用法')
+    const noDiff = await run(hooks, 'snapshot diff f1 to2', fakeSvc({ diff: async () => [] }))
+    expect(noDiff).toInclude('无差异')
+  })
+
+  test('restore 子命令从快照恢复指定文件', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const restored: Map<string, string> = new Map()
+    const svc = fakeSvc({
+      restore: async (files: Map<string, string>) => {
+        for (const [p, to] of files) restored.set(p, to)
+      },
+    })
+    const out = await run(hooks, 'snapshot restore to2 a.ts b.ts', svc)
+    expect(out).toInclude('已从快照 to2 恢复 2 个文件')
+    expect(restored.get('a.ts')).toBe('to2')
+    expect(restored.get('b.ts')).toBe('to2')
+  })
+
+  test('restore 缺参提示用法', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    expect(await run(hooks, 'snapshot restore to2', fakeSvc())).toInclude('用法')
+  })
+
+  test('checkout 子命令整仓恢复', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const checked: string[] = []
+    const svc = fakeSvc({ checkout: async (id: string) => { checked.push(id) } })
+    const out = await run(hooks, 'snapshot checkout to2', svc)
+    expect(out).toInclude('已整仓恢复到快照 to2')
+    expect(checked).toEqual(['to2'])
+  })
+
+  test('checkout 缺参提示用法', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    expect(await run(hooks, 'snapshot checkout', fakeSvc())).toInclude('用法')
   })
 
   test('非 snapshot 命令不设 result', async () => {
