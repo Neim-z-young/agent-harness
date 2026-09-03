@@ -1,5 +1,29 @@
 # Agent Harness 开发日志
 
+## 2026-09-03（续 57）快照功能开启 + `/snapshot` 信息命令（方案 A+B+C）
+
+> 承接续 55/56 调研结论落地：A（CLI `--snapshot` flag）+ B（config.json `harness.snapshot` 持久化，优先级 CLI>config>默认 false）+ C（新增薄壳 `/snapshot` 命令）。
+
+### 开启快照（@harness/cli）
+
+* `CliArgs`/`parseCliArgs` 增加布尔 `--snapshot`；`HarnessConfig` 增加 `snapshot?: boolean`。
+* `main()` 解析 `args.snapshot ?? cfg.snapshot ?? false` 传入 `HarnessApp({ snapshot })`，覆盖 repl / run / resume 路径。
+* `HELP_TEXT` 增加 `--snapshot` 说明。
+
+### `/snapshot` 薄壳命令（@harness/revert）
+
+* 新增 `createSnapshotPlugin`（id=`snapshot-shell`）：`cli.commands` 注册 `/snapshot`；`cli.command` 处理 `status|capture [scope]|files <from> <to>|help`，只读/轻量操作。
+* 依赖 cli 注入的 `input.snapshotService`；未启用时给出开启指引（`--snapshot` / config.json），不抛错。cli `providerPlugins.push(createSnapshotPlugin())` 并将其登记（同 revert-shell）。
+
+### 测试与验证
+
+* revert 新增 `createSnapshotPlugin` 7 用例（命令注册 / 未启用提示 / 缺省 status / capture / files·缺参 / 非 snapshot 不设 result / 稳定 id）——revert 共 22 用例全过。
+* cli 新增 `--snapshot` 解析用例 + 4 条 `/snapshot` boot 集成用例（未启用提示 / status / files 缺参 / /help 包含）——cli 共 163 用例全过。全仓 typecheck 通过。
+
+### 相关文档
+
+* [docs/workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.3
+
 ## 2026-09-03（续 56）snapshot/revert 薄壳插件化：`createRevertPlugin`
 
 > 承接续 55，落实 workspace-management §7.3「预创建 + 薄壳」模式同样适用于 snapshot 插件化。把内联在 cli 的 `/revert` 命令抽成 `@harness/revert` 包内的薄壳 AgentPlugin，快照服务由 cli 预创建后经 cmdInput 注入，消灭 cli 内联回滚逻辑。

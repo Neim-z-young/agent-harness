@@ -83,6 +83,12 @@ describe('parseCliArgs 命令解析', () => {
     expect(a.dataDir).toBe('/x')
   })
 
+  it('--snapshot 布尔标记', () => {
+    expect(parseCliArgs(['--snapshot']).snapshot).toBe(true)
+    expect(parseCliArgs(['repl', '--snapshot', '-v'])).toMatchObject({ snapshot: true, verbose: true })
+    expect(parseCliArgs([]).snapshot).toBeUndefined()
+  })
+
   it('--model / -m 解析模型 ID', () => {
     expect(parseCliArgs(['repl', '--model', 'claude-3-5-sonnet']).model).toBe('claude-3-5-sonnet')
     expect(parseCliArgs(['run', 'hi', '-m=model-x']).model).toBe('model-x')
@@ -1482,6 +1488,34 @@ describe('/revert 命令', () => {
     const { app, harness, session, stdout, chunks } = await bootApp(true)
     await startRepl({ app, harness, session, stdout, scriptedStdin: ['/help', '/exit'] })
     expect(chunks.join('')).toInclude('/revert')
+    await app.shutdown()
+  })
+
+  it('未启用 snapshot 时 /snapshot 提示开启方式', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(false)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/snapshot', '/exit'] })
+    expect(chunks.join('')).toInclude('--snapshot')
+    await app.shutdown()
+  })
+
+  it('启用后 /snapshot 输出已启用状态', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/snapshot status', '/exit'] })
+    expect(chunks.join('')).toInclude('快照已启用')
+    await app.shutdown()
+  })
+
+  it('/snapshot files 缺参提示用法', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/snapshot files', '/exit'] })
+    expect(chunks.join('')).toInclude('用法')
+    await app.shutdown()
+  })
+
+  it('/help 列表包含 /snapshot', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp(true)
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/help', '/exit'] })
+    expect(chunks.join('')).toInclude('/snapshot')
     await app.shutdown()
   })
 })

@@ -17,6 +17,7 @@ import {
   collectSnapshotMap,
   createSessionRevert,
   createRevertPlugin,
+  createSnapshotPlugin,
   RevertError,
   RevertEvents,
 } from './index'
@@ -373,5 +374,100 @@ describe('createRevertPlugin · 薄壳 /revert 命令', () => {
 
   test('暴露稳定 id', () => {
     expect(createRevertPlugin().id).toBe('revert-shell')
+  })
+})
+
+describe('createSnapshotPlugin · 薄壳 /snapshot 命令', () => {
+  function cmdInput(partial: { raw?: string; snapshotService?: unknown } = {}): CliCommandInput & {
+    snapshotService?: unknown
+  } {
+    const raw = partial.raw ?? 'snapshot'
+    return {
+      raw,
+      command: raw.split(/\s+/)[0],
+      arg: raw.split(/\s+/, 2)[1] ?? '',
+      sessionId: 's1',
+      result: undefined,
+      out: () => {},
+      snapshotService: partial.snapshotService,
+    }
+  }
+
+  async function hooksOf(p: ReturnType<typeof createSnapshotPlugin>): Promise<Hooks> {
+    return (await (p.install as (ctx?: unknown) => Promise<Hooks | void>)(undefined))!
+  }
+
+  function fakeSvc(overrides: Record<string, unknown> = {}) {
+    return {
+      capture: async (scope?: string) => scope ? `snap-${scope}` : 'snap-a',
+      files: async (from: string, to: string) => to === 'to2' ? ['a.ts', 'b.ts'] : [],
+      diff: async () => [],
+      preview: async () => [],
+      restore: async () => {},
+      checkout: async () => {},
+      ...overrides,
+    } as any
+  }
+
+  test('命中 snapshot 时注册命令定义（cli.commands）', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const cmds: Array<{ command: string; description: string; usage?: string }> = []
+    await hooks['cli.commands']!({ commands: cmds })
+    expect(cmds.some((c) => c.command === 'snapshot')).toBe(true)
+  })
+
+  test('未配套 snapshot 时提示开启方式且设 result=continue', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const out: string[] = []
+    const input = cmdInput()
+    input.out = (s) => void out.push(s)
+    await hooks['cli.command']!(input)
+    expect(out.join('')).toInclude('--snapshot')
+    expect(input.result).toBe('continue')
+  })
+
+  test('缺省子命令输出 status（已启用）', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const out: string[] = []
+    const input = cmdInput({ snapshotService: fakeSvc() })
+    input.out = (s) => void out.push(s)
+    await hooks['cli.command']!(input)
+    expect(out.join('')).toInclude('快照已启用')
+    expect(input.result).toBe('continue')
+  })
+
+  test('capture 子命令输出快照 ID', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const out: string[] = []
+    const input = cmdInput({ raw: 'snapshot capture', snapshotService: fakeSvc() })
+    input.out = (s) => void out.push(s)
+    await hooks['cli.command']!(input)
+    expect(out.join('')).toInclude('已捕获快照：snap-a')
+  })
+
+  test('files 子命令列出变更路径；缺参提示用法', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const outA: string[] = []
+    const a = cmdInput({ raw: 'snapshot files f1 to2', snapshotService: fakeSvc() })
+    a.out = (s) => void outA.push(s)
+    await hooks['cli.command']!(a)
+    expect(outA.join('')).toInclude('a.ts')
+
+    const outB: string[] = []
+    const b = cmdInput({ raw: 'snapshot files f1', snapshotService: fakeSvc() })
+    b.out = (s) => void outB.push(s)
+    await hooks['cli.command']!(b)
+    expect(outB.join('')).toInclude('用法')
+  })
+
+  test('非 snapshot 命令不设 result', async () => {
+    const hooks = await hooksOf(createSnapshotPlugin())
+    const input = cmdInput({ raw: 'revert', snapshotService: fakeSvc() })
+    await hooks['cli.command']!(input)
+    expect(input.result).toBeUndefined()
+  })
+
+  test('暴露稳定 id', () => {
+    expect(createSnapshotPlugin().id).toBe('snapshot-shell')
   })
 })

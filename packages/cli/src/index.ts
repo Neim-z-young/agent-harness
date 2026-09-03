@@ -61,7 +61,7 @@ import {
   normalizeDirs,
   type Workspace,
 } from '@harness/workspace'
-import { createRevertPlugin } from '@harness/revert'
+import { createRevertPlugin, createSnapshotPlugin } from '@harness/revert'
 import { startTuiRepl } from './tui'
 import {
   emptyUsage,
@@ -108,6 +108,8 @@ export interface CliArgs {
   dataDir?: string
   permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   verbose?: boolean
+  /** 开启文件快照 + /revert 能力（cli 传入时覆盖 config.json 的 harness.snapshot） */
+  snapshot?: boolean
   /** 以 TUI（alt-screen 全屏）模式启动 REPL */
   tui?: boolean
   /** 仅校验 config.json 配置并打印概览后退出 */
@@ -154,6 +156,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     const a = args.shift()!
     if (a === '-h' || a === '--help') { out.showHelp = true; continue }
     if (a === '-v' || a === '--verbose') { out.verbose = true; continue }
+    if (a === '--snapshot') { out.snapshot = true; continue }
     if (a === '--tui') { out.tui = true; continue }
     if (a === '--check-config') { out.checkConfig = true; continue }
     const [k, v] = a.startsWith('--')
@@ -223,6 +226,8 @@ export interface HarnessConfig {
    * 由 `/tools` 等插件持久化；缺省 Agent 为 tools:['*']（全部），配置指定数组则收窄。
    */
   agents?: Array<{ id: string; tools: string[] }>
+  /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
+  snapshot?: boolean
 }
 
 /** 单个 Provider 定义（config.json 的 providers 数组元素）——复用 @harness/plugin 抽象层契约 */
@@ -1247,6 +1252,8 @@ export class HarnessApp {
     providerPlugins.push(createWorkspacePlugin())
     // 薄壳插件：/revert 文件快照回滚（依赖 cli 注入的 snapshotService 与 harness.session/bus，见 cmdInput）
     providerPlugins.push(createRevertPlugin())
+    // 薄壳插件：/snapshot 快照信息命令（依赖 cli 注入的 snapshotService，见 cmdInput）
+    providerPlugins.push(createSnapshotPlugin())
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
@@ -2089,6 +2096,7 @@ teammate 选项:
       --permission <mode>  allow-all / ask / deny-all（默认 ask）
   -v, --verbose            输出调试信息
       --tui                以 TUI（alt-screen 全屏）模式启动 REPL
+      --snapshot           开启文件快照 + /revert 能力（默认 false；可用 config.json harness.snapshot 常开）
       --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
 
 多 Provider（config.json → providers）:
@@ -2265,6 +2273,8 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   // 加载 config.json 并与 CLI 合并：CLI > config
   const cfg = await new ConfigStore<HarnessConfig>(ws).load()
   const { agentId, provider, model, anthropicApiKey } = resolveConfig(args, cfg)
+  // 快照优先级：CLI（--snapshot）> config.json（harness.snapshot）> 默认 false
+  const snapshot = args.snapshot ?? cfg.snapshot ?? false
 
   if (args.command === 'list-sessions') {
     const store = new SessionFileStore(ws)
@@ -2302,7 +2312,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     providers: cfg.providers,
     anthropicProviderConfig: anthropicApiKey ? { apiKey: anthropicApiKey } : undefined,
     sessionId: args.command === 'resume' ? args.arg ?? args.sessionId : args.sessionId,
-    permissionMode, verbose: args.verbose,
+    permissionMode, verbose: args.verbose, snapshot,
   })
   const { harness, session } = await app.boot()
 

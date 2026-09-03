@@ -370,3 +370,89 @@ export function createRevertPlugin(opts: RevertShellOptions = {}): AgentPlugin {
     },
   }
 }
+
+// ===== 薄壳插件：/snapshot 命令（cli.commands / cli.command） =====
+
+/** cli.command 输入 + cli 注入的 snapshot 服务（cli 装配时注入） */
+export interface SnapshotCmdInput extends CliCommandInput {
+  snapshotService?: SnapshotService
+}
+
+/** createSnapshotPlugin 入参 */
+export interface SnapshotShellOptions {
+  /** 注入的 snapshot 服务（缺省改读命令输入的 input.snapshotService） */
+  snapshotService?: SnapshotService
+}
+
+/**
+ * 薄壳 AgentPlugin：把 `/snapshot status|capture|files|help` 以 `cli.command` hook 提供。
+ * - 依赖 cli 注入的 `input.snapshotService`，只读/轻量操作，不持有任何装配逻辑。
+ * - 快照未启用时给出开启指引（`--snapshot` 或 config.json `harness.snapshot:true`），不抛错。
+ */
+export function createSnapshotPlugin(opts: SnapshotShellOptions = {}): AgentPlugin {
+  const hooks: Hooks = {
+    'cli.commands'(input: CliCommandsInput) {
+      input.commands.push({
+        command: 'snapshot',
+        description: '文件快照信息：status/capture/files/help',
+        usage: '/snapshot [status|capture [scope]|files <from> <to>|help]',
+      })
+    },
+
+    async 'cli.command'(input: CliCommandInput) {
+      if (input.command !== 'snapshot') return
+      const inp = input as SnapshotCmdInput
+      try {
+        const snapshot = inp.snapshotService ?? opts.snapshotService
+        if (!snapshot) {
+          inp.out('快照未启用：启动加 `--snapshot`，或 config.json 设 `"harness": { "snapshot": true }`。\n')
+          return
+        }
+        const parts = input.raw.trim().split(/\s+/)
+        const sub = parts[1] ?? 'status'
+        switch (sub) {
+          case 'help':
+            inp.out(
+              '用法：\n' +
+              '  /snapshot                查看快照启用状态\n' +
+              '  /snapshot status          同上\n' +
+              '  /snapshot capture [scope] 手动捕获当前文件系统快照（返回快照 ID）\n' +
+              '  /snapshot files <from> <to>  列出两个快照间的变更文件路径\n',
+            )
+            return
+          case 'status': {
+            inp.out('快照已启用。每轮 query 自动 capture 并挂载 meta.snapshot；可用 /revert 回滚文件变更。\n')
+            return
+          }
+          case 'capture': {
+            const id = await snapshot.capture(parts[2])
+            inp.out(id ? `已捕获快照：${id}\n` : '捕获失败（无可捕获变更或出错）。\n')
+            return
+          }
+          case 'files': {
+            const from = parts[2], to = parts[3]
+            if (!from || !to) { inp.out('用法：/snapshot files <from> <to>\n'); return }
+            const paths = await snapshot.files(from as SnapshotID, to as SnapshotID)
+            inp.out(paths.length ? `变更文件（${paths.length}）：\n${paths.join('\n')}\n` : '（两个快照间无差异）\n')
+            return
+          }
+          default: {
+            inp.out(`未知子命令：${sub}，输入 /snapshot help 查看用法。\n`)
+            return
+          }
+        }
+      } finally {
+        input.result = 'continue'
+      }
+    },
+  }
+
+  return {
+    id: 'snapshot-shell',
+    name: 'Snapshot Shell',
+    version: '0.1.0',
+    async install() {
+      return hooks
+    },
+  }
+}
