@@ -437,6 +437,93 @@ describe('code_semantic_edit replace_node 模式', () => {
   })
 })
 
+describe('code_semantic_edit replace_subtree 模式', () => {
+  const read = (p: string) => require('node:fs').readFileSync(join(dir, p), 'utf-8')
+
+  it('按成员链选择器替换全部匹配子表达式并落盘', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const h0 = config.server.host\nconst h1 = config.server.host * 2\nconfig.server.host = 9\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'a.ts', selector: 'config.server.host', replacement: 'config.host' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_subtree') throw new Error('expected replace_subtree')
+    expect(out.total).toBe(3)
+    const outText = read('a.ts')
+    expect(outText).toContain('const h0 = config.host')
+    expect(outText).toContain('const h1 = config.host * 2')
+    expect(outText).toContain('config.host = 9')
+  })
+
+  it('只匹配 topmost：更长链里的子链不误伤', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const x = a.b\nconst y = a.b.c\nconst z = a.b.c.d\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'a.ts', selector: 'a.b', replacement: 'm.n' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_subtree') throw new Error('expected replace_subtree')
+    expect(out.total).toBe(1) // 仅独立的 a.b
+    const outText = read('a.ts')
+    expect(outText).toContain('const x = m.n')
+    expect(outText).toContain('const y = a.b.c')
+    expect(outText).toContain('const z = a.b.c.d')
+  })
+
+  it('dryRun 不落盘，返回匹配列表与替换后预览', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const v = cfg.host\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'a.ts', selector: 'cfg.host', replacement: 'env.HOST', dryRun: true },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_subtree') throw new Error('expected replace_subtree')
+    expect(out.dryRun).toBe(true)
+    expect(out.matches.length).toBe(1)
+    expect(out.matches[0]!.text).toBe('cfg.host')
+    expect(out.preview).toContain('env.HOST')
+    expect(read('a.ts')).toContain('cfg.host') // 未落盘
+  })
+
+  it('非法选择器报 INVALID_SELECTOR（含下标）', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const v = arr[0]\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'a.ts', selector: 'arr[0]', replacement: 'x' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('INVALID_SELECTOR')
+  })
+
+  it('未找到子表达式报 SUBTREE_NOT_FOUND', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const v = other.path\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'a.ts', selector: 'cfg.host', replacement: 'x' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('SUBTREE_NOT_FOUND')
+  })
+
+  it('路径越界报 PATH_OUTSIDE_CWD', async () => {
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: '/etc/passwd', selector: 'x.y', replacement: '1' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+})
+
 describe('createCodeIntelPlugin', () => {
   it('装配注入四个代码情报工具', async () => {
     const plugin = createCodeIntelPlugin() as AgentPlugin

@@ -1,5 +1,20 @@
 # Agent Harness 开发日志
 
+## 2026-09-04（续 65）code-intel v2：code_semantic_edit 新增 replace_subtree（成员链子表达式替换）
+
+> 承接续 64。在 replace_node（行列范围吸附节点）基础上，补第三种结构编辑模式：按成员链路径（`config.server.host`）精确定位并替换子表达式。
+
+### replace_subtree
+
+* 输入：单目标文件 + 成员链选择器（`selector`，如 `config.server.host`，仅标识符/字符串属性，含下标按非法拒绝）+ replacement（空串=删除该子表达式）+ dryRun。
+* `memberChainText`：把 AST 节点还原成 `a.b.c` 文本（`MemberExpression`/`OptionalMemberExpression`/`Identifier`，computed 仅接受字符串字面量）。
+* `collectSubtreeMatches`：遍历 AST 收集 `chainText === selector` 的**topmost**节点——排除作为更长成员链 object 的匹配，避免 `a.b.c` 里误伤 `a.b`。
+* 从后向前替换每个精确 AST 范围，落盘前内存 `tryParse` 重解析校验结构（`EDIT_INVALID_STRUCTURE` 整体放弃）；dryRun 返回匹配列表（行/列/文本）与替换后预览；写盘后缓存失效。
+
+### 测试
+
+* code-intel 扩至 37 用例全过（全量替换/topmost 排除/dryRun/非法选择器/未找到/越界）；全仓 typecheck 通过。插件 version 0.4.0，meta 描述同步三种 edit 模式。
+
 ## 2026-09-04（续 64）code-intel v2：code_semantic_edit 新增 replace_node（按 AST 节点范围替换）
 
 > 承接续 63。先把上轮遗留的 workspace-management.md 表格空白清理提交（纯格式），再实现 replace_node。

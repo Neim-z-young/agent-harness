@@ -726,8 +726,24 @@ export interface CodeSemanticEditReplaceNodeInput {
   dryRun?: boolean
 }
 
+/** replace_subtree：按成员链路径（如 `config.server.host`）定位子表达式并替换 */
+export interface CodeSemanticEditReplaceSubtreeInput {
+  mode: 'replace_subtree'
+  /** 目标文件（必填；子树替换作用于单文件） */
+  path: string
+  /** 成员链选择器，如 `config.server.host`（仅标识符/字符串属性，不含下标） */
+  selector: string
+  /** 替换文本（可为空串=删除该子表达式） */
+  replacement: string
+  /** 仅预览（返回匹配列表与替换后内容，不落盘）；默认 false */
+  dryRun?: boolean
+}
+
 /** code_semantic_edit 输入（按 mode 区分的联合） */
-export type CodeSemanticEditInput = CodeSemanticEditRenameInput | CodeSemanticEditReplaceNodeInput
+export type CodeSemanticEditInput =
+  | CodeSemanticEditRenameInput
+  | CodeSemanticEditReplaceNodeInput
+  | CodeSemanticEditReplaceSubtreeInput
 
 /** rename：单个文件的重命名结果 */
 export interface RenameEditFile {
@@ -781,10 +797,39 @@ export interface CodeSemanticEditReplaceNodeOutput {
   preview: string
 }
 
+/** replace_subtree：单个匹配位置 */
+export interface CodeSemanticEditSubtreeMatch {
+  line: number
+  column: number
+  /** 原文本（content.slice 得） */
+  text: string
+}
+
+/** replace_subtree：输出 */
+export interface CodeSemanticEditReplaceSubtreeOutput {
+  mode: 'replace_subtree'
+  path: string
+  selector: string
+  replacement: string
+  dryRun: boolean
+  /** 落盘前重解析校验通过 */
+  validated: boolean
+  total: number
+  matches: CodeSemanticEditSubtreeMatch[]
+  /** 替换后的文件内容预览 */
+  preview: string
+}
+
 /** code_semantic_edit 输出（按 mode 区分的联合） */
-export type CodeSemanticEditOutput = CodeSemanticEditRenameOutput | CodeSemanticEditReplaceNodeOutput
+export type CodeSemanticEditOutput =
+  | CodeSemanticEditRenameOutput
+  | CodeSemanticEditReplaceNodeOutput
+  | CodeSemanticEditReplaceSubtreeOutput
 
 const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
+
+/** 成员链选择器：`a` / `a.b` / `a.b.c`（不含下标） */
+const SELECTOR_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(\.[A-Za-z_$][A-Za-z0-9_$]*)*$/
 
 /**
  * 结构感知编辑（v2）：按 mode 分发 rename / replace_node。
@@ -808,6 +853,7 @@ export const codeSemanticEditTool = (index: CodeIntelIndex): Tool<CodeSemanticEd
     async call(input, ctx): Promise<ToolResult<CodeSemanticEditOutput>> {
       if (input.mode === 'rename') return execRename(index, input, ctx)
       if (input.mode === 'replace_node') return execReplaceNode(index, input, ctx)
+      if (input.mode === 'replace_subtree') return execReplaceSubtree(index, input, ctx)
       return {
         ok: false,
         error: { message: `不支持的编辑模式: ${String((input as { mode?: string }).mode)}`, code: 'UNSUPPORTED_MODE' },
@@ -1023,6 +1069,124 @@ async function execReplaceNode(
   }
 }
 
+// ===== replace_subtree（按成员链路径替换子表达式）=====
+
+/** 把节点还原成成员链文本（`a.b.c`）；非纯成员链/含下标则返回 undefined */
+function memberChainText(node: t.Node): string | undefined {
+  const parts: string[] = []
+  let cur: t.Node = node
+  while (true) {
+    if (t.isIdentifier(cur)) {
+      parts.unshift(cur.name)
+      break
+    }
+    if (t.isMemberExpression(cur) || t.isOptionalMemberExpression(cur)) {
+      if (cur.computed) {
+        if (t.isStringLiteral(cur.property)) parts.unshift(cur.property.value)
+        else return undefined
+      } else if (t.isIdentifier(cur.property)) {
+        parts.unshift(cur.property.name)
+      } else return undefined
+      cur = cur.object
+      continue
+    }
+    return undefined
+  }
+  return parts.join('.')
+}
+
+/** 节点是否属于成员访问链（MemberExpression / OptionalMemberExpression） */
+function isMemberLike(n: t.Node | null | undefined): boolean {
+  if (!n) return false
+  return t.isMemberExpression(n) || t.isOptionalMemberExpression(n)
+}
+
+/**
+ * 收集文件的完整成员链子表达式（`chainText === selector`）：
+ * - 仅匹配"topmost"：作为更长成员链 object 的节点不单独匹配，避免 `a.b` 误伤 `a.b.c` 里的 `a.b`；
+ * - 排除祖先仍是同一链的子节点（避开 `.property`/`.object` 标识符）。
+ */
+function collectSubtreeMatches(ast: t.File, selector: string): RangedNode[] {
+  const out: RangedNode[] = []
+  traverse(ast, {
+    enter(p) {
+      const raw = p.node as unknown
+      if (typeof (raw as RangedNode).start !== 'number' || typeof (raw as RangedNode).end !== 'number') return
+      const node = raw as RangedNode
+      if (node.start === node.end) return
+      if (memberChainText(node) !== selector) return
+      const parent = p.parentPath?.node
+      // 该节点是更长的成员链的 object → 不是 topmost 匹配（由外层节点整体处理）
+      if (isMemberLike(parent) && (parent as { object: unknown }).object === node) return
+      out.push(node)
+    },
+  })
+  return out
+}
+
+async function execReplaceSubtree(
+  index: CodeIntelIndex,
+  input: CodeSemanticEditReplaceSubtreeInput,
+  ctx: ToolContext,
+): Promise<ToolResult<CodeSemanticEditReplaceSubtreeOutput>> {
+  const absPath = resolvePath(input.path, ctx.cwd)
+  if (!isWithinCwd(absPath, ctx.cwd)) {
+    return { ok: false, error: { message: `路径 "${input.path}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
+  }
+  const selector = input.selector.trim()
+  if (!SELECTOR_RE.test(selector)) {
+    return { ok: false, error: { message: `选择器 "${input.selector}" 不是合法成员链（期望如 config.server.host）`, code: 'INVALID_SELECTOR' } }
+  }
+  try {
+    const content = await readFile(absPath, 'utf-8')
+    const ast = tryParse(content, absPath)
+    if (!ast) {
+      return { ok: false, error: { message: `无法解析文件 ${relative(ctx.cwd, absPath)}（AST 解析失败）`, code: 'PARSE_ERROR' } }
+    }
+    const matches = collectSubtreeMatches(ast, selector)
+    if (matches.length === 0) {
+      return { ok: false, error: { message: `未找到子表达式 "${selector}"`, code: 'SUBTREE_NOT_FOUND' } }
+    }
+    const starts = buildLineStarts(content)
+    const matchInfo: CodeSemanticEditSubtreeMatch[] = matches.map((m) => {
+      const line = offsetToLine(starts, m.start)
+      return {
+        line,
+        column: m.start - starts[line - 1] + 1,
+        text: content.slice(m.start, m.end),
+      }
+    })
+    let out = content
+    for (let i = matches.length - 1; i >= 0; i--) {
+      const m = matches[i]
+      out = out.slice(0, m.start) + input.replacement + out.slice(m.end)
+    }
+    if (!tryParse(out, absPath)) {
+      return { ok: false, error: { message: '替换后结构校验失败，已放弃（未落盘）', code: 'EDIT_INVALID_STRUCTURE' } }
+    }
+    const output: CodeSemanticEditReplaceSubtreeOutput = {
+      mode: 'replace_subtree',
+      path: absPath,
+      selector,
+      replacement: input.replacement,
+      dryRun: input.dryRun ?? false,
+      validated: true,
+      total: matches.length,
+      matches: matchInfo,
+      preview: out,
+    }
+    if (input.dryRun) return { ok: true, output }
+    await writeFile(absPath, out)
+    index.invalidate(absPath)
+    return { ok: true, output }
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      return { ok: false, error: { message: `路径不存在: ${input.path}`, code: 'PATH_NOT_FOUND' } }
+    }
+    return { ok: false, error: { message: err.message ?? String(err), code: 'CODE_INTEL_ERROR' } }
+  }
+}
+
 // ========================================================================
 // 5. AgentPlugin 入口
 // ========================================================================
@@ -1047,9 +1211,9 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
 
   return {
     id: 'code-intel',
-    version: '0.3.0',
+    version: '0.4.0',
     name: '代码情报',
-    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit(rename|replace_node)（AST 符号索引与结构感知编辑）',
+    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit(rename|replace_node|replace_subtree)（AST 符号索引与结构感知编辑）',
     async install(ctx) {
       ctx.log.info('code-intel 插件已加载', { tools: tools.map((t) => t.id) })
       return {

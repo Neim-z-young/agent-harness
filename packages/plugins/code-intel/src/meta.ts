@@ -36,7 +36,7 @@ export const CODE_INTEL_TOOL_META: BuiltinToolMeta[] = [
   },
   {
     id: 'code_semantic_edit',
-    description: '结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）。落盘前重解析校验结构，dryRun 预览。',
+    description: '结构感知编辑：rename / replace_node（行列圈选吸附节点）/ replace_subtree（成员链如 config.server.host 精确定位子表达式）。落盘前重解析校验结构，dryRun 预览。',
     isReadOnly: false,
     isConcurrencySafe: false,
     permissionKey: 'edit',

@@ -1,7 +1,7 @@
 {
   "name": "@harness/code-intel",
-  "version": "0.1.0",
-  "description": "代码情报插件：code_symbols / code_reference / code_definition（AST 符号索引）",
+  "version": "0.4.0",
+  "description": "代码情报插件：code_symbols / code_reference / code_definition + code_semantic_edit（rename/replace_node/replace_subtree）",
   "type": "module",
   "exports": {
     ".": {
