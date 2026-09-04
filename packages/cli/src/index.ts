@@ -432,6 +432,15 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       load: async () => (await lazyImport<{ toolsMediaPlugin: AgentPlugin }>('@harness/tools-media')).toolsMediaPlugin,
       metaSource: lazyToolMetaSource('@harness/tools-media/meta'),
     })
+    // code-intel：代码情报（AST 符号索引），工具经 tool.pool.assemble 注入，后台预加载即开箱即用。
+    defaultBuiltinRegistry.register({
+      id: 'code-intel',
+      name: 'Code Intel',
+      description: '代码情报插件：code_symbols / code_reference / code_definition（AST 符号索引）',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ codeIntelPlugin: AgentPlugin }>('@harness/code-intel')).codeIntelPlugin,
+      metaSource: lazyToolMetaSource('@harness/code-intel/meta'),
+    })
     // computer-use：进程内 MCP server，工具经 mcp-client 连接后才可用。仅携带 metaSource
     // （/tools 可提前展示 mcp__computer-use__* 元信息），metaOnly=true 使其不被后台预加载实例化。
     defaultBuiltinRegistry.register({

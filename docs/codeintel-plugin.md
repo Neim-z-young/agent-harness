@@ -1,6 +1,6 @@
 # codeintel 插件开发规划（`@harness/code-intel`）
 
-> 状态：规划（待实现）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
+> 状态：**v1 已实现**（2026-09-04，见开发日志续 62）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
 
 ## 1. 定位与目标
 
@@ -18,9 +18,9 @@
 
 ## 3. 技术选型
 
-- **AST**：推荐 `web-tree-sitter`（语言无关、多语言 grammar、该层唯一允许引入 AST 的位置）；纯 TS 域可退化为 `@babel/parser` 起步。
-- **符号索引**：v1 内存内 + 按需增量（parse 目标文件/目录）；不做持久化全文索引（呼应 §5.5），性能瓶颈再演进。
-- **grammar 加载**：按需加载 TS/TSX grammar，忽略目录由配置传入。
+- **AST**：规划推荐 `web-tree-sitter`；v1 按「纯 TS 域可退化 @babel/parser 起步」落地为 **`@babel/parser` + `@babel/traverse`**（纯 JS、同步、可单测，支持 TS/TSX/JS/JSX + decorators 等插件集）。多语言 grammar 后续换 web-tree-sitter 不影响工具/插件契约。
+- **符号索引**：v1 内存内 + 按需增量（parse 目标文件/目录，缓存按 mtime+size 失效）；不做持久化全文索引（呼应 §5.5），性能瓶颈再演进。
+- **grammar 加载**：v1 无外部 grammar 文件；解析失败多配置回退（TS 加 jsx 宽容、纯 JS 兼容 TS 语法），单文件失败跳过不中断目录索引。忽略目录由插件配置传入。
 
 ## 4. 注入工具（`tool.pool.assemble`）
 
@@ -49,12 +49,12 @@
 
 ## 7. 实施步骤
 
-1. 建包，注册 paths/deps，`bun install`；引入 web-tree-sitter + TS/TSX grammar。
-2. 实现索引核心（parse → symbols/references/definition 查询）。
-3. 注入 `code_symbols` / `code_reference` / `code_definition` + 单元测试（`index.test.ts`）。
-4. cli 装配：config 或 internal 加载该插件（对齐 tools-builtin 的 `internalPlugins`/插件清单）。
-5. （v2）`code_semantic_edit` 结构感知编辑。
-6. 全量 `typecheck` + `test`（跑测试补 `PATH=/bin:/usr/bin`）；更新 development-log。
+1. ✅ 建包，注册 paths/deps，`bun install`；v1 引入 @babel/parser + @babel/traverse。
+2. ✅ 实现索引核心 `CodeIntelIndex`（parse → symbols/references/definition 查询，mtime/size 缓存）。
+3. ✅ 注入 `code_symbols` / `code_reference` / `code_definition` + 单元测试（17 用例）。
+4. ✅ cli 装配：登记进 `getBuiltinRegistry()`（`code-intel`，惰性 load + metaSource），后台预加载开箱即用。
+5. ⏳（v2）`code_semantic_edit` 结构感知编辑。
+6. ✅ 全量 `typecheck` + `test`（code-intel 17、cli 163 全过）；更新 development-log（续 62）。
 
 ## 8. 相关文档
 

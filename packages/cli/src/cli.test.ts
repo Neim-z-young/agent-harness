@@ -1501,7 +1501,7 @@ describe('/revert 命令', () => {
   it('启用后 /snapshot 输出已启用状态', async () => {
     const { app, harness, session, stdout, chunks } = await bootApp(true)
     await startRepl({ app, harness, session, stdout, scriptedStdin: ['/snapshot status', '/exit'] })
-    expect(chunks.join('')).toInclude('快照已启用')
+    expect(chunks.join('')).toInclude('状态：已启用')
     await app.shutdown()
   })
 

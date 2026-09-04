@@ -1,5 +1,31 @@
 # Agent Harness 开发日志
 
+## 2026-09-04（续 62）实现 code-intel 插件（`@harness/code-intel`）
+
+> 落地 [codeintel-plugin.md](codeintel-plugin.md) 规划的 v1：代码情报（AST 符号索引）插件化。
+
+### 技术选型
+
+* 按规划 §3「纯 TS 域可退化为 @babel/parser 起步」选用 **`@babel/parser` + `@babel/traverse`**（纯 JS、同步、可单测），支持 TS/TSX/JS/JSX；多语言 web-tree-sitter 留作后续演进，不改工具/插件契约。
+* 索引为**内存内 + 按需增量**：parse 目标文件/目录，缓存按 mtime+size 失效；解析失败多配置回退（TS 加 jsx、纯 JS 兼容 TS 语法），单文件失败跳过不中断目录索引。
+
+### 新包 `packages/plugins/code-intel`
+
+* `CodeIntelIndex`：`symbols`/`allReferences`/`allDefinitions` 查询；`ignoreDirs`（默认 .git/node_modules/dist 等）、`maxFiles`(500)、`maxDepth`(8) 可配。
+* 三个只读工具（`isReadOnly`+`isConcurrencySafe`+`permission.key='read'`）：
+  * `code_symbols`：列文件/目录符号（函数/类/变量/接口/类型/枚举/导入），含位置、签名、exported。
+  * `code_reference`：查某符号引用（跨文件，行/列 + 上下文）。
+  * `code_definition`：go-to-definition（声明位置，排除 import 绑定）。
+* `meta.ts`（L1 静态元信息）自包含，供 `/tools` 提前展示。
+
+### 装配
+
+* 根 `tsconfig.json` 注册 `@harness/code-intel`（含 `/meta` 子路径）；cli `getBuiltinRegistry()` 登记 `code-intel`（惰性 load + metaSource），boot 后台预加载即开箱即用，烟测通过（注入三工具）。
+
+### 测试
+
+* code-intel 17 用例全过（符号提取/缓存/三工具/越界/插件装配/meta）；cli 163 用例全过（其中 1 例 `/snapshot status` 断言随续 60 输出变更同步更新）；全仓 typecheck 通过。
+
 ## 2026-09-03（续 61）文档：整理 /snapshot 命令清单与多工作区快照隔离说明
 
 > 承接续 59/60，把快照命令与隔离设计沉淀进 [workspace-management.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/workspace-management.md) §7.3。
