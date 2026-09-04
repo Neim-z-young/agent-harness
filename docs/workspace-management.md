@@ -142,13 +142,13 @@ Provider：config.json → providers（显式多 Provider） + 默认 Provider �
 
 薄壳插件 `createSnapshotPlugin`（id=`snapshot-shell`）依赖 cli 注入的 `input.snapshotService`，覆盖完整管理闭环：
 
-| 类别     | 子命令                                                    | 服务端 `SnapshotService` |
-| ------ | ------------------------------------------------------- | --------------------- |
-| 查询     | `status` / `list` / `files <from> <to>` / `diff <from> <to> [path]` | `list` / `files` / `diff` |
-| 捕获     | `capture [scope]`                                         | `capture`             |
-| 预览     | `preview <to> <path...>`                                  | `preview`             |
-| 回滚     | `restore <to> <path...>` / `checkout <to>`                 | `restore` / `checkout` |
-| 维护     | `gc`                                                     | `gc`                  |
+| 类别 | 子命令                                                                 | 服务端 `SnapshotService`     |
+| -- | ------------------------------------------------------------------- | ------------------------- |
+| 查询 | `status` / `list` / `files <from> <to>` / `diff <from> <to> [path]` | `list` / `files` / `diff` |
+| 捕获 | `capture [scope]`                                                   | `capture`                 |
+| 预览 | `preview <to> <path...>`                                            | `preview`                 |
+| 回滚 | `restore <to> <path...>` / `checkout <to>`                          | `restore` / `checkout`    |
+| 维护 | `gc`                                                                | `gc`                      |
 
 `status` 输出启用状态、后端（git/file）、快照数、最新快照 ID 与捕获时间（基于服务暴露的自省字段 `backend`/`enabled` + `list()`）。回滚命令复用同包 `createSessionRevert` 三态控制器（见续 56）。
 
@@ -157,6 +157,7 @@ Provider：config.json → providers（显式多 Provider） + 默认 Provider �
 快照存储目录**默认即按 worktree 派生**，天然隔离多工作区（不必显式传 `gitDirectory`/`dataDir`）：
 
 * git 后端：`~/.harness/snapshots/{sha256(worktree)[0:16]}`（独立 git 仓库，位于 worktree 之外，避免污染用户项目 `.git` 与快照自扫描）；
+
 * file 后端：`~/.harness/file-snapshots/{sha256(worktree)[0:16]}`（备份文件 + `snapshots.json` 快照链）。
 
 因此每个工作区各持一份独立快照链与对象库，`/snapshot list`/`restore` 只作用于当前工作区。需要显式隔离（如同一 worktree 多实例、自选存储根）时，可经 `SnapshotOptions.gitDirectory`/`dataDir` 覆盖；将来若需跨工作区共享快照（如全局 undo），可在 `createSnapshotService` 之外再加一层按 `workspace` 解析存储根的 provider，不必改两后端。
