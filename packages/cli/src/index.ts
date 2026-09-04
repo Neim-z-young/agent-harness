@@ -432,11 +432,11 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       load: async () => (await lazyImport<{ toolsMediaPlugin: AgentPlugin }>('@harness/tools-media')).toolsMediaPlugin,
       metaSource: lazyToolMetaSource('@harness/tools-media/meta'),
     })
-    // code-intel：代码情报（AST 符号索引），工具经 tool.pool.assemble 注入，后台预加载即开箱即用。
+    // code-intel：代码情报（AST 符号索引 + 结构感知编辑），工具经 tool.pool.assemble 注入，后台预加载即开箱即用。
     defaultBuiltinRegistry.register({
       id: 'code-intel',
       name: 'Code Intel',
-      description: '代码情报插件：code_symbols / code_reference / code_definition（AST 符号索引）',
+      description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit（AST 符号索引与结构感知编辑）',
       source: 'builtin',
       load: async () => (await lazyImport<{ codeIntelPlugin: AgentPlugin }>('@harness/code-intel')).codeIntelPlugin,
       metaSource: lazyToolMetaSource('@harness/code-intel/meta'),

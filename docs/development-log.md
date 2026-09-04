@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-09-04（续 63）code-intel v2：code_semantic_edit 结构感知编辑（符号重命名）
+
+> 承接续 62，落地 codeintel-plugin.md §4 的 v2 项：结构感知编辑。
+
+### 新增 `code_semantic_edit` 工具（mode=rename）
+
+* 仅替换**精确的 AST 标识符 token 范围**（声明 + 引用 + import 源名），字符串/注释中的同名文本与 `obj.x` 属性访问一律不触碰——"编辑前校验隔离性"的结构保证。
+* 位点收集 `collectRenameSites`：函数/类/变量/接口/类型/枚举声明、import 本地绑定与源名（`import { X as Y }`）、export 说明符本地名、ReferencedIdentifier（含对象简写）；按字符范围去重、偏移转行号。
+* **编辑前校验**：全部文件先在内存中完成变换并 `tryParse` 重解析，任一失败整体放弃、不落盘（`EDIT_INVALID_STRUCTURE`）；`dryRun` 预览计划位点；写盘后 `index.invalidate` 使缓存失效。
+* 安全声明：`isReadOnly=false`、`isConcurrencySafe=false`、`permission.key='edit'`（对齐 tools-builtin 写工具约定）。
+* `CodeIntelIndex` 新增 `collectRenameSitesFromScope`（复用目录发现）与 `invalidate`。
+
+### 装配与元信息
+
+* `createCodeIntelPlugin` 注入 4 个工具（version 0.2.0）；`meta.ts` 增 `code_semantic_edit`（只读=false/非并发/edit）；cli `BuiltinPluginRegistry` 描述同步。
+
+### 测试
+
+* code-intel 扩至 24 用例全过（跨文件重命名隔离性/dryRun/对象简写/非法标识符/符号不存在/越界/安全声明/meta）；cli 163 全过；全仓 typecheck 通过。烟测验证：`greet`→`salute` 三处（声明/import/引用）更新，`"greet"` 字符串与 `obj.greet` 未动。
+
 ## 2026-09-04（续 62）实现 code-intel 插件（`@harness/code-intel`）
 
 > 落地 [codeintel-plugin.md](codeintel-plugin.md) 规划的 v1：代码情报（AST 符号索引）插件化。

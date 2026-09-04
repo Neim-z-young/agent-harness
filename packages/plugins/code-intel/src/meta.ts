@@ -34,11 +34,18 @@ export const CODE_INTEL_TOOL_META: BuiltinToolMeta[] = [
     isConcurrencySafe: true,
     permissionKey: 'read',
   },
+  {
+    id: 'code_semantic_edit',
+    description: '结构感知编辑：符号重命名（rename）。只改精确的 AST 标识符位点（声明/引用/import 源名），字符串与 obj.x 属性不触碰；落盘前重解析校验结构，dryRun 可预览。',
+    isReadOnly: false,
+    isConcurrencySafe: false,
+    permissionKey: 'edit',
+  },
 ]
 
 /** 代码情报工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
 export const toolMetaSource: ToolMetaSource = {
   id: 'code-intel',
-  description: '代码情报插件：code_symbols / code_reference / code_definition（AST 符号索引）',
+  description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit（AST 符号索引与结构感知编辑）',
   list: () => CODE_INTEL_TOOL_META,
 }

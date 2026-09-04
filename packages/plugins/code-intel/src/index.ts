@@ -30,7 +30,7 @@ import * as t from '@babel/types'
 import { defineTool, Schema, Tool, ToolResult } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
-import { stat, readFile, readdir } from 'node:fs/promises'
+import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
 import { extname, isAbsolute, join, relative, resolve } from 'node:path'
 
 // ===== 数据类型 =====
@@ -243,6 +243,104 @@ function extractReferences(
   return refs
 }
 
+// ===== 结构感知编辑（v2）：符号重命名 =====
+
+/** 一个可重命名的 AST 标识符位点（精确 token 范围，保证隔离性：绝不触碰子串/属性） */
+export interface RenameSite {
+  /** 字符偏移（含） */
+  start: number
+  /** 字符偏移（不含） */
+  end: number
+  /** 角色：声明 / 引用 / 导入源名 */
+  role: 'decl' | 'ref' | 'imported'
+  /** 1-based 行 */
+  line: number
+}
+
+/** 字符偏移 → 1-based 行（lineStarts 为每行起始偏移，含第 0 行 0） */
+function offsetToLine(lineStarts: number[], offset: number): number {
+  let lo = 0
+  let hi = lineStarts.length - 1
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (lineStarts[mid] <= offset) lo = mid
+    else hi = mid - 1
+  }
+  return lo + 1
+}
+
+function buildLineStarts(content: string): number[] {
+  const starts = [0]
+  for (let i = 0; i < content.length; i++) {
+    if (content[i] === '\n') starts.push(i + 1)
+  }
+  return starts
+}
+
+/**
+ * 收集符号重命名位点：
+ * - 声明标识符（函数/类/变量/接口/类型/枚举 + import 本地绑定）
+ * - import 源名（`import { X as Y }` 的 X；未别名时与本地绑定同范围，按范围去重）
+ * - 引用标识符（ReferencedIdentifier，含 export 说明符本地名、对象简写）
+ *
+ * 仅替换精确的 AST 标识符 token 范围——字符串/注释里的同名文本、`obj.x` 属性访问一律不触碰，
+ * 这是"编辑前校验隔离性"的结构保证。
+ */
+function collectRenameSites(ast: t.File, content: string, name: string): RenameSite[] {
+  const lineStarts = buildLineStarts(content)
+  const sites = new Map<string, RenameSite>()
+  const add = (start: number, end: number, role: RenameSite['role']): void => {
+    const key = `${start}:${end}`
+    if (!sites.has(key)) sites.set(key, { start, end, role, line: offsetToLine(lineStarts, start) })
+  }
+  const addDecl = (id: t.Identifier | null | undefined): void => {
+    if (id && id.name === name) add(id.start!, id.end!, 'decl')
+  }
+
+  traverse(ast, {
+    FunctionDeclaration(path) {
+      addDecl(path.node.id)
+    },
+    ClassDeclaration(path) {
+      addDecl(path.node.id)
+    },
+    TSInterfaceDeclaration(path) {
+      addDecl(path.node.id)
+    },
+    TSTypeAliasDeclaration(path) {
+      addDecl(path.node.id)
+    },
+    TSEnumDeclaration(path) {
+      addDecl(path.node.id)
+    },
+    VariableDeclarator(path) {
+      if (t.isIdentifier(path.node.id)) addDecl(path.node.id)
+    },
+    ImportSpecifier(path) {
+      addDecl(path.node.local)
+      const imported = path.node.imported
+      if (t.isIdentifier(imported) && imported.name === name) {
+        add(imported.start!, imported.end!, 'imported')
+      }
+    },
+    ImportDefaultSpecifier(path) {
+      addDecl(path.node.local)
+    },
+    ImportNamespaceSpecifier(path) {
+      addDecl(path.node.local)
+    },
+    ExportSpecifier(path) {
+      if (t.isIdentifier(path.node.local) && path.node.local.name === name) {
+        add(path.node.local.start!, path.node.local.end!, 'ref')
+      }
+    },
+    ReferencedIdentifier(path) {
+      if (path.node.name === name) add(path.node.start!, path.node.end!, 'ref')
+    },
+  })
+  return [...sites.values()].sort((a, b) => a.start - b.start)
+}
+
 interface CachedFile {
   stat: { mtimeMs: number; size: number }
   data: IndexedFile
@@ -375,6 +473,29 @@ export class CodeIntelIndex {
       }
     }
     return out
+  }
+
+  /** 使某文件的索引缓存失效（内容变更后调用，强制下次重新解析） */
+  invalidate(absPath: string): void {
+    this.cache.delete(absPath)
+  }
+
+  /** 收集目标范围内某符号的精确重命名位点（AST 标识符 token，逐文件） */
+  async collectRenameSitesFromScope(
+    target: string,
+    relBase: string,
+    name: string,
+  ): Promise<Map<string, RenameSite[]>> {
+    const { files } = await this.load(target, relBase)
+    const byFile = new Map<string, RenameSite[]>()
+    for (const f of files) {
+      const content = await readFile(f.path, 'utf-8')
+      const ast = tryParse(content, f.path)
+      if (!ast) continue
+      const sites = collectRenameSites(ast, content, name)
+      if (sites.length) byFile.set(f.path, sites)
+    }
+    return byFile
   }
 }
 
@@ -570,7 +691,143 @@ export const codeDefinitionTool = (index: CodeIntelIndex): Tool<CodeDefinitionIn
   })
 
 // ========================================================================
-// 4. AgentPlugin 入口
+// 4. code_semantic_edit 工具（v2，结构感知编辑）
+// ========================================================================
+
+export interface CodeSemanticEditInput {
+  /** 编辑模式：rename（符号重命名） */
+  mode: 'rename'
+  /** 要重命名的符号名 */
+  symbol: string
+  /** 新符号名（须为合法标识符） */
+  to: string
+  /** 扫描根目录/文件（缺省当前工作目录） */
+  path?: string
+  /** 仅预览（返回计划位点，不落盘）；默认 false */
+  dryRun?: boolean
+}
+
+export interface CodeSemanticEditFile {
+  file: string
+  relativePath: string
+  /** 该文件中替换的标识符数 */
+  count: number
+  sites: RenameSite[]
+}
+
+export interface CodeSemanticEditOutput {
+  mode: 'rename'
+  symbol: string
+  to: string
+  path: string
+  dryRun: boolean
+  /** 已通过"编辑前校验隔离性"：全部文件内存中变换后重解析通过 */
+  validated: boolean
+  total: number
+  files: CodeSemanticEditFile[]
+}
+
+const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
+
+/**
+ * 结构感知编辑（v2）：符号重命名。
+ *
+ * 隔离性保证（"编辑前校验隔离性"）：
+ * 1. 仅替换 AST 标识符 token 的精确范围（声明 + 引用 + import 源名），
+ *    字符串/注释中的同名文本、`obj.x` 属性访问绝不触碰；
+ * 2. 所有文件先在内存中完成变换并重解析校验结构完整性，任一失败则整体放弃、不落盘；
+ * 3. dryRun 可预览计划位点。
+ *
+ * 写操作：isReadOnly=false、isConcurrencySafe=false、permission.key='edit'。
+ */
+export const codeSemanticEditTool = (index: CodeIntelIndex): Tool<CodeSemanticEditInput, CodeSemanticEditOutput> =>
+  defineTool<CodeSemanticEditInput, CodeSemanticEditOutput>({
+    id: 'code_semantic_edit',
+    description: '结构感知编辑：符号重命名（rename）。只改精确的 AST 标识符位点（声明/引用/import 源名），字符串与 obj.x 属性不触碰；落盘前重解析校验结构，dryRun 可预览。',
+    inputSchema: makeSchema<CodeSemanticEditInput>(),
+    isReadOnly: () => false,
+    isConcurrencySafe: () => false,
+    permission: {
+      key: 'edit',
+      extractPatterns: (input) => [input.path ?? '.'],
+    },
+    async call(input, ctx): Promise<ToolResult<CodeSemanticEditOutput>> {
+      if (input.mode !== 'rename') {
+        return { ok: false, error: { message: `不支持的编辑模式: ${String(input.mode)}（当前仅 rename）`, code: 'UNSUPPORTED_MODE' } }
+      }
+      if (!IDENTIFIER_RE.test(input.to)) {
+        return { ok: false, error: { message: `新符号名 "${input.to}" 不是合法标识符`, code: 'INVALID_IDENTIFIER' } }
+      }
+      if (input.symbol === input.to) {
+        return { ok: false, error: { message: '新符号名与旧符号名相同', code: 'NO_OP' } }
+      }
+      const absPath = resolvePath(input.path ?? '.', ctx.cwd)
+      if (!isWithinCwd(absPath, ctx.cwd)) {
+        return { ok: false, error: { message: `路径 "${input.path ?? '.'}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
+      }
+      try {
+        const byFile = await index.collectRenameSitesFromScope(absPath, ctx.cwd, input.symbol)
+        if (byFile.size === 0) {
+          return { ok: false, error: { message: `未找到符号 "${input.symbol}"（请先确认名称与作用域）`, code: 'SYMBOL_NOT_FOUND' } }
+        }
+
+        // 编辑前校验：全部文件先在内存中变换 + 重解析，任一失败整体放弃（不落盘）
+        const planned: Array<{ file: string; content: string; sites: RenameSite[] }> = []
+        for (const [file, sites] of byFile) {
+          const original = await readFile(file, 'utf-8')
+          let out = original
+          for (let i = sites.length - 1; i >= 0; i--) {
+            const s = sites[i]
+            out = out.slice(0, s.start) + input.to + out.slice(s.end)
+          }
+          if (!tryParse(out, file)) {
+            return {
+              ok: false,
+              error: {
+                message: `重命名后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
+                code: 'EDIT_INVALID_STRUCTURE',
+              },
+            }
+          }
+          planned.push({ file, content: out, sites })
+        }
+
+        const files: CodeSemanticEditFile[] = planned.map((p) => ({
+          file: p.file,
+          relativePath: relative(ctx.cwd, p.file),
+          count: p.sites.length,
+          sites: p.sites,
+        }))
+        const output: CodeSemanticEditOutput = {
+          mode: 'rename',
+          symbol: input.symbol,
+          to: input.to,
+          path: absPath,
+          dryRun: input.dryRun ?? false,
+          validated: true,
+          total: planned.reduce((n, p) => n + p.sites.length, 0),
+          files,
+        }
+
+        if (input.dryRun) {
+          return { ok: true, output }
+        }
+        for (const p of planned) {
+          await writeFile(p.file, p.content)
+          index.invalidate(p.file)
+        }
+        return { ok: true, output }
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          return { ok: false, error: { message: `路径不存在: ${input.path ?? '.'}`, code: 'PATH_NOT_FOUND' } }
+        }
+        return { ok: false, error: { message: err.message ?? String(err), code: 'CODE_INTEL_ERROR' } }
+      }
+    },
+  })
+
+// ========================================================================
+// 5. AgentPlugin 入口
 // ========================================================================
 
 /**
@@ -584,13 +841,18 @@ export const codeDefinitionTool = (index: CodeIntelIndex): Tool<CodeDefinitionIn
  */
 export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlugin {
   const index = new CodeIntelIndex(options)
-  const tools: Tool[] = [codeSymbolsTool(index), codeReferenceTool(index), codeDefinitionTool(index)]
+  const tools: Tool[] = [
+    codeSymbolsTool(index),
+    codeReferenceTool(index),
+    codeDefinitionTool(index),
+    codeSemanticEditTool(index),
+  ]
 
   return {
     id: 'code-intel',
-    version: '0.1.0',
+    version: '0.2.0',
     name: '代码情报',
-    description: '代码情报插件：code_symbols / code_reference / code_definition（AST 符号索引）',
+    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit（AST 符号索引与结构感知编辑）',
     async install(ctx) {
       ctx.log.info('code-intel 插件已加载', { tools: tools.map((t) => t.id) })
       return {

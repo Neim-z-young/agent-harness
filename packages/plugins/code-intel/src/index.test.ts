@@ -15,6 +15,7 @@ import {
   codeSymbolsTool,
   codeReferenceTool,
   codeDefinitionTool,
+  codeSemanticEditTool,
   createCodeIntelPlugin,
 } from './index'
 import { CODE_INTEL_TOOL_META } from './meta'
@@ -236,8 +237,102 @@ describe('code_definition 工具', () => {
   })
 })
 
+describe('code_semantic_edit 工具', () => {
+  const read = (p: string) => require('node:fs').readFileSync(join(dir, p), 'utf-8')
+
+  it('跨文件重命名：声明 + 引用 + import 源名同步，字符串/注释/obj.x 不触碰', async () => {
+    writeFileSync(
+      join(dir, 'a.ts'),
+      `export function compute(x: number) { return x * 2 }\n// compute 帮助函数\nconst msg = 'compute'\n`,
+    )
+    writeFileSync(join(dir, 'b.ts'), `import { compute } from './a'\nconst result = compute(21)\nobj.compute = 1\n`)
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'compute', to: 'calc' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.output!.validated).toBe(true)
+    // a.ts 声明 1 + b.ts import 源名 1 + b.ts 引用 1（注释/字符串/obj.x 被隔离排除）= 3
+    expect(res.output!.total).toBe(3)
+    expect(res.output!.files.length).toBe(2)
+
+    // 声明与引用、import 源名已改
+    expect(read('a.ts')).toContain('export function calc(x: number)')
+    expect(read('b.ts')).toContain(`import { calc } from './a'`)
+    expect(read('b.ts')).toContain('const result = calc(21)')
+    // 隔离性：注释、字符串、obj.x 属性访问不被触碰
+    expect(read('a.ts')).toContain('// compute 帮助函数')
+    expect(read('a.ts')).toContain(`const msg = 'compute'`)
+    expect(read('b.ts')).toContain('obj.compute = 1')
+  })
+
+  it('dryRun 只返回计划位点，不落盘', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export function foo() {}\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'foo', to: 'bar', dryRun: true },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.output!.dryRun).toBe(true)
+    expect(res.output!.validated).toBe(true)
+    expect(read('a.ts')).toContain('export function foo()')
+  })
+
+  it('对象简写属性名随引用重命名', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export const color = "red"\nconst map = { color }\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'color', to: 'hue' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(read('a.ts')).toContain('const map = { hue }')
+  })
+
+  it('非法新标识符报 INVALID_IDENTIFIER', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export function foo() {}\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'foo', to: '123bad' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('INVALID_IDENTIFIER')
+  })
+
+  it('符号不存在报 SYMBOL_NOT_FOUND，不落盘', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export function foo() {}\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'missing', to: 'bar' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('SYMBOL_NOT_FOUND')
+  })
+
+  it('路径越界报 PATH_OUTSIDE_CWD', async () => {
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'x', to: 'y', path: '/etc' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+
+  it('安全声明：可写 + 非并发 + edit 权限键', () => {
+    const tool = codeSemanticEditTool(new CodeIntelIndex())
+    expect(tool.isReadOnly?.()).toBe(false)
+    expect(tool.isConcurrencySafe?.()).toBe(false)
+    expect(tool.permission?.key).toBe('edit')
+  })
+})
+
 describe('createCodeIntelPlugin', () => {
-  it('装配注入三个代码情报工具', async () => {
+  it('装配注入四个代码情报工具', async () => {
     const plugin = createCodeIntelPlugin() as AgentPlugin
     expect(plugin.id).toBe('code-intel')
 
@@ -248,7 +343,7 @@ describe('createCodeIntelPlugin', () => {
     })
 
     const ids = pool.added.map((t) => (t as { id: string }).id).sort()
-    expect(ids).toEqual(['code_definition', 'code_reference', 'code_symbols'])
+    expect(ids).toEqual(['code_definition', 'code_reference', 'code_semantic_edit', 'code_symbols'])
   })
 
   it('支持忽略目录/文件数上限配置透传', () => {
@@ -260,14 +355,21 @@ describe('createCodeIntelPlugin', () => {
 })
 
 describe('meta 元信息', () => {
-  it('code-intel 三个工具均有静态元信息（只读 + 并发安全 + read 权限键）', () => {
+  it('code-intel 四个工具均有静态元信息（只读/可写、并发安全、权限键齐全）', () => {
     const ids = CODE_INTEL_TOOL_META.map((m) => m.id).sort()
-    expect(ids).toEqual(['code_definition', 'code_reference', 'code_symbols'])
+    expect(ids).toEqual(['code_definition', 'code_reference', 'code_semantic_edit', 'code_symbols'])
     for (const m of CODE_INTEL_TOOL_META) {
+      expect(m.description.length).toBeGreaterThan(0)
+    }
+    const readTools = CODE_INTEL_TOOL_META.filter((m) => m.id !== 'code_semantic_edit')
+    for (const m of readTools) {
       expect(m.isReadOnly).toBe(true)
       expect(m.isConcurrencySafe).toBe(true)
       expect(m.permissionKey).toBe('read')
-      expect(m.description.length).toBeGreaterThan(0)
     }
+    const edit = CODE_INTEL_TOOL_META.find((m) => m.id === 'code_semantic_edit')!
+    expect(edit.isReadOnly).toBe(false)
+    expect(edit.isConcurrencySafe).toBe(false)
+    expect(edit.permissionKey).toBe('edit')
   })
 })
