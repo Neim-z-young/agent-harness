@@ -58,8 +58,9 @@
 2. ✅ 实现索引核心 `CodeIntelIndex`（parse → symbols/references/definition 查询，mtime/size 缓存）。
 3. ✅ 注入 `code_symbols` / `code_reference` / `code_definition` + 单元测试（17 用例）。
 4. ✅ cli 装配：登记进 `getBuiltinRegistry()`（`code-intel`，惰性 load + metaSource），后台预加载开箱即用。
-5. ✅（v2）`code_semantic_edit` 结构感知编辑（rename：AST 精确位点 + 内存变换重解析校验 + dryRun）。
-6. ✅ 全量 `typecheck` + `test`（code-intel 24、cli 163 全过）；更新 development-log（续 62/63）。
+5. ✅（v2）`code_semantic_edit` 结构感知编辑：`rename`（符号重命名，AST 精确位点 + 内存变换重解析校验 + dryRun）。
+6. ✅（v2）`code_semantic_edit` `replace_node`：按 AST 节点范围替换（行列圈选自动吸附最小包含节点，整行替换顺带消费行尾换行）。
+7. ✅ 全量 `typecheck` + `test`（code-intel 31、cli 163 全过）；更新 development-log（续 62/63/64）。
 
 ## 8. 相关文档
 

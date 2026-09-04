@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-09-04（续 64）code-intel v2：code_semantic_edit 新增 replace_node（按 AST 节点范围替换）
+
+> 承接续 63。先把上轮遗留的 workspace-management.md 表格空白清理提交（纯格式），再实现 replace_node。
+
+### `code_semantic_edit` 重构为 mode 分发的联合输入/输出
+
+* 输入按 `mode` 联合：`CodeSemanticEditRenameInput | CodeSemanticEditReplaceNodeInput`，输出对应联合（Rename/ReplaceNode）。
+* 工具 `call` 按 mode 分派到 `execRename` / `execReplaceNode`；写声明/安全声明保持一致（isReadOnly=false、isConcurrencySafe=false、permission.key='edit'）。
+
+### replace_node
+
+* 输入：目标文件 + 行列范围（1-based line/column，列=该行第 1 字符为 1；`endColumn 0`=行末不含换行）+ replacement + dryRun。
+* `findContainingNode`：遍历 AST 找**完全包含**用户范围的最小节点（吸附）；精确命中节点边界→relation `exact`，否则 `absorbed`（`hasInner` 提示圈选过大）。
+* 行列↔偏移用 `buildLineStarts` + `lineEndExclusive` 换算（末行带换行/不带换行两态）。
+* 隔离性：仅替换 AST 节点精确范围；整行圈选顺带消费紧随节点的行尾换行（避免替换后残留空行）；落盘前内存重解析校验（`EDIT_INVALID_STRUCTURE` 整体放弃）；dryRun 返回吸附节点 + 替换后预览。写盘后缓存失效。
+
+### 测试
+
+* code-intel 扩至 31 用例全过；cli 163 全过；全仓 typecheck 通过。定位了两处真实的边界（末行换行换算、节点类型为 VariableDeclaration 而非 ExpressionStatement）并在实现/断言中修正。
+
 ## 2026-09-04（续 63）code-intel v2：code_semantic_edit 结构感知编辑（符号重命名）
 
 > 承接续 62，落地 codeintel-plugin.md §4 的 v2 项：结构感知编辑。

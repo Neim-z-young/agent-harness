@@ -252,10 +252,12 @@ describe('code_semantic_edit 工具', () => {
     )
     expect(res.ok).toBe(true)
     if (!res.ok) return
-    expect(res.output!.validated).toBe(true)
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.validated).toBe(true)
     // a.ts 声明 1 + b.ts import 源名 1 + b.ts 引用 1（注释/字符串/obj.x 被隔离排除）= 3
-    expect(res.output!.total).toBe(3)
-    expect(res.output!.files.length).toBe(2)
+    expect(out.total).toBe(3)
+    expect(out.files.length).toBe(2)
 
     // 声明与引用、import 源名已改
     expect(read('a.ts')).toContain('export function calc(x: number)')
@@ -328,6 +330,110 @@ describe('code_semantic_edit 工具', () => {
     expect(tool.isReadOnly?.()).toBe(false)
     expect(tool.isConcurrencySafe?.()).toBe(false)
     expect(tool.permission?.key).toBe('edit')
+  })
+})
+
+describe('code_semantic_edit replace_node 模式', () => {
+  const read = (p: string) => require('node:fs').readFileSync(join(dir, p), 'utf-8')
+
+  it('按行列范围吸附节点并替换落盘', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export const LEGACY = 1\nconst x = LEGACY + 1\n')
+    // range：第 2 行 `const x = LEGACY + 1` 的整行（1 行 1 列 → 行尾）
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 2, startColumn: 1, endLine: 2, endColumn: 0, replacement: 'export function used() { return LEGACY }\n' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_node') throw new Error('expected replace_node')
+    expect(out.validated).toBe(true)
+    expect(out.node.type).toBe('VariableDeclaration')
+    expect(read('a.ts')).toContain('export function used() { return LEGACY }')
+    expect(read('a.ts')).toContain('export const LEGACY = 1') // 第 1 行保留
+  })
+
+  it('dryRun 不落盘，返回预览与节点范围', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const y = 2\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 1, startColumn: 1, endLine: 1, endColumn: 0, replacement: 'const z = 3\n', dryRun: true },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_node') throw new Error('expected replace_node')
+    expect(out.dryRun).toBe(true)
+    expect(out.validated).toBe(true)
+    expect(out.preview).toContain('const z = 3') // 预览为替换后内容
+    expect(read('a.ts')).toContain('const y = 2') // 未落盘
+    expect(out.node.relation).toBeDefined()
+    expect(out.node.startColumn).toBe(1)
+  })
+
+  it('精确选中表达式节点替换（relation=exact）', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const r = add(1, 2) * 10\n')
+    // 精确覆盖 `add(1, 2)`：起始列 11，含 9 字符 → 结束列（不含）20
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 1, startColumn: 11, endLine: 1, endColumn: 20, replacement: 'sub(5, 5)' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_node') throw new Error('expected replace_node')
+    expect(out.node.relation).toBe('exact')
+    expect(out.node.type).toBe('CallExpression')
+    expect(read('a.ts')).toBe('const r = sub(5, 5) * 10\n')
+  })
+
+  it('范围越界报 INVALID_RANGE', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const y = 1\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 5, startColumn: 1, endLine: 5, endColumn: 20, replacement: 'x' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('INVALID_RANGE')
+  })
+
+  it('单行内圈选吸附到最小包含节点（含内层节点 hasInner）', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const total = helper(a) + helper(b)\n')
+    // 覆盖整行但不对齐节点边界 → 吸附到单个最小包含节点，绝不扩散到 Program
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 1, startColumn: 1, endLine: 1, endColumn: 0, replacement: 'const total = 0\n' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_node') throw new Error('expected replace_node')
+    expect(out.node.type).not.toBe('Program') // 吸附到语句/声明，而非整个文件
+    expect(out.node.relation).toBe('exact') // 整行范围恰好=该声明节点（不含结尾换行）
+    expect(read('a.ts')).toBe('const total = 0\n')
+  })
+
+  it('替换后结构校验失败整体放弃（EDIT_INVALID_STRUCTURE）', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const v = () => expr\n')
+    // 选中 CallExpression/箭头函数体区域并替换成非法 token
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 1, startColumn: 12, endLine: 1, endColumn: 21, replacement: '@@invalid@@' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('EDIT_INVALID_STRUCTURE')
+  })
+
+  it('路径越界报 PATH_OUTSIDE_CWD', async () => {
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: '/etc/passwd', startLine: 1, startColumn: 1, endLine: 1, endColumn: 2, replacement: 'x' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
   })
 })
 
