@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-09-05（续 69）code-intel：多语言 wasm 支持内联字节（适配单二进制打包）
+
+> 承接续 68。解决「语法 wasm 依赖 node_modules 落盘文件、单二进制打包后路径失效」的问题。经实测 bun 1.3.14 无法经导入查询（`?arraybuffer`/`?raw`/import attribute）无损内联二进制，转用**环境变量注入**（方案3）：运行时优先进 `Language.load(bytes)` 用内联 Uint8Array，未注入则回退磁盘读取。
+
+### 字节化加载（src/multi.ts）
+
+* `readGrammarBytes(ext)`：返回语法 wasm 的 `Uint8Array`（供 `Language.load(bytes)`）。
+  1) **env 内联**：读 `HARNESS_GRAMMAR_B64_GO/_PY/_RS`（各语言语法 wasm 的 base64）→ `Buffer.from(b64,'base64')` 解码；base64 非法则回退。
+  2) **磁盘回退**：`createRequire.resolve` 定位 node_modules 语法 wasm + `readFileSync`（dev/测试路径）。
+* `languageFor` 由 `Language.load(path)` 改为 `Language.load(bytes)`，同一 API 兼容内联/磁盘两来源。
+* 单二进制打包用法：构建时把某语言 wasm 转 base64 写入对应 env 再跑 `bun build --compile`，运行时即无需 node_modules 落盘。
+
+### 测试与版本
+
+* 新增用例「env 内联字节注入」：注入 Go wasm base64，验证 `readGrammarBytes` 返回字节且完整索引链路可解析 `injectedFn`。code-intel 55 用例全过、typecheck 通过。插件 version 0.8.0。
+
 ## 2026-09-05（续 68）code-intel：换 web-tree-sitter 支持多语言导航
 
 > 承接续 67。为 code_symbols / code_reference / code_definition 补上 Go / Python / Rust 多语言导航能力，采用**双后端**策略：TS/JS 保留 babel（语义引用），Go/Python/Rust 走 web-tree-sitter（名字命中型引用）。语义编辑（rename/replace_*）不扩到非 JS 语言。

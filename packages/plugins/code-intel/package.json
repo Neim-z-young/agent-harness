@@ -1,6 +1,6 @@
 {
   "name": "@harness/code-intel",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "代码情报插件：code_symbols / code_reference / code_definition + code_semantic_edit（rename scope/跨目录反向import/replace_node/replace_subtree 批量）",
   "type": "module",
   "exports": {

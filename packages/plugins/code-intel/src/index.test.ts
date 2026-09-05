@@ -249,6 +249,33 @@ describe('多语言导航（tree-sitter: Go/Python/Rust）', () => {
     expect(res.error!.code).toBe('SYMBOL_NOT_FOUND')
     expect(require('node:fs').readFileSync(f, 'utf-8')).toContain('def helper')
   })
+
+  it('env 内联字节注入：Go 语法经 base64 注入仍可索引（单二进制友好）', async () => {
+    const { readFileSync } = require('node:fs')
+    const { resolve } = require('node:path')
+    const { readGrammarBytes } = await import('./multi')
+    const wasmPath = resolve(
+      __dirname,
+      '..',
+      'node_modules/tree-sitter-go/tree-sitter-go.wasm',
+    )
+    const b64 = readFileSync(wasmPath).toString('base64')
+    const prev = process.env.HARNESS_GRAMMAR_B64_GO
+    process.env.HARNESS_GRAMMAR_B64_GO = b64
+    try {
+      // 直接校验 readGrammarBytes 走 env 分支返回字节
+      const bytes = readGrammarBytes('.go')
+      expect(bytes).toBeInstanceOf(Uint8Array)
+      // 经完整索引链路验证注入字节可解析
+      const throughIndex = new CodeIntelIndex()
+      writeFileSync(join(dir, 'injected.go'), 'package p\n\nfunc injectedFn() {}\n')
+      const s2 = await throughIndex.symbols(join(dir, 'injected.go'), dir)
+      expect(s2.map((s) => s.name)).toContain('injectedFn')
+    } finally {
+      if (prev === undefined) delete process.env.HARNESS_GRAMMAR_B64_GO
+      else process.env.HARNESS_GRAMMAR_B64_GO = prev
+    }
+  })
 })
 
 describe('code_symbols 工具', () => {

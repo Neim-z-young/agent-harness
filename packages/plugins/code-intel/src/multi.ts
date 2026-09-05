@@ -12,10 +12,15 @@
  *
  * WASM 定位注意：运行时依赖 node_modules 相对路径（createRequire 解析语法 wasm；
  * web-tree-sitter 的 tree-sitter.wasm 经 ESM 内部 new URL(import.meta.url) 解析）。
- * 打包为单二进制的 wasm 搬运不在本轮处理（外部项目亦有此痛点，见 Qwen-Code#2901）。
+ *
+ * 单二进制打包（内联字节）：bun 1.3.14 无法经导入查询内联二进制，特提供**环境变量注入**——
+ * 构建打包时把某语言 wasm 转 base64 写入其对应 env（见 `ENV_B64`），运行时优先进 `Language.load(bytes)`
+ * （Uint8Array），无需 node_modules 落盘；未注入则回退磁盘 `createRequire.resolve` 读取（dev/测试路径）。
  */
 
 import { createRequire } from 'node:module'
+import { Buffer } from 'node:buffer'
+import { readFileSync } from 'node:fs'
 import type { Node, Parser as TSParser } from 'web-tree-sitter'
 import type { CodeSymbol, SymbolKind, CodeReference } from './index'
 
@@ -29,16 +34,52 @@ interface MultiResult {
 
 const req = createRequire(import.meta.url)
 
+const GRAMMAR = {
+  '.go': 'tree-sitter-go/tree-sitter-go.wasm',
+  '.py': 'tree-sitter-python/tree-sitter-python.wasm',
+  '.rs': 'tree-sitter-rust/tree-sitter-rust.wasm',
+} as const
+
+/** 各语言内联字节注入的环境变量（值 = 该语言 wasm 的 base64；单二进制打包时注入） */
+const ENV_B64 = {
+  '.go': 'HARNESS_GRAMMAR_B64_GO',
+  '.py': 'HARNESS_GRAMMAR_B64_PY',
+  '.rs': 'HARNESS_GRAMMAR_B64_RS',
+} as const
+
+/**
+ * 读取某语言语法字节（Uint8Array，供 `Language.load(bytes)`）：
+ * 1) 优先取对应 env 的内联 base64（单二进制打包/无 node_modules 场景）；
+ * 2) 回退从 node_modules 磁盘读取（dev/测试路径）。
+ * 均失败返回 null（由上层降级为「不支持」）。
+ */
+export function readGrammarBytes(ext: string): Uint8Array | null {
+  const slug = ext as keyof typeof GRAMMAR
+  if (!GRAMMAR[slug]) return null
+  // 1) env 内联字节
+  const envKey = ENV_B64[slug]
+  const b64 = process.env[envKey]
+  if (b64) {
+    try {
+      return Uint8Array.from(Buffer.from(b64, 'base64'))
+    } catch {
+      // base64 非法 → 落到磁盘回退
+    }
+  }
+  // 2) 磁盘回退
+  try {
+    const wasmPath = req.resolve(GRAMMAR[slug])
+    return readFileSync(wasmPath)
+  } catch {
+    return null
+  }
+}
+
 // ===== 惰性单例：Parser.init + 语法 wasm 加载（每个语言一个 Parser，缓存 Language）=====
 
 let initPromise: Promise<TSParser | null> | null = null
 let parserInst: TSParser | null = null
 const languages = new Map<string, { type: 'loading'; p: Promise<unknown> } | { type: 'ok'; lang: unknown }>()
-const GRAMMAR = {
-  '.go': 'tree-sitter-go/tree-sitter-go.wasm',
-  '.py': 'tree-sitter-python/tree-sitter-python.wasm',
-  '.rs': 'tree-sitter-rust/tree-sitter-rust.wasm',
-}
 
 /** 初始化并返回共享 Parser（失败返回 null，由上层降级为「不支持」，不中断索引） */
 export function getMultiParser(): Promise<TSParser | null> {
@@ -83,8 +124,10 @@ async function languageFor(ext: string): Promise<unknown | null> {
   languages.set(ext, { type: 'loading', p })
   try {
     const { Language } = await import('web-tree-sitter')
-    const wasmPath = req.resolve(GRAMMAR[ext as keyof typeof GRAMMAR])
-    const lang = await Language.load(wasmPath)
+    const bytes = readGrammarBytes(ext)
+    if (!bytes) throw new Error(`no grammar bytes for ${ext}`)
+    // 注入 Uint8Array 由 web-tree-sitter 实例化，兼容内联字节 / 磁盘读取两种来源
+    const lang = await Language.load(bytes)
     languages.set(ext, { type: 'ok', lang })
     resolve!(lang)
     return lang
