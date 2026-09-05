@@ -31,7 +31,8 @@ import { defineTool, Schema, Tool, ToolContext, ToolResult } from '@harness/tool
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
-import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { existsSync, statSync } from 'node:fs'
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 // ===== 数据类型 =====
 
@@ -515,6 +516,55 @@ export class CodeIntelIndex {
     }
     return byFile
   }
+
+  /**
+   * 跨目录反向 import 查找：在 reverseRoot 内扫描所有「import { symbol } / export { symbol } from <相对说明符>」
+   * 指向 declaringFiles 中任一模块文件的外部导入方，返回这些导入方的 rename 位点（import 源名 + 本地绑定 + 引用）。
+   * 已传入 skip 集合内的文件忽略（避免重复）。
+   */
+  async reverseImporters(
+    reverseRoot: string,
+    relBase: string,
+    symbol: string,
+    declaringFiles: Set<string>,
+    skip: Set<string>,
+  ): Promise<Map<string, RenameSite[]>> {
+    const { files } = await this.load(reverseRoot, relBase)
+    const out = new Map<string, RenameSite[]>()
+    for (const f of files) {
+      if (skip.has(f.path)) continue
+      const content = await readFile(f.path, 'utf-8')
+      const ast = tryParse(content, f.path)
+      if (!ast) continue
+      let hitDeclaring = false
+      const importerDir = dirname(f.path)
+      traverse(ast, {
+        ImportDeclaration(path) {
+          const source = path.node.source.value
+          const target = resolveModuleFile(source, importerDir)
+          if (!target) return
+          for (const spec of path.node.specifiers) {
+            if (!t.isImportSpecifier(spec)) continue
+            const imported = spec.imported
+            if (t.isIdentifier(imported) && imported.name === symbol && declaringFiles.has(target)) hitDeclaring = true
+          }
+        },
+        ExportNamedDeclaration(path) {
+          if (!path.node.source) return
+          const source = path.node.source.value
+          const target = resolveModuleFile(source, importerDir)
+          if (!target || !declaringFiles.has(target)) return
+          for (const spec of path.node.specifiers) {
+            if (t.isExportSpecifier(spec) && t.isIdentifier(spec.local) && spec.local.name === symbol) hitDeclaring = true
+          }
+        },
+      })
+      if (!hitDeclaring) continue
+      const sites = collectRenameSites(ast, content, symbol)
+      if (sites.length) out.set(f.path, sites)
+    }
+    return out
+  }
 }
 
 // ===== 共享 helper（自包含，避免跨包依赖）=====
@@ -537,6 +587,33 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+function isFile(p: string): boolean {
+  try {
+    return existsSync(p) && (statSync(p)?.isFile() ?? false)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * 把 import 说明符解析为本地绝对文件路径。
+ * 仅处理相对说明符（`./`、`../`）：补齐扩展名、再试 index 文件；裸包/路径别名/未命中返回 null。
+ */
+function resolveModuleFile(spec: string, importerDir: string): string | null {
+  if (!spec.startsWith('./') && !spec.startsWith('../')) return null
+  const base = resolve(importerDir, spec)
+  if (isFile(base)) return base
+  for (const ex of SUPPORTED_EXT) {
+    const candidate = base + ex
+    if (isFile(candidate)) return candidate
+  }
+  for (const ex of SUPPORTED_EXT) {
+    const candidate = join(base, 'index' + ex)
+    if (isFile(candidate)) return candidate
+  }
+  return null
 }
 
 /** 结果中返回的最多条目数（防止 LLM 上下文爆炸） */
@@ -723,6 +800,10 @@ export interface CodeSemanticEditRenameInput {
   path?: string
   /** 作用域限定：在已扫描的根 path 下，仅编辑该子目录/文件内的命中。相对根 path 解析；缺省编辑全部 */
   scope?: string
+  /** 跨目录反向 import 查找：开启后在 importRoot（缺省 cwd）内，凡 import { symbol } 指向本 scope 声明模块的外部导入方一并改名 */
+  resolveImporters?: boolean
+  /** 反向 import 查找的扫描根（缺省 ctx.cwd，可用子目录收紧） */
+  importRoot?: string
   /** 仅预览（返回计划位点，不落盘）；默认 false */
   dryRun?: boolean
 }
@@ -774,6 +855,12 @@ export interface RenameEditFile {
   sites: RenameSite[]
 }
 
+/** rename：反向 import 查找拉入的外部导入方 */
+export interface RenameImporter {
+  file: string
+  relativePath: string
+}
+
 /** rename：输出 */
 export interface CodeSemanticEditRenameOutput {
   mode: 'rename'
@@ -782,6 +869,12 @@ export interface CodeSemanticEditRenameOutput {
   path: string
   /** 作用域限定回显（仅编辑该子目录/文件内的命中） */
   scope?: string
+  /** 反向 import 查找开启回显 */
+  resolveImporters?: boolean
+  /** 反向 import 查找的实际扫描根 */
+  importRoot?: string
+  /** 反向 import 查找拉入的外部导入方（不含本 scope 内已覆盖的文件） */
+  importers?: RenameImporter[]
   dryRun: boolean
   /** 已通过"编辑前校验隔离性"：全部文件内存中变换后重解析通过 */
   validated: boolean
@@ -877,7 +970,7 @@ const SELECTOR_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(\.[A-Za-z_$][A-Za-z0-9_$]*)*$/
 export const codeSemanticEditTool = (index: CodeIntelIndex): Tool<CodeSemanticEditInput, CodeSemanticEditOutput> =>
   defineTool<CodeSemanticEditInput, CodeSemanticEditOutput>({
     id: 'code_semantic_edit',
-    description: '结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰；支持 scope 子目录限定）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）/ replace_subtree（按成员链如 config.server.host 定位子表达式替换，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。',
+    description: '结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰；支持 scope 子目录限定、resolveImporters 跨目录反向 import）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）/ replace_subtree（按成员链如 config.server.host 定位子表达式替换，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。',
     inputSchema: makeSchema<CodeSemanticEditInput>(),
     isReadOnly: () => false,
     isConcurrencySafe: () => false,
@@ -886,6 +979,7 @@ export const codeSemanticEditTool = (index: CodeIntelIndex): Tool<CodeSemanticEd
       extractPatterns: (input) => {
         const patterns = [input.path ?? '.']
         if ('scope' in input && input.scope) patterns.push(input.scope)
+        if ('importRoot' in input && input.importRoot) patterns.push(input.importRoot)
         return patterns
       },
     },
@@ -958,6 +1052,32 @@ async function execRename(
         },
       }
     }
+    // 跨目录反向 import 查找：确定声明该符号的模块文件（真实声明，非 import 绑定），再反向拉入外部导入方
+    const importers: RenameImporter[] = []
+    const importsResolved = !!input.resolveImporters
+    if (importsResolved) {
+      const importRoot = input.importRoot ? resolvePath(input.importRoot, ctx.cwd) : ctx.cwd
+      if (!isWithinCwd(importRoot, ctx.cwd)) {
+        return { ok: false, error: { message: `路径 "${input.importRoot}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
+      }
+      // 声明模块：索引缓存中该符号 kind !== 'import'（真实声明），排除仅 import 的本地绑定
+      const declaringFiles = new Set<string>()
+      for (const file of byFile.keys()) {
+        const indexed = await index.load(file, ctx.cwd)
+        for (const f of indexed.files) {
+          if (f.symbols.some((s) => s.name === input.symbol && s.kind !== 'import')) declaringFiles.add(f.path)
+        }
+      }
+      if (declaringFiles.size > 0) {
+        const extras = await index.reverseImporters(importRoot, ctx.cwd, input.symbol, declaringFiles, new Set(byFile.keys()))
+        for (const [file, sites] of extras) {
+          if (!byFile.has(file)) {
+            byFile.set(file, sites)
+            importers.push({ file, relativePath: relative(ctx.cwd, file) })
+          }
+        }
+      }
+    }
     // 编辑前校验：全部文件先在内存中变换 + 重解析，任一失败整体放弃（不落盘）
     const planned: Array<{ file: string; content: string; sites: RenameSite[] }> = []
     for (const [file, sites] of byFile) {
@@ -990,6 +1110,9 @@ async function execRename(
       to: input.to,
       path: absPath,
       scope: input.scope,
+      resolveImporters: importsResolved,
+      importRoot: importsResolved ? (input.importRoot ?? ctx.cwd) : undefined,
+      importers: importsResolved ? importers : undefined,
       dryRun: input.dryRun ?? false,
       validated: true,
       total: planned.reduce((n, p) => n + p.sites.length, 0),
@@ -1315,9 +1438,9 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
 
   return {
     id: 'code-intel',
-    version: '0.5.0',
+    version: '0.6.0',
     name: '代码情报',
-    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit(rename|scope 限定|replace_node|replace_subtree 批量)（AST 符号索引与结构感知编辑）',
+    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit(rename|scope/反向import|replace_node|replace_subtree 批量)（AST 符号索引与结构感知编辑）',
     async install(ctx) {
       ctx.log.info('code-intel 插件已加载', { tools: tools.map((t) => t.id) })
       return {

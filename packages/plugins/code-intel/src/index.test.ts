@@ -372,6 +372,94 @@ describe('code_semantic_edit 工具', () => {
     expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
   })
 
+  it('resolveImporters 跨目录反向 import：外部导入方一并改名', async () => {
+    mkdirSync(join(dir, 'src'))
+    mkdirSync(join(dir, 'lib'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'export function compute(x: number) { return x * 2 }\n')
+    writeFileSync(join(dir, 'lib', 'use.ts'), "import { compute } from '../src/a'\nconst r = compute(21)\n")
+    // path='src' 只覆盖 src 下文件，lib/use.ts 靠 resolveImporters 反向拉入
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'compute', to: 'calc', path: 'src', resolveImporters: true },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.resolveImporters).toBe(true)
+    expect(out.importers!.length).toBe(1)
+    expect(out.importers![0]!.relativePath).toBe('lib' + require('node:path').sep + 'use.ts')
+    // 声明 + 外部 import 源名 + 外部引用 = 3
+    expect(out.total).toBe(3)
+    expect(out.files.length).toBe(2)
+    expect(read(join('src', 'a.ts'))).toContain('export function calc(')
+    expect(read(join('lib', 'use.ts'))).toContain(`import { calc } from '../src/a'`)
+    expect(read(join('lib', 'use.ts'))).toContain('const r = calc(21)')
+  })
+
+  it('resolveImporters 缺省（false）不越界：外部导入方不被改动', async () => {
+    mkdirSync(join(dir, 'src'))
+    mkdirSync(join(dir, 'lib'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'export function compute() {}\n')
+    writeFileSync(join(dir, 'lib', 'use.ts'), "import { compute } from '../src/a'\n")
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'compute', to: 'calc', path: 'src' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.importers).toBeUndefined()
+    expect(out.files.length).toBe(1)
+    expect(read(join('lib', 'use.ts'))).toContain(`import { compute } from '../src/a'`)
+  })
+
+  it('resolveImporters 捕获再导出 export { compute } from ...', async () => {
+    mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'export function compute() {}\n')
+    writeFileSync(join(dir, 'index.ts'), "export { compute } from './src/a'\n")
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'compute', to: 'calc', path: 'src', resolveImporters: true },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.importers!.length).toBe(1)
+    expect(read(join('index.ts'))).toContain(`export { calc } from './src/a'`)
+  })
+
+  it('importRoot 收紧：不含外部导入方时不反向拉入', async () => {
+    mkdirSync(join(dir, 'src'))
+    mkdirSync(join(dir, 'lib'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'export function compute() {}\n')
+    writeFileSync(join(dir, 'lib', 'use.ts'), "import { compute } from '../src/a'\n")
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'compute', to: 'calc', path: 'src', resolveImporters: true, importRoot: 'src' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.importers!.length).toBe(0)
+    expect(out.files.length).toBe(1)
+    expect(read(join('lib', 'use.ts'))).toContain(`import { compute } from '../src/a'`)
+  })
+
+  it('importRoot 越界报 PATH_OUTSIDE_CWD', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export function compute() {}\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'compute', to: 'x', path: '.', resolveImporters: true, importRoot: '/etc' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+
   it('安全声明：可写 + 非并发 + edit 权限键', () => {
     const tool = codeSemanticEditTool(new CodeIntelIndex())
     expect(tool.isReadOnly?.()).toBe(false)

@@ -1,5 +1,20 @@
 # Agent Harness 开发日志
 
+## 2026-09-05（续 67）code-intel v2：rename 跨目录全局反向 import 解析
+
+> 承接续 66。解决 import 反向查找：当符号定义在扫描根内、但被根之外的文件 `import { symbol } from '...'` 使用时，重新命名能同步外部导入方，避免改名字不一致。
+
+### resolveImporters + importRoot
+
+* `CodeSemanticEditRenameInput` 增 `resolveImporters?: boolean`（默认关，伪入开关）与 `importRoot?: string`（反向扫描根，缺省 ctx.cwd，可收紧）。
+* `resolveModuleFile(spec, importerDir)`：仅相对说明符，补齐扩展名 / index 文件解析为本地绝对路径；裸包/别名/未命中返回 null。
+* `CodeIntelIndex.reverseImporters(reverseRoot, relBase, symbol, declaringFiles, skip)`：在 reverseRoot 内枚举文件，遍历 `ImportDeclaration` / `ExportNamedDeclaration`（含 source），凡 import/再导出 `symbol` 且说明符解析命中 declaringFiles 中模块的文件 → 复用 `collectRenameSites` 收集改名位点。
+* `execRename`：先经 scope 过滤，再据索引缓存 `symbols`（kind !== 'import'）判定真实声明模块（排除仅 import 的本地绑定），开启时反向拉入外部导入方并 merge 进 byFile；输出回显 `resolveImporters` / `importRoot` 与 `importers[]`。外部导入文件同样先内存变换 + tryParse 校验，任一失败整体放弃。
+
+### 测试
+
+* code-intel 扩至 48 用例全过（跨目录反向改名/缺省不越界/再导出/importRoot 收紧/importRoot 越界）；全仓 typecheck 通过。插件 version 0.6.0，meta/文档/开发日志同步。
+
 ## 2026-09-05（续 66）code-intel v2：rename 加 scope 限定 + replace_subtree 目录批量
 
 > 承接续 65。补齐两处批量编辑能力：rename 子目录白名单限定（控制改名爆炸半径），replace_subtree 支持目录一键批量替换所有匹配文件。
