@@ -31,7 +31,7 @@ import { defineTool, Schema, Tool, ToolContext, ToolResult } from '@harness/tool
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
-import { extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 // ===== 数据类型 =====
 
@@ -497,6 +497,24 @@ export class CodeIntelIndex {
     }
     return byFile
   }
+
+  /** 收集目标范围内所有匹配 `selector` 的成员链子表达式（topmost，逐文件） */
+  async collectSubtreeFromScope(
+    target: string,
+    relBase: string,
+    selector: string,
+  ): Promise<Map<string, RangedNode[]>> {
+    const { files } = await this.load(target, relBase)
+    const byFile = new Map<string, RangedNode[]>()
+    for (const f of files) {
+      const content = await readFile(f.path, 'utf-8')
+      const ast = tryParse(content, f.path)
+      if (!ast) continue
+      const matches = collectSubtreeMatches(ast, selector)
+      if (matches.length) byFile.set(f.path, matches)
+    }
+    return byFile
+  }
 }
 
 // ===== 共享 helper（自包含，避免跨包依赖）=====
@@ -703,6 +721,8 @@ export interface CodeSemanticEditRenameInput {
   to: string
   /** 扫描根目录/文件（缺省当前工作目录） */
   path?: string
+  /** 作用域限定：在已扫描的根 path 下，仅编辑该子目录/文件内的命中。相对根 path 解析；缺省编辑全部 */
+  scope?: string
   /** 仅预览（返回计划位点，不落盘）；默认 false */
   dryRun?: boolean
 }
@@ -729,7 +749,7 @@ export interface CodeSemanticEditReplaceNodeInput {
 /** replace_subtree：按成员链路径（如 `config.server.host`）定位子表达式并替换 */
 export interface CodeSemanticEditReplaceSubtreeInput {
   mode: 'replace_subtree'
-  /** 目标文件（必填；子树替换作用于单文件） */
+  /** 目标文件或目录（目录时按选择器批量替换所有匹配文件） */
   path: string
   /** 成员链选择器，如 `config.server.host`（仅标识符/字符串属性，不含下标） */
   selector: string
@@ -760,6 +780,8 @@ export interface CodeSemanticEditRenameOutput {
   symbol: string
   to: string
   path: string
+  /** 作用域限定回显（仅编辑该子目录/文件内的命中） */
+  scope?: string
   dryRun: boolean
   /** 已通过"编辑前校验隔离性"：全部文件内存中变换后重解析通过 */
   validated: boolean
@@ -805,19 +827,32 @@ export interface CodeSemanticEditSubtreeMatch {
   text: string
 }
 
-/** replace_subtree：输出 */
+/** replace_subtree：单个文件的替换结果 */
+export interface CodeSemanticEditSubtreeFileResult {
+  /** 绝对路径 */
+  path: string
+  /** 相对 cwd 的路径 */
+  relativePath: string
+  /** 该文件中的匹配数 */
+  count: number
+  matches: CodeSemanticEditSubtreeMatch[]
+  /** 替换后的文件内容预览 */
+  preview: string
+}
+
+/** replace_subtree：输出（path 为目录时 files 含多个文件） */
 export interface CodeSemanticEditReplaceSubtreeOutput {
   mode: 'replace_subtree'
+  /** 根路径（文件或目录） */
   path: string
   selector: string
   replacement: string
   dryRun: boolean
   /** 落盘前重解析校验通过 */
   validated: boolean
+  /** 全部文件的匹配总数 */
   total: number
-  matches: CodeSemanticEditSubtreeMatch[]
-  /** 替换后的文件内容预览 */
-  preview: string
+  files: CodeSemanticEditSubtreeFileResult[]
 }
 
 /** code_semantic_edit 输出（按 mode 区分的联合） */
@@ -842,13 +877,17 @@ const SELECTOR_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(\.[A-Za-z_$][A-Za-z0-9_$]*)*$/
 export const codeSemanticEditTool = (index: CodeIntelIndex): Tool<CodeSemanticEditInput, CodeSemanticEditOutput> =>
   defineTool<CodeSemanticEditInput, CodeSemanticEditOutput>({
     id: 'code_semantic_edit',
-    description: '结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）。落盘前重解析校验结构，dryRun 预览。',
+    description: '结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰；支持 scope 子目录限定）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）/ replace_subtree（按成员链如 config.server.host 定位子表达式替换，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。',
     inputSchema: makeSchema<CodeSemanticEditInput>(),
     isReadOnly: () => false,
     isConcurrencySafe: () => false,
     permission: {
       key: 'edit',
-      extractPatterns: (input) => [input.path ?? '.'],
+      extractPatterns: (input) => {
+        const patterns = [input.path ?? '.']
+        if ('scope' in input && input.scope) patterns.push(input.scope)
+        return patterns
+      },
     },
     async call(input, ctx): Promise<ToolResult<CodeSemanticEditOutput>> {
       if (input.mode === 'rename') return execRename(index, input, ctx)
@@ -862,6 +901,29 @@ export const codeSemanticEditTool = (index: CodeIntelIndex): Tool<CodeSemanticEd
   })
 
 // ===== rename（符号重命名）=====
+
+/**
+ * 作用域白名单过滤：仅保留位于 scope 子目录/文件内的命中。
+ * scope 相对扫描根解析；不存在作用域时返回原样。越界返回错误描述。
+ */
+function filterByScope(
+  byFile: Map<string, RenameSite[]>,
+  root: string,
+  scope: string | undefined,
+  cwd: string,
+): Map<string, RenameSite[]> | { error: string } {
+  if (!scope) return byFile
+  const scopeAbs = resolvePath(scope, root)
+  if (!isWithinCwd(scopeAbs, cwd)) {
+    return { error: `路径 "${scope}" 超出工作目录范围` }
+  }
+  const prefix = scopeAbs + sep
+  const filtered = new Map<string, RenameSite[]>()
+  for (const [file, sites] of byFile) {
+    if (file === scopeAbs || file.startsWith(prefix)) filtered.set(file, sites)
+  }
+  return filtered
+}
 
 async function execRename(
   index: CodeIntelIndex,
@@ -879,9 +941,22 @@ async function execRename(
     return { ok: false, error: { message: `路径 "${input.path ?? '.'}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
   }
   try {
-    const byFile = await index.collectRenameSitesFromScope(absPath, ctx.cwd, input.symbol)
+    const collected = await index.collectRenameSitesFromScope(absPath, ctx.cwd, input.symbol)
+    const scoped = filterByScope(collected, absPath, input.scope, ctx.cwd)
+    if ('error' in scoped) {
+      return { ok: false, error: { message: scoped.error, code: 'PATH_OUTSIDE_CWD' } }
+    }
+    const byFile = scoped
     if (byFile.size === 0) {
-      return { ok: false, error: { message: `未找到符号 "${input.symbol}"（请先确认名称与作用域）`, code: 'SYMBOL_NOT_FOUND' } }
+      return {
+        ok: false,
+        error: {
+          message: input.scope
+            ? `作用域 "${input.scope}" 内未找到符号 "${input.symbol}"`
+            : `未找到符号 "${input.symbol}"（请先确认名称与作用域）`,
+          code: 'SYMBOL_NOT_FOUND',
+        },
+      }
     }
     // 编辑前校验：全部文件先在内存中变换 + 重解析，任一失败整体放弃（不落盘）
     const planned: Array<{ file: string; content: string; sites: RenameSite[] }> = []
@@ -914,6 +989,7 @@ async function execRename(
       symbol: input.symbol,
       to: input.to,
       path: absPath,
+      scope: input.scope,
       dryRun: input.dryRun ?? false,
       validated: true,
       total: planned.reduce((n, p) => n + p.sites.length, 0),
@@ -1138,32 +1214,59 @@ async function execReplaceSubtree(
     return { ok: false, error: { message: `选择器 "${input.selector}" 不是合法成员链（期望如 config.server.host）`, code: 'INVALID_SELECTOR' } }
   }
   try {
-    const content = await readFile(absPath, 'utf-8')
-    const ast = tryParse(content, absPath)
-    if (!ast) {
-      return { ok: false, error: { message: `无法解析文件 ${relative(ctx.cwd, absPath)}（AST 解析失败）`, code: 'PARSE_ERROR' } }
+    // 根路径不存在 → PATH_NOT_FOUND（区分于"存在但无匹配"的 SUBTREE_NOT_FOUND）
+    let rootExists = false
+    try {
+      const st = await stat(absPath)
+      rootExists = st.isFile() || st.isDirectory()
+    } catch {
+      rootExists = false
     }
-    const matches = collectSubtreeMatches(ast, selector)
-    if (matches.length === 0) {
+    if (!rootExists) {
+      return { ok: false, error: { message: `路径不存在: ${input.path}`, code: 'PATH_NOT_FOUND' } }
+    }
+    const byFile = await index.collectSubtreeFromScope(absPath, ctx.cwd, selector)
+    if (byFile.size === 0) {
       return { ok: false, error: { message: `未找到子表达式 "${selector}"`, code: 'SUBTREE_NOT_FOUND' } }
     }
-    const starts = buildLineStarts(content)
-    const matchInfo: CodeSemanticEditSubtreeMatch[] = matches.map((m) => {
-      const line = offsetToLine(starts, m.start)
+    // 编辑前校验：逐文件先在内存变换 + 重解析，任一失败整体放弃（不落盘）
+    const planned: Array<{ file: string; original: string; content: string; matches: RangedNode[] }> = []
+    for (const [file, matches] of byFile) {
+      const original = await readFile(file, 'utf-8')
+      let out = original
+      for (let i = matches.length - 1; i >= 0; i--) {
+        const m = matches[i]
+        out = out.slice(0, m.start) + input.replacement + out.slice(m.end)
+      }
+      if (!tryParse(out, file)) {
+        return {
+          ok: false,
+          error: {
+            message: `替换后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
+            code: 'EDIT_INVALID_STRUCTURE',
+          },
+        }
+      }
+      planned.push({ file, original, content: out, matches })
+    }
+    const files: CodeSemanticEditSubtreeFileResult[] = planned.map((p) => {
+      const starts = buildLineStarts(p.original)
+      const matches = p.matches.map((m) => {
+        const line = offsetToLine(starts, m.start)
+        return {
+          line,
+          column: m.start - starts[line - 1] + 1,
+          text: p.original.slice(m.start, m.end),
+        }
+      })
       return {
-        line,
-        column: m.start - starts[line - 1] + 1,
-        text: content.slice(m.start, m.end),
+        path: p.file,
+        relativePath: relative(ctx.cwd, p.file),
+        count: p.matches.length,
+        matches,
+        preview: p.content,
       }
     })
-    let out = content
-    for (let i = matches.length - 1; i >= 0; i--) {
-      const m = matches[i]
-      out = out.slice(0, m.start) + input.replacement + out.slice(m.end)
-    }
-    if (!tryParse(out, absPath)) {
-      return { ok: false, error: { message: '替换后结构校验失败，已放弃（未落盘）', code: 'EDIT_INVALID_STRUCTURE' } }
-    }
     const output: CodeSemanticEditReplaceSubtreeOutput = {
       mode: 'replace_subtree',
       path: absPath,
@@ -1171,13 +1274,14 @@ async function execReplaceSubtree(
       replacement: input.replacement,
       dryRun: input.dryRun ?? false,
       validated: true,
-      total: matches.length,
-      matches: matchInfo,
-      preview: out,
+      total: planned.reduce((n, p) => n + p.matches.length, 0),
+      files,
     }
     if (input.dryRun) return { ok: true, output }
-    await writeFile(absPath, out)
-    index.invalidate(absPath)
+    for (const p of planned) {
+      await writeFile(p.file, p.content)
+      index.invalidate(p.file)
+    }
     return { ok: true, output }
   } catch (err: any) {
     if (err.code === 'ENOENT') {
@@ -1211,9 +1315,9 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
 
   return {
     id: 'code-intel',
-    version: '0.4.0',
+    version: '0.5.0',
     name: '代码情报',
-    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit(rename|replace_node|replace_subtree)（AST 符号索引与结构感知编辑）',
+    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit(rename|scope 限定|replace_node|replace_subtree 批量)（AST 符号索引与结构感知编辑）',
     async install(ctx) {
       ctx.log.info('code-intel 插件已加载', { tools: tools.map((t) => t.id) })
       return {

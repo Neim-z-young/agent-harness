@@ -1,5 +1,24 @@
 # Agent Harness 开发日志
 
+## 2026-09-05（续 66）code-intel v2：rename 加 scope 限定 + replace_subtree 目录批量
+
+> 承接续 65。补齐两处批量编辑能力：rename 子目录白名单限定（控制改名爆炸半径），replace_subtree 支持目录一键批量替换所有匹配文件。
+
+### rename + scope（子目录白名单）
+
+* 输入 `CodeSemanticEditRenameInput` 增 `scope?: string`：在已扫描的根 `path` 下，仅编辑该子目录/文件内的命中，相对根解析。
+* `filterByScope`：`file === scopeAbs || file.startsWith(scopeAbs + sep)` 白名单过滤；越界报 `PATH_OUTSIDE_CWD`，scope 内无命中报 `SYMBOL_NOT_FOUND`（与 path 同语义）。输出回显 `scope`，permission `extractPatterns` 追加 scope。
+
+### replace_subtree 目录批量
+
+* `path` 语义扩展为「文件或目录」；`CodeIntelIndex` 新增 `collectSubtreeFromScope`（镜像 `collectRenameSitesFromScope`，成员链选择器内容定位天然可跨文件）。
+* 输出重构为逐文件 `files[]`（`CodeSemanticEditSubtreeFileResult`：path/relativePath/count/matches/preview），顶层 `total` 为全部文件匹配总数。
+* 隔离性：逐文件先内存变换 + `tryParse` 重解析，任一失败整体放弃；根路径不存在报 `PATH_NOT_FOUND`（区别于"存在但无匹配"的 `SUBTREE_NOT_FOUND`）；dryRun 只预览不落盘。
+
+### 测试
+
+* code-intel 扩至 43 用例全过（scope 白名单/无命中/越界、目录批量/无匹配/根不存在 + 原 dryRun 断言适配 `files[]`）；全仓 typecheck 通过。插件 version 0.5.0，meta/文档/开发日志同步。
+
 ## 2026-09-04（续 65）code-intel v2：code_semantic_edit 新增 replace_subtree（成员链子表达式替换）
 
 > 承接续 64。在 replace_node（行列范围吸附节点）基础上，补第三种结构编辑模式：按成员链路径（`config.server.host`）精确定位并替换子表达式。

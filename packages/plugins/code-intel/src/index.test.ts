@@ -325,6 +325,53 @@ describe('code_semantic_edit 工具', () => {
     expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
   })
 
+  it('scope 子目录白名单：仅编辑 scope 指定子目录内的命中', async () => {
+    mkdirSync(join(dir, 'sub'))
+    writeFileSync(join(dir, 'a.ts'), 'export function calc() {}\n')
+    writeFileSync(join(dir, 'sub', 'b.ts'), 'export function calc() {}\ncalc()\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'calc', to: 'calc2', path: '.', scope: 'sub' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.scope).toBe('sub')
+    // 仅 sub/b.ts 被改（声明 + 引用 = 2），a.ts 保持原样
+    expect(out.files.length).toBe(1)
+    expect(out.files[0]!.relativePath).toBe('sub' + require('node:path').sep + 'b.ts')
+    expect(out.total).toBe(2)
+    expect(read('a.ts')).toContain('export function calc()')
+    expect(read(join('sub', 'b.ts'))).toContain('export function calc2()')
+    expect(read(join('sub', 'b.ts'))).toContain('calc2()')
+  })
+
+  it('scope 无命中报 SYMBOL_NOT_FOUND，不落盘', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export function calc() {}\n')
+    writeFileSync(join(dir, 'other.ts'), 'export function calc() {}\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'calc', to: 'calc2', path: '.', scope: 'nodir' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('SYMBOL_NOT_FOUND')
+    expect(read('a.ts')).toContain('export function calc()')
+    expect(read('other.ts')).toContain('export function calc()')
+  })
+
+  it('scope 指向越界路径报 PATH_OUTSIDE_CWD', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export function calc() {}\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'calc', to: 'x', path: '.', scope: '/etc' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+
   it('安全声明：可写 + 非并发 + edit 权限键', () => {
     const tool = codeSemanticEditTool(new CodeIntelIndex())
     expect(tool.isReadOnly?.()).toBe(false)
@@ -485,10 +532,55 @@ describe('code_semantic_edit replace_subtree 模式', () => {
     const out = res.output!
     if (out.mode !== 'replace_subtree') throw new Error('expected replace_subtree')
     expect(out.dryRun).toBe(true)
-    expect(out.matches.length).toBe(1)
-    expect(out.matches[0]!.text).toBe('cfg.host')
-    expect(out.preview).toContain('env.HOST')
+    expect(out.files.length).toBe(1)
+    expect(out.files[0]!.matches.length).toBe(1)
+    expect(out.files[0]!.matches[0]!.text).toBe('cfg.host')
+    expect(out.files[0]!.preview).toContain('env.HOST')
     expect(read('a.ts')).toContain('cfg.host') // 未落盘
+  })
+
+  it('path 为目录时批量替换所有匹配文件并落盘', async () => {
+    mkdirSync(join(dir, 'src'))
+    mkdirSync(join(dir, 'more'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'const h0 = config.server.host\n')
+    writeFileSync(join(dir, 'src', 'b.ts'), 'const h1 = config.server.host * 2\n')
+    writeFileSync(join(dir, 'more', 'c.ts'), 'const other = something.else\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: '.', selector: 'config.server.host', replacement: 'config.host' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_subtree') throw new Error('expected replace_subtree')
+    expect(out.total).toBe(2)
+    expect(out.files.length).toBe(2)
+    expect(read(join('src', 'a.ts'))).toContain('config.host')
+    expect(read(join('src', 'b.ts'))).toContain('config.host * 2')
+    expect(read(join('more', 'c.ts'))).toContain('something.else') // 不匹配文件不受影响
+  })
+
+  it('目录内无任何匹配报 SUBTREE_NOT_FOUND', async () => {
+    mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'const v = other.path\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: '.', selector: 'cfg.host', replacement: 'x' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('SUBTREE_NOT_FOUND')
+    expect(read(join('src', 'a.ts'))).toContain('other.path')
+  })
+
+  it('目录根不存在报 PATH_NOT_FOUND', async () => {
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'no-such-dir', selector: 'a.b', replacement: 'x' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_NOT_FOUND')
   })
 
   it('非法选择器报 INVALID_SELECTOR（含下标）', async () => {

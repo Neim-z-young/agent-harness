@@ -1,6 +1,6 @@
 # codeintel 插件开发规划（`@harness/code-intel`）
 
-> 状态：**v1 + v2 已实现**（2026-09-04，见开发日志续 62/63/64）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
+> 状态：**v1 + v2 已实现**（2026-09-04，见开发日志续 62/63/64/65/66）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
 
 ## 1. 定位与目标
 
@@ -29,14 +29,14 @@
 | `code_symbols` | 列出文件/目录符号（函数/类/变量/接口/枚举） | 只读，`isConcurrencySafe:true` |
 | `code_reference` | 查找某符号的引用（usages，含跨文件） | 只读，`isConcurrencySafe:true` |
 | `code_definition` | 符号 go-to-definition（返回位置） | 只读，`isConcurrencySafe:true` |
-| `code_semantic_edit`（v2） | 结构感知编辑：`rename` / `replace_node` / `replace_subtree` | 协作工具，`isConcurrencySafe:false` |
+| `code_semantic_edit`（v2） | 结构感知编辑：`rename` / `replace_node` / `replace_subtree`（批量） | 协作工具，`isConcurrencySafe:false` |
 
 权限 key：导航类用 `code`（或复用 `read`）；`code_semantic_edit` 用 `edit`。
 
 `code_semantic_edit` 的隔离性保证（"编辑前校验隔离性"）：
-- `rename`：仅替换精确的 AST 标识符 token 范围（声明 + 引用 + import 源名；含对象简写、export 说明符），字符串/注释中的同名文本与 `obj.x` 属性访问一律不触碰；支持 `export { foo as bar }`、`import { X as Y }` 等别名场景。
+- `rename`：仅替换精确的 AST 标识符 token 范围（声明 + 引用 + import 源名；含对象简写、export 说明符），字符串/注释中的同名文本与 `obj.x` 属性访问一律不触碰；支持 `export { foo as bar }`、`import { X as Y }` 等别名场景；`scope` 子目录白名单可在扫描根 path 下限定改名只作用于指定子路径内的文件（控制爆炸半径）。
 - `replace_node`：按行列范围圈选，自动吸附到最小包含 AST 节点替换（`relation: exact|contains|inner`）；整行替换顺带消费行尾换行。
-- `replace_subtree`：按成员链选择器（如 `config.server.host`）定位 topmost 子表达式替换；排除更长成员链里的子链，避免误伤。
+- `replace_subtree`：按成员链选择器（如 `config.server.host`）定位 topmost 子表达式替换；排除更长成员链里的子链，避免误伤；`path` 支持目录，按选择器批量替换所有匹配文件（输出逐文件 `files[]`）。
 - 全部文件先在内存中完成变换并 `tryParse` 重解析校验结构完整性，任一失败整体放弃、不落盘；
 - `dryRun` 可预览计划位点与替换后内容。
 
@@ -65,6 +65,8 @@
 7. ✅ 全量 `typecheck` + `test`（code-intel 31、cli 163 全过）；更新 development-log（续 62/63/64）。
 8. ✅（v2）`code_semantic_edit` `replace_subtree`：成员链选择器定位 topmost 子表达式替换（含下标/非纯成员链拒绝、精确匹配排除嵌套子链、dryRun 预览）。
 9. ✅ 全量 `typecheck` + `test`（code-intel 37 全过）；更新 development-log（续 65）。
+10. ✅（v2）`rename` 加 `scope` 子目录白名单限定；`replace_subtree` `path` 支持目录批量替换（输出重构为逐文件 `files[]`）。
+11. ✅ 全量 `typecheck` + `test`（code-intel 43 全过）；更新 development-log（续 66）。
 
 ## 8. 相关文档
 
