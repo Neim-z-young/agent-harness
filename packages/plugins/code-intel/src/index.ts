@@ -34,6 +34,8 @@ import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
+import { extractMulti, MULTI_EXT } from './multi'
+
 // ===== 数据类型 =====
 
 export type SymbolKind = 'function' | 'class' | 'variable' | 'interface' | 'type' | 'enum' | 'import'
@@ -99,7 +101,9 @@ export interface CodeIntelOptions {
 
 // ===== 索引核心 =====
 
-const SUPPORTED_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'])
+const BABEL_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts', '.mjs', '.cjs'])
+// 支持的全部扩展名 = babel(TS/JS) + tree-sitter(Go/Python/Rust)
+const SUPPORTED_EXT = new Set([...BABEL_EXT, ...MULTI_EXT])
 
 /** 尽力解析：主配置失败时回退更宽松配置，仍失败返回 null（该文件跳过，不中断索引） */
 function tryParse(content: string, file: string): t.File | null {
@@ -372,14 +376,26 @@ export class CodeIntelIndex {
         return cached.data
       }
       const content = await readFile(absPath, 'utf-8')
-      const ast = tryParse(content, absPath)
-      if (!ast) return undefined
       const relativePath = relative(relBase, absPath)
+      let symbols: CodeSymbol[] = []
+      let references: Map<string, CodeReference[]> = new Map()
+      if (BABEL_EXT.has(ext)) {
+        const ast = tryParse(content, absPath)
+        if (!ast) return undefined
+        symbols = extractSymbols(ast, absPath, relativePath)
+        references = extractReferences(ast, absPath, relativePath, content)
+      } else if (MULTI_EXT.has(ext)) {
+        // tree-sitter 后端：Go/Python/Rust 导航（名字命中型引用）；失败降级为「不支持」，不中断
+        const multiResult = await extractMulti(content, absPath, relativePath, ext)
+        if (!multiResult) return undefined
+        symbols = multiResult.symbols
+        references = multiResult.references
+      }
       const data: IndexedFile = {
         path: absPath,
         relativePath,
-        symbols: extractSymbols(ast, absPath, relativePath),
-        references: extractReferences(ast, absPath, relativePath, content),
+        symbols,
+        references,
       }
       this.cache.set(absPath, { stat: { mtimeMs: st.mtimeMs, size: st.size }, data })
       return data

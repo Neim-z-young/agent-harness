@@ -1,5 +1,27 @@
 # Agent Harness 开发日志
 
+## 2026-09-05（续 68）code-intel：换 web-tree-sitter 支持多语言导航
+
+> 承接续 67。为 code_symbols / code_reference / code_definition 补上 Go / Python / Rust 多语言导航能力，采用**双后端**策略：TS/JS 保留 babel（语义引用），Go/Python/Rust 走 web-tree-sitter（名字命中型引用）。语义编辑（rename/replace_*）不扩到非 JS 语言。
+
+### 多语言引擎（src/multi.ts）
+
+* `getMultiParser()`：惰性单例 Parser + `Parser.init()`，预加载三语法 wasm；任一语言失败只降级该语言，不整包失败（返回 null 由上层跳过、不中断索引）。
+* `GRAMMAR` 映射 `.go/.py/.rs` → 各 `tree-sitter-*` 包的 wasm，经 `createRequire.resolve` 定位。校验了包内 wasm 文件全部就位（`web-tree-sitter.wasm` / 三语言 `*.wasm`）。
+* `extractMulti(content, filePath, relativePath, ext)`：`parser.parse`（返回值可为 null，取 `tree.rootNode`）→ 各语言提取器产出 `CodeSymbol[]` + 名字命中型 `CodeReference[]`。
+  * **Python**（pythonSymbols）：函数/异步函数/类；import_statement / import_from_statement（name 字段，带别名时含 `json as js`）；assignment / augmented_assignment 的标识符左目标（排除 self/cls）→ variable。
+  * **Go**（goSymbols）：function_declaration / method_declaration / method_spec → function；type_spec → struct_type 为 class / interface_type 为 interface / 其余 type；const_spec / var_spec → variable；import_spec 取别名或裸串。
+  * **Rust**（rustSymbols）：function_item / struct_item / enum_item / trait_item / type_item / const_item / static_item 按 `KIND_BY_TYPE` 映射；use_declaration 取 `name` 末段 → import。
+  * 引用为 token 文本命中 + 排除声明 name 节点的集合式匹配（tree-sitter 无作用域绑定，故非语义级；babel 语义引用不受影响）。
+
+### 后端分派（src/index.ts）
+
+* `SUPPORTED_EXT` = babel 扩展 ∪ `MULTI_EXT(.go/.py/.rs)`；`indexFile` 按扩展名分派到 babel（`BABEL_EXT`）或 tree-sitter（`extractMulti`），失败降级为「不支持」，不中断索引。
+
+### 测试
+
+* 新增「多语言导航（tree-sitter）」块 6 用例：Py 符号（函数/类/变量/导入 + 行号）、Py 名字命中型引用（排除声明处）、Go 符号（函数/方法/struct→class/interface/变量/导入）、Rust 符号（fn/struct/trait/enum/const + 引用）、目录聚合（babel(.ts)+Py+Go 合并）、编辑隔离（对 .py rename 报 SYMBOL_NOT_FOUND 且不落盘）。全仓 code-intel 54 用例全过、typecheck 通过。插件 version 0.7.0，meta 描述补多语言双后端标注。
+
 ## 2026-09-05（续 67）code-intel v2：rename 跨目录全局反向 import 解析
 
 > 承接续 66。解决 import 反向查找：当符号定义在扫描根内、但被根之外的文件 `import { symbol } from '...'` 使用时，重新命名能同步外部导入方，避免改名字不一致。

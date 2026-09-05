@@ -148,6 +148,109 @@ describe('CodeIntelIndex', () => {
   })
 })
 
+describe('多语言导航（tree-sitter: Go/Python/Rust）', () => {
+  it('Python 符号提取：函数/类/变量/导入 + 位置', async () => {
+    const file = join(dir, 'app.py')
+    writeFileSync(
+      file,
+      `import os\nimport json as js\n\nUSE = 5\nconst_val = USE + 1\n\ndef helper(a, b):\n    return a + b\n\nclass Point:\n    def __init__(self, x, y):\n        self.x = x\n`,
+    )
+    const index = new CodeIntelIndex()
+    const symbols = await index.symbols(file, dir)
+    const names = symbols.map((s) => `${s.kind}:${s.name}`)
+    expect(names).toContain('import:os')
+    expect(names).toContain('import:json as js') // 带别名时 name 字段含 `json as js`
+    expect(names).toContain('variable:USE')
+    expect(names).toContain('variable:const_val')
+    expect(names).toContain('function:helper')
+    expect(names).toContain('class:Point')
+
+    const helper = symbols.find((s) => s.name === 'helper')!
+    expect(helper.line).toBe(7)
+    expect(helper.file).toBe(file)
+    expect(helper.relativePath).toBe('app.py')
+  })
+
+  it('Python 名字命中型引用：跨调用点收集，排除声明处', async () => {
+    writeFileSync(join(dir, 'app.py'), `def helper(a):\n    return a\n\nUSE = helper(1) + helper(2)\n`)
+    const index = new CodeIntelIndex()
+    await index.load(join(dir, 'app.py'), dir)
+    const refs = index.allReferences('helper')
+    expect(refs.length).toBe(2)
+    for (const r of refs) {
+      expect(r.name).toBe('helper')
+      expect(r.relativePath).toBe('app.py')
+    }
+  })
+
+  it('Go 符号提取：函数/方法/struct/interface/变量/导入', async () => {
+    const file = join(dir, 'main.go')
+    writeFileSync(
+      file,
+      `package main\n\nimport (\n\t"fmt"\n\t"example.com/x"\n)\n\nconst Max = 100\nvar count = 0\n\ntype Point struct {\n\tX int\n}\n\ntype Shape interface {\n\tArea() float64\n}\n\nfunc NewPoint(x, y int) *Point {\n\treturn &Point{x, y}\n}\n\nfunc (p *Point) Move(dx int) {\n\tp.X += dx\n}\n`,
+    )
+    const index = new CodeIntelIndex()
+    const symbols = await index.symbols(file, dir)
+    const names = symbols.map((s) => `${s.kind}:${s.name}`)
+    expect(names).toContain('variable:Max')
+    expect(names).toContain('variable:count')
+    expect(names).toContain('class:Point')   // struct_type → class
+    expect(names).toContain('interface:Shape')
+    expect(names).toContain('function:NewPoint')
+    expect(names).toContain('function:Move') // method_declaration → function
+    // import_spec 取别名或裸串
+    expect(names).toContain('import:fmt')
+  })
+
+  it('Rust 符号提取：fn/struct/trait/enum/const + 引用', async () => {
+    const file = join(dir, 'lib.rs')
+    writeFileSync(
+      file,
+      `const MAX: usize = 100;\n\nstruct Point {\n    x: i32,\n}\n\ntrait Draw {\n    fn render(&self);\n}\n\nenum Color {\n    Red,\n}\n\nfn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\nfn call() -> i32 {\n    let r = add(1, 2);\n    r + MAX as i32\n}\n`,
+    )
+    const index = new CodeIntelIndex()
+    const symbols = await index.symbols(file, dir)
+    const names = symbols.map((s) => `${s.kind}:${s.name}`)
+    expect(names).toContain('variable:MAX')  // const_item → variable
+    expect(names).toContain('class:Point')   // struct_item → class
+    expect(names).toContain('interface:Draw') // trait_item → interface
+    expect(names).toContain('enum:Color')
+    expect(names).toContain('function:add')
+
+    // 引用：add 被 call 引用（非声明处）
+    await index.load(file, dir)
+    const refs = index.allReferences('add')
+    expect(refs.some((r) => r.context.includes('add(1, 2)'))).toBe(true)
+  })
+
+  it('目录聚合：babel(.ts) 与 tree-sitter(.py/.go) 符号合并', async () => {
+    mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'export function tsFn() {}\n')
+    writeFileSync(join(dir, 'src', 'b.py'), 'def pyFn():\n    return 1\n')
+    writeFileSync(join(dir, 'src', 'c.go'), 'package p\n\nfunc goFn() {}\n')
+    const index = new CodeIntelIndex()
+    const symbols = await index.symbols(join(dir, 'src'), dir)
+    const names = symbols.map((s) => s.name)
+    expect(names).toContain('tsFn')
+    expect(names).toContain('pyFn')
+    expect(names).toContain('goFn')
+  })
+
+  it('编辑隔离：对 .py 文件 rename 报 SYMBOL_NOT_FOUND，不落盘、不崩溃', async () => {
+    const f = join(dir, 'app.py')
+    writeFileSync(f, 'def helper(a):\n    return a\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'helper', to: 'h2', path: 'app.py' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    // tree-sitter 语言不支持语义编辑 → 找不到 babel 声明
+    expect(res.error!.code).toBe('SYMBOL_NOT_FOUND')
+    expect(require('node:fs').readFileSync(f, 'utf-8')).toContain('def helper')
+  })
+})
+
 describe('code_symbols 工具', () => {
   it('列出文件符号（含 kind/line/signature）', async () => {
     writeFileSync(join(dir, 'a.ts'), 'export function greet(name: string) {}\n')
