@@ -13,14 +13,15 @@
  * WASM 定位注意：运行时依赖 node_modules 相对路径（createRequire 解析语法 wasm；
  * web-tree-sitter 的 tree-sitter.wasm 经 ESM 内部 new URL(import.meta.url) 解析）。
  *
- * 单二进制打包（内联字节）：bun 1.3.14 无法经导入查询内联二进制，特提供**环境变量注入**——
- * 构建打包时把某语言 wasm 转 base64 写入其对应 env（见 `ENV_B64`），运行时优先进 `Language.load(bytes)`
- * （Uint8Array），无需 node_modules 落盘；未注入则回退磁盘 `createRequire.resolve` 读取（dev/测试路径）。
+ * 单二进制打包（import.meta.url 相对定位 + 显式复制）：参考 web-tree-sitter 自身加载
+ * `tree-sitter.wasm` 的做法（ESM 内 `new URL(import.meta.url)`）。构建脚本
+ * `scripts/copy-grammars.mts` 把三个语法 wasm 复制到产物目录（dist/），运行时 `new URL(file, import.meta.url)`
+ * 相对模块位置解析即可命中，无需 node_modules 落盘；未命中再回退 `createRequire.resolve`（dev/测试路径）。
  */
 
 import { createRequire } from 'node:module'
-import { Buffer } from 'node:buffer'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import type { Node, Parser as TSParser } from 'web-tree-sitter'
 import type { CodeSymbol, SymbolKind, CodeReference } from './index'
 
@@ -40,33 +41,34 @@ const GRAMMAR = {
   '.rs': 'tree-sitter-rust/tree-sitter-rust.wasm',
 } as const
 
-/** 各语言内联字节注入的环境变量（值 = 该语言 wasm 的 base64；单二进制打包时注入） */
-const ENV_B64 = {
-  '.go': 'HARNESS_GRAMMAR_B64_GO',
-  '.py': 'HARNESS_GRAMMAR_B64_PY',
-  '.rs': 'HARNESS_GRAMMAR_B64_RS',
+/** 定位于本模块同目录的语法 wasm 文件名（构建脚本复制产物，见 `scripts/copy-grammars.mts`） */
+const WASM_FILE = {
+  '.go': 'tree-sitter-go.wasm',
+  '.py': 'tree-sitter-python.wasm',
+  '.rs': 'tree-sitter-rust.wasm',
 } as const
+
+/** 文档：与多语言引擎取同一模块目录，供构建脚本/测试推导复制位置 */
+export const GRAMMAR_SRC = GRAMMAR
 
 /**
  * 读取某语言语法字节（Uint8Array，供 `Language.load(bytes)`）：
- * 1) 优先取对应 env 的内联 base64（单二进制打包/无 node_modules 场景）；
- * 2) 回退从 node_modules 磁盘读取（dev/测试路径）。
+ * 1) 相邻产物复制：`new URL(WASM_FILE[ext], import.meta.url)` 相对模块定位（对齐 web-tree-sitter 自身做法）。
+ *    构建产物目录（dist/）旁即复制好的 wasm，命中即用；
+ * 2) 回退 node_modules 磁盘读取（dev/测试路径）。
  * 均失败返回 null（由上层降级为「不支持」）。
  */
 export function readGrammarBytes(ext: string): Uint8Array | null {
   const slug = ext as keyof typeof GRAMMAR
   if (!GRAMMAR[slug]) return null
-  // 1) env 内联字节
-  const envKey = ENV_B64[slug]
-  const b64 = process.env[envKey]
-  if (b64) {
-    try {
-      return Uint8Array.from(Buffer.from(b64, 'base64'))
-    } catch {
-      // base64 非法 → 落到磁盘回退
-    }
+  // 1) 产物相邻复制
+  try {
+    const collocated = fileURLToPath(new URL(WASM_FILE[slug], import.meta.url))
+    if (existsSync(collocated)) return readFileSync(collocated)
+  } catch {
+    // new URL / 转换失败 → 落到磁盘回退
   }
-  // 2) 磁盘回退
+  // 2) 磁盘回退（dev/测试）
   try {
     const wasmPath = req.resolve(GRAMMAR[slug])
     return readFileSync(wasmPath)

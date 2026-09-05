@@ -1,6 +1,23 @@
 # Agent Harness 开发日志
 
-## 2026-09-05（续 69）code-intel：多语言 wasm 支持内联字节（适配单二进制打包）
+## 2026-09-06（续 70）code-intel：多语言 wasm 显式复制到产物（import.meta.url 相对定位）
+
+> 更正续 69 实现。用户指定对齐 web-tree-sitter 自身做法：ESM 内 `new URL('tree-sitter.wasm', import.meta.url)` 相对模块目录定位，构建脚本把三个语法 wasm **显式复制**到产物目录，运行时 `Language.load(bytes)` 命中相邻文件即可、无需 node_modules 落盘。弃用续 69 的 env base64 注入方案。
+
+### 相邻产物复制（src/multi.ts + scripts/copy-grammars.mts）
+
+* `WASM_FILE`：`.go/.py/.rs` → `tree-sitter-{go,python,rust}.wasm` 文件名（定位于本模块同目录）。
+* `readGrammarBytes(ext)` 来源优先级：
+  1) **相邻产物**：`fileURLToPath(new URL(WASM_FILE[ext], import.meta.url))` 相对模块定位，命中即用（对齐 web-tree-sitter 自身）；
+  2) **磁盘回退**：`createRequire.resolve` + `readFileSync`（dev/测试路径）。
+* `languageFor` 保持 `Language.load(bytes)`（Uint8Array），同一 API 兼容两来源。
+* 新增 `scripts/copy-grammars.mts`：`createRequire.resolve` 定位三个 node_modules 语法 wasm，`copyFileSync` 复制到 `dist/`（缺省出参 `process.argv[2]`），`build` 脚本前置执行。dist 已 gitignore。
+
+### 测试与版本
+
+* 用例改为「相邻产物复制优先 + node_modules 回退」：无相邻文件时回退校验字节长度、放置相邻文件后校验字节一致。工作区全量 452 用例全过、typecheck 通过。插件 version 0.9.0。
+
+## 2026-09-06（续 69）code-intel：多语言 wasm 支持内联字节（适配单二进制打包）
 
 > 承接续 68。解决「语法 wasm 依赖 node_modules 落盘文件、单二进制打包后路径失效」的问题。经实测 bun 1.3.14 无法经导入查询（`?arraybuffer`/`?raw`/import attribute）无损内联二进制，转用**环境变量注入**（方案3）：运行时优先进 `Language.load(bytes)` 用内联 Uint8Array，未注入则回退磁盘读取。
 
