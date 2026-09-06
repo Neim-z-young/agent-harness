@@ -1,5 +1,20 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 75）code-intel：语义编辑方向决策（搁置多语言扩展，保留导航）
+
+> 调研 Serena（oraios/serena，MIT，~24k stars）后定方向。Serena 是标准 MCP 分发、以 LSP（pyright/gopls/jdtls/rust-analyzer 等 40+ 语言服务器）驱动**真作用域/类型感知**的语义能力，工具集（`find_symbol` / `find_referencing_symbols` / `rename_symbol` / `replace_symbol_body` / `safe_delete`）与本项目 `code_symbols` / `code_reference` / `code_definition` / `code_semantic_edit` 目标重叠。
+
+### 结论：停止扩展，保留导航
+
+* 本项目语义编辑基于本地 AST（babel + tree-sitter），tree-sitter 无作用域绑定，rename 为**同名 token 弱语义**，精度天然弱于 LSP；继续扩展到 Kotlin/PHP 需为每语言固化 descriptor + 补测试，只为达成弱于 LSP 的效果，性价比低。
+* code-intel 的差异化不在语义编辑精度，而在**零外部依赖、wasm 全内嵌、可单二进制部署**的轻量能力；重型语义编辑场景可由外部标准 MCP（如 Serena）按需接入，符合插件化定位。
+* 已提交的 Java 语义编辑（续 72/73/74）保留为**离线兜底**能力，不回退。
+* 本次会话未提交的多语言 LanguageEditDriver 重构（`languages.ts`、`core.ts`/`multi.ts`/`index.test.ts`/`package.json`/`bun.lock` 的 Kotlin/PHP 扩展及探针）已全部 `git restore` 回滚到 `af7bae4`，新增文件删除，工作区干净（code-intel 73 用例全绿，typecheck 通过）。
+
+### 后续可选方向
+
+* 需重型语义能力时，把 Serena 作为可选 MCP 外部 server 接入 harness（标准 MCP，cheap），不内置复刻。
+
 ## 2026-09-06（续 74）code-intel：Java 反向 import 跨目录解析
 
 > 承接续 73。`code_semantic_edit` rename 的 `resolveImporters` 从仅覆盖 TS/JS 扩展到 Java：把 scope 外、但通过 `import <pkg>.<symbol>` 引用声明方符号的外部导入方一并纳入改名。

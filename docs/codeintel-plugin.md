@@ -1,6 +1,8 @@
 # codeintel 插件开发规划（`@harness/code-intel`）
 
 > 状态：**v1 + v2 已实现**（2026-09-04/05，见开发日志续 62/63/64/65/66/67）；**v3 Java 语义编辑已接入 rename**（CST token 位点 + 重解析校验，见 §3.2）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
+>
+> **语义编辑边界（续 75 决策）**：语义编辑基于本地 AST（babel + tree-sitter），tree-sitter 无作用域绑定，rename 为**同名 token 弱语义**。已接入的 Java 语义编辑保留为**离线/轻量兜底**；不继续扩展到更多语言（Kotlin/PHP 等）。需要**真作用域/类型感知**的重型语义能力（跨文件精确 rename、move、inline、类型层次）时，改为以**外部标准 MCP server（如 Serena）**按需接入，不内置复刻（详见开发日志续 75）。
 
 ## 1. 定位与目标
 
