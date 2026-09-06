@@ -1,5 +1,22 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 76）开发方向核实：同步 3 处「已实现但文档未同步」留痕
+
+> 盘点剩余开发方向时发现历史日志中有「已实现但文档仍标待办」的遗漏，经代码核验后在本期同步标注。均为文档留痕，不改业务代码。
+
+### 核实结论
+
+* **快照自动集成（原「后续待办」）——已实现**：cli 启动时把 `snapshotService` 注入 AgentRuntime 的 snapshot factory（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1305)）；core `AgentRuntimeImpl.captureForMessage()` 在 `query`/`queryStream` 主循环开始时 `capture()` 并把 `{ start, files }` 挂到 assistant 消息 `meta.snapshot`（[core/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts)），`core.test.ts` 已有单测覆盖。
+* **基于 caller.permission 过滤子 Agent —— 已实现**：subagent `isAgentDenied` / `filterAccessibleAgents` 已接入 `/subagents` 命令，按父 Agent 权限隐藏不可用子 Agent。
+* **配置文件加载 Agent —— 已实现**：core 经 `agentDirs`（user → project）多级目录加载 Agent 定义并支持同名覆盖（`core.test.ts` 覆盖）。
+* 以上三处本期在本文件同步为「已完成」，并在下方「剩余待办」表格对应行补 ✅。
+
+### 真正 still-open 的方向（本期不实现）
+
+* **OAuth2 PKCE／MCP OAuth 授权**：mcp-client 当前仅支持 `bearerToken`/自定义 Authorization header，无授权码流程/PKCE/token 刷新。
+* **TUI/REPL 多行输入**：CLI 走 readline 单行 `'line'` 事件，无多行输入组件。
+* **Subagent git worktree 隔离**：子代理在独立 git worktree 中执行以避免与父会话写冲突，目前仅注释提及、未实现。
+
 ## 2026-09-06（续 75）code-intel：语义编辑方向决策（搁置多语言扩展，保留导航）
 
 > 调研 Serena（oraios/serena，MIT，~24k stars）后定方向。Serena 是标准 MCP 分发、以 LSP（pyright/gopls/jdtls/rust-analyzer 等 40+ 语言服务器）驱动**真作用域/类型感知**的语义能力，工具集（`find_symbol` / `find_referencing_symbols` / `rename_symbol` / `replace_symbol_body` / `safe_delete`）与本项目 `code_symbols` / `code_reference` / `code_definition` / `code_semantic_edit` 目标重叠。
@@ -2057,7 +2074,7 @@ Provider 已惰性加载（续 26 / 续 27），但 help 只静态硬编码示�
 
 * 测试：10 用例全绿（stage 回滚 + 事件 / snapshotMap 覆盖 / 错误路径 / clear 撤销 / commit 接受 / 重复 stage 沿用 original / 挂载与收集辅助）；typecheck 通过
 
-* 后续待办：AgentRuntime query 开始时自动 capture + attachSnapshotToMessage（core 集成）
+* ✅ 已实现（core 集成，见续 76）：AgentRuntime query 开始时自动 capture + attachSnapshotToMessage——cli 注入 `snapshotService` factory（[cli/src/index.ts](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L1305)），core `captureForMessage()` 在 query/queryStream 主循环开始时 capture 并把 `meta.snapshot` 挂到 assistant 消息，`core.test.ts` 覆盖。
 
 ## 2026-08-24（续）：Snapshot 调研 + `@harness/snapshot` 包骨架
 
@@ -2851,8 +2868,8 @@ CLI 斜杠命令：
 | ---------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ | -- |
 | **P2**     | ~~Subagent 实时进度推送（Bus 事件）~~   | ~~子 Agent 执行过程中通过 Bus 发布进度事件（工具调用开始/结束、中间文本），父 Agent / CLI 可订阅展示~~ ✅ 完成（08-23，3 个事件：started/completed/failed + 10 个单元测试） | ✅  |
 | **P2**     | ~~Subagent 工具调用摘要~~           | ~~子 Agent 内部工具调用链过长时生成摘要后返回父 Agent，避免上下文膨胀~~ ✅ 完成（08-23，summarizeResult + 8 个单元测试）                                       | ✅  |
-| **P2**     | 基于 caller.permission 过滤 Agent | 根据调用者（父 Agent / 用户）的权限动态过滤可用子 Agent 列表，权限不足的子 Agent 不在 `/subagents` 列出                                                   | 待做 |
-| **P2**     | 配置文件加载 Agent                  | 从配置文件（如 `.harness/agents.yaml` 或 `harness.config.ts`）加载 Agent 定义，支持运行时动态注册子 Agent                                        | 待做 |
+| **P2**     | 基于 caller.permission 过滤 Agent | 根据调用者（父 Agent / 用户）的权限动态过滤可用子 Agent 列表，权限不足的子 Agent 不在 `/subagents` 列出 ✅ 已实现（`/subagents` 经 `filterAccessibleAgents`/`isAgentDenied`） | ✅ | 
+| **P2**     | 配置文件加载 Agent                  | 从配置文件（如 `.harness/agents.yaml` 或 `harness.config.ts`）加载 Agent 定义，支持运行时动态注册子 Agent ✅ 已实现（core 经 `agentDirs` user→project 多级目录加载 + 覆盖）  | ✅ |
 | **P2**     | Skill Layer                   | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project）                                                                   | 待做 |
 | **~~P2~~** | ~~Provider 补全~~               | ~~Gemini / 通义 / 智谱 等多模型适配~~ ✅ 完成（08-23，Gemini 独立实现 + Qwen/GLM 复用 OpenAIChatProvider）                                     | ✅  |
 | **P3**     | Subagent run\_in\_background  | 子 Agent 后台异步执行，父 Agent 不阻塞等待，通过 Bus 事件或轮询获取结果                                                                            | 待做 |
