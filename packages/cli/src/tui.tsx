@@ -91,7 +91,7 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
   { key: '◀ / ▶', desc: '侧栏模块切换（输入为空时）' },
   { key: 'Enter', desc: '输入框内换行；列表/菜单中确认选中' },
-  { key: '⌘ / Meta+Enter', desc: '提交输入' },
+  { key: 'Alt/Meta+Enter', desc: '提交输入' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
   { key: '/help', desc: '查看特殊命令' },
 ]
@@ -1259,9 +1259,12 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         {helpOpen && (
           <box style={{ border: true, padding: 1, maxHeight: 12 }}>
             {HELP_LINES.map((l) => (
-              <text key={l.key} attributes={createTextAttributes({ dim: true })} wrapMode="word">
-                {l.key.padEnd(18)}{l.desc}
-              </text>
+              <box flexDirection="row" key={l.key} minHeight={1}>
+                <box width={20}>
+                  <text attributes={createTextAttributes({ dim: true })}>{l.key}</text>
+                </box>
+                <text attributes={createTextAttributes({ dim: true })} wrapMode="word">{l.desc}</text>
+              </box>
             ))}
           </box>
         )}

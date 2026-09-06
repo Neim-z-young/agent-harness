@@ -15,6 +15,11 @@
 
 * `tui.test.tsx`：新增 `pressMetaEnter` 辅助（`pressEnter({ meta: true })`），既有「键入后提交」类用例统一升级为 Meta+Enter；新增 3 条：① 命令输入（`/stats`/`/exit`）改 Meta+Enter 提交命令文本（不依赖菜单时序）；② 命令菜单 `/` 前缀展开后普通 Enter 选中首个候选提交；③ 多行输入 Enter 换行不提交、Meta+Enter 提交整段；④ 粘贴换行文本（`pasteBracketedText`）保留并提交。tui.test.tsx 71 用例全过，cli 全量 166 通过，全仓 typecheck 通过。
 
+### 后记修复：Ctrl-? 帮助面板乱码 / 对齐 / 换行异常
+
+* 新增的提交键位行含特殊字符 `⌘`（U+2318），多数终端字体渲染为豆腐块乱码；且 `l.key.padEnd(18)` 按 JS 字符数对齐，遇 `↑ ↓ ◀ ▶` 等非 ASCII 箭头（渲染列宽≠字符数）时各 key 行 desc 起始列错位 → 换行/对齐不对。
+* 修复：键位文案 `⌘ / Meta+Enter` → `Alt/Meta+Enter`（纯 ASCII，消除乱码）；帮助面板渲染由 `padEnd` 拼接改两列固定宽度布局（key 列 `width:20` + desc 列 `wrapMode:"word"`），desc 起始列不再受 key 字符宽度影响。tui 71 用例全过。
+
 ## 2026-09-06（续 76）开发方向核实：同步 3 处「已实现但文档未同步」留痕
 
 > 盘点剩余开发方向时发现历史日志中有「已实现但文档仍标待办」的遗漏，经代码核验后在本期同步标注。均为文档留痕，不改业务代码。
