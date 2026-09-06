@@ -910,18 +910,14 @@ describe('code_semantic_edit replace_subtree 模式', () => {
 })
 
 describe('createCodeIntelPlugin', () => {
-  it('装配注入四个代码情报工具', async () => {
+  it('装配为纯 MCP server（对齐 computer-use，不直装 harness 工具）', async () => {
     const plugin = createCodeIntelPlugin() as AgentPlugin
     expect(plugin.id).toBe('code-intel')
+    expect(plugin.dependsOn).toContain('mcp.server-registry')
 
-    const pool = { added: [] as unknown[] }
     const hooks = await plugin.install({ log: { info() {}, warn() {}, error() {}, debug() {} } } as any)
-    await (hooks as any)['tool.pool.assemble']({ agentId: 'default' }, {
-      add: (t: unknown) => (pool.added as unknown[]).push(t),
-    })
-
-    const ids = pool.added.map((t) => (t as { id: string }).id).sort()
-    expect(ids).toEqual(['code_definition', 'code_reference', 'code_semantic_edit', 'code_symbols'])
+    // 纯 MCP 装配：不产生 tool.pool.assemble 直装工具，能力只在 mcp-server-registry 连接后以 mcp__code-intel__* 暴露
+    expect((hooks as any)['tool.pool.assemble']).toBeUndefined()
   })
 
   it('支持忽略目录/文件数上限配置透传', () => {
@@ -933,19 +929,25 @@ describe('createCodeIntelPlugin', () => {
 })
 
 describe('meta 元信息', () => {
-  it('code-intel 四个工具均有静态元信息（只读/可写、并发安全、权限键齐全）', () => {
+  it('code-intel 四个 MCP 工具均有静态元信息（mcp__code-intel__ 前缀，只读/可写、并发安全、权限键齐全）', () => {
     const ids = CODE_INTEL_TOOL_META.map((m) => m.id).sort()
-    expect(ids).toEqual(['code_definition', 'code_reference', 'code_semantic_edit', 'code_symbols'])
+    expect(ids).toEqual([
+      'mcp__code-intel__code_definition',
+      'mcp__code-intel__code_reference',
+      'mcp__code-intel__code_semantic_edit',
+      'mcp__code-intel__code_symbols',
+    ])
     for (const m of CODE_INTEL_TOOL_META) {
+      expect(m.id.startsWith('mcp__code-intel__')).toBe(true)
       expect(m.description.length).toBeGreaterThan(0)
     }
-    const readTools = CODE_INTEL_TOOL_META.filter((m) => m.id !== 'code_semantic_edit')
+    const readTools = CODE_INTEL_TOOL_META.filter((m) => m.id !== 'mcp__code-intel__code_semantic_edit')
     for (const m of readTools) {
       expect(m.isReadOnly).toBe(true)
       expect(m.isConcurrencySafe).toBe(true)
       expect(m.permissionKey).toBe('read')
     }
-    const edit = CODE_INTEL_TOOL_META.find((m) => m.id === 'code_semantic_edit')!
+    const edit = CODE_INTEL_TOOL_META.find((m) => m.id === 'mcp__code-intel__code_semantic_edit')!
     expect(edit.isReadOnly).toBe(false)
     expect(edit.isConcurrencySafe).toBe(false)
     expect(edit.permissionKey).toBe('edit')

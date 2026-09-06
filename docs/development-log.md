@@ -11,9 +11,16 @@
 * **`tools.ts`**：薄适配层，把 `core.ts` 能力适配为 `@harness/tool` 的 Tool（同 id），保留只读/并发安全/权限键声明，供 REPL `/tools` 展示与既有测试兼容。
 * **`index.ts`**：插件入口 `createCodeIntelPlugin` 装配方式对齐 computer-use（可插拔 / 独立装卸）——`install` 钩子内用 `registerMcpServer({ name, createTransport })` 注册进程内 server（同名覆盖、幂等）、`uninstall` 注销（`unregisterMcpServer`）；同时经 `tool.pool.assemble` 注入直装工具；`dependsOn: ['mcp.server-registry']`；重导出 core/tools/server 公共符号。
 
+### 装配方式（.harness/plugins 纯 MCP，可插拔）
+
+* `createCodeIntelPlugin` **改为纯 MCP server 装配**（对齐 computer-use）：install 只 `registerMcpServer`，**不再直装 harness 工具**（移除 `tool.pool.assemble`），工具统一由 registry 连接后以 `mcp__code-intel__*` 暴露；core 能力仍可经 `./tools` 薄适配程序化调用。
+* **CLI 派发成 metaOnly**：cli 里 code-intel 内置项与 computer-use 同为 `metaOnly: true`（仅预登记 `mcp__code-intel__*` 元信息供 /tools 展示，不后台预加载实例化）。
+* **`.harness/plugins/mcp.ts` 装配**：加入 `createCodeIntelPlugin()`（与 `createMcpServerRegistryPlugin` / `createComputerUsePlugin` 并列），删除该文件即停用；`meta.ts` 四个工具 id 加 `mcp__code-intel__` 前缀，description 对齐。
+* 新增端到端用例：code-intel + registry 装配 → `harness.start` 连接 → `tool.pool.assemble` 暴露 4 个 `mcp__code-intel__*` 工具且无前缀直装工具不在池中。
+
 ### 测试与版本
 
-* 新增 `server.test.ts` 用例：initialize、tools/list、tools/call 四工具、未知工具/方法走 JSON-RPC 错误码、rename dryRun 不落盘、transport 响应回传与队列，以及 2 条插件装配集成用例（install 后 registry 可见 code-intel 条目 + tool.pool.assemble 注入直装工具；transport 经 `@harness/mcp-client` `McpClient.connect` + `listTools`=4 + `callTool` 可用）。修复 `fail(message, code)` 参数顺序、`resolvePathRelative` 未定义、测试同步等待异步 `tools/call` 响应三类问题。code-intel 包 69 用例全过、typecheck 通过。插件 version 0.11.0。
+* 新增 `server.test.ts` 用例：initialize、tools/list、tools/call 四工具、未知工具/方法走 JSON-RPC 错误码、rename dryRun 不落盘、transport 响应回传与队列，以及 3 条插件装配集成用例（install 后 registry 可见 code-intel 条目 + 纯 MCP 无直装工具；transport 经 `@harness/mcp-client` `McpClient.connect` + `listTools`=4 + `callTool` 可用；端到端 harness.start 连接暴露 `mcp__code-intel__*`）。修复 `fail(message, code)` 参数顺序、`resolvePathRelative` 未定义、测试同步等待异步 `tools/call` 响应三类问题。code-intel 包 70 用例全过、typecheck 通过；cli 95 用例全过。插件 version 0.11.0。
 
 ## 2026-09-06（续 71）code-intel：多语言导航新增 Java
 

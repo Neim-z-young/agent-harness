@@ -30,12 +30,10 @@
  */
 
 import { registerMcpServer, unregisterMcpServer } from '@harness/mcp-server-registry'
-import type { AgentPlugin, Hooks } from '@harness/plugin'
-import type { Tool } from '@harness/tool'
+import type { AgentPlugin } from '@harness/plugin'
 
 import { CodeIntelIndex, type CodeIntelOptions } from './core'
 import { CodeIntelMcpServer, createCodeIntelServerTransport } from './server'
-import { codeSymbolsTool, codeReferenceTool, codeDefinitionTool, codeSemanticEditTool } from './tools'
 
 export * from './core'
 export * from './tools'
@@ -44,50 +42,46 @@ export { CodeIntelMcpServer, createCodeIntelServerTransport, type McpToolDefPara
 export const CODE_INTEL_SERVER_NAME = 'code-intel'
 
 /**
- * 代码情报插件（装配方式对齐 computer-use：可插拔 / 独立装卸）
+ * 代码情报插件（进程内 MCP server，装配方式对齐 computer-use：纯 MCP、可插拔）
  *
- * - install 钩子内注册进程内 MCP server：registry 在 harness.start 时进程内连接，
- *   暴露 `mcp__code-intel__*` 工具（与 harness 解耦，可独立部署 / 跨进程调用）。
- * - 同时把同 id 工具经 tool.pool.assemble 注入（兼容 REPL /tools 与既有测试）。
- * - uninstall 时注销 MCP server 注册，支持装卸。
+ * 通过 `.harness/plugins`（或 user `~/.harness/plugins`）外部插件目录显式装配，
+ * CLI 不做硬编码依赖（code-intel 在 BuiltinPluginRegistry 登记为 metaOnly，仅预登记元信息、
+ * 不自动实例化）。装配后：
+ *
+ * - `install` 钩子内注册进程内 MCP server（registerMcpServer，同名覆盖、幂等）；
+ *   registry 在 harness.start 时进程内连接，把工具暴露为 `mcp__code-intel__*`（与 harness 解耦）。
+ * - 不直装 harness 工具（纯 MCP，对齐 computer-use）；core 能力可经 `./tools` 薄适配程序化调用。
+ * - `uninstall` 注销 MCP server 注册，支持装卸。
+ *
+ * @example
+ * // .harness/plugins/mcp.ts
+ * import { createMcpServerRegistryPlugin } from '@harness/mcp-server-registry'
+ * import { createCodeIntelPlugin } from '@harness/code-intel'
+ * export const plugins = [createMcpServerRegistryPlugin(), createCodeIntelPlugin()]
  *
  * @param options.ignoreDirs 忽略目录名
  * @param options.maxFiles 单次目录索引最大文件数
  * @param options.maxDepth 目录递归最大深度
  */
 export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlugin {
-  const index = new CodeIntelIndex(options)
-  const tools: Tool[] = [
-    codeSymbolsTool(index),
-    codeReferenceTool(index),
-    codeDefinitionTool(index),
-    codeSemanticEditTool(index),
-  ]
-
   return {
     id: 'code-intel',
     version: '0.11.0',
     name: '代码情报',
-    description: '代码情报插件（MCP 解耦版）：code_symbols / code_reference / code_definition / code_semantic_edit（rename|scope/反向import|replace_node|replace_subtree 批量），进程内 MCP server 可插拔装配',
+    description: '代码情报 MCP server 插件（mcp__code-intel__*）：code_symbols / code_reference / code_definition / code_semantic_edit（rename|scope/反向import|replace_node|replace_subtree 批量）',
     dependsOn: ['mcp.server-registry'],
     async install(ctx) {
+      const index = new CodeIntelIndex(options)
       // 注册进程内 MCP server（同名覆盖、幂等）：registry 在 harness.start 进程内连接并暴露 mcp__code-intel__* 工具
       const server = new CodeIntelMcpServer({ index })
       registerMcpServer({
         name: server.serverName,
         createTransport: () => createCodeIntelServerTransport(server),
       })
-      ctx.log.info('code-intel 已注册进程内 MCP server（由 mcp-server-registry 启动连接）', {
+      ctx.log.info('code-intel 已注册进程内 MCP server（由 mcp-server-registry 启动连接，纯 MCP 装配）', {
         mcpServer: server.serverName,
-        tools: tools.map((t) => t.id),
       })
-      return {
-        async 'tool.pool.assemble'(_input, pool) {
-          for (const tool of tools) {
-            ;(pool as { add: (t: unknown) => void }).add(tool)
-          }
-        },
-      } as Hooks
+      return {}
     },
     async uninstall() {
       unregisterMcpServer(CODE_INTEL_SERVER_NAME)
@@ -95,7 +89,7 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
   }
 }
 
-/** 默认导出：代码情报插件常量 */
+/** 默认导出：代码情报插件常量（供 .harness/plugins 直接引用） */
 export const codeIntelPlugin: AgentPlugin = createCodeIntelPlugin()
 
 export default codeIntelPlugin

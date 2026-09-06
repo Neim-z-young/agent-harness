@@ -9,7 +9,7 @@ import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { listRegisteredMcpServers, unregisterMcpServer } from '@harness/mcp-server-registry'
+import { listRegisteredMcpServers, unregisterMcpServer, createMcpServerRegistryPlugin } from '@harness/mcp-server-registry'
 import { McpClient } from '@harness/mcp-client'
 import { CodeIntelMcpServer, createCodeIntelServerTransport } from './server'
 import { createCodeIntelPlugin, CODE_INTEL_SERVER_NAME } from './index'
@@ -130,22 +130,18 @@ describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', ()
     unregisterMcpServer(CODE_INTEL_SERVER_NAME)
   })
 
-  it('install 注册 code-intel 进程内 MCP server（依赖 registry）并注入直装工具', async () => {
+  it('install 注册 code-intel 进程内 MCP server（依赖 registry，纯 MCP 不直装工具）', async () => {
     const plugin = createCodeIntelPlugin()
     expect(plugin.dependsOn).toContain('mcp.server-registry')
     const hooks = await plugin.install({ log: { info() {}, warn() {}, error() {}, debug() {} } } as any)
+
+    // 纯 MCP 装配：不产生 tool.pool.assemble 直装工具
+    expect((hooks as any)['tool.pool.assemble']).toBeUndefined()
 
     // registry 中可见 code-intel server（伴随 harness.start 由 mcp-server-registry 连接）
     const entry = listRegisteredMcpServers().find((r) => r.name === CODE_INTEL_SERVER_NAME)
     expect(entry).toBeDefined()
     expect(entry && 'createTransport' in entry ? (entry as { createTransport: unknown }).createTransport : null).toBeTypeOf('function')
-
-    // 直装工具注入（tool.pool.assemble）
-    const assemble = hooks?.['tool.pool.assemble']
-    expect(assemble).toBeTypeOf('function')
-    const added: string[] = []
-    await (assemble as (...a: unknown[]) => unknown)({} as any, { add: (t: any) => added.push(t.id) } as any)
-    expect(added.sort()).toEqual(['code_definition', 'code_reference', 'code_semantic_edit', 'code_symbols'])
   })
 
   it('transport 对接 McpClient（registry 使用路径）listTools + callTool 可用', async () => {
@@ -163,5 +159,28 @@ describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', ()
     const callResult = await client.callTool('code_symbols', { path: 'src/util.ts' })
     expect(callResult.isError).toBeNull()
     client.close()
+  })
+
+  it('端到端：code-intel + registry 装配后 harness.start 连接，tool.pool.assemble 暴露 mcp__code-intel__*', async () => {
+    const log = { info() {}, warn() {}, error() {}, debug() {} }
+    const codeIntel = createCodeIntelPlugin()
+    await codeIntel.install({ log } as any)
+    const registry = createMcpServerRegistryPlugin()
+    const regHooks = await registry.install({ log } as any)
+
+    // 模拟 harness.start：连接所有已注册进程内 server（含 code-intel）
+    await (regHooks as any)['harness.start']()
+    const pool = { added: [] as unknown[] }
+    await (regHooks as any)['tool.pool.assemble']({} as any, { add: (t: unknown) => (pool.added as unknown[]).push(t) })
+
+    const ids = pool.added.map((t) => (t as { id: string }).id).sort()
+    expect(ids).toEqual([
+      'mcp__code-intel__code_definition',
+      'mcp__code-intel__code_reference',
+      'mcp__code-intel__code_semantic_edit',
+      'mcp__code-intel__code_symbols',
+    ])
+    // 直装无前缀工具不在池中（纯 MCP）
+    expect(ids.some((id) => id === 'code_symbols')).toBe(false)
   })
 })

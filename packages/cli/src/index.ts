@@ -432,13 +432,16 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       load: async () => (await lazyImport<{ toolsMediaPlugin: AgentPlugin }>('@harness/tools-media')).toolsMediaPlugin,
       metaSource: lazyToolMetaSource('@harness/tools-media/meta'),
     })
-    // code-intel：代码情报（AST 符号索引 + 结构感知编辑），工具经 tool.pool.assemble 注入，后台预加载即开箱即用。
+    // code-intel：进程内 MCP server（mcp__code-intel__*），工具经 mcp-client 连接后才可用。
+    // 仅携带 metaSource（/tools 可提前展示），metaOnly=true 使其不被后台预加载实例化——
+    // 需经 .harness/plugins 或 ~/.harness/plugins 外部插件目录装配（createMcpServerRegistryPlugin + createCodeIntelPlugin）。
     defaultBuiltinRegistry.register({
       id: 'code-intel',
       name: 'Code Intel',
-      description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit（AST 符号索引与结构感知编辑）',
+      description: '代码情报 MCP server 插件（mcp__code-intel__*）',
       source: 'builtin',
-      load: async () => (await lazyImport<{ codeIntelPlugin: AgentPlugin }>('@harness/code-intel')).codeIntelPlugin,
+      metaOnly: true,
+      load: async () => (await lazyImport<{ createCodeIntelPlugin: () => AgentPlugin }>('@harness/code-intel')).createCodeIntelPlugin(),
       metaSource: lazyToolMetaSource('@harness/code-intel/meta'),
     })
     // computer-use：进程内 MCP server，工具经 mcp-client 连接后才可用。仅携带 metaSource

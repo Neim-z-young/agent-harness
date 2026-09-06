@@ -362,13 +362,15 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     for (const id of ['read_file', 'write_file', 'bash', 'edit_file']) {
       expect(reg.has(id)).toBe(true)
     }
-    // 覆盖随应用打包的场景化工具插件元信息（search/glob/web/media）+ computer-use
-    for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image', 'mcp__computer-use__list_apps']) {
+    // 覆盖随应用打包的场景化工具插件元信息（search/glob/web/media）+ 进程内 MCP server 插件（computer-use / code-intel）
+    for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image', 'mcp__computer-use__list_apps', 'mcp__code-intel__code_symbols']) {
       expect(reg.has(id)).toBe(true)
     }
-    // metaOnly 插件（computer-use）仅登记元信息，不参与后台预加载实例化
+    // metaOnly 插件（computer-use / code-intel）仅登记元信息，不参与后台预加载实例化
     const cuEntry = getBuiltinRegistry().get('computer-use')!
     expect(cuEntry.metaOnly).toBe(true)
+    const ciEntry = getBuiltinRegistry().get('code-intel')!
+    expect(ciEntry.metaOnly).toBe(true)
     const permByTool: Record<string, string> = {
       web_fetch: 'network', list_dir: 'read', glob: 'read', view_image: 'read',
     }
