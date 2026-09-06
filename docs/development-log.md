@@ -1,5 +1,20 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 72）code-intel：进程内 MCP server 解耦
+
+> 承接续 71。把 code-intel 从"直装 `@harness/tool` 工具"重构为「进程内 MCP server + 直装工具」双路径，核心逻辑与 harness 解耦：索引 / 符号 / 引用 / 定义 / 结构感知编辑引擎下沉到 `core.ts`（零 `@harness/tool` / `@harness/plugin` 依赖），MCP server 由 `@harness/mcp-server-registry` 进程内连接并暴露为 `mcp__code-intel__*` 工具，可独立部署 / 跨进程调用。
+
+### 实现（src 拆分三件套）
+
+* **`core.ts`**：从原 `index.ts` 拆出全部核心逻辑——`CodeIntelIndex`（按需增量 + mtime/size 缓存）、babel 符号/引用提取、tree-sitter 多语言导航入口、`execSemanticEdit`（rename / replace_node / replace_subtree 结构感知编辑引擎）。定义独立契约 `CoreResult` / `ok` / `fail` / `CoreContext`（仅 `cwd`）。
+* **`server.ts`**：进程内 MCP JSON-RPC server（`CodeIntelMcpServer`）——`initialize` / `tools/list` / `tools/call`，四个工具入参支持可选 `cwd`、返回文本（便于 LLM 直接阅读）；`createCodeIntelServerTransport` 包装为 `@harness/mcp-client` 的 `McpTransport`（send 喂给 server、onMessage 回传、提前接收走队列）。
+* **`tools.ts`**：薄适配层，把 `core.ts` 能力适配为 `@harness/tool` 的 Tool（同 id），保留只读/并发安全/权限键声明，供 REPL `/tools` 展示与既有测试兼容。
+* **`index.ts`**：插件入口 `createCodeIntelPlugin` 用 `registerMcpServer({ name, createTransport })` 注册进程内 server（同名覆盖、幂等），同时经 `tool.pool.assemble` 注入直装工具；`dependsOn: ['mcp.server-registry']`；重导出 core/tools/server 公共符号。
+
+### 测试与版本
+
+* 新增 `server.test.ts` 8 用例：initialize、tools/list、tools/call 四工具、未知工具/方法走 JSON-RPC 错误码、rename dryRun 不落盘、transport 响应回传与队列。修复 `fail(message, code)` 参数顺序、`resolvePathRelative` 未定义、测试同步等待异步 `tools/call` 响应三类问题。code-intel 包 67 用例全过、typecheck 通过。插件 version 0.11.0。
+
 ## 2026-09-06（续 71）code-intel：多语言导航新增 Java
 
 > 承接续 70。为 tree-sitter 后端补 Java 支持，与 Go/Python/Rust 同一条链路（名字命中型引用，非语义编辑）。

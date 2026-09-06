@@ -46,6 +46,6 @@ export const CODE_INTEL_TOOL_META: BuiltinToolMeta[] = [
 /** 代码情报工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
 export const toolMetaSource: ToolMetaSource = {
   id: 'code-intel',
-  description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit（rename|反向import|replace_node|replace_subtree 批量）',
+  description: '代码情报插件（MCP 解耦版）：code_symbols / code_reference / code_definition / code_semantic_edit（rename|反向import|replace_node|replace_subtree 批量）',
   list: () => CODE_INTEL_TOOL_META,
 }
