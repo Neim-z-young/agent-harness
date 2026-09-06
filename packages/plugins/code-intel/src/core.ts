@@ -16,7 +16,7 @@ import * as t from '@babel/types'
 import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { collectJavaRenameSites, extractMulti, MULTI_EXT, verifyJavaSource } from './multi'
+import { collectJavaModuleInfo, collectJavaRenameSites, extractMulti, MULTI_EXT, verifyJavaSource } from './multi'
 
 // ===== 数据类型 =====
 
@@ -703,6 +703,7 @@ export class CodeIntelIndex {
   /**
    * 跨目录反向 import 查找：在 reverseRoot 内扫描所有「import { symbol } / export { symbol } from <相对说明符>」
    * 指向 declaringFiles 中任一模块文件的外部导入方，返回这些导入方的 rename 位点。已传入 skip 集合忽略。
+   * Java：按包名匹配——声明方 `package a.b;` + 外部导入方 `import a.b.symbol;`。
    */
   async reverseImporters(
     reverseRoot: string,
@@ -713,9 +714,35 @@ export class CodeIntelIndex {
   ): Promise<Map<string, RenameSite[]>> {
     const { files } = await this.load(reverseRoot, relBase)
     const out = new Map<string, RenameSite[]>()
+    // Java 声明方的包名集合（shape → `a.b`）
+    const javaDeclPkgs = new Set<string>()
+    for (const df of declaringFiles) {
+      if (extname(df).toLowerCase() !== '.java') continue
+      const info = await collectJavaModuleInfo(await readFile(df, 'utf-8'))
+      if (info) javaDeclPkgs.add(info.pkg)
+    }
     for (const f of files) {
       if (skip.has(f.path)) continue
       const content = await readFile(f.path, 'utf-8')
+      // Java 反向 import：`import <declPkg>.<symbol>;` → 整文件纳入
+      if (extname(f.path).toLowerCase() === '.java') {
+        if (javaDeclPkgs.size === 0) continue
+        const info = await collectJavaModuleInfo(content)
+        if (!info) continue
+        let hitDeclaring = false
+        for (const imp of info.imports) {
+          const i = imp.lastIndexOf('.')
+          if (i < 0) continue
+          if (imp.slice(i + 1) === symbol && javaDeclPkgs.has(imp.slice(0, i))) {
+            hitDeclaring = true
+            break
+          }
+        }
+        if (!hitDeclaring) continue
+        const sites = await collectJavaRenameSites(content, symbol)
+        if (sites.length) out.set(f.path, sites)
+        continue
+      }
       const ast = tryParse(content, f.path)
       if (!ast) continue
       let hitDeclaring = false

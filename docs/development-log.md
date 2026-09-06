@@ -1,5 +1,18 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 74）code-intel：Java 反向 import 跨目录解析
+
+> 承接续 73。`code_semantic_edit` rename 的 `resolveImporters` 从仅覆盖 TS/JS 扩展到 Java：把 scope 外、但通过 `import <pkg>.<symbol>` 引用声明方符号的外部导入方一并纳入改名。
+
+### 实现
+
+* **`multi.ts`**：新增 `collectJavaModuleInfo(content)`——解析 Java 文件的 `package a.b;`（取 `scoped_identifier` 命名子节点，非 `name` 字段）与 `import a.b.Symbol;` 完整限定名列表（含 static 导入），供包名匹配。
+* **`core.ts`**：`reverseImporters` 增加 Java 分支——预计算声明方（declaringFiles 中的 `.java` 文件）的包名集合；对每个外部导入方取它的 import 限定名，凡末段 == 符号且前缀 == 任一声明方包名，即用 `collectJavaRenameSites` 将整文件纳入（声明+引用全改）。仅全限定名引用（无 import 绑定）或非本包文件不误拉入。
+
+### 测试与版本
+
+* `index.test.ts` 新增 1 条：声明在 `app/Shape.java`（`package app`，类+构造），scope 设 `app`；scope 外 `consumer/Main.java` 经 `import app.Shape` 引用——`path:'app', resolveImporters:true` 后 `app/Shape.java` 类名/构造器与 `consumer/Main.java` 的 import 说明符/类型/构造引用全改，`importers` 记为 1；同根下仅「全限定名引用、无 import 绑定」的 `other/Other.java` 不被拉入。code-intel 包 73 用例全过，typecheck 通过。插件 version 0.13.0，meta 描述同步。
+
 ## 2026-09-06（续 73）code-intel：Java 语义 rename 接入结构编辑
 
 > 承接续 72。把 Java 从「名字命中型引用」提升为「语义编辑位点」：`code_semantic_edit` 的 rename 现对 `.java` 走 CST 标识符 token 级实现（声明位点精确化 + 引用识别 + 重解析校验），对齐 TS/JS 的 babel 语义 rename。

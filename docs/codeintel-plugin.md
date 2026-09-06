@@ -47,7 +47,9 @@
 - **偏移即字符索引**：web-tree-sitter 已把 UTF-8 字节偏移换算为 JS 字符索引（实测含中文注释时 `startIndex/endIndex` 仍与 `content.slice` 对齐），位点可直接用于替换，无需再字节→字符换算。
 - **结构校验**：rename 落盘前对每个改动文件用 `verifyJavaSource` 重解析（`!root.hasError`），任一失败整体放弃（对齐 TS/JS 的 `tryParse` 校验）。
 
-实现：`multi.ts` 的 `collectJavaRenameSites` / `verifyJavaSource`；`core.ts` 的 `CodeIntelIndex.collectRenameSitesFromScope` 按 `.java` 分派 + `execRename` 校验分支。作用域限定（scope）与 dryRun 预览对 Java 同样生效。
+实现：`multi.ts` 的 `collectJavaRenameSites` / `verifyJavaSource` / `collectJavaModuleInfo`；`core.ts` 的 `CodeIntelIndex.collectRenameSitesFromScope` 按 `.java` 分派 + `execRename` 校验分支 + `reverseImporters` 的 Java 包名匹配分支。作用域限定（scope）与 dryRun 预览对 Java 同样生效。
+
+**反向 import（Java）：** `resolveImporters` 对 Java 按**包名匹配**——`collectJavaModuleInfo` 提取声明方 `package a.b;` 与外部导入方 `import a.b.Symbol;`，凡 import 限定名末段 == 符号且前缀 == 声明方包名，该导入方整文件纳入改名（声明+引用全改）。仅全限定名引用（无 import 绑定）或非本包的开发者不会被误拉入。
 
 ## 4. 注入工具（`tool.pool.assemble`）
 

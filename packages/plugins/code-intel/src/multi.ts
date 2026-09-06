@@ -457,6 +457,42 @@ export interface JavaRenameSite {
   line: number
 }
 
+/** JavaScript 语义编辑（rename）：token 级位点 + 结构校验 ===== */
+
+/** Java 一个文件的包名与显式 import 列表（供跨目录反向 import 解析） */
+export interface JavaModuleInfo {
+  /** `package a.b;` 的完整限定名；缺省包为 '' */
+  pkg: string
+  /** import 说明符的完整限定名列表（如 `java.util.List`、`util.Shape`；含 static 导入） */
+  imports: string[]
+}
+
+/**
+ * 解析 Java 文件的包名与 import 限定名列表。返回 null 表示解析失败或语言不支持。
+ * 反向 import 查找时用它判断某个外部文件的 `import a.b.Symbol` 是否指向本包声明的符号。
+ */
+export async function collectJavaModuleInfo(content: string): Promise<JavaModuleInfo | null> {
+  const root = await parseRoot(content, '.java')
+  if (!root) return null
+  let pkg = ''
+  const imports: string[] = []
+  walkAll(root, (n) => {
+    if (n.type === 'package_declaration') {
+      // `package a.b;` → scoped_identifier 命名子节点即为完整限定名
+      const scoped = n.namedChildren.find(
+        (c) => c.type === 'scoped_identifier' || c.type === 'identifier',
+      )
+      if (scoped) pkg = scoped.text
+    } else if (n.type === 'import_declaration') {
+      const scoped = n.namedChildren.find(
+        (c) => c.type === 'scoped_identifier' || c.type === 'identifier',
+      )
+      if (scoped) imports.push(scoped.text)
+    }
+  })
+  return { pkg: pkg || '', imports }
+}
+
 /** tree-sitter 起始/结束偏移即为 JS 字符索引（web-tree-sitter 已把 UTF-8 字节偏移换算为字符索引），可直接用于 slice/替换 */
 
 /**

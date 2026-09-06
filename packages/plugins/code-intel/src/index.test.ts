@@ -546,6 +546,64 @@ public class Main {
     expect(read('Main.java')).toContain('public Circle build() { return new Circle(); }')
   })
 
+  it('Java 反向 import 跨目录：scope 内声明 + scope 外 import 方（importRoot 内）一并改名，包名匹配', async () => {
+    mkdirSync(join(dir, 'app'))
+    mkdirSync(join(dir, 'consumer'))
+    mkdirSync(join(dir, 'other'))
+    writeFileSync(
+      join(dir, 'app', 'Shape.java'),
+      `package app;
+public class Shape {
+  public Shape() {}
+}
+`,
+    )
+    writeFileSync(
+      join(dir, 'consumer', 'Main.java'),
+      `package consumer;
+
+import app.Shape;
+
+public class Main {
+  Shape s = new Shape();
+  public Shape build(Shape x) { return x; }
+}
+`,
+    )
+    // 无关第三方：仅用全限定名引用（无 import 绑定），不在 scope 内，不应被拉入
+    writeFileSync(
+      join(dir, 'other', 'Other.java'),
+      `package other;
+public class Other {
+  app.Shape q;
+}
+`,
+    )
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'Shape', to: 'Circle', path: 'app', resolveImporters: true },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.validated).toBe(true)
+    expect(out.resolveImporters).toBe(true)
+    // 声明方（app/Shape.java）+ scope 外 import 方（consumer/Main.java）共 2 个文件
+    expect(out.files.length).toBe(2)
+    expect(out.importers?.length).toBe(1)
+    expect(out.importers![0]!.relativePath).toBe('consumer' + require('node:path').sep + 'Main.java')
+    // 声明方：类名 + 构造器
+    expect(read(join('app', 'Shape.java'))).toContain('public class Circle')
+    expect(read(join('app', 'Shape.java'))).toContain('public Circle() {}')
+    // import 方：import 说明符 + 类型/构造引用全改
+    expect(read(join('consumer', 'Main.java'))).toContain('import app.Circle;')
+    expect(read(join('consumer', 'Main.java'))).toContain('Circle s = new Circle()')
+    expect(read(join('consumer', 'Main.java'))).toContain('public Circle build(Circle x)')
+    // 未走反向拉入的第三方（用全限定 app.Shape 而非 import 绑定）不被改动
+    expect(read(join('other', 'Other.java'))).toContain('app.Shape q')
+  })
+
   it('dryRun 只返回计划位点，不落盘', async () => {
     writeFileSync(join(dir, 'a.ts'), 'export function foo() {}\n')
     const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(

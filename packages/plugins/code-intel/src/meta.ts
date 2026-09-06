@@ -43,7 +43,7 @@ export const CODE_INTEL_TOOL_META: BuiltinToolMeta[] = [
   },
   {
     id: `${ID}code_semantic_edit`,
-    description: '结构感知编辑：rename（TS/JS 走 babel、Java 走 tree-sitter 语义位点；支持 scope 子目录限定、resolveImporters 跨目录反向 import）/ replace_node（行列圈选吸附节点）/ replace_subtree（成员链如 config.server.host 精确定位子表达式，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。',
+    description: '结构感知编辑：rename（TS/JS 走 babel、Java 走 tree-sitter 语义位点；支持 scope 子目录限定、resolveImporters 跨目录反向 import 含 Java 包名匹配）/ replace_node（行列圈选吸附节点）/ replace_subtree（成员链如 config.server.host 精确定位子表达式，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。',
     isReadOnly: false,
     isConcurrencySafe: false,
     permissionKey: 'edit',
@@ -53,6 +53,6 @@ export const CODE_INTEL_TOOL_META: BuiltinToolMeta[] = [
 /** 代码情报工具元信息来源（多级加载 L1，抽象契约 ToolMetaSource） */
 export const toolMetaSource: ToolMetaSource = {
   id: 'code-intel',
-  description: '代码情报 MCP server 工具（mcp__code-intel__*）：code_symbols / code_reference / code_definition / code_semantic_edit（rename TS/JS babel + Java tree-sitter 语义、反向import、replace_node、replace_subtree 批量）',
+  description: '代码情报 MCP server 工具（mcp__code-intel__*）：code_symbols / code_reference / code_definition / code_semantic_edit（rename TS/JS babel + Java tree-sitter 语义、反向import 含 Java 包名匹配、replace_node、replace_subtree 批量）',
   list: () => CODE_INTEL_TOOL_META,
 }
