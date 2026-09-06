@@ -1,6 +1,6 @@
 {
   "name": "@harness/code-intel",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "description": "代码情报插件：code_symbols / code_reference / code_definition + code_semantic_edit（rename scope/跨目录反向import/replace_node/replace_subtree 批量）",
   "type": "module",
   "exports": {
@@ -21,6 +21,7 @@
     "@harness/tool": "workspace:*",
     "@types/babel__traverse": "^7.20.6",
     "tree-sitter-go": "^0.25.0",
+    "tree-sitter-java": "^0.23.5",
     "tree-sitter-python": "^0.25.0",
     "tree-sitter-rust": "^0.24.0",
     "web-tree-sitter": "^0.27.0"

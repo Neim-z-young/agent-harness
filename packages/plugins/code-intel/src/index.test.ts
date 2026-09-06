@@ -250,6 +250,85 @@ describe('多语言导航（tree-sitter: Go/Python/Rust）', () => {
     expect(require('node:fs').readFileSync(f, 'utf-8')).toContain('def helper')
   })
 
+  it('Java 符号提取：class/interface/enum/record/方法/构造器/字段/局部变量/导入', async () => {
+    const file = join(dir, 'Main.java')
+    writeFileSync(
+      file,
+      `import java.util.List;
+import static java.lang.Math.max;
+
+public class Main {
+  private int count = 0;
+
+  public Main(int c) { this.count = c; }
+
+  public int add(int a, int b) {
+    int total = a + b;
+    return total + max(a, b);
+  }
+}
+
+interface Shape { double area(); }
+enum Color { RED, BLUE }
+record Point(int x, int y) {}
+`,
+    )
+    const index = new CodeIntelIndex()
+    const symbols = await index.symbols(file, dir)
+    const names = symbols.map((s) => `${s.kind}:${s.name}`)
+    expect(names).toContain('import:List')
+    expect(names).toContain('import:max')   // static 导入取末段
+    expect(names).toContain('class:Main')
+    expect(names).toContain('function:Main') // 构造器 → function
+    expect(names).toContain('function:add')
+    expect(names).toContain('variable:count') // 字段
+    expect(names).toContain('variable:total') // 局部变量
+    expect(names).toContain('interface:Shape')
+    expect(names).toContain('enum:Color')
+    expect(names).toContain('class:Point')   // record → class
+
+    const add = symbols.find((s) => s.name === 'add')!
+    expect(add.line).toBe(9)
+    expect(add.file).toBe(file)
+    expect(add.relativePath).toBe('Main.java')
+  })
+
+  it('Java 引用：类型标识符与方法调用（含声明处排除）', async () => {
+    writeFileSync(
+      join(dir, 'Main.java'),
+      `import java.util.List;
+public class Main {
+  private List<String> items;
+  public void fill(List<String> xs) {
+    this.items = xs;
+    items.add(xs.get(0));
+  }
+}
+`,
+    )
+    const index = new CodeIntelIndex()
+    await index.load(join(dir, 'Main.java'), dir)
+    const refs = index.allReferences('items')
+    // 声明处(items 字段)排除；this.items、items.add 处命中
+    expect(refs.some((r) => r.context.includes('this.items'))).toBe(true)
+    expect(refs.some((r) => r.context.includes('items.add'))).toBe(true)
+  })
+
+  it('目录聚合：babel(.ts) 与 tree-sitter(.py/.go/.java) 符号合并', async () => {
+    mkdirSync(join(dir, 'src'))
+    writeFileSync(join(dir, 'src', 'a.ts'), 'export function tsFn() {}\n')
+    writeFileSync(join(dir, 'src', 'b.py'), 'def pyFn():\n    return 1\n')
+    writeFileSync(join(dir, 'src', 'c.go'), 'package p\n\nfunc goFn() {}\n')
+    writeFileSync(join(dir, 'src', 'd.java'), 'public class J { public void javaFn() {} }\n')
+    const index = new CodeIntelIndex()
+    const symbols = await index.symbols(join(dir, 'src'), dir)
+    const names = symbols.map((s) => s.name)
+    expect(names).toContain('tsFn')
+    expect(names).toContain('pyFn')
+    expect(names).toContain('goFn')
+    expect(names).toContain('javaFn')
+  })
+
   it('相邻产物复制优先 + node_modules 回退（import.meta.url 相对定位）', async () => {
     const { readFileSync, rmSync } = require('node:fs')
     const { resolve } = require('node:path')

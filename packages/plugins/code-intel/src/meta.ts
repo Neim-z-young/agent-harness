@@ -15,14 +15,14 @@ import type { ToolMetaSource } from '@harness/plugin'
 export const CODE_INTEL_TOOL_META: BuiltinToolMeta[] = [
   {
     id: 'code_symbols',
-    description: '列出文件或目录中的代码符号（函数/类/变量/接口/类型/枚举/导入）。基于 AST 解析：TS/TSX/JS/JSX 走 babel，Go/Python/Rust 走 tree-sitter，返回符号名、类型、位置与签名。',
+    description: '列出文件或目录中的代码符号（函数/类/变量/接口/类型/枚举/导入）。基于 AST 解析：TS/TSX/JS/JSX 走 babel，Go/Python/Rust/Java 走 tree-sitter，返回符号名、类型、位置与签名。',
     isReadOnly: true,
     isConcurrencySafe: true,
     permissionKey: 'read',
   },
   {
     id: 'code_reference',
-    description: '查找某符号在代码中的引用（usages，含跨文件）。先索引目标目录（AST 解析），再返回所有使用位置（行/列 + 上下文）；TS/JS 语义引用，Go/Python/Rust 名字命中型引用。',
+    description: '查找某符号在代码中的引用（usages，含跨文件）。先索引目标目录（AST 解析），再返回所有使用位置（行/列 + 上下文）；TS/JS 语义引用，Go/Python/Rust/Java 名字命中型引用。',
     isReadOnly: true,
     isConcurrencySafe: true,
     permissionKey: 'read',

@@ -1,7 +1,7 @@
 /**
  * code-intel 多语言引擎（web-tree-sitter）
  *
- * 双后端导航：TS/JS 走 babel（语义级，见 index.ts）；此处为 Go / Python / Rust 提供
+ * 双后端导航：TS/JS 走 babel（语义级，见 index.ts）；此处为 Go / Python / Rust / Java 提供
  * code_symbols / code_reference / code_definition 所需的结构化信息。
  *
  * 设计约束（见 docs/codeintel-plugin.md）：
@@ -26,7 +26,7 @@ import type { Node, Parser as TSParser } from 'web-tree-sitter'
 import type { CodeSymbol, SymbolKind, CodeReference } from './index'
 
 /** 多语言导航支持的扩展名 */
-export const MULTI_EXT = new Set(['.go', '.py', '.rs'])
+export const MULTI_EXT = new Set(['.go', '.py', '.rs', '.java'])
 
 interface MultiResult {
   symbols: CodeSymbol[]
@@ -39,6 +39,7 @@ const GRAMMAR = {
   '.go': 'tree-sitter-go/tree-sitter-go.wasm',
   '.py': 'tree-sitter-python/tree-sitter-python.wasm',
   '.rs': 'tree-sitter-rust/tree-sitter-rust.wasm',
+  '.java': 'tree-sitter-java/tree-sitter-java.wasm',
 } as const
 
 /** 定位于本模块同目录的语法 wasm 文件名（构建脚本复制产物，见 `scripts/copy-grammars.mts`） */
@@ -46,6 +47,7 @@ const WASM_FILE = {
   '.go': 'tree-sitter-go.wasm',
   '.py': 'tree-sitter-python.wasm',
   '.rs': 'tree-sitter-rust.wasm',
+  '.java': 'tree-sitter-java.wasm',
 } as const
 
 /** 文档：与多语言引擎取同一模块目录，供构建脚本/测试推导复制位置 */
@@ -281,16 +283,78 @@ function rustSymbols(root: Node): Decl[] {
   return out
 }
 
+function javaSymbols(root: Node): Decl[] {
+  const out: Decl[] = []
+  walkAll(root, (n) => {
+    switch (n.type) {
+      case 'class_declaration':
+      case 'record_declaration': {
+        const name = nameOf(n)
+        if (name) out.push({ name, kind: 'class', node: n })
+        break
+      }
+      case 'interface_declaration':
+      case 'annotation_type_declaration': {
+        const name = nameOf(n)
+        if (name) out.push({ name, kind: 'interface', node: n })
+        break
+      }
+      case 'enum_declaration': {
+        const name = nameOf(n)
+        if (name) out.push({ name, kind: 'enum', node: n })
+        break
+      }
+      case 'method_declaration':
+      case 'constructor_declaration': {
+        const name = nameOf(n)
+        if (name) out.push({ name, kind: 'function', node: n })
+        break
+      }
+      case 'import_declaration': {
+        // `import java.util.List;` → 取 scoped_identifier 最末段 identifier（含 static 导入）
+        const scoped = n.namedChildren.find(
+          (c) => c.type === 'scoped_identifier' || c.type === 'identifier',
+        )
+        if (scoped) {
+          let last = scoped
+          while (last.type === 'scoped_identifier') {
+            const tail = last.namedChildren[last.namedChildren.length - 1]
+            if (!tail) break
+            last = tail
+          }
+          const name = last.text
+          if (name) out.push({ name, kind: 'import', node: last })
+        }
+        break
+      }
+      case 'field_declaration':
+      case 'local_variable_declaration': {
+        // 字段/局部变量可有多个 declarator，每个有 name 字段
+        for (const c of n.namedChildren) {
+          if (c.type === 'variable_declarator') {
+            const name = nameOf(c)
+            if (name) out.push({ name, kind: 'variable', node: c })
+          }
+        }
+        break
+      }
+    }
+  })
+  return out
+}
+
 const TOKEN_TYPES: Record<string, Set<string>> = {
   '.py': new Set(['identifier']),
   '.go': new Set(['identifier', 'type_identifier', 'field_identifier', 'package_identifier']),
   '.rs': new Set(['identifier', 'type_identifier', 'field_identifier']),
+  '.java': new Set(['identifier', 'type_identifier']),
 }
 
 const SYMBOL_EXTRACTOR: Record<string, (root: Node) => Decl[]> = {
   '.py': pythonSymbols,
   '.go': goSymbols,
   '.rs': rustSymbols,
+  '.java': javaSymbols,
 }
 
 // ===== 对外入口 =====

@@ -86,7 +86,7 @@
     },
     "packages/plugins/code-intel": {
       "name": "@harness/code-intel",
-      "version": "0.6.0",
+      "version": "0.9.0",
       "dependencies": {
         "@babel/parser": "^7.25.0",
         "@babel/traverse": "^7.25.0",
@@ -95,6 +95,7 @@
         "@harness/tool": "workspace:*",
         "@types/babel__traverse": "^7.20.6",
         "tree-sitter-go": "^0.25.0",
+        "tree-sitter-java": "^0.23.5",
         "tree-sitter-python": "^0.25.0",
         "tree-sitter-rust": "^0.24.0",
         "web-tree-sitter": "^0.27.0",
@@ -499,6 +500,8 @@
     "strip-ansi": ["strip-ansi@7.1.2", "https://registry.npmmirror.com/strip-ansi/-/strip-ansi-7.1.2.tgz", { "dependencies": { "ansi-regex": "^6.0.1" } }, "sha512-gmBGslpoQJtgnMAvOVqGZpEz9dyoKTCzy2nfz/n8aIFhN/jCE/rCmcxabB6jOOHV+0WNnylOxaxBQPSvcWklhA=="],
 
     "tree-sitter-go": ["tree-sitter-go@0.25.0", "https://registry.npmmirror.com/tree-sitter-go/-/tree-sitter-go-0.25.0.tgz", { "dependencies": { "node-addon-api": "^8.3.1", "node-gyp-build": "^4.8.4" }, "peerDependencies": { "tree-sitter": "^0.25.0" }, "optionalPeers": ["tree-sitter"] }, "sha512-APBc/Dq3xz/e35Xpkhb1blu5UgW+2E3RyGWawZSCNcbGwa7jhSQPS8KsUupuzBla8PCo8+lz9W/JDJjmfRa2tw=="],
+
+    "tree-sitter-java": ["tree-sitter-java@0.23.5", "https://registry.npmmirror.com/tree-sitter-java/-/tree-sitter-java-0.23.5.tgz", { "dependencies": { "node-addon-api": "^8.2.2", "node-gyp-build": "^4.8.2" }, "peerDependencies": { "tree-sitter": "^0.21.1" }, "optionalPeers": ["tree-sitter"] }, "sha512-Yju7oQ0Xx7GcUT01mUglPP+bYfvqjNCGdxqigTnew9nLGoII42PNVP3bHrYeMxswiCRM0yubWmN5qk+zsg0zMA=="],
 
     "tree-sitter-python": ["tree-sitter-python@0.25.0", "https://registry.npmmirror.com/tree-sitter-python/-/tree-sitter-python-0.25.0.tgz", { "dependencies": { "node-addon-api": "^8.5.0", "node-gyp-build": "^4.8.4" }, "peerDependencies": { "tree-sitter": "^0.25.0" }, "optionalPeers": ["tree-sitter"] }, "sha512-eCmJx6zQa35GxaCtQD+wXHOhYqBxEL+bp71W/s3fcDMu06MrtzkVXR437dRrCrbrDbyLuUDJpAgycs7ncngLXw=="],
 

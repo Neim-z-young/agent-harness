@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 71）code-intel：多语言导航新增 Java
+
+> 承接续 70。为 tree-sitter 后端补 Java 支持，与 Go/Python/Rust 同一条链路（名字命中型引用，非语义编辑）。
+
+### 实现（src/multi.ts + scripts/copy-grammars.mts）
+
+* `MULTI_EXT` / `GRAMMAR` / `WASM_FILE` 增 `.java` → `tree-sitter-java`（依赖 `tree-sitter-java@^0.23.5`，wasm 已确认）。
+* `javaSymbols` 提取器：class/record → class；interface/annotation_type → interface；enum → enum；method/constructor → function；字段/局部变量（`variable_declarator`，可多声明符）→ variable；import（`scoped_identifier` 最末段，含 `import static java.lang.Math.max` 取 `max`）→ import。
+* `TOKEN_TYPES['.java'] = {identifier, type_identifier}`（经实探确认 Java 无 `field_identifier`，类型引用走 `type_identifier`）。
+* `copy-grammars.mts` 增 Java wasm，构建时复制到 `dist/`。
+* `index.ts` 的 `SUPPORTED_EXT = BABEL_EXT ∪ MULTI_EXT` 自动含 `.java`，无需改分派。
+
+### 测试与版本
+
+* 新增 3 用例：Java 符号提取（class/interface/enum/record/方法/构造器/字段/局部变量/导入，含 static 导入与行号）、Java 引用（类型标识符与方法调用、声明处排除）、目录聚合（babel .ts + tree-sitter .py/.go/.java 合并）。code-intel 58 用例全过、typecheck 通过。插件 version 0.10.0。
+
 ## 2026-09-06（续 70）code-intel：多语言 wasm 显式复制到产物（import.meta.url 相对定位）
 
 > 更正续 69 实现。用户指定对齐 web-tree-sitter 自身做法：ESM 内 `new URL('tree-sitter.wasm', import.meta.url)` 相对模块目录定位，构建脚本把三个语法 wasm **显式复制**到产物目录，运行时 `Language.load(bytes)` 命中相邻文件即可、无需 node_modules 落盘。弃用续 69 的 env base64 注入方案。
