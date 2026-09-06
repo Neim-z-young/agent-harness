@@ -1,5 +1,20 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 77）TUI/REPL 多行输入：readline 单行 → OpenTUI <textarea>
+
+> 承接续 76 标注的「TUI/REPL 多行输入」方向。把 cli TUI 底部输入从单行 `<input>` 升级为 OpenTUI `<textarea>` 多行编辑器：Enter 插入换行、Meta/⌘+Enter 提交，同时保留命令菜单 / 输入历史 / 文件引用导航等既有交互，并验证粘贴多行文本被完整保留。
+
+### 实现（`packages/cli/src/tui.tsx`）
+
+* **组件替换**：底部 `<input value+onInput>`（受控单行）→ `<textarea ref+onSubmit>`（非受控多行）。`<textarea>` 无受控 value/onInput，故用 `textareaRef` 直接读写底层 `TextareaRenderable` 的 `plainText` / `setText`（`readComposer` / `setComposer`，用回调稳定引用，单实例无 remount，避免 buffer 损坏）；`submit` 改用 `setComposer('')` 清空。默认键位：`return`→newline、`return`+meta→submit，天然满足"Enter 换行 / Meta+Enter 提交"。
+* **输入状态同步（关键）**：`input` state 仍被命令菜单过滤 / 历史回看 / 侧栏切换依赖，但 `<textarea>` 不再有受控 value 回写。OpenTUI 的 `InternalKeyHandler` 保证全局 `useKeyboard` 先于聚焦组件处理按键，故在全局 handler 末尾用 `queueMicrotask` 等聚焦 textarea 写入本次字符后再读 composer 回填 `input`，并把 `histIdx → -1` 退出回看态。
+* **命令菜单 / 历史按键冲突**：`↑/↓/Tab/Esc/Enter` 在命令菜单与历史分支统一加 `key.preventDefault()`（只有它是真正阻止聚焦组件处理的开关；`useKeyboard` 的返回值不生效），阻止 textarea 把 Enter 误当换行；删除命令菜单末尾无效的 `return true` 吞键——否则键入字符会被截断无法收窄菜单，改为让其回落末尾微任务正常同步 `input`，命令过滤器随键入实时更新。Meta+Enter 在菜单打开时也放行（提交正文而非菜单项）。
+* **HELP_LINES**：登记 Enter=输入框内换行 / ⌘/Meta+Enter=提交。
+
+### 测试与验证
+
+* `tui.test.tsx`：新增 `pressMetaEnter` 辅助（`pressEnter({ meta: true })`），既有「键入后提交」类用例统一升级为 Meta+Enter；新增 3 条：① 命令输入（`/stats`/`/exit`）改 Meta+Enter 提交命令文本（不依赖菜单时序）；② 命令菜单 `/` 前缀展开后普通 Enter 选中首个候选提交；③ 多行输入 Enter 换行不提交、Meta+Enter 提交整段；④ 粘贴换行文本（`pasteBracketedText`）保留并提交。tui.test.tsx 71 用例全过，cli 全量 166 通过，全仓 typecheck 通过。
+
 ## 2026-09-06（续 76）开发方向核实：同步 3 处「已实现但文档未同步」留痕
 
 > 盘点剩余开发方向时发现历史日志中有「已实现但文档仍标待办」的遗漏，经代码核验后在本期同步标注。均为文档留痕，不改业务代码。

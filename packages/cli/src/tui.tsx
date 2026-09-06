@@ -22,7 +22,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
-import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer } from '@opentui/core'
+import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, listReplCommands } from './index'
 import type { HarnessApp } from './index'
@@ -90,7 +90,8 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: 'Tab', desc: '进入文件引用/会话列表' },
   { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
   { key: '◀ / ▶', desc: '侧栏模块切换（输入为空时）' },
-  { key: 'Enter', desc: '提交输入 / 确认选中' },
+  { key: 'Enter', desc: '输入框内换行；列表/菜单中确认选中' },
+  { key: '⌘ / Meta+Enter', desc: '提交输入' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
   { key: '/help', desc: '查看特殊命令' },
 ]
@@ -689,10 +690,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     histIdxRef.current = i
     setHistIdx(i)
   }, [])
-  // 模块 C：历史回看程序式写入值。OpenTUI 的 InputRenderable 在 value prop 被程序式变更时
-  // 也会 emit('input')，onInput 据此识别该值为「回看导航」而非用户输入，避免回看索引被立即
-  // 重置（否则 ↑ 只能取到最近一条）。用 ref 保证跨渲染读取的是最新值。
-  const programmaticValueRef = useRef<string | null>(null)
+  // 模块 C：底部输入改为多行 <textarea>。react <textarea> 无受控 value / onInput，故用 ref
+  // 直接读写底层 TextareaRenderable 的 plainText / setText（单实例，无 remount，避免 buffer 损坏）。
+  const textareaRef = useRef<TextareaRenderable | null>(null)
+  const readComposer = useCallback((): string => textareaRef.current?.plainText ?? '', [])
+  const setComposer = useCallback((value: string) => { textareaRef.current?.setText(value ?? '') }, [])
   // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
   const [helpOpen, setHelpOpen] = useState(false)
   // 模块 E：命令审批模态 —— 权限引擎 ask() 触发时弹出，等待 allow/deny/always/never
@@ -852,7 +854,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const submit = useCallback((value: string) => {
     if (exitRef.current) return
     const v = value.trim()
-    programmaticValueRef.current = null
+    setComposer('') // 清空多行 textarea buffer（替代原先依赖 value prop / onInput 的置空）
     setInput('')
     setHistIdxSync(-1)
     if (v) {
@@ -864,7 +866,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       pendingLines.current.push(v)
       void drain()
     }
-  }, [drain, setHistIdxSync])
+  }, [drain, setHistIdxSync, setComposer])
 
   // 模块 C：/ 命令补全候选 —— 输入以 / 开头时，按前缀过滤命令菜单
   const cmdCandidates = useMemo(() => {
@@ -917,39 +919,48 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     // 模块 C：/ 命令菜单 —— 输入以 / 开头且有候选时，↑/↓ 选中、Tab 补全、Enter 提交、Esc 关闭
     if (!listMode && cmdMenuOpen) {
       const last = cmdCandidates.length - 1
-      if (key.name === 'up') { setCmdSel((s) => Math.max(0, s - 1)); return }
-      if (key.name === 'down') { setCmdSel((s) => Math.min(last, s + 1)); return }
+      if (key.name === 'up') { key.preventDefault(); setCmdSel((s) => Math.max(0, s - 1)); return true }
+      if (key.name === 'down') { key.preventDefault(); setCmdSel((s) => Math.min(last, s + 1)); return true }
       if (key.name === 'tab') {
+        key.preventDefault()
         const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
-        setInput(c.command + (c.command.endsWith(' ') ? '' : ' '))
-        setCmdSel(0)
-        return
+        const filled = c.command + (c.command.endsWith(' ') ? '' : ' ')
+        setComposer(filled); setInput(filled); setCmdSel(0); return true
       }
-      if (key.name === 'escape') { setInput(prev => prev.split(/\s+/)[0] ?? prev); setCmdSel(0); return }
-      if (key.name === 'return') {
+      if (key.name === 'escape') {
+        key.preventDefault()
+        const head = input.split(/\s+/)[0] ?? ''
+        setComposer(head); setInput(head); setCmdSel(0); return true
+      }
+      // 仅拦截普通 Enter 选中命令；Meta+Enter 放行提交正文
+      if (key.name === 'return' && !key.meta) {
+        key.preventDefault()
         const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
         submitRef.current(c.command)
-        return
+        return true
       }
-      return true // 命令菜单吞掉其余按键
+      // 其余按键（含继续键入以收窄过滤、Meta+Enter）不 preventDefault，交由聚焦 textarea
+      // 处理后回落到末尾微任务同步 input —— 保证命令菜单过滤器随键入实时更新。
     }
-    // 模块 C：输入历史 —— 无命令菜单时，↑ 回看 / ↓ 前进，Enter 用回看值提交（当前输入内容会被回看值覆盖，输入任意字符即取消回看）
+    // 模块 C：输入历史 —— 无命令菜单时，↑ 回看 / ↓ 前进；回看值覆盖当前 composer（输入任意字符即取消回看）
     if (!listMode && !cmdMenuOpen && history.length > 0) {
       if (key.name === 'up') {
         const cur = histIdxRef.current
         const i = cur === -1 ? history.length - 1 : Math.max(0, cur - 1)
-        // 记录本次回看导航程序式写入的值，供 onInput 识别（见 programmaticValueRef 注释）
-        programmaticValueRef.current = history[i] ?? null
+        key.preventDefault()
+        setComposer(history[i] ?? '')
+        setInput(history[i] ?? '')
         setHistIdxSync(i) // ref 同步更新，连按/自动重复也能逐级回看
-        return
+        return true
       }
       if (key.name === 'down') {
         const cur = histIdxRef.current
         // 回看中 ↓ 前进一条；已到最近一条（cur + 1 >= history.length）时退出回看（恢复当前输入）
         const i = cur === -1 || cur + 1 >= history.length ? -1 : cur + 1
-        programmaticValueRef.current = i >= 0 && i < history.length ? history[i]! : null
-        setHistIdxSync(i)
-        return
+        const r = i >= 0 && i < history.length ? history[i]! : ''
+        key.preventDefault()
+        setComposer(r); setInput(r); setHistIdxSync(i)
+        return true
       }
     }
     // 模块 4：侧栏 tab 切换 —— 输入为空、非列表模式时，◀/▶ 循环切换侧栏模块
@@ -994,6 +1005,14 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       if (refs.length > 0 && openFile) { setSel(0); setFileMode(true); setSidebarTab('files'); return true }
       if (sessions.length > 0) { setSessionSel(0); setSessionMode(true); setSidebarTab('sessions'); return true }
     }
+    // 多行输入状态同步：<textarea> 为非受控组件，键入不触发 React 受控 value，但 `input` state
+    // 被命令菜单过滤 / 历史 / 侧栏切换依赖。全局 keyHandler 先于聚焦组件处理按键，此刻 textarea
+    // 尚未写入本次字符，故用微任务等聚焦组件同步处理完后，再读取 ref 的最新 composer 回填 input，
+    // 并退出历史回看态（histIdx → -1）。命令菜单 / 历史/列表模式各分支已 return，不会落到此处。
+    queueMicrotask(() => {
+      setInput(readComposer())
+      setHistIdxSync(-1)
+    })
   })
 
   // 侧栏文件引用：增量索引。流式时每个块的文本不断追加，若每次统一重扫全部
@@ -1274,22 +1293,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             })}
           </box>
         )}
-        <input
+        <textarea
+          ref={textareaRef}
           focused={!listMode}
-          value={histIdx >= 0 && histIdx < history.length ? history[histIdx] : input}
-          onInput={(v) => {
-            // 历史回看：OpenTUI 的 InputRenderable 在 value prop 程序式变更时也会 emit('input')。
-            // 若新值正是回看导航写入的值（programmaticValueRef），视为程序式更新、保持回看状态；
-            // 否则为真实用户输入，取消回看（setInput + 重置 histIdx）。
-            if (v === programmaticValueRef.current) {
-              programmaticValueRef.current = null
-              return
-            }
-            programmaticValueRef.current = null
-            setInput(v)
-            setHistIdxSync(-1)
-          }}
-          onSubmit={(value: unknown) => submit(String(value))}
+          onSubmit={() => submit(readComposer())}
           placeholder="❯ "
         />
       </box>
