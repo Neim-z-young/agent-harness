@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, it, expect, afterAll } from 'bun:test'
 import { tmpdir } from 'node:os'
+import { mkdtempSync, rmSync, writeFileSync, realpathSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { runGit, gitTopLevel } from './worktree'
 import {
   createSubagentPlugin,
   createSubagentTool,
@@ -58,7 +61,7 @@ function createMockAgentRuntime(
 function createMockSessionManager(sessions: Map<string, Session>): SessionManager {
   const pendingNotifications = new Map<string, string[]>()
   return {
-    create: async (options?: { title?: string; parentId?: string }) => {
+    create: async (options?: { title?: string; parentId?: string; cwd?: string; meta?: Record<string, unknown> }) => {
       const id = `s_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
       const session: Session = {
         id,
@@ -67,6 +70,8 @@ function createMockSessionManager(sessions: Map<string, Session>): SessionManage
         createdAt: Date.now(),
         updatedAt: Date.now(),
         parentId: options?.parentId,
+        cwd: options?.cwd,
+        meta: options?.meta,
       }
       sessions.set(id, session)
       return session
@@ -2284,5 +2289,165 @@ describe('subagentCapability（@harness/plugin.SubagentCapability）', () => {
     expect(latest).toEqual([{ taskId: 'cap-1', status: 'running' }])
 
     monitor.dispose()
+  })
+})
+
+// ===== Subagent git worktree 隔离集成测试 =====
+describe('Subagent git worktree 隔离', () => {
+  const coderAgent: AgentDefinition = {
+    id: 'coder',
+    name: 'Coder',
+    description: '负责写代码的子 Agent',
+    mode: 'subagent',
+    tools: ['read_file', 'write_file', 'bash'],
+    permission: { '*': 'allow' },
+    promptFragments: ['你是写代码的子 Agent'],
+  }
+
+  const cleanupDirs: string[] = []
+  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+  /** 构造一个含基线提交的临时 git 仓库（返回 realpath，与 git 输出对齐） */
+  async function makeGitRepo(): Promise<string> {
+    const dir = mkdtempSync(join(tmpdir(), 'wt-int-'))
+    await runGit(dir, ['init', '-q'])
+    await runGit(dir, ['config', 'user.email', 't@e.com'])
+    await runGit(dir, ['config', 'user.name', 'T'])
+    writeFileSync(join(dir, 'a.txt'), 'base\n')
+    await runGit(dir, ['add', '.'])
+    await runGit(dir, ['commit', '-q', '-m', 'base'])
+    cleanupDirs.push(dir)
+    return realpathSync(dir)
+  }
+
+  /** 组装插件并触发 harness.start，返回可调用的 subagentTool */
+  async function setupPlugin(cwd: string) {
+    const sessions = new Map<string, Session>()
+    const session = createMockSessionManager(sessions)
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      async (input) => {
+        if (input.message.includes('[delay]')) await sleep(40)
+        const msg = makeMessage('assistant', 'done')
+        const s = sessions.get(input.sessionId)
+        if (s) { s.messages.push(makeMessage('user', input.message)); s.messages.push(msg) }
+        return msg
+      },
+    )
+    const plugin = createSubagentPlugin({ subagents: [coderAgent] })
+    const ctx = {
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: async () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    }
+    const hooks = await plugin.install(ctx as any)
+    await (hooks as any)['harness.start']?.({ harness: { agent, session, cwd } })
+    const added: unknown[] = []
+    const pool = { add: (t: unknown) => { added.push(t) } }
+    await (hooks as any)['tool.pool.assemble']?.({}, pool)
+    return {
+      hooks,
+      session,
+      tool: added[0] as { call: (i: SubagentToolInput, c: ToolContext) => Promise<ToolResult<SubagentToolOutput>> },
+    }
+  }
+
+  afterAll(() => {
+    for (const d of cleanupDirs) { try { rmSync(d, { recursive: true, force: true }) } catch { /* ignore */ } }
+  })
+
+  it('git 仓库下：子 session 落到独立 worktree；续接复用；有改动时返回 diff 摘要 + diffPath', async () => {
+    const repo = await makeGitRepo()
+    const { session, tool } = await setupPlugin(repo)
+    const tctx = makeToolContext({ sessionId: 'parent-session' })
+
+    // 首次调用：创建 worktree
+    const res1 = await tool.call({ agentId: 'coder', prompt: '任务A' }, tctx)
+    expect(res1.ok).toBe(true)
+    const subSessionId = res1.output!.sessionId
+    const child = await session.get(subSessionId)
+    const worktreeDir = child!.cwd!
+    expect(worktreeDir).toInclude(join(repo, '.harness', 'worktrees'))
+    expect(existsSync(worktreeDir)).toBe(true)
+    expect(await gitTopLevel(worktreeDir)).toBe(worktreeDir) // worktree 本身是有效 git 工作根
+    // 无改动时不含 diff 摘要
+    expect(res1.output!.message).not.toInclude('Git Diff 摘要')
+
+    // 修改 worktree 内已跟踪文件（模拟子 Agent 修改；新文件不在 `git diff HEAD` 中）
+    writeFileSync(join(worktreeDir, 'a.txt'), 'base\nchanged\n')
+
+    // 续接同一 session：复用同一 worktree，且检测到改动
+    const res2 = await tool.call({ agentId: 'coder', prompt: '继续', sessionId: subSessionId }, tctx)
+    expect(res2.ok).toBe(true)
+    const child2 = await session.get(subSessionId)
+    expect(child2!.cwd).toBe(worktreeDir)
+    expect(res2.output!.message).toInclude('## Git Diff 摘要')
+    expect(res2.output!.message).toInclude('a.txt')
+    expect(res2.output!.diffPath).toBeTruthy()
+    expect(existsSync(res2.output!.diffPath!)).toBe(true)
+  })
+
+  it('非 git 目录：回退无隔离，session.cwd undefined、无 diff 摘要', async () => {
+    const plain = mkdtempSync(join(tmpdir(), 'wt-plain-int-'))
+    cleanupDirs.push(plain)
+    const { session, tool } = await setupPlugin(plain)
+    const res = await tool.call({ agentId: 'coder', prompt: '任务' }, makeToolContext({ sessionId: 'parent-session' }))
+    expect(res.ok).toBe(true)
+    const child = await session.get(res.output!.sessionId)
+    expect(child!.cwd).toBeUndefined()
+    expect(res.output!.message).not.toInclude('Git Diff 摘要')
+  })
+
+  it('后台模式：子 session 落到 worktree，且有改动时通知含 diffPath', async () => {
+    const repo = await makeGitRepo()
+    const { session, tool } = await setupPlugin(repo)
+    const tctx = makeToolContext({ sessionId: 'parent-session' })
+
+    const res = await tool.call({ agentId: 'coder', prompt: '[delay] 后台任务', runInBackground: true }, tctx)
+    expect(res.ok).toBe(true)
+    expect(res.output!.taskId).toBeTruthy()
+    const child = await session.get(res.output!.sessionId)
+    const worktreeDir = child!.cwd!
+    expect(worktreeDir).toInclude('.harness')
+    expect(existsSync(worktreeDir)).toBe(true)
+
+    // 立即修改已跟踪文件（后台 executor 内部带 40ms 延迟，确保 diff 能检测到）
+    writeFileSync(join(worktreeDir, 'a.txt'), 'base\nchanged\n')
+
+    // 等待后台完成并注入通知（git diff 较慢，轮询直到出现）
+    let notif: string[] = []
+    for (let i = 0; i < 20; i++) {
+      await sleep(100)
+      notif = session.drainNotifications('parent-session')
+      if (notif.length > 0) break
+    }
+    expect(notif.length).toBe(1)
+    expect(notif[0]).toInclude('<diff-file>')
+    expect(notif[0]).toInclude('a.txt')
+    expect(notif[0]).toInclude('Git Diff 摘要')
+  })
+
+  it('/worktrees 命令：list 显示隔离 worktree，remove 回收', async () => {
+    const repo = await makeGitRepo()
+    const { hooks, session, tool } = await setupPlugin(repo)
+
+    // 产生一个 worktree
+    const res = await tool.call({ agentId: 'coder', prompt: '任务' }, makeToolContext({ sessionId: 'parent-session' }))
+    const child = await session.get(res.output!.sessionId)
+    const worktreeDir = child!.cwd!
+
+    // list
+    const out: string[] = []
+    const cliInput = { command: 'worktrees', arg: '', out: (s: string) => { out.push(s) }, sessionId: 's1', raw: 'worktrees', result: undefined as any }
+    await (hooks as any)['cli.command']?.(cliInput)
+    const listed = out.join('')
+    expect(listed).toInclude('Worktrees')
+    expect(listed).toInclude('HEAD=')
+
+    // remove
+    const out2: string[] = []
+    const rmInput = { command: 'worktrees', arg: `remove ${worktreeDir}`, out: (s: string) => { out2.push(s) }, sessionId: 's1', raw: 'worktrees remove', result: undefined as any }
+    await (hooks as any)['cli.command']?.(rmInput)
+    expect(existsSync(worktreeDir)).toBe(false)
   })
 })

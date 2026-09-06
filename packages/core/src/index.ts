@@ -1314,7 +1314,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
           toolUseId: tc.toolUseId,
           signal: new AbortController().signal,
           variables: {},
-          cwd: this.deps.cwd,
+          cwd: session2.cwd ?? this.deps.cwd,
           requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
         }
         const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, tc.input, tctx)
@@ -1517,6 +1517,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
     if (reasoningBuf) assistant.parts.push({ type: 'reasoning', text: reasoningBuf })
     if (textBuf) assistant.parts.push({ type: 'text', text: textBuf })
 
+    // 读取会话级工作目录（若 Session.cwd 存在则覆盖全局 deps.cwd，支持子 Agent worktree 隔离）
+    const sessCwd = (await this.deps.session.get(sessionId))?.cwd
+    const tctxCwd = sessCwd ?? this.deps.cwd
+
     // 执行 tool calls
     for (const tc of toolCalls) {
       const inputJson = tc.inputParts.join('')
@@ -1549,7 +1553,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
         toolUseId: tc.toolUseId,
         signal: new AbortController().signal,
         variables: {},
-        cwd: this.deps.cwd,
+        cwd: tctxCwd,
         requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
       }
       const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, parsedInput, tctx)
@@ -1604,6 +1608,10 @@ export interface Harness {
   readonly permission: PermissionEngine
   /** Skill 管理器（加载/查询/禁用/重载技能；插件可在 harness.init 中通过此注册 plugin 来源技能） */
   readonly skillManager?: SkillManager
+
+  // === 工作目录 ===
+  /** 全局工具工作目录（= options.cwd ?? process.cwd()；子 Agent 判断 git worktree 用） */
+  readonly cwd: string
 }
 
 /** createHarness() 参数 */
@@ -1697,6 +1705,8 @@ export class HarnessImpl implements Harness {
   public readonly agent: AgentRuntime
   /** Skill 管理器（从 skillDirs 加载，通过 prompt.system.transform 注入） */
   public skillManager?: SkillManager
+  /** 全局工具工作目录（= options.cwd ?? process.cwd()） */
+  public readonly cwd: string
 
   private chatProvider: ChatProvider
   private started = false
@@ -1704,6 +1714,7 @@ export class HarnessImpl implements Harness {
 
   constructor(private readonly options: AgentHarnessOptions) {
     this.bus = options.bus ?? createBus()
+    this.cwd = options.cwd ?? process.cwd()
     this.context = new DefaultContextProvider()
     this.permission = options.permission ?? new DefaultPermissionEngine({ '*': 'ask' })
     this.tools = options.toolRegistry ?? new ToolRegistry()

@@ -42,6 +42,7 @@ import { matchGlob } from '@harness/permission'
 import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWorktree } from './worktree'
 
 // ===== Subagent Bus 事件定义 =====
 
@@ -195,6 +196,8 @@ export interface SubagentToolOutput {
   toolCallCount: number
   /** 完整输出的临时文件路径（summarized=true 时有值，父 Agent 可用 read_file/grep_file 探索） */
   outputPath?: string
+  /** 相对基线 HEAD 的完整 diff 补丁临时文件路径（worktree 隔离启用且子 Agent 有改动时有值） */
+  diffPath?: string
   /** 后台任务 ID（runInBackground=true 时有值） */
   taskId?: string
   /** 是否为后台模式（runInBackground=true 时为 true） */
@@ -223,6 +226,8 @@ interface HarnessLike {
   session: SessionManager
   /** Bus 事件总线（用于发布子 Agent 进度事件） */
   bus?: Bus
+  /** 全局工具工作目录（core 传入 HarnessImpl.cwd；子 Agent 判 git worktree 用） */
+  cwd?: string
 }
 
 // ===== Schema helper（自包含，避免跨包依赖）=====
@@ -489,6 +494,17 @@ function summarizeResult(
  * @param directive 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），
  *                  要求子 Agent 简洁结构化回复；不传则不注入
  */
+/** createSubagentTool 可选的 worktree 隔离依赖（由插件在 harness.start 时注入） */
+export interface WorktreeHooks {
+  /** 解析/创建子 Agent 隔离 worktree 目录（未启用返回 undefined） */
+  resolve: (existingCwd?: string) => Promise<string | undefined>
+  /** 把 worktree diff 摘要并入结果文本，返回完整 patch 文件路径 */
+  attachDiff: (
+    result: Readonly<{ text: string }>,
+    worktreeDir: string | undefined,
+  ) => Promise<{ text: string; diffPath?: string }>
+}
+
 /** 创建 SubagentTool（导出便于单独使用或测试） */
 export function createSubagentTool(
   getHarness: () => HarnessLike | undefined,
@@ -498,6 +514,7 @@ export function createSubagentTool(
   maxResultLines: number = 500,
   directive?: string,
   getRegistry?: () => BackgroundTaskRegistry | undefined,
+  worktree?: WorktreeHooks,
 ): Tool<SubagentToolInput, SubagentToolOutput> {
   return defineTool<SubagentToolInput, SubagentToolOutput>({
     id: 'subagent',
@@ -631,12 +648,20 @@ export function createSubagentTool(
         }
         subSessionId = input.sessionId
         isContinuation = true
+        // 续接：若非隔离 worktree 目录则保持该 session 原执行目录（不强行迁移）
+        await worktree?.resolve(existing.cwd)
       } else {
         // 创建新子 session（隔离上下文，关联父 session 便于审计追溯）
         try {
           const title = input.description
             ?? (input.prompt.length > 60 ? input.prompt.slice(0, 60) + '...' : input.prompt)
-          const subSession = await session.create({ title, parentId: ctx.sessionId })
+          const wcwd = await worktree?.resolve(undefined)
+          const subSession = await session.create({
+            title,
+            parentId: ctx.sessionId,
+            cwd: wcwd,
+            meta: wcwd ? { worktreeDir: wcwd } : undefined,
+          })
           subSessionId = subSession.id
         } catch (err) {
           publishFailed('SESSION_CREATE_FAILED', `创建子 session 失败：${(err as Error)?.message ?? err}`, input.agentId)
@@ -768,14 +793,20 @@ export function createSubagentTool(
               maxResultLines,
               undefined,
             )
+            // 附加 worktree diff 摘要 + 完整 patch（会话级隔离目录）
+            const { text: resultTextBg, diffPath } = await (
+              worktree?.attachDiff({ text: resultText }, subSession?.cwd)
+              ?? Promise.resolve<{ text: string; diffPath?: string }>({ text: resultText })
+            )
 
             // 更新 task 为 completed
             registry.complete(taskId, {
-              result: resultText,
+              result: resultTextBg,
               summarized,
               messageCount: messages.length,
               toolCallCount,
               outputPath,
+              diffPath,
               durationMs: Date.now() - startTime,
             })
 
@@ -786,7 +817,7 @@ export function createSubagentTool(
                 subSessionId,
                 parentSessionId: ctx.sessionId,
                 toolUseId: ctx.toolUseId,
-                replyPreview: resultText.length > 200 ? resultText.slice(0, 200) + '...' : resultText,
+                replyPreview: resultTextBg.length > 200 ? resultTextBg.slice(0, 200) + '...' : resultTextBg,
                 messageCount: messages.length,
                 durationMs: Date.now() - startTime,
                 taskId,
@@ -803,8 +834,9 @@ export function createSubagentTool(
                 status: 'completed',
                 agentName: input.agentId,
                 description: input.description,
-                result: resultText,
+                result: resultTextBg,
                 outputPath,
+                diffPath,
                 durationMs: Date.now() - startTime,
                 messageCount: messages.length,
                 toolCallCount,
@@ -944,6 +976,12 @@ export function createSubagentTool(
           callerToolIds,
         )
 
+        // 附加 worktree 相对基线 HEAD 的 diff 摘要（会话级隔离目录）+ 完整 patch 路径
+        const { text: finalResultText, diffPath } = await (
+          worktree?.attachDiff({ text: resultText }, subSession?.cwd)
+          ?? Promise.resolve<{ text: string; diffPath?: string }>({ text: resultText })
+        )
+
         // 发布 subagent.completed 事件
         if (bus) {
           bus.publish(SubagentEvents.completed, {
@@ -951,7 +989,7 @@ export function createSubagentTool(
             subSessionId,
             parentSessionId: ctx.sessionId,
             toolUseId: ctx.toolUseId,
-            replyPreview: resultText.length > 200 ? resultText.slice(0, 200) + '...' : resultText,
+            replyPreview: finalResultText.length > 200 ? finalResultText.slice(0, 200) + '...' : finalResultText,
             messageCount: messages.length,
             durationMs: Date.now() - startTime,
           }).catch(() => { /* Bus 发布失败不影响主流程 */ })
@@ -961,11 +999,12 @@ export function createSubagentTool(
           ok: true,
           output: {
             sessionId: subSessionId,
-            message: resultText,
+            message: finalResultText,
             messageCount: messages.length,
             summarized,
             toolCallCount,
             outputPath,
+            diffPath,
           },
         }
       } finally {
@@ -1000,6 +1039,7 @@ export function createSubagentTool(
         summarized: result.output.summarized,
         toolCallCount: result.output.toolCallCount,
         outputPath: result.output.outputPath,
+        diffPath: result.output.diffPath,
       }
     },
   })
@@ -1033,6 +1073,58 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
   /** 后台任务注册表（生命周期与插件实例一致） */
   const registry = new BackgroundTaskRegistry()
 
+  /** git 仓库根（worktree 隔离启用时为非空；null=非 git 回退） */
+  let baseCwd: string | null = null
+  /** worktree 隔离是否启用（harness.cwd 是 git 仓库时） */
+  let worktreeEnabled = false
+
+  /**
+   * 为子 Agent 解析/创建隔离 worktree 目录。
+   * - 未启用 → undefined。
+   * - 续接：existingCwd 已在 worktree 下则复用，否则 undefined（保持原执行目录）。
+   * - 新建：createWorktree；失败降级返回 undefined（不影响子 Agent 运行）。
+   */
+  const resolveWorktree = async (existingCwd?: string): Promise<string | undefined> => {
+    if (!worktreeEnabled || !baseCwd) return undefined
+    const prefix = join(baseCwd, '.harness', 'worktrees') + '/'
+    if (existingCwd) {
+      if (existingCwd.startsWith(prefix)) return existingCwd
+      return undefined
+    }
+    try {
+      const token = `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      return await createWorktree({ base: baseCwd, token })
+    } catch (err) {
+      console.warn('[subagent] 创建子 Agent worktree 失败，降级为无隔离执行', {
+        base: baseCwd,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      return undefined
+    }
+  }
+
+  /**
+   * 把 worktree 相对基线 HEAD 的 diff 摘要并入结果文本，并把完整 patch 写入临时文件。
+   * 有变更才追加；任何 getWorktreeDiff 失败均返回原样，不中断子 Agent。
+   */
+  const attachWorktreeDiff = async (
+    result: Readonly<{ text: string }>,
+    worktreeDir: string | undefined,
+  ): Promise<{ text: string; diffPath?: string }> => {
+    if (!worktreeEnabled || !baseCwd || !worktreeDir) return { text: result.text }
+    let diff: { summary: string; patch: string; hasChanges: boolean }
+    try {
+      diff = await getWorktreeDiff({ base: baseCwd, dir: worktreeDir })
+    } catch {
+      return { text: result.text }
+    }
+    if (!diff.hasChanges || !diff.summary) return { text: result.text }
+    const diffPath = join(tmpdir(), `subagent-diff-${Date.now()}.patch`)
+    try { writeFileSync(diffPath, diff.patch, 'utf-8') } catch { /* 写失败不阻塞 */ }
+    const text = `${result.text}\n\n## Git Diff 摘要（相对基线 HEAD，目录 ${worktreeDir}）\n${diff.summary}`
+    return { text, diffPath }
+  }
+
   return {
     id: 'subagent',
     version: '0.2.0',
@@ -1053,6 +1145,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         maxResultLines,
         directive,
         () => registry,
+        { resolve: resolveWorktree, attachDiff: attachWorktreeDiff },
       )
 
 
@@ -1064,6 +1157,15 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
             return
           }
           harness = h
+
+          // 检测 git worktree 隔离启用条件：harness 工作目录是 git 仓库
+          try {
+            baseCwd = h.cwd ? await gitTopLevel(h.cwd) : null
+            worktreeEnabled = baseCwd !== null
+          } catch {
+            baseCwd = null
+            worktreeEnabled = false
+          }
 
           // 注册子 Agent 定义到 AgentRuntime
           for (const def of subagents) {
@@ -1104,6 +1206,14 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
             description: '列出后台子 Agent 任务（runInBackground=true 派出的任务）',
             usage: '/tasks [running|completed|failed]',
           })
+          // /worktrees 命令：管理子 Agent 隔离 worktree（仅 git 仓库启用时）
+          if (worktreeEnabled) {
+            input.commands.push({
+              command: 'worktrees',
+              description: '管理子 Agent 隔离 worktree（list | remove <dir> | remove-all），默认保留便于续接/调试',
+              usage: '/worktrees [list|remove <dir>|remove-all]',
+            })
+          }
         },
 
         async 'cli.command'(input) {
@@ -1191,6 +1301,50 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
             input.result = 'continue'
             return
           }
+
+          // ===== /worktrees 命令：管理子 Agent 隔离 worktree =====
+          if (input.command === 'worktrees') {
+            if (!worktreeEnabled || !baseCwd) {
+              input.out('（尚未启用 worktree 隔离：当前工作目录不是 git 仓库）\n')
+            } else {
+              const arg = (input.arg ?? '').trim()
+              if (arg === 'remove-all') {
+                const all = await listWorktrees(baseCwd)
+                let removed = 0
+                for (const wt of all) {
+                  if (wt.path !== baseCwd) {
+                    try { await removeWorktree({ base: baseCwd, dir: wt.path }); removed += 1 } catch { /* ignore */ }
+                  }
+                }
+                input.out(`已移除 ${removed} 个隔离 worktree（主工作区保留）\n`)
+              } else if (arg.startsWith('remove ')) {
+                const dir = arg.slice('remove '.length).trim()
+                if (!dir) {
+                  input.out('用法：/worktrees remove <dir>\n')
+                } else {
+                  try {
+                    await removeWorktree({ base: baseCwd, dir })
+                    input.out(`已移除 worktree：${dir}\n`)
+                  } catch {
+                    input.out(`移除失败：${dir}（可能不存在或正在使用）\n`)
+                  }
+                }
+              } else {
+                const all = await listWorktrees(baseCwd)
+                input.out(`Worktrees（共 ${all.length} 个）：\n`)
+                for (const wt of all) {
+                  const marker = wt.path === baseCwd ? '（主工作区）' : ''
+                  input.out(`  ${wt.path}${marker}  HEAD=${(wt.head ?? '').slice(0, 12)}\n`)
+                }
+                if (all.length > 1) {
+                  input.out('\n提示：子 Agent 隔离 worktree 默认保留（便于续接/调试）。\n')
+                  input.out('可用 /worktrees remove <dir> 或 /worktrees remove-all 回收。\n')
+                }
+              }
+            }
+            input.result = 'continue'
+            return
+          }
         },
       } as Hooks
     },
@@ -1215,6 +1369,7 @@ export function formatTaskNotification(input: {
   result?: string
   error?: string
   outputPath?: string
+  diffPath?: string
   durationMs: number
   messageCount?: number
   toolCallCount?: number
@@ -1227,6 +1382,9 @@ export function formatTaskNotification(input: {
   const outputPathSection = input.outputPath
     ? `\n<output-file>${input.outputPath}</output-file>`
     : ''
+  const diffPathSection = input.diffPath
+    ? `\n<diff-file>${input.diffPath}</diff-file>`
+    : ''
   const usageSection = `\n<usage><duration-ms>${input.durationMs}</duration-ms>${
     input.messageCount !== undefined ? `<message-count>${input.messageCount}</message-count>` : ''
   }${
@@ -1235,7 +1393,7 @@ export function formatTaskNotification(input: {
   return `<task-notification>
 <task-id>${input.taskId}</task-id>
 <status>${input.status}</status>
-<summary>${summary}</summary>${resultSection}${outputPathSection}${usageSection}
+<summary>${summary}</summary>${resultSection}${outputPathSection}${diffPathSection}${usageSection}
 </task-notification>`
 }
 
@@ -1293,6 +1451,8 @@ export interface BackgroundTask {
   toolCallCount?: number
   /** 完整输出的临时文件路径 */
   outputPath?: string
+  /** 相对基线 HEAD 的完整 diff 补丁临时文件路径（worktree 隔离启用且有改动时有值） */
+  diffPath?: string
   /** 用于取消后台任务的 AbortController */
   controller?: AbortController
   /** 完成通知是否已注入父 session（去重，防止重复注入） */
@@ -1347,7 +1507,7 @@ export class BackgroundTaskRegistry {
    * 标记任务为 completed，存储结果，触发所有 wait 的 resolver
    */
   complete(taskId: string, result: Partial<Pick<BackgroundTask,
-    'result' | 'summarized' | 'messageCount' | 'toolCallCount' | 'outputPath' | 'durationMs'
+    'result' | 'summarized' | 'messageCount' | 'toolCallCount' | 'outputPath' | 'diffPath' | 'durationMs'
   >>): void {
     const task = this.tasks.get(taskId)
     if (!task) return

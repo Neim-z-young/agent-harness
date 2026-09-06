@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 78）Subagent git worktree 隔离：子代理独立工作区免写冲突
+
+> 承接待办「Subagent git worktree 隔离」。为避免多个子代理并发写操作与父工作区冲突，为每个子会话在独立 git worktree 中执行，并把相对基线 HEAD 的 diff 摘要 + patch 回传给父会话 / 注入后台通知。
+
+### 机制
+
+- 利用 `git worktree add --detach --force <dir> HEAD` 为每个子代理创建一个从当前 HEAD 派生的独立工作目录，落点 `<repo>/.harness/worktrees/<token>`。
+- worktree 之间文件系统级隔离，子代理的写操作互不冲突，也与父工作区隔离。
+- 子代理完成时用 `git -C <worktree> diff HEAD --stat` + `diff HEAD` 生成变更摘要；非零改动才回传摘要文本并写临时 `.patch` 文件（返回 `diffPath`）。后台路径随 `<task-notification>` 注入 `<diff-file>` 标记。
+- 非 git 仓库 / worktree 创建失败自动降级：回退无隔离执行（`session.cwd` undefined、无 diff 摘要），不中断子代理。
+
+### 改动清单
+
+- **`packages/core/src/index.ts`**：`ToolContext` 构造（同步 L1317、流式 L1520 区域）支持会话级 `cwd` 优先——`sess?.cwd ?? this.deps.cwd`；`Harness` 接口与 `HarnessImpl` 新增只读 `cwd`（= `options.cwd ?? process.cwd()`），供子代理判 `git worktree` 用。
+- **新增 `packages/plugins/subagent/src/worktree.ts`**：自包含 git worktree 模块——`runGit`（错误归一化为 `GitCommandError`）、`gitTopLevel` / `isGitRepo`、`worktreeDirFor`（清洗 token）、`ensureWorktreeIgnored`（幂等写 `.harness/.gitignore` 含 `worktrees/`）、`createWorktree`（幂等）、`getWorktreeDiff`、`removeWorktree`、`listWorktrees`（解析 `--porcelain`）。
+- **`packages/plugins/subagent/src/index.ts`**：`HarnessLike` 加只读 `cwd?`；模块级状态 `baseCwd` / `worktreeEnabled`；`resolveWorktree`（复用已有 worktree / 新建）；`attachWorktreeDiff`（生成 diff 摘要 + 写临时 patch）；同步 / 后台路径接入；`/worktrees` 命令支持 `list` / `remove <token>` / `remove-all`。
+- **测试**：`worktree.ts` 单测 12 用例（gitTopLevel / createWorktree 幂等 / listWorktrees / getWorktreeDiff / ensureWorktreeIgnored / removeWorktree / GitCommandError）；`index.test.ts` 新增 4 集成用例（git 仓库隔离 + 续接复用 + diff 回传、非 git 回退、后台通知含 diffPath、`/worktrees` 命令）。subagent 包 109 用例全绿，全量 typecheck 通过。
+
+### 待办
+
+- `.harness/.gitignore` 已含 `worktrees/`，worktree 目录不入库。
+- 子代理 worktree 生命周期内置管理：续接复用同一 worktree，任务完成不自动删除，可由 `/worktrees remove` 回收。
+
 ## 2026-09-06（续 77）TUI/REPL 多行输入：readline 单行 → OpenTUI <textarea>
 
 > 承接续 76 标注的「TUI/REPL 多行输入」方向。把 cli TUI 底部输入从单行 `<input>` 升级为 OpenTUI `<textarea>` 多行编辑器：Enter 插入换行、Meta/⌘+Enter 提交，同时保留命令菜单 / 输入历史 / 文件引用导航等既有交互，并验证粘贴多行文本被完整保留。
@@ -2908,7 +2931,7 @@ CLI 斜杠命令：
 | **P2**     | Skill Layer                   | Markdown 技能 + paths 条件触发 + 三来源发现（bundled/user/project）                                                                   | 待做 |
 | **~~P2~~** | ~~Provider 补全~~               | ~~Gemini / 通义 / 智谱 等多模型适配~~ ✅ 完成（08-23，Gemini 独立实现 + Qwen/GLM 复用 OpenAIChatProvider）                                     | ✅  |
 | **P3**     | Subagent run\_in\_background  | 子 Agent 后台异步执行，父 Agent 不阻塞等待，通过 Bus 事件或轮询获取结果                                                                            | 待做 |
-| **P3**     | Subagent git worktree 隔离      | 子 Agent 在独立 git worktree 中执行，避免与父 Agent 工作区冲突                                                                            | 待做 |
+| **P3**     | ~~Subagent git worktree 隔离~~    | ~~子 Agent 在独立 git worktree 中执行，避免与父 Agent 工作区冲突~~ ✅ 完成（09-06，worktree.ts + 会话级 cwd 注入 + diff 回传，16 新用例） | ✅ |
 | **P3**     | Swarm teammate                | Team + Mailbox + Task List + 权限桥接（多 Agent 协作）                                                                            | 待做 |
 | **P3**     | ~~TUI 形态~~                    | ~~基于终端 UI 的富交互（类似 Claude Code TUI）~~ ✅ 完成（08-26，自研 ANSI alt-screen：`--tui` + 日志滚动 + 输入行 + 21 测试）                         | ✅  |
 | **P3**     | OAuth2 PKCE                   | 完整 OAuth2 授权码流程（回调服务器 + token 刷新），用于对接 OAuth2-protected MCP Server                                                       | 待做 |
