@@ -1,7 +1,7 @@
 {
   "name": "@harness/mcp-server-registry",
-  "version": "0.1.0",
-  "description": "MCP Server 注册表插件：所有 mcpserver 相关插件依赖它启动 server，并通过 @harness/mcp-client 管理连接",
+  "version": "0.2.0",
+  "description": "MCP Server 注册表插件：所有 mcpserver 相关插件依赖它启动 server；支持 config.json mcpServers 装配 + 服务器/工具两级启停",
   "type": "module",
   "exports": {
     ".": {

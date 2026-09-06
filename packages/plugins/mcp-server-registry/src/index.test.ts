@@ -162,3 +162,118 @@ describe('createMcpServerRegistryPlugin', () => {
     await plugin.uninstall?.()
   })
 })
+
+describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServers）', () => {
+  const mkInput = (over: Record<string, unknown> = {}): any => ({
+    command: 'mcp', arg: '', raw: 'mcp', sessionId: 's', out: () => undefined,
+    mcpServers: [], setMcpServers: () => undefined,
+    ...over,
+  })
+  /** mcp.configure 是自定义 Hook，Hooks 类型未声明，转 any 便于测试直接调用 */
+  const installAny = async (plugin: ReturnType<typeof createMcpServerRegistryPlugin>) =>
+    (await plugin.install({ log: mockLog } as PluginContext)) as any
+
+  test('mcp.configure 注入配置态：/mcp servers 展示启停状态', async () => {
+    const reg = createMcpServerRegistry()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await installAny(plugin)
+
+    await hooks['mcp.configure'](
+      { mcpServers: [
+        { name: 'alpha', transport: 'http', url: 'http://x/a', enabled: true },
+        { name: 'beta', transport: 'http', url: 'http://x/b', enabled: false },
+      ] },
+      {},
+    )
+    const out: string[] = []
+    await hooks!['cli.command']!(mkInput({ arg: '', out: (s: string) => out.push(s) }))
+    expect(out.join('')).toContain('alpha')
+    expect(out.join('')).toContain('[启用]')
+    expect(out.join('')).toContain('beta')
+    expect(out.join('')).toContain('[禁用]')
+    await plugin.uninstall?.()
+  })
+
+  test('工具级启停：/mcp tool <s> <t> off 更新 managed 并持久化', async () => {
+    const reg = createMcpServerRegistry()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await installAny(plugin)
+    const saved: any[] = []
+    await hooks['mcp.configure'](
+      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
+    )
+
+    await hooks!['cli.command']!(mkInput({
+      arg: 'tool alpha list_apps off',
+      setMcpServers: (list: any[]) => saved.push(list),
+      out: () => undefined,
+    }))
+    // 持久化回调收到 tools:{ list_apps:false }
+    expect(saved.length).toBe(1)
+    expect((saved[0][0].tools as Record<string, boolean>).list_apps).toBe(false)
+
+    // 再打开 → tools 里删除该键
+    const saved2: any[] = []
+    await hooks!['cli.command']!(mkInput({
+      arg: 'tool alpha list_apps on',
+      setMcpServers: (list: any[]) => saved2.push(list),
+      out: () => undefined,
+    }))
+    expect((saved2[0][0].tools as Record<string, boolean>).list_apps).toBeUndefined()
+    await plugin.uninstall?.()
+  })
+
+  test('服务器级启停：disable 持久化 enabled=false，enable 写回 true', async () => {
+    const reg = createMcpServerRegistry()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await installAny(plugin)
+    await hooks['mcp.configure'](
+      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
+    )
+
+    const saved: any[] = []
+    await hooks!['cli.command']!(mkInput({
+      arg: 'disable alpha',
+      setMcpServers: (list: any[]) => saved.push(list),
+      out: () => undefined,
+    }))
+    expect(saved.length).toBe(1)
+    expect(saved[0][0].enabled).toBe(false)
+
+    const saved2: any[] = []
+    await hooks!['cli.command']!(mkInput({
+      arg: 'enable alpha',
+      setMcpServers: (list: any[]) => saved2.push(list),
+      out: () => undefined,
+    }))
+    expect(saved2[0][0].enabled).toBe(true)
+    expect(saved2[0][0].name).toBe('alpha')
+    await plugin.uninstall?.()
+  })
+
+  test('/mcp add 与 remove：新增/移除托管 server 并持久化', async () => {
+    const reg = createMcpServerRegistry()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await installAny(plugin)
+    const saved: any[][] = []
+
+    await hooks!['cli.command']!(mkInput({
+      arg: 'add -- {"name":"new","transport":"stdio","command":"echo","args":["hi"],"enabled":false,"tools":{"x":false}}',
+      setMcpServers: (list: any[]) => saved.push(list),
+      out: () => undefined,
+    }))
+    expect(saved.length).toBe(1)
+    expect(saved[0].map((e: any) => e.name)).toContain('new')
+    expect((saved[0].find((e: any) => e.name === 'new')!.tools as any).x).toBe(false)
+
+    // 移除
+    const saved2: any[] = []
+    await hooks!['cli.command']!(mkInput({
+      arg: 'remove new',
+      setMcpServers: (list: any[]) => saved2.push(list),
+      out: () => undefined,
+    }))
+    expect(saved2[0].map((e: any) => e.name)).not.toContain('new')
+    await plugin.uninstall?.()
+  })
+})

@@ -797,6 +797,26 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('getMcpServers/setMcpServers：读写 config.json mcpServers；boot 时注入运行时', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    // 预写入 mcpServers
+    await app.setMcpServers([{ name: 'alpha', transport: 'stdio', command: 'echo', args: ['hi'], enabled: true }])
+    const loaded = await app.getMcpServers()
+    expect(loaded.length).toBe(1)
+    expect(loaded[0].name).toBe('alpha')
+    expect(loaded[0].enabled).toBe(true)
+
+    await app.boot()
+    const cfg = await app.configStore.load()
+    expect(cfg.mcpServers?.[0]?.name).toBe('alpha')
+    await app.shutdown()
+  })
+
   it('boot 多 Provider 注册：config.providers 逐项注册，按 id 分发', async () => {
     const stdout = { write: () => {} }
     const app = new HarnessApp({

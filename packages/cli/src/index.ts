@@ -62,6 +62,7 @@ import {
   type Workspace,
 } from '@harness/workspace'
 import { createRevertPlugin, createSnapshotPlugin } from '@harness/revert'
+import type { McpServerEntry } from '@harness/mcp-server-registry'
 import { startTuiRepl } from './tui'
 import {
   emptyUsage,
@@ -226,6 +227,12 @@ export interface HarnessConfig {
    * 由 `/tools` 等插件持久化；缺省 Agent 为 tools:['*']（全部），配置指定数组则收窄。
    */
   agents?: Array<{ id: string; tools: string[] }>
+  /**
+   * MCP Server 装配列表：从 config.json 以 JSON 形式新增外部 MCP server（stdio/sse/http）。
+   * 元素复用 McpServerConfig 字段 + enabled（服务器级）、tools（工具级）开关。
+   * 启动时经 mcp.configure Hook 注入 mcp-server-registry 插件；/mcp 命令可即时启用/禁用并写回。
+   */
+  mcpServers?: McpServerEntry[]
   /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
   snapshot?: boolean
   /**
@@ -970,6 +977,31 @@ export class HarnessApp {
     if (existing) this.harness!.agent.register({ ...existing, tools: [...tools] })
   }
 
+  /** 读取 config.json 的 mcpServers 列表（缺省 []） */
+  async getMcpServers(): Promise<McpServerEntry[]> {
+    const cfg = await this.configStore.load()
+    return [...(cfg.mcpServers ?? [])]
+  }
+
+  /**
+   * 持久化 mcpServers 列表到 config.json（upsert 顶层 mcpServers）。供 mcp-server-registry 的
+   * /mcp 命令在启用/禁用/增删后写回；重启后由 boot 阶段经 mcp.configure 重新注入生效。
+   */
+  async setMcpServers(list: McpServerEntry[]): Promise<void> {
+    const cfg = await this.configStore.load()
+    await this.configStore.save({ ...cfg, mcpServers: [...list] })
+  }
+
+  /**
+   * 把 config.json 的 mcpServers 应用到运行时：createHarness 后、harness.start 前触发
+   * mcp.configure Hook，注入 mcp-server-registry 插件（按 enabled 开关在 start 时连接）。
+   */
+  async applyMcpServers(harness: Harness): Promise<void> {
+    const cfg = await this.configStore.load()
+    const list = [...(cfg.mcpServers ?? [])]
+    await (harness.plugin as any)?.trigger?.('mcp.configure', { mcpServers: list })
+  }
+
   /** 当前生效模型（`provider/model` 展示）：优先读取活动 Agent 定义的 model，回退 options.model */
   getModel(agentId: string): string | undefined {
     const a = this.harness?.agent?.get?.(agentId)
@@ -1316,6 +1348,9 @@ export class HarnessApp {
     })
     // 回读 config.json 的 agents[].tools 白名单并覆盖到已注册 Agent（createHarness 全部组装完成后、query 前）
     await this.applyConfigAgentTools(harness)
+    // 把 config.json 的 mcpServers 注入 mcp-server-registry 插件（在 start 前建立配置态，
+    // 由 harness.start 按 enabled 开关连接外部 MCP server）。
+    await this.applyMcpServers(harness)
     await harness.start()
     this.harness = harness
 
@@ -1899,11 +1934,13 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           return 'continue'
         }
         default: {
-          // 尝试交给插件处理（注入 harness / 当前 agentId / 持久化工具白名单接口 / 工具静态元信息）
+          // 尝试交给插件处理（注入 harness / 当前 agentId / 工具白名单持久化 / MCP 装配持久化 / 工具静态元信息）
           const cmdInput: {
             raw: string; command: string; arg: string; out: (s: string) => void; sessionId: string;
             harness: Harness; agentId?: string;
             setAgentTools: (agentId: string, tools: string[]) => Promise<void>;
+            mcpServers: McpServerEntry[];
+            setMcpServers: (list: McpServerEntry[]) => Promise<void>;
             toolMeta: ToolMetaLookup;
             workspace: Workspace;
             snapshotService?: SnapshotService;
@@ -1917,6 +1954,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             harness,
             agentId: current.agentId,
             setAgentTools: (id, tools) => app.setAgentTools(id, tools),
+            mcpServers: await app.getMcpServers(),
+            setMcpServers: (list) => app.setMcpServers(list),
             toolMeta: getBuiltinToolRegistry(),
             workspace: app.workspace,
             snapshotService: app.snapshotService,

@@ -1,5 +1,38 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 79）MCP Server 配置化管理：config.json 装配 + 服务器/工具两级启停
+
+> 承接待办「OAuth2 PKCE / MCP OAuth 授权」之外的方向。此前 MCP Server 只能经 `.harness/plugins/mcp.ts` 代码显式装配，无法从配置文件新增外部 server，也没有运行时启停；`/plugins` 只管理整插件粒度、`/mcp` 只读展示。本交付：从 `config.json` 以 JSON 新增 MCP server（stdio/sse/http），并支持**服务器 + 工具两级**启用/禁用、**即时生效（免重启）**，状态持久化回 `config.json`。
+
+### 配置模型
+
+`HarnessConfig.mcpServers: McpServerEntry[]`；`McpServerEntry` 复用 `@harness/mcp-client` 的 `McpServerConfig` 字段 + `enabled`（服务器级）、`tools`（工具级，`{ 工具名: false }` 停用单个工具）。
+
+```json
+{ "mcpServers": [{ "name": "github", "transport": "stdio", "command": "npx",
+  "args": ["-y", "@modelcontextprotocol/server-github"], "env": { "GITHUB_TOKEN": "${GITHUB_TOKEN}" } },
+  { "name": "notes", "url": "...", "auth": { "bearerToken": "enc:v1:..." }, "tools": { "notes_search": false } }] }
+```
+
+### 改动清单
+
+- **`packages/plugins/mcp-server-registry`（v0.2.0）**：
+  - 新增 `McpServerEntry` / `McpCliStore` 类型导出；工厂内新增托管配置态 `managed: Map<name, ManagedEntry>`（含 server `enabled` + 工具级 `tools`）。
+  - 新增自定义 Hook **`mcp.configure`**：注入 config.json 的 `mcpServers` 替换托管列表（仅配置态，start 时按 `enabled` 连接）。
+  - `harness.start`：代码注册 server 照旧连接；托管条目只连接 `enabled` 的。
+  - `tool.pool.assemble`：先按 server `enabled`（未连接自然不在 runtimes），再按工具 base 名过滤 `tools[name]===false`；每 query 组装 → 工具级即时生效。
+  - `/mcp` 命令扩展：`servers`（含启停状态）/ `tools`（含工具级状态）/ `enable|disable <s>`（即时连接/断开）/ `tool <s> <t> on|off` / `add <json>` / `remove <s>`；每次变更经注入的 `setMcpServers` 持久化。
+- **`packages/cli`**：`HarnessConfig` 加 `mcpServers?`；新增 `getMcpServers` / `setMcpServers`（configStore 读写）+ `applyMcpServers`（createHarness 后、start 前触发 `mcp.configure`）；`CliCommandInput` 注入 `mcpServers` / `setMcpServers`（对齐 `setAgentTools` 模式）；新增 `@harness/mcp-server-registry` 依赖。
+- **配置装配**：`.harness/plugins/mcp.ts` 无需改动（配置经 `mcp.configure` Hook 注入）。
+
+### 测试
+
+- registry 包 8 用例（新增 4：configure 注入态展示 / 工具级启停持久化 / 服务器级启停持久化 / add+remove 持久化）；cli 96 用例（新增 getMcpServers/setMcpServers + boot 注入）。全量 17 包 typecheck 通过。
+
+### 后续
+
+- `/mcp` CLI 全量管理已落地；界面（TUI/Web）添加及管理可复用 `mcp.configure` Hook + `McpCliStore.save` 数据接口，core 无需改动，另行排期。
+
 ## 2026-09-06（续 78）Subagent git worktree 隔离：子代理独立工作区免写冲突
 
 > 承接待办「Subagent git worktree 隔离」。为避免多个子代理并发写操作与父工作区冲突，为每个子会话在独立 git worktree 中执行，并把相对基线 HEAD 的 diff 摘要 + patch 回传给父会话 / 注入后台通知。

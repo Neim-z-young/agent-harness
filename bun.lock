@@ -28,6 +28,7 @@
         "@harness/bus": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/mcp-server-registry": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/provider-anthropic": "workspace:*",
@@ -86,7 +87,7 @@
     },
     "packages/plugins/code-intel": {
       "name": "@harness/code-intel",
-      "version": "0.11.0",
+      "version": "0.13.0",
       "dependencies": {
         "@babel/parser": "^7.25.0",
         "@babel/traverse": "^7.25.0",
@@ -126,17 +127,18 @@
     },
     "packages/plugins/mcp-client": {
       "name": "@harness/mcp-client",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
+        "@harness/workspace": "workspace:*",
       },
     },
     "packages/plugins/mcp-server-registry": {
       "name": "@harness/mcp-server-registry",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
         "@harness/mcp-client": "workspace:*",
         "@harness/plugin": "workspace:*",
