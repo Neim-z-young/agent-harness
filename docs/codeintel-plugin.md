@@ -1,6 +1,6 @@
 # codeintel 插件开发规划（`@harness/code-intel`）
 
-> 状态：**v1 + v2 已实现**（2026-09-04/05，见开发日志续 62/63/64/65/66/67）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
+> 状态：**v1 + v2 已实现**（2026-09-04/05，见开发日志续 62/63/64/65/66/67）；**v3 Java 语义编辑已接入 rename**（CST token 位点 + 重解析校验，见 §3.2）。承接 [workspace-management.md](workspace-management.md) §5.5：「AST 与内容索引归代码情报层」，本插件即该层的插件化具象。
 
 ## 1. 定位与目标
 
@@ -21,6 +21,33 @@
 - **AST**：规划推荐 `web-tree-sitter`；v1 按「纯 TS 域可退化 @babel/parser 起步」落地为 **`@babel/parser` + `@babel/traverse`**（纯 JS、同步、可单测，支持 TS/TSX/JS/JSX + decorators 等插件集）。多语言 grammar 后续换 web-tree-sitter 不影响工具/插件契约。
 - **符号索引**：v1 内存内 + 按需增量（parse 目标文件/目录，缓存按 mtime+size 失效）；不做持久化全文索引（呼应 §5.5），性能瓶颈再演进。
 - **grammar 加载**：v1 无外部 grammar 文件；解析失败多配置回退（TS 加 jsx 宽容、纯 JS 兼容 TS 语法），单文件失败跳过不中断目录索引。忽略目录由插件配置传入。
+
+### 3.1 竞品对标（opencode / claude code，2026-09 调研）
+
+调研 `reference/opencode-dev`（源码）与 `reference/claude-code-analysis-main`（Web 版源码反推分析）结论：**两者都没有内建完整 AST 符号索引 / 跨文件 go-to-definition**，本插件的 AST 结构化为差异化能力。
+
+| 能力 | opencode | Claude Code（Web） | `@harness/code-intel` |
+| --- | --- | --- | --- |
+| grep / 搜索 | `ripgrep`（正则文本），fallback `fff`（文件名/模糊索引，fuzzysort） | `GrepTool`（正则文本） | AST 索引（babel/tree-sitter）做符号/引用/定义 |
+| go-to-definition / references | 无（LSP 仅配置 schema，`tool/edit.ts` 仍为 `TODO: LSP runtime`） | 无内建，靠大模型 + grep | `code_definition` / `code_reference` 结构化返回 |
+| 代码语义编辑 | 字符串 `edit` / `apply_patch` | 字符串 `EditTool`（diff） | `code_semantic_edit`：AST 节点级 rename/replace_node/replace_subtree |
+| 结构完整性 | 无（文本补丁） | 无 | 落盘前内存重解析校验，失败整体放弃 |
+
+关键证据：opencode 内建工具为 `read/grep/glob/bash/edit/write/apply_patch/webfetch/websearch`（`packages/core/src/tool/`）；其代码语义计划走 LSP，但 [tool/edit.ts](reference/opencode-dev/packages/core/src/tool/edit.ts) 标注 `TODO: Add LSP ... after V2 LSP runtime exists`，尚未落地。Claude Code 工具集为 `Read / Grep / Glob / 只读 Bash / Edit / Write`（`claude-code-analysis-main/analysis/04g-prompt-management.md`）。二者均以「正则 grep + 大模型理解」代替结构化索引。
+
+对比本项目：`code-intel` 已内置了上述两者未提供的 AST 符号索引与结构感知编辑。**Java 语义编辑（v3）** 正在将 Java 从「名字命中型」提升为「语义」：连同已实现的 rename（TS/JAVA）与 replace_node/replace_subtree，使成员链定位与跨文件重命名在多语言一致。
+
+### 3.2 Java 语义 rename（v3，2026-09-06）
+
+对非 JS 语言，tree-sitter 是通用 CST、无 babel 的作用域绑定，故 `code_reference` 为名字命中型；但 `code_semantic_edit` 的 **rename** 对 Java 走独立实现，从「名字命中」提升为「语义位点」：
+
+- **声明位点精确化**：仅在拥有 `name` 字段的声明节点（class/record/interface/annotation_type/enum 的 `name`→type_identifier、method/constructor 的 `name`→identifier、variable_declarator 的 `name`）取声明名 token，标记为 `decl`。
+- **引用位点**：其余同名 `identifier` / `type_identifier` / `field_identifier` token（含 import 说明符尾部、字段访问、类型引用、调用）归为 `ref`。
+- **CST token 级隔离**：只在真实标识符 token 上替换，注释 / 字符串 / 字面量天然被排除（非 token）。
+- **偏移即字符索引**：web-tree-sitter 已把 UTF-8 字节偏移换算为 JS 字符索引（实测含中文注释时 `startIndex/endIndex` 仍与 `content.slice` 对齐），位点可直接用于替换，无需再字节→字符换算。
+- **结构校验**：rename 落盘前对每个改动文件用 `verifyJavaSource` 重解析（`!root.hasError`），任一失败整体放弃（对齐 TS/JS 的 `tryParse` 校验）。
+
+实现：`multi.ts` 的 `collectJavaRenameSites` / `verifyJavaSource`；`core.ts` 的 `CodeIntelIndex.collectRenameSitesFromScope` 按 `.java` 分派 + `execRename` 校验分支。作用域限定（scope）与 dryRun 预览对 Java 同样生效。
 
 ## 4. 注入工具（`tool.pool.assemble`）
 

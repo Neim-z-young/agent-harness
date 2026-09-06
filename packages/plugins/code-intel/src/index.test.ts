@@ -474,6 +474,78 @@ describe('code_semantic_edit 工具', () => {
     expect(read('b.ts')).toContain('obj.compute = 1')
   })
 
+  it('Java 语义 rename：字段声明 + 引用位点同步，注释/字符串隔离，中文字符偏移换算正确，重解析校验通过', async () => {
+    const file = join(dir, 'Counter.java')
+    writeFileSync(
+      file,
+      `public class Counter {
+  private int count = 0;
+  public void inc() {
+    // 计数器自增 count 变量
+    this.count = count + 1;
+  }
+  public int get() { return count; }
+}
+`,
+    )
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'count', to: 'total' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.validated).toBe(true)
+    // 声明 1（private int count）+ 引用 3（this.count / count+1 / return count）= 4。
+    // 注释中的 count 非标识符 token，被 CST 排除。
+    expect(out.total).toBe(4)
+    expect(out.files.length).toBe(1)
+    const rel = 'Counter.java'
+    expect(read(rel)).toContain('private int total = 0')
+    expect(read(rel)).toContain('this.total = total + 1')
+    expect(read(rel)).toContain('return total')
+    // 隔离性：注释中的 count 不被触碰
+    expect(read(rel)).toContain('// 计数器自增 count 变量')
+  })
+
+  it('Java 语义 rename：类名跨文件同步（import 说明符 + 类型引用），结构校验走 verifyJavaSource', async () => {
+    mkdirSync(join(dir, 'util'))
+    writeFileSync(
+      join(dir, 'util', 'Shape.java'),
+      `package util;
+public class Shape {
+  public Shape() {}
+}
+`,
+    )
+    writeFileSync(
+      join(dir, 'Main.java'),
+      `import util.Shape;
+
+public class Main {
+  Shape s = new Shape();
+  public Shape build() { return new Shape(); }
+}
+`,
+    )
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', symbol: 'Shape', to: 'Circle' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'rename') throw new Error('expected rename')
+    expect(out.validated).toBe(true)
+    // 声明文件 class Shape(decl) 1；Main.java：import 说明符 Shape 1 + 类型引用/构造/返回 数处
+    expect(out.files.length).toBe(2)
+    expect(read(join('util', 'Shape.java'))).toContain('public class Circle')
+    expect(read('Main.java')).toContain('import util.Circle')
+    expect(read('Main.java')).toContain('Circle s = new Circle()')
+    expect(read('Main.java')).toContain('public Circle build() { return new Circle(); }')
+  })
+
   it('dryRun 只返回计划位点，不落盘', async () => {
     writeFileSync(join(dir, 'a.ts'), 'export function foo() {}\n')
     const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(

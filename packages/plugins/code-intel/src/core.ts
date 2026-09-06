@@ -16,7 +16,7 @@ import * as t from '@babel/types'
 import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { extractMulti, MULTI_EXT } from './multi'
+import { collectJavaRenameSites, extractMulti, MULTI_EXT, verifyJavaSource } from './multi'
 
 // ===== 数据类型 =====
 
@@ -669,6 +669,11 @@ export class CodeIntelIndex {
     const byFile = new Map<string, RenameSite[]>()
     for (const f of files) {
       const content = await readFile(f.path, 'utf-8')
+      if (extname(f.path).toLowerCase() === '.java') {
+        const sites = await collectJavaRenameSites(content, name)
+        if (sites.length) byFile.set(f.path, sites)
+        continue
+      }
       const ast = tryParse(content, f.path)
       if (!ast) continue
       const sites = collectRenameSites(ast, content, name)
@@ -968,7 +973,14 @@ async function execRename(
         const s = sites[i]
         out = out.slice(0, s.start) + input.to + out.slice(s.end)
       }
-      if (!tryParse(out, file)) {
+      if (extname(file).toLowerCase() === '.java') {
+        if (!(await verifyJavaSource(out))) {
+          return fail(
+            `重命名后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
+            'EDIT_INVALID_STRUCTURE',
+          )
+        }
+      } else if (!tryParse(out, file)) {
         return fail(
           `重命名后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
           'EDIT_INVALID_STRUCTURE',

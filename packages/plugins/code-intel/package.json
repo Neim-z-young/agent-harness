@@ -1,7 +1,7 @@
 {
   "name": "@harness/code-intel",
-  "version": "0.11.0",
-  "description": "代码情报插件（MCP 解耦版）：code_symbols / code_reference / code_definition + code_semantic_edit（rename|scope/跨目录反向import|replace_node|replace_subtree 批量），进程内 MCP server 装配",
+  "version": "0.12.0",
+  "description": "代码情报插件（MCP 解耦版）：code_symbols / code_reference / code_definition + code_semantic_edit（rename TS/JS babel + Java tree-sitter 语义、scope/跨目录反向import、replace_node、replace_subtree 批量），进程内 MCP server 装配",
   "type": "module",
   "exports": {
     ".": {

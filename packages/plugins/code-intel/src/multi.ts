@@ -8,7 +8,10 @@
  * - tree-sitter 是通用 CST，不具备 babel 的作用域绑定 / 语义引用解析。故这里的
  *   code_reference 为**名字命中型（非语义）**：对声明符号名做 token 匹配（排除声明自身节点）。
  *   babel 语义引用不受影响（仅 TS/JS 走 babel）。
- * - 语义编辑（rename/replace_*）不扩到非 JS 语言。
+ * - 语义编辑：TS/JS 走 babel（rename/replace_*）。Java 例外——本模块提供 token 级
+ *   **语义 rename**（`collectJavaRenameSites`）：基于 CST 精确收集声明 + 引用标识符 token 位点
+ *   （排除注释/字符串/字面量），rename 后经 `verifyJavaSource` 重解析校验结构。
+ *   注：引用为「同名标识符 token」级别（未做 JDK/重载作用域绑定），与名字命中型引用同级。
  *
  * WASM 定位注意：运行时依赖 node_modules 相对路径（createRequire 解析语法 wasm；
  * web-tree-sitter 的 tree-sitter.wasm 经 ESM 内部 new URL(import.meta.url) 解析）。
@@ -419,4 +422,82 @@ export async function extractMulti(
   }
 
   return { symbols, references: refs }
+}
+
+// ===== Java 语义编辑（rename）：token 级位点 + 结构校验 =====
+
+/**
+ * Java 中「拥有 name 字段」的声明节点类型：
+ * - 类型声明（class/record/interface/annotation_type/enum）：`name` → type_identifier
+ * - 方法/构造器：`name` → identifier
+ * - 变量声明符（字段/局部变量）：`variable_declarator.name` → identifier
+ */
+const JAVA_DECL_KINDS = new Set([
+  'class_declaration',
+  'record_declaration',
+  'interface_declaration',
+  'annotation_type_declaration',
+  'enum_declaration',
+  'method_declaration',
+  'constructor_declaration',
+  'variable_declarator',
+])
+
+/** Java 引用 token 类型：标识符 / 类型标识符 / 字段访问标识符（含 import 说明符尾部 token） */
+const JAVA_REF_TOKENS = new Set(['identifier', 'type_identifier', 'field_identifier'])
+
+export interface JavaRenameSite {
+  /** JS 字符偏移（含） */
+  start: number
+  /** JS 字符偏移（不含） */
+  end: number
+  /** 声明（精确 name token）| 引用（同名标识符 token） */
+  role: 'decl' | 'ref'
+  /** 1-based 行 */
+  line: number
+}
+
+/** tree-sitter 起始/结束偏移即为 JS 字符索引（web-tree-sitter 已把 UTF-8 字节偏移换算为字符索引），可直接用于 slice/替换 */
+
+/**
+ * 收集 Java 文件中与 `name` 同名的**标识符 token 语义位点**（CST token 精确范围，排除注释/字符串/字面量）。
+ * 声明位点取其 name 字段（声明名），其余（含 import 说明符、引用、字段访问）归为引用。
+ * 返回空数组表示解析失败或语言不支持。
+ */
+export async function collectJavaRenameSites(content: string, name: string): Promise<JavaRenameSite[]> {
+  const root = await parseRoot(content, '.java')
+  if (!root) return []
+
+  // 1) 收集该符号的声明 name token（精确）
+  const declared = new Set<string>()
+  walkAll(root, (n) => {
+    if (!JAVA_DECL_KINDS.has(n.type)) return
+    const nameNode = n.childForFieldName('name')
+    if (nameNode && nameNode.text === name) {
+      declared.add(`${nameNode.startIndex}:${nameNode.endIndex}`)
+    }
+  })
+
+  // 2) 收集同名标识符 token：声明 token → decl，其余 → ref
+  const sites: JavaRenameSite[] = []
+  walkAll(root, (n) => {
+    if (!JAVA_REF_TOKENS.has(n.type)) return
+    const text = n.text
+    if (!text || text !== name) return
+    const s = n.startIndex
+    const e = n.endIndex
+    sites.push({
+      start: s,
+      end: e,
+      role: declared.has(`${s}:${e}`) ? 'decl' : 'ref',
+      line: n.startPosition.row + 1,
+    })
+  })
+  return sites
+}
+
+/** Java 重解析结构校验：无语法 ERROR 节点返回 true */
+export async function verifyJavaSource(content: string): Promise<boolean> {
+  const root = await parseRoot(content, '.java')
+  return root ? !root.hasError : false
 }

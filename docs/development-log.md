@@ -1,5 +1,19 @@
 # Agent Harness 开发日志
 
+## 2026-09-06（续 73）code-intel：Java 语义 rename 接入结构编辑
+
+> 承接续 72。把 Java 从「名字命中型引用」提升为「语义编辑位点」：`code_semantic_edit` 的 rename 现对 `.java` 走 CST 标识符 token 级实现（声明位点精确化 + 引用识别 + 重解析校验），对齐 TS/JS 的 babel 语义 rename。
+
+### 实现
+
+* **`core.ts`**：`CodeIntelIndex.collectRenameSitesFromScope` 按 `.java` 分派到 `collectJavaRenameSites`（其余走 babel `tryParse` + `collectRenameSites`）；`execRename` 落盘前校验分支——Java 文件用 `verifyJavaSource`（`!root.hasError`）而不是 `tryParse`，任一失败整体放弃（不落盘）。
+* **`multi.ts`**：`collectJavaRenameSites` 收集同名声明/引用 token 位点——声明仅取拥有 `name` 字段的节点（class/record/interface/annotation_type/enum → type_identifier、method/constructor → identifier、variable_declarator → identifier），标记 `decl`；其余 `identifier`/`type_identifier`/`field_identifier` 同名 token（含 import 说明符、字段访问、类型引用、调用）归 `ref`。注释/字符串/字面量非 token 天然隔离。`verifyJavaSource` 重解析无 ERROR 节点即校验通过。
+* **偏移修正（关键）**：web-tree-sitter 的 `startIndex/endIndex` 已把 UTF-8 字节偏移换算为 JS 字符索引（实测含中文注释时仍与 `content.slice` 精确对齐），位点可直接用于替换。此前为实现"字节→字符换算"而引入的 `jsIndexAt` 反而把已正确的字符索引当字节再换算一次，导致含非 ASCII 前文的 token 范围错位（出现 2 字符跨度等异常）——已删除，位点直接用 `n.startIndex/n.endIndex`。
+
+### 测试与版本
+
+* `index.test.ts` 新增 2 条：① 单文件字段重命名——声明 1 + 引用 3（`this.count`/`count+1`/`return count`）共 4 位点同步，注释中同名 token 不触碰、中文注释场景验证字符偏移换算正确、`validated=true`；② 类名跨文件——`util/Shape.java` 声明 + `Main.java` import 说明符与类型/构造引用同步改名。code-intel 包 72 用例全过（原 70 + 新增 2），typecheck 通过；全量 typecheck 通过。插件 version 0.12.0，meta 描述同步（rename TS/JS babel + Java tree-sitter 语义）。
+
 ## 2026-09-06（续 72）code-intel：进程内 MCP server 解耦
 
 > 承接续 71。把 code-intel 从"直装 `@harness/tool` 工具"重构为「进程内 MCP server + 直装工具」双路径，核心逻辑与 harness 解耦：索引 / 符号 / 引用 / 定义 / 结构感知编辑引擎下沉到 `core.ts`（零 `@harness/tool` / `@harness/plugin` 依赖），MCP server 由 `@harness/mcp-server-registry` 进程内连接并暴露为 `mcp__code-intel__*` 工具，可独立部署 / 跨进程调用。
