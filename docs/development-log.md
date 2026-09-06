@@ -9,11 +9,11 @@
 * **`core.ts`**：从原 `index.ts` 拆出全部核心逻辑——`CodeIntelIndex`（按需增量 + mtime/size 缓存）、babel 符号/引用提取、tree-sitter 多语言导航入口、`execSemanticEdit`（rename / replace_node / replace_subtree 结构感知编辑引擎）。定义独立契约 `CoreResult` / `ok` / `fail` / `CoreContext`（仅 `cwd`）。
 * **`server.ts`**：进程内 MCP JSON-RPC server（`CodeIntelMcpServer`）——`initialize` / `tools/list` / `tools/call`，四个工具入参支持可选 `cwd`、返回文本（便于 LLM 直接阅读）；`createCodeIntelServerTransport` 包装为 `@harness/mcp-client` 的 `McpTransport`（send 喂给 server、onMessage 回传、提前接收走队列）。
 * **`tools.ts`**：薄适配层，把 `core.ts` 能力适配为 `@harness/tool` 的 Tool（同 id），保留只读/并发安全/权限键声明，供 REPL `/tools` 展示与既有测试兼容。
-* **`index.ts`**：插件入口 `createCodeIntelPlugin` 用 `registerMcpServer({ name, createTransport })` 注册进程内 server（同名覆盖、幂等），同时经 `tool.pool.assemble` 注入直装工具；`dependsOn: ['mcp.server-registry']`；重导出 core/tools/server 公共符号。
+* **`index.ts`**：插件入口 `createCodeIntelPlugin` 装配方式对齐 computer-use（可插拔 / 独立装卸）——`install` 钩子内用 `registerMcpServer({ name, createTransport })` 注册进程内 server（同名覆盖、幂等）、`uninstall` 注销（`unregisterMcpServer`）；同时经 `tool.pool.assemble` 注入直装工具；`dependsOn: ['mcp.server-registry']`；重导出 core/tools/server 公共符号。
 
 ### 测试与版本
 
-* 新增 `server.test.ts` 8 用例：initialize、tools/list、tools/call 四工具、未知工具/方法走 JSON-RPC 错误码、rename dryRun 不落盘、transport 响应回传与队列。修复 `fail(message, code)` 参数顺序、`resolvePathRelative` 未定义、测试同步等待异步 `tools/call` 响应三类问题。code-intel 包 67 用例全过、typecheck 通过。插件 version 0.11.0。
+* 新增 `server.test.ts` 用例：initialize、tools/list、tools/call 四工具、未知工具/方法走 JSON-RPC 错误码、rename dryRun 不落盘、transport 响应回传与队列，以及 2 条插件装配集成用例（install 后 registry 可见 code-intel 条目 + tool.pool.assemble 注入直装工具；transport 经 `@harness/mcp-client` `McpClient.connect` + `listTools`=4 + `callTool` 可用）。修复 `fail(message, code)` 参数顺序、`resolvePathRelative` 未定义、测试同步等待异步 `tools/call` 响应三类问题。code-intel 包 69 用例全过、typecheck 通过。插件 version 0.11.0。
 
 ## 2026-09-06（续 71）code-intel：多语言导航新增 Java
 

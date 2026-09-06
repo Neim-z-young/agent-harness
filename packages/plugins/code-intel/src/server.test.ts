@@ -9,7 +9,10 @@ import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
+import { listRegisteredMcpServers, unregisterMcpServer } from '@harness/mcp-server-registry'
+import { McpClient } from '@harness/mcp-client'
 import { CodeIntelMcpServer, createCodeIntelServerTransport } from './server'
+import { createCodeIntelPlugin, CODE_INTEL_SERVER_NAME } from './index'
 
 let dir: string
 let server: CodeIntelMcpServer
@@ -119,5 +122,46 @@ describe('createCodeIntelServerTransport', () => {
     expect(received.length).toBe(2)
     expect(JSON.parse(received[1]).result.serverInfo.name).toBe('code-intel')
     transport.close()
+  })
+})
+
+describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', () => {
+  afterEach(() => {
+    unregisterMcpServer(CODE_INTEL_SERVER_NAME)
+  })
+
+  it('install 注册 code-intel 进程内 MCP server（依赖 registry）并注入直装工具', async () => {
+    const plugin = createCodeIntelPlugin()
+    expect(plugin.dependsOn).toContain('mcp.server-registry')
+    const hooks = await plugin.install({ log: { info() {}, warn() {}, error() {}, debug() {} } } as any)
+
+    // registry 中可见 code-intel server（伴随 harness.start 由 mcp-server-registry 连接）
+    const entry = listRegisteredMcpServers().find((r) => r.name === CODE_INTEL_SERVER_NAME)
+    expect(entry).toBeDefined()
+    expect(entry && 'createTransport' in entry ? (entry as { createTransport: unknown }).createTransport : null).toBeTypeOf('function')
+
+    // 直装工具注入（tool.pool.assemble）
+    const assemble = hooks?.['tool.pool.assemble']
+    expect(assemble).toBeTypeOf('function')
+    const added: string[] = []
+    await (assemble as (...a: unknown[]) => unknown)({} as any, { add: (t: any) => added.push(t.id) } as any)
+    expect(added.sort()).toEqual(['code_definition', 'code_reference', 'code_semantic_edit', 'code_symbols'])
+  })
+
+  it('transport 对接 McpClient（registry 使用路径）listTools + callTool 可用', async () => {
+    const plugin = createCodeIntelPlugin()
+    await plugin.install({ log: { info() {}, warn() {}, error() {}, debug() {} } } as any)
+    const entry = listRegisteredMcpServers().find((r) => r.name === CODE_INTEL_SERVER_NAME) as
+      | { createTransport: () => any }
+      | undefined
+    expect(entry).toBeDefined()
+    const transport = await entry!.createTransport()
+    const client = new McpClient('code-intel', transport)
+    await client.connect()
+    const tools = await client.listTools()
+    expect(tools.length).toBe(4)
+    const callResult = await client.callTool('code_symbols', { path: 'src/util.ts' })
+    expect(callResult.isError).toBeNull()
+    client.close()
   })
 })

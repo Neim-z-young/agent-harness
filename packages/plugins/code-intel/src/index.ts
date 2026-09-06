@@ -29,7 +29,7 @@
  * })
  */
 
-import { registerMcpServer } from '@harness/mcp-server-registry'
+import { registerMcpServer, unregisterMcpServer } from '@harness/mcp-server-registry'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
 
@@ -41,12 +41,15 @@ export * from './core'
 export * from './tools'
 export { CodeIntelMcpServer, createCodeIntelServerTransport, type McpToolDefParam, type ToolEntry } from './server'
 
+export const CODE_INTEL_SERVER_NAME = 'code-intel'
+
 /**
- * 代码情报插件
+ * 代码情报插件（装配方式对齐 computer-use：可插拔 / 独立装卸）
  *
- * - 进程内 MCP server：经 registerMcpServer 注册，由 mcp-server-registry 连接，
+ * - install 钩子内注册进程内 MCP server：registry 在 harness.start 时进程内连接，
  *   暴露 `mcp__code-intel__*` 工具（与 harness 解耦，可独立部署 / 跨进程调用）。
- * - 直装工具：同时把同 id 工具经 tool.pool.assemble 注入（兼容 REPL 与既有测试）。
+ * - 同时把同 id 工具经 tool.pool.assemble 注入（兼容 REPL /tools 与既有测试）。
+ * - uninstall 时注销 MCP server 注册，支持装卸。
  *
  * @param options.ignoreDirs 忽略目录名
  * @param options.maxFiles 单次目录索引最大文件数
@@ -54,13 +57,6 @@ export { CodeIntelMcpServer, createCodeIntelServerTransport, type McpToolDefPara
  */
 export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlugin {
   const index = new CodeIntelIndex(options)
-  // 注册进程内 MCP server（同名覆盖，幂等）：harness.start 时由 mcp-server-registry 进程内连接
-  const server = new CodeIntelMcpServer({ index })
-  registerMcpServer({
-    name: server.serverName,
-    createTransport: () => createCodeIntelServerTransport(server),
-  })
-
   const tools: Tool[] = [
     codeSymbolsTool(index),
     codeReferenceTool(index),
@@ -72,10 +68,16 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
     id: 'code-intel',
     version: '0.11.0',
     name: '代码情报',
-    description: '代码情报插件：code_symbols / code_reference / code_definition / code_semantic_edit（rename|scope/反向import|replace_node|replace_subtree 批量）（MCP 解耦版）',
+    description: '代码情报插件（MCP 解耦版）：code_symbols / code_reference / code_definition / code_semantic_edit（rename|scope/反向import|replace_node|replace_subtree 批量），进程内 MCP server 可插拔装配',
     dependsOn: ['mcp.server-registry'],
     async install(ctx) {
-      ctx.log.info('code-intel 插件已加载（进程内 MCP server + 直装工具）', {
+      // 注册进程内 MCP server（同名覆盖、幂等）：registry 在 harness.start 进程内连接并暴露 mcp__code-intel__* 工具
+      const server = new CodeIntelMcpServer({ index })
+      registerMcpServer({
+        name: server.serverName,
+        createTransport: () => createCodeIntelServerTransport(server),
+      })
+      ctx.log.info('code-intel 已注册进程内 MCP server（由 mcp-server-registry 启动连接）', {
         mcpServer: server.serverName,
         tools: tools.map((t) => t.id),
       })
@@ -86,6 +88,9 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
           }
         },
       } as Hooks
+    },
+    async uninstall() {
+      unregisterMcpServer(CODE_INTEL_SERVER_NAME)
     },
   }
 }
