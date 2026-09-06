@@ -30,7 +30,7 @@ import {
  * - createTransport：进程内或自定义启动器，返回 McpTransport（供 computer-use 等自包含 server 使用）
  */
 export type McpServerRegistration =
-  | { name: string; config: McpServerConfig }
+  | { name: string; config: McpServerConfig; dataDir?: string }
   | { name: string; createTransport: () => McpTransport | Promise<McpTransport> }
 
 /** MCP Server 注册表 */
@@ -89,6 +89,8 @@ interface McpServerRuntime {
 export interface McpServerRegistryPluginOptions {
   /** 设置自定义注册表（缺省用模块级默认） */
   registry?: McpServerRegistry
+  /** 透传给 mcp-client defaultTransportFactory 的默认 dataDir（OAuth token 持久化；单项可覆盖） */
+  dataDir?: string
 }
 
 /**
@@ -97,6 +99,7 @@ export interface McpServerRegistryPluginOptions {
  */
 export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOptions = {}): AgentPlugin {
   const reg = options.registry ?? defaultRegistry
+  const dataDir = options.dataDir
   const runtimes: McpServerRuntime[] = []
   let connected = false
 
@@ -117,7 +120,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
               let config: McpServerConfig | undefined
               if ('config' in item) {
                 config = item.config
-                transport = defaultTransportFactory(item.config)
+                transport = defaultTransportFactory(item.config, { dataDir: item.dataDir ?? dataDir })
               } else {
                 transport = await item.createTransport()
               }

@@ -10,22 +10,34 @@
  * - 工具命名：mcp__${serverName}__${toolName}（同 Claude Code 约定）
  * - 工具安全声明：Fail-Closed（isReadOnly=false, isDestructive=false）
  * - 支持 Bearer Token 鉴权（HTTP/SSE transport）
+ * - 支持 OAuth2 PKCE 授权码（HTTP/SSE transport）：
+ *   端点 well-known 自动发现 / 显式配置；token 加密持久化到 dataDir/oauth-tokens.json；
+ *   access 过期自动 refresh；HTTP 401/403 强制刷新后重试一次。
+ *   详见 src/oauth.ts 与 src/token-store.ts。
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import type { Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defaultUserDir } from '@harness/workspace'
+import { OAuthFlow, type McpOauthConfig } from './oauth'
+import { OAuthTokenStore, oauthServerKey } from './token-store'
 
 // ===== 类型定义 =====
+
+/** 异步 OAuth token 解析器：返回可用明文 access_token（内部负责缓存/刷新/交互授权） */
+export type OauthResolver = (opts?: { refresh?: boolean }) => Promise<string>
 
 /** 鉴权配置（用于 HTTP/SSE transport） */
 export interface McpAuthConfig {
   /** Bearer Token，会在请求头注入 `Authorization: Bearer ${token}` */
   bearerToken?: string
-  /** 直接作为 Authorization 头值（如 "Bearer xxx"），优先级高于 bearerToken */
+  /** 直接作为 Authorization 头值（如 "Bearer xxx"），优先级低于 oauth、高于 bearerToken */
   authorizationHeader?: string
   /** 自定义请求头（合并到 fetch headers） */
   headers?: Record<string, string>
+  /** OAuth2 PKCE 配置：存在时优先走 OAuth 授权码流程，其次回落静态 bearerToken */
+  oauth?: McpOauthConfig
 }
 
 /** MCP Server 配置（支持 stdio / http / sse 三种 transport） */
@@ -158,11 +170,23 @@ export class StdioTransport implements McpTransport {
 
 // ===== HTTP/SSE transport 公共辅助 =====
 
-/** 把鉴权配置 + 自定义头合并为 fetch headers */
-function buildAuthHeaders(auth?: McpAuthConfig): Record<string, string> {
+/**
+ * 把鉴权配置 + 自定义头合并为 fetch headers。
+ * oauth 存在时优先从 oauthResolver 取动态 token（异步），否则回落静态 bearerToken/authorizationHeader。
+ */
+async function buildAuthHeaders(
+  auth?: McpAuthConfig,
+  oauthResolver?: OauthResolver,
+): Promise<Record<string, string>> {
   const headers: Record<string, string> = { 'Content-Type': 'application/json' }
-  if (auth?.authorizationHeader) headers['Authorization'] = auth.authorizationHeader
-  else if (auth?.bearerToken) headers['Authorization'] = `Bearer ${auth.bearerToken}`
+  if (oauthResolver && auth?.oauth) {
+    const token = await oauthResolver()
+    if (token) headers['Authorization'] = `Bearer ${token}`
+  } else if (auth?.authorizationHeader) {
+    headers['Authorization'] = auth.authorizationHeader
+  } else if (auth?.bearerToken) {
+    headers['Authorization'] = `Bearer ${auth.bearerToken}`
+  }
   if (auth?.headers) Object.assign(headers, auth.headers)
   return headers
 }
@@ -190,15 +214,33 @@ export class HttpTransport implements McpTransport {
   private sessionId?: string
   private readonly url: string
   private readonly auth?: McpAuthConfig
+  private readonly oauthResolver?: OauthResolver
 
-  constructor(config: { url: string; auth?: McpAuthConfig }) {
+  constructor(config: { url: string; auth?: McpAuthConfig; oauthResolver?: OauthResolver }) {
     this.url = config.url
     this.auth = config.auth
+    this.oauthResolver = config.oauthResolver
   }
 
   async send(data: string): Promise<void> {
     if (this.closed) throw new Error('HTTP transport closed')
-    const headers: Record<string, string> = buildAuthHeaders(this.auth)
+    const status = await this.post(data)
+    if (status !== 401 && status !== 403) return
+    // 401/403：可重试的 oauth 场景强制刷新后重试一次，再失败抛错
+    if (this.oauthResolver && this.auth?.oauth) {
+      await this.oauthResolver({ refresh: true })
+      const retryStatus = await this.post(data)
+      if (retryStatus === 401 || retryStatus === 403) {
+        throw new Error(`HTTP ${retryStatus}: OAuth 重试后仍被拒绝`)
+      }
+      return
+    }
+    throw new Error(`HTTP ${status}: 鉴权被拒绝`)
+  }
+
+  /** 发送一次 POST，返回响应状态码；SSE/JSON 响应会分发给 handler */
+  private async post(data: string): Promise<number> {
+    const headers: Record<string, string> = await buildAuthHeaders(this.auth, this.oauthResolver)
     headers['Accept'] = 'application/json, text/event-stream'
     if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId
 
@@ -215,7 +257,7 @@ export class HttpTransport implements McpTransport {
     if (contentType.includes('text/event-stream')) {
       // SSE 流响应：逐块解析
       const reader = resp.body?.getReader()
-      if (!reader) return
+      if (!reader) return resp.status
       const decoder = new TextDecoder()
       let buf = ''
       while (!this.closed) {
@@ -234,11 +276,18 @@ export class HttpTransport implements McpTransport {
       }
       // flush 残留
       if (buf.trim()) for (const msg of parseSseChunk(buf + '\n\n')) this.handler?.(msg)
+      return resp.status
     } else if (contentType.includes('application/json')) {
       const text = await resp.text()
       if (text.trim()) this.handler?.(text)
+      return resp.status
     } else if (resp.status === 202) {
       // Accepted：响应在后续 SSE 推送中（这里不处理，等后续 GET 流）
+      return resp.status
+    } else if (resp.status === 401 || resp.status === 403) {
+      // 鉴权拒绝：交由 send 判定是否 OAuth 重试
+      await resp.text().catch(() => '')
+      return resp.status
     } else {
       throw new Error(`HTTP ${resp.status}: ${await resp.text().catch(() => '')}`)
     }
@@ -260,16 +309,18 @@ export class SseTransport implements McpTransport {
   private postEndpoint?: string
   private readonly baseUrl: string
   private readonly auth?: McpAuthConfig
+  private readonly oauthResolver?: OauthResolver
 
-  constructor(config: { url: string; auth?: McpAuthConfig }) {
+  constructor(config: { url: string; auth?: McpAuthConfig; oauthResolver?: OauthResolver }) {
     this.baseUrl = config.url
     this.auth = config.auth
+    this.oauthResolver = config.oauthResolver
   }
 
   /** 建立 SSE 连接，等待服务器推送 endpoint 事件 */
   async connectSse(): Promise<void> {
     if (this.closed) throw new Error('SSE transport closed')
-    const headers = buildAuthHeaders(this.auth)
+    const headers = await buildAuthHeaders(this.auth, this.oauthResolver)
     headers['Accept'] = 'text/event-stream'
     const resp = await fetch(this.baseUrl, { method: 'GET', headers })
     if (!resp.ok) throw new Error(`SSE connect failed: ${resp.status}`)
@@ -317,7 +368,7 @@ export class SseTransport implements McpTransport {
   async send(data: string): Promise<void> {
     if (this.closed) throw new Error('SSE transport closed')
     if (!this.postEndpoint) throw new Error('SSE endpoint not received yet')
-    const headers = buildAuthHeaders(this.auth)
+    const headers = await buildAuthHeaders(this.auth, this.oauthResolver)
     const resp = await fetch(this.postEndpoint, {
       method: 'POST',
       headers,
@@ -338,20 +389,53 @@ export class SseTransport implements McpTransport {
   }
 }
 
+/** transport 工厂上下文：承载 OAuth token 持久化目录与交互/日志注入 */
+export interface TransportFactoryContext {
+  /** token 加密持久化目录；缺省用 defaultUserDir() */
+  dataDir?: string
+  /** 替换全局 fetch（测试注入） */
+  fetchImpl?: typeof fetch
+  /** 授权码读取器（缺省读 stdin 一行） */
+  readCode?: () => Promise<string>
+  /** 授权提示/日志输出 */
+  log?: (msg: string) => void
+}
+
+/** 为 OAuth 配置装配 OAuthFlow 的 ensureAccessToken 解析器 */
+function oauthResolverFor(config: McpServerConfig, ctx: TransportFactoryContext): OauthResolver | undefined {
+  if (!config.auth?.oauth) return undefined
+  const baseUrl = config.url
+  if (!baseUrl) return undefined
+  const flow = new OAuthFlow({
+    serverKey: oauthServerKey(baseUrl),
+    baseUrl,
+    oauth: config.auth.oauth,
+    store: new OAuthTokenStore(ctx.dataDir ?? defaultUserDir()),
+    fetchImpl: ctx.fetchImpl,
+    readCode: ctx.readCode,
+    log: ctx.log,
+  })
+  return (opts) => flow.ensureAccessToken(opts)
+}
+
 /** 默认 transport 工厂：根据 config.transport 选择 */
-export function defaultTransportFactory(config: McpServerConfig): McpTransport {
+export function defaultTransportFactory(
+  config: McpServerConfig,
+  ctx: TransportFactoryContext = {},
+): McpTransport {
   const t = config.transport ?? (config.command ? 'stdio' : 'http')
+  const oauthResolver = oauthResolverFor(config, ctx)
   if (t === 'stdio') {
     if (!config.command) throw new Error(`MCP Server "${config.name}" 缺少 command（stdio 模式必填）`)
     return new StdioTransport({ command: config.command, args: config.args, env: config.env })
   }
   if (t === 'sse') {
     if (!config.url) throw new Error(`MCP Server "${config.name}" 缺少 url（sse 模式必填）`)
-    return new SseTransport({ url: config.url, auth: config.auth })
+    return new SseTransport({ url: config.url, auth: config.auth, oauthResolver })
   }
   if (t === 'http') {
     if (!config.url) throw new Error(`MCP Server "${config.name}" 缺少 url（http 模式必填）`)
-    return new HttpTransport({ url: config.url, auth: config.auth })
+    return new HttpTransport({ url: config.url, auth: config.auth, oauthResolver })
   }
   throw new Error(`Unknown transport: ${t as string}`)
 }
@@ -616,13 +700,15 @@ interface McpServerRuntime {
  *   - 'all'：注入所有发现到的资源
  *   - string[]：注入指定 URI 的资源
  *   - 缺省：不注入
+ * @param dataDir transport 上下文透传（OAuth token 持久化目录）
  */
 export function createMcpClientPlugin(options: {
   servers: McpServerConfig[]
-  transportFactory?: (config: McpServerConfig) => McpTransport
+  transportFactory?: (config: McpServerConfig, ctx?: TransportFactoryContext) => McpTransport
   autoInjectResources?: 'all' | string[]
+  dataDir?: string
 }): AgentPlugin {
-  const { servers, transportFactory, autoInjectResources } = options
+  const { servers, transportFactory, autoInjectResources, dataDir } = options
   const runtimes: McpServerRuntime[] = []
   /** 自动注入的资源内容缓存（uri → text） */
   const injectedResourceCache = new Map<string, string>()
@@ -642,8 +728,8 @@ export function createMcpClientPlugin(options: {
           for (const config of servers) {
             try {
               const transport = transportFactory
-                ? transportFactory(config)
-                : defaultTransportFactory(config)
+                ? transportFactory(config, { dataDir })
+                : defaultTransportFactory(config, { dataDir })
               const client = new McpClient(config.name, transport, config)
               await client.connect()
 

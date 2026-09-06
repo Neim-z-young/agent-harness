@@ -1,4 +1,6 @@
-import { describe, it, expect } from 'bun:test'
+import { describe, test, it, expect } from 'bun:test'
+import { mkdtempSync, existsSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import {
   McpClient,
   StdioTransport,
@@ -478,6 +480,107 @@ describe('HttpTransport', () => {
       ;(globalThis as any).fetch = prev
     }
   })
+
+  it('oauth resolver 注入动态 Bearer Token（优先级高于静态 token）', async () => {
+    let capturedHeaders: any
+    let resolverRefresh: boolean | undefined
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (_url: string, init: any) => {
+      capturedHeaders = init.headers
+      return makeJsonResp({ jsonrpc: '2.0', id: 1, result: {} })
+    }
+    try {
+      const t = new HttpTransport({
+        url: 'https://mcp.example.com',
+        auth: { oauth: {} as any, bearerToken: 'static-token' },
+        oauthResolver: (opts) => {
+          resolverRefresh = opts?.refresh
+          return Promise.resolve('oauth-token')
+        },
+      })
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: {} }))
+      expect(capturedHeaders['Authorization']).toBe('Bearer oauth-token')
+      expect(resolverRefresh).toBeUndefined()
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('401 触发 OAuth 强制刷新后重试一次并成功', async () => {
+    const calls: string[] = []
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (_url: string, init: any) => {
+      calls.push((init.headers as any)['Authorization'])
+      if (calls.length === 1) {
+        // 第一次：401 无 token / 过期 token
+        return Promise.resolve({
+          ok: false,
+          status: 401,
+          headers: new Map([['Content-Type', 'text/plain']]),
+          text: () => Promise.resolve('unauthorized'),
+        })
+      }
+      return makeJsonResp({ jsonrpc: '2.0', id: 1, result: {} })
+    }
+    try {
+      let refreshCount = 0
+      const t = new HttpTransport({
+        url: 'https://mcp.example.com',
+        auth: { oauth: {} as any },
+        oauthResolver: (opts) => {
+          if (opts?.refresh) refreshCount++
+          return Promise.resolve('fresh-token')
+        },
+      })
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: {} }))
+      expect(calls.length).toBe(2)
+      expect(calls[0]).toBe('Bearer fresh-token')
+      expect(calls[1]).toBe('Bearer fresh-token')
+      expect(refreshCount).toBe(1)
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('401 重试后仍被拒绝则抛错', async () => {
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = () => Promise.resolve({
+      ok: false,
+      status: 401,
+      headers: new Map([['Content-Type', 'text/plain']]),
+      text: () => Promise.resolve('unauthorized'),
+    })
+    try {
+      const t = new HttpTransport({
+        url: 'https://mcp.example.com',
+        auth: { oauth: {} as any },
+        oauthResolver: () => Promise.resolve('fresh-token'),
+      })
+      await expect(
+        t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: {} })),
+      ).rejects.toThrow(/OAuth 重试后仍被拒绝/)
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
+
+  it('非 oauth 的 401 直接抛错误（不重试）', async () => {
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = () => Promise.resolve({
+      ok: false,
+      status: 401,
+      headers: new Map([['Content-Type', 'text/plain']]),
+      text: () => Promise.resolve('unauthorized'),
+    })
+    try {
+      const t = new HttpTransport({ url: 'https://mcp.example.com', auth: { bearerToken: 'abc' } })
+      await expect(
+        t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'ping', params: {} })),
+      ).rejects.toThrow(/HTTP 401/)
+    } finally {
+      ;(globalThis as any).fetch = prev
+    }
+  })
 })
 
 // ===== SSE transport 测试 =====
@@ -557,6 +660,61 @@ describe('defaultTransportFactory', () => {
   })
   it('http 缺 url 抛错', () => {
     expect(() => defaultTransportFactory({ name: 's', transport: 'http' })).toThrow('缺少 url')
+  })
+  it('oauth 配置装配 OAuthFlow：走 discovery+交互授权+持久化，注入动态 Bearer', async () => {
+    const dir = mkdtempSync(tmpdir() + '/oauth-')
+    let mcpAuthHeader: unknown = ''
+    const mcpUrl = 'https://mcpx/mcp'
+    const discoveryUrl = 'https://authx/.well-known/oauth-authorization-server'
+    const tokenUrl = 'https://authx/token'
+    const prev = (globalThis as any).fetch
+    ;(globalThis as any).fetch = (url: string, init: any) => {
+      if (url === discoveryUrl) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ authorization_endpoint: 'https://authx/authorize', token_endpoint: tokenUrl }),
+        })
+      }
+      if (url === tokenUrl) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({ access_token: 'oauth-access', refresh_token: 'r', expires_in: 3600 }),
+        })
+      }
+      if (url === mcpUrl) {
+        mcpAuthHeader = init?.headers?.['Authorization']
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          headers: new Map([['Content-Type', 'application/json']]),
+          text: async () => JSON.stringify({ jsonrpc: '2.0', id: 1, result: { ok: true } }),
+        })
+      }
+      return Promise.resolve({ ok: false, status: 404, text: async () => 'nf' })
+    }
+    try {
+      const cfg: McpServerConfig = {
+        name: 's',
+        transport: 'http',
+        url: mcpUrl,
+        auth: { oauth: { discoveryUrl: 'https://authx/' } as any },
+      }
+      const t = defaultTransportFactory(cfg, {
+        dataDir: dir,
+        readCode: async () => 'https://cb.example.com/?code=AUTHXYZ',
+      })
+      expect(t).toBeInstanceOf(HttpTransport)
+      await t.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }))
+      expect(mcpAuthHeader).toBe('Bearer oauth-access')
+      // token 加密落盘
+      expect(existsSync(dir + '/oauth-tokens.json')).toBe(true)
+      t.close()
+    } finally {
+      ;(globalThis as any).fetch = prev
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

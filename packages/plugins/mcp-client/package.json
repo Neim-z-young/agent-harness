@@ -1,7 +1,7 @@
 {
   "name": "@harness/mcp-client",
-  "version": "0.1.0",
-  "description": "MCP Client 插件：对接 Model Context Protocol（stdio transport），自动发现并注册 MCP Server 的工具",
+  "version": "0.2.0",
+  "description": "MCP Client 插件：对接 Model Context Protocol（stdio/http/sse，支持 OAuth2 PKCE 授权码 + token 加密持久化），自动发现并注册 MCP Server 的工具",
   "type": "module",
   "exports": {
     ".": {
@@ -13,7 +13,8 @@
     "@harness/core": "workspace:*",
     "@harness/tool": "workspace:*",
     "@harness/plugin": "workspace:*",
-    "@harness/bus": "workspace:*"
+    "@harness/bus": "workspace:*",
+    "@harness/workspace": "workspace:*"
   },
   "scripts": {
     "dev": "tsc --noEmit --watch",

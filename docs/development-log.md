@@ -32,6 +32,21 @@
 
 * 需重型语义能力时，把 Serena 作为可选 MCP 外部 server 接入 harness（标准 MCP，cheap），不内置复刻。
 
+## 2026-09-06（续 75）mcp-client：OAuth2 PKCE 授权码 + token 加密持久化
+
+> 承接续 74。为 `@harness/mcp-client` 的 HTTP/SSE transport 增加 OAuth2 PKCE 授权码流程：端点 well-known 自动发现 / 显式配置，access 过期自动 refresh，token 用 `@harness/workspace` 的 `SecretCipher`（AES-256-GCM）加密持久化到 `dataDir/oauth-tokens.json`。授权码交互形态：打印授权 URL → 浏览器授权 → 把回调 URL（或其中 code）粘贴回 REPL（不做本地回调服务器）。
+
+### 实现
+
+* **`src/oauth.ts`**（新增，纯逻辑 + 交互注入）：`discoverOAuthMetadata`（RFC 8414 well-known）、`generatePkce`/`createPkceChallenge`（base64url(SHA256)，verifier 定长 43 无 padding）、`exchangeAuthorizationCode`、`refreshOAuthToken`（均 `fetchImpl` 可注入）、`buildAuthorizationUrl`；`class OAuthFlow` 对外只暴露 `ensureAccessToken({refresh?})`——命中缓存/磁盘直接返回 → 过期用 refresh_token 刷新 → 再否则交互授权，`pending` 并发去重；`readCode`/`log` 可注入（缺省读 stdin 一行）。
+* **`src/token-store.ts`**（新增）：`OAuthTokenStore` 用 `SecretCipher` 加解密 token 落盘到 `dataDir/oauth-tokens.json`，每 server 一项 `{ enc: 'enc:v1:...' }`；`serverKey = base64url(sha256(baseUrl))` 稳定不可逆；`load/save/clear/hasStored`。解密失败（密钥不符/篡改）抛错，由 OAuthFlow 捕获回落重授权。
+* **`src/index.ts`**（改）：`McpAuthConfig` 增 `oauth?: McpOauthConfig`；`buildAuthHeaders` 改 **async** 并接收 `oauthResolver`（oauth 存在优先取动态 token，回落静态 bearerToken）；`HttpTransport`/`SseTransport` 增 `oauthResolver` 构造注入；Http 401/403 **强制 refresh 后重试一次**，再失败抛错，非 oauth 的 401 直接抛错；新增 `TransportFactoryContext{ dataDir?; fetchImpl?; readCode?; log? }`，`defaultTransportFactory(config, ctx?)` 装配 OAuthFlow；`createMcpClientPlugin` 透传 `dataDir`。
+* **`mcp-server-registry`**（改）：`registerMcpServer` 支持单项 `dataDir?`，`createMcpServerRegistryPlugin` 增 `options.dataDir` 缺省，`defaultTransportFactory(item.config, { dataDir })` 透传；装配经 `.harness/plugins` 外部插件目录完成，cli 主逻辑不耦合。
+
+### 测试与版本
+
+* 新增 `oauth.test.ts`（16）+ `token-store.test.ts`（4）+ 补 `index.test.ts` 5 条（OAuth 头注入优先、401 刷新重试一次、重试仍拒抛错、非 oauth 401 抛错、factory 端到端 OAuth 装配+落盘）。修复一处逻辑 bug：`expires_in=0` 时原 `obtained_at && expires_in` 判成永不过期（误返回过期 token）——改 `!= null` 判定。mcp-client 55 用例全过，全量 typecheck 通过。mcp-client version 0.1.0 → 0.2.0。
+
 ## 2026-09-06（续 74）code-intel：Java 反向 import 跨目录解析
 
 > 承接续 73。`code_semantic_edit` rename 的 `resolveImporters` 从仅覆盖 TS/JS 扩展到 Java：把 scope 外、但通过 `import <pkg>.<symbol>` 引用声明方符号的外部导入方一并纳入改名。
