@@ -1,5 +1,22 @@
 # Agent Harness 开发日志
 
+## 2026-09-07（续 82）Agent 级 MCP 配置能力（server 粒度白名单/黑名单）
+
+> 让 Agent 在声明式配置里按 **MCP server 粒度** 控制可用 MCP，而不必在 `tools` 白名单里逐个列 `mcp__<server>__<tool>`。设计文档见 `.trae/documents/agent-mcp-config.md`。
+
+### 改动
+
+- **`@harness/tool`**：新增 `parseMcpToolId`（解析 `mcp__<server>__<tool>`，server 取首个 `__` 之前）与 `filterMcpTools`（按 server 白名单/黑名单对工具集收窄；白名单优先于黑名单、缺省透传、非 MCP 工具恒保留、server 名 trim）。作为 filterByWhitelist 之后的第二阶段。
+- **`@harness/agent`**：`AgentDefinition` 新增可选 `mcpServers?`/`excludeMcpServers?`；`agentFromMarkdown` 增加 `parseStringArr` 支持内联数组/块级列表/裸逗号字符串；显式 `[]` 表示拒绝全部 MCP。
+- **`@harness/core`**：`query` 与 `queryStream`(`_prepareQuery`) 两处统一接入 `filterMcpTools`，server 粒度过滤参与 allowedTools 组装，只影响模型可见/可调用工具集，不改 `/tools`/`/mcp` 命令语法。
+- **`packages/cli`**：`cfg.agents[]` 类型扩为含 mcp 三字段；`applyConfigAgentTools` 更名为 `applyConfigAgentOverrides` 并合并三字段；修复 `setAgentTools` 整条覆盖会静默丢弃手写 mcp 声明的坑（保留原 entry mcp 字段）。
+- **文档**：架构文档 agent 能力白名单补充 MCP server 粒度声明说明。
+
+### 验证
+
+- tool 44 / agent 27 / core 35 / cli 169 用例全绿；全量 typecheck 通过。
+- 覆盖：parseMcpToolId（含 server 含 `__`）、filterMcpTools 全分支（缺省/白名单/空数组/黑名单/白优先黑/非 MCP/trim）、frontmatter 三种写法、config.json 合并与 setAgentTools mcp 字段保留、core 装配接线不破坏执行 + 缺省向后兼容。
+
 ## 2026-09-07（续 81）命令单一职责 + 事件跨层解耦
 
 > 承接「MCP Server 配置化管理」。落实插件/服务/工具三类命令的单一职责，并以事件总线解耦上层命令对下层的副作用。设计文档见 `.trae/documents/command-srp-event-decoupling.md`。

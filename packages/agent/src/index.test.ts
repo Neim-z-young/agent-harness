@@ -173,6 +173,60 @@ tools: "*"
     expect(def.tools).toEqual(['*'])
   })
 
+  it('mcpServers/excludeMcpServers：块级列表 → 数组', () => {
+    const content = `---
+id: mcpw
+name: McpWhitelist
+description: MCP 白名单 Agent
+mcpServers:
+  - github
+  - filesystem
+excludeMcpServers:
+  - sandbox
+---`
+    const def = agentFromMarkdown(content)
+    expect(def.mcpServers).toEqual(['github', 'filesystem'])
+    expect(def.excludeMcpServers).toEqual(['sandbox'])
+  })
+
+  it('mcpServers：内联数组与裸逗号字符串 → 数组（含 trim）', () => {
+    const inline = `---
+id: a
+name: A
+description: d
+mcpServers: [github, filesystem]
+---`
+    expect(agentFromMarkdown(inline).mcpServers).toEqual(['github', 'filesystem'])
+    const csv = `---
+id: b
+name: B
+description: d
+mcpServers: github, filesystem
+---`
+    expect(agentFromMarkdown(csv).mcpServers).toEqual(['github', 'filesystem'])
+  })
+
+  it('mcpServers 显式空数组 → []（空白名单=拒绝全部 MCP）', () => {
+    const content = `---
+id: none
+name: None
+description: d
+mcpServers: []
+---`
+    expect(agentFromMarkdown(content).mcpServers).toEqual([])
+  })
+
+  it('缺省 mcp 字段 → undefined（向后兼容）', () => {
+    const content = `---
+id: plain
+name: Plain
+description: d
+---`
+    const def = agentFromMarkdown(content)
+    expect(def.mcpServers).toBeUndefined()
+    expect(def.excludeMcpServers).toBeUndefined()
+  })
+
   it('无 frontmatter.id 时用 fallbackId（文件名）', () => {
     const content = `---
 name: Custom Agent

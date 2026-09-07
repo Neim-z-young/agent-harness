@@ -15,6 +15,8 @@ import {
   ToolValidationError,
   defineTool,
   partitionToolCalls,
+  parseMcpToolId,
+  filterMcpTools,
 } from './index'
 
 // ===== 测试工具：简易 Schema 构造器（不依赖 zod） =====
@@ -597,6 +599,66 @@ describe('@harness/tool', () => {
         expect(called).toBe(false)
         expect(err).toBeDefined()
       })
+    })
+  })
+
+  describe('parseMcpToolId', () => {
+    it('解析 mcp__server__tool', () => {
+      expect(parseMcpToolId('mcp__github__create_issue')).toEqual({ server: 'github', tool: 'create_issue' })
+    })
+    it('server 名可含 __（取首个 __ 之前为 server）', () => {
+      expect(parseMcpToolId('mcp__a__b__x')).toEqual({ server: 'a', tool: 'b__x' })
+    })
+    it('非 mcp__ 前缀或无 __ 返回 undefined', () => {
+      expect(parseMcpToolId('bash')).toBeUndefined()
+      expect(parseMcpToolId('mcp__gh')).toBeUndefined()
+      expect(parseMcpToolId('')).toBeUndefined()
+    })
+  })
+
+  describe('filterMcpTools', () => {
+    function mkTool(id: string): Tool {
+      return {
+        id,
+        description: id,
+        call: async () => ({ ok: true, output: {} }),
+      } as unknown as Tool
+    }
+    const set = [
+      mkTool('bash'),
+      mkTool('mcp__github__a'),
+      mkTool('mcp__github__b'),
+      mkTool('mcp__filesystem__re'),
+    ]
+    const ids = (arr: Tool[]) => arr.map((t) => t.id).sort()
+
+    it('两者均 undefined → 原样透传（MCP 全可见，向后兼容）', () => {
+      expect(filterMcpTools(set)).toEqual(set)
+      expect(filterMcpTools(set, undefined, undefined)).toEqual(set)
+    })
+    it('白名单模式：仅保留 server ∈ mcpServers 的工具', () => {
+      expect(ids(filterMcpTools(set, ['github']))).toEqual(['bash', 'mcp__github__a', 'mcp__github__b'])
+    })
+    it('白名单空数组 → 拒绝全部 MCP，普通工具保留', () => {
+      expect(ids(filterMcpTools(set, []))).toEqual(['bash'])
+    })
+    it('黑名单模式：剔除 server ∈ excludeMcpServers 的工具', () => {
+      expect(ids(filterMcpTools(set, undefined, ['github']))).toEqual(['bash', 'mcp__filesystem__re'])
+    })
+    it('白名单优先于黑名单（黑名单内的白名单 server 工具仍保留）', () => {
+      expect(ids(filterMcpTools(set, ['github', 'filesystem'], ['github']))).toEqual([
+        'bash',
+        'mcp__filesystem__re',
+        'mcp__github__a',
+        'mcp__github__b',
+      ])
+    })
+    it('非 MCP 工具在任意组合下均保留', () => {
+      expect(filterMcpTools([mkTool('bash')], [])).toHaveLength(1)
+      expect(filterMcpTools([mkTool('bash')], undefined, ['x'])).toHaveLength(1)
+    })
+    it('server 名匹配前 trim', () => {
+      expect(ids(filterMcpTools(set, [' github ']))).toEqual(['bash', 'mcp__github__a', 'mcp__github__b'])
     })
   })
 })

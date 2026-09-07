@@ -339,6 +339,12 @@ interface AgentDefinition {
   skills?: string[]                  // 技能 ID 白名单
   subagents?: string[]               // 允许派出哪些 subagent
 
+  // === MCP Server 粒度声明（可选）===
+  // 可按 MCP server 名（mcp__<server>__<tool> 中的 <server>）控制该 Agent 可用的 MCP 工具。
+  // 白名单优先于黑名单；缺省(undefined) → MCP 全部可见（向后兼容）；[] → 拒绝全部 MCP。
+  mcpServers?: string[]              // 白名单：仅用列出的 server
+  excludeMcpServers?: string[]       // 黑名单：剔除列出的 server（mcpServers 未定义时生效）
+
   // === 权限配置（同 OpenCode 结构）===
   permission: PermissionRuleset
 

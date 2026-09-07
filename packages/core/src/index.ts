@@ -170,6 +170,7 @@ import {
   ToolContext,
   PermissionRequest as ToolPermissionRequest,
   PermissionDecision as ToolPermissionDecision,
+  filterMcpTools,
 } from '@harness/tool'
 import type {
   AgentDefinition,
@@ -1186,7 +1187,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 工具池组装（触发 tool.pool.assemble Hook）
     const pool = new DefaultToolPool(this.deps.toolRegistry)
     await this.deps.triggerPlugin('tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
-    const allowedTools = this.deps.toolRegistry.filterByWhitelist(agent.tools)
+    const allowedTools = filterMcpTools(
+      this.deps.toolRegistry.filterByWhitelist(agent.tools),
+      agent.mcpServers,
+      agent.excludeMcpServers,
+    )
 
     // 把 agent 的权限规则写回 PermissionEngine（若配置项比默认更具体）
     this.deps.permission.updateRules({
@@ -1346,7 +1351,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
     const pool = new DefaultToolPool(this.deps.toolRegistry)
     await this.deps.triggerPlugin('tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
-    const allowedTools = this.deps.toolRegistry.filterByWhitelist(agent.tools)
+    const allowedTools = filterMcpTools(
+      this.deps.toolRegistry.filterByWhitelist(agent.tools),
+      agent.mcpServers,
+      agent.excludeMcpServers,
+    )
 
     this.deps.permission.updateRules({
       ...this.deps.permission.getRules(),

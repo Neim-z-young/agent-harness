@@ -223,10 +223,16 @@ export interface HarnessConfig {
   /** 多 Provider 定义：可同时注册多个（anthropic / openai / gemini / mock + 任意 OpenAI 兼容端点如 DeepSeek / Ollama） */
   providers?: ProviderConfig[]
   /**
-   * Agent 工具白名单覆盖：`[{ id, tools }]`，启动时按 id 覆盖合并到对应 Agent 的 tools 白名单。
+   * Agent 工具/能力覆盖：`[{ id, tools, mcpServers, excludeMcpServers }]`，启动时按 id 覆盖合并到对应 Agent。
    * 由 `/tools` 等插件持久化；缺省 Agent 为 tools:['*']（全部），配置指定数组则收窄。
+   * mcpServers/excludeMcpServers：Agent 级 MCP server 白名单/黑名单（声明式，见 .md frontmatter 同名字段）。
    */
-  agents?: Array<{ id: string; tools: string[] }>
+  agents?: Array<{
+    id: string
+    tools?: string[]
+    mcpServers?: string[]
+    excludeMcpServers?: string[]
+  }>
   /**
    * MCP Server 装配列表：从 config.json 以 JSON 形式新增外部 MCP server（stdio/sse/http）。
    * 元素复用 McpServerConfig 字段 + enabled（服务器级）、tools（工具级）开关。
@@ -957,25 +963,37 @@ export class HarnessApp {
    * 必须放在 createHarness 之后、query 之前：工具池在 query 时经 filterByWhitelist(agent.tools)
    * 实时读白名单，因此覆盖任何来源（default / options.agents / agentDirs 的 md）的同名 Agent。
    */
-  async applyConfigAgentTools(harness: Harness): Promise<void> {
+  async applyConfigAgentOverrides(harness: Harness): Promise<void> {
     const cfg = await this.configStore.load()
     if (!cfg.agents?.length) return
-    for (const { id, tools } of cfg.agents) {
-      if (!tools?.length) continue
+    for (const { id, tools, mcpServers, excludeMcpServers } of cfg.agents) {
+      if (!tools?.length && !mcpServers && !excludeMcpServers) continue
       const existing = harness.agent.get(id)
-      if (existing) harness.agent.register({ ...existing, tools: [...tools] })
+      if (!existing) continue
+      const merged: AgentDefinition = { ...existing }
+      if (tools) merged.tools = [...tools]
+      if (mcpServers) merged.mcpServers = [...mcpServers]
+      if (excludeMcpServers) merged.excludeMcpServers = [...excludeMcpServers]
+      harness.agent.register(merged)
     }
   }
 
   /**
    * 持久化某 Agent 的 tools 白名单到 config.json（upsert agents[].tools）并即时应用到运行时。
-   * 供 /tools 等插件调用：写入端 + 内存覆盖一次完成，重启后由 applyConfigAgentTools 回读生效。
+   * 供 /tools 等插件调用：写入端 + 内存覆盖一次完成，重启后由 applyConfigAgentOverrides 回读生效。
+   * 保留已有 entry 的 mcpServers/excludeMcpServers 声明，避免 /tools 触发时静默丢弃。
    */
   async setAgentTools(agentId: string, tools: string[]): Promise<void> {
     const cfg = await this.configStore.load()
     const agents = [...(cfg.agents ?? [])]
-    const entry = { id: agentId, tools: [...tools] }
     const idx = agents.findIndex((a) => a.id === agentId)
+    const prev = idx >= 0 ? agents[idx] : undefined
+    const entry: { id: string; tools: string[]; mcpServers?: string[]; excludeMcpServers?: string[] } = {
+      id: agentId,
+      tools: [...tools],
+      ...(prev?.mcpServers ? { mcpServers: [...prev.mcpServers] } : {}),
+      ...(prev?.excludeMcpServers ? { excludeMcpServers: [...prev.excludeMcpServers] } : {}),
+    }
     if (idx >= 0) agents[idx] = entry
     else agents.push(entry)
     await this.configStore.save({ ...cfg, agents })
@@ -1304,8 +1322,8 @@ export class HarnessApp {
           : undefined,
       },
     })
-    // 回读 config.json 的 agents[].tools 白名单并覆盖到已注册 Agent（createHarness 全部组装完成后、query 前）
-    await this.applyConfigAgentTools(harness)
+    // 回读 config.json 的 agents[] 覆盖（tools 白名单 + mcpServers/excludeMcpServers）到已注册 Agent（createHarness 全部组装完成后、query 前）
+    await this.applyConfigAgentOverrides(harness)
     // 把 config.json 的 mcpServers 注入 mcp-server-registry 插件（在 start 前建立配置态，
     // 由 harness.start 按 enabled 开关连接外部 MCP server）。
     await this.applyMcpServers(harness)

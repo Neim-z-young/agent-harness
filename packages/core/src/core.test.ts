@@ -380,6 +380,60 @@ describe('@harness/core', () => {
     })
   })
 
+  describe('agent.mcpServers 按 MCP server 粒度过滤工具', () => {
+    /** 装两个 MCP server 的工具（gh / fs）；agent 级 mcp 声明经 core filterMcpTools 参与 allowedTools 组装，
+     *  算法正确性由 @harness/tool filterMcpTools 单测覆盖，此处验证 query 装配链路接线不破坏执行 + 缺省向后兼容。 */
+    function buildHarness(agentOverride: Partial<AgentDefinition>, chooseToolId: string) {
+      const McpPlugin: AgentPlugin = {
+        id: 'mcp-tools', version: '1', name: 'McpTools',
+        async install() {
+          return {
+            async 'tool.pool.assemble'(_i, pool: any) {
+              for (const [server, tool] of [['gh', 'create_issue'], ['fs', 'read']] as const) {
+                pool.add(defineTool({
+                  id: `mcp__${server}__${tool}`,
+                  description: `${server}/${tool}`,
+                  inputSchema: { parse: (v: any) => v, safeParse: (v: any) => ({ success: true, data: v }) },
+                  async call(): Promise<ToolResult> { return { ok: true, output: 'ok' } },
+                }))
+              }
+            },
+          } as Hooks
+        },
+      }
+      return createHarness({
+        chatProvider: mockChatProvider('tool', (p: any) => ({
+          content: '',
+          model: 'mock-v1',
+          tokenUsage: { input: 5, output: 2 },
+          toolCalls: [{ toolUseId: 'tu_1', toolId: chooseToolId, input: {} }],
+        })),
+        permission: new DefaultPermissionEngine({ '*': 'allow' }),
+        agents: [makeAgent({ tools: ['*'], ...agentOverride })],
+        internalPlugins: [McpPlugin],
+      })
+    }
+    async function runQuery(h: Harness, chooseToolId: string) {
+      const sess = await h.session.create()
+      const reply = await h.agent.query({ sessionId: sess.id, message: 'x' })
+      return reply.parts.find((p: any) => p.type === 'tool') as any
+    }
+
+    it('白名单 server 内工具经 query 装配可执行', async () => {
+      const h = await buildHarness({ mcpServers: ['gh'] }, 'mcp__gh__create_issue')
+      const toolPart = await runQuery(h, 'mcp__gh__create_issue')
+      expect(toolPart.toolId).toBe('mcp__gh__create_issue')
+      await h.stop()
+    })
+
+    it('缺省 mcpServers → 全部 MCP server 工具可执行（向后兼容）', async () => {
+      const h = await buildHarness({}, 'mcp__fs__read')
+      const toolPart = await runQuery(h, 'mcp__fs__read')
+      expect(toolPart.toolId).toBe('mcp__fs__read')
+      await h.stop()
+    })
+  })
+
   describe('bus.event 桥（Plugin hooks → Bus publish）', () => {
     it('插件声明 bus.event Hook 能订阅 Harness lifecycle 事件', async () => {
       const bus = new InMemoryBus()

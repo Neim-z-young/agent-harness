@@ -491,6 +491,49 @@ export class ToolRegistry {
   }
 }
 
+// ===== MCP 工具过滤原语 =====
+// 按 Agent 的 MCP server 声明（白名单/黑名单）对工具集做 server 粒度收窄。
+// MCP 工具命名约定：`mcp__<server>__<tool>`，server 取首个 `__` 之前（server 名可含 `__`）。
+
+/**
+ * 规范化解析 MCP 工具 id：`mcp__<server>__<tool>` → { server, tool }。
+ * server 取 `mcp__` 之后、首个 `__` 之前。非 `mcp__` 前缀或无 `__` 返回 undefined。
+ */
+export function parseMcpToolId(id: string): { server: string; tool: string } | undefined {
+  const rest = id.startsWith('mcp__') ? id.slice('mcp__'.length) : id
+  if (!rest.includes('__')) return undefined
+  const i = rest.indexOf('__')
+  return { server: rest.slice(0, i), tool: rest.slice(i + 2) }
+}
+
+/**
+ * 按 Agent 的 MCP server 声明过滤工具集（常作为 filterByWhitelist 之后的第二阶段收窄）。
+ *
+ * 规则：
+ * - `mcpServers` 定义（含空数组）→ 白名单模式：仅保留 server ∈ mcpServers 的 MCP 工具，空数组=拒绝全部 MCP。
+ * - 否则若 `excludeMcpServers` 定义 → 黑名单模式：剔除 server ∈ excludeMcpServers 的工具。
+ * - 两者均 undefined → 原样返回（向后兼容：MCP 全可见）。
+ * - 白名单优先于黑名单（白名单定义时忽略黑名单）。
+ * - 非 MCP 工具（parseMcpToolId 返回 undefined）始终不受影响。
+ * - server 名匹配前均 trim。
+ */
+export function filterMcpTools(
+  tools: Tool[],
+  mcpServers?: string[],
+  excludeMcpServers?: string[],
+): Tool[] {
+  if (mcpServers === undefined && excludeMcpServers === undefined) return tools
+  const white = mcpServers === undefined ? undefined : new Set(mcpServers.map((s) => s.trim()))
+  const black = excludeMcpServers === undefined ? undefined : new Set(excludeMcpServers.map((s) => s.trim()))
+  return tools.filter((t) => {
+    const parsed = parseMcpToolId(t.id)
+    if (!parsed) return true // 非 MCP 工具恒保留
+    const server = parsed.server.trim()
+    if (white !== undefined) return white.has(server) // 白名单优先
+    return !black!.has(server)
+  })
+}
+
 // ===== ToolPipeline =====
 
 /** ToolPipeline 构造参数 */

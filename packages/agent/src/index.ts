@@ -132,6 +132,20 @@ export interface AgentDefinition {
   /** 允许派出的 subagent ID 列表（mode=primary/coordinator 时有效） */
   subagents?: string[]
 
+  // === MCP Server 白名单（可选） ===
+  /**
+   * MCP Server 白名单：按 server 名（`mcp__<server>__<tool>` 中的 <server>）声明该 Agent 可用哪些 MCP server 的全部工具。
+   * - 缺省(undefined)：不限制，MCP server 全部可见（保持向后兼容）
+   * - 定义了（含空数组）：仅保留白名单内 server 的工具；白名单优先于 excludeMcpServers
+   * - 空数组 [] 含义为「拒绝全部 MCP 工具」，与 undefined（全可见）刻意区分
+   */
+  mcpServers?: string[]
+  /**
+   * MCP Server 黑名单：当 mcpServers 未定义（undefined）时生效，剔除这些 server 的全部工具。
+   * 白名单优先于黑名单。
+   */
+  excludeMcpServers?: string[]
+
   // === 权限配置 ===
   /** 权限规则集（结构兼容 @harness/permission） */
   permission: AgentPermissionConfig
@@ -345,6 +359,21 @@ function parseInlineObject(s: string): Record<string, unknown> {
 }
 
 /**
+ * 解析「可选字符串数组」字段（mcpServers / excludeMcpServers 用）。
+ * 支持三种写法：内联数组 `[a, b]`、块级列表 `["- a", ...]`、裸逗号字符串 `a, b`。
+ * - 未提供（字段缺失/空字符串）→ undefined
+ * - 显式空数组 `[]` → []（用于表示「空白名单=拒绝全部 MCP」，与 undefined 区分）
+ * - 有值 → trim 后的非空字符串数组
+ */
+function parseStringArr(raw: unknown): string[] | undefined {
+  if (Array.isArray(raw)) return raw.map((s) => String(s).trim()).filter(Boolean)
+  if (typeof raw === 'string' && raw.trim()) {
+    return raw.split(',').map((s) => s.trim()).filter(Boolean)
+  }
+  return undefined
+}
+
+/**
  * 从 Markdown 配置文件内容构建 AgentDefinition。
  *
  * frontmatter 字段映射到 AgentDefinition 的字段：
@@ -410,6 +439,10 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
   // subagents
   const subagents = Array.isArray(frontmatter.subagents) ? frontmatter.subagents.map(String) : undefined
 
+  // mcpServers / excludeMcpServers（MCP server 粒度白名单/黑名单）
+  const mcpServers = parseStringArr(frontmatter.mcpServers)
+  const excludeMcpServers = parseStringArr(frontmatter.excludeMcpServers)
+
   // background（frontmatter.background: true|false）
   const background = typeof frontmatter.background === 'boolean'
     ? frontmatter.background
@@ -440,6 +473,8 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
   if (subagents) def.subagents = subagents
   if (background !== undefined) def.background = background
   if (writesTo) def.writesTo = writesTo
+  if (mcpServers) def.mcpServers = mcpServers
+  if (excludeMcpServers) def.excludeMcpServers = excludeMcpServers
   if (model) def.model = model
   if (promptFragments) def.promptFragments = promptFragments
 

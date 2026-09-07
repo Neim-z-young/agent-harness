@@ -693,6 +693,51 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('boot 回读 config.json agents[].mcpServers/excludeMcpServers 覆盖到 Agent', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'config.json'),
+      JSON.stringify({ agents: [{ id: 'default', tools: ['*'], mcpServers: ['gh'], excludeMcpServers: ['sandbox'] }] }, null, 2),
+    )
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    expect(harness.agent.get('default')?.tools).toEqual(['*'])
+    expect(harness.agent.get('default')?.mcpServers).toEqual(['gh'])
+    expect(harness.agent.get('default')?.excludeMcpServers).toEqual(['sandbox'])
+    await app.shutdown()
+  })
+
+  it('setAgentTools 触发后保留 config.json 已有 mcp 声明（不丢弃）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'config.json'),
+      JSON.stringify({ agents: [{ id: 'default', tools: ['*'], mcpServers: ['gh'] }] }, null, 2),
+    )
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    await app.setAgentTools('default', ['bash'])
+    // config.json 回读：tools 已更新且 mcpServers 被保留
+    const cfg = JSON.parse(readFileSync(join(dataDir, 'config.json'), 'utf-8'))
+    const entry = cfg.agents.find((a: any) => a.id === 'default')
+    expect(entry.tools).toEqual(['bash'])
+    expect(entry.mcpServers).toEqual(['gh'])
+    await app.shutdown()
+  })
+
   it('startRepl 脚本模式：发送 prompt + /sessions + /new + /save + /exit 正常', async () => {
     const chunks: string[] = []
     const stdout = { write: (s: string) => { chunks.push(s) } }
