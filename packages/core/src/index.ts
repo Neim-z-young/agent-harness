@@ -1694,6 +1694,33 @@ export const HarnessEvents = {
   error:        BusEvent.define<{ stage: 'init' | 'start' | 'stop' | 'runtime'; error: unknown }>('harness.error'),
 } as const
 
+/**
+ * 生命周期跨层解耦事件。
+ *
+ * 命令单一职责：`plugin` 只管插件生命周期、`mcp` 只管 MCP server 生命周期、
+ * `tool` 只管工具启停。上层命令变更对下层的影响通过本组事件解耦——
+ * 下层组件在 install 订阅、uninstall 退订，收到事件后自行刷新自身缓存/清单，
+ * 不反向修改上层的内部状态。
+ *
+ * 发布方（变更提起来的那一方）：
+ * - manage-plugin：pluginLoaded / pluginUnloaded / pluginUpdated
+ * - mcp-server-registry：mcpServerEnabled / mcpServerDisabled / mcpServerAdded / mcpServerRemoved
+ * - tools-manager：toolEnabled / toolDisabled
+ *
+ * 载荷使用 `{ id }` / `{ name }` 细粒度，便于订阅方精确命中并刷新自身状态。
+ */
+export const LifecycleEvents = {
+  pluginLoaded:   BusEvent.define<{ id: string }>('plugin.loaded'),
+  pluginUnloaded: BusEvent.define<{ id: string }>('plugin.unloaded'),
+  pluginUpdated:  BusEvent.define<{ id: string }>('plugin.updated'),
+  mcpServerEnabled:  BusEvent.define<{ name: string }>('mcp.server.enabled'),
+  mcpServerDisabled: BusEvent.define<{ name: string }>('mcp.server.disabled'),
+  mcpServerAdded:    BusEvent.define<{ name: string }>('mcp.server.added'),
+  mcpServerRemoved:  BusEvent.define<{ name: string }>('mcp.server.removed'),
+  toolEnabled:   BusEvent.define<{ id: string; agentId?: string }>('tool.enabled'),
+  toolDisabled:  BusEvent.define<{ id: string; agentId?: string }>('tool.disabled'),
+} as const
+
 export class HarnessImpl implements Harness {
   public readonly bus: Bus
   public readonly context: ContextProvider

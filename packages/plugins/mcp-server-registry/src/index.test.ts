@@ -11,6 +11,7 @@ import {
   type McpServerRegistration,
 } from './index'
 import type { PluginContext } from '@harness/plugin'
+import type { Bus } from '@harness/bus'
 import type { McpTransport } from '@harness/mcp-client'
 
 /** 日志 ctx 桩 */
@@ -19,6 +20,18 @@ const mockLog: PluginContext['log'] = {
   warn: () => undefined,
   error: () => undefined,
   debug: () => undefined,
+}
+
+/** Bus 桩：记录发布事件，订阅返回 noop 退订 */
+function makeBus(): Bus & { emitted: Array<{ name: string; payload: unknown }> } {
+  const emitted: Array<{ name: string; payload: unknown }> = []
+  const bus = {
+    emitted,
+    publish: async (event: { name: string }, payload: unknown) => { emitted.push({ name: event.name, payload }) },
+    subscribe: () => () => undefined,
+    subscribeAll: () => () => undefined,
+  } as unknown as Bus & { emitted: Array<{ name: string; payload: unknown }> }
+  return bus
 }
 
 /** 进程内假 server：响应 initialize / tools/list / tools/call */
@@ -92,7 +105,7 @@ describe('createMcpServerRegistryPlugin', () => {
     reg.register({ name: 'fake', createTransport: () => transport })
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
-    const hooks = await plugin.install({ log: mockLog } as PluginContext)
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
 
     await hooks!['harness.start']!({ harness: {} } as any, { started: true })
     const pool = fakePool()
@@ -117,7 +130,7 @@ describe('createMcpServerRegistryPlugin', () => {
     reg.register({ name: 'fake', createTransport: () => transport })
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
-    const hooks = await plugin.install({ log: mockLog } as PluginContext)
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
     await hooks!['harness.start']!({ harness: {} } as any, { started: true })
 
     // 无服务器注册时可不出现在命令列表
@@ -151,7 +164,7 @@ describe('createMcpServerRegistryPlugin', () => {
     reg.register({ name: 'ok', createTransport: () => (createFakeTransport([{ name: 't' }]).transport) })
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
-    const hooks = await plugin.install({ log: mockLog } as PluginContext)
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
     await hooks!['harness.start']!({ harness: {} } as any, { started: true })
 
     const pool = fakePool()
@@ -171,7 +184,7 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
   })
   /** mcp.configure 是自定义 Hook，Hooks 类型未声明，转 any 便于测试直接调用 */
   const installAny = async (plugin: ReturnType<typeof createMcpServerRegistryPlugin>) =>
-    (await plugin.install({ log: mockLog } as PluginContext)) as any
+    (await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)) as any
 
   test('mcp.configure 注入配置态：/mcp servers 展示启停状态', async () => {
     const reg = createMcpServerRegistry()
@@ -194,32 +207,54 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     await plugin.uninstall?.()
   })
 
-  test('工具级启停：/mcp tool <s> <t> off 更新 managed 并持久化', async () => {
+  test('工具级启停已迁至 /tools：/mcp tool 报未知子命令', async () => {
     const reg = createMcpServerRegistry()
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await installAny(plugin)
-    const saved: any[] = []
     await hooks['mcp.configure'](
       { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
     )
 
+    const out: string[] = []
     await hooks!['cli.command']!(mkInput({
       arg: 'tool alpha list_apps off',
-      setMcpServers: (list: any[]) => saved.push(list),
-      out: () => undefined,
+      setMcpServers: () => undefined,
+      out: (s: string) => out.push(s),
     }))
-    // 持久化回调收到 tools:{ list_apps:false }
-    expect(saved.length).toBe(1)
-    expect((saved[0][0].tools as Record<string, boolean>).list_apps).toBe(false)
+    expect(out.join('')).toContain('未知子命令')
+    await plugin.uninstall?.()
+  })
 
-    // 再打开 → tools 里删除该键
-    const saved2: any[] = []
-    await hooks!['cli.command']!(mkInput({
-      arg: 'tool alpha list_apps on',
-      setMcpServers: (list: any[]) => saved2.push(list),
-      out: () => undefined,
-    }))
-    expect((saved2[0][0].tools as Record<string, boolean>).list_apps).toBeUndefined()
+  test('enable/disable/add/remove 发布 mcp.* 事件', async () => {
+    const reg = createMcpServerRegistry()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const bus = makeBus()
+    const hooks = (await plugin.install({ log: mockLog, bus } as unknown as PluginContext)) as any
+    await hooks['mcp.configure'](
+      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
+    )
+
+    const saved: any[][] = []
+    const mkCfg = (arg: string, out: (s: string) => void) => mkInput({
+      arg, setMcpServers: (l: any[]) => saved.push(l), out,
+    })
+
+    const out1: string[] = []
+    await hooks!['cli.command']!(mkCfg('disable alpha', (s: string) => out1.push(s)))
+    expect(bus.emitted).toContainEqual({ name: 'mcp.server.disabled', payload: { name: 'alpha' } })
+
+    const out2: string[] = []
+    // enable 依赖连接管理 server；这里 force 一次 enable（无真实连接，会失败但事件仍发）
+    await hooks!['cli.command']!(mkCfg('enable alpha', (s: string) => out2.push(s)))
+    expect(bus.emitted).toContainEqual({ name: 'mcp.server.enabled', payload: { name: 'alpha' } })
+
+    const out3: string[] = []
+    await hooks!['cli.command']!(mkCfg('add -- {"name":"beta","transport":"http","url":"http://x/b","enabled":false}', (s: string) => out3.push(s)))
+    expect(bus.emitted).toContainEqual({ name: 'mcp.server.added', payload: { name: 'beta' } })
+
+    const out4: string[] = []
+    await hooks!['cli.command']!(mkCfg('remove beta', (s: string) => out4.push(s)))
+    expect(bus.emitted).toContainEqual({ name: 'mcp.server.removed', payload: { name: 'beta' } })
     await plugin.uninstall?.()
   })
 

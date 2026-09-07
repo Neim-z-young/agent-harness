@@ -1,5 +1,23 @@
 # Agent Harness 开发日志
 
+## 2026-09-07（续 81）命令单一职责 + 事件跨层解耦
+
+> 承接「MCP Server 配置化管理」。落实插件/服务/工具三类命令的单一职责，并以事件总线解耦上层命令对下层的副作用。设计文档见 `.trae/documents/command-srp-event-decoupling.md`。
+
+### 改动
+
+- **`@harness/core`**：导出 `LifecycleEvents` 事件常量（`plugin.*` / `mcp.*` / `tool.*`），供跨插件的类型安全发布/订阅。
+- **新增 `@harness/manage-plugin`（`/plugins`）**：独立插件包负责插件生命周期（查看 / 启用 / 禁用 / 重载），成功时发布 `plugin.loaded/unloaded/updated`。从 `HarnessApp` 移除 `disablePlugin/enablePlugin/reloadPlugin`，改为注入 `manageablePlugin` / `pluginManageable` 能力。
+- **`mcp-server-registry`（`/mcp`）**：删掉 `tool` 子命令，只管理 server 生命周期；`enable/disable/add/remove` 发布 `mcp.*` 事件；并在 `install` 订阅 `plugin.unloaded`，宿主插件卸载时自检清理孤儿 runtime。
+- **`tools-manager`（`/tools`）**：统一工具启停唯一入口，支持 `mcp__<server>__<tool>` 前缀把掩码写入 `mcpServers[].tools`；发布 `tool.*` 事件；订阅 `mcp.server.disabled` 刷新清单、订阅 `plugin.*` 状态同步。
+- **`packages/cli/src/index.ts`**：插件分发时 `arg` 由「仅第二个 token」修正为「命令名之外的完整剩余内容」（此前 `line.split(/\s+/,2)` 截断导致 `/plugins disable <id>`、`/mcp <sub> <json>` 等参数丢失）。
+- **修复 `manage-plugin`**：`out(...) + '\n'` 因优先级错误生成 `undefined\n` 被丢弃，改为 `out(msg + '\n')`。
+
+### 验证
+
+- manage-plugin 7 用例、mcp-server-registry 9 用例、tools-manager 13 用例、code-intel 12 用例、mcp-client 55 用例、subagent 109 用例、cli 96 用例全绿；全量 30 包 typecheck 通过。
+- 顺带修正 `cli.test.ts` 幂等往返用例：原测试用全新 app 二次 boot（boot 时 mock provider 已默认加载）导致 enable 永远命中「已是启用状态」，改为同一 app 内 disable→enable→重复 enable 验证「禁用后恢复 + 幂等」。
+
 ## 2026-09-07（续 80）MCP 服务文档 + /help 展示插件命令 usage
 
 > 承接「MCP Server 配置化管理」。补齐 MCP 服务使用文档，并修复 `/help` 只打印插件命令 `description`、忽略注入的 `usage` 的问题。

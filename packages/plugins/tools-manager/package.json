@@ -1,7 +1,7 @@
 {
   "name": "@harness/tools-manager",
-  "version": "0.1.0",
-  "description": "工具管理插件：/tools 查看 / Agent 白名单持久化 / --global 运行时启停",
+  "version": "0.2.0",
+  "description": "工具管理插件：/tools 查看 / Agent 白名单持久化 / --global 运行时启停 / mcp 工具掩码统一收口，并经事件总线发布 tool.* 事件",
   "type": "module",
   "exports": {
     ".": {
@@ -10,6 +10,9 @@
     }
   },
   "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/bus": "workspace:*",
+    "@harness/mcp-server-registry": "workspace:*",
     "@harness/tool": "workspace:*",
     "@harness/plugin": "workspace:*"
   },

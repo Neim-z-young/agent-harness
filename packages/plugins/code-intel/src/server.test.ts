@@ -163,10 +163,11 @@ describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', ()
 
   it('端到端：code-intel + registry 装配后 harness.start 连接，tool.pool.assemble 暴露 mcp__code-intel__*', async () => {
     const log = { info() {}, warn() {}, error() {}, debug() {} }
+    const bus = { publish: async () => undefined, subscribe: () => () => undefined, subscribeAll: () => () => undefined }
     const codeIntel = createCodeIntelPlugin()
     await codeIntel.install({ log } as any)
     const registry = createMcpServerRegistryPlugin()
-    const regHooks = await registry.install({ log } as any)
+    const regHooks = await registry.install({ log, bus } as any)
 
     // 模拟 harness.start：连接所有已注册进程内 server（含 code-intel）
     await (regHooks as any)['harness.start']()

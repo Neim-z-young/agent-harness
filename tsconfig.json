@@ -37,6 +37,7 @@
       "@harness/tools-media": ["./packages/plugins/tools-media/src"],
       "@harness/tools-media/meta": ["./packages/plugins/tools-media/src/meta.ts"],
       "@harness/tools-manager": ["./packages/plugins/tools-manager/src"],
+      "@harness/manage-plugin": ["./packages/plugins/manage-plugin/src"],
       "@harness/code-intel": ["./packages/plugins/code-intel/src"],
       "@harness/code-intel/meta": ["./packages/plugins/code-intel/src/meta.ts"],
       "@harness/workspace-shell": ["./packages/plugins/workspace-shell/src"],

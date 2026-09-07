@@ -17,6 +17,9 @@
 
 import type { CliCommandInput, AgentPlugin, Hooks, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
+import type { Bus, Unsubscribe } from '@harness/bus'
+import { LifecycleEvents } from '@harness/core'
+import type { McpServerEntry } from '@harness/mcp-server-registry'
 
 /** cli 注入的 harness 能力视图（由消费侧类型化 harness?: unknown） */
 interface HarnessView {
@@ -36,9 +39,21 @@ type ToolsCtx = Omit<CliCommandInput, 'harness'> & {
   harness: HarnessView
   agentId: string
   setAgentTools: (agentId: string, tools: string[]) => Promise<void>
+  /** config.json 的 mcpServers 列表（供 mcp__ 前缀工具的 server 级掩码写入） */
+  mcpServers?: McpServerEntry[]
+  /** 把新的 mcpServers 列表写回 config.json */
+  setMcpServers?: (list: McpServerEntry[]) => Promise<void>
 }
 
 const FLAGS = new Set(['--all', '--json', '--global'])
+
+/** mcp__<server>__<tool> → 拆分（server 部分可能含 __，取首个 __ 之前作为 server 名） */
+function parseMcpTool(id: string): { server: string; tool: string } | undefined {
+  const rest = id.startsWith('mcp__') ? id.slice('mcp__'.length) : id
+  if (!rest.includes('__')) return undefined
+  const i = rest.indexOf('__')
+  return { server: rest.slice(0, i), tool: rest.slice(i + 2) }
+}
 
 /** 归一化「运行时 Tool（isXxx 为函数）或静态元信息（isXxx 为布尔）」的安全声明到统一布尔视图 */
 function entryFlags(t: Tool | ToolMetaEntry): { readOnly: boolean; destructive: boolean; concurrent: boolean } {
@@ -126,12 +141,19 @@ function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry): string {
 }
 
 /** 渲染工具表格：ID | 元信息(描述) | 权限键 | 状态（启用·加载·安全） */
-function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>): string {
+function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>, mcpDownServer?: Set<string>): string {
   const rows = entries.map((t) => {
     const { readOnly, destructive, concurrent } = entryFlags(t)
     const safety = [...(readOnly ? ['只读'] : []), ...(destructive ? ['危险'] : []), ...(concurrent === false ? ['非并发'] : [])]
     const base = entryStatus(inp, t)
-    const status = safety.length ? `${base}·${safety.join(',')}` : base
+    let status = safety.length ? `${base}·${safety.join(',')}` : base
+    if (t.id.startsWith('mcp__')) {
+      // MCP 场景化工具：标注来源 server；server 已被 /mcp 禁用时额外标注不可用
+      const m = parseMcpTool(t.id)
+      if (m) {
+        status += `·源自mcp${mcpDownServer?.has(m.server) ? '·server已禁用' : ''}`
+      }
+    }
     return { id: t.id, desc: (t.description ?? '').slice(0, 38), perm: permKeyOf(t), status }
   })
   const idW = Math.max('ID'.length, ...rows.map((r) => r.id.length))
@@ -184,12 +206,42 @@ function renderDetail(inp: ToolsCtx, toolArg: string): void {
 export function createToolsManagerPlugin(): AgentPlugin {
   /** 作用域 B：记录被 --global off 从注册池卸载的 Tool，供 on 时恢复 */
   const suspended = new Map<string, Tool>()
+  /** 事件总线（install 注入，用于发布/订阅生命周期事件） */
+  let bus: Bus | undefined
+  /** 事件退订句柄 */
+  const offs: Unsubscribe[] = []
+  /** 已被 /mcp 禁用的 server（用于 /tools 列表标注 mcp 工具来自的 server 不可用） */
+  const disabledMcpServers = new Set<string>()
+
+  /** 判定某工具是否来自「已被 /mcp 禁用的 server」 */
+  function mcpServerDown(t: Tool | ToolMetaEntry): boolean {
+    const m = parseMcpTool(t.id)
+    return !!m && disabledMcpServers.has(m.server)
+  }
+
+  /**
+   * 工具掩码统一收口到 /tools：对 mcp__<server>__<tool> 写入/删除 server 级掩码
+   * config.json mcpServers[].tools。on→删除键（全开）；off→tools[tool]=false。
+   * 返回错误字符串（undefined 表示成功）。
+   */
+  async function applyMcpMask(inp: ToolsCtx, id: string, isOn: boolean): Promise<string | undefined> {
+    const m = parseMcpTool(id)
+    if (!m) return undefined
+    const list = [...(inp.mcpServers ?? [])]
+    const entry = list.find((s) => s.name === m.server)
+    if (!entry) return `未知 MCP server："${m.server}"（用 /mcp servers 查看）。`
+    const tools = { ...(entry.tools ?? {}) }
+    if (isOn) delete tools[m.tool]
+    else tools[m.tool] = false
+    await inp.setMcpServers?.([...list.map((s) => (s.name === m.server ? { ...s, tools } : s))])
+    return undefined
+  }
 
   const hooks: Hooks = {
     'cli.commands'(input: { commands: Array<{ command: string; description: string; usage?: string }> }) {
       input.commands.push({
         command: 'tools',
-        description: '工具管理：查看 / Agent 白名单持久化 / --global 运行时启停',
+        description: '工具管理：查看 / Agent 白名单持久化 / --global 运行时启停 / mcp__ 工具掩码',
         usage:
           '/tools [--all | --json | <toolId> | <toolId> on|off | <toolId> --global on|off]',
       })
@@ -220,13 +272,13 @@ export function createToolsManagerPlugin(): AgentPlugin {
                 permissionKey: (t as { permission?: { key?: string } }).permission?.key,
               })), null, 2) + '\n')
             } else {
-              out(`全局注册 ${all.length} 个工具（含未加载的静态元信息）：\n${renderToolTable(inp, all)}\n`)
+              out(`全局注册 ${all.length} 个工具（含未加载的静态元信息）：\n${renderToolTable(inp, all, disabledMcpServers)}\n`)
             }
             return
           }
           const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
           const usable = agentUsableEntries(inp)
-          out(`Agent「${inp.agentId}」可用工具（白名单：${agentTools.join(', ') || '(空)'}）：\n${renderToolTable(inp, usable)}\n`)
+          out(`Agent「${inp.agentId}」可用工具（白名单：${agentTools.join(', ') || '(空)'}）：\n${renderToolTable(inp, usable, disabledMcpServers)}\n`)
           return
         }
 
@@ -237,6 +289,20 @@ export function createToolsManagerPlugin(): AgentPlugin {
 
         if (action && action !== 'on' && action !== 'off') {
           out(`未知动作：${action}（期望 on | off）。\n`)
+          return
+        }
+
+        // MCP 场景化工具（mcp__<server>__<tool>）：工具掩码统一收口到 /tools，写入 server 级掩码
+        if (parseMcpTool(toolArg)) {
+          if (!action) {
+            out(`MCP 工具：${toolArg}\n  启停语法：/tools ${toolArg} on|off\n`)
+            if (mcpServerDown({ id: toolArg } as Tool)) out(`  来源 server 已被 /mcp 禁用，工具当前不可用。\n`)
+            return
+          }
+          const err = await applyMcpMask(inp, toolArg, isOn)
+          if (err) { out(`${err}\n`); return }
+          await bus?.publish(isOn ? LifecycleEvents.toolEnabled : LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+          out(`已${isOn ? '启用' : '禁用'} MCP 工具 "${toolArg}"（${isOn ? '清除' : '写入'} server 级掩码，写入 config.json mcpServers[].tools）。\n`)
           return
         }
 
@@ -255,6 +321,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
             }
             harness.tools.register(cached)
             suspended.delete(toolArg)
+            await bus?.publish(LifecycleEvents.toolEnabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
             out(`已全局启用工具 "${toolArg}"（本轮进程生效）。\n`)
             return
           }
@@ -265,6 +332,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
           }
           suspended.set(toolArg, t)
           harness.tools.unregister(toolArg)
+          await bus?.publish(LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
           out(`已全局禁用工具 "${toolArg}"（影响所有 Agent，本轮进程生效；使用 --global on 恢复）。\n`)
           return
         }
@@ -284,6 +352,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
             return
           }
           await inp.setAgentTools(inp.agentId, [...cur, toolArg])
+          await bus?.publish(LifecycleEvents.toolEnabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
           out(`已启用工具 "${toolArg}" 并写入 config.json（Agent「${inp.agentId}」白名单，重启后保持）。\n`)
           return
         }
@@ -298,9 +367,11 @@ export function createToolsManagerPlugin(): AgentPlugin {
           const allIds = harness.tools.list().map((t) => t.id)
           out(`注意：Agent 白名单当前为全允许（*），"${toolArg}" 将转为显式白名单（除 ${toolArg} 外全部允许）后持久化。\n`)
           await inp.setAgentTools(inp.agentId, allIds.filter((id) => id !== toolArg))
+          await bus?.publish(LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
           return
         }
         await inp.setAgentTools(inp.agentId, cur.filter((id) => id !== toolArg))
+        await bus?.publish(LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
         out(`已禁用工具 "${toolArg}" 并写入 config.json（Agent「${inp.agentId}」白名单）。\n`)
       } finally {
         // 关键：标记命令已处理，避免 cli 因未设 result 而 fallthrough 到"未知命令"
@@ -313,8 +384,41 @@ export function createToolsManagerPlugin(): AgentPlugin {
     id: 'tools-manager',
     name: 'Tools Manager',
     version: '0.1.0',
-    async install() {
+    async install(ctx) {
+      bus = ctx.bus
+      // 跨层解耦：订阅 mcp / plugin 生命周期事件，刷新「哪些 mcp 工具的来源 server 不可用」
+      offs.push(
+        bus.subscribe(LifecycleEvents.mcpServerDisabled, ({ payload }) => {
+          disabledMcpServers.add(payload.name)
+        }),
+      )
+      offs.push(
+        bus.subscribe(LifecycleEvents.mcpServerEnabled, ({ payload }) => {
+          disabledMcpServers.delete(payload.name)
+        }),
+      )
+      offs.push(
+        bus.subscribe(LifecycleEvents.mcpServerAdded, ({ payload }) => {
+          disabledMcpServers.delete(payload.name)
+        }),
+      )
+      offs.push(
+        bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
+          if (payload.id === 'mcp.server-registry') disabledMcpServers.clear()
+        }),
+      )
+      offs.push(
+        bus.subscribe(LifecycleEvents.pluginUpdated, ({ payload }) => {
+          if (payload.id === 'mcp.server-registry') disabledMcpServers.clear()
+        }),
+      )
       return hooks
+    },
+    async uninstall() {
+      for (const off of offs) off()
+      offs.length = 0
+      bus = undefined
+      disabledMcpServers.clear()
     },
   }
 }

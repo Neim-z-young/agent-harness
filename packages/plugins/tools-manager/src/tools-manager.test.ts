@@ -3,6 +3,26 @@ import type { CliCommandInput, Hooks } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
 import { createToolsManagerPlugin } from './index'
 
+/** Bus 桩：记录发布事件，订阅记录 handler 便于手动触发 */
+interface BusStub {
+  emitted: Array<{ name: string; payload: unknown }>
+  handlers: Map<string, (record: { name: string; payload: any }) => void>
+  publish: (event: { name: string }, payload: unknown) => Promise<void>
+  subscribe: (event: { name: string }, h: (r: { name: string; payload: any }) => void) => () => void
+  emit: (name: string, payload: any) => void
+}
+function makeBus(): BusStub {
+  const emitted: Array<{ name: string; payload: unknown }> = []
+  const handlers: Map<string, (record: { name: string; payload: any }) => void> = new Map()
+  return {
+    emitted,
+    handlers,
+    publish: async (event: { name: string }, payload: unknown) => { emitted.push({ name: event.name, payload }) },
+    subscribe: (_event: { name: string }, h: (r: { name: string; payload: any }) => void) => { handlers.set(_event.name, h); return () => handlers.delete(_event.name) },
+    emit: (name: string, payload: any) => handlers.get(name)?.({ name, payload }),
+  }
+}
+
 function mkTool(id: string): Tool {
   return {
     id,
@@ -36,8 +56,8 @@ function makeHarness(initTools: Tool[], agentTools: string[]) {
   }
 }
 
-async function getHooks() {
-  return (await createToolsManagerPlugin().install({} as never)) as Hooks
+async function getHooks(bus?: ReturnType<typeof makeBus>): Promise<Hooks> {
+  return (await createToolsManagerPlugin().install({ bus: bus ?? makeBus() } as never)) as Hooks
 }
 
 async function run(
@@ -143,5 +163,84 @@ describe('tools-manager 插件', () => {
     expect(text).toContain('glob')
     expect(text).toContain('仅元信息')
     expect(text).toContain('read')
+  })
+})
+
+describe('tools-manager 事件解耦 + mcp 工具掩码', () => {
+  async function runMcp(h: Hooks, arg: string, ctx: {
+    harness: unknown; out: string[]; mcpServers: any[]; savedMcp: any[]; bus: ReturnType<typeof makeBus>;
+  }): Promise<CliCommandInput> {
+    const input = {
+      command: 'tools', raw: arg, arg, sessionId: 's',
+      out: (s: string) => { ctx.out.push(s) },
+      harness: ctx.harness,
+      agentId: 'default',
+      setAgentTools: async () => undefined,
+      mcpServers: ctx.mcpServers,
+      setMcpServers: async (list: any[]) => { ctx.savedMcp.push(list) },
+    } as unknown as CliCommandInput
+    await h['cli.command']?.(input)
+    return input
+  }
+
+  it('mcp__ 工具 off 写入 server 级掩码；on 删除掩码', async () => {
+    const bus = makeBus()
+    const h = await getHooks(bus)
+    const mcpServers = [{ name: 'github', transport: 'http', url: 'http://g', tools: {} as Record<string, boolean> }]
+    const ctx: any = makeHarness([mkTool('mcp__github__create_issue'), mkTool('bash')], ['*'])
+    ctx.mcpServers = mcpServers
+    ctx.savedMcp = []
+    ctx.out = []
+    ctx.bus = bus
+
+    // off → 写掩码
+    await runMcp(h, 'mcp__github__create_issue off', ctx)
+    expect(ctx.savedMcp.length).toBe(1)
+    expect(ctx.savedMcp[0][0].tools.create_issue).toBe(false)
+    expect(bus.emitted).toContainEqual({ name: 'tool.disabled', payload: { id: 'mcp__github__create_issue', agentId: 'default' } })
+
+    // on → 删除掩码
+    await runMcp(h, 'mcp__github__create_issue on', ctx)
+    expect(ctx.savedMcp.length).toBe(2)
+    expect(ctx.savedMcp[1][0].tools.create_issue).toBeUndefined()
+    expect(bus.emitted).toContainEqual({ name: 'tool.enabled', payload: { id: 'mcp__github__create_issue', agentId: 'default' } })
+  })
+
+  it('mcp 工具详情视图展示启停语法与 server 状态', async () => {
+    const bus = makeBus()
+    const h = await getHooks(bus)
+    const ctx: any = makeHarness([mkTool('mcp__github__create_issue')], ['*'])
+    ctx.mcpServers = [{ name: 'github', transport: 'http', url: 'http://g' }]
+    ctx.savedMcp = []
+    ctx.out = []
+    ctx.bus = bus
+    await runMcp(h, 'mcp__github__create_issue', ctx)
+    expect(ctx.out.join('')).toContain('mcp__github__create_issue')
+    expect(ctx.out.join('')).toContain('on|off')
+  })
+
+  it('收到 mcp.server.disabled 后 /tools 列表标注该 server 工具不可用', async () => {
+    const bus = makeBus()
+    const h = await getHooks(bus)
+    const ctx: any = makeHarness([mkTool('mcp__github__create_issue')], ['*'])
+    ctx.mcpServers = [{ name: 'github', transport: 'http', url: 'http://g' }]
+    ctx.savedMcp = []
+    ctx.out = []
+    ctx.bus = bus
+    // 触发下行事件（等价 /mcp disable github）
+    bus.emit('mcp.server.disabled', { name: 'github' })
+    await runMcp(h, '', ctx)
+    expect(ctx.out.join('')).toContain('·server已禁用')
+    expect(ctx.out.join('')).toContain('·源自mcp')
+  })
+
+  it('作用域 A 启停发布 tool.* 事件', async () => {
+    const bus = makeBus()
+    const h = await getHooks(bus)
+    const { harness, out, saved } = makeHarness([mkTool('bash'), mkTool('read_file')], ['read_file'])
+    await run(h, 'bash on', { harness, out, saved })
+    expect(bus.emitted).toContainEqual({ name: 'tool.enabled', payload: { id: 'bash', agentId: 'default' } })
+    await run(h, 'read_file off', { harness, out, saved })
+    expect(bus.emitted).toContainEqual({ name: 'tool.disabled', payload: { id: 'read_file', agentId: 'default' } })
   })
 })

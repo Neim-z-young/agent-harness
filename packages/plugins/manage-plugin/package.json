@@ -1,0 +1,23 @@
+{
+  "name": "@harness/manage-plugin",
+  "version": "0.1.0",
+  "description": "插件生命周期管理插件：/plugins 查看 / 启用 / 禁用 / 重载，并经事件总线发布 plugin.* 生命周期事件",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/bus": "workspace:*",
+    "@harness/plugin": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

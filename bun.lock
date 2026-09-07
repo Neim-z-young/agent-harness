@@ -28,6 +28,7 @@
         "@harness/bus": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
@@ -125,6 +126,15 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/manage-plugin": {
+      "name": "@harness/manage-plugin",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+      },
+    },
     "packages/plugins/mcp-client": {
       "name": "@harness/mcp-client",
       "version": "0.2.0",
@@ -138,8 +148,9 @@
     },
     "packages/plugins/mcp-server-registry": {
       "name": "@harness/mcp-server-registry",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "dependencies": {
+        "@harness/core": "workspace:*",
         "@harness/mcp-client": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
@@ -258,8 +269,11 @@
     },
     "packages/plugins/tools-manager": {
       "name": "@harness/tools-manager",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/mcp-server-registry": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -371,6 +385,8 @@
     "@harness/coordinator": ["@harness/coordinator@workspace:packages/plugins/coordinator"],
 
     "@harness/core": ["@harness/core@workspace:packages/core"],
+
+    "@harness/manage-plugin": ["@harness/manage-plugin@workspace:packages/plugins/manage-plugin"],
 
     "@harness/mcp-client": ["@harness/mcp-client@workspace:packages/plugins/mcp-client"],
 

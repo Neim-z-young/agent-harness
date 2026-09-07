@@ -1,7 +1,7 @@
 {
   "name": "@harness/mcp-server-registry",
-  "version": "0.2.0",
-  "description": "MCP Server 注册表插件：所有 mcpserver 相关插件依赖它启动 server；支持 config.json mcpServers 装配 + 服务器/工具两级启停",
+  "version": "0.3.0",
+  "description": "MCP Server 注册表插件：所有 mcpserver 相关插件依赖它启动 server；支持 config.json mcpServers 装配 + 服务器级启停，并经事件总线发布 mcp.* 生命周期事件",
   "type": "module",
   "exports": {
     ".": {
@@ -10,6 +10,7 @@
     }
   },
   "dependencies": {
+    "@harness/core": "workspace:*",
     "@harness/mcp-client": "workspace:*",
     "@harness/tool": "workspace:*",
     "@harness/plugin": "workspace:*"

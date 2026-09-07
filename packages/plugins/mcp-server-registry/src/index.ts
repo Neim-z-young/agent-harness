@@ -14,6 +14,8 @@
 
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
+import type { Unsubscribe } from '@harness/bus'
+import { LifecycleEvents } from '@harness/core'
 import {
   McpClient,
   defaultTransportFactory,
@@ -141,6 +143,22 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   /** CLI 注入的持久化回调 */
   let cliStore: McpCliStore | undefined
   let connected = false
+  /** 事件退订句柄（install 注册、uninstall 退订） */
+  const offs: Unsubscribe[] = []
+
+  /**
+   * 跨层解耦的自检：核对 runtimes 与「托管配置 + 代码注册」两个来源，
+   * 清理已不属于任何来源的孤儿 runtime（例如宿主插件被卸载/重载而未正确注销其 server 时）。
+   */
+  function syncRuntimesFromSources(): void {
+    for (let i = runtimes.length - 1; i >= 0; i--) {
+      const rt = runtimes[i]
+      if (!managed.has(rt.name) && !reg.has(rt.name)) {
+        rt.client.close()
+        runtimes.splice(i, 1)
+      }
+    }
+  }
 
   /** 根据一个 server 配置建立运行时（不落 entries，调用方 push） */
   function makeRuntime(serverName: string, cfg: McpServerConfig, entry?: McpServerEntry): Promise<McpServerRuntime | undefined> {
@@ -187,11 +205,23 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
 
   return {
     id: 'mcp.server-registry',
-    version: '0.2.0',
+    version: '0.3.0',
     name: 'MCP Server Registry',
     description: 'MCP Server 注册表：启动所有注册的 MCP Server，并通过 @harness/mcp-client 连接管理',
 
     async install(ctx) {
+      // 跨层解耦：宿主插件卸载/更新时自检并清理孤儿 runtime（不反向改上层状态）
+      offs.push(
+        ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
+          if (payload.id === 'mcp.server-registry') syncRuntimesFromSources()
+        }),
+      )
+      offs.push(
+        ctx.bus.subscribe(LifecycleEvents.pluginUpdated, ({ payload }) => {
+          if (payload.id === 'mcp.server-registry') syncRuntimesFromSources()
+        }),
+      )
+
       return {
         /**
          * 注入 config.json 的 mcpServers（替换托管列表）。仅建立配置态，不连接；
@@ -266,8 +296,8 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
           if (runtimes.length === 0 && managed.size === 0) return
           input.commands.push({
             command: 'mcp',
-            description: 'MCP Server / 工具管理（含 config.json 装配、两级启停）',
-            usage: '/mcp [servers | tools | enable <s> | disable <s> | tool <s> <t> on|off | add <json> | remove <s>]',
+            description: 'MCP Server 生命周期管理（config.json 装配、服务器级启停）',
+            usage: '/mcp [servers | tools | enable <s> | disable <s> | add <json> | remove <s>]',
           })
         },
 
@@ -322,21 +352,12 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             if (m.enabled) {
               const ok = await connectManaged(name)
               out(ok ? `已启用并连接 ${name}\n` : `启用失败（未能连接 ${name}）\n`)
+              await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
             } else {
               disconnectServer(name)
               out(`已禁用 ${name}\n`)
+              await ctx.bus.publish(LifecycleEvents.mcpServerDisabled, { name }, { source: 'mcp.server-registry' })
             }
-          } else if (sub === 'tool') {
-            const name = parts[1]
-            const tname = parts[2]
-            const flag = (parts[3] ?? '').toLowerCase()
-            if (!name || !tname || !['on', 'off'].includes(flag)) { out('用法：/mcp tool <server> <tool> on|off\n'); return }
-            const m = managed.get(name)
-            if (!m) { out(`未知托管 server："${name}"\n`); return }
-            if (flag === 'off') m.tools[tname] = false
-            else delete m.tools[tname]
-            persist()
-            out(`工具 ${name}/${tname} 已${flag === 'off' ? '禁用' : '启用'}\n`)
           } else if (sub === 'add') {
             const json = arg.slice(sub.length).trim().replace(/^--\s*/, '')
             try {
@@ -346,6 +367,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
               persist()
               const ok = managed.get(e.name)!.enabled ? await connectManaged(e.name) : true
               out(ok ? `已添加并连接 ${e.name}\n` : `已添加但仍需连接（config 有误？）${e.name}\n`)
+              await ctx.bus.publish(LifecycleEvents.mcpServerAdded, { name: e.name }, { source: 'mcp.server-registry' })
             } catch (err) {
               out(`JSON 解析失败：${(err as Error)?.message ?? String(err)}\n用法：/mcp add <json>（含 name; 可再 -- 前缀）\n`)
             }
@@ -357,8 +379,9 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             disconnectServer(name)
             persist()
             out(`已移除 ${name}\n`)
+            await ctx.bus.publish(LifecycleEvents.mcpServerRemoved, { name }, { source: 'mcp.server-registry' })
           } else {
-            out(`未知子命令：${sub}\n用法：/mcp [servers | tools | enable <s> | disable <s> | tool <s> <t> on|off | add <json> | remove <s>]\n`)
+            out(`未知子命令：${sub}\n用法：/mcp [servers | tools | enable <s> | disable <s> | add <json> | remove <s>]\n`)
           }
           input.result = 'continue'
         },
@@ -366,6 +389,8 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     },
 
     async uninstall() {
+      for (const off of offs) off()
+      offs.length = 0
       for (const rt of runtimes) rt.client.close()
       runtimes.length = 0
       managed.clear()

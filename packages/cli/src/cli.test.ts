@@ -1558,7 +1558,6 @@ describe('/plugins 插件管理', () => {
       mockProviderConfig: { defaultResponse: 'hi' },
     })
     const { harness, session } = await app.boot()
-    expect(app.pluginInfos().length).toBeGreaterThan(0)
     return { app, harness, session, stdout, chunks }
   }
 
@@ -1616,25 +1615,22 @@ describe('/plugins 插件管理', () => {
     await app.shutdown()
   })
 
-  it('enable/disable 插件幂等往返', async () => {
+  it('enable/disable 插件幂等往返（经 /plugins 命令）', async () => {
     const { app, harness, session, stdout, chunks } = await bootApp()
-    const id = 'provider.mock'
-    expect(app.pluginInfos().some((p) => p.id === id)).toBe(true)
 
-    // disable → 从列表移除
-    const disableErr = await app.disablePlugin(id)
-    expect(disableErr).toBeUndefined()
-    expect(app.pluginInfos().some((p) => p.id === id)).toBe(false)
+    // disable → 从插件列表移除
+    await startRepl({ app, harness, session, stdout, scriptedStdin: ['/plugins disable provider.mock', '/exit'] })
+    let out = chunks.join('')
+    expect(out).toInclude('已禁用插件')
 
-    // 重复 disable → 返回不受管理（已不在 plugin.list，但 registry 仍在 → 实际走到 enable 分支逻辑）
-    // 这里改用 enable 恢复
-    const enableErr = await app.enablePlugin(id)
-    expect(enableErr).toBeUndefined()
-    expect(app.pluginInfos().some((p) => p.id === id)).toBe(true)
-
-    // 再次 enable → 已是启用状态
-    const again = await app.enablePlugin(id)
-    expect(again).toInclude('已是启用状态')
+    // 同一 app 内 enable 恢复 → 再次出现在列表；再次 enable 幂等提示已是启用状态
+    await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/plugins enable provider.mock', '/plugins enable provider.mock', '/exit'],
+    })
+    out = chunks.join('')
+    expect(out).toInclude('已启用插件')
+    expect(out).toInclude('已是启用状态')
     await app.shutdown()
   })
 

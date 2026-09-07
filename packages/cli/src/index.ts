@@ -400,9 +400,16 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
     defaultBuiltinRegistry.register({
       id: 'tools-manager',
       name: 'Tools Manager',
-      description: '工具管理命令 /tools（查看 / Agent 白名单持久化 / --global 运行时启停）',
+      description: '工具管理命令 /tools（查看 / Agent 白名单持久化 / --global 运行时启停 / mcp__ 工具掩码）',
       source: 'builtin',
       load: async () => (await lazyImport<{ createToolsManagerPlugin: () => AgentPlugin }>('@harness/tools-manager')).createToolsManagerPlugin(),
+    })
+    defaultBuiltinRegistry.register({
+      id: 'manage-plugin',
+      name: 'Plugin Manager',
+      description: '插件生命周期管理命令 /plugins（查看 / 启用 / 禁用 / 重载）',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ createPluginManagerPlugin: () => AgentPlugin }>('@harness/manage-plugin')).createPluginManagerPlugin(),
     })
     // 场景化工具插件（search/glob/web/media，metaSource 由各插件自携带）：
     // 登记进 BuiltinPluginRegistry 后，boot 末尾的后台预加载（scheduleBuiltinPreload）
@@ -1030,59 +1037,8 @@ export class HarnessApp {
   }
 
   // ------------------------------------------------------------------
-  // 插件管理（/plugins）与技能管理（/skills）
+  // 技能管理（/skills）
   // ------------------------------------------------------------------
-
-  /** 插件信息（供 /plugins 展示） */
-  pluginInfos(): Array<{ id: string; name: string; version: string; source: string; manageable: boolean; enabled: boolean }> {
-    if (!this.harness) return []
-    return this.harness.plugin.list().map((lp) => ({
-      id: lp.plugin.id,
-      name: lp.plugin.name,
-      version: lp.plugin.version,
-      source: lp.source,
-      manageable: this.pluginRegistry.has(lp.plugin.id),
-      enabled: true,
-    }))
-  }
-
-  /** 禁用插件（仅可管理插件可禁用；返回错误消息或 undefined 表示成功） */
-  async disablePlugin(id: string): Promise<string | undefined> {
-    const obj = this.pluginRegistry.get(id)
-    if (!obj) return `插件 "${id}" 不受管理（内置/未登记插件不可禁用）。`
-    try {
-      await this.harness.plugin.unload(id)
-    } catch (err: any) {
-      return `禁用插件 "${id}" 失败：${err?.message ?? String(err)}`
-    }
-    return undefined
-  }
-
-  /** 启用插件：将登记的原插件对象重新安装进 Harness */
-  async enablePlugin(id: string): Promise<string | undefined> {
-    const obj = this.pluginRegistry.get(id)
-    if (!obj) return `插件 "${id}" 不受管理（内置/未登记插件不可启用）。`
-    try {
-      // 已启用则幂等成功
-      const already = this.harness.plugin.list().find((p) => p.plugin.id === id)
-      if (already) return `${id} 已是启用状态。`
-      await this.harness.plugin.loadInternal([obj])
-    } catch (err: any) {
-      return `启用插件 "${id}" 失败：${err?.message ?? String(err)}`
-    }
-    return undefined
-  }
-
-  /** 重载插件 */
-  async reloadPlugin(id: string): Promise<string | undefined> {
-    if (!this.harness.plugin.list().some((p) => p.plugin.id === id)) return `插件 "${id}" 未加载。`
-    try {
-      await this.harness.plugin.hotReload(id)
-    } catch (err: any) {
-      return `重载插件 "${id}" 失败：${err?.message ?? String(err)}`
-    }
-    return undefined
-  }
 
   /** 技能信息（供 /skills 展示，来源中文标注） */
   skillInfos(): Array<{ id: string; name: string; source: string; sourceLabel: string; enabled: boolean }> {
@@ -1297,6 +1253,8 @@ export class HarnessApp {
     providerPlugins.push(toolsBuiltin)
     const toolsManager = await getBuiltinRegistry().get('tools-manager')!.load()
     providerPlugins.push(toolsManager)
+    const managePlugin = await getBuiltinRegistry().get('manage-plugin')!.load()
+    providerPlugins.push(managePlugin)
     // 薄壳插件：/workspace 查看工作区布局（依赖 cli 注入的 workspace，见 cmdInput.workspace）
     providerPlugins.push(createWorkspacePlugin())
     // 薄壳插件：/revert 文件快照回滚（依赖 cli 注入的 snapshotService 与 harness.session/bus，见 cmdInput）
@@ -1888,29 +1846,6 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out(`无法解析 "${t}"。/permission 查看，/permission <mode> 或 /permission <key>=<behavior> 设置。\n`)
           return 'continue'
         }
-        case '/plugins': {
-          const parts = line.split(/\s+/).map((s) => s.trim()).filter(Boolean)
-          const op = parts[1]
-          const pid = parts[2]
-          if (!op || !pid || !['enable', 'disable', 'reload'].includes(op)) {
-            const infos = app.pluginInfos()
-            if (infos.length === 0) { out('（未加载任何插件）\n'); return 'continue' }
-            for (const p of infos) {
-              const manage = p.manageable ? '可管理' : '内置'
-              out(`  ${p.id.padEnd(28)}${p.name}  v${p.version}  来源=${p.source}  [${manage}]\n`)
-            }
-            if (parts.length === 1) { out('\n用法：/plugins <enable|disable|reload> <pluginId>\n'); return 'continue' }
-            out('用法：/plugins <enable|disable|reload> <pluginId>\n')
-            return 'continue'
-          }
-          const msg = op === 'disable'
-            ? await app.disablePlugin(pid)
-            : op === 'enable'
-              ? await app.enablePlugin(pid)
-              : await app.reloadPlugin(pid)
-          out((msg ?? `${op === 'reload' ? '已重载' : `已${op === 'enable' ? '启用' : '禁用'}`}插件 "${pid}"。`) + '\n')
-          return 'continue'
-        }
         case '/skills': {
           const parts = line.split(/\s+/).map((s) => s.trim()).filter(Boolean)
           const op = parts[1]
@@ -1945,11 +1880,13 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             toolMeta: ToolMetaLookup;
             workspace: Workspace;
             snapshotService?: SnapshotService;
+            manageablePlugin: (id: string) => AgentPlugin | undefined;
+            pluginManageable: (id: string) => boolean;
             result?: 'continue' | 'exit'
           } = {
             raw: line.slice(1),
             command: cmd.slice(1),
-            arg: (arg ?? '').trim(),
+            arg: line.slice(cmd.length).trim(),
             out,
             sessionId: current.id,
             harness,
@@ -1960,6 +1897,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             toolMeta: getBuiltinToolRegistry(),
             workspace: app.workspace,
             snapshotService: app.snapshotService,
+            manageablePlugin: (id) => app.pluginRegistry.get(id),
+            pluginManageable: (id) => app.pluginRegistry.has(id),
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)
