@@ -191,7 +191,7 @@ describe('createMcpServerRegistryPlugin', () => {
     // 代码注册 server 禁用：会话内断开连接，工具不再装配
     const out: string[] = []
     await hooks!['cli.command']!({
-      command: 'mcp', arg: 'disable code-intel', raw: 'mcp disable code-intel',
+      command: 'mcp', arg: 'servers disable code-intel', raw: 'mcp servers disable code-intel',
       sessionId: 's', out: (s: string) => out.push(s),
     } as any)
     expect(out.join('')).toContain('已禁用')
@@ -201,10 +201,10 @@ describe('createMcpServerRegistryPlugin', () => {
     await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list()).toHaveLength(0)
 
-    // 重新启用：重新连接，工具恢复
+    // 重新启用（嵌套写法 servers enable）：重新连接，工具恢复
     const out2: string[] = []
     await hooks!['cli.command']!({
-      command: 'mcp', arg: 'enable code-intel', raw: 'mcp enable code-intel',
+      command: 'mcp', arg: 'servers enable code-intel', raw: 'mcp servers enable code-intel',
       sessionId: 's', out: (s: string) => out2.push(s),
     } as any)
     expect(out2.join('')).toContain('重新连接')

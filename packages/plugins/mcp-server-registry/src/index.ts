@@ -319,7 +319,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
           input.commands.push({
             command: 'mcp',
             description: 'MCP Server 生命周期管理（config.json 装配、服务器级启停）',
-            usage: '/mcp [servers | tools | enable <s> | disable <s> | add <json> | remove <s>]',
+            usage: '/mcp [servers [enable|disable <s>] | tools | enable <s> | disable <s> | add <json> | remove <s>]',
           })
         },
 
@@ -331,7 +331,13 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
           }
           const arg = (input.arg ?? '').trim()
           const parts = arg.split(/\s+/)
-          const sub = (parts[0] ?? '').toLowerCase()
+          let sub = (parts[0] ?? '').toLowerCase()
+          // 兼容嵌套写法 /mcp servers enable|disable <s>：把动作提升为主子命令，
+          // parts 归一化为 [<sub>, <name>, ...]（如 [disable, code-intel]）
+          if (sub === 'servers' && (parts[1] === 'enable' || parts[1] === 'disable')) {
+            sub = parts[1]
+            parts.splice(0, 2, sub)
+          }
           const out = (s: string) => input.out(s)
 
           const serverList = () => {
@@ -421,7 +427,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             out(`已移除 ${name}\n`)
             await ctx.bus.publish(LifecycleEvents.mcpServerRemoved, { name }, { source: 'mcp.server-registry' })
           } else {
-            out(`未知子命令：${sub}\n用法：/mcp [servers | tools | enable <s> | disable <s> | add <json> | remove <s>]\n`)
+            out(`未知子命令：${sub}\n用法：/mcp [servers [enable|disable <s>] | tools | enable <s> | disable <s> | add <json> | remove <s>]\n`)
           }
           input.result = 'continue'
         },

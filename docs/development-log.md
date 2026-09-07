@@ -8,7 +8,7 @@
 
 - **`@harness/tool`**：新增 `McpToolIndex`（内存索引：`server` → 完整工具 id 集，含 `index/unindex/serverOf/has/servers/entries`）与模块单例 `globalMcpToolIndex`；新增 `resolveMcpTool(id, index?)` —— 优先用索引精确反解（server 名可含 `__`），未登记时回退 `parseMcpToolId` 启发式切分。索引放在叶节点 `@harness/tool`，装配方与反解方共享同一实例，不引入新包依赖、不影响软件加载。
 - **`mcp-server-registry`**：生成工具（`makeRuntime` / 新抽出的 `connectCodeServer`）时登记 `globalMcpToolIndex`，断开（`disconnectServer`）与 `uninstall` 反注册；`harness.start` 代码注册循环复用 `connectCodeServer`。
-- **`mcp-server-registry` `/mcp` 命令**：`enable/disable <s>` 不再只允许托管 server —— 对代码注册 server（`reg.has` 命中）做**会话内启停**（无法落盘 config.json，重启后恢复连接）：disable 断开 client + `disabledCode` 标记 + assemble 跳过其工具；enable 经 `connectCodeServer` 重连。`serverList` 对代码注册项展示 `[启用]`/`[会话禁用]` 与连接态。
+- **`mcp-server-registry` `/mcp` 命令**：`enable/disable <s>` 不再只允许托管 server —— 对代码注册 server（`reg.has` 命中）做**会话内启停**（无法落盘 config.json，重启后恢复连接）：disable 断开 client + `disabledCode` 标记 + assemble 跳过其工具；enable 经 `connectCodeServer` 重连。`serverList` 对代码注册项展示 `[启用]`/`[会话禁用]` 与连接态。**兼容嵌套写法** `/mcp servers enable|disable <s>`（把动作提升为主子命令归一化处理）。
 - **`tools-manager`**：删除本地 `parseMcpTool`（首个 `__` 切分），改经 `mcpToolOf = (id) => resolveMcpTool(id, globalMcpToolIndex)`，server 名含 `__` 时归属/掩码写入总是精确。
 
 ### 验证
