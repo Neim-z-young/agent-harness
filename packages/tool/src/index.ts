@@ -507,6 +507,78 @@ export function parseMcpToolId(id: string): { server: string; tool: string } | u
 }
 
 /**
+ * MCP 工具归属索引（内存缓存）：server 名 → 其暴露的完整工具 id 集合。
+ *
+ * 背景：MCP 工具 id 形如 `mcp__<server>__<tool>`，但 server 名本身可含 `__`
+ * （如 `mcp__code-intel__x`、`mcp__a__b__c`）。此时仅凭 `parseMcpToolId` 的
+ * 「首个 __ 切分」无法可靠反解出工具的真实来源 server 与 tool 名。
+ *
+ * 因此由装配方（如 mcp-server-registry）在生成工具时把「server → 全量工具 id」
+ * 登记进该索引；反解方（如 tools-manager / 上层 UI）据此精确归属，未登记的工具
+ * 再回退到 `parseMcpToolId` 启发式切分。纯内存数据结构，无副作用、无外部依赖。
+ */
+export class McpToolIndex {
+  /** server 名 → 完整工具 id 集合 */
+  private readonly serverTools = new Map<string, Set<string>>()
+  /** 完整工具 id → server 名（精确归属） */
+  private readonly toolServer = new Map<string, string>()
+
+  /** 登记 server 的全部工具 id（幂等；同 server 重复登记以最新为准） */
+  index(server: string, toolIds: Iterable<string>): void {
+    this.unindex(server) // 先清旧归属，避免重连后残留过期工具
+    const set = new Set<string>()
+    for (const id of toolIds) {
+      set.add(id)
+      this.toolServer.set(id, server)
+    }
+    if (set.size) this.serverTools.set(server, set)
+  }
+  /** 移除 server 及其全部工具的归属 */
+  unindex(server: string): void {
+    const set = this.serverTools.get(server)
+    if (set) for (const id of set) this.toolServer.delete(id)
+    this.serverTools.delete(server)
+  }
+  /** 精确反解工具来源 server；未登记返回 undefined（调用方回退 parseMcpToolId） */
+  serverOf(toolId: string): string | undefined {
+    return this.toolServer.get(toolId)
+  }
+  /** 该工具是否有可靠归属（已登记） */
+  has(toolId: string): boolean {
+    return this.toolServer.has(toolId)
+  }
+  /** 已登记的 server 名列表 */
+  servers(): string[] {
+    return Array.from(this.serverTools.keys())
+  }
+  /** 已登记全部（server → 工具 id 列表）的只读视图 */
+  entries(): Array<{ server: string; tools: string[] }> {
+    return Array.from(this.serverTools.entries()).map(([server, set]) => ({ server, tools: Array.from(set) }))
+  }
+}
+
+/** 全局默认 MCP 工具归属索引（模块单例，装配方与消费方共享） */
+export const globalMcpToolIndex = new McpToolIndex()
+
+/**
+ * 解析 MCP 工具 id → { server, tool }。
+ * 优先使用索引（globalMcpToolIndex 或显式传入）精确反解，可应对 server 名含 `__`
+ * 的场景；未登记归属时回退到 `parseMcpToolId` 启发式切分。非 `mcp__` 前缀返回 undefined。
+ */
+export function resolveMcpTool(
+  id: string,
+  index: McpToolIndex = globalMcpToolIndex,
+): { server: string; tool: string } | undefined {
+  if (!id.startsWith('mcp__')) return undefined
+  const exact = index?.serverOf(id)
+  if (exact !== undefined) {
+    const prefix = `mcp__${exact}__`
+    if (id.startsWith(prefix)) return { server: exact, tool: id.slice(prefix.length) }
+  }
+  return parseMcpToolId(id)
+}
+
+/**
  * 按 Agent 的 MCP server 声明过滤工具集（常作为 filterByWhitelist 之后的第二阶段收窄）。
  *
  * 规则：

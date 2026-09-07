@@ -174,6 +174,46 @@ describe('createMcpServerRegistryPlugin', () => {
     expect(ids).not.toContain('mcp__bad__')
     await plugin.uninstall?.()
   })
+
+  test('/mcp disable/enable 可对代码注册 server 会话内启停（任务B），并登记工具归属索引（任务A）', async () => {
+    const reg = createMcpServerRegistry()
+    const { transport } = createFakeTransport([{ name: 'list_apps' }])
+    reg.register({ name: 'code-intel', createTransport: () => transport })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
+    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+
+    let pool = fakePool()
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
+
+    // 代码注册 server 禁用：会话内断开连接，工具不再装配
+    const out: string[] = []
+    await hooks!['cli.command']!({
+      command: 'mcp', arg: 'disable code-intel', raw: 'mcp disable code-intel',
+      sessionId: 's', out: (s: string) => out.push(s),
+    } as any)
+    expect(out.join('')).toContain('已禁用')
+    expect(reg.has('code-intel')).toBe(true) // 注册项仍在，仅本次进程禁用
+
+    pool = fakePool()
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list()).toHaveLength(0)
+
+    // 重新启用：重新连接，工具恢复
+    const out2: string[] = []
+    await hooks!['cli.command']!({
+      command: 'mcp', arg: 'enable code-intel', raw: 'mcp enable code-intel',
+      sessionId: 's', out: (s: string) => out2.push(s),
+    } as any)
+    expect(out2.join('')).toContain('重新连接')
+
+    pool = fakePool()
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
+    await plugin.uninstall?.()
+  })
 })
 
 describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServers）', () => {

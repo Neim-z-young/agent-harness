@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-09-07（续 83）MCP 工具归属索引统一解析 + 代码注册 server 会话内启停
+
+> 两件事：①把 tools-manager / mcp-server-registry 的 MCP 前缀反解统一到 `@harness/tool` 的 `parseMcpToolId` 语义之上，并用内存缓存的「server → 工具集」映射修正 server 名含 `__` 时的退化；②修复 `/mcp disable code-intel`（代码注册 server）无法禁用的问题。
+
+### 改动
+
+- **`@harness/tool`**：新增 `McpToolIndex`（内存索引：`server` → 完整工具 id 集，含 `index/unindex/serverOf/has/servers/entries`）与模块单例 `globalMcpToolIndex`；新增 `resolveMcpTool(id, index?)` —— 优先用索引精确反解（server 名可含 `__`），未登记时回退 `parseMcpToolId` 启发式切分。索引放在叶节点 `@harness/tool`，装配方与反解方共享同一实例，不引入新包依赖、不影响软件加载。
+- **`mcp-server-registry`**：生成工具（`makeRuntime` / 新抽出的 `connectCodeServer`）时登记 `globalMcpToolIndex`，断开（`disconnectServer`）与 `uninstall` 反注册；`harness.start` 代码注册循环复用 `connectCodeServer`。
+- **`mcp-server-registry` `/mcp` 命令**：`enable/disable <s>` 不再只允许托管 server —— 对代码注册 server（`reg.has` 命中）做**会话内启停**（无法落盘 config.json，重启后恢复连接）：disable 断开 client + `disabledCode` 标记 + assemble 跳过其工具；enable 经 `connectCodeServer` 重连。`serverList` 对代码注册项展示 `[启用]`/`[会话禁用]` 与连接态。
+- **`tools-manager`**：删除本地 `parseMcpTool`（首个 `__` 切分），改经 `mcpToolOf = (id) => resolveMcpTool(id, globalMcpToolIndex)`，server 名含 `__` 时归属/掩码写入总是精确。
+
+### 验证
+
+- tool 50 / mcp-server-registry 10 / tools-manager 13 / cli 169 用例全绿；全量 30 包 typecheck 通过。
+- 新增用例：`McpToolIndex`+`resolveMcpTool`（server 含 `__` 精确反解、未登记回退、unindex、幂等重登记）、代码注册 server `/mcp disable/enable` 会话内往返（禁用后 assemble 空、启用后工具恢复）。
+
 ## 2026-09-07（续 82）Agent 级 MCP 配置能力（server 粒度白名单/黑名单）
 
 > 让 Agent 在声明式配置里按 **MCP server 粒度** 控制可用 MCP，而不必在 `tools` 白名单里逐个列 `mcp__<server>__<tool>`。设计文档见 `.trae/documents/agent-mcp-config.md`。

@@ -16,7 +16,7 @@
  */
 
 import type { CliCommandInput, AgentPlugin, Hooks, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
-import type { Tool } from '@harness/tool'
+import { globalMcpToolIndex, resolveMcpTool, type Tool } from '@harness/tool'
 import type { Bus, Unsubscribe } from '@harness/bus'
 import { LifecycleEvents } from '@harness/core'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
@@ -47,12 +47,12 @@ type ToolsCtx = Omit<CliCommandInput, 'harness'> & {
 
 const FLAGS = new Set(['--all', '--json', '--global'])
 
-/** mcp__<server>__<tool> → 拆分（server 部分可能含 __，取首个 __ 之前作为 server 名） */
-function parseMcpTool(id: string): { server: string; tool: string } | undefined {
-  const rest = id.startsWith('mcp__') ? id.slice('mcp__'.length) : id
-  if (!rest.includes('__')) return undefined
-  const i = rest.indexOf('__')
-  return { server: rest.slice(0, i), tool: rest.slice(i + 2) }
+/**
+ * MCP 工具 id → { server, tool }。走 @harness/tool 的共享解析：优先用
+ * globalMcpToolIndex 精确反解（server 名可含 __），未登记时回退启发式切分。
+ */
+function mcpToolOf(id: string): { server: string; tool: string } | undefined {
+  return resolveMcpTool(id, globalMcpToolIndex)
 }
 
 /** 归一化「运行时 Tool（isXxx 为函数）或静态元信息（isXxx 为布尔）」的安全声明到统一布尔视图 */
@@ -149,7 +149,7 @@ function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>, mc
     let status = safety.length ? `${base}·${safety.join(',')}` : base
     if (t.id.startsWith('mcp__')) {
       // MCP 场景化工具：标注来源 server；server 已被 /mcp 禁用时额外标注不可用
-      const m = parseMcpTool(t.id)
+      const m = mcpToolOf(t.id)
       if (m) {
         status += `·源自mcp${mcpDownServer?.has(m.server) ? '·server已禁用' : ''}`
       }
@@ -215,7 +215,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
 
   /** 判定某工具是否来自「已被 /mcp 禁用的 server」 */
   function mcpServerDown(t: Tool | ToolMetaEntry): boolean {
-    const m = parseMcpTool(t.id)
+    const m = mcpToolOf(t.id)
     return !!m && disabledMcpServers.has(m.server)
   }
 
@@ -225,7 +225,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
    * 返回错误字符串（undefined 表示成功）。
    */
   async function applyMcpMask(inp: ToolsCtx, id: string, isOn: boolean): Promise<string | undefined> {
-    const m = parseMcpTool(id)
+    const m = mcpToolOf(id)
     if (!m) return undefined
     const list = [...(inp.mcpServers ?? [])]
     const entry = list.find((s) => s.name === m.server)
@@ -293,7 +293,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
         }
 
         // MCP 场景化工具（mcp__<server>__<tool>）：工具掩码统一收口到 /tools，写入 server 级掩码
-        if (parseMcpTool(toolArg)) {
+        if (mcpToolOf(toolArg)) {
           if (!action) {
             out(`MCP 工具：${toolArg}\n  启停语法：/tools ${toolArg} on|off\n`)
             if (mcpServerDown({ id: toolArg } as Tool)) out(`  来源 server 已被 /mcp 禁用，工具当前不可用。\n`)

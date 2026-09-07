@@ -17,6 +17,8 @@ import {
   partitionToolCalls,
   parseMcpToolId,
   filterMcpTools,
+  McpToolIndex,
+  resolveMcpTool,
 } from './index'
 
 // ===== 测试工具：简易 Schema 构造器（不依赖 zod） =====
@@ -613,6 +615,47 @@ describe('@harness/tool', () => {
       expect(parseMcpToolId('bash')).toBeUndefined()
       expect(parseMcpToolId('mcp__gh')).toBeUndefined()
       expect(parseMcpToolId('')).toBeUndefined()
+    })
+  })
+
+  describe('McpToolIndex + resolveMcpTool', () => {
+    it('server 名含 __ 时，登记索引后可精确反解 server 与 tool', () => {
+      const idx = new McpToolIndex()
+      // server = "a__b"，工具 "x"、"y"；启发式 parseMcpToolId('mcp__a__b__x') 会误判 server='a'
+      idx.index('a__b', ['mcp__a__b__x', 'mcp__a__b__y'])
+      expect(idx.serverOf('mcp__a__b__x')).toBe('a__b')
+      expect(resolveMcpTool('mcp__a__b__x', idx)).toEqual({ server: 'a__b', tool: 'x' })
+      expect(resolveMcpTool('mcp__a__b__y', idx)).toEqual({ server: 'a__b', tool: 'y' })
+      expect(idx.has('mcp__a__b__x')).toBe(true)
+      expect(idx.servers()).toEqual(['a__b'])
+    })
+    it('未登记的 id 回退到启发式 parseMcpToolId', () => {
+      const idx = new McpToolIndex()
+      idx.index('github', ['mcp__github__create_issue'])
+      expect(resolveMcpTool('mcp__github__create_issue', idx)).toEqual({ server: 'github', tool: 'create_issue' })
+      // 未登记的 server 名含 __：回退后按首个 __ 切分
+      expect(resolveMcpTool('mcp__a__b__c', idx)).toEqual({ server: 'a', tool: 'b__c' })
+    })
+    it('空索引（未登记任何 server）时回退启发式切分', () => {
+      const idx = new McpToolIndex()
+      expect(resolveMcpTool('mcp__github__a', idx)).toEqual({ server: 'github', tool: 'a' })
+    })
+    it('非 mcp__ 前缀返回 undefined', () => {
+      expect(resolveMcpTool('bash', new McpToolIndex())).toBeUndefined()
+    })
+    it('unindex 移除后回退启发式', () => {
+      const idx = new McpToolIndex()
+      idx.index('a__b', ['mcp__a__b__x'])
+      idx.unindex('a__b')
+      expect(idx.has('mcp__a__b__x')).toBe(false)
+      expect(resolveMcpTool('mcp__a__b__x', idx)).toEqual({ server: 'a', tool: 'b__x' })
+    })
+    it('index 幂等重登记：旧工具归属被清除', () => {
+      const idx = new McpToolIndex()
+      idx.index('srv', ['mcp__srv__a', 'mcp__srv__b'])
+      idx.index('srv', ['mcp__srv__c']) // 重新登记后只剩 c
+      expect(idx.serverOf('mcp__srv__a')).toBeUndefined()
+      expect(idx.serverOf('mcp__srv__c')).toBe('srv')
     })
   })
 
