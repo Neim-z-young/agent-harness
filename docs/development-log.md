@@ -16,6 +16,20 @@
 - tool 50 / mcp-server-registry 10 / tools-manager 13 / cli 169 用例全绿；全量 30 包 typecheck 通过。
 - 新增用例：`McpToolIndex`+`resolveMcpTool`（server 含 `__` 精确反解、未登记回退、unindex、幂等重登记）、代码注册 server `/mcp disable/enable` 会话内往返（禁用后 assemble 空、启用后工具恢复）。
 
+## 2026-09-07（续 84）修复 `/mcp disable` 后工具仍显示「启用」且残留可调用
+
+`/tools` 状态矛盾（`启用·…·server已禁用`）的根因：禁用/移除 server 只跳过 `tool.pool.assemble` 的「新增」，而运行时 `ToolRegistry` 早已在启动时登记过这些工具；`DefaultToolPool.add` 只增不减，导致旧工具残留下线、仍可被 LLM 调用、`/tools` 仍判为「启用」。
+
+### 改动
+
+- **mcp-server-registry**：禁用标记 `disabledCode:Set` 升级为 `downTools:Map<server, string[]>`（server → 待移除工具 id）。`tool.pool.assemble` 先按 `downTools` 用 `pool.remove` 收敛注册表、再装配启用 server 的工具；`enable`/`disable`/`remove` 在断开前捕获该 server 的工具 id 记入 `downTools`，供下一次 assemble 移除。这样禁用/移除在运行时真正生效，而非仅「不再加入」。
+- **CLI**：新增 `attachMcpReassemble(harness)`，订阅 `mcp.server.disabled/enabled/added/removed` 事件 → `harness.assembleTools()`，让禁用即时收敛（REPL 生命周期挂载/退订）。否则事件只是通知、注册表不会自动重组。
+- **tools-manager**：`renderToolTable` 对来源 server 已禁用的 MCP 工具，把状态前缀 `启用` 改写为 `禁用`，消除与白名单判定的矛盾（作为残留期的显示安全网）。
+
+### 验证
+
+- mcp-server-registry 复用同一 pool 断言禁用后工具确实被移除、启用后恢复；tools-manager 13、cli 169、core/tool 等全绿；全量 30 包 typecheck 通过。
+
 ## 2026-09-07（续 82）Agent 级 MCP 配置能力（server 粒度白名单/黑名单）
 
 > 让 Agent 在声明式配置里按 **MCP server 粒度** 控制可用 MCP，而不必在 `tools` 白名单里逐个列 `mcp__<server>__<tool>`。设计文档见 `.trae/documents/agent-mcp-config.md`。

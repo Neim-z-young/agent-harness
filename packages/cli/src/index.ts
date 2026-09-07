@@ -63,6 +63,7 @@ import {
 } from '@harness/workspace'
 import { createRevertPlugin, createSnapshotPlugin } from '@harness/revert'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
+import { LifecycleEvents } from '@harness/core'
 import { startTuiRepl } from './tui'
 import {
   emptyUsage,
@@ -1490,6 +1491,27 @@ export interface BackgroundTaskPanelOptions {
 }
 
 /**
+ * 订阅 MCP server 生命周期事件，触发工具池重组（assembleTools）。
+ *
+ * 禁用/启用/新增/移除 server 后，mcp-server-registry 的 tool.pool.assemble 会
+ * 移除 / 装配对应 server 的工具；若不主动重组，运行时 ToolRegistry 里旧工具会一直
+ * 「残留下线」，导致 /tools 仍把禁用 server 的工具显示为启用/可调用。本函数把事件
+ * 桥接到 harness.assembleTools()，让禁用即时生效。
+ *
+ * @returns 卸载函数（取消全部订阅）
+ */
+export function attachMcpReassemble(harness: Harness): () => void {
+  if (!harness.bus) return () => {}
+  const offs = [
+    harness.bus.subscribe(LifecycleEvents.mcpServerDisabled, () => { void harness.assembleTools() }),
+    harness.bus.subscribe(LifecycleEvents.mcpServerEnabled, () => { void harness.assembleTools() }),
+    harness.bus.subscribe(LifecycleEvents.mcpServerAdded, () => { void harness.assembleTools() }),
+    harness.bus.subscribe(LifecycleEvents.mcpServerRemoved, () => { void harness.assembleTools() }),
+  ]
+  return () => { for (const off of offs) off() }
+}
+
+/**
  * 挂载后台任务面板（P1-4 前端事件驱动展示）。
  *
  * 订阅 subagent.started / completed / failed Bus 事件，任务状态变化时
@@ -2020,9 +2042,11 @@ export async function startRepl(options: ReplOptions): Promise<'exit' | 'eof' | 
     harness: options.harness,
     stdout: options.stdout,
   })
+  const detachMcpReassemble = attachMcpReassemble(options.harness)
   try {
     return await startReplCore(options)
   } finally {
+    detachMcpReassemble()
     detachPanel()
   }
 }

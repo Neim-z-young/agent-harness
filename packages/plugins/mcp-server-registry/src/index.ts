@@ -140,8 +140,8 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   const runtimes: McpServerRuntime[] = []
   /** name → 托管配置条目；来自 config.json mcpServers */
   const managed = new Map<string, ManagedEntry>()
-  /** 本次进程内被 /mcp 禁用的「代码注册」server（无托管配置项，无法持久化，重启后恢复连接） */
-  const disabledCode = new Set<string>()
+  /** 本次进程内被 /mcp 禁用的 server → 其应从工具池移除的工具 id（含托管与代码注册） */
+  const downTools = new Map<string, string[]>()
   /** CLI 注入的持久化回调 */
   let cliStore: McpCliStore | undefined
   let connected = false
@@ -299,17 +299,22 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
         },
 
         async 'tool.pool.assemble'(_input, pool) {
-          const add = (t: unknown) => (pool as { add: (t: unknown) => void }).add(t)
+          const p = pool as { add: (t: unknown) => void; remove?: (id: string) => void }
+          // ① 先把「已禁用」server 的工具从池中移除（收敛运行时 ToolRegistry，避免残留可调用）
+          if (p.remove) {
+            for (const [, ids] of downTools) for (const id of ids) p.remove(id)
+          }
+          // ② 装配启用状态 server 的工具
+          const down = new Set<string>(downTools.keys())
           for (const rt of runtimes) {
-            // 代码注册的 server 若本次进程内被 /mcp disable，则不装配其工具
-            if (!rt.entry && disabledCode.has(rt.name)) continue
+            if (down.has(rt.name)) continue
             // 工具级过滤：base 名 = 去掉 mcp__<server>__ 前缀；managed.tools[base]===false 时跳过
             const prefix = `mcp__${rt.name}__`
             const m = rt.entry ? managed.get(rt.name) : undefined
             for (const tool of rt.tools) {
               const base = tool.id.startsWith(prefix) ? tool.id.slice(prefix.length) : tool.id
               if (m && m.tools[base] === false) continue
-              add(tool)
+              p.add(tool)
             }
           }
         },
@@ -350,7 +355,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             for (const item of reg.list()) {
               if (managed.has(item.name)) continue
               const rt = runtimes.find((r) => r.name === item.name)
-              const disabled = disabledCode.has(item.name)
+              const disabled = downTools.has(item.name)
               out(`  ${item.name}  [代码注册]${disabled ? ' [会话禁用]' : ' [启用]'}  tools=${rt?.tools.length ?? 0}  connected=${rt?.client.isConnected ?? false}\n`)
             }
           }
@@ -377,31 +382,21 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             if (!name) { out('用法：/mcp enable <server> | disable <server>\n'); return }
             const isOn = sub === 'enable'
             const m = managed.get(name)
-            if (m) {
-              m.enabled = isOn
-              persist()
-              if (m.enabled) {
-                const ok = await connectManaged(name)
-                out(ok ? `已启用并连接 ${name}\n` : `启用失败（未能连接 ${name}）\n`)
-                await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
-              } else {
-                disconnectServer(name)
-                out(`已禁用 ${name}\n`)
-                await ctx.bus.publish(LifecycleEvents.mcpServerDisabled, { name }, { source: 'mcp.server-registry' })
-              }
-              return
-            }
-            // 代码注册的 server：无托管配置项，无法持久化到 config.json，仅本次进程启停
-            if (!reg.has(name)) { out(`未知 MCP server："${name}"\n`); return }
+            const isReg = reg.has(name)
+            if (!m && !isReg) { out(`未知 MCP server："${name}"\n`); return }
             if (isOn) {
-              disabledCode.delete(name)
-              const ok = await connectCodeServer(name)
-              out(ok ? `已启用并重新连接 ${name}（本次进程生效）\n` : `启用失败（未能连接 ${name}）\n`)
+              downTools.delete(name)
+              if (m) { m.enabled = true; persist() }
+              const ok = m ? await connectManaged(name) : await connectCodeServer(name)
+              out(ok ? (m ? `已启用并连接 ${name}\n` : `已启用并重新连接 ${name}（本次进程生效）\n`) : `启用失败（未能连接 ${name}）\n`)
               await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
             } else {
-              disabledCode.add(name)
+              // 记录待移除的工具 id（先从运行态取，再断开连接），供 tool.pool.assemble 收敛注册表
+              const rt = runtimes.find((r) => r.name === name)
+              downTools.set(name, rt ? rt.tools.map((t) => t.id) : [])
+              if (m) { m.enabled = false; persist() }
               disconnectServer(name)
-              out(`已禁用 ${name}（本次进程生效；重启后恢复连接）\n`)
+              out(`已禁用 ${name}${m ? '' : '（本次进程生效；重启后恢复连接）'}\n`)
               await ctx.bus.publish(LifecycleEvents.mcpServerDisabled, { name }, { source: 'mcp.server-registry' })
             }
           } else if (sub === 'add') {
@@ -421,6 +416,8 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             const name = parts[1]
             if (!name) { out('用法：/mcp remove <server>\n'); return }
             if (!managed.has(name)) { out(`未知托管 server："${name}"\n`); return }
+            const rt = runtimes.find((r) => r.name === name)
+            downTools.set(name, rt ? rt.tools.map((t) => t.id) : []) // 移除后从工具池收敛
             managed.delete(name)
             disconnectServer(name)
             persist()
@@ -443,7 +440,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
       }
       runtimes.length = 0
       managed.clear()
-      disabledCode.clear()
+      downTools.clear()
       cliStore = undefined
       connected = false
     },

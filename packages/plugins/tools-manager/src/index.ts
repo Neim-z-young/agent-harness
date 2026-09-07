@@ -148,10 +148,12 @@ function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>, mc
     const base = entryStatus(inp, t)
     let status = safety.length ? `${base}·${safety.join(',')}` : base
     if (t.id.startsWith('mcp__')) {
-      // MCP 场景化工具：标注来源 server；server 已被 /mcp 禁用时额外标注不可用
+      // MCP 场景化工具：标注来源 server；server 已被 /mcp 禁用时状态改为「禁用」并额外标注
       const m = mcpToolOf(t.id)
       if (m) {
-        status += `·源自mcp${mcpDownServer?.has(m.server) ? '·server已禁用' : ''}`
+        const down = mcpDownServer?.has(m.server)
+        if (down) status = status.replace(/^启用/, '禁用') // 禁用态优先于 Agent 白名单判定
+        status += `·源自mcp${down ? '·server已禁用' : ''}`
       }
     }
     return { id: t.id, desc: (t.description ?? '').slice(0, 38), perm: permKeyOf(t), status }

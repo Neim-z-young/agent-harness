@@ -184,11 +184,12 @@ describe('createMcpServerRegistryPlugin', () => {
     const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
     await hooks!['harness.start']!({ harness: {} } as any, { started: true })
 
-    let pool = fakePool()
+    // 复用同一个 pool：验证禁用时工具被真正移除、启用时恢复（而非只是不再 add）
+    const pool = fakePool()
     await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
 
-    // 代码注册 server 禁用：会话内断开连接，工具不再装配
+    // 代码注册 server 禁用（嵌套写法 servers disable）：会话内断开连接，工具从池中移除
     const out: string[] = []
     await hooks!['cli.command']!({
       command: 'mcp', arg: 'servers disable code-intel', raw: 'mcp servers disable code-intel',
@@ -197,9 +198,8 @@ describe('createMcpServerRegistryPlugin', () => {
     expect(out.join('')).toContain('已禁用')
     expect(reg.has('code-intel')).toBe(true) // 注册项仍在，仅本次进程禁用
 
-    pool = fakePool()
     await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
-    expect(pool.list()).toHaveLength(0)
+    expect(pool.list()).toHaveLength(0) // 已在池中的工具也被移除
 
     // 重新启用（嵌套写法 servers enable）：重新连接，工具恢复
     const out2: string[] = []
@@ -209,7 +209,6 @@ describe('createMcpServerRegistryPlugin', () => {
     } as any)
     expect(out2.join('')).toContain('重新连接')
 
-    pool = fakePool()
     await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
     await plugin.uninstall?.()
