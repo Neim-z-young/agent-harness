@@ -1,5 +1,19 @@
 # Agent Harness 开发日志
 
+## 2026-09-07（续 80）MCP 服务文档 + /help 展示插件命令 usage
+
+> 承接「MCP Server 配置化管理」。补齐 MCP 服务使用文档，并修复 `/help` 只打印插件命令 `description`、忽略注入的 `usage` 的问题。
+
+### 改动
+
+- **新增 `docs/mcp-services.md`**：MCP 服务使用文档——代码注册 vs config.json 托管两种装配方式、`McpServerEntry` 字段表、`/mcp` 命令全量用法（含 `enable/disable/tool/add/remove`）、运行时机制（`mcp.configure` 注入 → start 按 enabled 连接 → assemble 工具级过滤 → `setMcpServers` 持久化）、凭证安全（明文/`${ENV}`/`enc:v1:`/OAuth）、相关文档索引。
+- **AGENTS.md**：文档索引补充 `docs/mcp-services.md`。
+- **`packages/cli/src/index.ts` `/help`**：插件命令列表在 `/${command} + description` 后，若插件注册了 `usage` 则追加一行 `用法：<usage>`（如 `/mcp`、`/subagents`、`/worktrees`、`/tasks`、`/workspace` 等均受益）。
+
+### 验证
+
+- cli 96 用例全绿；全量 17 包 typecheck 通过。
+
 ## 2026-09-06（续 79）MCP Server 配置化管理：config.json 装配 + 服务器/工具两级启停
 
 > 承接待办「OAuth2 PKCE / MCP OAuth 授权」之外的方向。此前 MCP Server 只能经 `.harness/plugins/mcp.ts` 代码显式装配，无法从配置文件新增外部 server，也没有运行时启停；`/plugins` 只管理整插件粒度、`/mcp` 只读展示。本交付：从 `config.json` 以 JSON 新增 MCP server（stdio/sse/http），并支持**服务器 + 工具两级**启用/禁用、**即时生效（免重启）**，状态持久化回 `config.json`。

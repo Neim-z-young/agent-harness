@@ -1687,6 +1687,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             await harness.plugin.trigger('cli.commands', cmdInput)
             for (const c of cmdInput.commands) {
               out(`  /${c.command.padEnd(16)}${c.description}\n`)
+              if (c.usage) out(`     用法：${c.usage}\n`)
             }
           } catch { /* 忽略插件 hook 错误 */ }
           return 'continue'
