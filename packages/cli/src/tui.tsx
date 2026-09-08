@@ -23,7 +23,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { resolve } from 'node:path'
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, listReplCommands } from './index'
@@ -908,8 +909,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         }))
         const openPromise = open(parsed.path, parsed.line)
         void (openPromise ? Promise.resolve(openPromise) : Promise.resolve()).then(async () => {
-          // 编辑结束回读磁盘，仅当文件可读时注入摘要
-          const abs = resolve(parsed.path)
+          // 编辑结束回读磁盘（与编辑器打开用同一绝对路径基准解析），仅当文件可读时注入摘要
+          const abs = resolveEditPath(parsed.path)
           let content = ''
           try { content = await readFile(abs, 'utf8') } catch { /* 文件不可读则不回读 */ }
           if (!content) return
@@ -1392,24 +1393,50 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 // startTuiRepl：真实终端入口 + 默认 openFile
 // ------------------------------------------------------------------------
 
-/** 构造编辑器启动参数：$EDITOR + 独立 `+<line>`（绝不拼 `path:line`），回退 macOS `open -l`。 */
-function buildEditorArgv(path: string, line?: number): string[] {
-  const abs = resolve(path)
-  const editor = process.env.EDITOR || process.env.VISUAL
-  if (editor) {
-    // vim/emacs 等用独立 `+<line>` 参数定位行号；editor 字符串拆分为可执行+参数
-    const cmd = editor.split(/\s+/).filter(Boolean)
-    return [...cmd, ...(line != null && line > 1 ? [`+${line}`] : []), abs]
-  }
-  // macOS `open` 不接受 `+<line>`，用 `-l <line> <abs>` 定位行号
-  return ['open', ...(line != null && line > 1 ? ['-l', String(line)] : []), abs]
+/**
+ * 解析编辑器目标路径（双基准）：`~`/`~/` 开头 → 主目录；其余 → 基于（run 时）cwd。
+ * 返回规范化的绝对路径，供编辑器打开与回读统一使用。
+ */
+export function resolveEditPath(path: string): string {
+  if (path === '~' || path.startsWith('~/')) return join(homedir(), path.slice(2))
+  if (path.startsWith('~')) return join(homedir(), path.slice(1))
+  return resolve(path)
 }
 
 /**
- * 用本机编辑器打开文件。相对路径解析为绝对路径；根据 $EDITOR/$VISUAL 决定
- * vim 风格 `+<line>` 或 macOS `open -l`。返回需前台运行的命令 argv（纯函数），
- * 由调用方决定如何执行（TUI 下先 suspend 再前台 spawn inherit，避免 alt-screen 下后台
- * spawn 令编辑器拿不到前台焦点而"打不开"）。
+ * 选择前台编辑器命令。优先 $EDITOR/$VISUAL；缺失时回退到交互式终端编辑器
+ * （vim → nano）。不做 macOS `open` 兜底——`open` 立即返回、在 alt-screen TUI 下
+ * 会让编辑器在 GUI 异步打开而终端瞬间被 resume 遮回，用户看不到编辑器界面。
+ */
+function pickEditor(): string[] | null {
+  const env = process.env.EDITOR || process.env.VISUAL
+  if (env && env.trim()) return env.split(/\s+/).filter(Boolean)
+  // 探测常见交互式终端编辑器（存在于 $PATH 即用）
+  const candidates = ['vim', 'nvim', 'nano']
+  return candidates.find((c) => isExecutableInPath(c)) ? [candidates.find((c) => isExecutableInPath(c))!] : null
+}
+
+/** 判断可执行文件是否存在于 $PATH（用于编辑器探测，用 `which` 最可靠）。 */
+function isExecutableInPath(name: string): boolean {
+  try {
+    const { spawnSync } = require('node:child_process') as typeof import('node:child_process')
+    const r = spawnSync('which', [name], { stdio: 'ignore' })
+    return !r.error && r.status === 0
+  } catch { return false }
+}
+
+/** 构造编辑器启动参数：编辑器命令 + 独立 `+<line>`（绝不拼 `path:line`）。 */
+function buildEditorArgv(path: string, line?: number): string[] {
+  const abs = resolveEditPath(path)
+  const cmd = pickEditor()
+  if (!cmd) return [abs] // 无可用编辑器时退化：仅返回文件路径（调用方决定如何处理）
+  return [...cmd, ...(line != null && line > 1 ? [`+${line}`] : []), abs]
+}
+
+/**
+ * 用本机编辑器打开文件。返回需前台运行的命令 argv（纯函数），由调用方决定如何执行
+ * （TUI 下先 suspend 再前台 spawn inherit，避免 alt-screen 下后台 spawn 令编辑器拿不到
+ * 前台焦点而"打不开"）。
  */
 export function buildEditorCommand(path: string, line?: number): string[] {
   return buildEditorArgv(path, line)
@@ -1435,6 +1462,8 @@ export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit
     ...options,
     openFile: async (path, line) => {
       const argv = buildEditorCommand(path, line)
+      // 无可用编辑器时 argv 退化为 [abs]（单路径，不可 spawn），此时直接返回、不做挂起
+      if (argv.length < 2) return
       try {
         renderer.suspend()
         await new Promise<void>((res, rej) => {

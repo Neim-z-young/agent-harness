@@ -53,6 +53,8 @@ import {
   approvalLine,
   __KEYLOG,
   __resetKeyLog,
+  resolveEditPath,
+  buildEditorCommand,
   type SessionRow,
   type ChatBlock,
   type TuiReplExit,
@@ -992,6 +994,27 @@ describe('TuiApp 输入历史导航', () => {
 })
 
 describe('TuiApp /edit 外部编辑器命令', () => {
+  it('resolveEditPath：~ 展开到主目录、相对路径基于 cwd', () => {
+    const home = require('node:os').homedir()
+    expect(resolveEditPath('~/x/y.ts')).toBe(join(home, 'x/y.ts'))
+    expect(resolveEditPath('~/.harness/p.json')).toBe(join(home, '.harness/p.json'))
+    expect(resolveEditPath('relative/z.ts')).toBe(join(process.cwd(), 'relative/z.ts'))
+    expect(resolveEditPath('/abs/a.ts')).toBe('/abs/a.ts')
+  })
+
+  it('buildEditorCommand 用 $EDITOR + 独立 +行号，绝不拼 path:line', () => {
+    const prev = process.env.EDITOR
+    process.env.EDITOR = 'vim'
+    try {
+      const argv = buildEditorCommand('~/x/a.ts', 12)
+      expect(argv.join(' ')).not.toContain('a.ts:12')
+      expect(argv[argv.length - 1]).toBe(join(require('node:os').homedir(), 'x/a.ts'))
+      expect(argv).toContain('+12')
+    } finally {
+      if (prev === undefined) delete process.env.EDITOR; else process.env.EDITOR = prev
+    }
+  })
+
   it('/e 前缀出现 /edit 候选；无参数提交提示用法', async () => {
     const f = await mountTui({ openFile: () => {} })
     await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
