@@ -22,6 +22,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
+import { resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, listReplCommands } from './index'
@@ -1348,12 +1349,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
 /** 用本机编辑器在后台打开文件（不阻塞 TUI）。优先 $EDITOR/$VISUAL，回退 macOS `open`。 */
 function openInEditor(path: string, line?: number): void {
+  // 相对路径 → 绝对路径：外部程序大多不接受相对路径 + `:line` 后缀，需先解析。
+  const abs = resolve(path)
   const editor = process.env.EDITOR || process.env.VISUAL
-  const target = line != null && line > 1 ? `${path}:${line}` : path
-  const argv = editor ? [...editor.split(/\s+/).filter(Boolean), target] : ['open', target]
-  try {
-    spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' }).unref()
-  } catch { /* 打开失败静默忽略 */ }
+  if (editor) {
+    // vim/emacs 等用独立 `+<line>` 参数定位行号（绝不拼成 `path:line`，会导致打开失败）
+    const argv = [...editor.split(/\s+/).filter(Boolean), ...(line != null && line > 1 ? [`+${line}`] : []), abs]
+    try {
+      spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' }).unref()
+    } catch { /* 打开失败静默忽略 */ }
+  } else {
+    // macOS `open` 不接受 `+<line>`，用 `-l <line> <abs>` 定位行号
+    const argv = ['open', ...(line != null && line > 1 ? ['-l', String(line)] : []), abs]
+    try {
+      spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' }).unref()
+    } catch { /* 打开失败静默忽略 */ }
+  }
 }
 
 /**
