@@ -182,6 +182,10 @@ describe('findFileReferences / collectFileReferences', () => {
     const refs = findFileReferences('x docs/readme.md y docs/readme.md')
     expect(refs).toEqual([{ path: 'docs/readme.md', start: 2, end: 16 }])
   })
+  it('`~/` 开头路径保留 ~ 前缀（不吞成 /path）', () => {
+    const refs = findFileReferences('编辑 ~/.harness/config.json 与 ~/src/rel.ts')
+    expect(refs.map((r) => r.path)).toEqual(['~/.harness/config.json', '~/src/rel.ts'])
+  })
   it('collectFileReferences 汇总各块并限量', () => {
     let state = initialChatState
     state = pushConsole(state, '见 src/a.ts 和 src/b.ts')
