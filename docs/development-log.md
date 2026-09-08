@@ -1,5 +1,26 @@
 # Agent Harness 开发日志
 
+## 2026-09-09（续 89）TUI /tree 语义修正：磁盘真实文件树 + 对话引用 * 标记
+
+### 问题
+
+用户运行 `/tree` 发现输出与磁盘不一致：`~/.harness/` 打印了 `permissions.json`（对话提到过但磁盘不存在），而磁盘上真实存在的 `sessions/` 却没打印。根因：上一版 `/tree` 打印的是「对话引用树」（从对话文本捕捉路径），非磁盘真实结构。
+
+### 决策
+
+`/tree` 语义改为**磁盘真实文件树**，同时兼顾对话上下文：**对话中引用过的文件在树上以 `*` 标记**（两者结合）。交互式目录树仍留给图形页面。
+
+### 改动（tui.tsx）
+
+- 删除引用树纯函数 `buildFileRefTree`（语义废弃），新增 `buildDiskFileTree(root, refs, opts?)`：`readdirSync(withFileTypes)` 递归扫描，目录在前、同级字母序，排除 `.git`/`node_modules`/`.DS_Store`，`maxDepth`（默认 3）与 `maxNodes`（默认 100，超出置 truncated）；引用标记双基准解析（`resolveEditPath` cwd/~ 基准 + `resolve(root, base)` 相对 root 基准），文件 absPath 命中即 `marked`。
+- `renderFileRefTree`：`marked` 文件带 `*`，目录带 `/`，根无分支线。
+- `/tree [path]`：无参默认 `process.cwd()`，有参经 `resolveEditPath`（支持 `~`）；`statSync` 校验目录，非目录提示「目录不存在」；输出 `文件树（<root>）：` + 树 + 有标记时 `* = 对话中引用过的文件` 图例。不入历史栈、不进会话内核。
+
+### 验证
+
+- 新增用例：`buildDiskFileTree`（排序/排除/标记/深度/截断）、`renderFileRefTree`（`*` 渲染）、`/tree <dir>` 端到端（`a.ts*` 标记 + 图例 + 输入框清空）、目录不存在提示。
+- `bun run typecheck` 通过；`bun test` 185 全绿，无回归。
+
 ## 2026-09-09（续 88）TUI 新增 /tree 命令打印文件引用目录树（交互树留给图形页面）
 
 ### 背景与决策

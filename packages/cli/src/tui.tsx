@@ -23,8 +23,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
+import { readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, listReplCommands } from './index'
@@ -269,111 +270,97 @@ export function parseFileRef(ref: string): ParsedFileRef {
 }
 
 // ------------------------------------------------------------------------
-// 文件引用目录树（/tree 命令打印；完整交互树留给图形页面实现）
+// 文件引用目录树（/tree 命令打印磁盘树 + 对话引用 * 标记）
 // ------------------------------------------------------------------------
 
 export interface FileRefTreeNode {
-  /** 节点唯一键：root:{标签} | {root键}:{相对 root 的路径} */
+  /** 节点唯一键：root:{absPath} | 目录/文件的 absPath */
   key: string
-  /** 根→root 标签（./ | ~/ | 其他）；目录/文件→basename */
+  /** 根→路径缩写（./ | ~/...）；目录/文件→basename */
   name: string
   kind: 'root' | 'dir' | 'file'
-  /** 绝对路径（文件打开用；目录亦记录以便展示层级） */
+  /** 绝对路径 */
   absPath: string
-  /** 文件叶：原始引用串里的行号（打开时定位） */
-  line?: number
+  /** 文件叶：被对话引用过（打印时以 * 标记） */
+  marked?: boolean
   children: FileRefTreeNode[]
 }
 
-export interface BuildFileTreeOptions {
-  /** 注入 cwd（默认 process.cwd()，测试用） */
-  cwd?: string
-  /** 注入主目录（默认 homedir()，测试用） */
-  home?: string
+export interface DiskTreeOptions {
+  /** 最大目录深度（根=0；默认 3） */
+  maxDepth?: number
+  /** 最大节点数（超出截断；默认 100） */
+  maxNodes?: number
+  /** 排除的 basename（目录与文件；默认 .git / node_modules / .DS_Store） */
+  exclude?: string[]
 }
 
 /**
- * 把扁平文件引用列表构建为「根 → 目录 → 文件」森林（纯函数）。
- * 根自动推断：cwd（→`./`）优先，其次主目录（→`~/`），其余兜底（→`其他`）。
- * 目录按相对根的路径逐级建立、跨引用合并共享父目录；同文件（去 :行[:列] 后缀）仅保留首个。
+ * 扫描磁盘构建「根 → 目录 → 文件」树（纯函数，/tree 命令用）。
+ * - 目录在前、同级按字母序（类 `tree` 命令习惯）；
+ * - 排除噪声（.git / node_modules 等），限制深度与节点数，超出置 truncated；
+ * - 对话引用过的文件（abs 命中，含相对 root 解析）以 marked 标记。
  */
-export function buildFileRefTree(refs: string[], opts: BuildFileTreeOptions = {}): FileRefTreeNode[] {
-  const cwd = opts.cwd ?? process.cwd()
-  const home = opts.home ?? homedir()
-  const cwdRoot: FileRefTreeNode = { key: 'root:./', name: './', kind: 'root', absPath: cwd, children: [] }
-  const homeRoot: FileRefTreeNode = { key: 'root:~/', name: '~/', kind: 'root', absPath: home, children: [] }
-  const otherRoot: FileRefTreeNode = { key: 'root:其他', name: '其他', kind: 'root', absPath: '', children: [] }
-  const tree = [cwdRoot, homeRoot, otherRoot]
-  /** 目录/根节点：key → 节点（跨引用合并共享父目录） */
-  const nodes = new Map<string, FileRefTreeNode>([
-    [cwdRoot.key, cwdRoot],
-    [homeRoot.key, homeRoot],
-    [otherRoot.key, otherRoot],
-  ])
-  const seen = new Set<string>()
-
-  /** 与 resolveEditPath 同基准（~ 展开 + 相对 cwd 解析），但 cwd/home 可注入 */
-  const resolveAbs = (p: string): string => {
-    if (p === '~' || p.startsWith('~/')) return join(home, p.slice(2))
-    if (p.startsWith('~')) return join(home, p.slice(1))
-    return resolve(cwd, p)
-  }
-
-  /** 在 root 下沿 rel 目录链找到/创建文件应挂载的父目录（rel 为相对 root 的路径） */
-  const ensureParent = (root: FileRefTreeNode, rel: string): FileRefTreeNode => {
-    const segs = rel.split('/').filter(Boolean)
-    segs.pop() // 去掉文件名的最后一段，剩目录链
-    let cur = root
-    let relPath = ''
-    for (const s of segs) {
-      relPath = relPath ? `${relPath}/${s}` : s
-      const key = `${root.key}:${relPath}`
-      let dir = nodes.get(key)
-      if (!dir) {
-        dir = { key, name: s, kind: 'dir', absPath: root.absPath ? join(root.absPath, relPath) : relPath, children: [] }
-        nodes.set(key, dir)
-        cur.children.push(dir)
-      }
-      cur = dir
-    }
-    return cur
-  }
-
+export function buildDiskFileTree(
+  root: string,
+  refs: string[],
+  opts: DiskTreeOptions = {},
+): { nodes: FileRefTreeNode[]; truncated: boolean } {
+  const maxDepth = opts.maxDepth ?? 3
+  const maxNodes = opts.maxNodes ?? 100
+  const exclude = new Set(opts.exclude ?? ['.git', 'node_modules', '.DS_Store'])
+  // 引用 → 绝对路径集合：cwd 基准 + 相对 root 基准双解析，覆盖 ~/绝对/相对三种形态
+  const marked = new Set<string>()
   for (const ref of refs) {
     const base = ref.replace(/:\d+(?::\d+)?$/, '')
-    if (seen.has(base)) continue
-    seen.add(base)
-    const abs = resolveAbs(base)
-    const parsed = parseFileRef(ref)
-    let root: FileRefTreeNode
-    let rel: string
-    if (abs === cwd || abs.startsWith(cwd + '/')) {
-      root = cwdRoot
-      rel = abs === cwd ? '' : abs.slice(cwd.length + 1)
-    } else if (abs === home || abs.startsWith(home + '/')) {
-      root = homeRoot
-      rel = abs === home ? '' : abs.slice(home.length + 1)
-    } else {
-      root = otherRoot
-      rel = abs
-    }
-    if (!rel) continue // 引用指向根本身，无文件名可挂
-    const parent = ensureParent(root, rel)
-    parent.children.push({
-      key: `${root.key}:${rel}`,
-      name: basename(rel),
-      kind: 'file',
-      absPath: abs,
-      line: parsed.line,
-      children: [],
-    })
+    marked.add(resolveEditPath(base))
+    marked.add(resolve(root, base))
   }
-  // 剪掉没有任何引用归属的空根
-  return tree.filter((r) => r.children.length > 0)
+  let count = 0
+  let truncated = false
+  const rootNode: FileRefTreeNode = {
+    key: `root:${root}`,
+    name: abbrevFileRef(root, 60),
+    kind: 'root',
+    absPath: root,
+    children: [],
+  }
+  const scan = (dirAbs: string, node: FileRefTreeNode, depth: number): void => {
+    if (truncated || depth >= maxDepth) return
+    let entries: import('node:fs').Dirent[]
+    try { entries = readdirSync(dirAbs, { withFileTypes: true }) } catch { return }
+    entries.sort((a, b) => {
+      const ad = a.isDirectory() ? 0 : 1
+      const bd = b.isDirectory() ? 0 : 1
+      return ad - bd || a.name.localeCompare(b.name)
+    })
+    for (const e of entries) {
+      if (exclude.has(e.name)) continue
+      if (count >= maxNodes) { truncated = true; return }
+      const childAbs = join(dirAbs, e.name)
+      if (e.isDirectory()) {
+        count++
+        const child: FileRefTreeNode = { key: childAbs, name: e.name, kind: 'dir', absPath: childAbs, children: [] }
+        node.children.push(child)
+        scan(childAbs, child, depth + 1)
+      } else if (e.isFile()) {
+        count++
+        node.children.push({ key: childAbs, name: e.name, kind: 'file', absPath: childAbs, marked: marked.has(childAbs), children: [] })
+      }
+      // 符号链接 / 特殊文件：忽略，避免循环与噪音
+    }
+  }
+  scan(root, rootNode, 0)
+  return { nodes: [rootNode], truncated }
+}
+
+/** 树中是否有被引用标记的节点 */
+function anyMarked(nodes: FileRefTreeNode[]): boolean {
+  return nodes.some((n) => n.marked || anyMarked(n.children))
 }
 
 /**
- * 把森林渲染为树形文本（根不带分支线，目录带 `/`，文件带 `:行号`）。
+ * 把森林渲染为树形文本（根不带分支线，目录带 `/`，被引用文件带 `*`）。
  */
 export function renderFileRefTree(tree: FileRefTreeNode[]): string {
   const lines: string[] = []
@@ -382,7 +369,7 @@ export function renderFileRefTree(tree: FileRefTreeNode[]): string {
       const n = nodes[i]
       const last = i === nodes.length - 1
       const branch = last ? '└─ ' : '├─ '
-      const label = n.kind === 'file' ? n.name + (n.line != null ? `:${n.line}` : '') : n.name + (n.kind === 'dir' ? '/' : '')
+      const label = n.kind === 'file' ? n.name + (n.marked ? '*' : '') : n.name + (n.kind === 'dir' ? '/' : '')
       lines.push(prefix + branch + label)
       if (n.children.length > 0) walk(n.children, prefix + (last ? '   ' : '│  '))
     }
@@ -972,7 +959,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       .then((cmds) => setAllCommands([
         ...cmds,
         { command: '/edit', description: '挂起 TUI 用外部编辑器打开文件（/edit <file[:line]>）' },
-        { command: '/tree', description: '打印对话中出现的文件引用目录树（/tree）' },
+        { command: '/tree', description: '打印磁盘目录树，* 标记对话引用过的文件（/tree [path]）' },
       ]))
       .catch(() => { /* 忽略加载失败 */ })
   }, [options.harness])
@@ -1016,15 +1003,21 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         }))
         return
       }
-      // /tree：在聊天区打印对话中出现的文件引用目录树（不入历史栈、不进会话内核）
-      if (v === '/tree') {
+      // /tree [path]：扫描磁盘打印目录树，对话引用过的文件带 * 标记（不入历史栈、不进会话内核）
+      if (v.startsWith('/tree')) {
+        const arg = v.replace(/^\/tree\s*/, '').trim()
+        const root = arg ? resolveEditPath(arg) : process.cwd()
         setState((prev) => {
+          let isDir = false
+          try { isDir = statSync(root).isDirectory() } catch { isDir = false }
+          if (!isDir) {
+            return { ...prev, blocks: [...prev.blocks, { id: prev.nextId, kind: 'system', text: `目录不存在：${root}` }], nextId: prev.nextId + 1 }
+          }
           const refs = collectFileReferences(prev, Number.MAX_SAFE_INTEGER)
-          const tree = buildFileRefTree(refs)
-          const body = refs.length
-            ? `文件引用（${refs.length}）：\n${renderFileRefTree(tree)}`
-            : '（暂无文件引用）'
-          return { ...prev, blocks: [...prev.blocks, { id: prev.nextId, kind: 'system', text: body }], nextId: prev.nextId + 1 }
+          const { nodes, truncated } = buildDiskFileTree(root, refs)
+          const lines = [`文件树（${nodes[0].name}）${truncated ? '（截断）' : ''}：`, renderFileRefTree(nodes)]
+          if (anyMarked(nodes)) lines.push('', '* = 对话中引用过的文件')
+          return { ...prev, blocks: [...prev.blocks, { id: prev.nextId, kind: 'system', text: lines.join('\n') }], nextId: prev.nextId + 1 }
         })
         return
       }

@@ -56,8 +56,9 @@ import {
   resolveEditPath,
   buildEditorCommand,
   abbrevFileRef,
-  buildFileRefTree,
+  buildDiskFileTree,
   renderFileRefTree,
+  type FileRefTreeNode,
   type SessionRow,
   type ChatBlock,
   type TuiReplExit,
@@ -1004,80 +1005,126 @@ describe('TuiApp 输入历史导航', () => {
   })
 })
 
-describe('buildFileRefTree / renderFileRefTree（/tree 命令纯函数）', () => {
-  const cwd = '/work/proj'
-  const home = '/Users/u'
+describe('buildDiskFileTree / renderFileRefTree（/tree 命令纯函数）', () => {
+  it('扫描磁盘：目录在前字母序、排除噪声、引用标记、深度限制', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'harness-tree-'))
+    try {
+      mkdirSync(join(dir, 'docs'), { recursive: true })
+      mkdirSync(join(dir, 'packages', 'cli', 'src'), { recursive: true })
+      mkdirSync(join(dir, '.git'), { recursive: true })
+      mkdirSync(join(dir, 'node_modules'), { recursive: true })
+      writeFileSync(join(dir, 'docs', 'mcp.md'), '')
+      writeFileSync(join(dir, 'packages', 'cli', 'src', 'tui.tsx'), '')
+      writeFileSync(join(dir, '.git', 'HEAD'), '')
+      writeFileSync(join(dir, 'node_modules', 'x'), '')
+      writeFileSync(join(dir, 'README.md'), '')
 
-  it('多根推断：cwd→./、主目录→~/、其余→其他，空根剪掉', () => {
-    const tree = buildFileRefTree(
-      ['src/tui.tsx:890', 'docs/mcp.md', '~/.harness/config.json:1', '/tmp/x.log:3'],
-      { cwd, home },
-    )
-    expect(tree.map((r) => r.name)).toEqual(['./', '~/', '其他'])
-    expect(tree.map((r) => r.kind)).toEqual(['root', 'root', 'root'])
+      const { nodes, truncated } = buildDiskFileTree(dir, ['README.md'])
+      expect(truncated).toBe(false)
+      const root = nodes[0]
+      expect(root.name).toBe(abbrevFileRef(dir, 60))
+      // 目录在前、字母序
+      expect(root.children.map((c) => c.name)).toEqual(['docs', 'packages', 'README.md'])
+      // 排除噪声
+      expect(root.children.map((c) => c.name)).not.toContain('.git')
+      expect(root.children.map((c) => c.name)).not.toContain('node_modules')
+      // 引用标记
+      const readme = root.children.find((c) => c.name === 'README.md')!
+      expect(readme.marked).toBe(true)
+      // 深度：默认 3 层目录 → 可见到 src，但 src 内文件不再下钻
+      const pkg = root.children.find((c) => c.name === 'packages')!
+      expect(pkg.children.map((c) => c.name)).toEqual(['cli'])
+      const cli = pkg.children[0]!
+      expect(cli.children.map((c) => c.name)).toEqual(['src'])
+      expect(cli.children[0]!.children).toEqual([])
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
-  it('目录按层级建立并合并共享父目录；同文件不同行号仅保留首个', () => {
-    const tree = buildFileRefTree(['src/a.ts:1', 'src/a.ts:20', 'src/b.ts:2'], { cwd, home })
-    expect(tree).toHaveLength(1) // 仅 ./ 根
-    const src = tree[0].children[0]
-    expect(src).toMatchObject({ name: 'src', kind: 'dir' })
-    expect(src.children.map((f) => f.name)).toEqual(['a.ts', 'b.ts'])
-    expect(src.children[0].line).toBe(1) // 去重后保留首个行号
+  it('maxDepth 限制下钻层数', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'harness-tree-'))
+    try {
+      mkdirSync(join(dir, 'a', 'b', 'c'), { recursive: true })
+      writeFileSync(join(dir, 'a', 'b', 'c', 'f.txt'), '')
+      const { nodes } = buildDiskFileTree(dir, [], { maxDepth: 2 })
+      const a = nodes[0].children[0]!
+      expect(a.name).toBe('a')
+      expect(a.children.map((c) => c.name)).toEqual(['b'])
+      expect(a.children[0]!.children).toEqual([]) // c 在深度 2 之外
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
-  it('renderFileRefTree：根无分支线，目录带 /，文件带 :行号', () => {
-    const tree = buildFileRefTree(
-      ['src/tui.tsx:890', 'docs/mcp.md', '~/.harness/config.json:1'],
-      { cwd, home },
-    )
+  it('maxNodes 截断：超出上限置 truncated 并停止收集', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'harness-tree-'))
+    try {
+      for (let i = 0; i < 6; i++) writeFileSync(join(dir, `f${i}.txt`), '')
+      const { nodes, truncated } = buildDiskFileTree(dir, [], { maxNodes: 4 })
+      expect(truncated).toBe(true)
+      expect(nodes[0].children).toHaveLength(4)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('renderFileRefTree：目录带 /，被引用文件带 *，根无分支线', () => {
+    const tree: FileRefTreeNode[] = [{
+      key: 'root:/x', name: './', kind: 'root', absPath: '/x', children: [
+        { key: '/x/docs', name: 'docs', kind: 'dir', absPath: '/x/docs', children: [
+          { key: '/x/docs/mcp.md', name: 'mcp.md', kind: 'file', absPath: '/x/docs/mcp.md', marked: true, children: [] },
+          { key: '/x/docs/other.ts', name: 'other.ts', kind: 'file', absPath: '/x/docs/other.ts', children: [] },
+        ] },
+      ],
+    }]
     expect(renderFileRefTree(tree)).toBe([
       './',
-      '├─ src/',
-      '│  └─ tui.tsx:890',
       '└─ docs/',
-      '   └─ mcp.md',
-      '~/',
-      '└─ .harness/',
-      '   └─ config.json:1',
+      '   ├─ mcp.md*',
+      '   └─ other.ts',
     ].join('\n'))
-  })
-
-  it('空引用 → 空树，渲染为空串', () => {
-    expect(buildFileRefTree([], { cwd, home })).toEqual([])
-    expect(renderFileRefTree([])).toBe('')
   })
 })
 
-describe('TuiApp /tree 文件引用目录树命令', () => {
-  it('/tree：把对话中出现的引用汇总为目录树打印，且不入历史栈', async () => {
-    const f = await mountTui({
-      responses: [
-        { match: /列出/, response: '相关文件：src/a.ts:1 和 docs/mcp.md' },
-      ],
-    })
-    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
-    await sendMessageWithGap(f.setup, '列出文件')
-    await waitFrame(f.setup, (fr) => fr.includes('docs/mcp.md'))
+describe('TuiApp /tree 磁盘目录树命令', () => {
+  it('/tree <dir>：打印磁盘树，对话引用过的文件带 * 标记，且不入历史栈', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'harness-tui-tree-'))
+    try {
+      mkdirSync(join(dir, 'src'), { recursive: true })
+      writeFileSync(join(dir, 'src', 'a.ts'), '')
+      writeFileSync(join(dir, 'docs.md'), '')
+      const f = await mountTui({
+        responses: [
+          { match: /列出/, response: '相关文件：src/a.ts:1 和 docs.md' },
+        ],
+      })
+      await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+      await sendMessageWithGap(f.setup, '列出文件')
+      await waitFrame(f.setup, (fr) => fr.includes('docs.md'))
 
-    f.setup.mockInput.typeText('/tree')
-    for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
-    pressMetaEnter(f.setup)
-    await waitFrame(f.setup, (fr) => fr.includes('文件引用（2）：'))
-    await waitFrame(f.setup, (fr) => fr.includes('src/') && fr.includes('a.ts:1'))
-    expect(inputLine(f.setup)).toBe('❯') // 输入框已清空，命令未回显为消息
-    await f.cleanup()
+      f.setup.mockInput.typeText('/tree ' + dir)
+      for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
+      pressMetaEnter(f.setup)
+      await waitFrame(f.setup, (fr) => fr.includes('文件树（'))
+      await waitFrame(f.setup, (fr) => fr.includes('src/') && fr.includes('a.ts*'))
+      await waitFrame(f.setup, (fr) => fr.includes('* = 对话中引用过的文件'))
+      expect(inputLine(f.setup)).toBe('❯') // 输入框已清空，命令未回显为消息
+      await f.cleanup()
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 
-  it('/tree：无可引用时提示空态', async () => {
+  it('/tree <path>：目录不存在时提示', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
-    await sendMessageWithGap(f.setup, 'hello') // 触发默认回复（无文件引用），并让欢迎页消失
+    await sendMessageWithGap(f.setup, 'hello') // 让欢迎页消失
     await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
-    f.setup.mockInput.typeText('/tree')
+    f.setup.mockInput.typeText('/tree /no/such/dir')
     for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
     pressMetaEnter(f.setup)
-    await waitFrame(f.setup, (fr) => fr.includes('（暂无文件引用）'))
+    await waitFrame(f.setup, (fr) => fr.includes('目录不存在：/no/such/dir'))
     await f.cleanup()
   })
 })
