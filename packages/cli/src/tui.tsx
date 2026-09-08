@@ -1347,24 +1347,27 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 // startTuiRepl：真实终端入口 + 默认 openFile
 // ------------------------------------------------------------------------
 
-/** 用本机编辑器在后台打开文件（不阻塞 TUI）。优先 $EDITOR/$VISUAL，回退 macOS `open`。 */
-function openInEditor(path: string, line?: number): void {
-  // 相对路径 → 绝对路径：外部程序大多不接受相对路径 + `:line` 后缀，需先解析。
+/** 构造编辑器启动参数：$EDITOR + 独立 `+<line>`（绝不拼 `path:line`），回退 macOS `open -l`。 */
+function buildEditorArgv(path: string, line?: number): string[] {
   const abs = resolve(path)
   const editor = process.env.EDITOR || process.env.VISUAL
   if (editor) {
-    // vim/emacs 等用独立 `+<line>` 参数定位行号（绝不拼成 `path:line`，会导致打开失败）
-    const argv = [...editor.split(/\s+/).filter(Boolean), ...(line != null && line > 1 ? [`+${line}`] : []), abs]
-    try {
-      spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' }).unref()
-    } catch { /* 打开失败静默忽略 */ }
-  } else {
-    // macOS `open` 不接受 `+<line>`，用 `-l <line> <abs>` 定位行号
-    const argv = ['open', ...(line != null && line > 1 ? ['-l', String(line)] : []), abs]
-    try {
-      spawn(argv[0], argv.slice(1), { detached: true, stdio: 'ignore' }).unref()
-    } catch { /* 打开失败静默忽略 */ }
+    // vim/emacs 等用独立 `+<line>` 参数定位行号；editor 字符串拆分为可执行+参数
+    const cmd = editor.split(/\s+/).filter(Boolean)
+    return [...cmd, ...(line != null && line > 1 ? [`+${line}`] : []), abs]
   }
+  // macOS `open` 不接受 `+<line>`，用 `-l <line> <abs>` 定位行号
+  return ['open', ...(line != null && line > 1 ? ['-l', String(line)] : []), abs]
+}
+
+/**
+ * 用本机编辑器打开文件。相对路径解析为绝对路径；根据 $EDITOR/$VISUAL 决定
+ * vim 风格 `+<line>` 或 macOS `open -l`。返回需前台运行的命令 argv（纯函数），
+ * 由调用方决定如何执行（TUI 下先 suspend 再前台 spawn inherit，避免 alt-screen 下后台
+ * spawn 令编辑器拿不到前台焦点而"打不开"）。
+ */
+export function buildEditorCommand(path: string, line?: number): string[] {
+  return buildEditorArgv(path, line)
 }
 
 /**
@@ -1380,8 +1383,25 @@ export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit
   // useMouse：启用 SGR 鼠标协议，支持消息复制按钮点击
   const renderer: CliRenderer = await createCliRenderer({ useMouse: true })
   const root = createRoot(renderer)
-  // 未显式提供 openFile 时，用本机编辑器打开文件引用
-  const opts: TuiReplOptions = options.openFile ? options : { ...options, openFile: openInEditor }
+  // 未显式提供 openFile 时，用本机编辑器在前台打开文件引用。
+  // 关键：先 suspend() 释放终端 raw-mode 并退出 alt-screen，前台 spawn inherit 运行
+  // 编辑器（用户能真正看到并交互），等待其退出后 resume() 回到 TUI。
+  const opts: TuiReplOptions = options.openFile ? options : {
+    ...options,
+    openFile: async (path, line) => {
+      const argv = buildEditorCommand(path, line)
+      try {
+        renderer.suspend()
+        await new Promise<void>((res, rej) => {
+          const child = spawn(argv[0], argv.slice(1), { stdio: 'inherit' })
+          child.on('exit', () => res())
+          child.on('error', rej)
+        })
+      } finally {
+        renderer.resume()
+      }
+    },
+  }
   try {
     return await new Promise<TuiReplExit>((resolve) => {
       root.render(<TuiApp options={opts} onExit={resolve} />)
