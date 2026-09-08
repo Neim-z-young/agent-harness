@@ -694,7 +694,14 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   // 直接读写底层 TextareaRenderable 的 plainText / setText（单实例，无 remount，避免 buffer 损坏）。
   const textareaRef = useRef<TextareaRenderable | null>(null)
   const readComposer = useCallback((): string => textareaRef.current?.plainText ?? '', [])
-  const setComposer = useCallback((value: string) => { textareaRef.current?.setText(value ?? '') }, [])
+  // 注意：底层 setText 会「完全重置缓冲状态」，把插入点放回 (0,0)。若只 setText，Tab 补全 /
+  // 历史回看后光标会滞留在文本开头，导致后续键入被「前置」到命令开头（多行缓冲时更明显）。
+  // 故这里在写回后调用 gotoBufferEnd() 把光标重新定位到文本末尾，恢复「行尾继续键入」的直觉。
+  const setComposer = useCallback((value: string) => {
+    const t = textareaRef.current
+    t?.setText(value ?? '')
+    t?.gotoBufferEnd()
+  }, [])
   // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
   const [helpOpen, setHelpOpen] = useState(false)
   // 模块 E：命令审批模态 —— 权限引擎 ask() 触发时弹出，等待 allow/deny/always/never

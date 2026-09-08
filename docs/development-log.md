@@ -16,6 +16,22 @@
 - tool 50 / mcp-server-registry 10 / tools-manager 13 / cli 169 用例全绿；全量 30 包 typecheck 通过。
 - 新增用例：`McpToolIndex`+`resolveMcpTool`（server 含 `__` 精确反解、未登记回退、unindex、幂等重登记）、代码注册 server `/mcp disable/enable` 会话内往返（禁用后 assemble 空、启用后工具恢复）。
 
+## 2026-09-08（续 86）修复 TUI Tab 补全/历史回看后光标跳回开头
+
+### 现象与根因
+
+Tab 补全命令、↑ 回看历史等场景后，输入框光标有时「回到开头」——后续键入被**前置**到命令开头（如 `/resume <sid>` 变成 `<sid>/resume`），多行缓冲时更明显。
+
+根因：`setComposer` 底层走 `textarea.setText()`（Rust `editBufferSetText`），该调用会**完全重置缓冲状态并把插入点放回 (0,0)**，而此前代码没有在写回后重新定位光标。
+
+### 改动
+
+`tui.tsx` 的 `setComposer` 在 `setText` 后追加 `textareaRef.current?.gotoBufferEnd()`，把光标重新定位到文本末尾，恢复「补全/回看后继续在行尾键入」的直觉。该路径覆盖：Tab 补全、Esc 关闭命令菜单、历史回看（↑/↓）、提交后的清空。
+
+### 验证
+
+TUI 测试 71 pass（含输入历史导航、命令菜单、文件引用导航等），无回归。
+
 ## 2026-09-08（续 85）/plugins 装卸与 MCP server 联动 + 文档对齐
 
 ### 问题
