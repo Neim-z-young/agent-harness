@@ -218,7 +218,7 @@ function finalizeStream(state: ChatState): ChatState {
 // ------------------------------------------------------------------------
 
 const FILE_REF_RE =
-  /(?:\b(?:src|packages|docs|lib|app|api|scripts|test|tests|build)\b(?:\/[\w.\-]+)+|(?:~\/|\/)?[\w.\-]+\/[\w.\-]+\.[A-Za-z]{1,6})(?::\d+(?::\d+)?)?/g
+  /(?:\b(?:src|packages|docs|lib|app|api|scripts|test|tests|build)\b(?:\/[\w.\-]+)+|(?:~\/)?\/?(?:[\w.\-]+\/)+[\w.\-]+\.[A-Za-z]{1,6})(?::\d+(?::\d+)?)?/g
 
 /** 从文本中提取「类文件路径」引用（含可选的 :行[:列] 后缀），按出现顺序去重 */
 export function findFileReferences(text: string): Array<{ path: string; start: number; end: number }> {
