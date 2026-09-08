@@ -56,6 +56,8 @@ import {
   resolveEditPath,
   buildEditorCommand,
   abbrevFileRef,
+  buildFileRefTree,
+  renderFileRefTree,
   type SessionRow,
   type ChatBlock,
   type TuiReplExit,
@@ -998,6 +1000,84 @@ describe('TuiApp 输入历史导航', () => {
     for (let i = 0; i < 15; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
     // 命令菜单应包含 /history 候选
     await waitFrame(f.setup, (fr) => fr.includes('/history'))
+    await f.cleanup()
+  })
+})
+
+describe('buildFileRefTree / renderFileRefTree（/tree 命令纯函数）', () => {
+  const cwd = '/work/proj'
+  const home = '/Users/u'
+
+  it('多根推断：cwd→./、主目录→~/、其余→其他，空根剪掉', () => {
+    const tree = buildFileRefTree(
+      ['src/tui.tsx:890', 'docs/mcp.md', '~/.harness/config.json:1', '/tmp/x.log:3'],
+      { cwd, home },
+    )
+    expect(tree.map((r) => r.name)).toEqual(['./', '~/', '其他'])
+    expect(tree.map((r) => r.kind)).toEqual(['root', 'root', 'root'])
+  })
+
+  it('目录按层级建立并合并共享父目录；同文件不同行号仅保留首个', () => {
+    const tree = buildFileRefTree(['src/a.ts:1', 'src/a.ts:20', 'src/b.ts:2'], { cwd, home })
+    expect(tree).toHaveLength(1) // 仅 ./ 根
+    const src = tree[0].children[0]
+    expect(src).toMatchObject({ name: 'src', kind: 'dir' })
+    expect(src.children.map((f) => f.name)).toEqual(['a.ts', 'b.ts'])
+    expect(src.children[0].line).toBe(1) // 去重后保留首个行号
+  })
+
+  it('renderFileRefTree：根无分支线，目录带 /，文件带 :行号', () => {
+    const tree = buildFileRefTree(
+      ['src/tui.tsx:890', 'docs/mcp.md', '~/.harness/config.json:1'],
+      { cwd, home },
+    )
+    expect(renderFileRefTree(tree)).toBe([
+      './',
+      '├─ src/',
+      '│  └─ tui.tsx:890',
+      '└─ docs/',
+      '   └─ mcp.md',
+      '~/',
+      '└─ .harness/',
+      '   └─ config.json:1',
+    ].join('\n'))
+  })
+
+  it('空引用 → 空树，渲染为空串', () => {
+    expect(buildFileRefTree([], { cwd, home })).toEqual([])
+    expect(renderFileRefTree([])).toBe('')
+  })
+})
+
+describe('TuiApp /tree 文件引用目录树命令', () => {
+  it('/tree：把对话中出现的引用汇总为目录树打印，且不入历史栈', async () => {
+    const f = await mountTui({
+      responses: [
+        { match: /列出/, response: '相关文件：src/a.ts:1 和 docs/mcp.md' },
+      ],
+    })
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    await sendMessageWithGap(f.setup, '列出文件')
+    await waitFrame(f.setup, (fr) => fr.includes('docs/mcp.md'))
+
+    f.setup.mockInput.typeText('/tree')
+    for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
+    pressMetaEnter(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('文件引用（2）：'))
+    await waitFrame(f.setup, (fr) => fr.includes('src/') && fr.includes('a.ts:1'))
+    expect(inputLine(f.setup)).toBe('❯') // 输入框已清空，命令未回显为消息
+    await f.cleanup()
+  })
+
+  it('/tree：无可引用时提示空态', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    await sendMessageWithGap(f.setup, 'hello') // 触发默认回复（无文件引用），并让欢迎页消失
+    await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    f.setup.mockInput.typeText('/tree')
+    for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
+    pressMetaEnter(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('（暂无文件引用）'))
     await f.cleanup()
   })
 })

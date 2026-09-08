@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-09-09（续 88）TUI 新增 /tree 命令打印文件引用目录树（交互树留给图形页面）
+
+### 背景与决策
+
+用户评估后调整方向：**交互式目录树（多根浏览、展开/折叠）不在 TUI 实现，留给图形页面**；TUI 侧栏维持扁平引用列表现状，仅新增 `/tree` 斜杠命令，把对话中已出现的文件引用汇总为「根 → 目录 → 文件」树打印到聊天区。调研（opencode 无侧栏树、Claude Code 为真实磁盘扫描树）确认「汇总已出现引用」是本项目独特能力。
+
+### 改动
+
+- **`tui.tsx`**：
+  - 新增纯函数 `buildFileRefTree(refs, opts?)`：根自动推断（cwd→`./` 优先、主目录→`~/`、其余→`其他`，空根剪掉）；目录按相对根的路径逐级建立、`Map` 合并共享父目录；同文件（去 `:行[:列]`）去重保留首个行号；`cwd/home` 可注入便于测试。
+  - 新增 `renderFileRefTree(tree)`：根不带分支线，目录带 `/`、文件带 `:行号`，`├─/└─/│` 分支线缩进。
+  - `/tree` 命令（submit 拦截，仿 `/history`）：`collectFileReferences(prev, MAX_SAFE_INTEGER)` 全量收集（不受侧栏 8 条上限约束）→ 建树 → system 块打印；无引用提示「（暂无文件引用）」；不入历史栈、不进会话内核。
+  - 命令菜单候选追加 `/tree`。
+- **`index.ts`**：`REPL_COMMANDS` 追加 `/tree`。
+
+### 验证
+
+- 新增用例：`buildFileRefTree`（多根推断/空根剪除/共享父目录合并/同文件去重/空引用）、`renderFileRefTree`（精确树形文本）、`/tree` 端到端（mock 回复含引用 → 打印树 + 输入框清空；无引用空态）。
+- `bun run typecheck` 通过；`bun test` 185 全绿，无回归。
+
 ## 2026-09-07（续 83）MCP 工具归属索引统一解析 + 代码注册 server 会话内启停
 
 > 两件事：①把 tools-manager / mcp-server-registry 的 MCP 前缀反解统一到 `@harness/tool` 的 `parseMcpToolId` 语义之上，并用内存缓存的「server → 工具集」映射修正 server 名含 `__` 时的退化；②修复 `/mcp disable code-intel`（代码注册 server）无法禁用的问题。
