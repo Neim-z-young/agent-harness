@@ -55,6 +55,7 @@ import {
   __resetKeyLog,
   resolveEditPath,
   buildEditorCommand,
+  abbrevFileRef,
   type SessionRow,
   type ChatBlock,
   type TuiReplExit,
@@ -1008,6 +1009,18 @@ describe('TuiApp /edit 外部编辑器命令', () => {
     expect(resolveEditPath('~/.harness/p.json')).toBe(join(home, '.harness/p.json'))
     expect(resolveEditPath('relative/z.ts')).toBe(join(process.cwd(), 'relative/z.ts'))
     expect(resolveEditPath('/abs/a.ts')).toBe('/abs/a.ts')
+  })
+
+  it('abbrevFileRef：~ 相对化 + 超宽中间省略保留目录与文件名', () => {
+    const home = require('node:os').homedir()
+    expect(abbrevFileRef(join(home, 'x/a.ts'))).toBe('~/x/a.ts')
+    expect(abbrevFileRef(join(process.cwd(), 'src/a.ts'))).toBe('./src/a.ts')
+    expect(abbrevFileRef('x/a.ts')).toBe('x/a.ts')
+    const long = '/Users/oyoungy/Documents/project/XiaoZhi-new/very-long-dir-name/src/nested/engine.ts'
+    const out = abbrevFileRef(long, 30)
+    expect(out.length).toBeLessThanOrEqual(30)
+    expect(out.endsWith('engine.ts')).toBe(true)
+    expect(out).toContain('…')
   })
 
   it('buildEditorCommand 用 $EDITOR + 独立 +行号，绝不拼 path:line', () => {

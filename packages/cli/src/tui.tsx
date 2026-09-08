@@ -1263,7 +1263,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                       : createTextAttributes({ dim: true, underline: true })
                     return (
                       <text key={p} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
-                        {fileMode && options.openFile ? (active ? '▸' : ' ') : ''}{p}
+                        {fileMode && options.openFile ? (active ? '▸' : ' ') : ''}{abbrevFileRef(p, SIDEBAR_WIDTH - 6)}
                       </text>
                     )
                   }))}
@@ -1392,6 +1392,43 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 // ------------------------------------------------------------------------
 // startTuiRepl：真实终端入口 + 默认 openFile
 // ------------------------------------------------------------------------
+
+/**
+ * 缩写：外层文件引用路径为"可读且保留目录层级"的单行形态。
+ * 优先相对化到主目录（`~/...`）再相对化到 cwd；仍超宽时对中间目录做省略
+ * （`dir1/…/name.ext`），文件名与最近一级目录始终保留。
+ */
+export function abbrevFileRef(path: string, maxLen = 40): string {
+  if (!path) return path
+  const home = homedir()
+  const rels: string[] = []
+  // 主目录相对化（`~/...`）
+  if (path === home) return '~'
+  if (path.startsWith(home + '/')) rels.push(path === home ? '~' : '~' + path.slice(home.length))
+  else if (path.startsWith('~/')) rels.push(path)
+  // cwd 相对化（`./...`），与主目录相对化并存、取较短者
+  try {
+    const cwd = process.cwd()
+    if (path === cwd) rels.push('.')
+    else if (path.startsWith(cwd + '/')) rels.push('.' + path.slice(cwd.length))
+    else if (path.startsWith('./')) rels.push(path)
+  } catch { /* cwd 不可用则忽略 */ }
+  const rel = rels.length ? rels.sort((a, b) => a.length - b.length)[0] : path
+  if (rel.length <= maxLen) return rel
+  // 超宽：保留目录前段 + 文件名末段，中间折叠，严格控制在 maxLen 内
+  const segs = rel.split('/')
+  const leaf = segs.pop() ?? rel
+  const head = segs.shift() ?? ''
+  let headFull = head
+  for (const s of segs) {
+    const candidate = (headFull ? headFull + '/' : '') + s
+    // 折叠标记 `…/`(2) + 文件名(leaf) 需完整落在 maxLen 内
+    if (candidate.length + 2 + leaf.length > maxLen) break
+    headFull = candidate
+  }
+  const base = `${headFull}/…/${leaf}`
+  return base.length <= maxLen ? base : `…/${leaf}`
+}
 
 /**
  * 解析编辑器目标路径（双基准）：`~`/`~/` 开头 → 主目录；其余 → 基于（run 时）cwd。
