@@ -941,6 +941,44 @@ describe('TuiApp 输入历史导航', () => {
 
     await f.cleanup()
   })
+
+  it('历史回看不被 / 命令菜单劫持：连续 ↑ 遍历 / 命令与其前一条', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    await sendMessageWithGap(f.setup, 'hello world') // 普通消息
+    f.setup.mockInput.typeText('/stats')             // / 命令（同时是命令菜单候选）
+    pressMetaEnter(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('/stats'))
+    for (let i = 0; i < 6; i++) await pumpOnce(f.setup)
+
+    // ↑ 第 1 次 → 最近一条（/stats）
+    f.setup.mockInput.pressArrow('up')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('/stats'))
+    expect(inputLine(f.setup)).toBe('/stats')
+
+    // ↑ 第 2 次 → 应继续回看历史（hello world），而不是被 /stats 命令菜单「卡住」
+    f.setup.mockInput.pressArrow('up')
+    await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('hello world'))
+    expect(inputLine(f.setup)).toBe('hello world')
+
+    await f.cleanup()
+  })
+
+  it('/history：提交后在聊天区列出输入历史，且不入历史栈', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    await sendMessageWithGap(f.setup, 'first message')
+    await sendMessageWithGap(f.setup, 'second message')
+
+    f.setup.mockInput.typeText('/history')
+    for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
+    pressMetaEnter(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('输入历史'))
+    const frame = inputLine(f.setup)
+    expect(frame).toBe('❯') // 输入框已清空且未后续提交为消息
+
+    await f.cleanup()
+  })
 })
 
 // ------------------------------------------------------------------------

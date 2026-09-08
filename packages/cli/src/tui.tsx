@@ -682,6 +682,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [cmdSel, setCmdSel] = useState(0)
   const [history, setHistory] = useState<string[]>([])
   const [histIdx, setHistIdx] = useState(-1) // -1 表示不在回看历史
+  // history 的 ref 镜像：/history 命令需在 submit 回调（依赖 [] 闭包）里同步读取当前历史
+  const historyRef = useRef<string[]>([])
+  useEffect(() => { historyRef.current = history }, [history])
   // 历史导航索引的同步真源（ref 镜像）：React 状态是异步提交的，连按/自动重复 ↑ 时若读
   // state 会拿到上一次渲染的旧值（始终 -1），导致每次都跳到最近一条。ref 同步更新，
   // 保证连续按键逐级回看；state 仅用于渲染输入框 value。
@@ -865,6 +868,19 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     setInput('')
     setHistIdxSync(-1)
     if (v) {
+      // /history：在聊天区展示输入历史（不入历史栈、不进会话内核）
+      if (v === '/history') {
+        const h = historyRef.current
+        const body = h.length
+          ? `输入历史（${h.length}）：\n${h.map((x, i) => `  ${i + 1}. ${x}`).join('\n')}`
+          : '（暂无输入历史）'
+        setState((prev) => ({
+          ...prev,
+          blocks: [...prev.blocks, { id: prev.nextId, kind: 'assistant', text: body }],
+          nextId: prev.nextId + 1,
+        }))
+        return
+      }
       // 模块 C：提交成功后入栈输入历史（去重相邻、限长，最新的在后）
       setHistory((prev) => {
         const trimmed = prev.filter((h) => h !== v).slice(-99)
@@ -923,11 +939,44 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     }
     const refs = fileRefs
     const openFile = options.openFile
-    // 模块 C：/ 命令菜单 —— 输入以 / 开头且有候选时，↑/↓ 选中、Tab 补全、Enter 提交、Esc 关闭
+    // 模块 C：/ 命令菜单（Tab 补全、Enter 提交、Esc 关闭）+ 输入历史（↑/↓ 回看）。
+    // ↑/↓ 存在同键冲突：回看出的历史若以 / 开头会同时命中命令菜单。优先级规则：
+    //   - 正在回看（histIdx >= 0）：↑/↓ 继续回看，不被命令菜单劫持；
+    //   - 否则命令菜单开启：↑/↓ 选择候选；否则：↑ 开始回看历史。
+    const inHistoryRecall = histIdxRef.current >= 0
+    if (!listMode && (key.name === 'up' || key.name === 'down')) {
+      if (inHistoryRecall || !cmdMenuOpen) {
+        // —— 输入历史 ↑/↓ ——
+        if (history.length > 0) {
+          if (key.name === 'up') {
+            const cur = histIdxRef.current
+            const i = cur === -1 ? history.length - 1 : Math.max(0, cur - 1)
+            key.preventDefault()
+            setComposer(history[i] ?? '')
+            setInput(history[i] ?? '')
+            setHistIdxSync(i)
+            return true
+          }
+          if (key.name === 'down') {
+            const cur = histIdxRef.current
+            const i = cur === -1 || cur + 1 >= history.length ? -1 : cur + 1
+            const r = i >= 0 && i < history.length ? history[i]! : ''
+            key.preventDefault()
+            setComposer(r); setInput(r); setHistIdxSync(i)
+            return true
+          }
+        }
+      }
+      if (!inHistoryRecall && cmdMenuOpen) {
+        // —— 命令菜单候选 ↑/↓ 选择 ——
+        const last = cmdCandidates.length - 1
+        if (key.name === 'up') { key.preventDefault(); setCmdSel((s) => Math.max(0, s - 1)); return true }
+        if (key.name === 'down') { key.preventDefault(); setCmdSel((s) => Math.min(last, s + 1)); return true }
+      }
+    }
+    // —— 命令菜单 Tab 补全 / Esc 关闭 / Enter 提交 ——
     if (!listMode && cmdMenuOpen) {
       const last = cmdCandidates.length - 1
-      if (key.name === 'up') { key.preventDefault(); setCmdSel((s) => Math.max(0, s - 1)); return true }
-      if (key.name === 'down') { key.preventDefault(); setCmdSel((s) => Math.min(last, s + 1)); return true }
       if (key.name === 'tab') {
         key.preventDefault()
         const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
@@ -948,27 +997,6 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       }
       // 其余按键（含继续键入以收窄过滤、Meta+Enter）不 preventDefault，交由聚焦 textarea
       // 处理后回落到末尾微任务同步 input —— 保证命令菜单过滤器随键入实时更新。
-    }
-    // 模块 C：输入历史 —— 无命令菜单时，↑ 回看 / ↓ 前进；回看值覆盖当前 composer（输入任意字符即取消回看）
-    if (!listMode && !cmdMenuOpen && history.length > 0) {
-      if (key.name === 'up') {
-        const cur = histIdxRef.current
-        const i = cur === -1 ? history.length - 1 : Math.max(0, cur - 1)
-        key.preventDefault()
-        setComposer(history[i] ?? '')
-        setInput(history[i] ?? '')
-        setHistIdxSync(i) // ref 同步更新，连按/自动重复也能逐级回看
-        return true
-      }
-      if (key.name === 'down') {
-        const cur = histIdxRef.current
-        // 回看中 ↓ 前进一条；已到最近一条（cur + 1 >= history.length）时退出回看（恢复当前输入）
-        const i = cur === -1 || cur + 1 >= history.length ? -1 : cur + 1
-        const r = i >= 0 && i < history.length ? history[i]! : ''
-        key.preventDefault()
-        setComposer(r); setInput(r); setHistIdxSync(i)
-        return true
-      }
     }
     // 模块 4：侧栏 tab 切换 —— 输入为空、非列表模式时，◀/▶ 循环切换侧栏模块
     if (!listMode && !cmdMenuOpen && input === '' && showSidebar) {
