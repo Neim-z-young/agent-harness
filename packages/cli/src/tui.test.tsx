@@ -9,7 +9,7 @@
  * - parseCliArgs --tui
  */
 import { describe, it, expect, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { HarnessApp, parseCliArgs } from './index'
@@ -988,6 +988,49 @@ describe('TuiApp 输入历史导航', () => {
     // 命令菜单应包含 /history 候选
     await waitFrame(f.setup, (fr) => fr.includes('/history'))
     await f.cleanup()
+  })
+})
+
+describe('TuiApp /edit 外部编辑器命令', () => {
+  it('/e 前缀出现 /edit 候选；无参数提交提示用法', async () => {
+    const f = await mountTui({ openFile: () => {} })
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    f.setup.mockInput.typeText('/e')
+    for (let i = 0; i < 15; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
+    await waitFrame(f.setup, (fr) => fr.includes('/edit'))
+    // 提交 /edit （无参数）→ 提示用法
+    for (let i = 0; i < 6; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
+    pressMetaEnter(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('/edit <file[:line]>'))
+    await f.cleanup()
+  })
+
+  it('提交 /edit <file>:<line> 调用 openFile，回读尾部注入聊天区', async () => {
+    // 临时文件（相对 cwd），确保回读可命中
+    const tmpName = `__tui_edit_cmd_${Date.now()}`
+    const dirUnderCwd = join(process.cwd(), tmpName)
+    mkdirSync(dirUnderCwd, { recursive: true })
+    const editPath = join(dirUnderCwd, 'edit.ts')
+    writeFileSync(editPath, 'head\n---\ntail2\ntail3\n', 'utf8')
+    const ref = `${tmpName}/edit.ts:2`
+    const opened: Array<[string, number | undefined]> = []
+
+    try {
+      const f = await mountTui({ openFile: (p, l) => { opened.push([p, l]) } })
+      await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+      f.setup.mockInput.typeText('/edit ' + ref)
+      for (let i = 0; i < 8; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
+      pressMetaEnter(f.setup)
+      await waitFrame(f.setup, (fr) => fr.includes('打开 ' + tmpName + '/edit.ts'))
+      // openFile 已用相对 path + 行号调用
+      expect(opened).toEqual([[`${tmpName}/edit.ts`, 2]])
+      // 回读展示文件尾部（最新 8 行内包含 tail2）
+      await waitFrame(f.setup, (fr) => fr.includes('tail2'))
+      expect(f.setup.captureCharFrame()).toContain('已编辑')
+      await f.cleanup()
+    } finally {
+      rmSync(dirUnderCwd, { recursive: true, force: true })
+    }
   })
 })
 

@@ -22,6 +22,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { spawn } from 'node:child_process'
+import { readFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
@@ -838,9 +839,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     return () => { if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current) }
   }, [usage, options.session, options.app])
 
-  // 模块 C：加载 / 命令补全候选（内置 REPL 命令 + 插件注册命令）
+  // 模块 C：加载 / 命令补全候选（内置 REPL 命令 + 插件注册命令 + TUI 专属 /edit）
   useEffect(() => {
-    void listReplCommands(options.harness).then(setAllCommands).catch(() => { /* 忽略加载失败 */ })
+    void listReplCommands(options.harness)
+      .then((cmds) => setAllCommands([...cmds, { command: '/edit', description: '挂起 TUI 用外部编辑器打开文件（/edit <file[:line]>）' }]))
+      .catch(() => { /* 忽略加载失败 */ })
   }, [options.harness])
 
   const finish = useCallback((reason: TuiReplExit) => {
@@ -882,6 +885,46 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         }))
         return
       }
+      // /edit [file[:line]]：挂起 TUI 前台打开外部编辑器，退出后回读文件内容注入会话
+      if (v.startsWith('/edit')) {
+        const arg = v.replace(/^\/edit\s*/, '').trim()
+        const open = openFileRef.current
+        if (!arg || !open) {
+          setState((prev) => ({
+            ...prev,
+            blocks: [...prev.blocks, {
+              id: prev.nextId, kind: 'system',
+              text: arg ? '/edit 不可用：当前未启用文件打开' : '用法：/edit <file[:line]>',
+            }],
+            nextId: prev.nextId + 1,
+          }))
+          return
+        }
+        const parsed = parseFileRef(arg)
+        setState((prev) => ({
+          ...prev,
+          blocks: [...prev.blocks, { id: prev.nextId, kind: 'system', text: `打开 ${parsed.path}${parsed.line ? `:${parsed.line}` : ''}（退出编辑器后回读）` }],
+          nextId: prev.nextId + 1,
+        }))
+        const openPromise = open(parsed.path, parsed.line)
+        void (openPromise ? Promise.resolve(openPromise) : Promise.resolve()).then(async () => {
+          // 编辑结束回读磁盘，仅当文件可读时注入摘要
+          const abs = resolve(parsed.path)
+          let content = ''
+          try { content = await readFile(abs, 'utf8') } catch { /* 文件不可读则不回读 */ }
+          if (!content) return
+          const tail = content.trimEnd().split('\n').slice(-8)
+          setState((prev) => ({
+            ...prev,
+            blocks: [...prev.blocks, {
+              id: prev.nextId, kind: 'assistant',
+              text: `已编辑 ${abs}，最新尾部：\n${tail.map((l) => `  ${l}`).join('\n')}`,
+            }],
+            nextId: prev.nextId + 1,
+          }))
+        })
+        return
+      }
       // 模块 C：提交成功后入栈输入历史（去重相邻、限长，最新的在后）
       setHistory((prev) => {
         const trimmed = prev.filter((h) => h !== v).slice(-99)
@@ -901,6 +944,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
   // 全局快捷键：Ctrl-C 退出、Ctrl-B 切换侧栏；列表模式 Tab 进入、↑/↓ 选中、Enter 触发、Esc 返回。
   // 两个列表互斥：优先会话模式；退出文件引用 Tab。useKeyboard 底层用 useEffectEvent 包裹，回调闭包每次渲染刷新。
+  const openFileRef = useRef(options.openFile)
+  openFileRef.current = options.openFile
   const submitRef = useRef(submit)
   submitRef.current = submit
   useKeyboard((key) => {
