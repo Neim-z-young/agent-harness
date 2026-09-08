@@ -979,6 +979,16 @@ describe('TuiApp 输入历史导航', () => {
 
     await f.cleanup()
   })
+
+  it('/history：输入 /h 前缀时出现在命令菜单候选中', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    f.setup.mockInput.typeText('/h')
+    for (let i = 0; i < 15; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
+    // 命令菜单应包含 /history 候选
+    await waitFrame(f.setup, (fr) => fr.includes('/history'))
+    await f.cleanup()
+  })
 })
 
 // ------------------------------------------------------------------------
