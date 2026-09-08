@@ -1922,6 +1922,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             snapshotService?: SnapshotService;
             manageablePlugin: (id: string) => AgentPlugin | undefined;
             pluginManageable: (id: string) => boolean;
+            availablePlugins: () => Array<{ id: string; name: string; version: string }>;
             result?: 'continue' | 'exit'
           } = {
             raw: line.slice(1),
@@ -1939,6 +1940,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             snapshotService: app.snapshotService,
             manageablePlugin: (id) => app.pluginRegistry.get(id),
             pluginManageable: (id) => app.pluginRegistry.has(id),
+            availablePlugins: () => Array.from(app.pluginRegistry.entries()).map(([id, p]) => ({ id, name: p.name ?? id, version: p.version ?? '0.0.0' })),
           }
           try {
             await harness.plugin.trigger('cli.command', cmdInput)

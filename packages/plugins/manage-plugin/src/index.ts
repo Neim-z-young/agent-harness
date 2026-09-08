@@ -38,6 +38,8 @@ type PluginsCtx = Omit<CliCommandInput, 'harness'> & {
   harness: HarnessView
   manageablePlugin: (id: string) => AgentPlugin | undefined
   pluginManageable: (id: string) => boolean
+  /** 全部「已登记可管理」插件（含未加载的，供 list 展示并支持 enable 恢复） */
+  availablePlugins?: () => Array<{ id: string; name: string; version: string }>
 }
 
 /** 执行一个生命周期动作，返回错误字符串（undefined 表示成功） */
@@ -97,13 +99,21 @@ export function createPluginManagerPlugin(): AgentPlugin {
       const pid = parts[1]
 
       if (!op || !pid || !['enable', 'disable', 'reload'].includes(op ?? '')) {
-        const loaded = inp.harness.plugin.list()
-        if (loaded.length === 0) {
+        // 合并「已加载」与「已登记未加载」插件：禁用后仍可见、可重新启用
+        const loaded = new Map(inp.harness.plugin.list().map((lp) => [lp.plugin.id, lp]))
+        const metas = new Map<string, { name: string; version: string }>()
+        for (const p of inp.availablePlugins?.() ?? []) metas.set(p.id, p)
+        for (const [id, lp] of loaded) {
+          if (!metas.has(id)) metas.set(id, { name: lp.plugin.name, version: lp.plugin.version })
+        }
+        if (metas.size === 0) {
           out('（未加载任何插件）\n')
         } else {
-          for (const lp of loaded) {
-            const manage = inp.pluginManageable(lp.plugin.id) ? '可管理' : '内置'
-            out(`  ${lp.plugin.id.padEnd(28)}${lp.plugin.name}  v${lp.plugin.version}  来源=${lp.source}  [${manage}]\n`)
+          for (const [id, meta] of metas) {
+            const lp = loaded.get(id)
+            const manage = inp.pluginManageable(id) ? '可管理' : '内置'
+            const state = lp ? '已加载' : '已禁用'
+            out(`  ${id.padEnd(28)}${meta.name}  v${meta.version}  来源=${lp?.source ?? '未加载'}  [${manage}·${state}]\n`)
           }
         }
         out('用法：/plugins <enable|disable|reload> <pluginId>\n')

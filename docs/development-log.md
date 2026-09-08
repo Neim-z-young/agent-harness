@@ -16,6 +16,26 @@
 - tool 50 / mcp-server-registry 10 / tools-manager 13 / cli 169 用例全绿；全量 30 包 typecheck 通过。
 - 新增用例：`McpToolIndex`+`resolveMcpTool`（server 含 `__` 精确反解、未登记回退、unindex、幂等重登记）、代码注册 server `/mcp disable/enable` 会话内往返（禁用后 assemble 空、启用后工具恢复）。
 
+## 2026-09-08（续 85）/plugins 装卸与 MCP server 联动 + 文档对齐
+
+### 问题
+
+1. `/plugins disable code-intel` 后 `/plugins` 列表里看不到该插件 → 用户无法重新启用（list 只显示已加载插件）。
+2. 禁用插件后其注册的 MCP server 不断开、`mcp__code-intel__*` 工具不收敛 → 仍可被调用。
+3. `docs/mcp-services.md` 遗留工作区未提交改动，把已废弃的 `/mcp tool` 子命令写回（倒退），与当前架构矛盾。
+
+### 改动
+
+- **manage-plugin**：list 合并「已加载」+「已登记未加载」（CLI 注入 `availablePlugins`，来自 `app.pluginRegistry`）——禁用后插件仍显示并标注 `[可管理·已禁用]`，可直接 `/plugins enable` 恢复。
+- **mcp-server-registry**：`McpServerRegistration` 增加可选 `source`（来源插件 id）；插件维护 `serverSource: Map<server, 插件id>`；订阅 `plugin.unloaded` → 断开该插件注册的 server + 记入 `downTools`（assemble 收敛工具）+ 发 `mcpServerDisabled`；订阅 `plugin.loaded` → 重连并恢复装配（清 `downTools`）+ 发 `mcpServerEnabled`。
+- **code-intel**：`registerMcpServer` 携带 `source: 'code-intel'`。
+- **docs/mcp-services.md**：去掉 `/mcp tool` 残留；命令列表补 `/mcp servers enable|disable <s>` 嵌套写法；明确工具级启停统一走 `/tools`；补「随插件装卸」运行时机制（`source` 关联、卸载断开/重载重连）。
+
+### 验证
+
+- manage-plugin 8 / mcp-server-registry 11 / code-intel 73 / cli 169 全绿；全量 30 包 typecheck 通过。
+- 新增用例：list 显示已禁用插件并可恢复；插件卸载 → 工具从池收敛、重载 → 重连恢复。
+
 ## 2026-09-07（续 84）修复 `/mcp disable` 后工具仍显示「启用」且残留可调用
 
 `/tools` 状态矛盾（`启用·…·server已禁用`）的根因：禁用/移除 server 只跳过 `tool.pool.assemble` 的「新增」，而运行时 `ToolRegistry` 早已在启动时登记过这些工具；`DefaultToolPool.add` 只增不减，导致旧工具残留下线、仍可被 LLM 调用、`/tools` 仍判为「启用」。

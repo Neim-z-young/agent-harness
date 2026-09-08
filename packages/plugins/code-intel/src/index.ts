@@ -77,6 +77,7 @@ export function createCodeIntelPlugin(options: CodeIntelOptions = {}): AgentPlug
       registerMcpServer({
         name: server.serverName,
         createTransport: () => createCodeIntelServerTransport(server),
+        source: 'code-intel', // 供 mcp-server-registry 在插件卸载/重载时同步断开/重连
       })
       ctx.log.info('code-intel 已注册进程内 MCP server（由 mcp-server-registry 启动连接，纯 MCP 装配）', {
         mcpServer: server.serverName,

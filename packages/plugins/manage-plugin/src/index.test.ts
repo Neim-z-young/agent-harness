@@ -40,7 +40,7 @@ async function getHooks() {
   return (await createPluginManagerPlugin().install({} as never)) as Hooks
 }
 
-async function run(h: Hooks, arg: string, ctx: ReturnType<typeof makeCtx>): Promise<CliCommandInput> {
+async function run(h: Hooks, arg: string, ctx: ReturnType<typeof makeCtx>, extra?: Record<string, unknown>): Promise<CliCommandInput> {
   const input = {
     command: 'plugins',
     raw: arg,
@@ -50,6 +50,7 @@ async function run(h: Hooks, arg: string, ctx: ReturnType<typeof makeCtx>): Prom
     harness: ctx.h,
     manageablePlugin: (id: string) => ctx.manageable.get(id),
     pluginManageable: (id: string) => ctx.manageable.has(id),
+    ...(extra ?? {}),
   } as unknown as CliCommandInput
   await h['cli.command']?.(input)
   return input
@@ -129,5 +130,31 @@ describe('manage-plugin 插件', () => {
     await run(h, 'reload tools-manager', ctx)
     expect(ctx.calls).toContain('hotReload:tools-manager')
     expect(ctx.emitted).toContainEqual({ name: 'plugin.updated', payload: { id: 'tools-manager' } })
+  })
+
+  it('list：禁用插件后仍显示（已登记未加载），标注「已禁用」并支持重新启用', async () => {
+    const h = await getHooks()
+    const ctx = makeCtx([mkPlugin('tools-manager')]) // 仅 tools-manager 已加载
+    const ctxOut: string[] = []
+    ;(ctx as unknown as { out: string[] }).out = ctxOut
+
+    // 模拟 code-intel 已登记但被禁用（不在 loaded，在 availablePlugins）
+    ctx.manageable.set('code-intel', mkPlugin('code-intel'))
+    await run(h, '', ctx, { availablePlugins: () => [
+      { id: 'tools-manager', name: 'tools-manager', version: '1.0.0' },
+      { id: 'code-intel', name: 'code-intel', version: '1.0.0' },
+    ] })
+
+    const text = ctxOut.join('')
+    expect(text).toContain('tools-manager')
+    expect(text).toContain('已加载')
+    expect(text).toContain('code-intel')
+    expect(text).toContain('已禁用')
+
+    // 禁用后 enable 可恢复
+    const out2: string[] = []
+    ;(ctx as unknown as { out: string[] }).out = out2
+    await run(h, 'enable code-intel', ctx)
+    expect(ctx.calls).toContain('loadInternal:code-intel')
   })
 })

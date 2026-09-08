@@ -30,10 +30,12 @@ import {
  * MCP Server 注册项。
  * - config：外部 server 配置（stdio/http/sse），registry 用 defaultTransportFactory 启动
  * - createTransport：进程内或自定义启动器，返回 McpTransport（供 computer-use 等自包含 server 使用）
+ * - source：来源插件 id（可选）。插件 install 时 registerMcpServer 携带，供 registry
+ *   在插件卸载/重载时同步断开/重连该插件注册的 server。
  */
 export type McpServerRegistration =
-  | { name: string; config: McpServerConfig; dataDir?: string }
-  | { name: string; createTransport: () => McpTransport | Promise<McpTransport> }
+  | { name: string; config: McpServerConfig; dataDir?: string; source?: string }
+  | { name: string; createTransport: () => McpTransport | Promise<McpTransport>; source?: string }
 
 /** MCP Server 注册表 */
 export class McpServerRegistry {
@@ -142,6 +144,8 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   const managed = new Map<string, ManagedEntry>()
   /** 本次进程内被 /mcp 禁用的 server → 其应从工具池移除的工具 id（含托管与代码注册） */
   const downTools = new Map<string, string[]>()
+  /** 代码注册 server → 来源插件 id（供插件卸载/重载时同步断连/重连） */
+  const serverSource = new Map<string, string>()
   /** CLI 注入的持久化回调 */
   let cliStore: McpCliStore | undefined
   let connected = false
@@ -211,6 +215,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     const tools = await client.listTools()
     const harnessTools = tools.map((t) => convertMcpToolToHarnessTool(t, item.name, client))
     globalMcpToolIndex.index(item.name, harnessTools.map((t) => t.id))
+    if (item.source) serverSource.set(item.name, item.source)
     const rt: McpServerRuntime = { name: item.name, client, tools: harnessTools }
     runtimes.push(rt)
     return rt
@@ -224,6 +229,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
       runtimes.splice(i, 1)
     }
     globalMcpToolIndex.unindex(name)
+    serverSource.delete(name)
   }
 
   /** 持久化当前托管条目到 config.json；无回调时静默跳过 */
@@ -250,6 +256,34 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
       offs.push(
         ctx.bus.subscribe(LifecycleEvents.pluginUpdated, ({ payload }) => {
           if (payload.id === 'mcp.server-registry') syncRuntimesFromSources()
+        }),
+      )
+      // 宿主插件卸载：断开其注册的 MCP server，并记录待移除工具（经 assembleTools 收敛）
+      offs.push(
+        ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
+          for (const [serverName, src] of Array.from(serverSource)) {
+            if (src !== payload.id) continue
+            const rt = runtimes.find((r) => r.name === serverName)
+            downTools.set(serverName, rt ? rt.tools.map((t) => t.id) : [])
+            disconnectServer(serverName)
+            void ctx.bus.publish(LifecycleEvents.mcpServerDisabled, { name: serverName }, { source: 'mcp.server-registry' })
+          }
+        }),
+      )
+      // 宿主插件重新启用/重载：重连其注册的 MCP server（reg 里已重新注册）
+      offs.push(
+        ctx.bus.subscribe(LifecycleEvents.pluginLoaded, ({ payload }) => {
+          for (const item of reg.list()) {
+            if (item.source !== payload.id) continue
+            if (runtimes.some((r) => r.name === item.name)) continue
+            downTools.delete(item.name) // 恢复装配（之前卸载时可能被 downTools 记录）
+            void (async () => {
+              try {
+                const rt = await connectCodeServer(item.name)
+                if (rt) await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name: item.name }, { source: 'mcp.server-registry' })
+              } catch { /* 连接失败不阻塞其他 server */ }
+            })()
+          }
         }),
       )
 

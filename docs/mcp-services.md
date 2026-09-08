@@ -6,10 +6,10 @@
 
 项目支持两种方式接入 MCP Server：
 
-| 方式       | 装配位置                                           | 说明                                           | 启停                          |
-| -------- | ---------------------------------------------- | -------------------------------------------- | --------------------------- |
-| **代码注册** | `.harness/plugins/mcp.ts`（`registerMcpServer`） | 进程内/自定义 transport（computer-use、code-intel 等） | 随插件启用/卸载                    |
-| **配置托管** | `config.json` 的 `mcpServers` 数组                | 外部 stdio / http / sse server                 | `/mcp enable\|disable` 即时启停 |
+| 方式       | 装配位置                                           | 说明                                           | 启停                                                               |
+| -------- | ---------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------- |
+| **代码注册** | `.harness/plugins/mcp.ts`（`registerMcpServer`） | 进程内/自定义 transport（computer-use、code-intel 等） | 随插件装卸（`/plugins enable\|disable`）；或 `/mcp enable\|disable` 会话内启停 |
+| **配置托管** | `config.json` 的 `mcpServers` 数组                | 外部 stdio / http / sse server                 | `/mcp enable\|disable` 即时启停（持久化）                                 |
 
 - 所有 server 统一由 `@harness/mcp-server-registry` 插件在 `harness.start` 时连接，复用 `@harness/mcp-client` 管理连接，工具经 `tool.pool.assemble` 暴露为 `mcp__<server>__<tool>`。
 
@@ -57,16 +57,17 @@
 `/mcp` 提供运行时查看与管理（REPL 内输入）：
 
 ```
-/mcp                                # 服务器列表（含启停状态）
-/mcp servers                        # 同上
-/mcp tools                          # 工具列表（托管 server 标注工具级启停）
-/mcp enable <server>                # 启用并立即连接
-/mcp disable <server>               # 禁用并立即断开
-/mcp add <json>                     # 新增托管 server（写回 config.json 并连接）
-/mcp remove <server>                # 移除托管 server（断开并写回 config.json）
+/mcp [servers]                       # 服务器列表（含启停状态）
+/mcp servers enable <server>         # 启用并立即连接（含代码注册 server，会话内生效）
+/mcp servers disable <server>        # 禁用并立即断开（含代码注册 server，会话内生效）
+/mcp tools                           # 工具列表（托管 server 标注工具级启停）
+/mcp enable <server>                 # 同上（顶层写法）
+/mcp disable <server>                # 同上（顶层写法）
+/mcp add <json>                      # 新增托管 server（写回 config.json 并连接）
+/mcp remove <server>                 # 移除托管 server（断开并写回 config.json）
 ```
 
-工具级启停统一走 `/tools`（`mcp__<server>__<tool>` 前缀），`/mcp` 不再承担工具掩码责任：
+- **工具级启停统一走** **`/tools`**（`mcp__<server>__<tool>` 前缀），`/mcp` 不再承担工具掩码责任：
 
 ```
 /tools mcp__github__create_issue off   # 关闭某个 MCP 工具（写 mcpServers[].tools）
@@ -81,11 +82,15 @@
 /tools mcp__github__create_issue off
 ```
 
+> 说明：**代码注册** server（computer-use、code-intel 等）无 config.json 槽位，`/mcp disable` 为**本次进程生效**（重启后自动恢复连接）；随插件整体装卸请用 `/plugins disable|enable <pluginId>`——插件卸载时其注册的 MCP server 自动断开、工具从工具池移除，重载后自动重连。
+
 ## 4. 运行时机制
 
 - **启动**：CLI boot 时 `applyMcpServers` 读 `config.json` 的 `mcpServers`，经 `mcp.configure` Hook 注入 registry 插件（仅建立配置态）；`harness.start` 时按 `enabled` 开关连接。
 
-- **服务器级启停**：`/mcp enable\|disable` 立即 connect/close 客户端并移除工具；状态经注入的 `setMcpServers` 写回 `config.json`，重启后生效。
+- **服务器级启停**：`/mcp enable\|disable` 立即 connect/close 客户端并移除工具；状态经注入的 `setMcpServers` 写回 `config.json`，重启后生效。代码注册 server 无配置槽位，仅本次进程生效。
+
+- **随插件装卸**：registry 订阅 `plugin.unloaded` / `plugin.loaded` 事件——宿主插件（如 code-intel）卸载时自动断开其注册的 MCP server 并收敛工具，重新启用时自动重连（`registerMcpServer` 携带 `source: <插件id>` 关联）。
 
 - **工具级启停**：`tool.pool.assemble` 每 query 组装，按工具 base 名过滤 `tools[name]===false`，天然即时生效。
 

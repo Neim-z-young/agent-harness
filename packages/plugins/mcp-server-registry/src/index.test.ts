@@ -12,6 +12,7 @@ import {
 } from './index'
 import type { PluginContext } from '@harness/plugin'
 import type { Bus } from '@harness/bus'
+import { LifecycleEvents } from '@harness/core'
 import type { McpTransport } from '@harness/mcp-client'
 
 /** 日志 ctx 桩 */
@@ -22,13 +23,20 @@ const mockLog: PluginContext['log'] = {
   debug: () => undefined,
 }
 
-/** Bus 桩：记录发布事件，订阅返回 noop 退订 */
+/** Bus 桩：记录发布事件，订阅返回 noop 退订；publish 同步触发同事件订阅回调（便于测试插件装卸联动） */
 function makeBus(): Bus & { emitted: Array<{ name: string; payload: unknown }> } {
   const emitted: Array<{ name: string; payload: unknown }> = []
+  const subs: Array<{ name: string; cb: (e: { payload: unknown }) => void }> = []
   const bus = {
     emitted,
-    publish: async (event: { name: string }, payload: unknown) => { emitted.push({ name: event.name, payload }) },
-    subscribe: () => () => undefined,
+    publish: async (event: { name: string }, payload: unknown) => {
+      emitted.push({ name: event.name, payload })
+      for (const s of subs) if (s.name === event.name) s.cb({ payload })
+    },
+    subscribe: (event: { name: string }, cb: (e: { payload: unknown }) => void) => {
+      subs.push({ name: event.name, cb })
+      return () => undefined
+    },
     subscribeAll: () => () => undefined,
   } as unknown as Bus & { emitted: Array<{ name: string; payload: unknown }> }
   return bus
@@ -211,6 +219,34 @@ describe('createMcpServerRegistryPlugin', () => {
 
     await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
+    await plugin.uninstall?.()
+  })
+
+  test('宿主插件卸载（/plugins disable）：断开其 MCP server 并收敛工具；重载后重连恢复', async () => {
+    const reg = createMcpServerRegistry()
+    const { transport } = createFakeTransport([{ name: 'code_symbols' }])
+    const bus = makeBus()
+    reg.register({ name: 'code-intel', createTransport: () => transport, source: 'code-intel' })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await plugin.install({ log: mockLog, bus } as unknown as PluginContext)
+    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+
+    const pool = fakePool()
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__code_symbols')
+
+    // 插件卸载 → server 断开 + 工具从工具池收敛
+    await bus.publish(LifecycleEvents.pluginUnloaded, { id: 'code-intel' })
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list()).toHaveLength(0)
+
+    // 插件重载 → 重新注册并重连，工具恢复
+    reg.register({ name: 'code-intel', createTransport: () => transport, source: 'code-intel' })
+    await bus.publish(LifecycleEvents.pluginLoaded, { id: 'code-intel' })
+    await new Promise((r) => setTimeout(r, 10)) // 等待异步重连完成
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__code_symbols')
     await plugin.uninstall?.()
   })
 })
