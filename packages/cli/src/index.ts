@@ -1039,8 +1039,8 @@ export class HarnessApp {
 
   /** 解析指定 providerId 在当前 harness 实际命中的 ChatProvider；未装配的 provider 会回退到默认 Provider */
   resolveChatProvider(providerId?: string): ChatProvider | undefined {
-    const h = this.harness as { chatProvider?: (id?: string) => ChatProvider } | undefined
-    return h?.chatProvider?.(providerId)
+    const h = this.harness as { resolveChatProvider?: (id?: string) => ChatProvider } | undefined
+    return h?.resolveChatProvider?.(providerId)
   }
 
   /**
