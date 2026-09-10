@@ -1,5 +1,22 @@
 # Agent Harness 开发日志
 
+## 2026-09-10（续 94）启动时输出默认 Provider 装配日志
+
+### 问题
+
+用户多次困惑「刚启动时是 mock，要切换模型才有用」。实际根因是跑的是旧进程/旧构建：最新代码在真实 config.json（`provider: "local"`）下 boot，默认 ChatProvider 本就正确装配为 `local` 而非 mock。缺少启动日志，用户无从确认当前默认 Provider。
+
+### 改动（packages/cli/src/index.ts）
+
+- boot 装配默认 Provider 完毕后，输出一行明确日志：
+  `✅ 默认 Provider: local（type=openai · model=deepseek-flash）`
+- 仅直接使用已解析的配置信息（`defaultProviderId` / `defaultPc`），**不触碰 chosenProvider.provider 的 lazy getter**——boot 阶段插件尚未 install，提前访问 getter 会抛 `OpenAIChatProvider 未创建` 异常。
+
+### 验证
+
+- 沙箱外真实 boot 诊断：`resolveChatProvider() = local`，启动日志正确输出，类型检查通过。
+- `bun test` 187 全绿，无回归。
+
 ## 2026-09-10（续 93）`/model` 切换到未装配 Provider 时明确警告（不再静默回退 mock）
 
 ### 问题

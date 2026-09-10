@@ -1281,6 +1281,16 @@ export class HarnessApp {
       }
     }
     providerPlugins.push(chosenProvider)
+    // 明确输出启动时装配的默认 Provider（不触碰 lazy getter，直接用已解析的配置信息）
+    const cpId = defaultProviderId === 'mock'
+      ? 'mock'
+      : defaultPc?.id ?? 'anthropic'
+    const cpLabel = cpId === 'mock' ? '（测试 Mock）' : defaultPc?.type ? `（type=${defaultPc.type} · model=${parseModelSpec(this.options.model ?? '').modelId || defaultPc.model}）` : ''
+    this.options.stdout?.write?.(
+      `✅ 默认 Provider: ${cpId}${cpLabel}\n` +
+      (defaultProviderId !== cpId ? `   config.json → provider="${defaultProviderId}"，实际装配 "${cpId}"。\n` : '') +
+      `   /model 命令可切换；若 "当前模型" 仍显示 Mock，请重启 CLI 使配置生效。\n\n`
+    )
     // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载
     const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load()
     providerPlugins.push(toolsBuiltin)
