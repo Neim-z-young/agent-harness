@@ -901,6 +901,8 @@ export class HarnessApp {
   readonly pluginRegistry = new Map<string, AgentPlugin>()
   private harness!: Harness
   private options: Required<Pick<HarnessAppOptions, 'cwd' | 'dataDir' | 'agentId' | 'provider'>> & HarnessAppOptions
+  /** boot() 装载的 Provider 配置（CLI options.providers 优先，其次 config.json providers），供 /model ? 展示 */
+  private loadedProviders: ProviderConfig[] = []
 
   constructor(options: HarnessAppOptions) {
     const cwd = resolve(options.cwd)
@@ -1131,6 +1133,11 @@ export class HarnessApp {
     return ids
   }
 
+  /** 启动装载的 Provider 实例配置（含各自默认/附加模型），供 /model ? 展示 config.json / CLI 配置的模型 */
+  listConfiguredProviders(): Array<{ id: string; model?: string; baseUrl?: string; apiPath?: string; type?: string }> {
+    return this.loadedProviders.map((p) => ({ id: p.id, model: p.model, baseUrl: p.baseUrl, apiPath: p.apiPath, type: p.type }))
+  }
+
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
   async boot(): Promise<{ harness: Harness; session: Session }> {
     // 多级加载 L1：预载内置工具静态元信息（描述/别名/安全），由各工具插件自携带 metaSource，
@@ -1157,6 +1164,7 @@ export class HarnessApp {
     // ------------------------------------------------------------------
     const cfg = await this.configStore.load()
     const rawProviderConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
+    this.loadedProviders = rawProviderConfigs
     const defaultProviderId = this.options.provider ?? cfg.provider ?? 'anthropic'
 
     // 加载外部插件（user ~/.harness/plugins → project .harness/plugins，后加载覆盖先加载）：
@@ -1753,6 +1761,20 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           if (!arg || arg === '?') {
             const prods = app.listProviders()
             out('已注册 Provider：' + (prods.length ? prods.join(' / ') : '（默认 mock/anthropic）') + '\n')
+            // 展示 config.json / CLI 里配置的 Provider 实例及其默认/附加模型
+            const configured = app.listConfiguredProviders()
+            if (configured.length) {
+              out('配置的模型（providers）：\n')
+              for (const p of configured) {
+                const model = p.model ? `${p.id}/${p.model}` : `${p.id}（未指定 model，用 Provider 默认）`
+                const extra = [
+                  p.baseUrl ? `baseUrl=${p.baseUrl}` : '',
+                  p.apiPath ? `apiPath=${p.apiPath}` : '',
+                  p.type ? `type=${p.type}` : '',
+                ].filter(Boolean).join(' · ')
+                out(`  - ${model}${extra ? `  (${extra})` : ''}\n`)
+              }
+            }
             const m = app.getModel(agentId)
             if (m) out(`当前模型：${m}（agent=${agentId}）\n`)
             else out(`Agent "${agentId}" 未绑定模型，使用 Provider 默认。\n`)

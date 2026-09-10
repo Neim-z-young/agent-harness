@@ -1,5 +1,22 @@
 # Agent Harness 开发日志
 
+## 2026-09-10（续 91）`/model ?` 展示 config.json / CLI 配置的 Provider 模型
+
+### 问题
+
+`/model ?` 只列出已注册 Provider 的 id（`app.listProviders()`），不显示 config.json `providers` 里为各 Provider 配置的默认模型，用户无法在 REPL 内一眼看到配置了哪些「provider/model」组合。
+
+### 改动（packages/cli/src/index.ts）
+
+- 新增成员 `loadedProviders`：`boot()` 时记录实际装载的 Provider 配置（CLI `options.providers` 优先，其次 `config.json → providers`）。
+- 新增公开方法 `listConfiguredProviders()`：返回各 Provider 实例的 `id / model / baseUrl / apiPath / type`。
+- `/model ?`（无参分支）在「已注册 Provider」后追加「配置的模型（providers）」清单：`id/model`、未配置 model 时提示用 Provider 默认，并附 `baseUrl` / `apiPath` / `type`。
+- 新增测试：从 config.json 装配 `deepseek/deepseek-chat` 与 `local/qwen2.5`，`/model` 输出包含配置的模型及 baseUrl。
+
+### 验证
+
+- `bun run typecheck` 通过；`bun test` 186 全绿，无回归。
+
 ## 2026-09-10（续 90）完善 README：TUI 文件引用/编辑用法 + config.json 配置说明
 
 ### 改动

@@ -796,6 +796,33 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('/model ? 展示 config.json 配置的 Provider 模型（含 baseUrl/type）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const dd = join(dir, '.harness')
+    mkdirSync(dd, { recursive: true })
+    writeFileSync(join(dd, 'config.json'), JSON.stringify({
+      provider: 'deepseek',
+      providers: [
+        { id: 'deepseek', type: 'openai', baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat', apiKey: 'sk-test' },
+        { id: 'local', type: 'openai', baseUrl: 'http://localhost:11434', model: 'qwen2.5' },
+      ],
+    }, null, 2))
+    const app = new HarnessApp({
+      cwd: dir, dataDir: dd, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    const r = await startRepl({ app, harness, session, stdout, scriptedStdin: ['/model', '/exit'] })
+    expect(r).toBe('exit')
+    const output = chunks.join('')
+    expect(output).toInclude('配置的模型（providers）：')
+    expect(output).toInclude('deepseek/deepseek-chat')
+    expect(output).toInclude('baseUrl=https://api.deepseek.com')
+    expect(output).toInclude('local/qwen2.5')
+    await app.shutdown()
+  })
+
   it('parseModelSpec / formatModel：provider/model 规格解析', () => {
     expect(parseModelSpec('openai/gpt-4o')).toEqual({ providerId: 'openai', modelId: 'gpt-4o' })
     expect(parseModelSpec('claude-3-5-sonnet')).toEqual({ providerId: undefined, modelId: 'claude-3-5-sonnet' })

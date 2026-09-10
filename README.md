@@ -153,6 +153,8 @@ bun run typecheck           # 全部类型检查
 - **环境变量引用**：`"apiKey": "${OPENAI_API_KEY}"`（缺失时启动报 `ConfigValidationError`）
 - **AES-256-GCM 密文**：`"apiKey": "enc:v1:<base64>…"`（主密钥来源：`HARNESS_CONFIG_KEY` 环境变量 > `<data-dir>/.config-key`）
 
+`/model ?` 会列出这些配置的 Provider 实例及其默认模型（如 `deepseek/deepseek-chat`，附 `baseUrl` / `type`）；`/model <spec>` 跨 Provider 切换（如 `/model local/qwen2.5`）。
+
 ### agents 数组
 
 按 `id` 覆盖对应 Agent 的工具与 MCP 能力（由 `/tools` 等插件持久化）：
