@@ -2432,7 +2432,8 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       }
     }
     if (args.tui) {
-      await startTuiRepl({ app, harness, session, provider, model })
+      // 状态栏 provider 用实际解析出的 ChatProvider，而非静态配置值（更真实、避免过期误报）
+      await startTuiRepl({ app, harness, session, provider: app.resolveChatProvider()?.id ?? provider, model })
     } else {
       await startRepl({ app, harness, session })
     }
