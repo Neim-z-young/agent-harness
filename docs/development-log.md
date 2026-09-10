@@ -1,5 +1,20 @@
 # Agent Harness 开发日志
 
+## 2026-09-10（续 92）修复 send 统计行 `model=` 只显示 modelId、丢 provider 前缀
+
+### 问题
+
+`/model local/deepseek-flash` 切换后，send 结束的统计行打印 `model=deepseek-flash`，而非 `model=local/deepseek-flash`。根因：打印取自 `assistant.meta.model`（仅 modelId），而切换后模型是跨 Provider 的，缺 provider 前缀。
+
+### 改动（packages/cli/src/index.ts）
+
+- 发送后的统计行改用 `app.getModel(agentId)` 显示完整 `provider/model`（`formatModel`），并兜底 agent id 为 `'default'`；TUI 状态栏原本就分开展示 `provider` 与 `model`，不受影响。
+- 新增测试：mock 场景 `/model mock/deepseek-flash` 切换后 send，断言统计行以 `model=mock/deepseek-flash` 展示。
+
+### 验证
+
+- `bun run typecheck` 通过；`bun test` 187 全绿，无回归。
+
 ## 2026-09-10（续 91）`/model ?` 展示 config.json / CLI 配置的 Provider 模型
 
 ### 问题

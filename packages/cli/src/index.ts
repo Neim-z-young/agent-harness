@@ -2043,8 +2043,9 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       return 'continue'
     }
     const duration = Date.now() - started
+    const modelLabel = app.getModel(assistant?.agentId ?? current.agentId ?? 'default')
     out(`⏱️  ${duration}ms | agent=${assistant?.agentId ?? current.agentId ?? '?'}` +
-      (assistant?.meta?.model ? ` | model=${assistant.meta.model}` : '') + '\n\n')
+      (modelLabel ? ` | model=${modelLabel}` : '') + '\n\n')
     return 'continue'
   }
 }

@@ -823,6 +823,22 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('/model <provider>/<model> 切换后 send 统计行显示完整 provider/model（mock 场景）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness-sendmodel'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    const r = await startRepl({ app, harness, session, stdout, scriptedStdin: ['/model mock/deepseek-flash', 'hi', '/exit'] })
+    expect(r).toBe('exit')
+    const full = chunks.join('')
+    // 统计行用完整 provider/model 展示（而非仅 modelId），不再出现「model=deepseek-flash」
+    expect(full).toInclude('model=mock/deepseek-flash')
+    await app.shutdown()
+  })
+
   it('parseModelSpec / formatModel：provider/model 规格解析', () => {
     expect(parseModelSpec('openai/gpt-4o')).toEqual({ providerId: 'openai', modelId: 'gpt-4o' })
     expect(parseModelSpec('claude-3-5-sonnet')).toEqual({ providerId: undefined, modelId: 'claude-3-5-sonnet' })
