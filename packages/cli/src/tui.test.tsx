@@ -125,6 +125,31 @@ describe('pushConsole 追加控制台文本', () => {
     expect(s.blocks.map((b) => b.kind)).toEqual(['assistant', 'system', 'thinking'])
     expect(s.nextId).toBe(4)
   })
+  it('连续命令输出（system 行）合并为单个块，复制按钮只在末尾出现一次', () => {
+    // 模拟 /switch ? 逐行 out：已注册 Agent： /  default  -  Harness Agent
+    let s = pushConsole(initialChatState, '已注册 Agent：')
+    s = pushConsole(s, ' default  -  Harness Agent')
+    expect(s.blocks).toHaveLength(1)
+    expect(s.blocks[0].kind).toBe('system')
+    // 行首单个空格被 classifyConsoleLine 剥掉（对齐 console 缩进惯例）
+    expect(s.blocks[0].text).toBe('已注册 Agent：\ndefault  -  Harness Agent')
+    expect(s.nextId).toBe(2)
+  })
+  it('欢迎块（id 0）不与首条输出合并', () => {
+    const s = pushConsole(initialChatWithWelcome('欢迎语'), '已注册 Agent：')
+    expect(s.blocks.map((b) => b.kind)).toEqual(['system', 'system'])
+    expect(s.blocks[0].text).toBe('欢迎语')
+    expect(s.blocks[1].text).toBe('已注册 Agent：')
+  })
+  it('连续 tool 行合并为单个块；user 行不合并', () => {
+    let s = pushConsole(initialChatState, '🔧  bash ls')
+    s = pushConsole(s, '✅  bash 完成')
+    expect(s.blocks).toHaveLength(1)
+    expect(s.blocks[0].text).toBe('🔧  bash ls\n✅  bash 完成')
+    s = pushConsole(s, '🧑  第二条消息')
+    expect(s.blocks).toHaveLength(2)
+    expect(s.blocks[1].kind).toBe('user')
+  })
 })
 
 describe('applyStreamEvent 结构化流', () => {

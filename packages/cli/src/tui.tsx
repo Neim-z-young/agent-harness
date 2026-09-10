@@ -162,14 +162,24 @@ export function classifyConsoleLine(line: string): { kind: ChatBlockKind; text: 
   return { kind: 'system', text: t }
 }
 
-/** 追加一段控制台文本（按 \n 拆行归类为新块；空行忽略） */
+/** 追加一段控制台文本（按 \n 拆行归类为新块；空行忽略）。
+ *  相邻同类块合并为一个块（命令/工具输出多行 → 单块，复制按钮只在末尾出现一次；
+ *  欢迎块 id 0 不参与合并，避免首条输出污染静态欢迎文本）。 */
 export function pushConsole(state: ChatState, text: string): ChatState {
   let s = state
   for (const raw of text.split('\n')) {
     const line = raw
     if (!line.trim()) continue
     const { kind, text: body } = classifyConsoleLine(line)
-    s = { ...s, blocks: [...s.blocks, { id: s.nextId, kind, text: body }], nextId: s.nextId + 1 }
+    // 仅合并 system（命令输出）/ tool（工具输出）类相邻块；user/thinking/assistant 各自独立
+    const last = s.blocks[s.blocks.length - 1]
+    if (last && last.id !== 0 && last.kind === kind && (kind === 'system' || kind === 'tool') && !last.streaming) {
+      const blocks = s.blocks.slice()
+      blocks[blocks.length - 1] = { ...last, text: last.text + '\n' + body }
+      s = { ...s, blocks }
+    } else {
+      s = { ...s, blocks: [...s.blocks, { id: s.nextId, kind, text: body }], nextId: s.nextId + 1 }
+    }
   }
   return s
 }
