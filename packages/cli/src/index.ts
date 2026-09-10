@@ -1037,6 +1037,12 @@ export class HarnessApp {
     return this.options.model
   }
 
+  /** 解析指定 providerId 在当前 harness 实际命中的 ChatProvider；未装配的 provider 会回退到默认 Provider */
+  resolveChatProvider(providerId?: string): ChatProvider | undefined {
+    const h = this.harness as { chatProvider?: (id?: string) => ChatProvider } | undefined
+    return h?.chatProvider?.(providerId)
+  }
+
   /**
    * 运行时切换模型：接受 `[provider/]modelId` 规格（如 `openai/gpt-4o` 跨 Provider 切换），
    * 更新指定 Agent 的 model 并持久化到 config.json（provider + model）作为下次启动默认。
@@ -1794,6 +1800,15 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           const ok = await app.setModel(agentId, arg.trim())
           if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
           out(`已切换模型 ${arg.trim()}（agent=${agentId}，影响下次 send；已写入 config.json）\n`)
+          // 目标 Provider 若未装配到当前 harness，会静默回退默认（如 mock）——明确提示，避免「为什么一直 mock」
+          const parsedSpec = parseModelSpec(arg.trim())
+          if (parsedSpec.providerId) {
+            const actual = app.resolveChatProvider(parsedSpec.providerId)?.id
+            if (actual && actual !== parsedSpec.providerId) {
+              out(`⚠️  当前进程未装配 Provider "${parsedSpec.providerId}"，实际将以 "${actual}" 发送。\n` +
+                `   请重启 REPL 使 config.json → providers 中该 Provider 生效（或先写入后再启动）。\n`)
+            }
+          }
           return 'continue'
         }
         case '/config': {

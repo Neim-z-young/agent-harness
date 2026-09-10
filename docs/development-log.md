@@ -1,5 +1,24 @@
 # Agent Harness 开发日志
 
+## 2026-09-10（续 93）`/model` 切换到未装配 Provider 时明确警告（不再静默回退 mock）
+
+### 问题
+
+用户在 config.json `providers` 里定义了 `local`（type openai），`/model local/deepseek-flash` 切换后 send 却一直是 `(Mock Provider)`。根因：**当前运行进程的默认 Provider 落在 mock，且 harness 未装配 `local` 的 ChatProvider**；运行时 `/model` 只改 agent.model 与 config.json，并未把新 Provider 加载进 harness。于是 `resolveChatProvider('local')` 静默回退到默认 mock。
+
+### 改动（packages/cli/src/index.ts）
+
+- 新增公开方法 `resolveChatProvider(providerId)`，代理到底层 harness 的 provider 解析。
+- `/model <provider>/<model>` 成功切换后，若目标 provider 在当前 harness 未装配（解析到的 actual.id 不等于请求的 providerId），打印明确警告：`⚠️ 当前进程未装配 Provider "xxx"，实际将以 "yyy" 发送。请重启 REPL 使 config.json → providers 生效`。
+
+### 说明
+
+Provider 装配发生在 boot：默认 provider 若已在 config `providers`（type 有效），本就会安装并编程命中；该警告主要兜底「列表里可切换、但当前进程未装配」的边界，避免用户困惑「为什么一直 mock」。
+
+### 验证
+
+- `bun run typecheck` 通过；`bun test` 187 全绿，无回归。
+
 ## 2026-09-10（续 92）修复 send 统计行 `model=` 只显示 modelId、丢 provider 前缀
 
 ### 问题
