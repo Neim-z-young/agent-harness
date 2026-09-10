@@ -1,5 +1,14 @@
 # Agent Harness 开发日志
 
+## 2026-09-10（续 90）完善 README：TUI 文件引用/编辑用法 + config.json 配置说明
+
+### 改动
+
+- **README 命令区**：REPL 内置命令段更新为与 `REPL_COMMANDS` + TUI 本地命令一致（含 `/sessions` `/new` `/resume` `/switch` `/model` `/config` `/save` `/plugins` `/skills` `/stats` `/permission` 及 TUI 的 `/history` `/tree` `/edit`）；CLI 选项补充 `--tui`。
+- **README 新增「TUI 文件引用与编辑」小节**：侧栏「文件」Tab 自动收集 `path[:line]` 引用、Tab 进入导航/↑↓/Enter 打开/Esc 返回；`/edit <file[:line]>` 前台外部编辑器（`$EDITOR`/`$VISUAL`→vim/nvim/nano，不落 macOS `open`）退出后回读；`/tree [path]` 磁盘文件树 + `*` 引用标记（排除 .git/node_modules，3 层/100 项上限）；`/history`。
+- **README 新增「Configuration」章节**：两级 config.json 加载（project 覆盖 user）、CLI > config.json > 环境变量优先级、顶层字段表、`providers[]` 及 apiKey 三种格式（明文 / `${ENV_VAR}` / `enc:v1:` AES-256-GCM）、`agents[]` 工具/MCP 白名单覆盖、`mcpServers[]` 三种 transport + enabled/tools 两级开关、`permissions.json`。
+- **README Documentation 链接**：补 `mcp-services.md` / `workspace-management.md` / `codeintel-plugin.md`。
+
 ## 2026-09-09（续 89）TUI /tree 语义修正：磁盘真实文件树 + 对话引用 * 标记
 
 ### 问题
@@ -231,7 +240,7 @@ TUI 测试 71 pass（含输入历史导航、命令菜单、文件引用导航�
 - `.harness/.gitignore` 已含 `worktrees/`，worktree 目录不入库。
 - 子代理 worktree 生命周期内置管理：续接复用同一 worktree，任务完成不自动删除，可由 `/worktrees remove` 回收。
 
-## 2026-09-06（续 77）TUI/REPL 多行输入：readline 单行 → OpenTUI <textarea>
+## 2026-09-06（续 77）TUI/REPL 多行输入：readline 单行 → OpenTUI
 
 > 承接续 76 标注的「TUI/REPL 多行输入」方向。把 cli TUI 底部输入从单行 `<input>` 升级为 OpenTUI `<textarea>` 多行编辑器：Enter 插入换行、Meta/⌘+Enter 提交，同时保留命令菜单 / 输入历史 / 文件引用导航等既有交互，并验证粘贴多行文本被完整保留。
 

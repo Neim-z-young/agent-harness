@@ -66,20 +66,44 @@ harness help                          显示帮助
   -s, --session <id>        指定会话 ID
   -d, --data-dir <dir>      持久化目录（默认 ~/.harness）
       --permission <mode>   allow-all / ask（默认 ask）
+      --tui                 以 TUI（alt-screen 全屏）模式启动 REPL
   -v, --verbose             调试日志
 ```
 
 ### REPL 内斜杠命令
 
+内置命令（`/help` 列出全部，其余命令由插件注册）：
+
 ```
-/help                              显示所有可用命令
-/compact [prune|summary|agent|auto] 压缩当前会话历史
-/search <keyword>                 关键词搜索历史会话
-/export [path]                    导出当前会话为 Markdown
-/mcp [servers|tools|resources|read <uri>|prompts|prompt <name>]  MCP 服务器管理
-/subagents                        列出已注册的子 Agent
-/exit                              退出 REPL
+/help               显示所有可用命令
+/exit  /quit        退出 REPL
+/sessions           列出持久化会话
+/new                新建会话
+/resume <id>        恢复指定会话
+/switch <id>        切换到另一会话
+/model [spec]       查看 / 切换模型（如 /model openai/gpt-4o）
+/config             查看 config.json 配置概览
+/save               保存当前会话
+/compact [prune|summary|agent|auto]  压缩当前会话历史
+/plugins            插件管理（list / enable / disable / reload）
+/skills             技能管理（list / enable / disable / reload）
+/stats  /stats-export  用量统计
+/permission         权限交互模式与规则（permissions.json）
+/history            查看输入历史
+/tree [path]        打印磁盘文件树（对话引用过的文件带 *）
+/edit <file[:line]> 挂起 TUI 前台打开外部编辑器（编辑后回读）
 ```
+
+### TUI 文件引用与编辑
+
+TUI（`harness repl --tui` 或 `startTuiRepl`）会在对话过程中**自动收集 `path[:line]` 形式的文件引用**，展示在侧栏「文件」标签：
+
+- **Tab** 进入文件引用导航；**↑/↓** 移动选中；**Enter** 用本机编辑器前台打开该文件（解析 `path:line:column`）；**Esc** 返回输入框；**Tab** 切到会话列表。
+- **`/edit <file[:line]>`**：挂起 TUI，前台打开外部编辑器，退出后回读文件末尾若干行注入会话，方便把编辑结果交还给 LLM。路径支持 `~` 展开与相对 `cwd`。编辑器优先级：`$EDITOR` / `$VISUAL` → `vim`/`nvim`/`nano`（不采用 macOS `open`，因其异步打开会与 alt-screen 冲突）。
+- **`/tree [path]`**：扫描磁盘打印真实目录树；对话中出现过的文件以 `*` 标记。默认排除 `.git`/`node_modules`/`.DS_Store`，限制 3 层深、最多 100 项（超出标注「截断」）。无参默认 `cwd`，也支持 `~` 与相对路径。
+- **`/history`**：查看输入历史。
+
+> 完整交互式目录树（多根浏览 / 展开折叠）计划在图形页面实现；TUI 以 `/tree` 命令轻量呈现。
 
 ### 运行测试
 
@@ -87,6 +111,88 @@ harness help                          显示帮助
 bun test                    # 全部测试
 bun run typecheck           # 全部类型检查
 ```
+
+## Configuration（config.json）
+
+配置通过两级 `config.json` 加载：user 级 `~/.harness/config.json` 与 project 级 `.harness/config.json`，**project 级覆盖 user 级**。数据目录由 `--data-dir` 指定（默认 `~/.harness`），承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。
+
+**配置来源优先级**：CLI 参数 > config.json > 环境变量。例如 `--provider` / `--model` 会覆盖 config.json 的同名项。
+
+### config.json 顶层字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `agentId` | string | 默认 Agent ID（缺省 `default`） |
+| `provider` | string | 默认 Provider id（`anthropic` / `openai` / `gemini` / 自定义） |
+| `model` | string | 默认模型 ID；可写 `openai/gpt-4o` 跨 Provider 指定 |
+| `anthropicApiKey` | string | Anthropic API Key（命令行快捷配置） |
+| `providers` | ProviderConfig[] | 自定义 Provider 定义（见下） |
+| `agents` | AgentOverride[] | 按 id 覆盖 Agent 的工具白名单 / MCP server 白名单 |
+| `mcpServers` | McpServerEntry[] | 托管的外部 MCP server（支持运行时 `/mcp` 启停，写回本字段） |
+| `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
+| `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
+
+### providers 数组
+
+每个 Provider 定义（`ProviderConfig`）：
+
+| 字段 | 说明 |
+|------|------|
+| `id` | 唯一 ID，运行时 `provider/model` 前缀据此分发（`anthropic` / `openai` / `deepseek` / `ollama`…） |
+| `type` | Provider 类型：内置 `anthropic` / `openai` / `gemini` / `glm` / `qwen` / `mock`；可经插件扩展自定义 |
+| `baseUrl` | API 根路径（如 `https://api.deepseek.com` / `http://localhost:11434`） |
+| `apiKey` | API Key（支持三种格式，见下） |
+| `model` | 该 Provider 默认模型 |
+| `apiPath` | OpenAI 类型专用：API 路径（默认 `/v1/chat/completions`；智谱等可改 `/chat/completions`） |
+| `maxTokens` | `max_tokens` 默认值 |
+| `timeoutMs` | 请求超时（ms） |
+
+`apiKey` 支持三种格式：
+
+- **明文**：`"apiKey": "sk-xxx"`
+- **环境变量引用**：`"apiKey": "${OPENAI_API_KEY}"`（缺失时启动报 `ConfigValidationError`）
+- **AES-256-GCM 密文**：`"apiKey": "enc:v1:<base64>…"`（主密钥来源：`HARNESS_CONFIG_KEY` 环境变量 > `<data-dir>/.config-key`）
+
+### agents 数组
+
+按 `id` 覆盖对应 Agent 的工具与 MCP 能力（由 `/tools` 等插件持久化）：
+
+```json
+"agents": [
+  { "id": "coder", "tools": ["*"], "mcpServers": ["gh"], "excludeMcpServers": [] }
+]
+```
+
+- `tools`：工具白名单，指定数组则收窄缺省的 `["*"]`
+- `mcpServers` / `excludeMcpServers`：Agent 级 MCP server 白名单 / 黑名单，白名单优先；缺省（undefined）= MCP 全可见，`[]` = 拒绝全部 MCP
+
+### mcpServers 数组
+
+从 config.json 以 JSON 形式托管外部 MCP server（`McpServerEntry` = `McpServerConfig` + 两级启停开关）：
+
+```json
+"mcpServers": [
+  { "name": "fs", "transport": "stdio", "command": "npx", "args": ["-y", "server-fs", "/tmp"], "enabled": true },
+  { "name": "remote", "transport": "http", "url": "https://mcp.example.com/sse",
+    "auth": { "bearerToken": "xxx" }, "enabled": true, "tools": { "read_file": true } }
+]
+```
+
+- transport：`stdio` / `sse` / `http`。缺省时按字段推断：有 `command` → stdio，有 `url` → http。
+- stdio：`command` / `args` / `env`；http/sse：`url` + `auth`。
+- `auth`：`bearerToken` / `authorizationHeader` / `headers` / `oauth`（OAuth2 PKCE，token 加密存 `dataDir/oauth-tokens.json`）。
+- `enabled`：服务器级开关（缺省 true）；`tools`：工具级开关（key=基础工具名，value=false 停用）。
+- 经 `/mcp` 命令可即时启停并写回本字段；工具的启停统一走 `/tools` 命令。
+
+### permissions.json
+
+`<data-dir>/permissions.json`：权限规则持久化，由 `/permission` 命令维护：
+
+```json
+{ "rules": { "*": "ask", "bash": "deny" } }
+```
+
+交互模式（`allow-all` / `ask` / `deny-all`）通过 `--permission` 或 `/permission` 切换。
 
 ## Skill Configuration
 
@@ -497,6 +603,9 @@ const mcpPlugin = createMcpClientPlugin({
 
 - [架构设计文档](docs/agent-harness-architecture.md) — 设计理念、总体架构、核心模块详解、实现路径
 - [开发日志](docs/development-log.md) — 每日开发进度、遇到的问题与修复、下一步计划
+- [MCP 服务](docs/mcp-services.md) — MCP server 注册方法、配置字段、命令用法、运行机制与凭据安全
+- [工作区管理](docs/workspace-management.md) — 两级工作区目录、config/permissions/sessions 数据布局
+- [代码情报插件](docs/codeintel-plugin.md) — CodeIntel 插件规划与实现说明
 
 ## Tech Stack
 
