@@ -1254,8 +1254,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current, usage)
 
   const renderBlock = (b: ChatBlock) => {
-    // 对话消息（用户/助手/工具且非空）在正文下加一行鼠标「复制」按钮 —— 工具/报错信息也可复制
-    const copyable = (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool') && b.text.trim().length > 0
+    // 对话消息（用户/助手/工具/命令输出，非空）在正文下加一行鼠标「复制」按钮 —— 工具/报错/命令结果也可复制
+    const copyable =
+      (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool' || b.kind === 'system') &&
+      b.text.trim().length > 0
     if (copyable) {
       return (
         <box key={b.id} flexDirection="column">

@@ -1,5 +1,42 @@
 # Agent Harness 开发日志
 
+## 2026-09-10（续 95）MCP 懒加载 / 插件可解析 / 命令输出复制按钮
+
+### 一、MCP 服务懒加载，不影响应用启动
+
+**问题**：`config.json` 里配置的 MCP 服务在 `harness.start` 同步连接，连接慢或失败会阻塞应用启动。
+
+**改动（packages/plugins/mcp-server-registry/src/index.ts）**：
+- 移除 `harness.start` 中的同步连接逻辑。
+- 新增 `ensureConnected()`：在**首次 `tool.pool.assemble`（首条消息 / `/tools` / `/mcp` 等真正需要工具时）**才连接所有「启用」server。
+- 用 `managedInflight` / `codeInflight` 做 in-flight 去重，避免并发重复连接；单个 server 连接失败仅被跳过，不影响启动与其他 server。
+- 修正 `/mcp servers` 与 server 列表：懒加载下运行时为空，改把 `reg.list()`（代码注册 & 托管登记）纳入判断，确保注册 server 始终可见。
+- `tool.pool.assemble` 在装配前先调 `ensureConnected`，保证首次用到工具时已连接。
+
+**验证**：单测在启动后手动触发一次 `tool.pool.assemble` 再断言连接与工具装配，mcp-server-registry 相关测试全绿。
+
+### 二、/plugins 未显示 SubagentPlugin / CoordinatorPlugin（插件配置未生效）
+
+**问题**：根目录插件（`.harness/plugins/coordinator.ts` 等）启动报 `Cannot find module '@harness/subagent'`，`/plugins` 看不到这两个插件。
+
+**根因**：项目根目录 `.harness/plugins/*.ts` 的运行时入口解析 `@harness/*` 依赖时，根 `node_modules` 没有这些包的链接，导致插件加载报错被吞、插件未登记。
+
+**改动（根 package.json）**：
+- 根 `package.json` 增加 `dependencies`，列出全部 `@harness/*` 包的 `workspace:*` 依赖，使根 `node_modules` 生成链接。
+- 重新 `bun install` 后，`.harness/plugins/coordinator.ts` 等插件可被正确解析、加载并出现在 `/plugins`。
+
+### 三、命令执行结果支持复制按钮
+
+**状态与改动（packages/cli/src/tui.tsx）**：
+- 复制按钮原来只对 `user` / `assistant` / `tool` 块开放；命令输出（如 `/plugins`、目录列表等）属于 `system` 块，无复制按钮。
+- 将 `system` 块纳入 `copyable` 判断（文本非空即可复制），使 `/plugins` 等命令执行结果也显示「⧉ 复制」按钮。
+
+### 验证
+
+- 全量 `typecheck` 通过（30 个包全部 Exit 0）。
+- 存量 607 个 fail 全部来自各包 `dist` 构建产物内嵌的 OpenTUI 第三方测试（`reference/` 与第三方测试框架产物），属预先存在的环境性问题，与本改动无关。
+- 本项目 packages 相关测试全绿：`packages/`（不含第三方产物）与 subagent/coordinator/plugin/mcp 等均 pass、0 fail。
+
 ## 2026-09-10（续 94）启动时输出默认 Provider 装配日志
 
 ### 问题

@@ -148,7 +148,6 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   const serverSource = new Map<string, string>()
   /** CLI 注入的持久化回调 */
   let cliStore: McpCliStore | undefined
-  let connected = false
   /** 事件退订句柄（install 注册、uninstall 退订） */
   const offs: Unsubscribe[] = []
 
@@ -179,46 +178,60 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     })()
   }
 
-  /** 连接一个托管条目，失败返回 false */
+  /** 连接一个托管条目，失败返回 false（in-flight 去重，供懒加载并发安全） */
+  const managedInflight = new Map<string, Promise<boolean>>()
   async function connectManaged(name: string): Promise<boolean> {
     const m = managed.get(name)
     if (!m) return false
     if (runtimes.some((r) => r.name === name)) return true
-    try {
-      const rt = await makeRuntime(name, m.entry, m.entry)
-      runtimes.push(rt!)
-      return true
-    } catch {
-      return false
-    }
+    const inflight = managedInflight.get(name)
+    if (inflight) return inflight
+    const p = (async () => {
+      try {
+        const rt = await makeRuntime(name, m.entry, m.entry)
+        runtimes.push(rt!)
+        return true
+      } catch {
+        return false
+      }
+    })().finally(() => managedInflight.delete(name))
+    managedInflight.set(name, p)
+    return p
   }
 
   /**
    * 连接一个「代码注册」server（当前未连接则建立运行时并登记归属索引）。
-   * 与 harness.start 的代码注册循环共用，供 /mcp enable 在会话内重新启用禁用项。
+   * 与懒加载 assemble 共用，供 /mcp enable 在会话内重新启用禁用项。
    */
+  const codeInflight = new Map<string, Promise<McpServerRuntime | undefined>>()
   async function connectCodeServer(name: string): Promise<McpServerRuntime | undefined> {
     const item = reg.list().find((r) => r.name === name)
     if (!item) return undefined
     const existing = runtimes.find((r) => r.name === name)
     if (existing) return existing
-    let transport: McpTransport
-    let config: McpServerConfig | undefined
-    if ('config' in item) {
-      config = item.config
-      transport = defaultTransportFactory(item.config, { dataDir: item.dataDir ?? dataDir })
-    } else {
-      transport = await item.createTransport()
-    }
-    const client = new McpClient(item.name, transport, config)
-    await client.connect()
-    const tools = await client.listTools()
-    const harnessTools = tools.map((t) => convertMcpToolToHarnessTool(t, item.name, client))
-    globalMcpToolIndex.index(item.name, harnessTools.map((t) => t.id))
-    if (item.source) serverSource.set(item.name, item.source)
-    const rt: McpServerRuntime = { name: item.name, client, tools: harnessTools }
-    runtimes.push(rt)
-    return rt
+    const inflight = codeInflight.get(name)
+    if (inflight) return inflight
+    const p = (async () => {
+      let transport: McpTransport
+      let config: McpServerConfig | undefined
+      if ('config' in item) {
+        config = item.config
+        transport = defaultTransportFactory(item.config, { dataDir: item.dataDir ?? dataDir })
+      } else {
+        transport = await item.createTransport()
+      }
+      const client = new McpClient(item.name, transport, config)
+      await client.connect()
+      const tools = await client.listTools()
+      const harnessTools = tools.map((t) => convertMcpToolToHarnessTool(t, item.name, client))
+      globalMcpToolIndex.index(item.name, harnessTools.map((t) => t.id))
+      if (item.source) serverSource.set(item.name, item.source)
+      const rt: McpServerRuntime = { name: item.name, client, tools: harnessTools }
+      runtimes.push(rt)
+      return rt
+    })().finally(() => codeInflight.delete(name))
+    codeInflight.set(name, p)
+    return p
   }
 
   /** 断开并移除 one server（close 客户端，并清除其工具归属索引） */
@@ -230,6 +243,23 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     }
     globalMcpToolIndex.unindex(name)
     serverSource.delete(name)
+  }
+
+  /** 懒加载：首次工具池装配（assemble）时连接所有「启用」server（in-flight 去重，失败仅跳过） */
+  async function ensureConnected(): Promise<void> {
+    const down = new Set<string>(downTools.keys())
+    const jobs: Promise<unknown>[] = []
+    for (const item of reg.list()) {
+      if (down.has(item.name)) continue
+      if (runtimes.some((r) => r.name === item.name)) continue
+      jobs.push(connectCodeServer(item.name).catch(() => undefined))
+    }
+    for (const [name, m] of managed) {
+      if (!m.enabled || down.has(name)) continue
+      if (runtimes.some((r) => r.name === name)) continue
+      jobs.push(connectManaged(name).catch(() => false))
+    }
+    if (jobs.length) await Promise.all(jobs)
   }
 
   /** 持久化当前托管条目到 config.json；无回调时静默跳过 */
@@ -304,36 +334,15 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
         },
 
         async 'harness.start'() {
-          if (connected) return
-          // ① 代码注册的 server（位于 runtimes，不受托管开关控制；本次进程可经 /mcp disable 会话内禁用）
-          const items = reg.list()
-          for (const item of items) {
-            try {
-              const rt = await connectCodeServer(item.name)
-              if (!rt) throw new Error('连接失败，返回空运行时')
-              ctx.log.info(`MCP Server "${item.name}" 已启动并连接`, {
-                transport: 'config' in item ? (item.config.transport ?? (item.config.command ? 'stdio' : 'http')) : 'in-process',
-                tools: rt.tools.map((t) => t.id),
-              })
-            } catch (err) {
-              ctx.log.error(`MCP Server "${item.name}" 启动/连接失败`, {
-                error: (err as Error)?.message ?? String(err),
-              })
-            }
-          }
-          // ② 托管配置条目（来自 config.json）：仅连接已启用的 server
-          for (const [name, m] of managed) {
-            if (!m.enabled) continue
-            const ok = await connectManaged(name)
-            if (!ok) {
-              ctx.log.error(`MCP Server "${name}" 启动/连接失败（config.json mcpServers）`, {})
-            }
-          }
-          connected = true
+          // 懒加载：启动不预连 MCP server，避免阻塞应用启动。
+          // 首次 tool.pool.assemble（首条消息 / /tools / /mcp 等真正需要工具时）才连接；
+          // 单个 server 连接失败仅被跳过，不影响启动与其他 server。
         },
 
         async 'tool.pool.assemble'(_input, pool) {
           const p = pool as { add: (t: unknown) => void; remove?: (id: string) => void }
+          // 懒加载：装配工具前确保「启用」server 已连接（in-flight 去重，失败仅跳过）
+          await ensureConnected()
           // ① 先把「已禁用」server 的工具从池中移除（收敛运行时 ToolRegistry，避免残留可调用）
           if (p.remove) {
             for (const [, ids] of downTools) for (const id of ids) p.remove(id)
@@ -354,7 +363,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
         },
 
         'cli.commands'(input) {
-          if (runtimes.length === 0 && managed.size === 0) return
+          if (runtimes.length === 0 && managed.size === 0 && reg.list().length === 0) return
           input.commands.push({
             command: 'mcp',
             description: 'MCP Server 生命周期管理（config.json 装配、服务器级启停）',
@@ -380,7 +389,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
           const out = (s: string) => input.out(s)
 
           const serverList = () => {
-            if (runtimes.length === 0 && managed.size === 0) { out('（无已注册的 MCP Server）\n'); return }
+            if (runtimes.length === 0 && managed.size === 0 && reg.list().length === 0) { out('（无已注册的 MCP Server）\n'); return }
             out(`已注册 ${managed.size + reg.list().length} 个 MCP Server（` + (cliStore ? 'config.json 托管 + 代码注册' : '全部为代码注册') + `）：\n`)
             for (const [name, m] of managed) {
               const rt = runtimes.find((r) => r.name === name)
@@ -476,7 +485,6 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
       managed.clear()
       downTools.clear()
       cliStore = undefined
-      connected = false
     },
   }
 }

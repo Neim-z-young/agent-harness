@@ -140,6 +140,8 @@ describe('createMcpServerRegistryPlugin', () => {
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
     await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+    // 懒加载：经过一次 tool.pool.assemble 后才真正连接 server（启动不预连）
+    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, fakePool())
 
     // 无服务器注册时可不出现在命令列表
     const cmdInput1: any = { commands: [] }
