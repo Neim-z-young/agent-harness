@@ -1,0 +1,1 @@
+列出文件或目录中的代码符号（函数/类/变量/接口/类型/枚举/导入）。基于 AST 解析：TS/TSX/JS/JSX 走 babel，Go/Python/Rust/Java 走 tree-sitter，返回符号名、类型、位置与签名。

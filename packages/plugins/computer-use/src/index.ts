@@ -20,6 +20,8 @@ import type { Skill } from '@harness/skill'
 import { registerMcpServer, unregisterMcpServer } from '@harness/mcp-server-registry'
 import { ComputerUseBackend, type ComputerUseBackendOptions } from './mac'
 import { ComputerUseMcpServer, createComputerUseServerTransport } from './server'
+// Computer Use 操作指南（plugin 来源 Skill 内容），prompts/computer-use-skill.txt 加载
+import computerUseSkillContent from './prompts/computer-use-skill.txt'
 
 export const COMPUTER_USE_SERVER_NAME = 'computer-use'
 
@@ -31,25 +33,8 @@ export interface ComputerUsePluginOptions {
   backendOptions?: ComputerUseBackendOptions
 }
 
-/** Computer Use 操作指南（plugin 来源 Skill 内容） */
-const COMPUTER_USE_SKILL_CONTENT = `# Skill: Computer Use
-
-在通过 Computer Use 操作应用 UI、查看应用 UI 状态或执行桌面交互之前，
-必须先遵循本指南。优先使用专门用途的 MCP（如 browseruse）或 CLI，
-除非用户明确要求使用 Computer Use。
-
-## 工作流
-
-1. 初始化：先 \`list_apps\` 获取目标应用的 bundleId，再 \`get_app_state\` 获取 UI 树 + 截图。
-   \`get_app_state\` 必须在每次与应用交互前调用一次。
-2. 执行动作：\`click\` / \`scroll\` / \`drag\` / \`type_text\` / \`press_key\` / \`perform_action\` / \`set_value\` / \`select_text\`。
-3. 每次动作后再调用 \`get_app_state\` 获取最新状态，避免使用过期的 element_id。
-
-## 要点
-- \`type_text\` 前务必先 \`click\` 目标输入框使其获得焦点。
-- 需要等待 UI 更新时不要轮询 \`get_app_state\`，用 Shell 等待（如 \`sleep 3\`）后再取状态。
-- 权限不足时先 \`check_permissions\` 检查「辅助功能」与「屏幕录制」授权。
-`
+/** Computer Use 操作指南（plugin 来源 Skill 内容，见 prompts/computer-use-skill.txt） */
+const COMPUTER_USE_SKILL_CONTENT = computerUseSkillContent.trim()
 
 /** 创建 computer-use 插件工厂 */
 export function createComputerUsePlugin(options: ComputerUsePluginOptions = {}): AgentPlugin {

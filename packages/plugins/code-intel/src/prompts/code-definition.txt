@@ -1,0 +1,1 @@
+符号 go-to-definition：返回符号的声明位置（文件/行/列/类型/签名）。先索引目标目录（AST 解析，babel+tree-sitter 双后端），再定位声明。

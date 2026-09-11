@@ -1,0 +1,1 @@
+结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰；支持 scope 子目录限定、resolveImporters 跨目录反向 import）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）/ replace_subtree（按成员链如 config.server.host 定位子表达式替换，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。

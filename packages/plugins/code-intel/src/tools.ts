@@ -19,6 +19,11 @@ import {
   type CodeSemanticEditInput,
   type CodeSemanticEditOutput,
 } from './core'
+// 工具提示词文本（prompts/*.txt，import 加载，参考 opencode）
+import codeSymbolsPrompt from './prompts/code-symbols.txt'
+import codeReferencePrompt from './prompts/code-reference.txt'
+import codeDefinitionPrompt from './prompts/code-definition.txt'
+import codeSemanticEditPrompt from './prompts/code-semantic-edit.txt'
 
 // ===== 共享 helper =====
 
@@ -52,7 +57,7 @@ export interface CodeSymbolsOutput {
 export const codeSymbolsTool = (index: CodeIntelIndex): Tool<CodeSymbolsInput, CodeSymbolsOutput> =>
   defineTool<CodeSymbolsInput, CodeSymbolsOutput>({
     id: 'code_symbols',
-    description: '列出文件或目录中的代码符号（函数/类/变量/接口/类型/枚举/导入）。基于 AST 解析：TS/TSX/JS/JSX 走 babel，Go/Python/Rust/Java 走 tree-sitter，返回符号名、类型、位置与签名。',
+    description: codeSymbolsPrompt.trim(),
     inputSchema: makeSchema<CodeSymbolsInput>(),
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
@@ -101,7 +106,7 @@ export interface CodeReferenceOutput {
 export const codeReferenceTool = (index: CodeIntelIndex): Tool<CodeReferenceInput, CodeReferenceOutput> =>
   defineTool<CodeReferenceInput, CodeReferenceOutput>({
     id: 'code_reference',
-    description: '查找某符号在代码中的引用（usages，含跨文件）。先索引目标目录（AST 解析），再返回所有使用位置（行/列 + 上下文）；TS/JS 语义引用，Go/Python/Rust/Java 名字命中型引用。',
+    description: codeReferencePrompt.trim(),
     inputSchema: makeSchema<CodeReferenceInput>(),
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
@@ -151,7 +156,7 @@ export interface CodeDefinitionOutput {
 export const codeDefinitionTool = (index: CodeIntelIndex): Tool<CodeDefinitionInput, CodeDefinitionOutput> =>
   defineTool<CodeDefinitionInput, CodeDefinitionOutput>({
     id: 'code_definition',
-    description: '符号 go-to-definition：返回符号的声明位置（文件/行/列/类型/签名）。先索引目标目录（AST 解析，babel+tree-sitter 双后端），再定位声明。',
+    description: codeDefinitionPrompt.trim(),
     inputSchema: makeSchema<CodeDefinitionInput>(),
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
@@ -190,7 +195,7 @@ export const codeSemanticEditTool = (
 ): Tool<CodeSemanticEditInput, CodeSemanticEditOutput> =>
   defineTool<CodeSemanticEditInput, CodeSemanticEditOutput>({
     id: 'code_semantic_edit',
-    description: '结构感知编辑：rename（符号重命名，只改精确 AST 标识符位点，字符串与 obj.x 属性不触碰；支持 scope 子目录限定、resolveImporters 跨目录反向 import）/ replace_node（按 AST 节点范围替换，圈选自动吸附到节点）/ replace_subtree（按成员链如 config.server.host 定位子表达式替换，path 可为目录批量）。落盘前重解析校验结构，dryRun 预览。',
+    description: codeSemanticEditPrompt.trim(),
     inputSchema: makeSchema<CodeSemanticEditInput>(),
     isReadOnly: () => false,
     isConcurrencySafe: () => false,

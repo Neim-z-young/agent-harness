@@ -1,5 +1,35 @@
 # Agent Harness 开发日志
 
+## 2026-09-11（续 99）工具插件提示词外置（长文本）——code-intel + computer-use
+
+### 背景
+
+承接续 97/98，用户要求把各工具插件里面向 LLM 的提示词也统一外置。经确认采用「只外置长文本提示词」策略：**短单行 description（≤110 字符）是结构化工具签名，保留内联**；**指令性长文本外置**。
+
+### 现状盘点
+
+- tools-builtin（read/write/bash/edit）、tools-search（list_dir/grep_file）、tools-glob、tools-media（view_image）、tools-web（web_fetch）、swarm（约 10 个工具）：description 均为短单行，不符合外置策略，保留。
+- **code-intel**：4 个工具 description 较长（`code_semantic_edit` 约 200+ 字符）→ 外置。
+- **computer-use**：`COMPUTER_USE_SKILL_CONTENT`（一整段 Skill 操作指南）→ 外置。
+
+### 改动
+
+1. **code-intel**（packages/plugins/code-intel/src）
+   - 新增 `prompts/code-symbols.txt` / `code-reference.txt` / `code-definition.txt` / `code-semantic-edit.txt`。
+   - `tools.ts` 的 4 个 `description` 改由 import 文本加载（`.trim()`）。
+2. **computer-use**（packages/plugins/computer-use/src）
+   - 新增 `prompts/computer-use-skill.txt`。
+   - `COMPUTER_USE_SKILL_CONTENT = computerUseSkillContent.trim()`，`register` Skill 时仍复用该常量（测试/逻辑不变）。
+
+各包新增 `src/env.d.ts`（`declare module '*.txt'`）保证 tsc 通过。
+
+### 验证
+
+- 全量 typecheck 通过（30 包全部 Exit 0）。
+- code-intel + computer-use 测试 86 pass 0 fail。
+
+此后所有运行时提示词（默认 Agent / Coordinator / Subagent / MCP 资源 / 工具插件长文本 / Computer Use Skill）均已外置为独立 `.txt` 文件，统一 `import` 加载。
+
 ## 2026-09-11（续 98）工具/MCP/Coordinator 提示词外置到文本文件
 
 ### 背景
