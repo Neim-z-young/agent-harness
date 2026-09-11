@@ -22,6 +22,8 @@ import type { Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
 import { defaultUserDir } from '@harness/workspace'
 import { OAuthFlow, type McpOauthConfig } from './oauth'
 import { OAuthTokenStore, oauthServerKey } from './token-store'
+// MCP 资源注入模板（prompts/mcp-resources.txt，import 加载，参考 opencode）
+import mcpResourceTemplate from './prompts/mcp-resources.txt'
 
 // ===== 类型定义 =====
 
@@ -789,12 +791,17 @@ export function createMcpClientPlugin(options: {
         },
 
         'prompt.system.transform'(_input, parts) {
-          // 注入自动拉取的资源文本
+          // 注入自动拉取的资源文本（模板含 `# MCP Resources` 标题 + `{uri}`/`{text}` 占位符）
           if (injectedResourceCache.size > 0) {
-            const section = Array.from(injectedResourceCache.entries())
-              .map(([uri, text]) => `## MCP Resource: ${uri}\n${text}`)
+            const rendered = Array.from(injectedResourceCache.entries())
+              .map(([uri, text]) => mcpResourceTemplate.replace('{uri}', uri).replace('{text}', text))
+            // 模板第一条自带标题；后续条目剥离标题行后拼接，避免重复标题
+            const [first = '', ...rest] = rendered
+            const header = mcpResourceTemplate.match(/^(# [^\n]+\n+)/)?.[1] ?? '# MCP Resources\n\n'
+            const extra = rest
+              .map((r) => r.startsWith(header) ? r.slice(header.length) : r)
               .join('\n\n')
-            if (section) parts.push(`\n\n# MCP Resources\n\n${section}`)
+            parts.push(extra ? `\n\n${first}\n\n${extra}` : `\n\n${first}`)
           }
         },
 

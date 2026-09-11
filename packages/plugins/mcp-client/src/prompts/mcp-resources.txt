@@ -1,0 +1,4 @@
+# MCP Resources
+
+## MCP Resource: {uri}
+{text}

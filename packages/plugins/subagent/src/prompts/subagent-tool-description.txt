@@ -1,0 +1,1 @@
+派一个子 Agent 执行独立任务（隔离 session）。输入：agentId（子 Agent ID）、prompt（任务描述）、description（3-5 词简短描述，可选）、model（模型覆盖，可选）、sessionId（续接已有子 session，可选）、runInBackground（可选）。决策规则：需要结果才能继续 → 前台（默认）；有独立工作可并行、或无需阻塞当前流程 → runInBackground: true（后台异步执行，立即返回 taskId）。后台任务完成后系统自动向本会话注入任务完成通知，不要 sleep/poll/主动查询进度。

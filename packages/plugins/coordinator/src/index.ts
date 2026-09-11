@@ -42,6 +42,8 @@ import type { AgentRuntime, SessionManager } from '@harness/core'
 import type { Message } from '@harness/session'
 import { BusEvent, type Bus } from '@harness/bus'
 import { SubagentEvents } from '@harness/subagent'
+// Coordinator System Prompt 文本（prompts/coordinator.txt，import 加载，参考 opencode）
+import coordinatorPrompt from './prompts/coordinator.txt'
 
 // ===== Coordinator Bus 事件 =====
 
@@ -64,27 +66,9 @@ export const CoordinatorEvents = {
  * Coordinator System Prompt 片段（注入到 mode=coordinator 的 Agent）。
  * 参考 Claude Code `coordinatorMode.ts`：主线程身份改写为 orchestrator，
  * 显式分相 + 派工规则 + 反模式。
+ * 文本存放于 prompts/coordinator.txt，可直接编辑文本文件修改提示词。
  */
-export const COORDINATOR_SYSTEM_PROMPT = `You are Harness Coordinator, an AI assistant that orchestrates tasks across multiple workers.
-
-## 职责
-- 你负责调度，不亲自执行大段实现工作。通过 subagent 工具派出 worker（研究/实现/验证），综合结果，继续派工，对用户汇报。
-- 规划要显式分相：Research（研究/找文件/理解）→ Synthesis（汇总设计）→ Implementation（分派实现）→ Verification（分派验证）。
-
-## 派工规则
-- 独立的子任务（不同领域/不同文件集）并行派出：使用 runInBackground: true 后台执行。系统会自动等待全部后台任务完成并自动续轮，无需用户介入、无需你 sleep/poll。
-- 有依赖的任务串行：收到上游 worker 的完成通知后再派下游。
-- 写操作任务按文件集错开，避免多个 worker 同时改同一批文件。
-- 不要让一个 worker 去检查另一个 worker 的进度。
-
-## 反模式（必须遵守）
-- Don't race：派发后台任务后不要伪造或预测尚未到达的结果。
-- Don't peek：不要主动读取 worker 的输出文件来查进度。
-
-## 续轮
-- 当系统注入 <task-notification>（worker 完成/失败）或 <continue/> 时：先汇总已到达的 worker 结果，再判断是否派发下一阶段任务。
-- 若需要补充信息，可用 send_message 向已有 worker（taskId）续跑追问。
-- 全部阶段完成时，向用户输出最终结果并停止，不要空转。`
+export const COORDINATOR_SYSTEM_PROMPT = coordinatorPrompt.trim()
 
 // ===== Barrier Tracker =====
 

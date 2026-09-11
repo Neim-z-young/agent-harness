@@ -1,5 +1,33 @@
 # Agent Harness 开发日志
 
+## 2026-09-11（续 98）工具/MCP/Coordinator 提示词外置到文本文件
+
+### 背景
+
+承接续 97（默认 Agent 提示词外置），用户要求把其余运行时提示词（工具、MCP 等）也统一外置到文本文件，通过文本加载。
+
+### 改动（三处，均为 prompts/*.txt + import 加载，参考 opencode）
+
+1. **Coordinator System Prompt**（packages/plugins/coordinator）
+   - 新增 `src/prompts/coordinator.txt`（orchestrator 职责/派工规则/反模式/续轮指令）。
+   - `COORDINATOR_SYSTEM_PROMPT = coordinatorPrompt.trim()`，仍保持导出常量（测试兼容）。
+
+2. **Subagent 工具提示词**（packages/plugins/subagent）
+   - 新增 `src/prompts/subagent-tool-description.txt`（工具 description，单行决策规则）。
+   - 新增 `src/prompts/subagent-tool-documentation.txt`（工具 documentation，前台/后台规则 + 反模式 + 并行说明）。
+   - `createSubagentTool` 的 `description` / `documentation` 改由文本加载（trim 后使用）。
+
+3. **MCP 资源注入模板**（packages/plugins/mcp-client）
+   - 新增 `src/prompts/mcp-resources.txt`：`# MCP Resources` 标题 + `## MCP Resource: {uri}` / `{text}` 占位符。
+   - `prompt.system.transform` 按模板渲染：第一条自带标题，后续条目剥离标题行拼接，避免标题重复；标题行从模板动态提取（编辑文件后仍跟随）。
+
+各包新增 `src/env.d.ts`（`declare module '*.txt'`）保证 tsc 通过。
+
+### 验证
+
+- 全量 typecheck 通过（30 包全部 Exit 0）。
+- coordinator / subagent / mcp-client 三包测试 165 pass 0 fail。
+
 ## 2026-09-11（续 97）Agent 提示词文本外置：独立 .txt 文件 + import 加载（参考 opencode）
 
 ### 背景

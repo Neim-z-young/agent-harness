@@ -43,6 +43,9 @@ import { writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWorktree } from './worktree'
+// SubagentTool 提示词文本（prompts/*.txt，import 加载，参考 opencode）
+import subagentToolDescription from './prompts/subagent-tool-description.txt'
+import subagentToolDocumentation from './prompts/subagent-tool-documentation.txt'
 
 // ===== Subagent Bus 事件定义 =====
 
@@ -519,32 +522,8 @@ export function createSubagentTool(
   return defineTool<SubagentToolInput, SubagentToolOutput>({
     id: 'subagent',
     aliases: ['agent', 'run_agent', 'task'],
-    description: '派一个子 Agent 执行独立任务（隔离 session）。输入：agentId（子 Agent ID）、prompt（任务描述）、description（3-5 词简短描述，可选）、model（模型覆盖，可选）、sessionId（续接已有子 session，可选）、runInBackground（可选）。决策规则：需要结果才能继续 → 前台（默认）；有独立工作可并行、或无需阻塞当前流程 → runInBackground: true（后台异步执行，立即返回 taskId）。后台任务完成后系统自动向本会话注入任务完成通知，不要 sleep/poll/主动查询进度。',
-    documentation: `SubagentTool 让主 Agent 能派出子 Agent 执行独立任务。
-
-## 前台 / 后台决策规则
-
-- 需要子 Agent 的结果才能继续下一步 → **前台（默认）**：子 Agent 执行完成后，最终回复作为工具结果返回。
-- 子 Agent 有独立工作可并行、或当前流程无需等待其结果 → **后台（runInBackground: true）**：立即返回 taskId，子 Agent 在后台异步执行。
-- 多次 runInBackground=true 调用会在后台并行执行多个子 Agent，互不阻塞。
-
-## 后台模式（runInBackground: true）
-
-立即返回 taskId，子 Agent 在后台异步执行。执行完成后：
-1. 通过 Bus 事件 subagent.completed / subagent.failed 推送（带 taskId）
-2. 自动向父会话注入 <task-notification> 通知（下一轮推理开始时可见），无需主动查询
-
-## 反模式警示（必须遵守）
-
-- do NOT sleep, poll, or proactively check on the subagent's progress — 完成后系统自动通知
-- Don't race — 派发后台任务后不要伪造或预测尚未到达的结果
-- Don't peek — 不要主动读取子 Agent 的输出文件来查进度
-
-## 并行执行多个子 Agent
-
-依赖后台异步执行机制：
-- 同步并行：在一次 assistant 消息中发起多个 subagent 工具调用（各自前台执行，结果直接返回）
-- 后台并行：多次 runInBackground=true 调用，子 Agent 在后台并行执行，完成后自动通知`,
+    description: subagentToolDescription.trim(),
+    documentation: subagentToolDocumentation.trim(),
     searchHint: 'subagent agent task delegate spawn worker background async',
 
     // Fail-Closed 安全声明
