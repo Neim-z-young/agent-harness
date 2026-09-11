@@ -50,6 +50,8 @@ import { CoordinatorEvents } from '@harness/coordinator'
 import { swarmCapability } from '@harness/swarm'
 import { createWorkspacePlugin } from '@harness/workspace-shell'
 import { createSnapshotService, type SnapshotService } from '@harness/snapshot'
+// 默认 Agent 提示词：独立文本文件（prompts/default-agent.txt），import 加载（参考 opencode）
+import defaultAgentPrompt from './prompts/default-agent.txt'
 import {
   ConfigStore,
   SessionFileStore,
@@ -940,7 +942,9 @@ export class HarnessApp {
     await this.saveRules(rules)
   }
 
-  /** 默认 Agent 定义（无 agent 指定时使用）；含 CLI/config 解析出的默认模型 */
+  /** 默认 Agent 定义（无 agent 指定时使用）；含 CLI/config 解析出的默认模型。
+   *  提示词文本存放于 prompts/default-agent.txt（参考 opencode：prompt 独立成文件，import 加载），
+   *  便于直接编辑文本而不改代码。 */
   defaultAgent(): AgentDefinition {
     const def: AgentDefinition = {
       id: this.options.agentId,
@@ -949,10 +953,7 @@ export class HarnessApp {
       mode: 'primary',
       tools: ['*'],
       permission: { '*': 'ask' },
-      promptFragments: [
-        'You are Harness Agent, a helpful assistant with access to tools (file system, shell).',
-        'Be concise and precise.',
-      ],
+      systemPrompt: defaultAgentPrompt.trim(),
     }
     if (this.options.model) {
       const spec = parseModelSpec(this.options.model)

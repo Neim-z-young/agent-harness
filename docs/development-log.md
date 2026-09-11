@@ -1,5 +1,27 @@
 # Agent Harness 开发日志
 
+## 2026-09-11（续 97）Agent 提示词文本外置：独立 .txt 文件 + import 加载（参考 opencode）
+
+### 背景
+
+用户要求把代码中与 Agent 提示词相关的文本分别放到独立文本文件里，通过文本加载，参考 Claude Code 与 opencode 的做法。
+
+### 现状盘点
+
+运行时硬编码的 Agent 提示词只有一处：CLI 默认 Agent（`defaultAgent()`）的 2 条 `promptFragments`（`packages/cli/src/index.ts`）。其余为测试夹具与 JSDoc 示例，不属于运行时提示词。外部 Agent 已支持从 `.harness/agents/*.md` 文本加载（frontmatter + body 作 prompt）。
+
+### 改动
+
+- 新增 `packages/cli/src/prompts/default-agent.txt`：默认 Agent 提示词全文（原 2 条 fragment 合并为一段）。
+- `defaultAgent()` 改为 `systemPrompt: defaultAgentPrompt.trim()`，经 `import defaultAgentPrompt from './prompts/default-agent.txt'` 加载（Bun 原生支持文本文件导入，build 时内联，直接编辑 txt 即可改提示词）。
+- 新增 `packages/cli/src/env.d.ts`：`declare module '*.txt'`，让 tsc 类型检查通过（对齐 opencode 的 `*.txt` 声明方式）。
+
+### 验证
+
+- 全量 typecheck 通过（30 包全部 Exit 0）。
+- 运行时验证：txt 文本正确加载为字符串。
+- cli 测试 190 pass（唯一 fail/error 来自 reference/ 目录缺 `effect` 依赖，属既有环境问题）；agent/core 单测 62 pass 0 fail。
+
 ## 2026-09-11（续 96）命令输出复制按钮每行重复 → 相邻同类块合并，只在末尾显示
 
 ### 问题
