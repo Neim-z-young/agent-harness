@@ -117,4 +117,61 @@ describe('editFileTool', () => {
     expect(editFileTool.isDestructive?.()).toBe(false)
     expect(editFileTool.isConcurrencySafe?.()).toBe(false)
   })
+
+  it('引号归一：文件用花引号，oldString 用直引号也能匹配', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'const s = “hello”;\n')
+
+    const res = await editFileTool.call!({
+      path: 'a.txt',
+      oldString: 'const s = "hello";',
+      newString: 'const s = "world";',
+    } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const after = await import('node:fs/promises').then((m) => m.readFile(join(dir, 'a.txt'), 'utf-8'))
+    // 替换为模型提供的 newString（直引号）
+    expect(after).toBe('const s = "world";\n')
+  })
+
+  it('换行归一：CRLF 文件用 LF oldString 也能匹配，且插入内容保持 CRLF', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'a\r\nold line\r\nb\r\n')
+
+    const res = await editFileTool.call!({
+      path: 'a.txt',
+      oldString: 'old line',
+      newString: 'new line',
+    } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const after = await import('node:fs/promises').then((m) => m.readFile(join(dir, 'a.txt'), 'utf-8'))
+    expect(after).toBe('a\r\nnew line\r\nb\r\n')
+  })
+
+  it('整行删除：newString 为空时顺带删掉尾随换行，不留空行', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'line1\nremove me\nline3\n')
+
+    const res = await editFileTool.call!({
+      path: 'a.txt',
+      oldString: 'remove me',
+      newString: '',
+    } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const after = await import('node:fs/promises').then((m) => m.readFile(join(dir, 'a.txt'), 'utf-8'))
+    expect(after).toBe('line1\nline3\n')
+  })
+
+  it('整行删除：文件末尾无换行时也能删除（不追加多余换行）', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'line1\nremove me')
+
+    const res = await editFileTool.call!({
+      path: 'a.txt',
+      oldString: 'remove me',
+      newString: '',
+    } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const after = await import('node:fs/promises').then((m) => m.readFile(join(dir, 'a.txt'), 'utf-8'))
+    expect(after).toBe('line1\n')
+  })
 })

@@ -1,5 +1,27 @@
 # Agent Harness 开发日志
 
+## 2026-09-11（续 101）edit_file 替换逻辑增强：换行/引号归一 + 整行删除
+
+### 背景
+
+承接续 100（4 个原语工具 documentation 外置），本次针对 **edit_file** 参考 Claude Code（FileEditTool/utils.ts）与 opencode（edit.ts）的替换逻辑，增强匹配与删除的健壮性，避免常见的「精确匹配失败」与「删除留空行」问题。
+
+### 改动（packages/plugins/tools-builtin/src/index.ts）
+
+1. **换行归一**（参考 opencode `convertToLineEnding`）
+   - 读取文件真实换行风格（LF/CRLF），把 old/new string 归一化到同样风格再匹配，CRLF 文件传 `\n` 也能匹配，插入内容保持 CRLF。
+2. **引号归一**（参考 Claude Code `findActualString` / `normalizeQuotes`）
+   - 精确匹配失败时，把花引号（“”‘’）归一为直引号再定位文件里真实的匹配片段，替换为模型提供的 newString。
+3. **整行删除**（参考 Claude Code `applyEditToFile`）
+   - newString 为空且 oldString 不在行末、且内容里真实存在「old+换行」时，顺带删除尾随换行，不留空行；文件末尾无换行时正常直接替换。
+
+新增 helper：`normalizeQuotes` / `findActualString`。同时更新 `prompts/edit-file.txt` 说明这三项增强。
+
+### 验证
+
+- typecheck 通过（30 包全部 Exit 0）。
+- tools-builtin 测试 65 pass 0 fail（新增 4 个用例：花引号匹配、CRLF 归一、行首删行不留空行、文件末尾删行）。
+
 ## 2026-09-11（续 100）4 个原语工具 documentation 外置并注入 LLM 工具定义
 
 ### 背景

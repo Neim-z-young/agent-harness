@@ -678,6 +678,33 @@ export interface EditFileOutput {
   afterSnippet: string
 }
 
+/** 把花引号归一化为直引号（参考 Claude Code findActualString / normalizeQuotes） */
+function normalizeQuotes(s: string): string {
+  return s
+    .replaceAll('‘', "'")
+    .replaceAll('’', "'")
+    .replaceAll('“', '"')
+    .replaceAll('”', '"')
+}
+
+/**
+ * 定位文件里真正的匹配片段。
+ * 先精确匹配；失败时把双方花引号归一化为直引号后再定位，
+ * 返回文件里与该搜索意图对应的原始子串（保留原引号，便于精确替换）。
+ */
+function findActualString(fileContent: string, search: string): string | null {
+  if (fileContent.includes(search)) {
+    return search
+  }
+  const normalizedFile = normalizeQuotes(fileContent)
+  const normalizedSearch = normalizeQuotes(search)
+  const idx = normalizedFile.indexOf(normalizedSearch)
+  if (idx === -1) {
+    return null
+  }
+  return fileContent.substring(idx, idx + search.length)
+}
+
 /**
  * edit_file 工具：编辑文件（old_string → new_string 替换）
  *
@@ -690,6 +717,11 @@ export interface EditFileOutput {
  * 若 oldString 在文件中未找到 → 返回错误（NOT_FOUND）
  * 若 oldString 出现多次且 replaceAll=false → 返回错误（MULTIPLE_MATCHES）
  * 若 oldString === newString → 返回错误（NO_CHANGE）
+ *
+ * 替换逻辑增强（参考 Claude Code + opencode）：
+ * - 换行归一：按文件实际的换行风格（LF/CRLF）归一 old/new string 再匹配
+ * - 引号归一：精确匹配失败时，花引号（“”‘’）按直引号匹配定位真实片段
+ * - 整行删除：newString 为空时顺带删掉尾随换行，不留空行
  */
 export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
   id: 'edit_file',
@@ -729,24 +761,49 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
 
       const content = await readFile(absPath, 'utf-8')
 
+      // 归一化换行风格：读取文件的换行，把 old/new string 归一化到同样风格再匹配，
+      // 避免 CRLF 文件因模型传入 \n 而匹配失败（参考 opencode 的 line-ending 处理）。
+      const lineEnding = content.includes('\r\n') ? '\r\n' : '\n'
+      const toLf = (s: string) => s.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
+      const toFileEnding = (s: string) => (lineEnding === '\r\n' ? s.replaceAll('\n', '\r\n') : s)
+      const oldNorm = toFileEnding(toLf(input.oldString))
+      const newNorm = toFileEnding(toLf(input.newString))
+
+      // 定位文件里真正匹配的片段：先精确，匹配失败再引号归一（花引号→直引号）
+      const actualOld = findActualString(content, oldNorm)
+      if (actualOld === null) {
+        return { ok: false, error: { message: `未找到匹配的文本`, code: 'NOT_FOUND' } }
+      }
+      if (actualOld === newNorm) {
+        return { ok: false, error: { message: 'oldString 和 newString 相同，无需修改', code: 'NO_CHANGE' } }
+      }
+
+      // 整行删除：newString 为空且 oldString 不在行末时，顺带删掉尾随换行，避免留下空行；
+      // 仅当内容里确实存在「old + 换行」时才扩展（文件末尾无换行时直接替换）
+      const deleteWholeLine =
+        newNorm === '' &&
+        !actualOld.endsWith('\n') &&
+        content.includes(actualOld + lineEnding)
+      const oldForReplace = deleteWholeLine ? actualOld + lineEnding : actualOld
+
       // 查找匹配
       let replacementCount = 0
       let newContent: string
 
       if (input.replaceAll) {
-        const parts = content.split(input.oldString)
+        const parts = content.split(oldForReplace)
         replacementCount = parts.length - 1
         if (replacementCount === 0) {
           return { ok: false, error: { message: `未找到匹配的文本`, code: 'NOT_FOUND' } }
         }
-        newContent = parts.join(input.newString)
+        newContent = parts.join(newNorm)
       } else {
-        const idx = content.indexOf(input.oldString)
+        const idx = content.indexOf(oldForReplace)
         if (idx === -1) {
           return { ok: false, error: { message: `未找到匹配的文本`, code: 'NOT_FOUND' } }
         }
         // 检查是否有多个匹配
-        const secondIdx = content.indexOf(input.oldString, idx + 1)
+        const secondIdx = content.indexOf(oldForReplace, idx + 1)
         if (secondIdx !== -1) {
           return {
             ok: false,
@@ -756,7 +813,7 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
             },
           }
         }
-        newContent = content.slice(0, idx) + input.newString + content.slice(idx + input.oldString.length)
+        newContent = content.slice(0, idx) + newNorm + content.slice(idx + oldForReplace.length)
         replacementCount = 1
       }
 
