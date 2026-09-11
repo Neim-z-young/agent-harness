@@ -222,11 +222,14 @@ function toGeminiContents(messages: Message[]): GeminiContent[] {
 // ===== Tool Schema 导出 =====
 
 function toolToGeminiDecl(tool: Tool): GeminiFunctionDeclaration {
+  const description = tool.documentation
+    ? `${tool.description || tool.id}\n\n${tool.documentation}`
+    : tool.description || tool.id
   const schema: any = (tool.inputSchema as any).__jsonSchema
   if (schema && typeof schema === 'object') {
     return {
       name: tool.id,
-      description: tool.description || tool.id,
+      description,
       parameters: {
         type: schema.type ?? 'object',
         properties: schema.properties ?? {},
@@ -238,7 +241,7 @@ function toolToGeminiDecl(tool: Tool): GeminiFunctionDeclaration {
   // 兜底：宽松对象 schema
   return {
     name: tool.id,
-    description: tool.description || tool.id,
+    description,
     parameters: {
       type: 'object',
       properties: {},

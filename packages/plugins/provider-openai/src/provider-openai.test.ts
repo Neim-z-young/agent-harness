@@ -199,6 +199,30 @@ describe('@harness/provider-openai', () => {
       }
     })
 
+    it('带 documentation 的工具会合并为完整 description', async () => {
+      const t = defineTool({
+        id: 'my_tool',
+        description: '一个工具',
+        documentation: '用法：\n- 先 read 再 edit\n- 只在工作目录内操作',
+        inputSchema: { parse: (v) => v, safeParse: (v) => ({ success: true, data: v }) },
+        isReadOnly: () => true,
+        async call(input): Promise<any> { return { ok: true, output: input } },
+      })
+      const p = new OpenAIChatProvider({ apiKey: 'k' }, () => [t])
+      let captured: any
+      const restore = installMock(async ({ init }) => {
+        captured = JSON.parse(init.body as string)
+        return new Response(okResponse('ok'))
+      })
+      try {
+        await p.complete({ providerId: 'o', messages: [{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'x' }], createdAt: 1 }], params: {} })
+        expect(captured.tools[0].function.description).toContain('一个工具')
+        expect(captured.tools[0].function.description).toContain('先 read 再 edit')
+      } finally {
+        restore()
+      }
+    })
+
     it('不带 __jsonSchema 的工具回落到宽松 schema', async () => {
       const loose = defineTool({
         id: 'loose',

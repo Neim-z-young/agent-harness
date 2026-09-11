@@ -1,5 +1,29 @@
 # Agent Harness 开发日志
 
+## 2026-09-11（续 100）4 个原语工具 documentation 外置并注入 LLM 工具定义
+
+### 背景
+
+承接续 98/99 把运行时提示词外置到文本文件的策略，本次把 **tools-builtin 的 4 个原语工具（read_file / write_file / bash / edit_file）** 基于 reference 里 Claude Code（claude-code-analysis）与 opencode 的原语工具提示词，为每个工具补充一份完整 `documentation`（详细用法 / 前置约束 / 安全限制），并使其能真正注入到各 LLM 提供商的工具定义里，稳定基础功能。
+
+### 改动
+
+1. **tools-builtin**（packages/plugins/tools-builtin/src）
+   - 新增 `prompts/read-file.txt` / `write-file.txt` / `bash.txt` / `edit-file.txt`（参考 Claude Code 的 read/write/bash/edit 工具提示词编写）。
+   - 4 个原语工具定义新增 `documentation` 字段：`documentation: xDoc.trim()`。
+   - 新增 `src/env.d.ts`（`declare module '*.txt'`）保证 tsc 通过。
+2. **provider 序列化注入 documentation**（此前各 provider 仅把 `tool.description` 发给 LLM，`documentation` 未被消费）
+   - `provider-openai`：新增 `fullDescription(tool)` helper，合并到 `toolToOpenAIDef` 的两个分支。
+   - `provider-anthropic`：`toolToAnthropicDef` 内拼接 `description + '\n\n' + documentation`。
+   - `provider-gemini`：`toolToGeminiDecl` 内同样拼接。
+   - 均采用条件合并：仅当 `documentation` 存在时追加，无 documentation 的工具保持原样，不影响既有测试。
+
+### 验证
+
+- 全量 typecheck 通过（30 包全部 Exit 0）。
+- tools-builtin 61 pass、provider-openai 18 pass（新增「带 documentation 的工具会合并为完整 description」用例）、provider-anthropic 16 pass、provider-gemini 19 pass，均 0 fail。
+- 全量测试 1654 pass，剩余 fail 为 reference/opencode、opentui（theme/titlebar 等）预存问题，与本改动无关。
+
 ## 2026-09-11（续 99）工具插件提示词外置（长文本）——code-intel + computer-use
 
 ### 背景

@@ -308,6 +308,12 @@ function toOpenAIMessages(messages: Message[]): OpenAIChatMessage[] {
 
 // ===== Tool Schema 导出 =====
 
+/** 合并 tool.documentation 到 description，让 LLM 获得完整使用指引 */
+function fullDescription(tool: Tool): string {
+  const base = tool.description || tool.id
+  return tool.documentation ? `${base}\n\n${tool.documentation}` : base
+}
+
 function toolToOpenAIDef(tool: Tool): OpenAIToolDef {
   const schema: any = (tool.inputSchema as any).__jsonSchema
   if (schema && typeof schema === 'object') {
@@ -315,7 +321,7 @@ function toolToOpenAIDef(tool: Tool): OpenAIToolDef {
       type: 'function',
       function: {
         name: tool.id,
-        description: tool.description || tool.id,
+        description: fullDescription(tool),
         parameters: {
           type: 'object',
           properties: schema.properties ?? {},
@@ -330,7 +336,7 @@ function toolToOpenAIDef(tool: Tool): OpenAIToolDef {
     type: 'function',
     function: {
       name: tool.id,
-      description: tool.description || tool.id,
+      description: fullDescription(tool),
       parameters: {
         type: 'object',
         properties: {},

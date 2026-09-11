@@ -31,6 +31,11 @@ import { resolve, isAbsolute, relative } from 'node:path'
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
+// 4 个原语工具的完整文档（documentation，参考 Claude Code / opencode），prompts/*.txt 加载
+import readFileDoc from './prompts/read-file.txt'
+import writeFileDoc from './prompts/write-file.txt'
+import editFileDoc from './prompts/edit-file.txt'
+import bashDoc from './prompts/bash.txt'
 
 /** 将路径解析为绝对路径（相对 cwd），并返回归一化结果 */
 function resolvePath(inputPath: string, cwd: string): string {
@@ -104,6 +109,7 @@ const MAX_CONTENT_CHARS = 256 * 1024 // 256KB
 export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
   id: 'read_file',
   description: '读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。',
+  documentation: readFileDoc.trim(),
   inputSchema: makeSchema<ReadFileInput>(),
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
@@ -222,6 +228,7 @@ export interface WriteFileOutput {
 export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
   id: 'write_file',
   description: '写入本地文件。支持覆盖、追加和仅新建模式。只能在工目录内写入。',
+  documentation: writeFileDoc.trim(),
   inputSchema: makeSchema<WriteFileInput>(),
   isReadOnly: () => false,
   isDestructive: (input) => input?.mode === 'overwrite',
@@ -424,6 +431,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
   return defineTool<BashInput, BashOutput>({
     id: 'bash',
     description: '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
+    documentation: bashDoc.trim(),
     inputSchema: makeSchema<BashInput>(),
     isReadOnly: () => false,
     isDestructive: () => true,
@@ -686,6 +694,7 @@ export interface EditFileOutput {
 export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
   id: 'edit_file',
   description: '编辑文件：精确查找并替换文本片段。默认只替换第一个匹配，支持 replaceAll。需要 oldString 在文件中唯一匹配。',
+  documentation: editFileDoc.trim(),
   inputSchema: makeSchema<EditFileInput>(),
   isReadOnly: () => false,
   isDestructive: () => false,

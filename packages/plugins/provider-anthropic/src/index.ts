@@ -232,11 +232,14 @@ function toAnthropicMessages(messages: Message[]): AnthropicMessage[] {
  *   2. 否则生成宽松的 {type:'object',additionalProperties:true} 兜底 schema（让模型填 JSON，ToolPipeline 再硬校验）
  */
 function toolToAnthropicDef(tool: Tool): AnthropicToolDef {
+  const description = tool.documentation
+    ? `${tool.description || tool.id}\n\n${tool.documentation}`
+    : tool.description || tool.id
   const schema: any = (tool.inputSchema as any).__jsonSchema
   if (schema && typeof schema === 'object') {
     return {
       name: tool.id,
-      description: tool.description || tool.id,
+      description,
       input_schema: {
         type: 'object',
         properties: schema.properties ?? {},
@@ -248,7 +251,7 @@ function toolToAnthropicDef(tool: Tool): AnthropicToolDef {
   // 兜底：宽松对象 schema
   return {
     name: tool.id,
-    description: tool.description || tool.id,
+    description,
     input_schema: {
       type: 'object',
       properties: {},
