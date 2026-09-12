@@ -299,6 +299,8 @@ export interface SessionManager {
   addMessage(sessionId: string, message: Message): Promise<void>
   /** 删除消息 */
   deleteMessage(sessionId: string, messageId: string): Promise<void>
+  /** 整体覆盖会话消息（供上下文压缩/裁剪插件回写精简后的消息列表） */
+  setMessages(sessionId: string, messages: Message[]): Promise<void>
 
   /** 创建快照（用于 revert） */
   snapshot(sessionId: string): Promise<string>

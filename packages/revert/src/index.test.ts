@@ -69,6 +69,10 @@ class FakeSessionManager implements SessionManager {
     const session = this.sessions.get(sessionId)
     session?.messages.push(message)
   }
+  async setMessages(sessionId: string, messages: Session['messages']): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (session) session.messages = messages
+  }
   async deleteMessage(): Promise<void> {
     throw new Error('not implemented')
   }

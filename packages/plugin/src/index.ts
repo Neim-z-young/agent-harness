@@ -103,6 +103,22 @@ export interface CompactionContext {
   summary?: string
 }
 
+/** session.preModel hook 的输入（每轮进入模型前） */
+export interface SessionPreModelInput {
+  /** 会话 ID */
+  sessionId: string
+  /** Agent ID */
+  agentId: string
+  /** 目标 Provider ID */
+  providerId: string
+  /** 目标模型 ID（可选） */
+  modelId?: string
+  /**
+   * 把精简后的会话消息回写持久层（不含 system）。消息 object 形态由 host 决定（本项目为 Message[]）。
+   */
+  save: (messages: unknown[]) => Promise<void>
+}
+
 export interface PermissionRequestLike {
   toolKey: string
   patterns: string[]
@@ -154,6 +170,15 @@ export interface Hooks {
   // === Session 生命周期 ===
   /** 会话压缩阶段 */
   'session.compacting'?: (input: PromptInput, output: CompactionContext) => Awaitable<void>
+  /**
+   * 每轮进入模型前 Hook：把本轮待发消息（含 system）交给插件，插件可裁剪/改写 messages 原地生效，
+   * 并通过 save(messages) 把精简后的会话消息回写持久层（上下文压缩插件使用）。
+   * messages 为待发消息数组，可原地 splice/push（会反映到本轮的模型请求）。
+   */
+  'session.preModel'?: (
+    input: SessionPreModelInput,
+    messages: unknown[]
+  ) => Awaitable<void>
 
   // === Permission 扩展 ===
   /** 权限检查 Hook：可修改决策（如 teammate 桥接到 leader） */

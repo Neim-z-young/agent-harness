@@ -16,6 +16,7 @@
   },
   "dependencies": {
     "@harness/agent": "workspace:*",
+    "@harness/acp-context": "workspace:*",
     "@harness/bus": "workspace:*",
     "@harness/code-intel": "workspace:*",
     "@harness/computer-use": "workspace:*",
@@ -46,7 +47,8 @@
     "@harness/tools-search": "workspace:*",
     "@harness/tools-web": "workspace:*",
     "@harness/workspace": "workspace:*",
-    "@harness/workspace-shell": "workspace:*"
+    "@harness/workspace-shell": "workspace:*",
+    "acp-kernel": "^0.0.63"
   },
   "devDependencies": {
     "@types/bun": "latest",

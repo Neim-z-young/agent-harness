@@ -666,6 +666,13 @@ export class DefaultSessionManager implements SessionManager {
     sess.updatedAt = Date.now()
   }
 
+  async setMessages(sessionId: string, messages: Message[]): Promise<void> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return
+    sess.messages = messages
+    sess.updatedAt = Date.now()
+  }
+
   private readonly snapshots = new Map<string, Map<string, Session>>()
   async snapshot(sessionId: string): Promise<string> {
     const sess = this.sessions.get(sessionId)
@@ -1260,6 +1267,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
     await this.deps.triggerPlugin('llm.params', llmIn, params)
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
 
+    // 每轮进入模型前：交给上下文压缩插件裁剪/改写 messages（原地生效），并回写精简后的会话
+    await this.deps.triggerPlugin(
+      'session.preModel',
+      {
+        sessionId,
+        agentId,
+        providerId: llmIn.providerId,
+        modelId: llmIn.modelId,
+        save: async (msgs) => {
+          await this.deps.session.setMessages(sessionId, msgs as Message[])
+        },
+      },
+      finalMessages,
+    )
+
     const provider = this.deps.chatProvider(llmIn.providerId)
     const completion = await provider.complete({
       providerId: llmIn.providerId,
@@ -1416,6 +1438,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const headers: Record<string, string> = {}
     await this.deps.triggerPlugin('llm.params', llmIn, params)
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
+
+    // 每轮进入模型前：交给上下文压缩插件裁剪/改写 messages（原地生效），并回写精简后的会话
+    await this.deps.triggerPlugin(
+      'session.preModel',
+      {
+        sessionId,
+        agentId,
+        providerId: llmIn.providerId,
+        modelId: llmIn.modelId,
+        save: async (msgs) => {
+          await this.deps.session.setMessages(sessionId, msgs as Message[])
+        },
+      },
+      finalMessages,
+    )
 
     return { agentId, sessionId, finalMessages, params, headers, allowedTools, providerId: llmIn.providerId, modelId: llmIn.modelId }
   }

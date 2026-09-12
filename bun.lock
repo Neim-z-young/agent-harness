@@ -5,6 +5,7 @@
     "": {
       "name": "agent-harness",
       "dependencies": {
+        "@harness/acp-context": "workspace:*",
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
         "@harness/code-intel": "workspace:*",
@@ -37,6 +38,7 @@
         "@harness/tools-web": "workspace:*",
         "@harness/workspace": "workspace:*",
         "@harness/workspace-shell": "workspace:*",
+        "acp-kernel": "^0.0.63",
       },
       "devDependencies": {
         "@types/bun": "latest",
@@ -118,6 +120,16 @@
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
+      },
+    },
+    "packages/plugins/acp-context": {
+      "name": "@harness/acp-context",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+        "acp-kernel": "^0.0.63",
       },
     },
     "packages/plugins/code-intel": {
@@ -406,6 +418,8 @@
 
     "@babel/types": ["@babel/types@7.29.8", "https://registry.npmmirror.com/@babel/types/-/types-7.29.8.tgz", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg=="],
 
+    "@harness/acp-context": ["@harness/acp-context@workspace:packages/plugins/acp-context"],
+
     "@harness/agent": ["@harness/agent@workspace:packages/agent"],
 
     "@harness/bus": ["@harness/bus@workspace:packages/bus"],
@@ -507,6 +521,8 @@
     "@types/node": ["@types/node@26.2.0", "https://registry.npmmirror.com/@types/node/-/node-26.2.0.tgz", { "dependencies": { "undici-types": "~8.3.0" } }, "sha512-5IviulTZeRNp2vAJ514cc/HUlY5nZ9fCbq9DMyC52BrhFZACo3nI0R7qBxhQmo/d27NFe96ur/b7Wwxklda+kg=="],
 
     "@types/react": ["@types/react@19.2.18", "https://registry.npmmirror.com/@types/react/-/react-19.2.18.tgz", { "dependencies": { "csstype": "^3.2.2" } }, "sha512-AnzbBERsrLKtk2XSfTbYRLjQPdy116Sty4q+T+Bp3IC4l6jNBvreVPAHmpq9qhXQM7CXZPjLVmGMw9sy+hxQ3w=="],
+
+    "acp-kernel": ["acp-kernel@0.0.63", "https://registry.npmmirror.com/acp-kernel/-/acp-kernel-0.0.63.tgz", {}, "sha512-hM437yJ+iDeYzXMRZ6pIO37o+qS9i27GPO24xGDcEWKjFIb2GPJOQkqURI7rtdiouPnDX1bWojUjPyLghz0jDQ=="],
 
     "ansi-regex": ["ansi-regex@6.3.0", "https://registry.npmmirror.com/ansi-regex/-/ansi-regex-6.3.0.tgz", {}, "sha512-WpDfL7NO6j7tH88IDBNVdUJxDh9nmCteAVW9dsep846XdwF4naCBK+/tGLX3KJgcpgMRXCFlTM2hKGoK9FsdrQ=="],
 

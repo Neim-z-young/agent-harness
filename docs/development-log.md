@@ -1,6 +1,34 @@
 # Agent Harness 开发日志
 
-## 2026-09-11（续 101）edit_file 替换逻辑增强：换行/引号归一 + 整行删除
+## 2026-09-12（续 102）ACP 上下文压缩插件（基于 acp-kernel）
+
+### 背景
+
+基于参考插件 [billion-context](https://github.com/ranxianglei/billion-context) 所拆出的纯引擎 [acp-kernel](https://github.com/ranxianglei/acp-kernel)（零宿主依赖，MIT），实现本项目自己的上下文压缩插件。采用**直接引用功能包做插件开发**：插件只做宿主适配，算法/状态机全部复用 acp-kernel。
+
+### 模型驱动压缩机制
+
+- **每轮接入**：给 core 新增 `session.preModel` hook（query 与 queryStream 两条路径），在进入模型前把本轮待发消息交给插件裁剪/改写，并可通过 `save(messages)` 把精简后的会话历史回写持久层；以此支撑「模型写完摘要、内核编排」的模型驱动压缩。
+- **模型驱动工具**：注入 `compress` / `decompress` / `search_context` / `acp_status` 4 个工具，由模型决定压缩时机与范围（compress 调用 `engine.applyCompression`，其余读状态）。
+- **主机兜底**：即使模型不主动压缩，`processTurn` 的 nudge 决策会在上下文增长达到阈值时以 user 消息提醒；kernel 的压力带/截断策略做最终兜底。
+
+### 改动
+
+1. **core**（packages/core/src/index.ts）
+   - `DefaultSessionManager` 新增 `setMessages(sessionId, messages)`：整体覆盖会话消息。
+   - `query` / `queryStream` 构建 finalMessages 后、调用模型前触发 `session.preModel` hook，注入 `save` 回写精简历史。
+2. **plugin**（packages/plugin/src/index.ts）
+   - Hooks 新增 `session.preModel` 钩子与 `SessionPreModelInput`（sessionId / agentId / providerId / modelId / save）。
+3. **新插件 `@harness/acp-context`**（packages/plugins/acp-context）
+   - `adapter.ts`：Message[] ↔ acp `CoreMessage[]` 双向映射。`toCores` 把消息压平成 core（文本/工具调用/工具结果拆分，复合 id `${base}#${i}`）；`requestMessages` 忠实重建本轮请求（provider 序列化兼容）；`compactHistory` 精简持久化历史——未被压缩的原始消息复用对象（保留图片等 part），压缩掉的丢弃，kernel 摘要块作为新消息补入，并给出 `changed` 判定避免每轮无谓回写。
+   - `index.ts`：`createAcpContextPlugin({ modelContextLimit, config, toolIds })`。核心函数 `runPreModel`：压平历史 → `processTurn(renderTags:'text-only')` 指派 refs/分层压缩/nudge → 变化时 `save` 回写 → 每轮注入 ACP 哲学 system 提示 + nudge（需压缩时）。压缩是旁路优化，处理失败仅 warn 不阻断本轮请求。
+   - ACP 工具不声明 `permission`（权限仅在声明时才检查），天然放行；`isConcurrencySafe:false`，`compress` 串行写 state。
+
+### 验证
+
+- acp-context 单测 7 pass 0 fail：adapter 压平/还原、compactHistory 变化判定与对象复用、runPreModel 普通轮不 save、ACP 哲学每轮注入一次、compress 应用后下一轮回写精简历史（消息变少且含摘要）。
+- 全量 typecheck 通过（含受影响包 core / plugin / revert）。
+- 顺带修复 revert 包 `FakeSessionManager` 因 `setMessages` 入接口而缺失方法的问题。
 
 ### 背景
 
