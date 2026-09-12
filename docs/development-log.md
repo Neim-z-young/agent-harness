@@ -1,5 +1,40 @@
 # Agent Harness 开发日志
 
+## 2026-09-12（续 103）补全 ACP 压缩会话状态与原始消息持久化
+
+### 背景
+
+续 102 实现 ACP 上下文压缩插件后遗留两个取舍：压缩状态仅存内存、重启丢失；被压缩的原始消息被移出历史、decompress 无法还原全文。本次补全两者。
+
+### 改动
+
+1. **core**（packages/core/src/index.ts）
+   - `DefaultSessionManager` 新增 `updateMeta(sessionId, patch)`：浅合并写入 session.meta（随 SessionFileStore 落盘）。
+   - `session.preModel` hook 输入新增 `meta: { read, patch }`（query 与 queryStream 两处），让插件可读写 session.meta 持久化运行时状态。
+2. **plugin**（packages/plugin/src/index.ts）
+   - `SessionPreModelInput` 新增 `meta` 访问器。
+3. **`@harness/acp-context`**（packages/plugins/acp-context）
+   - 会话上下文（AcpSessionCtx）新增 `archive`（core.id→原始 Message）、`hydrated`、`stateSnapshot`。
+   - `runPreModel`：
+     - 首次从 `session.meta[ACP_META_KEY]` 水合压缩状态（重启恢复）；
+     - 每次保留本轮原始消息归档（即使被压缩出请求，仍可全文还原）；
+     - 压缩状态变化时写入 meta（按 stateSnapshot 判重，避免每轮无谓 IO）；
+     - **不再裁减持久历史**——会话历史保留全文，压缩只作用于"本轮发给模型的请求"。既满足原始消息持久化，也让块的可解析性跨重启稳定。
+   - 新增导出 `restoreBlockMessages(engine, state, archive, blockId)`：按"ref→core id→归档 Message"反解，返回被压缩原始消息全文。`decompress` 工具输出 `originalMessages` 字段。
+   - `session` 包 `SessionManager` 接口新增 `updateMeta`，同步补齐 revert 测试 Fake。
+
+### 设计取舍
+
+- 压缩不回收持久化存储（会话历史保留全文），只节省每次请求的上下文 token；换取「decompress 可完整还原原文」与「块跨重启稳定」。若需存储回收，可由宿主另行调用既有 `session.compact`。
+- 压缩状态仍按会话随 `session.meta` 落盘，重启后水合；`CompressionState` 为纯 JSON，可安全 `JSON.stringify` 持久化，契合 kernel "refs survive restarts" 的设计。
+
+### 验证
+
+- acp-context 单测 8 pass 0 fail：adapter 压平/还原；普通轮状态入 meta、请求含完整历史并注入 ACP 哲学；压缩后请求被精简 + 状态持久化 + `restoreBlockMessages` 还原原文；重启后从 meta 水合、块仍可定位。
+- core / plugin / session / revert 单测与类型检查通过；全量 typecheck 通过。
+
+---
+
 ## 2026-09-12（续 102）ACP 上下文压缩插件（基于 acp-kernel）
 
 ### 背景

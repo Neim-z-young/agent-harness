@@ -673,6 +673,13 @@ export class DefaultSessionManager implements SessionManager {
     sess.updatedAt = Date.now()
   }
 
+  async updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return
+    sess.meta = { ...(sess.meta ?? {}), ...patch }
+    sess.updatedAt = Date.now()
+  }
+
   private readonly snapshots = new Map<string, Map<string, Session>>()
   async snapshot(sessionId: string): Promise<string> {
     const sess = this.sessions.get(sessionId)
@@ -1278,6 +1285,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         save: async (msgs) => {
           await this.deps.session.setMessages(sessionId, msgs as Message[])
         },
+        meta: {
+          read: async () => (await this.deps.session.get(sessionId))?.meta,
+          patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
+        },
       },
       finalMessages,
     )
@@ -1449,6 +1460,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         modelId: llmIn.modelId,
         save: async (msgs) => {
           await this.deps.session.setMessages(sessionId, msgs as Message[])
+        },
+        meta: {
+          read: async () => (await this.deps.session.get(sessionId))?.meta,
+          patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
         },
       },
       finalMessages,

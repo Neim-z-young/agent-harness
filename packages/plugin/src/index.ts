@@ -117,6 +117,16 @@ export interface SessionPreModelInput {
    * 把精简后的会话消息回写持久层（不含 system）。消息 object 形态由 host 决定（本项目为 Message[]）。
    */
   save: (messages: unknown[]) => Promise<void>
+  /**
+   * 会话 meta 访问器：插件可据此在 session.meta 中持久化运行时状态
+   * （如 ACP 压缩状态），随会话落盘、重启后恢复。patch 为浅合并。
+   */
+  meta: {
+    /** 读取当前会话 meta（无则 undefined） */
+    read: () => Promise<Record<string, unknown> | undefined>
+    /** 浅合并写入 session.meta */
+    patch: (patch: Record<string, unknown>) => Promise<void>
+  }
 }
 
 export interface PermissionRequestLike {

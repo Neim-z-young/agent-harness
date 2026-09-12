@@ -42,9 +42,12 @@ import {
 import {
   toCores,
   requestMessages,
-  compactHistory,
   estimateTokens,
+  safeString,
 } from './adapter.js'
+
+/** session.meta 中存储 ACP 压缩状态的键 */
+export const ACP_META_KEY = 'acp.v1'
 
 // ===== 轻量 Schema 工厂（不依赖 zod）=====
 function makeSchema<T>(): Schema<T> {
@@ -91,6 +94,8 @@ export interface DecompressOutput {
   active: boolean
   tier: 1 | 2 | 3
   effectiveMessages: string[]
+  /** 被该块压缩并归档的原始消息全文（按原顺序），便于模型了解被折叠的具体内容 */
+  originalMessages: Array<{ id: string; role?: string; text: string }>
 }
 
 export interface SearchInput {
@@ -131,11 +136,20 @@ export interface AcpContextPluginOptions {
   toolIds?: Array<'compress' | 'decompress' | 'search_context' | 'acp_status'>
 }
 
-/** 会话级 ACP 运行时上下文（内存态，进程内持久） */
+/** 会话级 ACP 运行时上下文（内存态，跨轮保留；state 会持久化到 session.meta） */
 interface AcpSessionCtx {
   state: CompressionState
+  /**
+   * 本轮映射的原始消息归档（core.id → Message）。
+   * 即使某范围的原始消息被压缩出本轮请求，仍可通过它还原全文（decompress full）。
+   */
+  archive: Map<string, Message>
   /** 最近一次 processTurn 的 core（已指派 refs），供工具引用 */
   lastCores: CoreMessage[]
+  /** 是否已从 session.meta 水合过压缩状态 */
+  hydrated: boolean
+  /** 最近一次持久化的状态 JSON（用于跳过无变化的重复写入） */
+  stateSnapshot: string
 }
 
 // ========================================================================
@@ -163,7 +177,13 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   function getOrCreateCtx(sessionId: string): AcpSessionCtx {
     let ctx = sessions.get(sessionId)
     if (!ctx) {
-      ctx = { state: createInitialState(), lastCores: [] }
+      ctx = {
+        state: createInitialState(),
+        archive: new Map(),
+        lastCores: [],
+        hydrated: false,
+        stateSnapshot: '',
+      }
       sessions.set(sessionId, ctx)
     }
     return ctx
@@ -244,6 +264,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               active: block.active,
               tier: block.tier,
               effectiveMessages: block.effectiveMessageIds,
+              originalMessages: restoreBlockMessages(engine, sctx.state, sctx.archive, block.blockId),
             },
           }
         },
@@ -342,7 +363,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               getCtx: () => getOrCreateCtx(input.sessionId),
               engine,
               config,
-              save: input.save,
+              meta: input.meta,
               makeSystemPrompt: () => buildCompressSystemPrompt(),
               tempMessage,
             })
@@ -370,18 +391,38 @@ interface RunPreModelDeps {
   getCtx: () => AcpSessionCtx
   engine: ReturnType<typeof createCore>
   config: AcpConfig
-  save: (messages: unknown[]) => Promise<void>
+  /** session.meta 持久化访问器（用于保存/恢复压缩状态） */
+  meta: { read: () => Promise<Record<string, unknown> | undefined>; patch: (patch: Record<string, unknown>) => Promise<void> }
   makeSystemPrompt: () => string
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
 }
 
 /**
- * 每轮进入模型前：压平历史 → processTurn（指派 refs / 分层压缩 / nudge）→
- * 回写精简历史 → 重建本轮请求（系统 + ACP 哲学 + 历史 + nudge）。
+ * 每轮进入模型前：从 meta 水合压缩状态 → 压平历史 → processTurn（指派 refs /
+ * 分层压缩 / nudge）→ 保留原始消息归档 + 持久化状态 → 重建本轮请求
+ * （系统 + ACP 哲学 + 历史 + nudge）。
+ *
+ * 设计取舍：会话历史保留全文（原始消息持久化在 session 本体，decompress 可完整还原），
+ * 压缩只作用于"本轮发给模型的请求"；压缩状态单独持久化到 session.meta，重启后可恢复，
+ * 从而既有请求级 token 节省，又保证可回溯。
  */
 export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
-  const { sessionId, messages, engine, config, save } = deps
+  const { sessionId, messages, engine, config, meta } = deps
   const ctx = deps.getCtx()
+
+  // 从 session.meta 水合压缩状态（仅首次）
+  if (!ctx.hydrated) {
+    ctx.hydrated = true
+    try {
+      const saved = (await meta.read())?.[ACP_META_KEY] as CompressionState | undefined
+      if (saved && typeof saved === 'object') {
+        ctx.state = { ...createInitialState(), ...saved }
+        ctx.stateSnapshot = JSON.stringify(ctx.state)
+      }
+    } catch {
+      // 水合失败则从空状态开始
+    }
+  }
 
   // 拆分系统消息与历史
   const systemMsgs: Message[] = []
@@ -391,8 +432,9 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     else history.push(m)
   }
 
-  // 压平为 core，运行 processTurn
+  // 压平为 core（同时记录原始消息归档，供 decompress 还原全文），运行 processTurn
   const inflat = toCores(history)
+  ctx.archive = new Map(inflat.byId)
   const tokenCount = estimateTokens(inflat.cores)
   const res = engine.processTurn({
     messages: inflat.cores,
@@ -406,13 +448,14 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   ctx.state = res.state
   ctx.lastCores = res.messages
 
-  // 回写精简历史（仅在真正发生变化时）
-  const compact = compactHistory(inflat, res.messages)
-  if (compact.changed) {
+  // 持久化压缩状态（仅变化时写一次，避免每轮无谓 IO）
+  const nextSnapshot = JSON.stringify(res.state)
+  if (ctx.stateSnapshot !== nextSnapshot) {
+    ctx.stateSnapshot = nextSnapshot
     try {
-      await save(compact.messages)
+      await meta.patch({ [ACP_META_KEY]: res.state })
     } catch {
-      // 回写失败不致命，本轮请求仍可继续
+      // 持久化失败不致命，内存态仍可用
     }
   }
 
@@ -434,3 +477,40 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
 /** 默认导出常量插件（默认配置） */
 export const acpContextPlugin: AgentPlugin = createAcpContextPlugin()
+
+/**
+ * 还原一个压缩块所覆盖的原始消息全文（供 decompress）。
+ * 通过状态里的"ref → core id → 归档 Message"反解；先试直接 id，再走 byRef。
+ */
+export function restoreBlockMessages(
+  engine: ReturnType<typeof createCore>,
+  state: CompressionState,
+  archive: Map<string, Message>,
+  blockId: string,
+): DecompressOutput['originalMessages'] {
+  const block = engine.decompress(blockId, state)
+  if (!block) return []
+
+  const out: DecompressOutput['originalMessages'] = []
+  const seen = new Set<string>()
+  const ids = [...(block.effectiveMessageIds ?? []), ...(block.directMessageIds ?? [])]
+  for (const idOrRef of ids) {
+    if (seen.has(idOrRef)) continue
+    seen.add(idOrRef)
+    let orig = archive.get(idOrRef)
+    if (!orig) {
+      const raw = state.messageRefs?.byRef?.[idOrRef]
+      orig = raw ? archive.get(raw) : undefined
+    }
+    if (!orig) continue
+    const text = (orig.parts as Array<{ type?: string; text?: string; input?: unknown; result?: unknown }>)
+      .map((p) => {
+        if (p.type === 'tool') return safeString(p.result ?? p.input)
+        return p.text ?? ''
+      })
+      .filter((t) => typeof t === 'string')
+      .join('\n')
+    out.push({ id: orig.id, role: orig.role, text })
+  }
+  return out
+}

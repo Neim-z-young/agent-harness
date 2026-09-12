@@ -301,6 +301,8 @@ export interface SessionManager {
   deleteMessage(sessionId: string, messageId: string): Promise<void>
   /** 整体覆盖会话消息（供上下文压缩/裁剪插件回写精简后的消息列表） */
   setMessages(sessionId: string, messages: Message[]): Promise<void>
+  /** 合并更新会话 meta（浅合并 patch 到 meta；供 ACP 等插件持久化运行时状态） */
+  updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void>
 
   /** 创建快照（用于 revert） */
   snapshot(sessionId: string): Promise<string>
