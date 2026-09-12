@@ -505,6 +505,8 @@ interface SkillEmbed {
 - Snapshot + Revert/Unrevert（同 OpenCode revert.ts）
 - Todo List Plane（独立存储 + Bus 通知）
 
+> 说明：此处的 Compaction 面向**持久化历史的内存/存储回收**；请求级上下文压缩由 ACP 插件（见 [3.9](#39-acp-上下文压缩插件harnessacp-context)）负责，两者正交。
+
 ---
 
 ### 3.7 Permission Engine：路径级匹配
@@ -537,12 +539,52 @@ interface PermissionDecision {
 
 ---
 
-### 3.8 Bus 事件总线：类型安全解耦
+### 3.9 ACP 上下文压缩插件（@harness/acp-context）
 
-**同 OpenCode Bus 设计：**
-- `BusEvent.define<T>(name, zodSchema)` 类型安全定义
-- `publish/subscribe/subscribeAll` 三 API
-- 事件自动桥接 SSE（Web UI）
+**定位**：通过新增的 `session.preModel` Hook 接入 acp-kernel（billion-context 抽取的纯引擎，MIT）做**模型驱动 3 层 LSM 上下文压缩**。对话越长、token 占用越高，代价越低——超长会话不丢失早期上下文，而是折叠成可检索/可还原的摘要块。
+
+**每轮接入点**：core 在 query 与 queryStream 两处构建 `finalMessages` 后、调用模型前，触发 `session.preModel(input, messages)`。插件据此：
+- 调 `processTurn` 指派 refs、按需产出 nudge、执行分层压缩过滤；
+- 用 `save(messages)` 回写精简历史、用 `meta.read/patch` 读写 `session.meta` 持久化压缩状态。
+
+```typescript
+// plugin/src/index.ts — SessionPreModelInput（核心约定）
+interface SessionPreModelInput {
+  sessionId: string
+  agentId: string
+  providerId: string
+  modelId?: string
+  save: (messages: unknown[]) => Promise<void>   // 回写精简后会话消息
+  meta: {                                        // session.meta 持久化访问器
+    read: () => Promise<Record<string, unknown> | undefined>
+    patch: (patch: Record<string, unknown>) => Promise<void>  // 浅合并
+  }
+}
+// Hooks['session.preModel'] → (input, messages: unknown[]) => Awaitable<void>
+```
+
+**模型驱动压缩分工**：
+
+| 环节 | 执行者 |
+|------|--------|
+| 何时去压（nudge 决策、上下文占比、可压缩范围） | 内核 `processTurn`（每轮，无需模型） |
+| 写摘要、选压缩范围（startId/endId/summary/topic） | **模型**（调 `compress` 工具） |
+| 折叠成块、分层蒸馏（tier 1→2→3）、token 统计 | 内核 `applyCompression` |
+| 范围合法性与摘要长度校验 | 内核 `compress` 配置（minCompressRange/maxSummaryLength） |
+
+插件注入 4 个模型工具：`compress`、`decompress`、`search_context`、`acp_status`，与内置 ACP 哲学 system prompt + nudge 配套。
+
+**持久化与恢复**：
+- **原始消息全文**存会话本体（插件不裁减持久历史，压缩只作用于"本轮发给模型的请求"），每次追加落盘；
+- **压缩状态**（`CompressionState`：blocks / messageRefs / tokenSnapshot / nudge / stats / nextBlockId）以纯 JSON 存 `session.meta[ACP_META_KEY]`，变化时写、跨重启保留；
+- **恢复会话**：历史从会话本体读全文，压缩块从 `meta` **水合复用，不重新生成**；`messageRefs` 随状态持久化，而原始消息 id 重启后不变，故 ref 能对齐（kernel "refs survive restarts"）。恢复后首轮置 `needFull` 走全量渲染重建请求，之后恢复增量。
+- `decompress` 可按 `blockId` 还原被压缩的**原始消息全文**（`restoreBlockMessages` 按 ref→core id→归档 Message 反解），因此压缩不损失可回溯性。
+
+**增量渲染缓存（性能）**：内核 `processTurn` 每轮对完整历史跑 pipeline，其 O(n) 扫描不可避免；为省宿主侧"历史前缀反复 `core↔message` 往返渲染"，`runPreModel` 双路径：
+- **增量（常态）**：`!needFull` 且缓存前缀与当前历史前缀逐 id 对齐、且本轮无压缩/截断（`res.messages` 与输入 cores 等长）时，复用 `prefixRender`，只对新增尾部做 `requestMessages`，并将尾部并入缓存；
+- **全量**：压缩发生 / 历史前缀漂移 / 截断时重建并刷新缓存；本轮消息数变化强制 `needFull`。
+
+**设计取舍**：压缩是**旁路优化**——失败仅 warn、不阻断本轮模型请求；增量缓存失效只回落全量，不影响正确性。
 
 ---
 
@@ -631,6 +673,25 @@ const AnthropicProviderPlugin: AgentPlugin = {
   }
 }
 ```
+
+## 四、补充：ACP 上下文压缩插件示例
+
+**官方内置插件，见 3.9 节详述。** 接入方式：把 `createAcpContextPlugin` 加入 `internalPlugins`，通过 `session.preModel` Hook 每轮在进入模型前运行 acp-kernel，并注入 4 个模型驱动压缩工具。
+
+```typescript
+import { createHarness } from '@harness/core'
+import { createAcpContextPlugin } from '@harness/acp-context'
+
+const h = await createHarness({
+  internalPlugins: [
+    createAcpContextPlugin({ modelContextLimit: 200_000 }),
+    // ...其他内置插件
+  ],
+  agents: [/* ... */],
+})
+```
+
+**与既有 Compaction 的关系**：`session` 包自带 prune→summary→auto agent 三级压缩负责**持久化历史的内存/存储回收**；ACP 插件则负责**请求级上下文 token 瘦身**——两者正交：ACP 不裁减持久历史（保留全文供可回溯），只压缩"本轮发给模型的请求"。
 
 ---
 

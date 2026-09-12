@@ -24,6 +24,7 @@
 ### 验证
 
 - acp-context 单测 12 pass 0 fail：新增增量命中（前缀复用+尾部并入缓存）、压缩后置 needFull 全量重建、前缀漂移回落全量。typecheck 通过。
+- 架构文档 `docs/agent-harness-architecture.md` 新增 3.9 节（ACP 插件：session.preModel 接入、模型驱动压缩分工、持久化与恢复、增量缓存）与第四节补充示例，并区分其与 session 原生 Compaction 的正交关系。
 
 ---
 
