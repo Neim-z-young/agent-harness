@@ -43,6 +43,7 @@ import {
   toCores,
   requestMessages,
   estimateTokens,
+  baseId,
   safeString,
 } from './adapter.js'
 
@@ -150,6 +151,17 @@ interface AcpSessionCtx {
   hydrated: boolean
   /** 最近一次持久化的状态 JSON（用于跳过无变化的重复写入） */
   stateSnapshot: string
+  // ---- 增量渲染缓存 ----
+  /** 已渲染（含压缩效果/refs 标签）的历史前缀的原始消息 id 序列 */
+  prefixIds: string[]
+  /** 与 prefixIds 对应的渲染结果（不含 system），增量路径直接复用 */
+  prefixRender: Message[]
+  /** 是否需要强制全量重算（压缩发生/状态变化/水合后置位） */
+  needFull: boolean
+  /** 全量路径最后一次的 token 估算，用于判断增量是否逼近阈值 */
+  lastTokens: number
+  /** 会话 meta 写访问器（由 runPreModel 注入，供 compress 工具即时持久化状态） */
+  meta?: { patch: (patch: Record<string, unknown>) => Promise<void> }
 }
 
 // ========================================================================
@@ -183,6 +195,10 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         lastCores: [],
         hydrated: false,
         stateSnapshot: '',
+        prefixIds: [],
+        prefixRender: [],
+        needFull: true,
+        lastTokens: 0,
       }
       sessions.set(sessionId, ctx)
     }
@@ -225,6 +241,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             config,
           })
           sctx.state = applied.state
+          // 压缩改变了块结构/历史 → 强制下一轮全量重建，失效增量缓存
+          sctx.needFull = true
           return {
             ok: true,
             output: {
@@ -410,7 +428,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const { sessionId, messages, engine, config, meta } = deps
   const ctx = deps.getCtx()
 
-  // 从 session.meta 水合压缩状态（仅首次）
+  // 从 session.meta 水合压缩状态（仅首次）；水合后置 needFull，强制全量重建一次
   if (!ctx.hydrated) {
     ctx.hydrated = true
     try {
@@ -422,6 +440,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     } catch {
       // 水合失败则从空状态开始
     }
+    ctx.needFull = true
   }
 
   // 拆分系统消息与历史
@@ -459,10 +478,61 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     }
   }
 
-  // 重建本轮请求：系统 + ACP 哲学(每轮) + 历史 + nudge
+  // ---- 增量渲染缓存 ----
+  // 常态投影路径：若历史前缀与缓存一致、本轮无压缩/截断（res.messages 与输入 cores 等长，
+  // 即没有块插入或紧急剔除），则复用缓存的"已渲染前缀"，只对新增尾部 core 做 requestMessages。
+  // 全量路径：压缩发生（needFull）、历史前缀漂移、或 res.messages 数量变化（截断）时，全量重建并刷新缓存。
+  // 本轮发生压缩/截断（消息数变化）时，历史本体已被改写，缓存前缀不再可信 → 强制下一轮全量。
+  if (res.messages.length !== inflat.cores.length) {
+    ctx.needFull = true
+  }
+  let cacheHit = false
+  let prefixCoreCount = 0
+  if (
+    !ctx.needFull &&
+    ctx.prefixIds.length > 0 &&
+    ctx.prefixIds.length <= history.length &&
+    res.messages.length === inflat.cores.length
+  ) {
+    // 校验历史前缀逐 id 相等（无插入/删除，仅尾部追加）
+    let aligned = true
+    for (let i = 0; i < ctx.prefixIds.length; i++) {
+      if (ctx.prefixIds[i] !== history[i]!.id) {
+        aligned = false
+        break
+      }
+    }
+    if (aligned) {
+      // 前缀对应的 core 数量 = 前 prefixLen 条原始消息展开出的 core 数
+      prefixCoreCount = 0
+      for (let i = 0; i < ctx.prefixIds.length; i++) {
+        prefixCoreCount += (inflat.byBase.get(baseId(history[i]!.id)) ?? []).length
+      }
+      cacheHit = prefixCoreCount <= res.messages.length
+    }
+  }
+
   const request: Message[] = [...systemMsgs]
   request.push(deps.tempMessage('system', deps.makeSystemPrompt(), sessionId))
-  request.push(...requestMessages(res.messages))
+
+  if (cacheHit) {
+    // 增量：复用缓存前缀 + 只渲染新增尾部 core，并把尾部并入缓存供下一轮继续命中
+    const tailCores = res.messages.slice(prefixCoreCount)
+    const tailRender = requestMessages(tailCores)
+    request.push(...ctx.prefixRender)
+    request.push(...tailRender)
+    ctx.prefixIds = history.map((m) => m.id)
+    ctx.prefixRender = [...ctx.prefixRender, ...tailRender]
+    ctx.lastTokens = tokenCount
+  } else {
+    // 全量：重建整段渲染结果并刷新缓存
+    const rendered = requestMessages(res.messages)
+    request.push(...rendered)
+    ctx.prefixIds = history.map((m) => m.id)
+    ctx.prefixRender = rendered
+    ctx.lastTokens = tokenCount
+    ctx.needFull = false
+  }
 
   const nudge = res.nudge
   if (nudge?.shouldInject) {

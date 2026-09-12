@@ -63,7 +63,7 @@ function renderText(m: Message): string {
 }
 
 /** 把一个原始 Message.id 消毒成可用于复合 core id 的安全串 */
-function baseId(id: string): string {
+export function baseId(id: string): string {
   return id.replace(/[^a-zA-Z0-9_:\-]/g, '_')
 }
 

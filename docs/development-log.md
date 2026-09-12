@@ -1,5 +1,32 @@
 # Agent Harness 开发日志
 
+## 2026-09-12（续 104）ACP 压缩增量渲染缓存优化
+
+### 背景
+
+针对「每轮都进 `session.preModel` 是否性能受影响」的疑问，选定"增量 + 缓存"路线：内核 `processTurn` 每轮对完整历史跑 pipeline（assignRefs→sync→prune→recommend→nudge→truncate），其 O(n) 核心扫描不可避免；真正可省的是宿主侧**历史前缀反复 `core↔message` 往返渲染**（`toCores`/`requestMessages`）的开销。
+
+### 改动（packages/plugins/acp-context）
+
+1. `AcpSessionCtx` 新增增量缓存字段：`prefixIds`（已渲染前缀的原始消息 id 序列）、`prefixRender`（对应渲染结果，不含 system）、`needFull`（是否强制全量重建）、`lastTokens`（最后一次全量的 token 估算）。
+2. `adapter.ts` 导出 `baseId`（核心链路需按原始 id 前缀反解 core 数）。
+3. `runPreModel` 渲染路径二选一：
+   - **增量（常态）**：当 `!needFull`、缓存前缀与当前历史前缀逐 id 对齐、且 `res.messages` 与输入 cores 等长（本轮无压缩/截断）时，复用 `prefixRender`，只对新增尾部 core 做 `requestMessages`；并把尾部并入缓存供下一轮继续命中。
+   - **全量**：压缩发生 / 历史前缀漂移 / 消息数变化（截断）时全量重建并刷新缓存。
+4. 安全兜底：本轮 `res.messages` 数量 ≠ 输入 cores 数量（发生了压缩/截断）即强制 `needFull`，避免缓存与请求内容错位。
+5. `compress` 工具 `applyCompression` 后置 `needFull = true`（块结构/历史已改写，缓存失效）。
+
+### 设计取舍
+
+- 压缩是**旁路优化**，失败仅 warn 不阻断本轮模型请求；增量缓存命中失效也只会回落全量，不影响正确性。
+- 常态下只对新增尾部做渲染 + token 估算，超长会话的每轮宿主开销从 O(总量) 降到 O(新增尾部)；一旦真正压缩/截断则下一轮全量一次，之后恢复增量。
+
+### 验证
+
+- acp-context 单测 12 pass 0 fail：新增增量命中（前缀复用+尾部并入缓存）、压缩后置 needFull 全量重建、前缀漂移回落全量。typecheck 通过。
+
+---
+
 ## 2026-09-12（续 103）补全 ACP 压缩会话状态与原始消息持久化
 
 ### 背景

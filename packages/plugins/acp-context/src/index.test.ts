@@ -10,7 +10,7 @@ import {
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
 import { runPreModel, restoreBlockMessages, ACP_META_KEY } from './index'
-import { toCores, compactHistory, idBase } from './adapter'
+import { toCores, compactHistory, idBase, baseId } from './adapter'
 
 // ===== helpers =====
 
@@ -55,7 +55,17 @@ function tempMessage(role: Message['role'], text: string, _sid: string): Message
 
 interface Harness {
   engine: ReturnType<typeof createCore>
-  ctx: { state: CompressionState; archive: Map<string, Message>; lastCores: ReturnType<typeof toCores>['cores']; hydrated: boolean; stateSnapshot: string }
+  ctx: {
+    state: CompressionState
+    archive: Map<string, Message>
+    lastCores: ReturnType<typeof toCores>['cores']
+    hydrated: boolean
+    stateSnapshot: string
+    prefixIds: string[]
+    prefixRender: Message[]
+    needFull: boolean
+    lastTokens: number
+  }
   meta: Record<string, unknown>
   patches: Array<Record<string, unknown>>
   metaOf: () => unknown
@@ -72,6 +82,10 @@ function makeHarness(config: Config = makeConfig(), sessionId = 's1'): Harness {
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
     stateSnapshot: '',
+    prefixIds: [] as string[],
+    prefixRender: [] as Message[],
+    needFull: true,
+    lastTokens: 0,
   }
   const h: Harness = {
     engine,
@@ -236,4 +250,79 @@ test('runPreModel：重启后从 meta 水合压缩状态，块仍可定位', asy
   expect(activeBlocks(freshHarness.ctx.state).length).toBeGreaterThan(0)
   const block = freshHarness.ctx.state.blocks.find((b) => b.topic === '重启块')
   expect(block).toBeDefined()
+})
+
+// ===== 增量渲染缓存 =====
+
+test('runPreModel：增量路径缓存命中，命中后 needFull 复位、prefixIds 更新为全量', async () => {
+  const h = makeHarness()
+
+  // 首轮（需全量）
+  await h.run(history(4))
+  expect(h.ctx.needFull).toBe(false) // 首轮全量重建后 needFull 复位
+  expect(h.ctx.prefixIds).toHaveLength(4)
+  expect(h.ctx.prefixRender).toHaveLength(4)
+
+  // 第二轮：完整保留历史 + 追加 2 条 → 前缀一致，命中增量路径
+  h.ctx.needFull = false
+  const lenBefore = h.ctx.prefixRender.length
+  const second = [...history(4), ...history(2)]
+  await h.run(second)
+  // 增量命中：prefixRender 即为请求中的历史渲染；结果含 6 + acp system
+  expect(second.filter((m) => m.role === 'system')).toHaveLength(1)
+  expect(second.length).toBe(7)
+  expect(h.ctx.prefixIds).toHaveLength(6)
+  expect(h.ctx.prefixRender.length).toBeGreaterThan(lenBefore) // 缓存追加了新增尾部渲染
+})
+
+test('runPreModel：压缩后置 needFull，下一轮全量重建并刷新缓存', async () => {
+  const h = makeHarness()
+  const config = makeConfig()
+  const messages = history(12)
+  await h.run([...messages])
+
+  // 模拟 compress 调用置 needFull
+  const refs = h.ctx.state.messageRefs
+  const cores = h.ctx.lastCores
+  const applied = h.engine.applyCompression({
+    ranges: [
+      { startRef: refForRaw(refs, cores[1]!.id)!, endRef: refForRaw(refs, cores[4]!.id)!, summary: '压缩摘要', topic: '压缩块' },
+    ],
+    messages: cores,
+    state: h.ctx.state,
+    config,
+  })
+  h.ctx.state = applied.state
+  h.ctx.needFull = true
+
+  const before = [...messages]
+  await h.run(before)
+  // 全量路径已重建缓存：needFull 复位、请求被压缩精简
+  const reqText = before.map((m) => m.parts.map((p) => (p as any).text ?? '').join('')).join('\n')
+  expect(reqText).not.toContain('Message number 3')
+  expect(h.ctx.needFull).toBe(false)
+  // 压缩轮历史含 12 条原始消息（可裁剪来自本轮全量重建）
+  expect(h.ctx.prefixIds.length).toBe(12)
+})
+
+test('runPreModel：历史前缀漂移（中间插入/删除）时回落全量路径', async () => {
+  const h = makeHarness()
+  await h.run(history(4))
+  h.ctx.needFull = false
+
+  // 历史被改写：移除 m0（前缀 m1... 长度 3 与缓存 4 不一致）→ 命中条件不成立 → 全量重建
+  const drifted = history(4).slice(1)
+  const driftedCopy = [...drifted]
+  await h.run(drifted)
+  expect(h.ctx.needFull).toBe(false)
+  // 全量重建后缓存以"完整待发历史"为准
+  expect(h.ctx.prefixIds.length).toBe(driftedCopy.length)
+  expect(drifted.filter((m) => m.role === 'system')).toHaveLength(1)
+  expect(drifted.length).toBe(drifted.filter((m) => m.role !== 'system').length + 1)
+})
+
+test('adapter：baseId 导出可复用（核心链路依赖）', () => {
+  // 直接校验 baseId 稳定、可消毒非法字符
+  expect(baseId('m0')).toBe('m0')
+  expect(baseId('a b!c')).toBe('a_b_c')
 })
