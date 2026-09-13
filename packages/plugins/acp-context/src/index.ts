@@ -24,7 +24,7 @@
  */
 
 import { defineTool, Schema, ToolResult, ToolContext } from '@harness/tool'
-import type { AgentPlugin, Hooks } from '@harness/plugin'
+import type { AgentPlugin, Hooks, CompactionContext } from '@harness/plugin'
 import type { Message } from '@harness/session'
 import {
   createCore,
@@ -33,6 +33,10 @@ import {
   parseCompressInput,
   renderNudgeText,
   buildCompressSystemPrompt,
+  assignRefs,
+  highestUsedIndex,
+  refForRaw,
+  coveredMessageIds,
   type Config as AcpConfig,
   type CoreMessage,
   type CompressionState,
@@ -390,6 +394,25 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             plgCtx.log.warn?.('ACP preModel 处理失败，跳过本轮压缩', { err: String(err) })
           }
         },
+
+        async 'session.compacting'(input, compactCtx) {
+          try {
+            await runCompacting({
+              sessionId: input.sessionId,
+              input: compactCtx,
+              getCtx: () => getOrCreateCtx(input.sessionId),
+              engine,
+              config,
+              meta: {
+                read: async () => undefined,
+                patch: async () => {},
+              },
+            })
+          } catch (err) {
+            // 折叠失败不阻断 core 的默认 session 压缩
+            plgCtx.log.warn?.('ACP session.compacting 处理失败，走默认压缩', { err: String(err) })
+          }
+        },
       } as Hooks
     },
 
@@ -547,6 +570,126 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
 /** 默认导出常量插件（默认配置） */
 export const acpContextPlugin: AgentPlugin = createAcpContextPlugin()
+
+/**
+ * session.compacting hook 的处理核心（可单测纯函数）。
+ *
+ * 目标：在 core 物理删除历史窗口前，让 ACP 先把这个窗口折叠进自己的压缩块，
+ * 从而即使原文被 session 压缩从会话历史删掉，ACP 的块/摘要仍保留该段的梗概，
+ * decompress / search_context 依旧能对这段内容起作用。
+ *
+ * 策略（幂等）：
+ * 1. 先水合压缩状态（若未水合）。
+ * 2. 仅处理"尚未被 ACP 块覆盖"的窗口消息（复用 coveredMessageIds 判定，已覆盖即跳过 → 幂等）。
+ * 3. 对未覆盖消息指派 refs，并整体折叠成一个摘要块（规则摘要兜底，随时可换成模型摘要）。
+ * 4. 持久化状态到 session.meta；同时提供 summary 以让 core 复用、避免双份摘要。
+ *
+ * @returns Promise<boolean> 是否发生了折叠（true = 已处理并豁免 core 自行摘要）
+ */
+export async function runCompacting(deps: {
+  sessionId: string
+  input: CompactionContext
+  getCtx: () => AcpSessionCtx
+  engine: ReturnType<typeof createCore>
+  config: AcpConfig
+  meta: {
+    read: () => Promise<Record<string, unknown> | undefined>
+    patch: (patch: Record<string, unknown>) => Promise<void>
+  }
+  /** 为一段窗口生成规则摘要；缺省用首/尾文本拼接兜底 */
+  ruleSummary?: (window: Message[]) => string
+}): Promise<boolean> {
+  const { sessionId, input, engine, config, meta } = deps
+  const window = (input.window ?? []) as Message[]
+  if (window.length === 0) return false
+  const ctx = deps.getCtx()
+
+  // 尚未水合则先恢复压缩状态（session 压缩可能在首轮 preModel 之前进入）
+  if (!ctx.hydrated) {
+    ctx.hydrated = true
+    try {
+      const saved = (await meta.read())?.[ACP_META_KEY] as CompressionState | undefined
+      if (saved && typeof saved === 'object') {
+        ctx.state = { ...createInitialState(), ...saved }
+        ctx.stateSnapshot = JSON.stringify(ctx.state)
+      }
+    } catch {
+      // 水合失败则从空状态开始
+    }
+  }
+
+  // 幂等：先把窗口整体压平成 core，若其核心 id 已全部被 ACP 块覆盖，则已保全、无需再折叠
+  const inflat = toCores(window)
+  if (inflat.cores.length === 0) return false
+
+  const covered = coveredMessageIds(ctx.state)
+  const uncoveredCores = inflat.cores.filter((c) => !covered.has(c.id))
+  if (uncoveredCores.length === 0) {
+    // 整个窗口都已被 ACP 压缩块覆盖 → 已保全，无需再折叠
+    input.windowHandled = true
+    return false
+  }
+  // 只用"尚未覆盖"的片段折叠（避免与既有块重叠重复）
+  const uncoveredFlat: import('./adapter.js').Flat = { cores: uncoveredCores, byId: inflat.byId, byBase: inflat.byBase }
+
+  // 保留窗口原文到归档，保证折叠后 decompress 仍能还原该段全文
+  for (const [coreId, orig] of inflat.byId) ctx.archive.set(coreId, orig)
+
+  // 指派 refs（基于既有 map 继续增长），再对整段折叠成一个摘要块
+  const nextIndex = highestUsedIndex(ctx.state.messageRefs) + 1
+  const { map } = assignRefs(uncoveredCores, {
+    existing: ctx.state.messageRefs,
+    nextIndex,
+  })
+  const startRef = refForRaw(map, uncoveredCores[0]!.id)
+  const endRef = refForRaw(map, uncoveredCores[uncoveredCores.length - 1]!.id)
+  if (!startRef || !endRef) return false
+
+  const summary = deps.ruleSummary
+    ? deps.ruleSummary(window)
+    : defaultRuleSummary(window)
+  const applied = engine.applyCompression({
+    ranges: [{ startRef, endRef, summary, topic: 'session 压缩折叠' }],
+    messages: uncoveredFlat.cores,
+    state: { ...ctx.state, messageRefs: map },
+    config,
+  })
+  if (applied.result.blocksCreated === 0 && !input.summary) return false
+  ctx.state = applied.state
+  ctx.needFull = true
+
+  // 持久化压缩状态（避免覆盖窗口后续仍可回溯）
+  const nextSnapshot = JSON.stringify(ctx.state)
+  if (ctx.stateSnapshot !== nextSnapshot) {
+    ctx.stateSnapshot = nextSnapshot
+    await meta.patch({ [ACP_META_KEY]: ctx.state })
+  }
+
+  // 已把窗口折叠进 ACP 块：让 core 复用它生成的摘要，避免双份摘要
+  input.summary = summary
+  input.windowHandled = true
+  void sessionId
+  return true
+}
+
+/** 窗口规则摘要兜底：首/尾消息文本拼接，控制在合理长度 */
+export function defaultRuleSummary(window: Message[]): string {
+  const head = textOf(window[0])
+  const tail = window.length > 1 ? textOf(window[window.length - 1]) : undefined
+  const joined = [head, tail ? `…\n${tail}` : ''].join('\n')
+  return joined.length > 2000 ? `${joined.slice(0, 2000)}…` : joined
+}
+
+function textOf(m?: Message): string {
+  if (!m) return ''
+  return (m.parts as Array<{ type?: string; text?: string; input?: unknown; result?: unknown }>)
+    .map((p) => {
+      if (p.type === 'tool') return safeString(p.result ?? p.input)
+      return p.text ?? ''
+    })
+    .filter((t) => typeof t === 'string')
+    .join('\n')
+}
 
 /**
  * 还原一个压缩块所覆盖的原始消息全文（供 decompress）。

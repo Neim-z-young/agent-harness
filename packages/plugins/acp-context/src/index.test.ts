@@ -9,7 +9,7 @@ import {
   type CompressionState,
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
-import { runPreModel, restoreBlockMessages, ACP_META_KEY } from './index'
+import { runPreModel, runCompacting, restoreBlockMessages, ACP_META_KEY } from './index'
 import { toCores, compactHistory, idBase, baseId } from './adapter'
 
 // ===== helpers =====
@@ -325,4 +325,131 @@ test('adapter：baseId 导出可复用（核心链路依赖）', () => {
   // 直接校验 baseId 稳定、可消毒非法字符
   expect(baseId('m0')).toBe('m0')
   expect(baseId('a b!c')).toBe('a_b_c')
+})
+
+// ===== session.compacting 协同（方案三：先保全原文再物理删除） =====
+
+function compactCtxFor(window: Message[]) {
+  return { window, keepLast: 10, strategy: 'summary' as const, windowHandled: false, summary: undefined }
+}
+
+test('runCompacting：session 压缩前把 window 折叠进 ACP 块，并豁免 core 自行摘要', async () => {
+  const engine = createCore()
+  const config = makeConfig()
+  const meta: Record<string, unknown> = {}
+  const patches: Array<Record<string, unknown>> = []
+  const ctx = {
+    state: createInitialState(),
+    archive: new Map<string, Message>(),
+    lastCores: [] as ReturnType<typeof toCores>['cores'],
+    hydrated: false,
+    stateSnapshot: '',
+    prefixIds: [] as string[],
+    prefixRender: [] as Message[],
+    needFull: true,
+    lastTokens: 0,
+  }
+
+  const window = history(8)
+  const input = compactCtxFor(window)
+  const handled = await runCompacting({
+    sessionId: 's1',
+    input,
+    getCtx: () => ctx,
+    engine,
+    config,
+    meta: {
+      read: async () => meta,
+      patch: async (p) => {
+        Object.assign(meta, p)
+        patches.push(p)
+      },
+    },
+  })
+
+  expect(handled).toBe(true)
+  // 折叠出至少一个块
+  expect(activeBlocks(ctx.state).length).toBeGreaterThan(0)
+  // 已处理：windowHandled 置位，且提供了 summary 供 core 复用（避免双份摘要）
+  expect(input.windowHandled).toBe(true)
+  expect(input.summary).toBeTruthy()
+  // 状态持久化到 meta
+  expect(meta[ACP_META_KEY]).toBeDefined()
+})
+
+test('runCompacting：幂等——已覆盖的窗口二次处理不重复折叠', async () => {
+  const engine = createCore()
+  const config = makeConfig()
+  const meta: Record<string, unknown> = {}
+  const ctx = {
+    state: createInitialState(),
+    archive: new Map<string, Message>(),
+    lastCores: [] as ReturnType<typeof toCores>['cores'],
+    hydrated: true,
+    stateSnapshot: '',
+    prefixIds: [] as string[],
+    prefixRender: [] as Message[],
+    needFull: true,
+    lastTokens: 0,
+  }
+
+  const window = history(6)
+  // 第一次折叠
+  await runCompacting({
+    sessionId: 's1',
+    input: compactCtxFor(window),
+    getCtx: () => ctx,
+    engine,
+    config,
+    meta: { read: async () => meta, patch: async (p) => { Object.assign(meta, p) } },
+  })
+  const blocksAfterFirst = ctx.state.blocks.length
+
+  // 第二次：整个窗口已覆盖 → 幂等，不新增块，仅标记 handled
+  const input2 = compactCtxFor(window)
+  const handled2 = await runCompacting({
+    sessionId: 's1',
+    input: input2,
+    getCtx: () => ctx,
+    engine,
+    config,
+    meta: { read: async () => meta, patch: async (p) => { Object.assign(meta, p) } },
+  })
+  expect(handled2).toBe(false)
+  expect(input2.windowHandled).toBe(true)
+  expect(ctx.state.blocks.length).toBe(blocksAfterFirst)
+})
+
+test('runCompacting：折叠后 decompress 仍能还原窗口原文全文', async () => {
+  const engine = createCore()
+  const config = makeConfig()
+  const meta: Record<string, unknown> = {}
+  const ctx = {
+    state: createInitialState(),
+    archive: new Map<string, Message>(),
+    lastCores: [] as ReturnType<typeof toCores>['cores'],
+    hydrated: false,
+    stateSnapshot: '',
+    prefixIds: [] as string[],
+    prefixRender: [] as Message[],
+    needFull: true,
+    lastTokens: 0,
+  }
+
+  const window = history(10)
+  const input = compactCtxFor(window)
+  await runCompacting({
+    sessionId: 's1',
+    input,
+    getCtx: () => ctx,
+    engine,
+    config,
+    meta: { read: async () => meta, patch: async (p) => { Object.assign(meta, p) } },
+  })
+
+  const block = ctx.state.blocks.find((b) => b.topic === 'session 压缩折叠')
+  expect(block).toBeDefined()
+  const restored = restoreBlockMessages(engine, ctx.state, ctx.archive, block!.blockId)
+  // 折叠后窗口原文仍可从归档还原（物理删除后 decompress 依旧有效）
+  expect(restored.length).toBeGreaterThan(0)
 })

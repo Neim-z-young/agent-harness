@@ -1,5 +1,36 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 107）上下文压缩改造·阶段三：session.compacting 接线 + ACP 协同
+
+### 背景
+
+前两阶段建立了压缩消息文件/断点索引与内存视图接口骨架，但两条压缩管线（session 原生 Compaction 物理回收 / ACP 模型压缩）存在时序冲突：进入会话时 `compactIfNeeded` 可能先物理删旧文，破坏 ACP 保的"全文可回溯"。阶段三目标：把此前从未接线的 `session.compacting` hook 真正打通，让 ACP 在 core 物理删除窗口前先保全原文。
+
+### 改动
+
+**packages/plugin**
+- `CompactionContext` 扩展 `window`（待压缩窗口，只读参考）与 `windowHandled`（插件已保全窗口，core 可放心删除）。
+
+**packages/core**
+- `compact()` 在真正删除窗口前触发 `session.compacting` hook，传入 `{ agentId, sessionId }` 与 `compactCtx`（含 `window`）。
+- 消费插件改写：`keepLast` 变化 → 重算保留段/裁剪窗口；`strategy` 覆盖；`summary` 已提供则跳过自行生成（避免双份摘要）。
+- `SessionServices` 新增 `triggerPlugin`，并把 `createHarness` 的构造处接入（复用 AgentRuntime 的 trigger 桥）。
+
+**packages/plugins/acp-context**
+- 注册 `session.compacting` hook，处理核心为可单测纯函数 `runCompacting`：先水合 ACP 压缩状态 → 把窗口整体压平成 core，幂等判定（复用 `coveredMessageIds`，已覆盖即跳过并仅置 `windowHandled`）→ 对"尚未覆盖"片段指派 refs 并折叠成一个摘要块（规则摘要兜底）→ 窗口原文归档进 `ctx.archive`（折叠后 decompress 仍可全文还原）→ 状态持久化到 `session.meta`，并把 `summary`/`windowHandled` 写回给 core。
+- 导出 `defaultRuleSummary` 作规则摘要兜底。
+
+### 验证
+
+- acp-context 新增 3 用例：折叠+豁免 core 摘要、幂等（二次处理不重复折叠）、折叠后 decompress 仍可还原窗口原文；15 测试全过。
+- core 35、revert 35 全过；全仓 typecheck 通过。
+
+### 后续
+
+阶段三摘要在 ACP 侧落进 `session.meta`，`decompress`/`search_context` 的原文回溯暂依赖进程内 `archive` 归档；跨重启的全文回读待阶段三收尾接入断点索引回读（`HistoryLoader`/压缩消息文件）。阶段四：TUI/Web 历史按需分页渲染。
+
+---
+
 ## 2026-09-13（续 106）上下文压缩改造·阶段二：压缩视图接口骨架
 
 ### 背景

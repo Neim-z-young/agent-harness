@@ -158,6 +158,7 @@ import {
   LLMParams,
   PromptInput,
 } from '@harness/plugin'
+import type { CompactionContext } from '@harness/plugin'
 import {
   Tool,
   ToolResult,
@@ -517,6 +518,11 @@ class DefaultToolPool implements PluginToolPool {
 interface SessionServices {
   readonly agent: AgentRuntime
   readonly currentAgentId: () => string
+  /** 触发插件 hook（供 session.compacting 等生命周期接入） */
+  readonly triggerPlugin: <N extends keyof Hooks>(
+    name: N,
+    ...args: Parameters<NonNullable<Hooks[N]>>
+  ) => Promise<void>
 }
 
 export class DefaultSessionManager implements SessionManager {
@@ -762,7 +768,7 @@ export class DefaultSessionManager implements SessionManager {
     const sess = this.sessions.get(sessionId)
     if (!sess) return
     const now = Date.now()
-    const strat = strategy ?? options.strategy ?? 'summary'
+    let strat = strategy ?? options.strategy ?? 'summary'
     const keepRecent = Math.max(options.keepRecentMessages ?? 10, 0)
 
     const beforeLen = sess.messages.length
@@ -770,15 +776,36 @@ export class DefaultSessionManager implements SessionManager {
     const msgs = sess.messages
     if (msgs.length <= keepRecent) return // 无需压缩
 
-    const cutIndex = Math.max(0, msgs.length - keepRecent)
-    const windowToPrune = msgs.slice(0, cutIndex)
-    const kept = msgs.slice(cutIndex)
+    let cutIndex = Math.max(0, msgs.length - keepRecent)
+    let windowToPrune = msgs.slice(0, cutIndex)
+    let kept = msgs.slice(cutIndex)
 
-    // 生成摘要（仅 summary / agent）
-    let summaryText: string | undefined
+    // 触发 session.compacting hook：给插件（如 ACP）在删除前保全原文的窗口，
+    // 并可改写 keepLast/strategy/summary。核心路径此前从未触发该 hook。
+    const compactCtx: CompactionContext = {
+      keepLast: keepRecent,
+      strategy: strat,
+      window: windowToPrune,
+    }
+    await this.services?.()?.triggerPlugin(
+      'session.compacting',
+      { agentId: sess.agentId ?? '', sessionId },
+      compactCtx,
+    )
+    // 消费插件改写：keepLast → 重算窗口/保留段；strategy 覆盖；已提供 summary 则不再自行生成
+    if (compactCtx.keepLast != null && compactCtx.keepLast !== keepRecent) {
+      cutIndex = Math.max(0, msgs.length - Math.max(compactCtx.keepLast, 0))
+      windowToPrune = msgs.slice(0, cutIndex)
+      kept = msgs.slice(cutIndex)
+    }
+    if (compactCtx.strategy != null) strat = compactCtx.strategy
+    const pluginSummary = compactCtx.summary
+
+    // 生成摘要（仅 summary / agent；插件已提供 summary 时跳过自行生成）
+    let summaryText: string | undefined = pluginSummary
     const prevMemory = this.readMemory(sess)
 
-    if (strat === 'summary' || strat === 'agent') {
+    if (summaryText === undefined && (strat === 'summary' || strat === 'agent')) {
       const maxChars = options.summaryMaxChars ?? 8000
       if (strat === 'agent') {
         // 尝试调用 agent（通过 services?.agent）——缺失或失败则 fallback 到规则摘要
@@ -1893,7 +1920,11 @@ export class HarnessImpl implements Harness {
     let agentRuntime: AgentRuntime | undefined
     this.session = new DefaultSessionManager(() => {
       if (!agentRuntime) throw new Error('AgentRuntime 未就绪')
-      return { agent: agentRuntime, currentAgentId: () => options.defaultAgentId ?? 'default' }
+      return {
+        agent: agentRuntime,
+        currentAgentId: () => options.defaultAgentId ?? 'default',
+        triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
+      }
     })
 
     const defaultAgentId = options.defaultAgentId ?? 'default'

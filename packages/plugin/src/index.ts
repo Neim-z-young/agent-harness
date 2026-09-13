@@ -95,12 +95,23 @@ export interface PromptInput {
 }
 
 export interface CompactionContext {
-  /** 保留最近 N 条消息 */
+  /** 保留最近 N 条消息（插件可改写） */
   keepLast?: number
-  /** 摘要策略 */
+  /** 摘要策略（插件可改写；`prune` 表示仅删除不写摘要） */
   strategy?: 'prune' | 'summary' | 'agent'
-  /** 摘要内容（输出） */
+  /** 摘要内容（输出；插件若已提供则 core 不再自行生成） */
   summary?: string
+  /**
+   * 待压缩窗口（将要被删除的消息，只读参考）。core 会在真正删除前的
+   * `session.compacting` hook 里传入，供 ACP 等插件在删除前保全原文。
+   * 语义为只读：插件不应修改该数组（core 之后会按 keepLast 重算并存取）。
+   */
+  window?: readonly unknown[]
+  /**
+   * 插件置 true 表示已把 window 原文保全到自身持久化（如 ACP 块/摘要文件），
+   * core 可放心物理删除。非强制：未置位时 core 仅按默认行为压缩。
+   */
+  windowHandled?: boolean
 }
 
 /** session.preModel hook 的输入（每轮进入模型前） */
