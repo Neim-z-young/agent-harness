@@ -9,7 +9,7 @@ import {
   type CompressionState,
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
-import { runPreModel, runCompacting, restoreBlockMessages, ACP_META_KEY } from './index'
+import { runPreModel, runCompacting, restoreBlockMessages, ACP_META_KEY, ACP_ARCHIVE_KEY } from './index'
 import { toCores, compactHistory, idBase, baseId } from './adapter'
 
 // ===== helpers =====
@@ -452,4 +452,64 @@ test('runCompacting：折叠后 decompress 仍能还原窗口原文全文', asyn
   const restored = restoreBlockMessages(engine, ctx.state, ctx.archive, block!.blockId)
   // 折叠后窗口原文仍可从归档还原（物理删除后 decompress 依旧有效）
   expect(restored.length).toBeGreaterThan(0)
+})
+
+test('runCompacting：折叠窗口原文持久化到 meta，跨重启后新 ctx 仍可还原全文', async () => {
+  const engine = createCore()
+  const config = makeConfig()
+  const meta: Record<string, unknown> = {}
+  const ctx = {
+    state: createInitialState(),
+    archive: new Map<string, Message>(),
+    lastCores: [] as ReturnType<typeof toCores>['cores'],
+    hydrated: false,
+    stateSnapshot: '',
+    prefixIds: [] as string[],
+    prefixRender: [] as Message[],
+    needFull: true,
+    lastTokens: 0,
+  }
+  const patch = async (p: Record<string, unknown>) => Object.assign(meta, p as any)
+
+  const window = history(10)
+  await runCompacting({
+    sessionId: 's1',
+    input: compactCtxFor(window),
+    getCtx: () => ctx,
+    engine,
+    config,
+    meta: { read: async () => meta, patch },
+  })
+
+  // 折叠后 meta 持久化了状态 + 原文归档
+  expect(meta[ACP_META_KEY]).toBeDefined()
+  expect(meta[ACP_ARCHIVE_KEY]).toBeDefined()
+
+  // 模拟重启：全新 ctx（空 memory），仅从 meta 水合
+  const fresh = {
+    state: createInitialState(),
+    archive: new Map<string, Message>(),
+    lastCores: [] as ReturnType<typeof toCores>['cores'],
+    hydrated: false,
+    stateSnapshot: '',
+    prefixIds: [] as string[],
+    prefixRender: [] as Message[],
+    needFull: true,
+    lastTokens: 0,
+  }
+  await runCompacting({
+    sessionId: 's1',
+    input: compactCtxFor(window), // 仍是同一窗口：水合后判定已被覆盖 → 幂等跳过，不重复折叠
+    getCtx: () => fresh,
+    engine,
+    config,
+    meta: { read: async () => meta, patch },
+  })
+
+  // 水合后归档被恢复，解压仍能还原窗口全文
+  const block = fresh.state.blocks.find((b) => b.topic === 'session 压缩折叠')
+  expect(block).toBeDefined()
+  const restored = restoreBlockMessages(engine, fresh.state, fresh.archive, block!.blockId)
+  expect(restored.length).toBeGreaterThan(0)
+  expect(fresh.archive.size).toBeGreaterThan(0)
 })

@@ -1,5 +1,31 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 108）上下文压缩改造·阶段三 收尾：窗口原文跨重启回溯
+
+### 背景
+续 107 `runCompacting` 折叠窗口原文只进内存 `ctx.archive`，重启即失；且 core 每次都物理删除窗口，`.json` 里的断点也无从回读。本次打通"跨重启后 `decompress` 仍能还原被 session 压缩删掉的窗口全文"。
+
+### 改动
+**packages/plugin**
+- `CompactionContext` 增加 `meta` 访问器（`read`/`patch`，与 `session.preModel` 同义），供插件在物理删除前持久化到 `session.meta`。
+
+**packages/core**
+- `compact()` 构造 `compactCtx.meta`，用会话自身的读/写实现（`sess.meta` + `updatedAt`），把真实持久化入口交给 ACP。
+
+**packages/plugins/acp-context**
+- 新增 `ACP_ARCHIVE_KEY = 'acp.archive.v1'`，把被折叠窗口的原文（coreId → Message）持久化到 `session.meta`（覆盖式合并窗口内原文，不下沉本轮新消息）。
+- `runCompacting` / `runPreModel` 水合时从 meta 恢复归档进 `ctx.archive`，保证跨重启后 `restoreBlockMessages`/`decompress` 仍能还原全文。
+- hook 注册改为透传 `compactCtx.meta`（替换此前的假 meta）。
+
+### 验证
+- 新增 1 用例：折叠后 meta 持久化状态+原文归档，模拟全新 ctx 从 meta 水合后仍可还原窗口全文；acp-context 16 全过。
+- core 35 全过；全仓 typecheck 通过。
+
+### 后续
+- `.cmp.json`/断点索引（阶段一产物）仍无需接入 ACP：当前经 `session.meta` 归档已满足跨重启回溯；如需压缩文件独立出 meta 防膨胀，再回到 `SessionCompactionStore` 路线（阶段四前的可选优化）。
+
+---
+
 ## 2026-09-13（续 107）上下文压缩改造·阶段三：session.compacting 接线 + ACP 协同
 
 ### 背景

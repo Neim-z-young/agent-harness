@@ -53,6 +53,8 @@ import {
 
 /** session.meta 中存储 ACP 压缩状态的键 */
 export const ACP_META_KEY = 'acp.v1'
+/** session.meta 中存储"被 session 压缩折叠窗口的原文归档"的键（跨重启回溯用） */
+export const ACP_ARCHIVE_KEY = 'acp.archive.v1'
 
 // ===== 轻量 Schema 工厂（不依赖 zod）=====
 function makeSchema<T>(): Schema<T> {
@@ -403,7 +405,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               getCtx: () => getOrCreateCtx(input.sessionId),
               engine,
               config,
-              meta: {
+              meta: compactCtx.meta ?? {
                 read: async () => undefined,
                 patch: async () => {},
               },
@@ -476,7 +478,20 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
   // 压平为 core（同时记录原始消息归档，供 decompress 还原全文），运行 processTurn
   const inflat = toCores(history)
+  // 归档 = 本轮历史原文 ++ 跨session压缩折叠窗口持久化的原文（后者跨重启后可回溯）
   ctx.archive = new Map(inflat.byId)
+  try {
+    const archived = (await meta.read())?.[ACP_ARCHIVE_KEY] as Record<string, Message> | undefined
+    if (archived && typeof archived === 'object') {
+      for (const [coreId, orig] of Object.entries(archived)) {
+        if (orig && typeof orig === 'object' && !ctx.archive.has(coreId)) {
+          ctx.archive.set(coreId, orig as Message)
+        }
+      }
+    }
+  } catch {
+    // 读取失败不影响主流程
+  }
   const tokenCount = estimateTokens(inflat.cores)
   const res = engine.processTurn({
     messages: inflat.cores,
@@ -613,6 +628,16 @@ export async function runCompacting(deps: {
         ctx.state = { ...createInitialState(), ...saved }
         ctx.stateSnapshot = JSON.stringify(ctx.state)
       }
+      // 恢复"被 session 压缩折叠窗口"的原文归档，保证跨重启仍可解压回溯
+      const archived = (await meta.read())?.[ACP_ARCHIVE_KEY] as
+        | Record<string, Message>
+        | undefined
+      if (archived && typeof archived === 'object') {
+        for (const [coreId, orig] of Object.entries(archived)) {
+          if (orig && typeof orig === 'object') ctx.archive.set(coreId, orig as Message)
+        }
+        void archived
+      }
     } catch {
       // 水合失败则从空状态开始
     }
@@ -664,6 +689,19 @@ export async function runCompacting(deps: {
     ctx.stateSnapshot = nextSnapshot
     await meta.patch({ [ACP_META_KEY]: ctx.state })
   }
+  // 持久化被折叠窗口的原文归档：core 物理删除窗口后，跨重启仍可从 meta 还原全文。
+  // 只合并"窗口内"的原文（其 original 在 inflat.byId），避免 meta 冗余累积本轮新消息。
+  const archiveObj: Record<string, unknown> = {}
+  try {
+    const prev = (await meta.read())?.[ACP_ARCHIVE_KEY]
+    if (prev && typeof prev === 'object') Object.assign(archiveObj, prev)
+  } catch {
+    // 读旧归档失败则从空开始
+  }
+  for (const [coreId, orig] of inflat.byId) {
+    if (typeof orig === 'object' && orig != null) archiveObj[coreId] = orig
+  }
+  await meta.patch({ [ACP_ARCHIVE_KEY]: archiveObj })
 
   // 已把窗口折叠进 ACP 块：让 core 复用它生成的摘要，避免双份摘要
   input.summary = summary

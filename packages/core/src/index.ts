@@ -786,6 +786,13 @@ export class DefaultSessionManager implements SessionManager {
       keepLast: keepRecent,
       strategy: strat,
       window: windowToPrune,
+      meta: {
+        read: async () => sess.meta,
+        patch: async (patch) => {
+          sess.meta = { ...(sess.meta ?? {}), ...patch }
+          sess.updatedAt = Date.now()
+        },
+      },
     }
     await this.services?.()?.triggerPlugin(
       'session.compacting',

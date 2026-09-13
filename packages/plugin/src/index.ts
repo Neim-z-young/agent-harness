@@ -112,6 +112,14 @@ export interface CompactionContext {
    * core 可放心物理删除。非强制：未置位时 core 仅按默认行为压缩。
    */
   windowHandled?: boolean
+  /**
+   * 会话 meta 访问器：与 `session.preModel` 的 meta 同义，供插件在物理删除前
+   * 把窗口原文/状态持久化到 session.meta，跨重启后可回溯。只读/浅合并读写。
+   */
+  meta?: {
+    read: () => Promise<Record<string, unknown> | undefined>
+    patch: (patch: Record<string, unknown>) => Promise<void>
+  }
 }
 
 /** session.preModel hook 的输入（每轮进入模型前） */
