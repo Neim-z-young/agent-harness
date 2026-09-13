@@ -85,9 +85,11 @@
 | D2 | 三文件放 `.planning/` 目录 | 不污染仓库根；支持 `.active_plan` 多计划；默认 gitignore |
 | D3 | 复用 `read_file`/`write_file` 更新三文件，不注入专用工具 | 实现最简、权限走既有工具链；attestation 由注入 hook 侧计算，不依赖工具 |
 | D4 | attestation 为「动态哈希 + 告警」而非「拒绝写入」 | 复用工具模式下无法拦写；模型合法改动后哈希自然更新，外部静默改写时告警足够 |
-| D5 | smart 注入策略（PWF_INJECT=smart 类比） | 长计划只注入目标+当前阶段+下一步+完成度，省 token、防上下文被计划占满 |
+| D5 | smart 注入策略（PWF_INJECT=smart 类比） | 长计划只注入目标+当前阶段+下一步+完成度，省 token、防上下文被计划占满；注入块设 token 上限（默认 ≤300），超长只注入摘要行，控制上下文占用 |
 | D6 | 并发保护降级为「checked 计数提示」 | 复用工具模式下无法强锁文件；注入块携带上次 checked 计数，模型写入时发现下降可获提示 |
 | D7 | Skill 注册 + CLI 命令齐备 | 与 computer-use 插件同模式：插件工厂 + skillManager.register + cli.commands/command |
+| D8 | 注入块做**缓存友好设计**：按文件 mtime/哈希做变化检测，计划未变化则注入与上轮**逐字相同**的文本 | 前缀缓存从头精确匹配：计划块位于历史消息之前，内容一旦变化会连累历史消息缓存整条失效 → 每轮全量 re-prefill；变化检测可让绝大多数轮次保持前缀一致、命中缓存 |
+| D9 | `injectPlacement: 'system' \| 'tail'` 选项（默认 system） | `system`（注入 system prompt 尾部，语义/一致性优先）；`tail`（在 `session.preModel` 中临时插入消息尾部、不落历史）换取最大缓存命中：历史前缀稳定，仅 prefill 计划块+新消息 |
 
 ---
 
@@ -116,9 +118,11 @@
     哈希: sha256:abcd…（上次: sha256:xxxx，若变化且非本轮写入 → [PLAN TAMPERED]）
     ===END PLAN DATA===
     ```
-  - smart 策略：`planning.inject: 'smart' | 'full'`（选项，默认 smart）
+  - smart 策略：`planning.inject: 'smart' | 'full'`（选项，默认 smart）；注入块 token 上限（默认 300）
+  - **变化检测（缓存友好）**：记录 `{ lastBlockText, lastSig }`（sig = 三文件 mtime+size+hash）；本轮 sig 与上次一致 → 直接复用 `lastBlockText`（逐字相同，前缀缓存命中）；变化 → 重算注入块并更新 `lastBlockText`。`[PLAN TAMPERED]` 告警也由 sig 变化驱动
+  - `injectPlacement: 'system' | 'tail'`：`system` 走 `prompt.system.transform` 追加 parts；`tail` 走 `session.preModel` 在 messages 尾部临时插入一条 user 消息（不调用 save，不落历史），本轮请求后即丢弃
 - `session.compacting` hook：压缩前把 `progress.md` 尾部（本轮进度）flush 到盘（PreCompact 对应，防压缩丢尾部日志）
-- 单测：注入块内容/格式、smart 裁剪、tampered 告警
+  - 单测：注入块内容/格式、smart 裁剪、tampered 告警、**变化检测（sig 不变时注入文本逐字一致）**、tail 模式不落历史
 
 ### 阶段三：CLI 命令 + Skill 注册
 - `cli.commands` 注册：`plan`、`plan-status`、`plan-doctor`、`plan-complete`
