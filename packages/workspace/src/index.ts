@@ -17,6 +17,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 export * from './storage'
+export * from './compaction-store'
 export * from './multi-dir'
 
 /** 单级目录根：plugin / skill / agent 三组可插拔资源目录 */
