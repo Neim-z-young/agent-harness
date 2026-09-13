@@ -101,6 +101,9 @@ export interface DecompressOutput {
   active: boolean
   tier: 1 | 2 | 3
   effectiveMessages: string[]
+  /** 断点索引：该块覆盖的原文消息在主会话历史中的起止 id（供宿主 loader 按 [startId,endId] 从归档容器切片回读）。缺省为空串表示无覆盖。 */
+  startId: string
+  endId: string
   /** 被该块压缩并归档的原始消息全文（按原顺序），便于模型了解被折叠的具体内容 */
   originalMessages: Array<{ id: string; role?: string; text: string }>
 }
@@ -114,6 +117,9 @@ export interface SearchResult {
   topic?: string
   summary: string
   score: number
+  /** 断点索引：覆盖原文的起止消息 id，供宿主经归档容器切片回读全文 */
+  startId?: string
+  endId?: string
 }
 export interface SearchOutput {
   query: string
@@ -155,6 +161,8 @@ interface AcpSessionCtx {
   lastCores: CoreMessage[]
   /** 是否已从 session.meta 水合过压缩状态 */
   hydrated: boolean
+  /** 已持久化到 ACP_ARCHIVE_KEY 的 core id / ref 集合（用于幂等合并原文归档），惰性初始化 */
+  archivedKeys: Set<string>
   /** 最近一次持久化的状态 JSON（用于跳过无变化的重复写入） */
   stateSnapshot: string
   // ---- 增量渲染缓存 ----
@@ -200,6 +208,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         archive: new Map(),
         lastCores: [],
         hydrated: false,
+        archivedKeys: new Set(),
         stateSnapshot: '',
         prefixIds: [],
         prefixRender: [],
@@ -278,6 +287,13 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           if (!block) {
             return { ok: false, error: { message: `未找到压缩块: ${input.blockId}`, code: 'NOT_FOUND' } }
           }
+          const originalMessages = restoreBlockMessages(
+            engine,
+            sctx.state,
+            sctx.archive,
+            block.blockId,
+          )
+          const span = blockSpan(originalMessages)
           return {
             ok: true,
             output: {
@@ -288,7 +304,9 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               active: block.active,
               tier: block.tier,
               effectiveMessages: block.effectiveMessageIds,
-              originalMessages: restoreBlockMessages(engine, sctx.state, sctx.archive, block.blockId),
+              startId: span.startId,
+              endId: span.endId,
+              originalMessages,
             },
           }
         },
@@ -309,12 +327,17 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           }
           const blocks = engine.search(input.query, sctx.state)
           const limit = Math.max(0, input.limit ?? 5)
-          const results: SearchResult[] = blocks.slice(0, limit).map((b) => ({
-            blockId: b.blockId,
-            topic: b.topic,
-            summary: b.summary,
-            score: 0, // kernel 不返回数值分，展示顺序即相关序
-          }))
+          const results: SearchResult[] = blocks.slice(0, limit).map((b) => {
+            const span = coveredSpan(sctx.state, sctx.archive, b)
+            return {
+              blockId: b.blockId,
+              topic: b.topic,
+              summary: b.summary,
+              score: 0, // kernel 不返回数值分，展示顺序即相关序
+              startId: span.startId,
+              endId: span.endId,
+            }
+          })
           return { ok: true, output: { query: input.query, limit, results } }
         },
       })
@@ -480,12 +503,15 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const inflat = toCores(history)
   // 归档 = 本轮历史原文 ++ 跨session压缩折叠窗口持久化的原文（后者跨重启后可回溯）
   ctx.archive = new Map(inflat.byId)
+  ctx.archivedKeys ??= new Set()
   try {
     const archived = (await meta.read())?.[ACP_ARCHIVE_KEY] as Record<string, Message> | undefined
     if (archived && typeof archived === 'object') {
       for (const [coreId, orig] of Object.entries(archived)) {
-        if (orig && typeof orig === 'object' && !ctx.archive.has(coreId)) {
-          ctx.archive.set(coreId, orig as Message)
+        if (orig && typeof orig === 'object') {
+          if (!ctx.archive.has(coreId)) ctx.archive.set(coreId, orig as Message)
+          // 记录已持久化的挡住键，后续幂等合并不再重复写入
+          ctx.archivedKeys.add(coreId)
         }
       }
     }
@@ -511,6 +537,53 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     ctx.stateSnapshot = nextSnapshot
     try {
       await meta.patch({ [ACP_META_KEY]: res.state })
+    } catch {
+      // 持久化失败不致命，内存态仍可用
+    }
+  }
+
+  // ---- 折叠轮持久化原文到 ACP_ARCHIVE_KEY ----
+  // 断点索引回读原文容器：把当前所有块（含 processTurn 紧急折叠、上轮 compress 工具折叠）
+  // 所覆盖的原文消息，若尚不在容器的"已持久化键"集合（archivedKeys）中，则合并写入
+  // session.meta[ACP_ARCHIVE_KEY]。跨重启后即便会话本体已物理删除窗口，decompress /
+  // search_context / loader 仍能按断点索引 [startId,endId] 从该容器还原完整原文。
+  const dirty = new Set<string>()
+  {
+    const covered = new Set<string>()
+    for (const b of res.state.blocks) collectCoveredIds(res.state, b, covered)
+    for (const idOrRef of covered) {
+      if (ctx.archivedKeys.has(idOrRef)) continue
+      let orig = ctx.archive.get(idOrRef)
+      if (!orig) {
+        const raw = res.state.messageRefs?.byRef?.[idOrRef]
+        orig = raw ? ctx.archive.get(raw) : undefined
+      }
+      if (orig && typeof orig === 'object') {
+        dirty.add(idOrRef)
+        // 记录本次新增的挡 key，避免重复扫描 meta
+        ctx.archivedKeys.add(idOrRef)
+      }
+    }
+  }
+  if (dirty.size > 0) {
+    let archiveObj: Record<string, unknown> = {}
+    try {
+      const prev = (await meta.read())?.[ACP_ARCHIVE_KEY]
+      if (prev && typeof prev === 'object') archiveObj = { ...archiveObj, ...(prev as object) }
+    } catch {
+      // 读写失败不影响主流程
+    }
+    for (const coreId of dirty) {
+      const orig = ctx.archive.get(coreId)
+      if (orig && typeof orig === 'object') archiveObj[coreId] = orig
+      else {
+        const raw = res.state.messageRefs?.byRef?.[coreId]
+        const resolved = raw ? ctx.archive.get(raw) : undefined
+        if (resolved && typeof resolved === 'object') archiveObj[coreId] = resolved
+      }
+    }
+    try {
+      await meta.patch({ [ACP_ARCHIVE_KEY]: archiveObj })
     } catch {
       // 持久化失败不致命，内存态仍可用
     }
@@ -622,6 +695,7 @@ export async function runCompacting(deps: {
   // 尚未水合则先恢复压缩状态（session 压缩可能在首轮 preModel 之前进入）
   if (!ctx.hydrated) {
     ctx.hydrated = true
+    ctx.archivedKeys ??= new Set()
     try {
       const saved = (await meta.read())?.[ACP_META_KEY] as CompressionState | undefined
       if (saved && typeof saved === 'object') {
@@ -634,9 +708,11 @@ export async function runCompacting(deps: {
         | undefined
       if (archived && typeof archived === 'object') {
         for (const [coreId, orig] of Object.entries(archived)) {
-          if (orig && typeof orig === 'object') ctx.archive.set(coreId, orig as Message)
+          if (orig && typeof orig === 'object') {
+            ctx.archive.set(coreId, orig as Message)
+            ctx.archivedKeys.add(coreId)
+          }
         }
-        void archived
       }
     } catch {
       // 水合失败则从空状态开始
@@ -756,8 +832,70 @@ function textOf(m?: Message): string {
 }
 
 /**
+ * 递归收集一个压缩块"完整覆盖"的原始消息 id / ref（含 tier2/3 嵌套子块）。
+ *
+ * 断点索引回读原文的语义：不仅要还原该块直接压缩的消息，还要连同它直接嵌套的
+ * 子块（directBlockIds，即 tier 分层折叠出的更深层块）所覆盖的消息一起收集，
+ * 保证跨重启后 decompress / search_context 能回读"原文容器"取回完整的原始会话。
+ *
+ * @param out 收集到的消息 id / ref 集合（写入 out，允许复用现有 Set）
+ */
+export function collectCoveredIds(
+  state: CompressionState,
+  block: CompressionBlock,
+  out: Set<string>,
+): void {
+  for (const id of block.effectiveMessageIds) out.add(id)
+  for (const id of block.directMessageIds) out.add(id)
+  for (const childId of block.directBlockIds) {
+    const child = state.blocks.find((b) => b.blockId === childId)
+    if (child) collectCoveredIds(state, child, out)
+  }
+}
+
+/**
+ * 从 decode 出的 originalMessages 计算断点索引线 span（起止原始消息 id）。
+ * 断点索引回读原文容器的定位依据：宿主可按 [startId, endId] 从归档切片还原。
+ */
+export function blockSpan(
+  originalMessages: DecompressOutput['originalMessages'],
+): { startId: string; endId: string } {
+  const first = originalMessages[0]
+  const last = originalMessages[originalMessages.length - 1]
+  return {
+    startId: first?.id ?? '',
+    endId: originalMessages.length > 1 ? last?.id ?? '' : '',
+  }
+}
+
+/**
+ * 仅依据状态 + 归档轻量计算一个块的断点 span（不渲染原文全文），用于 search_context 等
+ * 需要附带索引、但不必取回全部原文的场景。
+ */
+export function coveredSpan(
+  state: CompressionState,
+  archive: Map<string, Message>,
+  block: CompressionBlock,
+): { startId: string; endId: string } {
+  const covered = new Set<string>()
+  collectCoveredIds(state, block, covered)
+  const ids: string[] = []
+  for (const idOrRef of covered) {
+    let orig = archive.get(idOrRef)
+    if (!orig) {
+      const raw = state.messageRefs?.byRef?.[idOrRef]
+      orig = raw ? archive.get(raw) : undefined
+    }
+    if (orig && typeof orig === 'object') ids.push(orig.id)
+  }
+  return { startId: ids[0] ?? '', endId: ids.length > 1 ? ids[ids.length - 1] ?? '' : '' }
+}
+
+/**
  * 还原一个压缩块所覆盖的原始消息全文（供 decompress）。
  * 通过状态里的"ref → core id → 归档 Message"反解；先试直接 id，再走 byRef。
+ * 采用断点索引回读：递归收集 directBlockIds 覆盖的全部嵌套子块消息 id，保证
+ * tier2/3 分层折叠的完整原文都能从归档容器（ACP_ARCHIVE_KEY 水合出的 archive）取回。
  */
 export function restoreBlockMessages(
   engine: ReturnType<typeof createCore>,
@@ -768,10 +906,12 @@ export function restoreBlockMessages(
   const block = engine.decompress(blockId, state)
   if (!block) return []
 
+  const covered = new Set<string>()
+  collectCoveredIds(state, block, covered)
+
   const out: DecompressOutput['originalMessages'] = []
   const seen = new Set<string>()
-  const ids = [...(block.effectiveMessageIds ?? []), ...(block.directMessageIds ?? [])]
-  for (const idOrRef of ids) {
+  for (const idOrRef of covered) {
     if (seen.has(idOrRef)) continue
     seen.add(idOrRef)
     let orig = archive.get(idOrRef)

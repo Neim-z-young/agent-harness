@@ -1,5 +1,26 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 112）上下文压缩·遗留项3：decompress/search_context 走断点索引回读原文容器（tier 嵌套还原 + 跨重启原文持久化）
+
+### 背景
+阶段三收尾后，`decompress`/`search_context` 的原文回溯仍只依赖进程内 `ctx.archive`（meta 水合原文），跨重启后 ACP 内部逐层（tier2/3 嵌套）折叠块的完整还原路径未完全打通到统一 loader。本次实现"断点索引回读原文容器"：①折叠窗口原文在 `runPreModel`/`runCompacting` 折叠轮持久化进 `session.meta[acp.archive.v1]`；②`restoreBlockMessages` 递归收集 `directBlockIds` 覆盖的嵌套子块消息 id，保证 tier2/3 完整还原；③工具输出附 `startId`/`endId` 断点索引，对齐 CLI `resolveAcpBlockOriginals` 的容器切片回读。
+
+### 改动
+
+**packages/plugins/acp-context/src/index.ts**
+- 新增 `collectCoveredIds(state, block, out)`：递归收集块的 `effectiveMessageIds` + `directMessageIds` + 其 `directBlockIds` 嵌套子块覆盖的全部消息 id/ref。
+- `restoreBlockMessages` 改为经 `collectCoveredIds` 走断点索引回读：不仅取回直连消息，还穿透 tier2/3 子块还原完整原文。
+- 新增 `ctx.archivedKeys: Set<string>`，记录已持久化到 `ACP_ARCHIVE_KEY` 的键，供幂等合并；`runPreModel` 水合时与 `runCompacting` 水合时同步填充（跨重启不重复写）。
+- `runPreModel` 折叠轮（新增块或已有块覆盖未归档原文）把所覆盖原文合并持久化到 `session.meta[ACP_ARCHIVE_KEY]`，解决跨重启原文丢失。
+- `compress` 的 `DecompressOutput` 与 `search_context` 的 `SearchResult` 增加断点索引 `startId`/`endId`；新增 `blockSpan`（还原数组→夹角）与 `coveredSpan`（状态+归档轻量计算）。
+
+### 验证
+- acp-context 新增用例：`collectCoveredIds` tier 嵌套深度收集、`restoreBlockMessages` tier 嵌套完整还原、`blockSpan`/`coveredSpan` 断点索引、`runPreModel` 压缩块创建后原文持久化到 `ACP_ARCHIVE_KEY` 且跨重启新 ctx 仍可还原全文。
+- acp-context 21 用例全绿；单包 typecheck 通过。CLI 侧 `loadFullHistory`/`resolveAcpBlockOriginals` 已在此前的统一块模型接线中消费该容器，无需改动。
+
+### 后续
+- `.cmp.json`/断点索引（阶段一产物）仍无需接入 ACP：当前经 `session.meta` 归档已满足跨重启回溯；如需压缩文件独立出 meta 防膨胀，再回到 `SessionCompactionStore` 路线。
+
 ## 2026-09-13（续 111）上下文压缩·阶段四：TUI 前端按需渲染（压缩提示行 + 惰性展开 + 更早分页）
 
 ### 背景

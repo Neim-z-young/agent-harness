@@ -7,10 +7,20 @@ import {
   activeBlocks,
   type Config,
   type CompressionState,
+  type CompressionBlock,
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
 import type { CompactionContext } from '@harness/plugin'
-import { runPreModel, runCompacting, restoreBlockMessages, ACP_META_KEY, ACP_ARCHIVE_KEY } from './index'
+import {
+  runPreModel,
+  runCompacting,
+  restoreBlockMessages,
+  collectCoveredIds,
+  blockSpan,
+  coveredSpan,
+  ACP_META_KEY,
+  ACP_ARCHIVE_KEY,
+} from './index'
 import { toCores, compactHistory, idBase, baseId } from './adapter'
 
 // ===== helpers =====
@@ -61,6 +71,7 @@ interface Harness {
     archive: Map<string, Message>
     lastCores: ReturnType<typeof toCores>['cores']
     hydrated: boolean
+    archivedKeys: Set<string>
     stateSnapshot: string
     prefixIds: string[]
     prefixRender: Message[]
@@ -82,6 +93,7 @@ function makeHarness(config: Config = makeConfig(), sessionId = 's1'): Harness {
     archive: new Map<string, Message>(),
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
+    archivedKeys: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -351,6 +363,7 @@ test('runCompacting：session 压缩前把 window 折叠进 ACP 块，并豁免 
     archive: new Map<string, Message>(),
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
+    archivedKeys: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -402,6 +415,7 @@ test('runCompacting：幂等——已覆盖的窗口二次处理不重复折叠'
     archive: new Map<string, Message>(),
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: true,
+    archivedKeys: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -445,6 +459,7 @@ test('runCompacting：折叠后 decompress 仍能还原窗口原文全文', asyn
     archive: new Map<string, Message>(),
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
+    archivedKeys: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -479,6 +494,7 @@ test('runCompacting：折叠窗口原文持久化到 meta，跨重启后新 ctx 
     archive: new Map<string, Message>(),
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
+    archivedKeys: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -507,6 +523,7 @@ test('runCompacting：折叠窗口原文持久化到 meta，跨重启后新 ctx 
     archive: new Map<string, Message>(),
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
+    archivedKeys: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -528,4 +545,155 @@ test('runCompacting：折叠窗口原文持久化到 meta，跨重启后新 ctx 
   const restored = restoreBlockMessages(engine, fresh.state, fresh.archive, block!.blockId)
   expect(restored.length).toBeGreaterThan(0)
   expect(fresh.archive.size).toBeGreaterThan(0)
+})
+
+// ===== 遗留项3：断点索引回读原文容器 =====
+
+/** 构造一个带指定直连子块/消息的压缩块（供 tier 嵌套测试） */
+function makeBlock(
+  blockId: string,
+  opts: Partial<CompressionBlock> = {},
+): CompressionBlock {
+  return {
+    blockId,
+    runId: 'r',
+    tier: 2,
+    summary: `summary:${blockId}`,
+    directMessageIds: [],
+    effectiveMessageIds: [],
+    directBlockIds: [],
+    compressedTokens: 1,
+    createdAt: 1,
+    survivedCount: 0,
+    generation: 'young',
+    active: true,
+    ...opts,
+  }
+}
+
+function makeArchive(coreIds: string[], base = 'm'): Map<string, Message> {
+  const map = new Map<string, Message>()
+  coreIds.forEach((c, i) => map.set(c, msg((i % 2 === 0 ? 'user' : 'assistant') as Message['role'], `orig ${c}`, i)))
+  void base
+  return map
+}
+
+test('collectCoveredIds：tier2/3 嵌套块深度收集全部覆盖消息 id', () => {
+  const state = createInitialState()
+  const child = makeBlock('cb', {
+    tier: 3,
+    directMessageIds: ['c1', 'c2'],
+    effectiveMessageIds: ['c1', 'c2'],
+  })
+  const parent = makeBlock('pb', {
+    tier: 2,
+    directMessageIds: ['c0'],
+    effectiveMessageIds: ['c0', 'c1', 'c2'],
+    directBlockIds: ['cb'],
+  })
+  state.blocks = [child, parent]
+
+  const out = new Set<string>()
+  collectCoveredIds(state, parent, out)
+  expect([...out].sort()).toEqual(['c0', 'c1', 'c2'])
+
+  const childOnly = new Set<string>()
+  collectCoveredIds(state, child, childOnly)
+  expect([...childOnly].sort()).toEqual(['c1', 'c2'])
+})
+
+test('restoreBlockMessages：tier 嵌套块还原完整原文（含更深层子块覆盖消息）', () => {
+  const engine = createCore()
+  const state = createInitialState()
+  const child = makeBlock('cb', {
+    tier: 3,
+    directMessageIds: ['c1', 'c2'],
+    effectiveMessageIds: ['c1', 'c2'],
+  })
+  const parent = makeBlock('pb', {
+    tier: 2,
+    directMessageIds: ['c0'],
+    effectiveMessageIds: ['c0', 'c1', 'c2'],
+    directBlockIds: ['cb'],
+  })
+  state.blocks = [child, parent]
+
+  const archive = makeArchive(['c0', 'c1', 'c2'])
+  const restored = restoreBlockMessages(engine, state, archive, 'pb')
+  // 嵌套还原：不仅取回直连 c0，还经 directBlockIds 递归取回 c1、c2 的原文
+  expect(restored.map((r) => r.id)).toEqual(['m0', 'm1', 'm2'])
+  expect(restored.some((r) => r.text.includes('c1'))).toBe(true)
+  expect(restored.some((r) => r.text.includes('c2'))).toBe(true)
+})
+
+test('blockSpan：从还原出的原文计算断点索引 startId/endId', () => {
+  const span = blockSpan([
+    { id: 'm0', role: 'user', text: 'a' },
+    { id: 'm1', role: 'assistant', text: 'b' },
+  ])
+  expect(span).toEqual({ startId: 'm0', endId: 'm1' })
+  // 单条消息：endId 为空
+  const lone = blockSpan([{ id: 'm0', role: 'user', text: 'a' }])
+  expect(lone.startId).toBe('m0')
+  expect(lone.endId).toBe('')
+})
+
+test('coveredSpan：仅依据状态+归档轻量计算块的断点索引', () => {
+  const state = createInitialState()
+  const child = makeBlock('cb', {
+    tier: 3,
+    directMessageIds: ['c1', 'c2'],
+    effectiveMessageIds: ['c1', 'c2'],
+  })
+  const parent = makeBlock('pb', {
+    tier: 2,
+    directMessageIds: ['c0'],
+    effectiveMessageIds: ['c0', 'c1', 'c2'],
+    directBlockIds: ['cb'],
+  })
+  state.blocks = [child, parent]
+  const archive = makeArchive(['c0', 'c1', 'c2'])
+  expect(coveredSpan(state, archive, parent)).toEqual({ startId: 'm0', endId: 'm2' })
+  expect(coveredSpan(state, archive, child)).toEqual({ startId: 'm1', endId: 'm2' })
+})
+
+test('runPreModel：压缩块创建后原文持久化到 ACP_ARCHIVE_KEY（断点索引回读容器）', async () => {
+  const h = makeHarness()
+  const config = makeConfig()
+  const messages = history(12)
+  // 第一轮：指派 refs，archive 持有全部原文
+  await h.run([...messages])
+
+  // 模拟上轮 compress 工具创建一个压缩块（此时块已进入 ctx.state）
+  const refs = h.ctx.state.messageRefs
+  const cores = h.ctx.lastCores
+  const applied = h.engine.applyCompression({
+    ranges: [
+      { startRef: refForRaw(refs, cores[1]!.id)!, endRef: refForRaw(refs, cores[4]!.id)!, summary: '断点压缩', topic: '断点块' },
+    ],
+    messages: cores,
+    state: h.ctx.state,
+    config,
+  })
+  h.ctx.state = applied.state
+
+  // 第二轮：runPreModel 把该块覆盖的原文合并持久化到 ACP_ARCHIVE_KEY
+  expect(h.meta[ACP_ARCHIVE_KEY]).toBeUndefined()
+  await h.run([...messages])
+  expect(h.meta[ACP_ARCHIVE_KEY]).toBeDefined()
+
+  const block = h.ctx.state.blocks.find((b) => b.topic === '断点块')
+  expect(block).toBeDefined()
+  // 容器内以 core id 为键存有该块覆盖的原文（回溯定位）
+  const archiveObj = h.meta[ACP_ARCHIVE_KEY] as Record<string, unknown>
+  expect(Object.keys(archiveObj).length).toBeGreaterThan(0)
+
+  // 跨重启：全新 ctx 从 meta 水合归档后，仍能按块还原全文
+  const fresh = makeHarness(config, 's1')
+  fresh.meta[ACP_META_KEY] = JSON.parse(JSON.stringify(h.metaOf() as CompressionState))
+  fresh.meta[ACP_ARCHIVE_KEY] = archiveObj
+  await fresh.run([...messages])
+  const restored = restoreBlockMessages(fresh.engine, fresh.ctx.state, fresh.ctx.archive, block!.blockId)
+  expect(restored.length).toBeGreaterThan(0)
+  expect(restored.some((r) => r.text.includes('Message number 3'))).toBe(true)
 })

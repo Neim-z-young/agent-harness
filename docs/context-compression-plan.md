@@ -112,7 +112,7 @@
 - `packages/plugin/src/index.ts`：扩展 `CompactionContext`（加入 `sessionId` 及可读历史窗口引用的入口）。
 - `packages/core/src/index.ts`：`compact()` / `compactIfNeeded()` 触发 `session.compacting` hook；`keepLast/strategy/summary` 允许插件改写。
 - `packages/plugins/acp-context`：注册 `session.compacting` hook——删除前把待压缩窗口**先行折叠进自己的块/摘要文件**，或将 strategy 置为"已由 ACP 处理"以豁免物理删除；幂等（复用 `state` 的 already-compressed 判定）。
-- 摘要读取：`decompress` / `search_context` 改走断点索引回读原文容器。
+- 摘要读取：`decompress` / `search_context` 改走断点索引回读原文容器。✅ 已实施（续 112）：`restoreBlockMessages` 经 `collectCoveredIds` 递归 `directBlockIds` 还原 tier2/3 嵌套原文；折叠窗口原文在 `runPreModel` 折叠轮持久化进 `session.meta[acp.archive.v1]`（跨重启回溯）；工具输出附 `startId/endId` 断点索引，对齐宿主 `resolveAcpBlockOriginals` 容器切片。
 
 验收：
 - 先 ACP 后 session 顺序下，全文可回溯不丢；反之亦然。
