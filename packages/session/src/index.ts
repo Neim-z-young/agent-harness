@@ -174,8 +174,8 @@ export interface CompactionBlock {
   startId: string
   /** 被压缩原文消息范围的结束 message id */
   endId: string
-  /** 本块创建时间戳 */
-  at: number
+  /** 本块创建时间戳（缺省时由写入方填充） */
+  at?: number
   /**
    * 该块原文在 SessionOriginalStore 中的归档 key（供 loader 按块还原原文）。
    * 缺省沿用 block.id。
@@ -488,6 +488,11 @@ export interface SessionManager {
   deleteMessage(sessionId: string, messageId: string): Promise<void>
   /** 整体覆盖会话消息（供上下文压缩/裁剪插件回写精简后的消息列表） */
   setMessages(sessionId: string, messages: Message[]): Promise<void>
+  /**
+   * 合并写入会话压缩块（统一块模型）：按块 id 去重覆盖 session.blocks，
+   * 供 host 把插件（ACP 等）回传的折叠块并入统一块列表（幂等）。
+   */
+  setBlocks(sessionId: string, blocks: CompactionBlock[]): Promise<void>
   /** 合并更新会话 meta（浅合并 patch 到 meta；供 ACP 等插件持久化运行时状态） */
   updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void>
 

@@ -573,7 +573,7 @@ export function messagesToBlocks(
   }
 
   if (blocks && blocks.length > 0) {
-    for (const b of [...blocks].sort((x, y) => x.at - y.at)) {
+    for (const b of [...blocks].sort((x, y) => (x.at ?? 0) - (y.at ?? 0))) {
       push({ id: nextId, kind: 'compact', text: compactBlockText(b), blockId: b.id })
     }
   }

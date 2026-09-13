@@ -151,6 +151,21 @@ export interface SessionPreModelInput {
    */
   save: (messages: unknown[]) => Promise<void>
   /**
+   * 插件本轮折叠产出的压缩块（统一块模型）。
+   * 输出字段：ACP 等插件把每轮内部折叠（tier 1/2/3）的块 push 进该数组，
+   * host 在 preModel hook 返回后统一合并进 session.blocks（按块 id 去重覆盖），
+   * 与通用 compact 块一致供视图/loader/reconstructHistory/revert 消费。
+   */
+  blocksPatch?: {
+    id: string
+    topic?: string
+    summary: string
+    startId: string
+    endId: string
+    source?: 'generic' | 'acp'
+    archiveRef?: string
+  }[]
+  /**
    * 会话 meta 访问器：插件可据此在 session.meta 中持久化运行时状态
    * （如 ACP 压缩状态），随会话落盘、重启后恢复。patch 为浅合并。
    */

@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 113）上下文压缩·遗留项2：ACP 每轮内部压缩块同步进 session.blocks（统一块模型补写 runPreModel 侧）
+
+### 背景
+续 110 统一块模型整合后，`session.blocks` 只覆盖了 `session.compacting`（core 物理裁剪）时折叠出的窗口；`runPreModel` / 模型主动 compress 产生的 ACP 内部块（tier 1/2/3）仍只落在 `meta['acp.v1']` 的 messageRefs。`/revert` 与全历史重建无法定位 ACP 每轮内部折叠量。本次按统一块模型文档第 4 步补写 `runPreModel` 侧，使全部折叠量（无论来自 compacting 还是 ACP 每轮内部）都进入同一份 `session.blocks`。
+
+### 改动
+
+**packages/plugin/src/index.ts**
+- `SessionPreModelInput` 新增 `blocksPatch?`：插件把本轮折叠产出的块（`id`/`topic`/`summary`/`startId`/`endId`/`source`/`archiveRef`）回传给 host，Host 合并进统一块模型。
+
+**packages/core/src/index.ts**
+- `SessionManager.setBlocks(sessionId, blocks)`：按块 id 合并去重（覆盖）写入 `session.blocks`，并填充 `at` 时间戳；`blocks` 为空或会话不存在时 no-op。
+- 复用了 `session.preModel` 钩子返回的 `blocksPatch`：查询路径里 `triggerPlugin('session.preModel', { ..., blocksPatch })` 后，若回传块非空则调用 `session.setBlocks` 落库。
+
+**packages/session/src/index.ts**
+- `CompactionBlock.at` 改为可选（`at?: number`），由写入方 `setBlocks` 填充，兼容 blocksPatch 未带时间戳。
+
+**packages/plugins/acp-context/src/index.ts**
+- `AcpSessionCtx` 新增 `recordedBlockIds: Set<string>`，记录已回传 session.blocks 的 ACP 内部块 id（幂等，避免每轮重复写）。
+- `runPreModel` 新增 `recordBlocks?` 回调；折叠轮筛选未回传的块，用 `coveredSpan` 计算断点索引 `startId`/`endId`，构造 `source:'acp'` 块（`archiveRef: acp:<sessionId>:<blockId>`）经回调 push 进 `input.blocksPatch`，并更新 `recordedBlockIds`。缺省 `recordBlocks` 时（无 host blocksPatch 的测试/独立环境）仅落在 ACP 自身状态，不破坏既有行为。
+
+### 验证
+- acp-context 新增 `recordedBlockIds` 字段与环境初始化，21 用例全绿。
+- core 新增用例：`session.preModel` 回传 `blocksPatch` 后 ACP 块合并进 `session.blocks`（`source:'acp'`），多轮幂等去重（第二次 query 不重复写块）。
+- `CompactionBlock.at` 可选化后，cli `tui.tsx` 排序处补 `?? 0`，全 workspace typecheck 通过。
+
+### 后续
+- ACP 内部折叠块现与通用 compact 块同源；后续 `revert`/全历史重建可直接经统一 loader 消费两类块。
+
 ## 2026-09-13（续 112）上下文压缩·遗留项3：decompress/search_context 走断点索引回读原文容器（tier 嵌套还原 + 跨重启原文持久化）
 
 ### 背景

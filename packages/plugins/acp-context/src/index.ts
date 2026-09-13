@@ -163,6 +163,8 @@ interface AcpSessionCtx {
   hydrated: boolean
   /** 已持久化到 ACP_ARCHIVE_KEY 的 core id / ref 集合（用于幂等合并原文归档），惰性初始化 */
   archivedKeys: Set<string>
+  /** 已回填到 session.blocks 的 ACP 内部折叠块 id（按 blockId 幂等，避免每轮重复写块），惰性初始化 */
+  recordedBlockIds: Set<string>
   /** 最近一次持久化的状态 JSON（用于跳过无变化的重复写入） */
   stateSnapshot: string
   // ---- 增量渲染缓存 ----
@@ -209,6 +211,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         lastCores: [],
         hydrated: false,
         archivedKeys: new Set(),
+        recordedBlockIds: new Set(),
         stateSnapshot: '',
         prefixIds: [],
         prefixRender: [],
@@ -413,6 +416,11 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               meta: input.meta,
               makeSystemPrompt: () => buildCompressSystemPrompt(),
               tempMessage,
+              // 统一块模型：把每轮内部折叠（tier1/2/3）的 source:'acp' 块 push 给 host，
+              // host 合并进 session.blocks，供视图/loader/reconstructHistory/revert 消费
+              recordBlocks: (blocks) => {
+                if (input.blocksPatch) input.blocksPatch.push(...blocks)
+              },
             })
           } catch (err) {
             // 压缩是旁路优化：失败绝不阻断本轮模型请求
@@ -461,6 +469,19 @@ interface RunPreModelDeps {
   meta: { read: () => Promise<Record<string, unknown> | undefined>; patch: (patch: Record<string, unknown>) => Promise<void> }
   makeSystemPrompt: () => string
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
+  /**
+   * 把本轮内部折叠的压缩块（统一块模型）回传给 host，供其合并进 session.blocks。
+   * 缺省则仅落在 ACP 自身状态，不进统一块模型（测试/无 host blocksPatch 时）。
+   */
+  recordBlocks?: (blocks: {
+    id: string
+    topic?: string
+    summary: string
+    startId: string
+    endId: string
+    source: 'acp'
+    archiveRef: string
+  }[]) => void
 }
 
 /**
@@ -586,6 +607,32 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
       await meta.patch({ [ACP_ARCHIVE_KEY]: archiveObj })
     } catch {
       // 持久化失败不致命，内存态仍可用
+    }
+  }
+
+  // ---- 同步内部折叠块到 session.blocks（统一块模型） ----
+  // ACP 每轮内部折叠（tier1/2/3）的块经 recordBlocks 回传给 host 合并进 session.blocks，
+  // 使全历史重建/revert 也覆盖 ACP 内部折叠（不再只覆盖 session.compacting 折叠窗口）。
+  // 幂等：以 recordedBlockIds 记录已回传的块，避免每轮重复写；跨重启后该集合为空，
+  // 首轮会把既有块重新回传（session.blocks 按 id 去重覆盖，安全幂等）。
+  if (deps.recordBlocks) {
+    ctx.recordedBlockIds ??= new Set()
+    const missing = res.state.blocks.filter((b) => !ctx.recordedBlockIds.has(b.blockId))
+    if (missing.length > 0) {
+      const blocks = missing.map((b) => {
+        const span = coveredSpan(res.state, ctx.archive, b)
+        return {
+          id: `acp_${b.blockId}`,
+          topic: b.topic ?? 'ACP 折叠',
+          summary: b.summary,
+          startId: span.startId,
+          endId: span.endId,
+          source: 'acp' as const,
+          archiveRef: `${acpRefPrefix(sessionId)}:${b.blockId}`,
+        }
+      })
+      for (const b of missing) ctx.recordedBlockIds.add(b.blockId)
+      deps.recordBlocks(blocks)
     }
   }
 

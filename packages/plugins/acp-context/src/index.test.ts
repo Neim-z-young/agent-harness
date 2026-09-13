@@ -72,6 +72,7 @@ interface Harness {
     lastCores: ReturnType<typeof toCores>['cores']
     hydrated: boolean
     archivedKeys: Set<string>
+    recordedBlockIds: Set<string>
     stateSnapshot: string
     prefixIds: string[]
     prefixRender: Message[]
@@ -94,6 +95,7 @@ function makeHarness(config: Config = makeConfig(), sessionId = 's1'): Harness {
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
     archivedKeys: new Set<string>(),
+    recordedBlockIds: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -364,6 +366,7 @@ test('runCompacting：session 压缩前把 window 折叠进 ACP 块，并豁免 
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
     archivedKeys: new Set<string>(),
+    recordedBlockIds: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -416,6 +419,7 @@ test('runCompacting：幂等——已覆盖的窗口二次处理不重复折叠'
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: true,
     archivedKeys: new Set<string>(),
+    recordedBlockIds: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -460,6 +464,7 @@ test('runCompacting：折叠后 decompress 仍能还原窗口原文全文', asyn
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
     archivedKeys: new Set<string>(),
+    recordedBlockIds: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -495,6 +500,7 @@ test('runCompacting：折叠窗口原文持久化到 meta，跨重启后新 ctx 
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
     archivedKeys: new Set<string>(),
+    recordedBlockIds: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],
@@ -524,6 +530,7 @@ test('runCompacting：折叠窗口原文持久化到 meta，跨重启后新 ctx 
     lastCores: [] as ReturnType<typeof toCores>['cores'],
     hydrated: false,
     archivedKeys: new Set<string>(),
+    recordedBlockIds: new Set<string>(),
     stateSnapshot: '',
     prefixIds: [] as string[],
     prefixRender: [] as Message[],

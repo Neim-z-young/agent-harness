@@ -696,6 +696,43 @@ describe('@harness/core', () => {
       await h.stop()
     })
 
+    it('session.preModel 回传 blocksPatch：每轮内部折叠的 acp 块合并进 session.blocks（幂等去重）', async () => {
+      const acpLike: AgentPlugin = {
+        id: 'acp-premodel',
+        version: '1',
+        name: 'acp-premodel',
+        async install(ctx) {
+          return {
+            'session.preModel': async (input, _msgs) => {
+              // 每轮内部折叠产出一个 source:'acp' 块（模拟 runPreModel 折叠）
+              input.blocksPatch?.push({
+                id: 'acp_b_c1',
+                topic: 'ACP 每轮折叠',
+                summary: '内部折叠摘要',
+                startId: 'u_0',
+                endId: 'a_3',
+                source: 'acp',
+                archiveRef: 'acp:s1:c1',
+              })
+            },
+          }
+        },
+      }
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider(), internalPlugins: [acpLike] })
+      const sess = await h.session.create()
+      await fill(h, sess.id, 4)
+      // 两轮 query：同一块 id 重复回传 → session.blocks 只保留一条（幂等去重覆盖）
+      await h.agent.query({ sessionId: sess.id, message: '第一轮' })
+      await h.agent.query({ sessionId: sess.id, message: '第二轮' })
+      const s = (await h.session.get(sess.id))!
+      expect(s.blocks?.length).toBe(1)
+      expect(s.blocks![0].source).toBe('acp')
+      expect(s.blocks![0].id).toBe('acp_b_c1')
+      expect(s.blocks![0].archiveRef).toBe('acp:s1:c1')
+      expect(typeof s.blocks![0].at).toBe('number')
+      await h.stop()
+    })
+
     it('compact 后 query 的请求历史 = 摘要占位 + 近期，不含被压缩原文消息', async () => {
       const provider = mockChatProvider() // 收集 calls
       const h = await createHarness({ agents: [makeAgent()], chatProvider: provider })

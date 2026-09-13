@@ -694,6 +694,16 @@ export class DefaultSessionManager implements SessionManager {
     sess.updatedAt = Date.now()
   }
 
+  async setBlocks(sessionId: string, blocks: NonNullable<Session['blocks']>): Promise<void> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess || blocks.length === 0) return
+    const map = new Map<string, NonNullable<Session['blocks']>[number]>((sess.blocks ?? []).map((b) => [b.id, b]))
+    const now = Date.now()
+    for (const b of blocks) map.set(b.id, { ...b, at: now })
+    sess.blocks = [...map.values()]
+    sess.updatedAt = now
+  }
+
   async updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void> {
     const sess = this.sessions.get(sessionId)
     if (!sess) return
@@ -1404,6 +1414,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
 
     // 每轮进入模型前：交给上下文压缩插件裁剪/改写 messages（原地生效），并回写精简后的会话
+    const preModelBlocks: NonNullable<import('@harness/plugin').SessionPreModelInput['blocksPatch']> = []
     await this.deps.triggerPlugin(
       'session.preModel',
       {
@@ -1418,9 +1429,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
           read: async () => (await this.deps.session.get(sessionId))?.meta,
           patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
         },
+        blocksPatch: preModelBlocks,
       },
       finalMessages,
     )
+    // 统一块模型：把插件（ACP）每轮内部折叠的 source:'acp' 块合并进 session.blocks（按 id 去重覆盖）
+    if (preModelBlocks.length > 0) this.deps.session.setBlocks(sessionId, preModelBlocks)
 
     const provider = this.deps.chatProvider(llmIn.providerId)
     const completion = await provider.complete({
@@ -1589,6 +1603,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
 
     // 每轮进入模型前：交给上下文压缩插件裁剪/改写 messages（原地生效），并回写精简后的会话
+    const preModelBlocks: NonNullable<import('@harness/plugin').SessionPreModelInput['blocksPatch']> = []
     await this.deps.triggerPlugin(
       'session.preModel',
       {
@@ -1603,9 +1618,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
           read: async () => (await this.deps.session.get(sessionId))?.meta,
           patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
         },
+        blocksPatch: preModelBlocks,
       },
       finalMessages,
     )
+    // 统一块模型：把插件（ACP）每轮内部折叠的 source:'acp' 块合并进 session.blocks（按 id 去重覆盖）
+    if (preModelBlocks.length > 0) this.deps.session.setBlocks(sessionId, preModelBlocks)
 
     return { agentId, sessionId, finalMessages, params, headers, allowedTools, providerId: llmIn.providerId, modelId: llmIn.modelId }
   }
