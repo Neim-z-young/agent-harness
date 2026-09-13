@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 106）上下文压缩改造·阶段二：压缩视图接口骨架
+
+### 背景
+
+阶段一完成"会话压缩消息文件 + 断点索引"持久层后，阶段二本应切"内存视图 + 惰性加载"。考虑到 `query`/`resume`/TUI 均直接消费 `Session.messages` 全量数组，直接改核心风险高；经确认采取「先搭接口骨架、默认退化、标题不切 query/resume」路线：先确立视图类型与惰性加载接口，为阶段三接入数据做准备，现有行为零变化。
+
+### 改动
+
+**packages/session**
+- 新增类型：`CompactionBlock`（与 workspace 的 CompactionBlock 同构，session 不反向依赖 workspace）、`SessionView { blocks, messages, slimmed }`、`HistoryLoadRange`、`HistoryLoader { load(sessionId, range?) }`。
+- 纯函数：`buildView(blocks?, messages)`——无 blocks 时退化为 `slimmed=false、messages 原样`，保证无压缩块时零行为变化；`renderBlocksAsMessage(blocks?)`——把压缩块渲染为一条 user text 摘要占位消息，供未来 query 折叠已压缩历史。
+- `Session` 新增可选字段 `blocks?: CompactionBlock[]`（内存驻留的已压缩历史摘要；缺省表示未启用压缩视图）。
+- `SessionManager` 接口新增：`getView`、`setHistoryLoader`、`flushHistory`。
+
+**packages/core**
+- `DefaultSessionManager` 实现三方法：`historyLoaders` Map 承载注入的 loader；`getView` 经 `buildView(sess.blocks, sess.messages)`；`flushHistory` 调注入 loader、失败 try/catch 容错返回空，不抛错。
+
+**packages/revert**：`FakeSessionManager` 补齐三方法。
+
+### 验证
+
+- session 新增 6 用例（buildView 退化/精简、renderBlocksAsMessage、CompactionBlock 结构）全过；revert 35、core 35 全过；全仓 typecheck 通过。
+
+### 后续
+
+阶段二将"标题接核心"：query 的 finalMessages 改从 `getView()` 组装（含 `renderBlocksAsMessage` 折叠历史）、cli resume 改为加载「摘要块+近期」；届时需将与 ACP 增量缓存（基于 finalMessages 原文 id）的交互一并验证。阶段三：`session.compacting` 接线 + ACP 协同。
+
+---
+
 ## 2026-09-13（续 105）上下文压缩改造·阶段一：会话压缩消息文件存储
 
 ### 背景
