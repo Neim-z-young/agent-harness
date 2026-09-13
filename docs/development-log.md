@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 114）上下文压缩·统一块模型性能压测（可复用 bench，mock 模型）
+
+### 背景
+遗留项4（风险表记项）：`session.compacting` 敏感路径「折叠时才落块、不折叠不写」已实现，但 `setBlocks`/`blocksPatch` 的合并去重与持久化频率是否最优未量。本次落地可复用压测脚本（先 mock 模型+合成数据，后续可切真实 ChatProvider 复跑），给该项一次定量结论。
+
+### 改动
+- 新增 `packages/core/bench/helpers.ts`：`createMockProvider`/`makeAgent`/`makeMessages`/`makeBlocks`/`createSessionId`/`timeMs`，装配低成本 mock 环境。
+- 新增 `packages/core/bench/block-perf.ts` 三个场景：
+  1. **setBlocks 规模伸缩**：已有 N 块基础上追加 1 块，量 the whole-array 重建成本随 N 的线性。
+  2. **完整 query 链路**：mock model + 插件每轮 `session.preModel` push 1 个 `source:'acp'` 块，测每轮写块频率与平均 query 耗时。
+  3. **compactIfNeeded 折叠门控**：每轮真折叠 vs 不折叠 no-op，对比写块侧成本。
+- `package.json` 增 `bench:blocks` 脚本；CLI 支持 `--scenario`/`--rounds`/`--sizes`/`--rep`。
+
+### 首压结论（mock 数据）
+- **场景1**：append 1 块成本 ~17μs@100 块 → ~1.1ms@20000 块，随块数线性；绝对值低，真实会话块数级（<几千）在亚毫秒内。
+- **场景2**：200 轮共 201 块，平均 0.04ms/query，每轮写块开销可忽略。
+- **场景3**：真折叠 0.0145ms vs no-op 0.0012ms（约 12×），但均为微秒级。
+- 结论：风险项4 **性能无瓶颈**，降级为低风险观察项；若极端会话（数万块）再优化（如新增块时才重建数组、跨重启不重灌全量块）。
+
+### 后续
+- 需真实模型时：`createHarness({ chatProvider: <真实Provider> })` 复跑其余装配不变。
+- 场景3 首次压测曾因两处 bug 失真（`h.session.create()` 返回对象被当 id、幂等 id 去重成单块），已修复。
+
 ## 2026-09-13（续 113）上下文压缩·遗留项2：ACP 每轮内部压缩块同步进 session.blocks（统一块模型补写 runPreModel 侧）
 
 ### 背景

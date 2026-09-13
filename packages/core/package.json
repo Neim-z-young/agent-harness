@@ -23,6 +23,7 @@
     "dev": "tsc --noEmit --watch",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "test": "bun test",
+    "bench:blocks": "bun run bench/block-perf.ts",
     "typecheck": "tsc --noEmit"
   }
 }
