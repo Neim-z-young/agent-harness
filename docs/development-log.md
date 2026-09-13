@@ -1,5 +1,29 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 111）上下文压缩·阶段四：TUI 前端按需渲染（压缩提示行 + 惰性展开 + 更早分页）
+
+### 背景
+续 110 统一块模型落地后，压缩块已进入 `session.blocks`，但 TUI 历史渲染仍是 `setSession` 时一次性 `messagesToBlocks(s.messages)` 全量转换：压缩过的会话看不到压缩块（原文在盘只存档案），未压缩的超长会话首屏也会全量构建 ChatBlock。本次实现前端按需渲染：压缩块渲染为**提示行**（不渲染内容，仅提示"已自动压缩"），点击经 loader 惰性取回原文；超长近期段只渲染最近一页 + "更早省略"提示、点击向前加载。
+
+### 改动
+
+**packages/cli/src/tui.tsx**
+- `ChatBlockKind` 增加 `'compact' | 'loadmore'`；`ChatBlock` 增加可选 `msgId`（关联原文消息）/ `blockId`（关联压缩块）/ `loading`（展开中）。
+- `messagesToBlocks(messages, blocks?, page = HISTORY_PAGE)`：`blocks` 按 `at` 升序渲染为 compact 提示块置于最前（无 blocks 零变化）；`messages` 超过 `page`（100）条时只渲染最近一页 + loadmore 提示块。
+- 新增纯函数 `compactBlockText`（只显示来源/主题/摘要字数，不渲染摘要全文）、`expandCompactBlocks`（把某块原文替换提示块位置）、`loadOlderBlocks`（插入更早一页，到底移除提示）。
+- `TuiReplOptions` 增加可选 `loadHistory`；`renderBlockBody` 增加 compact/loadmore 分支（dim 提示行，鼠标点击展开/加载更多，loading 显示 ⏳）；`TuiApp.setSession` 传 `s.blocks` 渲染压缩提示行。
+
+**packages/cli/src/index.ts**
+- `loadFullHistory` 增加 `range.blockIds` 分支：只对命中块逐个 resolve 取原文段返回（按块惰性加载，不回落全量）。
+- `startTuiRepl` 注入 `loadHistory: (sid, range) => app.loadFullHistory(sid, range)`。
+
+### 验证
+- tui 纯函数用例：compact 提示文本（acp/通用来源、不渲染摘要）、blocks 前置 + at 升序、无 blocks 零变化、超长分页 + loadmore、expand 命中/未命中/空原文、loadOlder 两页到底移除提示。
+- cli 用例：`loadFullHistory({ blockIds })` 只返回命中块原文、未命中返回空。
+- cli 197 全绿（新增 7 用例）；session/workspace/core 回归全绿；全仓 typecheck 通过。
+
+---
+
 ## 2026-09-13（续 110）上下文压缩·统一块模型整合（ACP 折叠并入 session.blocks + revert 全文回溯）
 
 ### 背景

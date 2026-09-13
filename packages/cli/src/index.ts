@@ -1427,6 +1427,16 @@ export class HarnessApp {
       return buildResolveBlock(originalStore, sessionId)(block)
     }
     const full = await reconstructHistory(sess, resolveBlock)
+    // 阶段四·按需渲染：blockIds 存在时只返回命中块的原文段（压缩提示行惰性展开用）
+    if (range?.blockIds?.length) {
+      const wanted = new Set(range.blockIds)
+      const parts: Message[] = []
+      for (const b of sess.blocks ?? []) {
+        if (!wanted.has(b.id)) continue
+        parts.push(...(await resolveBlock(b)))
+      }
+      return parts
+    }
     return range ? this.filterByRange(full, range) : full
   }
 
@@ -2518,7 +2528,15 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     }
     if (args.tui) {
       // 状态栏 provider 用实际解析出的 ChatProvider，而非静态配置值（更真实、避免过期误报）
-      await startTuiRepl({ app, harness, session, provider: app.resolveChatProvider()?.id ?? provider, model })
+      await startTuiRepl({
+        app,
+        harness,
+        session,
+        provider: app.resolveChatProvider()?.id ?? provider,
+        model,
+        // 阶段四·按需渲染：压缩块提示行点击展开 / 更早分页经 loadFullHistory 惰性加载原文
+        loadHistory: (sid, range) => app.loadFullHistory(sid, range),
+      })
     } else {
       await startRepl({ app, harness, session })
     }

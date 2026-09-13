@@ -2,7 +2,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
-import { resolveWorkspace } from '@harness/workspace'
+import { resolveWorkspace, createWorkspaceOriginalStore } from '@harness/workspace'
+import type { Message } from '@harness/session'
 import {
   parseCliArgs,
   SessionFileStore,
@@ -1238,6 +1239,39 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     } finally {
       process.stdout.write = originalWrite
     }
+  })
+
+  it('阶段四：loadFullHistory({ blockIds }) 只返回命中块原文（惰性展开）', async () => {
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all',
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+
+    // 构造：4 条近期消息 + 1 个 generic 压缩块（覆盖前 2 条，原文入 .cmp.orig 归档）
+    const mk = (id: string, role: 'user' | 'assistant', text: string) =>
+      ({ id, role, createdAt: 0, parts: [{ type: 'text', text }] }) as Message
+    const m1 = mk('m1', 'user', '旧一问')
+    const m2 = mk('m2', 'assistant', '旧一答')
+    const m3 = mk('m3', 'user', '近问')
+    const m4 = mk('m4', 'assistant', '近答')
+    await harness.session.setMessages(session.id, [m1, m2, m3, m4])
+
+    const sess = (await harness.session.get(session.id))!
+    sess.blocks = [{ id: 'b1', topic: '旧段', summary: 's', startId: 'm1', endId: 'm2', at: 1, source: 'generic' }]
+    await createWorkspaceOriginalStore(app.workspace).save(session.id, 'b1', [m1, m2])
+
+    // 命中块 → 仅原文段
+    const parts = await app.loadFullHistory(session.id, { blockIds: ['b1'] })
+    expect(parts.map((m) => m.id)).toEqual(['m1', 'm2'])
+    // 未命中块 → 空（不回落全量）
+    const none = await app.loadFullHistory(session.id, { blockIds: ['nope'] })
+    expect(none).toEqual([])
+    // 无 range → 全量（近期 + 块原文）
+    const all = await app.loadFullHistory(session.id)
+    expect(all.length).toBe(4)
+    await app.shutdown()
   })
 })
 

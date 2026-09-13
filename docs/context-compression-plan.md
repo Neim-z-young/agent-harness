@@ -6,7 +6,7 @@
 
 - 关联插件：`@harness/acp-context`
 - 讨论对齐的版本：**V5 定稿**（在标记消息、归档文件、懒加载讨论基础上收敛）
-- 状态：阶段一→三已实施（持久层 / 视图骨架 / session.compacting 接线），阶段二后续走 Route B 彻底改造已落地（开发日志续 109）；**统一块模型整合已落地**：ACP 折叠经 `blocksPatch` 并入 `session.blocks`（`source: 'generic'|'acp'`）、`revert` 经全文回溯只回退最近消息（开发日志续 110、`.trae/documents/上下文压缩-统一块模型.md`）；阶段四待做
+- 状态：阶段一→三已实施（持久层 / 视图骨架 / session.compacting 接线），阶段二后续走 Route B 彻底改造已落地（开发日志续 109）；**统一块模型整合已落地**：ACP 折叠经 `blocksPatch` 并入 `session.blocks`（`source: 'generic'|'acp'`）、`revert` 经全文回溯只回退最近消息（开发日志续 110、`.trae/documents/上下文压缩-统一块模型.md`）；**阶段四前端按需渲染已落地**：压缩块提示行 + 惰性展开 + 超长分页（开发日志续 111、`.trae/documents/上下文压缩-阶段四-前端按需渲染.md`）
 
 ---
 
@@ -121,13 +121,13 @@
 ### 阶段四：前端按需渲染
 **目标**：TUI/Web 历史浏览不再一次性渲染全量。
 
-改动：
-- CLI 渲染层：历史列表改为经 loader 分页/虚拟滚动读取；按"已压缩块"显示提示行（不渲染块内容）。
-- 语义保留：全量搜索、消息计数等功能经 loader 透传。
+改动（已落地，开发日志续 111）：
+- CLI 渲染层：历史列表改为经 loader 分页/虚拟滚动读取；按"已压缩块"显示提示行（不渲染块内容）。✅ 已实施：`ChatBlockKind` 增加 `compact|loadmore`，`messagesToBlocks` 把 `session.blocks` 渲染为提示行、超长近期段只渲染最近 100 条 + "更早省略"提示；`TuiReplOptions.loadHistory` 注入 `loadFullHistory`，点击提示行经 `{ blockIds }` 惰性取回原文（`expandCompactBlocks`）、点击省略提示向前翻页（`loadOlderBlocks`）。
+- 语义保留：全量搜索、消息计数等功能经 loader 透传。✅ `/history` 等已走 `loadFullHistory` 全量还原。
 
 验收：
-- 超长会话 TUI 打开流畅、滚动按需加载。
-- 已压缩段显示为提示标记，点击可展开全文（走 loader）。
+- 超长会话 TUI 打开流畅、滚动按需加载。✅ 首屏只渲染最近一页（未压缩超长段）+ 压缩提示行；opentui ScrollBox 原生 viewportCulling 绘制裁剪。
+- 已压缩段显示为提示标记，点击可展开全文（走 loader）。✅ 提示行（📦 已自动压缩历史 · 来源 · 摘要字数）→ 点击 → `loadHistory(sessionId, { blockIds })` → 原文块替换提示位。
 
 ---
 

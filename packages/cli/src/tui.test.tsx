@@ -30,6 +30,10 @@ import {
   messageText,
   roleToKind,
   messagesToBlocks,
+  compactBlockText,
+  expandCompactBlocks,
+  loadOlderBlocks,
+  HISTORY_PAGE,
   toSessionRows,
   sessionRowText,
   computeTuiStats,
@@ -66,7 +70,7 @@ import {
 import { createRoot } from '@opentui/react'
 import { createTestRenderer, type TestRendererSetup } from '@opentui/core/testing'
 import type { Harness } from '@harness/core'
-import type { Message, Session } from '@harness/session'
+import type { CompactionBlock, Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
 
 // ------------------------------------------------------------------------
@@ -373,6 +377,86 @@ describe('会话历史渲染（模块 B）', () => {
     expect(sessionRowText(r, 3_600_000)).toContain('5条')
     expect(sessionRowText(r, 3_600_000)).toContain('1h')
     expect(sessionRowText(r, 3_600_000)).toContain('…')
+  })
+})
+
+describe('阶段四·按需渲染（压缩块提示行 + 分页）', () => {
+  const msg = (id: string, role: Message['role'], text: string): Message =>
+    ({ id, role, createdAt: 0, parts: [{ type: 'text', text }] })
+  const block = (id: string, extra?: Partial<CompactionBlock>): CompactionBlock => ({
+    id,
+    topic: 't',
+    summary: '机密摘要XYZ',
+    startId: 's',
+    endId: 'e',
+    at: 1,
+    ...extra,
+  })
+
+  it('compactBlockText：来源 acp/通用区分，不渲染 summary 全文', () => {
+    const t1 = compactBlockText(block('b1', { source: 'acp' }))
+    expect(t1).toContain('ACP 折叠')
+    expect(t1).toContain('点击展开原文')
+    expect(t1).not.toContain('机密摘要XYZ') // 只显示字数计量，不渲染摘要内容
+    const t2 = compactBlockText(block('b2', { topic: undefined }))
+    expect(t2).toContain('会话压缩')
+  })
+
+  it('messagesToBlocks：带 blocks → 首部 compact 提示块（at 升序）', () => {
+    const cs = messagesToBlocks(
+      [msg('m2', 'user', '新'), msg('m3', 'assistant', '答')],
+      [block('b2', { at: 2 }), block('b1', { at: 1 })],
+    )
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['compact', 'compact', 'user', 'assistant'])
+    expect(cs.blocks[0].blockId).toBe('b1')
+    expect(cs.blocks[1].blockId).toBe('b2')
+    expect(cs.nextId).toBe(5)
+  })
+
+  it('messagesToBlocks：无 blocks 时行为与旧版一致（零变化）', () => {
+    const cs = messagesToBlocks([msg('m1', 'user', '问')])
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['user'])
+  })
+
+  it('messagesToBlocks：超长 messages 只渲染最近一页 + loadmore 提示', () => {
+    const many: Message[] = []
+    for (let i = 0; i < HISTORY_PAGE + 5; i++) many.push(msg(`m${i}`, i % 2 ? 'assistant' : 'user', `msg${i}`))
+    const cs = messagesToBlocks(many, undefined, HISTORY_PAGE)
+    expect(cs.blocks[0].kind).toBe('loadmore')
+    expect(cs.blocks[0].text).toContain('5 条')
+    expect(cs.blocks.filter((b) => b.kind === 'loadmore').length).toBe(1)
+    expect(cs.blocks.filter((b) => b.kind !== 'loadmore').length).toBe(HISTORY_PAGE)
+  })
+
+  it('expandCompactBlocks：命中块替换为原文块，nextId 递增，空原文/未命中不变', () => {
+    const base = messagesToBlocks(
+      [msg('m2', 'user', '新')],
+      [block('b1', { source: 'acp' })],
+    )
+    const expanded = expandCompactBlocks(base, 'b1', [msg('o1', 'user', '原文一'), msg('o2', 'assistant', '原文二'), msg('o3', 'tool', '')])
+    expect(expanded.blocks.map((b) => b.kind)).toEqual(['user', 'assistant', 'user'])
+    expect(expanded.blocks[0].msgId).toBe('o1')
+    expect(expanded.nextId).toBe(base.nextId + 2) // 空消息跳过
+    // 未命中：原样
+    expect(expandCompactBlocks(base, 'nope', [msg('x', 'user', 'x')])).toBe(base)
+    // 原文全空：原样
+    expect(expandCompactBlocks(base, 'b1', [msg('x', 'tool', '')])).toBe(base)
+  })
+
+  it('loadOlderBlocks：插入更早页到提示之后；加载到底移除提示', () => {
+    const many: Message[] = []
+    for (let i = 0; i < 250; i++) many.push(msg(`m${i}`, i % 2 ? 'assistant' : 'user', `msg${i}`))
+    // 首屏：可见最近 100 条（m150..m249），loadmore 提示"更早 150 条"
+    const base = messagesToBlocks(many, undefined, HISTORY_PAGE)
+    expect(base.blocks[0].kind).toBe('loadmore')
+    // 第一页：模拟 handleLoadMore 取 [50,150) 100 条 → 还有 50 条更早，提示保留
+    const page1 = loadOlderBlocks(base, many.slice(50, 150), HISTORY_PAGE)
+    expect(page1.blocks[0].kind).toBe('loadmore')
+    expect(page1.blocks.filter((b) => b.msgId === 'm50').length).toBe(1)
+    // 第二页：取 [0,50) 50 条 → 到底，移除提示
+    const page2 = loadOlderBlocks(page1, many.slice(0, 50), HISTORY_PAGE)
+    expect(page2.blocks.filter((b) => b.kind === 'loadmore').length).toBe(0)
+    expect(page2.blocks.filter((b) => b.msgId).length).toBe(250)
   })
 })
 

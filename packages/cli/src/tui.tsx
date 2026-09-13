@@ -31,7 +31,7 @@ import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, listReplCommands } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
-import type { Message, Session } from '@harness/session'
+import type { CompactionBlock, HistoryLoadRange, Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
 import { subagentCapability } from '@harness/subagent'
 import {
@@ -73,6 +73,11 @@ export interface TuiReplOptions {
   openFile?: (path: string, line?: number) => Promise<void> | void
   /** 收到普通用户输入时回调（REPL 回显前触发） */
   onLine?: (line: string) => Promise<void> | void
+  /**
+   * 阶段四·按需渲染：惰性加载会话原文（压缩块展开 / 更早分页）。
+   * 未传则压缩块只显示提示、点击不展开（/history 兜底全量）。
+   */
+  loadHistory?: (sessionId: string, range?: HistoryLoadRange) => Promise<Message[]>
 }
 
 export type TuiReplExit = 'exit'
@@ -124,7 +129,7 @@ export function nextSidebarTab(current: SidebarTabId, delta: 1 | -1): SidebarTab
 // 结构化块模型（纯函数可单测）
 // ------------------------------------------------------------------------
 
-export type ChatBlockKind = 'system' | 'user' | 'thinking' | 'assistant' | 'tool'
+export type ChatBlockKind = 'system' | 'user' | 'thinking' | 'assistant' | 'tool' | 'compact' | 'loadmore'
 
 export interface ChatBlock {
   id: number
@@ -133,6 +138,12 @@ export interface ChatBlock {
   text: string
   /** assistant/thinking 流式进行中（尚未 done） */
   streaming?: boolean
+  /** 关联原始消息 id（展开/分页插入的原文块；防重复） */
+  msgId?: string
+  /** 关联压缩块 id（kind==='compact'，展开时经 loader 取回该块原文） */
+  blockId?: string
+  /** 压缩块展开进行中 */
+  loading?: boolean
 }
 
 export interface ChatState {
@@ -522,17 +533,110 @@ export function roleToKind(role: Message['role']): ChatBlockKind {
   return 'system'
 }
 
-/** 把会话历史转成 ChatState：user/assistant/tool 各成一个块，跳过空消息 */
-export function messagesToBlocks(messages: Message[]): ChatState {
-  const blocks: ChatBlock[] = []
+/** 阶段四·按需渲染：单页渲染的历史消息条数上限（超出显示"更早省略"提示块） */
+export const HISTORY_PAGE = 100
+
+/** 把一条消息转成对话块（消息转块的公共入口；空消息返回 undefined） */
+function messageToBlock(m: Message, id: number): ChatBlock | undefined {
+  const text = messageText(m)
+  if (!text.trim()) return undefined
+  return { id, kind: roleToKind(m.role), text, msgId: m.id }
+}
+
+/** 压缩块 → 提示行文本（只展示元信息，不渲染 summary 内容，符合"仅提示自动压缩过"） */
+export function compactBlockText(b: CompactionBlock): string {
+  const topic = b.topic ? `[${b.topic}] ` : ''
+  const source = b.source === 'acp' ? 'ACP 折叠' : '会话压缩'
+  return `📦 已自动压缩历史 · ${topic}${source}（${b.summary.length} 字摘要，点击展开原文）`
+}
+
+/**
+ * 阶段四·按需渲染：把会话历史转成 ChatState。
+ * - `blocks`（压缩块）按 at 升序渲染为 compact 提示块，置于最前（时间上早于近期消息）；
+ *   为空则不产生任何块（回归零变化）。
+ * - `messages` 超过 `page` 条时只渲染末尾 `page` 条，并在最前插入 loadmore 提示块
+ *   （未压缩超长会话的首屏可控；更早内容点击加载）。
+ */
+export function messagesToBlocks(
+  messages: Message[],
+  blocks?: CompactionBlock[],
+  page = HISTORY_PAGE,
+): ChatState {
+  const out: ChatBlock[] = []
   let nextId = 1
-  for (const m of messages) {
-    const text = messageText(m)
-    if (!text.trim()) continue
-    blocks.push({ id: nextId, kind: roleToKind(m.role), text })
-    nextId++
+
+  const push = (b: ChatBlock | undefined): void => {
+    if (b) {
+      out.push(b)
+      nextId++
+    }
   }
-  return { blocks, nextId, thinkingIdx: -1, assistantIdx: -1 }
+
+  if (blocks && blocks.length > 0) {
+    for (const b of [...blocks].sort((x, y) => x.at - y.at)) {
+      push({ id: nextId, kind: 'compact', text: compactBlockText(b), blockId: b.id })
+    }
+  }
+
+  let visible = messages
+  if (messages.length > page) {
+    visible = messages.slice(messages.length - page)
+    const hidden = messages.length - page
+    push({ id: nextId, kind: 'loadmore', text: `▲ 更早 ${hidden} 条消息已省略（点击加载更多）` })
+  }
+
+  for (const m of visible) push(messageToBlock(m, nextId))
+
+  return { blocks: out, nextId, thinkingIdx: -1, assistantIdx: -1 }
+}
+
+/**
+ * 阶段四·按需渲染：把某压缩块的原文展开到提示块位置（替换该 compact 块）。
+ * 未命中 blockId 时原样返回 state；originals 中的空消息跳过。
+ */
+export function expandCompactBlocks(state: ChatState, blockId: string, originals: Message[]): ChatState {
+  const idx = state.blocks.findIndex((b) => b.kind === 'compact' && b.blockId === blockId)
+  if (idx < 0) return state
+  const inserted: ChatBlock[] = []
+  let nextId = state.nextId
+  for (const m of originals) {
+    const b = messageToBlock(m, nextId)
+    if (b) {
+      inserted.push(b)
+      nextId++
+    }
+  }
+  if (inserted.length === 0) return state
+  const blocks = state.blocks.slice()
+  blocks.splice(idx, 1, ...inserted)
+  return { ...state, blocks, nextId }
+}
+
+/**
+ * 阶段四·按需渲染：把更早一页原文插入 loadmore 提示块之后。
+ * 若 `older` 已覆盖全部隐藏消息（长度 < page 或调用方判定），则移除 loadmore 块。
+ */
+export function loadOlderBlocks(state: ChatState, older: Message[], page = HISTORY_PAGE): ChatState {
+  const idx = state.blocks.findIndex((b) => b.kind === 'loadmore')
+  if (idx < 0) return state
+  const inserted: ChatBlock[] = []
+  let nextId = state.nextId
+  for (const m of older) {
+    const b = messageToBlock(m, nextId)
+    if (b) {
+      inserted.push(b)
+      nextId++
+    }
+  }
+  const blocks = state.blocks.slice()
+  if (older.length < page) {
+    // 已加载到底：移除省略提示，插入全部
+    blocks.splice(idx, 1, ...inserted)
+  } else {
+    // 还有更早：提示块保持在最前，原文插其后
+    blocks.splice(idx + 1, 0, ...inserted)
+  }
+  return { ...state, blocks, nextId }
 }
 
 /** 侧栏会话列表行（来自 store.list） */
@@ -840,6 +944,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [copiedId, setCopiedId] = useState<number | null>(null)
   // 统计面板计时起点：组件挂载时刻
   const startTimeRef = useRef(Date.now())
+  // 阶段四·按需渲染：会话全量消息引用 + 当前可见最旧消息下标（loadmore 分页用）。
+  // setSession 时快照；会话继续增长时下标略有偏差（顶部旧段边缘可接受）。
+  const allMessagesRef = useRef<Message[]>(options.session.messages)
+  const earliestVisibleIdxRef = useRef(Math.max(0, options.session.messages.length - HISTORY_PAGE))
   // 实际用量累积器（onEvent 驱动）：LLM 调用 token / 模型 / 工具粒度
   const [usage, setUsage] = useState<UsageStats>(emptyUsage())
   // 模块 4：侧栏各模块改为顶部图标 tab + 左右切换（每次仅展示一个面板）
@@ -925,13 +1033,51 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       },
       onLine: options.onLine,
       // 模块 B：会话切换（/resume /new 等）后换绑外层会话指针，并用 messagesToBlocks
-      // 把新会话历史还原为对话块刷新聊天区；空会话则回落初始欢迎态。
+      // 把新会话历史还原为对话块刷新聊天区（阶段四：压缩块 → 提示行 + 超长分页）；
+      // 空会话则回落初始欢迎态。
       setSession: (s) => {
         options.session = s
-        setState(messagesToBlocks(s.messages))
+        allMessagesRef.current = s.messages
+        earliestVisibleIdxRef.current = Math.max(0, s.messages.length - HISTORY_PAGE)
+        setState(messagesToBlocks(s.messages, s.blocks))
       },
     })
   }
+
+  // 阶段四·按需渲染：压缩块展开中置 loading 态（提示行显示 ⏳）
+  const markCompactLoading = useCallback((blockId: number, loading: boolean) => {
+    setState((prev) => {
+      const idx = prev.blocks.findIndex((b) => b.id === blockId)
+      if (idx < 0) return prev
+      const blocks = prev.blocks.slice()
+      blocks[idx] = { ...blocks[idx], loading }
+      return { ...prev, blocks }
+    })
+  }, [])
+
+  // 阶段四·按需渲染：点击压缩提示行 → 经 loader 取回该块原文，替换提示块
+  const handleExpandCompact = async (chatBlockId: number, compactBlockId: string): Promise<void> => {
+    const load = options.loadHistory
+    if (!load) return
+    markCompactLoading(chatBlockId, true)
+    try {
+      const originals = await load(options.session.id, { blockIds: [compactBlockId] })
+      setState((prev) => expandCompactBlocks(prev, compactBlockId, originals))
+    } catch {
+      // 加载失败：提示块保持，复位 loading（/history 兜底全量）
+      markCompactLoading(chatBlockId, false)
+    }
+  }
+
+  // 阶段四·按需渲染：点击"更早省略"提示 → 从内存向前取一页插入
+  const handleLoadMore = useCallback((): void => {
+    const all = allMessagesRef.current
+    if (!all.length) return
+    const start = Math.max(0, earliestVisibleIdxRef.current - HISTORY_PAGE)
+    const older = all.slice(start, earliestVisibleIdxRef.current)
+    earliestVisibleIdxRef.current = start
+    setState((prev) => loadOlderBlocks(prev, older))
+  }, [])
 
   // 模块 A：后台任务实时面板 —— 订阅 subagent 监控器，状态并入侧栏
   useEffect(() => {
@@ -1314,6 +1460,37 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             {b.text}
           </text>
         )
+      case 'compact': {
+        // 阶段四：压缩块提示行（不渲染内容），点击经 loader 惰性展开原文
+        const onExpand = b.blockId
+          ? (e: { preventDefault(): void }) => {
+              e.preventDefault()
+              void handleExpandCompact(b.id, b.blockId!)
+            }
+          : undefined
+        return (
+          <text
+            key={b.id}
+            attributes={createTextAttributes({ dim: true, underline: !!onExpand })}
+            wrapMode="word"
+            onMouseUp={onExpand}
+          >
+            {b.loading ? `⏳ ${b.text.replace(/（点击展开原文）$/, '')}（加载中…）` : b.text}
+          </text>
+        )
+      }
+      case 'loadmore': {
+        return (
+          <text
+            key={b.id}
+            attributes={createTextAttributes({ dim: true, underline: true })}
+            wrapMode="word"
+            onMouseUp={(e) => { e.preventDefault(); void handleLoadMore() }}
+          >
+            {b.text}
+          </text>
+        )
+      }
       case 'system':
       default:
         return (
