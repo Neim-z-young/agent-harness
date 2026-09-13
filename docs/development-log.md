@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 105）上下文压缩改造·阶段一：会话压缩消息文件存储
+
+### 背景
+
+按 `docs/context-compression-plan.md`（V5 定稿）推进"内存只驻留压缩摘要块+新消息、全文盘上原样保留、按需惰性加载"的改造。阶段一打地基：确立"原文不动 + 摘要文件覆盖 + 可从块定位原文段"的持久层，不改内存结构、不拆 messages。
+
+### 改动（packages/workspace）
+
+1. 新增 `src/compaction-store.ts`：`SessionCompactionStore`
+   - 旁路只读落盘文件 `sessions/{sessionId}.cmp.json`（`CompactionFile`，含 `version:1` + blocks），与既有原文文件 `{id}.json` 共存。
+   - 类型：`CompactionBlock { id, topic?, summary, startId, endId, at }`；`CompactionPoint { blockId, file, startId, endId, summary }`。
+   - 写路径：`save()`（覆盖式整体写，对应"每次压缩覆盖内容"语义；`append=true` 则合并去重追加）、`append()`；tmp + rename 原子落盘。
+   - 读路径：`load()` / `loadBlocks()` / `readBlock()` / `exists()`。
+   - 断点索引：`buildIndex()` 由 blocks 生成 `blockId → { file, startId, endId, summary }`，`file` 指向该会话原文文件，供 loader 按块定位原文 id 段。
+   - 导出常量：`COMPACTION_FILE_VERSION`、`COMPACTION_META_KEY`（会话 meta"已启用压缩文件"预留键）。
+2. `src/index.ts` 导出 `compaction-store`。
+3. 新增 `src/compaction-store.test.ts`：9 个用例（路径定位、覆盖式、append 去重与同 id 更新、blockId 注入、文件结构、buildIndex、readBlock、无文件安全默认、tmp 无残留）。
+
+### 验证
+
+- workspace 包 23 pass 0 fail（含新增 9）；全仓 typecheck 通过。
+- 原文文件与既有 SessionFileStore 行为零改动（回归覆盖）。
+
+### 后续
+
+阶段二：session 内存视图 + 惰性加载；阶段三：`session.compacting` 接线 + ACP 协同；阶段四：前端按需渲染。
+
+---
+
 ## 2026-09-12（续 104）ACP 压缩增量渲染缓存优化
 
 ### 背景
