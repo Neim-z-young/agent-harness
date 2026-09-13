@@ -176,6 +176,11 @@ export interface CompactionBlock {
   endId: string
   /** 本块创建时间戳 */
   at: number
+  /**
+   * 该块原文在 SessionOriginalStore 中的归档 key（供 loader 按块还原原文）。
+   * 缺省沿用 block.id。
+   */
+  origKey?: string
 }
 
 /** 组装待发请求的精简视图：摘要块 + 近期完整消息 */
@@ -203,6 +208,22 @@ export interface HistoryLoader {
    * 未指定 range（或 loader 无法满足）时，语义由 host 决定（通常加载全部可用原文）。
    */
   load(sessionId: string, range?: HistoryLoadRange): Promise<Message[]>
+}
+
+/**
+ * 原文档案存储器（上下文压缩·阶段二，Route B）。
+ * 由宿主注入 core：compact 裁剪前把被压缩窗口原文落盘到内存之外，
+ * loader/flushHistory 经此按块还原，实现「内存瘦身 + 全文可回溯」。
+ * core 不直接读写文件，只依赖本接口。
+ */
+export interface SessionOriginalStore {
+  /**
+   * 把某压缩块对应的原文消息序列化到盘。
+   * 返回写入的绝对路径；失败由调用方容错。实现需幂等（同 key 覆盖式写）。
+   */
+  save(sessionId: string, blockId: string, messages: Message[]): Promise<string | void>
+  /** 读取某压缩块归档的原文消息；不存在返回 undefined */
+  load(sessionId: string, blockId: string): Promise<Message[] | undefined>
 }
 
 /**
@@ -237,6 +258,43 @@ export function renderBlocksAsMessage(blocks: CompactionBlock[] | undefined): Me
     parts: [{ type: 'text', text: lines.join('\n') }],
     createdAt: Date.now(),
   }
+}
+
+/**
+ * 重建会话"全文历史"：按 blocks 顺序经 `resolveBlock` 取回各块归档的原文，
+ * 再拼接近期 `messages`（id 去重，保证块原文与近期不重叠，block 在前、近期在后，
+ * 由于块按压缩时序追加、近期是未压缩的最新段，故拼接结果保持时间顺序）。
+ *
+ * - 有 loader/OriginalStore 时：`resolveBlock` 返回该块原文，实现"全文可回溯"。
+ * - 块原文取回失败/未提供：`resolveBlock` 返回空数组，不抛错，退化为「仅近期 + 摘要块」。
+ *
+ * 供 CLI loader、core exportMarkdown、/history 等消费方共用；纯函数可单测。
+ */
+export async function reconstructHistory(
+  sess: Pick<Session, 'blocks' | 'messages'>,
+  resolveBlock?: (block: CompactionBlock) => Promise<Message[]>,
+): Promise<Message[]> {
+  const out: Message[] = []
+  const seen = new Set<string>()
+  const push = (m: Message | undefined): void => {
+    if (!m) return
+    if (seen.has(m.id)) return
+    seen.add(m.id)
+    out.push(m)
+  }
+  for (const b of sess.blocks ?? []) {
+    let restored: Message[] = []
+    if (resolveBlock) {
+      try {
+        restored = (await resolveBlock(b)) ?? []
+      } catch {
+        restored = []
+      }
+    }
+    for (const m of restored) push(m)
+  }
+  for (const m of sess.messages ?? []) push(m)
+  return out
 }
 
 // ===== Session =====

@@ -13,9 +13,10 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import type { Message, SessionOriginalStore } from '@harness/session'
 import type { Workspace } from './index'
 
 /** 压缩文件格式版本（会话 meta 的"已启用压缩文件"标记与之对应，预留键见 COMPACTION_META_KEY） */
@@ -36,6 +37,8 @@ export interface CompactionBlock {
   startId: string
   /** 被压缩原文消息范围的结束 message id */
   endId: string
+  /** 该块原文在 SessionOriginalStore 中的归档 key（缺省沿用 id） */
+  origKey?: string
   /** 本块创建时间戳 */
   at: number
 }
@@ -186,6 +189,69 @@ export class SessionCompactionStore {
     if (!block) return undefined
     const point = this.buildIndex(f)[blockId]
     return { block, point }
+  }
+
+  // ---------- 原文档案（上下文压缩·阶段二，Route B）----------
+  // 被压缩窗口的原文落盘到 `sessions/{id}.cmp.orig/{blockId}.json`，
+  // 内存只驻留近期消息 + blocks，loader 经此按块还原全文（全文可回溯）。
+
+  /** 原文档案目录（sessions/{id}.cmp.orig） */
+  origDirFor(sessionId: string): string {
+    return join(this.sessionsDir(), `${sessionId}.cmp.orig`)
+  }
+
+  /** 原文档案单个块文件路径（{dir}/{blockId}.json） */
+  origPathFor(sessionId: string, blockId: string): string {
+    return join(this.origDirFor(sessionId), `${blockId}.json`)
+  }
+
+  /** 把某压缩块的原文消息序列化到盘（tmp+rename 原子写，同 key 覆盖式）。返回写入路径。 */
+  async saveOriginals(
+    sessionId: string,
+    blockId: string,
+    messages: Message[],
+  ): Promise<string> {
+    const p = this.origPathFor(sessionId, blockId)
+    await mkdir(this.origDirFor(sessionId), { recursive: true })
+    const tmp = `${p}.${process.pid}.tmp`
+    await writeFile(tmp, JSON.stringify(messages, null, 2))
+    await rename(tmp, p)
+    return p
+  }
+
+  /** 读取某压缩块归档的原文消息；不存在返回 undefined */
+  async loadOriginals(sessionId: string, blockId: string): Promise<Message[] | undefined> {
+    const p = this.origPathFor(sessionId, blockId)
+    if (!existsSync(p)) return undefined
+    return JSON.parse(await readFile(p, 'utf-8')) as Message[]
+  }
+
+  /** 该会话已归档原文消息总数（供 list 计数展示全量条数） */
+  async countOriginals(sessionId: string): Promise<number> {
+    const dir = this.origDirFor(sessionId)
+    if (!existsSync(dir)) return 0
+    const files = await readdir(dir)
+    let total = 0
+    for (const f of files) {
+      if (!f.endsWith('.json')) continue
+      try {
+        const p = join(dir, f)
+        const arr = JSON.parse(await readFile(p, 'utf-8')) as unknown
+        if (Array.isArray(arr)) total += arr.length
+      } catch {
+        /* 单个归档损坏不影响整体计数 */
+      }
+    }
+    return total
+  }
+}
+
+/** 把 SessionCompactionStore 适配成 @harness/session 的 SessionOriginalStore（CLI 注入 core 用） */
+export function createWorkspaceOriginalStore(ws: Workspace): SessionOriginalStore {
+  const store = new SessionCompactionStore(ws)
+  return {
+    save: (sessionId, blockId, messages) => store.saveOriginals(sessionId, blockId, messages),
+    load: (sessionId, blockId) => store.loadOriginals(sessionId, blockId),
   }
 }
 

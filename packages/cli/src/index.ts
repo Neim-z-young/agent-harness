@@ -61,6 +61,7 @@ import {
   resolveWorkspace,
   MultiDirLoader,
   normalizeDirs,
+  createWorkspaceOriginalStore,
   type Workspace,
 } from '@harness/workspace'
 import { createRevertPlugin, createSnapshotPlugin } from '@harness/revert'
@@ -76,7 +77,7 @@ import {
   exportStatsMarkdown,
   type UsageStats,
 } from './usage-stats'
-import type { Message, Session } from '@harness/session'
+import { reconstructHistory, type Message, type Session, type HistoryLoadRange, type SessionOriginalStore } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -1337,6 +1338,9 @@ export class HarnessApp {
       ],
       permission: perm,
       snapshot: this.snapshotService ? () => this.snapshotService! : undefined,
+      // 上下文压缩·阶段二（Route B）：宿主注入原文档案存储器，compact 裁剪前把被压缩窗口原文落盘到
+      // sessions/{id}.cmp.orig/，供惰性 loader 按块还原全文（内存瘦身 + 全文可回溯）。
+      originalStore: createWorkspaceOriginalStore(this.workspace),
       logger: {
         info: (msg, meta) => this.options.verbose
           ? this.options.stdout?.write?.(`[INFO] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}\n`)
@@ -1373,6 +1377,13 @@ export class HarnessApp {
         for (const m of saved.messages) await sm.addMessage(session.id, m)
         // 若用户明确 --session sid，实际文件 id ≠ sid，做个 save 用正确 id
         await sm.setId(session.id, sid)
+        // 上下文压缩·阶段二（Route B）：恢复压缩块并注册惰性加载器，供 /history 等按需读盘还原被压缩原文
+        if (saved.blocks?.length) {
+          session.blocks = saved.blocks
+          sm.setHistoryLoader(session.id, {
+            load: (s, range) => this.loadFullHistory(s, range),
+          })
+        }
       } else {
         session = await sm.create({ title: sid, agentId: this.options.agentId, cwd: this.options.cwd })
         await sm.setId(session.id, sid)
@@ -1393,6 +1404,49 @@ export class HarnessApp {
     const sess = (await h.session.get(sessionId))!
     await this.sessionStore.save(sess)
     return assistant
+  }
+
+  /**
+   * 上下文压缩·阶段二（Route B）：按需读盘还原被压缩原文的全文历史。
+   * 以会话「近期消息 + blocks」为骨架，经 originalStore 逐块取回被压缩窗口原文，
+   * 再与近期合并、去重排序得到全文；可选按 range（startId/endId/blockIds）过滤。
+   * 无 blocks 或读盘失败时 best-effort 返回近期消息，不阻断调用方。
+   */
+  async loadFullHistory(sessionId: string, range?: HistoryLoadRange): Promise<Message[]> {
+    const h = this.harness
+    const sess = await h.session.get(sessionId)
+    if (!sess) return []
+    if (!sess.blocks?.length) return range ? this.filterByRange([...sess.messages], range) : [...sess.messages]
+    const originalStore: SessionOriginalStore = createWorkspaceOriginalStore(this.workspace)
+    const full = await reconstructHistory(sess, async (block) => {
+      const key = block.origKey ?? block.id
+      try {
+        return (await originalStore.load(sessionId, key)) ?? []
+      } catch {
+        return []
+      }
+    })
+    return range ? this.filterByRange(full, range) : full
+  }
+
+  /** 按 range（startId/endId/blockIds）过滤消息列表 */
+  private filterByRange(
+    messages: Message[],
+    range: HistoryLoadRange,
+  ): Message[] {
+    let out = messages
+    if (range.blockIds?.length) {
+      // 块级过滤经 reconstructHistory 无法直接映射原文，此处忽略 blockIds（按时间范围兜底）
+      void range.blockIds
+    }
+    if (range.startId || range.endId) {
+      const startIdx = range.startId ? out.findIndex((m) => m.id === range.startId) : -1
+      const endIdx = range.endId ? out.findIndex((m) => m.id === range.endId) : out.length - 1
+      const from = startIdx >= 0 ? startIdx : 0
+      const to = endIdx >= 0 ? endIdx : out.length - 1
+      out = out.slice(from, to + 1)
+    }
+    return out
   }
 
   /** 流式发送：逐事件 yield AgentStreamEvent，完成后自动持久化 session */
@@ -1755,9 +1809,17 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           const next = await harness.session.create({ title: saved.title, agentId: saved.agentId, cwd: saved.cwd, meta: saved.meta })
           for (const m of saved.messages) await harness.session.addMessage(next.id, m)
           await harness.session.setId(next.id, saved.id)
+          // 上下文压缩·阶段二（Route B）：恢复压缩块并注册惰性加载器
+          if (saved.blocks?.length) {
+            next.blocks = saved.blocks
+            harness.session.setHistoryLoader(next.id, {
+              load: (s, range) => app.loadFullHistory(s, range),
+            })
+          }
           current = next
           options.setSession?.(next)
-          out(`已恢复会话 ${saved.id}（${saved.messages.length} 条消息）\n`)
+          const totalMsg = (await app.loadFullHistory(saved.id).catch(() => []))?.length ?? saved.messages.length
+          out(`已恢复会话 ${saved.id}（${totalMsg} 条消息）\n`)
           return 'continue'
         }
         case '/switch': {

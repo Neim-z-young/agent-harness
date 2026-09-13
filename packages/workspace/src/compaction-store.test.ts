@@ -7,8 +7,10 @@ import {
   COMPACTION_FILE_VERSION,
   COMPACTION_META_KEY,
   SessionCompactionStore,
+  createWorkspaceOriginalStore,
 } from './compaction-store'
 import { resolveWorkspace } from './index'
+import type { Message } from '@harness/session'
 
 /** 构造一个指向临时 dataDir 的 workspace + store */
 function makeStore(): { store: SessionCompactionStore; dataDir: string } {
@@ -122,5 +124,44 @@ describe('SessionCompactionStore', () => {
     // 目录内不应有残余 .tmp
     const files = await readdir(join(dataDir, 'sessions'))
     expect(files.some((f) => f.endsWith('.tmp'))).toBe(false)
+  })
+
+  test('saveOriginals/loadOriginals 往返（原文档案落盘）', async () => {
+    const { store, dataDir } = makeStore()
+    const msgs: Message[] = [
+      { id: 'm1', role: 'user', parts: [{ type: 'text' as const, text: 'a' }], createdAt: 1 },
+      { id: 'm2', role: 'assistant' as const, parts: [{ type: 'text' as const, text: 'b' }], createdAt: 2 },
+    ]
+    const p = await store.saveOriginals(SID, 'bk-1', msgs)
+    expect(p).toBe(store.origPathFor(SID, 'bk-1'))
+    expect(existsSync(store.origPathFor(SID, 'bk-1'))).toBe(true)
+    const loaded = await store.loadOriginals(SID, 'bk-1')
+    expect(loaded?.map((m) => m.id)).toEqual(['m1', 'm2'])
+    // 覆盖式写
+    await store.saveOriginals(SID, 'bk-1', [{ id: 'm9', role: 'user', parts: [{ type: 'text' as const, text: 'z' }], createdAt: 9 }])
+    expect((await store.loadOriginals(SID, 'bk-1'))!.map((m) => m.id)).toEqual(['m9'])
+    // 不存在的块返回 undefined
+    expect(await store.loadOriginals(SID, 'nope')).toBeUndefined()
+  })
+
+  test('countOriginals：按块累计归档原文条数', async () => {
+    const { store } = makeStore()
+    expect(await store.countOriginals(SID)).toBe(0)
+    await store.saveOriginals(SID, 'bk-1', [{ id: 'm1', role: 'user' as const, parts: [], createdAt: 1 }])
+    await store.saveOriginals(SID, 'bk-2', [
+      { id: 'm2', role: 'user' as const, parts: [], createdAt: 2 },
+      { id: 'm3', role: 'user' as const, parts: [], createdAt: 3 },
+    ])
+    expect(await store.countOriginals(SID)).toBe(3)
+  })
+
+  test('createWorkspaceOriginalStore 适配 SessionOriginalStore 接口', async () => {
+    const { store, dataDir } = makeStore()
+    expect(store.origDirFor(SID)).toBe(join(dataDir, 'sessions', 'sess-1.cmp.orig'))
+    const os = createWorkspaceOriginalStore(resolveWorkspace({ cwd: dataDir, dataDir }))
+    const msgs = [{ id: 'm1', role: 'user' as const, parts: [{ type: 'text' as const, text: 'a' }], createdAt: 1 }]
+    await os.save(SID, 'bk-1', msgs)
+    expect((await os.load(SID, 'bk-1'))?.map((m) => m.id)).toEqual(['m1'])
+    expect(await os.load(SID, 'none')).toBeUndefined()
   })
 })

@@ -593,6 +593,86 @@ describe('@harness/core', () => {
     })
   })
 
+  describe('Session Compaction · 阶段二 Route B（blocks + 原文归档 + 精简视图）', () => {
+    function makeSessionMessages(n: number): Message[] {
+      const out: Message[] = []
+      for (let i = 0; i < n; i++) {
+        out.push({ id: `u_${i}`, role: 'user', parts: [{ type: 'text', text: `问题${i}: ${'x'.repeat(40)}` }], createdAt: Date.now() + i * 2 })
+        out.push({ id: `a_${i}`, role: 'assistant', parts: [{ type: 'text', text: `回复${i}: ${'y'.repeat(40)}` }], createdAt: Date.now() + i * 2 + 1 })
+      }
+      return out
+    }
+    async function fill(h: Harness, sid: string, n: number) {
+      for (const m of makeSessionMessages(n)) await h.session.addMessage(sid, m)
+    }
+
+    it('compact 产 block（带 origKey 断点）并调用原文归档，messages 瘦到 keepRecent', async () => {
+      const saved: Array<{ key: string; msgs: Message[] }> = []
+      const originalStore = {
+        save: async (sid: string, key: string, msgs: Message[]) => { saved.push({ key, msgs }); return `${sid}/${key}` },
+        load: async () => undefined,
+      }
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider(), originalStore })
+      const sess = await h.session.create()
+      await fill(h, sess.id, 6)
+      expect((await h.session.get(sess.id))!.messages.length).toBe(12)
+      await h.session.compact(sess.id, 'summary', { keepRecentMessages: 4 })
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBe(4)
+      expect(s.blocks?.length).toBe(1)
+      const block = s.blocks![0]
+      expect(block.topic).toBe('会话压缩')
+      expect(block.startId).toBe('u_0')
+      expect(block.endId).toBe('a_3')
+      expect(block.origKey).toBe(block.id)
+      // 原文归档被调用，且归档内容=被压缩窗口（12 条 → keepRecent 4 → 归档 8 条）
+      expect(saved.length).toBe(1)
+      expect(saved[0].msgs.length).toBe(8)
+      // getView 为精简视图
+      const view = await h.session.getView(sess.id)
+      expect(view.slimmed).toBe(true)
+      expect(view.blocks.length).toBe(1)
+      expect(view.messages.length).toBe(4)
+      await h.stop()
+    })
+
+    it('无 originalStore 时 compact 仍产 block，不阻断、不归档', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fill(h, sess.id, 5)
+      await h.session.compact(sess.id, 'prune', { keepRecentMessages: 4 })
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBe(4)
+      expect(s.blocks?.length).toBe(1)
+      await h.stop()
+    })
+
+    it('compact 后 query 的请求历史 = 摘要占位 + 近期，不含被压缩原文消息', async () => {
+      const provider = mockChatProvider() // 收集 calls
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: provider })
+      const sess = await h.session.create()
+      await fill(h, sess.id, 6)
+      await h.session.compact(sess.id, 'summary', { keepRecentMessages: 4 })
+      await h.start()
+      await h.agent.query({ sessionId: sess.id, agentId: 'default', message: '再来一轮' })
+      await h.stop()
+      const lastCall = provider.calls[provider.calls.length - 1]
+      const msgs = lastCall.messages as Message[]
+      // 仅取真实用户消息（排除摘要占位这类以 ===COMPACTED 开头的合成 user 消息）
+      const userOnly = msgs
+        .filter((m) => m.role === 'user')
+        .map((m) => {
+          const t = m.parts.find((p: any) => p.type === 'text')
+          return String((t as any)?.text ?? '')
+        })
+        .filter((t) => !t.startsWith('===COMPACTED'))
+      // 请求历史含摘要占位，但不含被压缩的原文消息（u_0 明文不该进入请求）
+      expect(userOnly.join('\n')).not.toContain('问题0')
+      const view = await h.session.getView(sess.id)
+      expect(view.slimmed).toBe(true)
+    })
+  })
+
   describe('AgentRuntime + snapshot 自动捕获挂载（meta.snapshot）', () => {
     it('注入 snapshot 工厂后，query 的 assistant 消息携带 meta.snapshot.start（首轮 files 为空）', async () => {
       let calls = 0

@@ -202,11 +202,13 @@ import type {
   SessionView,
   HistoryLoader,
   HistoryLoadRange,
+  SessionOriginalStore,
 } from '@harness/session'
 import {
   COMPACT_META_KEY as COMPACT_META_KEY_VAL,
   COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
   buildView,
+  renderBlocksAsMessage,
 } from '@harness/session'
 import type {
   SnapshotID,
@@ -523,6 +525,8 @@ interface SessionServices {
     name: N,
     ...args: Parameters<NonNullable<Hooks[N]>>
   ) => Promise<void>
+  /** 原文档案存储器（宿主注入；compact 裁剪前把窗口原文落盘，供全文回溯） */
+  readonly originalStore?: SessionOriginalStore
 }
 
 export class DefaultSessionManager implements SessionManager {
@@ -530,6 +534,11 @@ export class DefaultSessionManager implements SessionManager {
   /** 会话惰性加载器（host 注入，供 flushHistory 按需读盘原文） */
   private readonly historyLoaders = new Map<string, HistoryLoader>()
   constructor(private readonly services?: () => SessionServices) {}
+
+  /** 访问注入的原文档案器（compact 落盘原文用） */
+  private get originalStore(): SessionOriginalStore | undefined {
+    return this.services?.()?.originalStore
+  }
 
   async create(options: SessionCreateOptions = {}): Promise<Session> {
     const id = options?.title
@@ -848,6 +857,35 @@ export class DefaultSessionManager implements SessionManager {
     }
     this.writeMemory(sess, newMemory)
 
+    // 上下文压缩·阶段二（Route B）：裁剪前把窗口原文落盘 + 记录压缩块。
+    // 内存只驻留「近期消息 + blocks」，原文在盘 .cmp.orig 由 loader 按块还原（全文可回溯）。
+    if (windowToPrune.length > 0) {
+      const blockId = `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+      // 原文落盘为 best-effort：失败仅记录，不阻断压缩（此时归档缺失，全文回溯退化为仅摘要）
+      if (this.originalStore) {
+        try {
+          await this.originalStore.save(sessionId, blockId, windowToPrune)
+        } catch {
+          // SessionManager 无统一 logger，使用 console 兜底告警（不阻断主流程）
+          if (typeof console !== 'undefined') {
+            console.warn(`[compact] 原文归档失败，session=${sessionId} block=${blockId}`)
+          }
+        }
+      }
+      sess.blocks = [
+        ...(sess.blocks ?? []),
+        {
+          id: blockId,
+          topic: '会话压缩',
+          summary: summaryText ?? '',
+          startId: windowToPrune[0]?.id ?? '',
+          endId: windowToPrune[windowToPrune.length - 1]?.id ?? '',
+          at: now,
+          origKey: blockId,
+        },
+      ]
+    }
+
     // 实际截断：删除 windowToPrune
     sess.messages = kept
     const afterLen = sess.messages.length
@@ -949,8 +987,13 @@ export class DefaultSessionManager implements SessionManager {
       lines.push(`> 摘要：${mem.summaryText}`)
       lines.push('')
     }
-    // 消息
-    for (const m of sess.messages) {
+    // 消息（上下文压缩·阶段二：有压缩块时经 loader 还原全文再导出；否则近期/全量）
+    let msgs: Message[] = sess.messages
+    if (sess.blocks?.length) {
+      const full = await this.flushHistory(sessionId).catch(() => [] as Message[])
+      if (full.length > 0) msgs = full
+    }
+    for (const m of msgs) {
       const ts = new Date(m.createdAt).toLocaleString()
       const roleLabel = m.role === 'user' ? '👤 **User**' : m.role === 'assistant' ? '🤖 **Assistant**' : `🔧 **${m.role}**`
       lines.push(`---`)
@@ -1319,7 +1362,16 @@ export class AgentRuntimeImpl implements AgentRuntime {
         createdAt: Date.now(),
       })
     }
-    finalMessages.push(...session2.messages)
+    // 上下文压缩·阶段二（D1）：有压缩块时用「精简视图」组装请求历史
+    // （摘要占位 + 近期消息），不再全量拼接原文；无块则零变化。
+    const view = await this.deps.session.getView(sessionId)
+    if (view.slimmed) {
+      const summaryMsg = renderBlocksAsMessage(view.blocks)
+      if (summaryMsg) finalMessages.push(summaryMsg)
+      finalMessages.push(...view.messages)
+    } else {
+      finalMessages.push(...session2.messages)
+    }
 
     // LLM params + headers（触发 llm.params / llm.headers hooks）
     // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
@@ -1496,7 +1548,16 @@ export class AgentRuntimeImpl implements AgentRuntime {
         createdAt: Date.now(),
       })
     }
-    finalMessages.push(...session2.messages)
+    // 上下文压缩·阶段二（D1）：有压缩块时用「精简视图」组装请求历史
+    // （摘要占位 + 近期消息），不再全量拼接原文；无块则零变化。
+    const view = await this.deps.session.getView(sessionId)
+    if (view.slimmed) {
+      const summaryMsg = renderBlocksAsMessage(view.blocks)
+      if (summaryMsg) finalMessages.push(summaryMsg)
+      finalMessages.push(...view.messages)
+    } else {
+      finalMessages.push(...session2.messages)
+    }
 
     // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
     const llmIn: LLMInput = {
@@ -1800,6 +1861,13 @@ export interface AgentHarnessOptions {
    * 未注入则不启用自动快照记录。
    */
   snapshot?: () => SnapshotService
+  /**
+   * 可选：原文档案存储器（@harness/session 的 SessionOriginalStore）。
+   * 注入后，会话 compact 在裁剪前会把被压缩窗口原文落盘到内存之外，
+   * 供 flushHistory/loader 按块还原（"内存瘦身 + 全文可回溯"）。
+   * 未注入则压缩不产原文档案（仍产 blocks 与摘要，全文回溯退化为仅摘要）。
+   */
+  originalStore?: SessionOriginalStore
   /** 可选：透传给 PluginManager（测试注入 dynamicImport） */
   pluginOverrides?: Partial<PluginManagerOptions>
   /** 可选：透传 logger */
@@ -1931,6 +1999,7 @@ export class HarnessImpl implements Harness {
         agent: agentRuntime,
         currentAgentId: () => options.defaultAgentId ?? 'default',
         triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
+        originalStore: options.originalStore,
       }
     })
 

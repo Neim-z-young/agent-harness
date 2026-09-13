@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { CompactionBlock, Message } from './index'
-import { buildView, renderBlocksAsMessage } from './index'
+import { buildView, reconstructHistory, renderBlocksAsMessage } from './index'
 
 function msg(id: string, text: string): Message {
   return { id, role: 'user', parts: [{ type: 'text', text }], createdAt: 1 }
@@ -69,5 +69,48 @@ describe('CompactionBlock 结构与 workspace 同构（字段完整）', () => {
     expect(b.startId).toBe('m1')
     expect(b.endId).toBe('m2')
     expect(b.at).toBe(1)
+  })
+})
+
+describe('reconstructHistory（按块还原全文）', () => {
+  test('无 blocks 时即为近期消息', async () => {
+    const msgs = [msg('m1', 'a'), msg('m2', 'b')]
+    const full = await reconstructHistory({ blocks: undefined, messages: msgs })
+    expect(full.map((m) => m.id)).toEqual(['m1', 'm2'])
+  })
+
+  test('有 blocks：resolveBlock 返回块原文，拼接在近期之前', async () => {
+    const blocks: CompactionBlock[] = [
+      { id: 'b1', summary: 's1', startId: 'm1', endId: 'm2', at: 1, origKey: 'b1' },
+    ]
+    const resolveBlock = async (b: CompactionBlock) =>
+      ({ b1: [msg('m1', 'a'), msg('m2', 'b')] })[b.origKey ?? b.id] ?? []
+    const full = await reconstructHistory(
+      { blocks, messages: [msg('m3', 'c')] },
+      resolveBlock,
+    )
+    expect(full.map((m) => m.id)).toEqual(['m1', 'm2', 'm3'])
+  })
+
+  test('resolveBlock 失败/为空时退化为仅近期，不抛错', async () => {
+    const blocks: CompactionBlock[] = [
+      { id: 'b1', summary: 's1', startId: 'm1', endId: 'm2', at: 1 },
+    ]
+    const full = await reconstructHistory(
+      { blocks, messages: [msg('m3', 'c')] },
+      async () => { throw new Error('read fail') },
+    )
+    expect(full.map((m) => m.id)).toEqual(['m3'])
+  })
+
+  test('原文与近期 id 重叠时去重', async () => {
+    const blocks: CompactionBlock[] = [
+      { id: 'b1', summary: 's1', startId: 'm1', endId: 'm2', at: 1 },
+    ]
+    const full = await reconstructHistory(
+      { blocks, messages: [msg('m2', 'b'), msg('m3', 'c')] },
+      async () => [msg('m1', 'a'), msg('m2', 'b')],
+    )
+    expect(full.map((m) => m.id)).toEqual(['m1', 'm2', 'm3'])
   })
 })

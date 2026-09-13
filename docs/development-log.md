@@ -1,6 +1,45 @@
 # Agent Harness 开发日志
 
-## 2026-09-13（续 108）上下文压缩改造·阶段三 收尾：窗口原文跨重启回溯
+## 2026-09-13（续 109）上下文压缩改造·阶段二后续（Route B 彻底）：内存瘦身 + 原文落盘 + 惰性回溯
+
+### 背景
+续 106/107 确立「内存视图 + 惰性加载」接口骨架、续 108 由 ACP 经 `session.meta` 保全窗口原文。但通用 `compact()` 仍物理截断 `sess.messages`，被删窗口原文一旦离开会话文件即失效，`.cmp.json`/断点索引也未接入核心读取路径。本次落实 Route B 彻底改造：内存只驻留「压缩摘要块 blocks + 近期消息」，被压缩窗口原文落盘到独立档案，按需经 loader 还原——内存瘦身 + 请求 token 瘦身 + 全文可回溯三赢，且不依赖 ACP（ACP 可启停）。
+
+### 改动
+
+**packages/session**
+- `CompactionBlock` 增加可选 `origKey`（原文在 OriginalStore 的 key，缺省=block.id）。
+- 新增共享接口 `SessionOriginalStore`（`save`/`load`），供 core/workspace/cli 跨包引用。
+- 新增纯函数 `reconstructHistory(sess, resolveBlock?)`：按 `blocks` 顺序经 resolveBlock 取回各块归档原文，再拼近期 `messages`，按 id 去重、稳定排序还原全文。
+- `buildView` 语义不变（blocks+messages+slimmed），摘要占位只在 core 请求组装处插入，避免波及 revert 的 FakeSessionManager。
+
+**packages/workspace**
+- `SessionCompactionStore` 新增原文档案读写：`saveOriginals`（写 `sessions/{id}.cmp.orig/{blockId}.json`，tmp+rename 原子）、`loadOriginals`、`countOriginals`（该会话归档消息总数，供 list 计数）。
+- 新增工厂 `createWorkspaceOriginalStore(ws)`，把上述方法适配成 `SessionOriginalStore`（CLI 注入 core 用）。
+- `SessionFileStore`：`SessionFile` 增加 `blocks` 字段并随 `save/load` 往返；`list().messageCount` = 近期 + `countOriginals`（仍反映全量）。
+
+**packages/core**
+- `AgentHarnessOptions`/`SessionServices`/`HarnessImpl` 注入可选 `originalStore`。
+- `compact()`：裁剪前若 `windowToPrune` 非空，生成 `b_{ts}_{rand}` 块 id，`originalStore.save` 落盘窗口原文（best-effort，失败仅告警不阻断），并把块追加进 `sess.blocks`（`topic=会话压缩`、`startId/endId` 断点、`origKey=blockId`）。
+- `_prepareQuery`/`query`/`queryStream`：有压缩块（`view.slimmed`）时请求历史改为「`renderBlocksAsMessage(blocks)` 摘要占位 + `view.messages` 近期」，不再全量拼接原文；无块零变化。
+- `exportMarkdown`：`sess.blocks` 存在时经 `flushHistory` 取全文再导出。
+
+**packages/cli**
+- `createHarness` 注入 `createWorkspaceOriginalStore(this.workspace)`。
+- `boot()` 会话恢复处：`session.blocks = saved.blocks`，存在块时 `setHistoryLoader` 注册惰性加载器。
+- `/resume` 命令同样补 `blocks` + 注册 loader；恢复条数改用 `loadFullHistory` 汇报全量。
+- 新增 `loadFullHistory(sessionId, range?)`：以近期+blocks 为骨架经 originalStore 逐块取回原文，`reconstructHistory` 合并去重排序，支持按 id 范围过滤；无块/读盘失败 best-effort 返回近期。
+
+### 验证
+- session `reconstructHistory` 单测；workspace `saveOriginals/loadOriginals/countOriginals` + blocks 写读 + `list.count` 单测；core 新增 Route B 用例（compact 产块+归档、无 store 不阻断、query slim 视图、export 全文）。
+- 所涉包全绿：session 10、workspace 26、core 38、cli 190；acp-context 16、revert 35 不破；全仓 typecheck 通过。
+- 全仓 `bun test` 的 607 失败均为既有 opentui/DOM/TUI 环境性失败，与本阶段改动无关。
+
+### 后续
+- revert `/revert` 目标是近期消息，天然可工作；若边界已被压缩进块（历史回滚）为已知限制，留待阶段四经 loader 全文回滚。
+- 阶段四：TUI/Web 历史按需分页渲染，压缩块只显示提示行。
+
+---
 
 ### 背景
 续 107 `runCompacting` 折叠窗口原文只进内存 `ctx.archive`，重启即失；且 core 每次都物理删除窗口，`.json` 里的断点也无从回读。本次打通"跨重启后 `decompress` 仍能还原被 session 压缩删掉的窗口全文"。

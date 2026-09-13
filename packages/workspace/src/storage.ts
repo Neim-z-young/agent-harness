@@ -12,6 +12,7 @@ import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:
 import { join } from 'node:path'
 import type { Message, Session } from '@harness/session'
 import type { Workspace } from './index'
+import { SessionCompactionStore } from './compaction-store'
 
 /** 配置校验 / 密钥解析等一次性启动失败 */
 export class ConfigValidationError extends Error {
@@ -30,7 +31,9 @@ export interface SessionFile {
   agentId?: string
   cwd?: string
   meta?: Record<string, unknown>
-  /** 完整消息列表 */
+  /** 已压缩摘要块（上下文压缩·阶段二 Route B；原文在盘 .cmp.orig 由 loader 还原） */
+  blocks?: Session['blocks']
+  /** 完整消息列表（未压缩时为全量；压缩后为「近期」消息） */
   messages: Message[]
 }
 
@@ -61,6 +64,7 @@ export class SessionFileStore {
       agentId: s.agentId,
       cwd: s.cwd,
       meta: s.meta,
+      blocks: s.blocks,
       messages: s.messages,
     }
   }
@@ -84,9 +88,14 @@ export class SessionFileStore {
     const files = await readdir(this.sessionsDir())
     const ids = files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5))
     const items: Array<{ id: string; title?: string; updatedAt: number; messageCount: number }> = []
+    // 压缩后 sessions/{id}.json 只存近期消息，原文归档在 .cmp.orig；计数需合并以反映全量
+    const compaction = new SessionCompactionStore(this.workspace)
     for (const id of ids) {
       const s = await this.load(id)
-      if (s) items.push({ id, title: s.title, updatedAt: s.updatedAt, messageCount: s.messages.length })
+      if (s) {
+        const archived = await compaction.countOriginals(id).catch(() => 0)
+        items.push({ id, title: s.title, updatedAt: s.updatedAt, messageCount: s.messages.length + archived })
+      }
     }
     items.sort((a, b) => b.updatedAt - a.updatedAt)
     return items
