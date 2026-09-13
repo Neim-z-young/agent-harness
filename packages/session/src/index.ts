@@ -156,6 +156,89 @@ export interface CompactMemory {
 export const COMPACT_META_KEY = 'compaction' as const
 export const COMPACT_MEMORY_KEY = 'compactMemory' as const
 
+// ===== Session 压缩视图（上下文压缩·阶段二）=====
+// 目标：内存只驻留「摘要块 + 近期消息」，原文在盘按需懒加载。
+// session 层不直接读盘（盘由 workspace/cli 层承担），故这里只定义视图类型与
+// 纯组装函数，盘访问通过 host 注入的 HistoryLoader 回调提供。
+// 与 @harness/workspace 的 CompactionBlock 保持同构（session 不反向依赖 workspace）。
+
+/** 会话压缩块：摘要 + 指向原文 id 段的断点 */
+export interface CompactionBlock {
+  /** 块 ID（稳定，跨重启可定位原文） */
+  id: string
+  /** 主题（可选） */
+  topic?: string
+  /** 压缩摘要内容 */
+  summary: string
+  /** 被压缩原文消息范围的起始 message id */
+  startId: string
+  /** 被压缩原文消息范围的结束 message id */
+  endId: string
+  /** 本块创建时间戳 */
+  at: number
+}
+
+/** 组装待发请求的精简视图：摘要块 + 近期完整消息 */
+export interface SessionView {
+  blocks: CompactionBlock[]
+  messages: Message[]
+  /** 是否为"已精简"视图（有 blocks 且不全量） */
+  slimmed: boolean
+}
+
+/** 惰性加载原文的范围选择 */
+export interface HistoryLoadRange {
+  /** 起始消息 id（含） */
+  startId?: string
+  /** 结束消息 id（含） */
+  endId?: string
+  /** 按块 id 加载对应原文段 */
+  blockIds?: string[]
+}
+
+/** 由 host 注入的懒加载器：按需从盘加载原文消息全文 */
+export interface HistoryLoader {
+  /**
+   * 加载指定会话中 range 范围内的原文消息。
+   * 未指定 range（或 loader 无法满足）时，语义由 host 决定（通常加载全部可用原文）。
+   */
+  load(sessionId: string, range?: HistoryLoadRange): Promise<Message[]>
+}
+
+/**
+ * 组装精简视图：无 blocks 时完全退化为「blocks=[]、messages=原样、slimmed=false」，
+ * 保证在未启用压缩/无压缩块时现有行为零变化。
+ */
+export function buildView(
+  blocks: CompactionBlock[] | undefined,
+  messages: Message[],
+): SessionView {
+  if (!blocks || blocks.length === 0) {
+    return { blocks: [], messages, slimmed: false }
+  }
+  return { blocks, messages, slimmed: true }
+}
+
+/**
+ * 把压缩块渲染成一条摘要占位消息（user 角色、text part）。
+ * 供未来 query 在组装 finalMessages 时把已压缩历史「折叠」为一条摘要，减少 token。
+ * 无块时返回 undefined。
+ */
+export function renderBlocksAsMessage(blocks: CompactionBlock[] | undefined): Message | undefined {
+  if (!blocks || blocks.length === 0) return undefined
+  const lines: string[] = ['===COMPACTED HISTORY SUMMARY===']
+  for (const b of blocks) {
+    const head = b.topic ? `[${b.topic}]` : ''
+    lines.push(`${head} ${b.summary}`)
+  }
+  return {
+    id: `__compaction_view__`,
+    role: 'user',
+    parts: [{ type: 'text', text: lines.join('\n') }],
+    createdAt: Date.now(),
+  }
+}
+
 // ===== Session =====
 
 /**
@@ -175,6 +258,11 @@ export interface Session {
   agentId?: string
   /** 消息列表（按时间顺序） */
   messages: Message[]
+  /**
+   * 已压缩摘要块（可选；阶段二）：内存驻留的"已压缩历史"摘要，原文在盘由 HistoryLoader 按需加载。
+   * 缺省 / undefined 表示未启用压缩视图，消息仍以 messages 全量内存驻留。
+   */
+  blocks?: CompactionBlock[]
   /** 工作目录 */
   cwd?: string
   /** 父会话 ID（子 Agent 派生时关联，便于审计追溯） */
@@ -319,6 +407,18 @@ export interface SessionManager {
   estimateTokens(sessionId: string): Promise<number>
   /** 读取当前压缩记忆（CompactMemory + 元数据），供 Agent 注入 system prompt */
   getCompactionInfo(sessionId: string): Promise<{ meta?: CompactionMeta; memory?: CompactMemory }>
+  /** 组装发送给模型的精简视图（摘要块 + 近期完整消息）；无压缩块时退化为全量 messages */
+  getView(sessionId: string): Promise<SessionView>
+  /**
+   * 注入/移除该会话的惰性加载器（原文在盘按需加载；由 host 提供读盘实现）。
+   * 传 undefined 表示移除 loader（此时 flushHistory 返回空）。
+   */
+  setHistoryLoader(sessionId: string, loader?: HistoryLoader): void
+  /**
+   * 惰性加载指定会话的原文消息全文（经注入的 HistoryLoader）。
+   * 未注入 loader 或加载失败时返回空数组（不抛错，一级容错）。
+   */
+  flushHistory(sessionId: string, range?: HistoryLoadRange): Promise<Message[]>
   /** 导出会话为 Markdown 文本 */
   exportMarkdown(sessionId: string): Promise<string>
 

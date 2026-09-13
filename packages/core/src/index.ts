@@ -198,10 +198,14 @@ import type {
   CompactMemory,
   COMPACT_META_KEY,
   COMPACT_MEMORY_KEY,
+  SessionView,
+  HistoryLoader,
+  HistoryLoadRange,
 } from '@harness/session'
 import {
   COMPACT_META_KEY as COMPACT_META_KEY_VAL,
   COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
+  buildView,
 } from '@harness/session'
 import type {
   SnapshotID,
@@ -517,6 +521,8 @@ interface SessionServices {
 
 export class DefaultSessionManager implements SessionManager {
   private readonly sessions = new Map<string, Session>()
+  /** 会话惰性加载器（host 注入，供 flushHistory 按需读盘原文） */
+  private readonly historyLoaders = new Map<string, HistoryLoader>()
   constructor(private readonly services?: () => SessionServices) {}
 
   async create(options: SessionCreateOptions = {}): Promise<Session> {
@@ -678,6 +684,28 @@ export class DefaultSessionManager implements SessionManager {
     if (!sess) return
     sess.meta = { ...(sess.meta ?? {}), ...patch }
     sess.updatedAt = Date.now()
+  }
+
+  async getView(sessionId: string): Promise<SessionView> {
+    const sess = this.sessions.get(sessionId)
+    if (!sess) return { blocks: [], messages: [], slimmed: false }
+    return buildView(sess.blocks, sess.messages)
+  }
+
+  setHistoryLoader(sessionId: string, loader?: HistoryLoader): void {
+    if (loader) this.historyLoaders.set(sessionId, loader)
+    else this.historyLoaders.delete(sessionId)
+  }
+
+  async flushHistory(sessionId: string, range?: HistoryLoadRange): Promise<Message[]> {
+    const loader = this.historyLoaders.get(sessionId)
+    if (!loader) return []
+    try {
+      return await loader.load(sessionId, range)
+    } catch {
+      // 惰性加载失败仅返回空，不影响主流程
+      return []
+    }
   }
 
   private readonly snapshots = new Map<string, Map<string, Session>>()

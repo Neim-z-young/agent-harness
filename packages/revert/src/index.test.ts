@@ -9,7 +9,8 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import type { Session, SessionManager } from '@harness/session'
+import type { Session, SessionManager, SessionView } from '@harness/session'
+import { buildView } from '@harness/session'
 import { createBus } from '@harness/bus'
 import { createSnapshotService } from '@harness/snapshot'
 import {
@@ -76,6 +77,17 @@ class FakeSessionManager implements SessionManager {
   async updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (session) session.meta = { ...(session.meta ?? {}), ...patch }
+  }
+  async getView(sessionId: string): Promise<SessionView> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return { blocks: [], messages: [], slimmed: false }
+    return buildView(session.blocks, session.messages)
+  }
+  setHistoryLoader(): void {
+    /* not implemented */
+  }
+  async flushHistory(): Promise<Session['messages']> {
+    return []
   }
   async deleteMessage(): Promise<void> {
     throw new Error('not implemented')
