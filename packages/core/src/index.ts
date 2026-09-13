@@ -857,9 +857,10 @@ export class DefaultSessionManager implements SessionManager {
     }
     this.writeMemory(sess, newMemory)
 
-    // 上下文压缩·阶段二（Route B）：裁剪前把窗口原文落盘 + 记录压缩块。
-    // 内存只驻留「近期消息 + blocks」，原文在盘 .cmp.orig 由 loader 按块还原（全文可回溯）。
-    if (windowToPrune.length > 0) {
+    // 上下文压缩·统一块模型：ACP 已认领窗口（windowHandled）时，由 ACP 落 source:'acp' 块，
+    // core 不再重复归档 / 产 generic 块（消除同一窗口双击/双归档）。
+    // 否则走通用 compact 产 source:'generic' 块 + .cmp.orig 原文档案（内存瘦身 + 全文可回溯）。
+    if (windowToPrune.length > 0 && !compactCtx.windowHandled) {
       const blockId = `b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
       // 原文落盘为 best-effort：失败仅记录，不阻断压缩（此时归档缺失，全文回溯退化为仅摘要）
       if (this.originalStore) {
@@ -882,8 +883,22 @@ export class DefaultSessionManager implements SessionManager {
           endId: windowToPrune[windowToPrune.length - 1]?.id ?? '',
           at: now,
           origKey: blockId,
+          source: 'generic',
         },
       ]
+    }
+
+    // 应用插件（ACP）回传的折叠块：按块 id 合并去重进入统一 session.blocks，
+    // 使 ACP 折叠与通用 compact 块一致，供视图/loader/reconstructHistory/revert 消费。
+    const patches = compactCtx.blocksPatch ?? []
+    if (patches.length > 0) {
+      const map = new Map<string, NonNullable<Session['blocks']>[number]>(
+        (sess.blocks ?? []).map((b) => [b.id, b]),
+      )
+      for (const p of patches) {
+        map.set(p.id, { ...p, at: now })
+      }
+      sess.blocks = [...map.values()]
     }
 
     // 实际截断：删除 windowToPrune

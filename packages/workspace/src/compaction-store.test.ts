@@ -164,4 +164,16 @@ describe('SessionCompactionStore', () => {
     expect((await os.load(SID, 'bk-1'))?.map((m) => m.id)).toEqual(['m1'])
     expect(await os.load(SID, 'none')).toBeUndefined()
   })
+
+  test('createWorkspaceOriginalStore.loadRef：orig:{sid}:{block} 转本地归档，acp: 回退 undefined', async () => {
+    const { dataDir } = makeStore()
+    const os = createWorkspaceOriginalStore(resolveWorkspace({ cwd: dataDir, dataDir }))
+    const msgs = [{ id: 'm1', role: 'user' as const, parts: [{ type: 'text' as const, text: 'a' }], createdAt: 1 }]
+    await os.save(SID, 'bk-1', msgs)
+    // orig: 前缀 → 命中本地原文档案
+    expect((await os.loadRef!(SID, `orig:${SID}:bk-1`))?.map((m) => m.id)).toEqual(['m1'])
+    // 默认不要 star 前缀 / 空引用回退
+    expect(await os.loadRef!(SID, 'acp:archive-1')).toBeUndefined()
+    expect(await os.loadRef!(SID, 'unknown-ref')).toBeUndefined()
+  })
 })

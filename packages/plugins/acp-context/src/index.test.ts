@@ -9,6 +9,7 @@ import {
   type CompressionState,
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
+import type { CompactionContext } from '@harness/plugin'
 import { runPreModel, runCompacting, restoreBlockMessages, ACP_META_KEY, ACP_ARCHIVE_KEY } from './index'
 import { toCores, compactHistory, idBase, baseId } from './adapter'
 
@@ -329,8 +330,15 @@ test('adapter：baseId 导出可复用（核心链路依赖）', () => {
 
 // ===== session.compacting 协同（方案三：先保全原文再物理删除） =====
 
-function compactCtxFor(window: Message[]) {
-  return { window, keepLast: 10, strategy: 'summary' as const, windowHandled: false, summary: undefined }
+function compactCtxFor(window: Message[]): CompactionContext {
+  return {
+    window,
+    keepLast: 10,
+    strategy: 'summary',
+    windowHandled: false,
+    summary: undefined,
+    blocksPatch: undefined,
+  }
 }
 
 test('runCompacting：session 压缩前把 window 折叠进 ACP 块，并豁免 core 自行摘要', async () => {
@@ -373,6 +381,14 @@ test('runCompacting：session 压缩前把 window 折叠进 ACP 块，并豁免 
   // 已处理：windowHandled 置位，且提供了 summary 供 core 复用（避免双份摘要）
   expect(input.windowHandled).toBe(true)
   expect(input.summary).toBeTruthy()
+  // 统一块模型：回传 source:'acp' 折叠块（供 core 追加到 session.blocks）
+  expect(input.blocksPatch?.length).toBe(1)
+  const patch = input.blocksPatch![0]
+  expect(patch.source).toBe('acp')
+  expect(patch.summary).toBeTruthy()
+  expect(patch.startId).toBe(window[0].id)
+  expect(patch.endId).toBe(window[window.length - 1].id)
+  expect(patch.archiveRef).toMatch(/^acp:s1:/)
   // 状态持久化到 meta
   expect(meta[ACP_META_KEY]).toBeDefined()
 })

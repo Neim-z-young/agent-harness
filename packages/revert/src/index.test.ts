@@ -224,6 +224,39 @@ describe('SessionRevert', () => {
     ).rejects.toBeInstanceOf(RevertError)
   })
 
+  test('stage：boundary 在折叠块内（仅全文可回溯定位）时仍能回退最近消息', async () => {
+    const env = await makeEnv()
+    const { session, manager, svc, bus, worktree } = env
+    const aPath = path.join(worktree, 'a.txt')
+
+    // 折叠：session.messages 只保留近期（m0→m2），boundary m0 与 m1 被折叠进块原文，仅经全文可回溯
+    await writeFile(aPath, 'v1\n')
+    const snap1 = await svc.capture() // m1 快照（a=v1）
+    await writeFile(aPath, 'v2\n')
+    const snap2 = await svc.capture() // m2 快照（a=v2）
+    const foldedBoundary = makeMessage('m0', 'user')
+    const foldedFollow = makeMessage('m1', 'assistant')
+    attachSnapshotToMessage({ messages: [foldedBoundary, foldedFollow] } as any, 'm1', snap1!, ['a.txt'])
+    session.messages = [foldedFollow, makeMessage('m2', 'assistant')]
+    attachSnapshotToMessage(session, 'm2', snap2!, ['a.txt'])
+    // 近期 messages 里没有 boundary m0（已被折叠），只有全文回溯能定位
+    expect(session.messages.some((m) => m.id === 'm0')).toBe(false)
+
+    // 注入全文回溯器：还原折叠块原文 + 近期
+    const revert = createSessionRevert({
+      session: manager,
+      snapshot: svc,
+      bus,
+      getFullHistory: async () => [foldedBoundary, foldedFollow, ...session.messages],
+    })
+
+    const state = await revert.stage({ sessionId: 's1', messageID: 'm0' })
+    // 文件回滚到离 boundary 最近的后继快照 m1（a=v1）——即便 m1 在折叠块内也能被收集
+    expect(await readFile(aPath, 'utf-8')).toBe('v1\n')
+    expect(state.messageID).toBe('m0')
+    expect(state.files?.some((f) => f.path === 'a.txt')).toBe(true)
+  })
+
   test('clear：撤销回滚（文件恢复回滚前状态），发布 cleared，清除 revert 状态', async () => {
     const env = await makeEnv()
     const { session, manager, svc, bus, worktree } = env

@@ -181,6 +181,14 @@ export interface CompactionBlock {
    * 缺省沿用 block.id。
    */
   origKey?: string
+  /** 块来源（统一块模型）：通用 compact 折叠 / ACP 插件折叠。缺省视为 'generic'。 */
+  source?: 'generic' | 'acp'
+  /**
+   * 原文取回引用（统一块模型，source==='acp' 时用）：
+   * 指向 ACP 归档 key（如 `acp:...`），供 loader/reconstructHistory 据此取回原文，
+   * 避免同一窗口原文双写（meta 归档 + .cmp.orig）。
+   */
+  archiveRef?: string
 }
 
 /** 组装待发请求的精简视图：摘要块 + 近期完整消息 */
@@ -224,6 +232,39 @@ export interface SessionOriginalStore {
   save(sessionId: string, blockId: string, messages: Message[]): Promise<string | void>
   /** 读取某压缩块归档的原文消息；不存在返回 undefined */
   load(sessionId: string, blockId: string): Promise<Message[] | undefined>
+  /**
+   * 按引用取回原文（统一块模型，可选）：当块带 `archiveRef`（source==='acp' 时）
+   * 而非传统 `origKey` 时，供 loader/reconstructHistory 据此取回 ACP 归档的原文。
+   * 未实现时返回 undefined，调用方回退到 `load(sessionId, origKey ?? id)`。
+   */
+  loadRef?(sessionId: string, ref: string): Promise<Message[] | undefined>
+}
+
+/**
+ * 构造 `reconstructHistory` 用的 `resolveBlock`：按块的 source/引用统一分派原文取回。
+ * - `source:'acp'` 且提供 OriginalStore.loadRef 时 → 走 archiveRef；
+ * - 否则回退 OriginalStore.load(sessionId, origKey ?? id)。
+ * 供 core/cli/revert 复用，保证"全文回溯"对 ACP 与通用折叠一致取原文。
+ */
+export function buildResolveBlock(
+  store: SessionOriginalStore | undefined,
+  sessionId: string,
+): (block: CompactionBlock) => Promise<Message[]> {
+  return async (block) => {
+    if (!store) return []
+    const ref = block.source === 'acp' ? block.archiveRef : undefined
+    if (ref && typeof store.loadRef === 'function') {
+      try {
+        const msgs = await store.loadRef(sessionId, ref)
+        if (msgs) return msgs
+      } catch {
+        /* 落到回退 */
+      }
+    }
+    const key = block.origKey ?? block.id
+    const msgs = await store.load(sessionId, key)
+    return msgs ?? []
+  }
 }
 
 /**

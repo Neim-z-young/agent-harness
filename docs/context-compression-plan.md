@@ -6,7 +6,7 @@
 
 - 关联插件：`@harness/acp-context`
 - 讨论对齐的版本：**V5 定稿**（在标记消息、归档文件、懒加载讨论基础上收敛）
-- 状态：阶段一→三已实施（持久层 / 视图骨架 / session.compacting 接线），阶段二后续走 Route B 彻底改造（内存瘦身 + 原文落盘 + 惰性回溯）已落地（见 `.trae/documents/会话上下文压缩-阶段2-RouteB.md` 与开发日志续 109），阶段四待做
+- 状态：阶段一→三已实施（持久层 / 视图骨架 / session.compacting 接线），阶段二后续走 Route B 彻底改造已落地（开发日志续 109）；**统一块模型整合已落地**：ACP 折叠经 `blocksPatch` 并入 `session.blocks`（`source: 'generic'|'acp'`）、`revert` 经全文回溯只回退最近消息（开发日志续 110、`.trae/documents/上下文压缩-统一块模型.md`）；阶段四待做
 
 ---
 

@@ -647,6 +647,55 @@ describe('@harness/core', () => {
       await h.stop()
     })
 
+    it('windowHandled（ACP 认领）：跳过 .cmp.orig 归档与 generic 块，应用 blocksPatch 的 acp 块', async () => {
+      const saved: Array<{ key: string; msgs: Message[] }> = []
+      const originalStore = {
+        save: async (sid: string, key: string, msgs: Message[]) => { saved.push({ key, msgs }); return `${sid}/${key}` },
+        load: async () => undefined,
+      }
+      const acpLike: AgentPlugin = {
+        id: 'acp-like',
+        version: '1',
+        name: 'acp-like',
+        async install(ctx) {
+          return {
+            'session.compacting': async (_input, output) => {
+              output.windowHandled = true
+              output.blocksPatch = [
+                { id: 'b_acp_1', summary: 'ACP折叠摘要', startId: 'u_0', endId: 'a_3', source: 'acp', archiveRef: 'acp:1' },
+              ]
+            },
+          }
+        },
+      }
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider(), originalStore, internalPlugins: [acpLike] })
+      const sess = await h.session.create()
+      await fill(h, sess.id, 6)
+      await h.session.compact(sess.id, 'summary', { keepRecentMessages: 4 })
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBe(4) // 仍物理截断
+      expect(saved.length).toBe(0) // ACP 已保全，不再重复归档
+      expect(s.blocks?.length).toBe(1)
+      expect(s.blocks![0].source).toBe('acp')
+      expect(s.blocks![0].id).toBe('b_acp_1')
+      expect(s.blocks![0].archiveRef).toBe('acp:1')
+      const view = await h.session.getView(sess.id)
+      expect(view.slimmed).toBe(true)
+      await h.stop()
+    })
+
+    it('未设 windowHandled 时产 source:\'generic\' 块并归档（默认行为）', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fill(h, sess.id, 5)
+      await h.session.compact(sess.id, 'summary', { keepRecentMessages: 4 })
+      const s = (await h.session.get(sess.id))!
+      expect(s.blocks?.length).toBe(1)
+      expect(s.blocks![0].source).toBe('generic')
+      expect(s.blocks![0].origKey).toBe(s.blocks![0].id)
+      await h.stop()
+    })
+
     it('compact 后 query 的请求历史 = 摘要占位 + 近期，不含被压缩原文消息', async () => {
       const provider = mockChatProvider() // 收集 calls
       const h = await createHarness({ agents: [makeAgent()], chatProvider: provider })

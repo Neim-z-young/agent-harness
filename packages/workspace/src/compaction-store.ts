@@ -252,6 +252,14 @@ export function createWorkspaceOriginalStore(ws: Workspace): SessionOriginalStor
   return {
     save: (sessionId, blockId, messages) => store.saveOriginals(sessionId, blockId, messages),
     load: (sessionId, blockId) => store.loadOriginals(sessionId, blockId),
+    loadRef: async (sessionId, ref) => {
+      // 统一块模型：ref 形如 `orig:{sessionId}:{blockId}` 时转本地原文档案；
+      // `acp:` 前缀留给宿主层（ACP 归档在 session.meta，workspace 无权访问），返回 undefined 由调用方回退。
+      const orig = /^orig:([^:]+):(.+)$/.exec(ref)
+      if (!orig) return undefined
+      // 忽略前缀中的 sid（本 store 已由调用方给定 sessionId），以块 id 读取
+      return store.loadOriginals(sessionId, orig[2])
+    },
   }
 }
 

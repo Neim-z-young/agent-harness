@@ -77,7 +77,7 @@ import {
   exportStatsMarkdown,
   type UsageStats,
 } from './usage-stats'
-import { reconstructHistory, type Message, type Session, type HistoryLoadRange, type SessionOriginalStore } from '@harness/session'
+import { reconstructHistory, buildResolveBlock, type Message, type Session, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -1418,16 +1418,21 @@ export class HarnessApp {
     if (!sess) return []
     if (!sess.blocks?.length) return range ? this.filterByRange([...sess.messages], range) : [...sess.messages]
     const originalStore: SessionOriginalStore = createWorkspaceOriginalStore(this.workspace)
-    const full = await reconstructHistory(sess, async (block) => {
-      const key = block.origKey ?? block.id
-      try {
-        return (await originalStore.load(sessionId, key)) ?? []
-      } catch {
-        return []
+    // 统一块模型：generic 块经 originalStore(.cmp.orig)，acp 块经 session.meta[acp.archive.v1] 还原
+    const acpArchive = (sess.meta?.['acp.archive.v1'] ?? {}) as Record<string, Message>
+    const resolveBlock = async (block: CompactionBlock): Promise<Message[]> => {
+      if (block.source === 'acp' && Object.keys(acpArchive).length > 0) {
+        return resolveAcpBlockOriginals(acpArchive, block)
       }
-    })
+      return buildResolveBlock(originalStore, sessionId)(block)
+    }
+    const full = await reconstructHistory(sess, resolveBlock)
     return range ? this.filterByRange(full, range) : full
   }
+
+  /** 供 /revert 注入的会话全文回溯器（统一块模型）：经 loadFullHistory 还原） */
+  private getFullHistory = (sessionId: string): Promise<Message[]> =>
+    this.loadFullHistory(sessionId)
 
   /** 按 range（startId/endId/blockIds）过滤消息列表 */
   private filterByRange(
@@ -1579,6 +1584,23 @@ export interface BackgroundTaskPanelOptions {
  *
  * @returns 卸载函数（取消全部订阅）
  */
+/**
+ * 统一块模型·ACP 原文取回：从 session.meta[acp.archive.v1]（coreId → Message）中，
+ * 还原被某 ACP 折叠块（source:'acp'）覆盖的原文。
+ * 归档记录保持消息插入序，故按 startId/endId 定位切片；id 不存在/范围非法时返回空
+ * （加载方回退到 buildResolveBlock 的通用兜底，最终退化为仅摘要，不阻断）。
+ */
+function resolveAcpBlockOriginals(
+  archive: Record<string, Message>,
+  block: CompactionBlock,
+): Message[] {
+  const ordered = Object.values(archive).filter((m): m is Message => !!m && typeof m.id === 'string')
+  const startIdx = ordered.findIndex((m) => m.id === block.startId)
+  const endIdx = ordered.findIndex((m) => m.id === block.endId)
+  if (startIdx < 0 || endIdx < startIdx) return []
+  return ordered.slice(startIdx, endIdx + 1)
+}
+
 export function attachMcpReassemble(harness: Harness): () => void {
   if (!harness.bus) return () => {}
   const offs = [

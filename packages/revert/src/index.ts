@@ -16,7 +16,7 @@
 
 import { BusEvent } from '@harness/bus'
 import type { Bus } from '@harness/bus'
-import type { Session, SessionManager } from '@harness/session'
+import type { Session, SessionManager, Message } from '@harness/session'
 import type { FileDiff, SnapshotID, SnapshotService } from '@harness/snapshot'
 import type { AgentPlugin, Hooks, CliCommandInput, CliCommandsInput } from '@harness/plugin'
 
@@ -104,13 +104,15 @@ export function attachSnapshotToMessage(
 export function collectSnapshotMap(
   session: Session,
   boundaryMessageId: string,
+  messages?: Message[],
 ): Map<string, SnapshotID> {
-  const boundaryIndex = session.messages.findIndex((m) => m.id === boundaryMessageId)
+  const list = messages ?? session.messages
+  const boundaryIndex = list.findIndex((m) => m.id === boundaryMessageId)
   if (boundaryIndex < 0) return new Map()
 
   const files = new Map<string, SnapshotID>()
-  for (let i = boundaryIndex + 1; i < session.messages.length; i++) {
-    const msg = session.messages[i]
+  for (let i = boundaryIndex + 1; i < list.length; i++) {
+    const msg = list[i]
     if (msg.role !== 'assistant') continue
     const ref = msg.meta?.snapshot as MessageSnapshotRef | undefined
     if (!ref?.start) continue
@@ -131,6 +133,13 @@ export interface SessionRevertOptions {
   snapshot: SnapshotService
   /** 事件总线（发布 staged/cleared/committed） */
   bus: Bus
+  /**
+   * 全文回溯器（统一块模型，可选）：经 reconstructHistory 还原会话"完整历史"
+   * （含被 ACP/通用 compact 折叠块的原文 + 近期），供 stage 在折叠后仍能定位
+   * boundary 并收集其后消息的快照引用（"只回退最近消息"在压缩后依然可靠）。
+   * 缺省时回退到 session.messages 直接定位（未压缩/未折叠会话）。
+   */
+  getFullHistory?: (sessionId: string) => Promise<Message[]>
 }
 
 /**
@@ -145,11 +154,13 @@ export class SessionRevert {
   private readonly session: SessionManager
   private readonly snapshot: SnapshotService
   private readonly bus: Bus
+  private readonly getFullHistory?: (sessionId: string) => Promise<Message[]>
 
   constructor(options: SessionRevertOptions) {
     this.session = options.session
     this.snapshot = options.snapshot
     this.bus = options.bus
+    this.getFullHistory = options.getFullHistory
   }
 
   /**
@@ -164,7 +175,11 @@ export class SessionRevert {
   }): Promise<RevertState> {
     const session = await this.session.get(input.sessionId)
     if (!session) throw new RevertError('stage', `Session "${input.sessionId}" not found`)
-    if (!session.messages.some((m) => m.id === input.messageID)) {
+
+    // 统一块模型：折叠后 boundary 可能已不在近期 messages，经全文回溯还原定位；
+    // 缺省（未压缩）回退到近期消息直接定位。
+    const full = this.getFullHistory ? await this.getFullHistory(input.sessionId) : session.messages
+    if (!full.some((m) => m.id === input.messageID)) {
       throw new RevertError('stage', `Message "${input.messageID}" not found`)
     }
 
@@ -178,7 +193,7 @@ export class SessionRevert {
     if (existing) {
       for (const f of existing.files ?? []) restore.set(f.path, original as SnapshotID)
     }
-    const collected = input.snapshotMap ?? collectSnapshotMap(session, input.messageID)
+    const collected = input.snapshotMap ?? collectSnapshotMap(session, input.messageID, full)
     for (const [file, tree] of collected) {
       if (!restore.has(file)) restore.set(file, tree)
     }
@@ -265,6 +280,8 @@ export function createSessionRevert(options: SessionRevertOptions): SessionRever
 export interface RevertCmdInput extends CliCommandInput {
   /** cli 注入的 snapshot 服务（HarnessApp.snapshotService）；缺省回退 opts.snapshotService */
   snapshotService?: SnapshotService
+  /** cli 注入的会话全文回溯器（统一块模型，缺省回落近期直接定位） */
+  getFullHistory?: (sessionId: string) => Promise<Message[]>
 }
 
 /** createRevertPlugin 入参 */
@@ -304,7 +321,12 @@ export function createRevertPlugin(opts: RevertShellOptions = {}): AgentPlugin {
           inp.out('harness 未注入 session/bus，无法执行 /revert。\n')
           return
         }
-        const revert = createSessionRevert({ session, snapshot, bus })
+        const revert = createSessionRevert({
+          session,
+          snapshot,
+          bus,
+          getFullHistory: inp.getFullHistory,
+        })
         // 子命令与参数从完整 raw 解析（cli 注入的 arg 只含第二个 token，见 workspace-shell 同款处理）
         const parts = input.raw.trim().split(/\s+/)
         const sub = parts[1] ?? 'help'

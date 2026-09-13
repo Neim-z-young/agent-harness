@@ -113,6 +113,20 @@ export interface CompactionContext {
    */
   windowHandled?: boolean
   /**
+   * 插件折叠成功后产出的压缩块（统一块模型）。
+   * 输出字段：ACP 等插件把孩子折叠成新块时回传，core 将其追加到 session.blocks，
+   * 与通用 compact 块一致供视图/loader/reconstructHistory/revert 消费。
+   */
+  blocksPatch?: {
+    id: string
+    topic?: string
+    summary: string
+    startId: string
+    endId: string
+    source?: 'generic' | 'acp'
+    archiveRef?: string
+  }[]
+  /**
    * 会话 meta 访问器：与 `session.preModel` 的 meta 同义，供插件在物理删除前
    * 把窗口原文/状态持久化到 session.meta，跨重启后可回溯。只读/浅合并读写。
    */

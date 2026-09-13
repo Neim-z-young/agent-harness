@@ -706,8 +706,34 @@ export async function runCompacting(deps: {
   // 已把窗口折叠进 ACP 块：让 core 复用它生成的摘要，避免双份摘要
   input.summary = summary
   input.windowHandled = true
+
+  // 统一块模型：把 ACP 折叠块回传 core，追加进 session.blocks（source:'acp'），
+  // 使 ACP 折叠与通用 compact 块一致，供视图/loader/reconstructHistory/revert 消费。
+  const startId =
+    inflat.byId.get(uncoveredCores[0]!.id)?.id ?? uncoveredCores[0]!.id
+  const endId =
+    inflat.byId.get(uncoveredCores[uncoveredCores.length - 1]!.id)?.id ??
+    uncoveredCores[uncoveredCores.length - 1]!.id
+  const acpBlockId = `acp_b_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
+  input.blocksPatch = [
+    {
+      id: acpBlockId,
+      topic: 'ACP 折叠',
+      summary,
+      startId,
+      endId,
+      source: 'acp',
+      // 原文取回引用：宿主层经 session.meta[ACP_ARCHIVE_KEY] 按 [startId,endId] 还原该段全文
+      archiveRef: `${acpRefPrefix(sessionId)}:${acpBlockId}`,
+    },
+  ]
   void sessionId
   return true
+}
+
+/** ACP 原文取回引用的前缀（`acp:{sessionId}`），宿主 loader 据此解析归档 */
+function acpRefPrefix(sessionId: string): string {
+  return `acp:${sessionId}`
 }
 
 /** 窗口规则摘要兜底：首/尾消息文本拼接，控制在合理长度 */

@@ -1,5 +1,41 @@
 # Agent Harness 开发日志
 
+## 2026-09-13（续 110）上下文压缩·统一块模型整合（ACP 折叠并入 session.blocks + revert 全文回溯）
+
+### 背景
+续 106~109 分别打通了「通用 compact 块 + 原文落盘（Route B）」、「session.compacting 接线 + ACP 协同」。但两块体系仍未统一：ACP 压缩块（`acp-kernel` 内部摘要）与 `session.blocks` 不一致，且 ACP 压缩频率较高、一次对话会多次压缩——导致 `view.slimmed` 请求瘦身漏掉 ACP 折叠量、高频多块在 `sess.blocks` 中无从定位、`/revert` 无法只回退最近消息（边界可能已缩进块里）。本次把两类折叠收敛为**统一块模型**：给块打 `source: 'generic' | 'acp'` 标记 + ACP 折叠经 `blocksPatch` 并入 `session.blocks`，定位/取回/回退统一走同一套块 & 原文回溯路径。
+
+### 改动
+
+**packages/session**
+- `CompactionBlock` 增加可选 `source: 'generic' | 'acp'`、`archiveRef?: string`（ACP 原文取回引用）。
+- `SessionOriginalStore` 增加可选 `loadRef?(sessionId, ref)`（按引用取回原文，供 ACP 归档）。
+- 新增 `buildResolveBlock(store, sessionId)`：统一取原文入口——acp 块优先经 `loadRef(archiveRef)`，失败回退 `load(origKey ?? id)`；generic 走 `load`。
+
+**packages/workspace**
+- `createWorkspaceOriginalStore` 增加 `loadRef`：`orig:{sessionId}:{blockId}` 转本地归档读，其他（`acp:`）返回 undefined（交回 CLI/宿主的 ACP 归档）。
+
+**packages/core**
+- `compact()`：`windowHandled`（ACP 已认领窗口）时跳过硬编码 generic 块生成，避免同一窗口双击/双归档；产 generic 块标 `source: 'generic'`。
+- `compact()`：消费插件回传 `compactCtx.blocksPatch[]`，按块 id 合并去重进 `sess.blocks`（`at: now`）。
+
+**packages/plugins/acp-context**
+- `runCompacting`：折叠成功后构造 `source:'acp'` 块（topic=ACP 折叠、startId/endId、archiveRef=`acp:{sessionId}:{blockId}`）回传 `input.blocksPatch`；窗口已被覆盖时置 `windowHandled=true` 不重复折叠。
+
+**packages/revert**
+- `SessionRevertOptions` 增加可选 `getFullHistory`；`stage()` 经全文回溯定位 boundary：折叠后边界已不在近期消息时也能在完整历史中定位并收集边界之后文件快照，实现「只回退最近消息」。
+
+**packages/cli**
+- `loadFullHistory` 按块 `source`/`archiveRef` 区分双源取数：acp 块经 `session.meta['acp.archive.v1']`（`resolveAcpBlockOriginals` 按 startId/endId 切片）还原，generic 块经 `originalStore` 还原。
+- 新增 `getFullHistory`（=`loadFullHistory`）供 `/revert` 插件注入，实现压缩后全文定位。
+
+### 验证
+- session `buildResolveBlock`（source/引用/回退）单测；workspace `loadRef` 单测；core 统一块模型用例（generic/ACP 双源块入 blocks、windowHandled 免重复）；acp-context `runCompacting` 产出 blocksPatch 用例；revert 折叠块内 boundary 定位用例。
+- 所涉包全绿：session 15、workspace 27、core 40、revert 36、acp-context 16、cli 190；全仓 typecheck 通过。
+- 全仓 `bun test` 的失败均为 `reference/`（opencode-dev）环境性失败（缺 `react/jsx-dev-runtime` 等依赖），与本次改动无关。
+
+---
+
 ## 2026-09-13（续 109）上下文压缩改造·阶段二后续（Route B 彻底）：内存瘦身 + 原文落盘 + 惰性回溯
 
 ### 背景
