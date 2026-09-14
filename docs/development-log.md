@@ -1,5 +1,41 @@
 # Agent Harness 开发日志
 
+## 2026-09-14（续 116）ACP 上下文压缩：接入 CLI 配置文件入口 + 提示词可配置
+
+### 背景
+ACP 插件此前需代码内 `createAcpContextPlugin` 手动装配，且压缩提示词（t1/t2/t3/哲学）与压缩系统提示硬编码不可配。本次把它正式接入 CLI——`config.json` 新增 `compression` 段作为入口，并按「提示词可配置」落实（t1/t2/t3 规则逐层可覆盖、压缩系统提示可整段覆盖）。core 侧统一块模型（`setBlocks`/`blocksPatch`/`source:'acp'`）前期已完成，本次不改 core。
+
+### 改动
+- **插件 `@harness/acp-context`**（packages/plugins/acp-context/src/index.ts）
+  - `AcpContextPluginOptions` 新增 `prompts?: Partial<Prompts>`（t1=`howToCompressRules`、t2=`tier2DistillRules`、t3=`tier3CondenseRules`、哲学=`compressPhilosophy`）和 `systemPrompt?: string`（整段覆盖，优先级最高）。
+  - 工厂启动期解析一次：`resolvedPrompts = options.prompts ? resolvePrompts(options.prompts,{acknowledgeRisk:true}) : defaultPrompts`；`makeSystemPrompt()` 优先生效 `systemPrompt`，否则 `buildCompressSystemPrompt(resolvedPrompts)`。
+  - `session.preModel` 复用该 `makeSystemPrompt`，并把 `resolvedPrompts` 透传进 `runPreModel`，nudge 渲染 `renderNudgeText(nudge, prompts)` 与系统提示保持同一套自定义提示（`RunPreModelDeps` 新增 `prompts?`）。
+  - 测例 +2（共 25）：`systemPrompt` 整段覆盖后系统提示即该串；`prompts` 覆盖 t1 后系统提示体现自定义规则且默认提示不被冲掉。
+- **CLI `@harness/cli`**（packages/cli/src/index.ts + package.json）
+  - `HarnessConfig` 新增 `compression?: { enabled, modelContextLimit, prompts, systemPrompt, config }`。
+  - `boot()` 在 `createHarness` 前：`compression.enabled` 为真才 `lazyImport('@harness/acp-context')` 惰性装配并透传配置（默认关闭、惰性加载，符合 CLI 不硬编码依赖风格）。
+  - `buildConfigOverview`（/config、config check）新增一行「上下文压缩（ACP）：启用/未启用」状态，自定义提示词时标注。
+  - cli/package.json 增加 `@harness/acp-context: workspace:*`。
+  - 测例 +1（共 198 pass）：config 概览展示 ACP 启用/未启用与 fitWindow/自定义提示词。
+
+### 配置示例
+```jsonc
+{ "compression": {
+    "enabled": true,
+    "modelContextLimit": 200000,
+    "config": { "preserveRecentTokens": 8000, "preserveRecentMessages": 10 },
+    "prompts": { "howToCompressRules": "…t1…", "tier2DistillRules": "…t2…", "tier3CondenseRules": "…t3…" }
+} }
+```
+
+### 决定
+- **默认关闭**：`enabled` 缺省 false，改变行为需显式开启。
+- **提示覆盖承担质量风险**：`prompts` 经 `resolvePrompts(...,{acknowledgeRisk:true})`，load-bearing 字段，错误类型静默丢弃。
+- **不新增 CLI 子命令**：仅 `config.json` 作为配置文件入口；`/config` 只展示不运行时改。
+
+### 验证
+- 插件 typecheck + 25 测例全过；CLI typecheck + 198 测例全过；根 `bun run typecheck` 全绿。
+
 ## 2026-09-14（续 115）ACP 压缩率压测：不同上下文长度下的输入瘦身压缩比
 
 ### 背景

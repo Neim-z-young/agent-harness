@@ -60,6 +60,7 @@
         "harness": "./src/index.ts",
       },
       "dependencies": {
+        "@harness/acp-context": "workspace:*",
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
         "@harness/coordinator": "workspace:*",

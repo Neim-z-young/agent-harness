@@ -250,6 +250,22 @@ export interface HarnessConfig {
    * 若顶层 snapshot 未填，则回退读此字段。
    */
   harness?: { snapshot?: boolean }
+  /**
+   * ACP 上下文压缩配置（`compression.enabled: true` 开启才装配 @harness/acp-context 插件）。
+   * 装配后运行 @harness/acp-context 的 runPreModel：保留历次折叠的 source:'acp' 压缩块到统一块模型。
+   */
+  compression?: {
+    /** 是否启用 ACP 上下文压缩（默认 false）。 */
+    enabled?: boolean
+    /** 模型上下文窗口（tokens）。缺省走插件默认 200_000。 */
+    modelContextLimit?: number
+    /** 覆盖 t1/t2/t3 压缩及压缩哲学的提示词（key 见 acp-kernel Prompts，load-bearing） */
+    prompts?: Partial<import('acp-kernel').Prompts>
+    /** 整段覆盖压缩系统提示（优先级最高，覆盖 prompts 合成的压缩系统提示） */
+    systemPrompt?: string
+    /** 透传 kernel 配置：preserveRecentTokens / preserveRecentMessages / tiers / nudge 等 */
+    config?: Record<string, unknown>
+  }
 }
 
 /** 单个 Provider 定义（config.json 的 providers 数组元素）——复用 @harness/plugin 抽象层契约 */
@@ -721,6 +737,12 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   const lines: string[] = []
   lines.push(`默认 provider：${cfg.provider ?? defaultProviderId}`)
   if (cfg.model) lines.push(`默认 model：${cfg.model}`)
+  const c = cfg.compression
+  lines.push(
+    c?.enabled
+      ? `上下文压缩（ACP）：启用 fitWindow=${c.modelContextLimit ?? 200000}${c.prompts ? ' · 自定义提示词' : ''}`
+      : '上下文压缩（ACP）：未启用（config.json → compression.enabled: true 开启）'
+  )
   const providers = cfg.providers ?? []
   if (!providers.length) {
     lines.push('providers：（未配置，使用内置 mock / anthropic）')
@@ -1306,6 +1328,18 @@ export class HarnessApp {
     providerPlugins.push(createRevertPlugin())
     // 薄壳插件：/snapshot 快照信息命令（依赖 cli 注入的 snapshotService，见 cmdInput）
     providerPlugins.push(createSnapshotPlugin())
+    // ACP 上下文压缩：config.json → compression.enabled 为真时才惰性装配 @harness/acp-context，
+    // 并把 config.json 的 prompts / systemPrompt / config 透传给插件（提示词可配置）。
+    const compression = cfg.compression
+    if (compression?.enabled) {
+      const acp = await lazyImport<{ createAcpContextPlugin: (o?: any) => AgentPlugin }>('@harness/acp-context')
+      providerPlugins.push(acp.createAcpContextPlugin({
+        modelContextLimit: compression.modelContextLimit,
+        systemPrompt: compression.systemPrompt,
+        prompts: compression.prompts as any,
+        config: compression.config,
+      }))
+    }
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)

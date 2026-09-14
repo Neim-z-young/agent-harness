@@ -10,7 +10,7 @@ import {
   type CompressionBlock,
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
-import type { CompactionContext } from '@harness/plugin'
+import type { CompactionContext, Hooks } from '@harness/plugin'
 import {
   runPreModel,
   runCompacting,
@@ -18,6 +18,7 @@ import {
   collectCoveredIds,
   blockSpan,
   coveredSpan,
+  createAcpContextPlugin,
   ACP_META_KEY,
   ACP_ARCHIVE_KEY,
 } from './index'
@@ -197,6 +198,50 @@ test('runPreModel：ACP 哲学 system 每轮注入一次', async () => {
   messages = history(2)
   await h.run(messages)
   expect(messages.filter((m) => m.role === 'system')).toHaveLength(1)
+})
+
+// ===== 提示词可配置（prompts / systemPrompt）=====
+
+/** 安装插件并取回 session.preModel hook 处理器，供端到端验证工厂的提示词解析 */
+async function preModelFromPlugin(options: Parameters<typeof createAcpContextPlugin>[0]) {
+  const plugin = createAcpContextPlugin(options)
+  const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
+  const handler = hooks['session.preModel']!
+  return (rawMessages: Message[]) =>
+    handler(
+      {
+        sessionId: 's',
+        meta: { read: async () => undefined, patch: async () => {} },
+        blocksPatch: [],
+      } as any,
+      rawMessages,
+    )
+}
+
+test('createAcpContextPlugin：systemPrompt 整段覆盖后，系统提示即该字符串', async () => {
+  const preModel = await preModelFromPlugin({ systemPrompt: '<custom system>', modelContextLimit: 20000 })
+  const messages = history(3)
+  await preModel(messages)
+  expect(messages[0]!.role).toBe('system')
+  expect((messages[0]!.parts[0] as any).text).toBe('<custom system>')
+})
+
+test('createAcpContextPlugin：prompts 覆盖后系统提示应用自定义 t1 规则并保留默认', async () => {
+  const preModel = await preModelFromPlugin({
+    modelContextLimit: 20000,
+    prompts: {
+      howToCompressRules: 'CUSTOM_T1_RULES',
+      tier2DistillRules: 'CUSTOM_T2_RULES',
+      tier3CondenseRules: 'CUSTOM_T3_RULES',
+    },
+  })
+  const messages = history(3)
+  await preModel(messages)
+  const sysText = (messages[0]!.parts[0] as any).text
+  // t1 规则写入压缩系统提示（resolvePrompts 合并默认，未覆盖则静默丢弃）
+  expect(sysText).toInclude('CUSTOM_T1_RULES')
+  // 未覆盖的默认字段仍保留（没有把默认提示冲掉）
+  expect(sysText).toInclude('All compression serves the primary task')
 })
 
 test('runPreModel：压缩后状态持久化、请求被精简，且可还原原始消息全文', async () => {

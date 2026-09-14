@@ -33,6 +33,8 @@ import {
   parseCompressInput,
   renderNudgeText,
   buildCompressSystemPrompt,
+  resolvePrompts,
+  defaultPrompts,
   assignRefs,
   highestUsedIndex,
   refForRaw,
@@ -41,6 +43,7 @@ import {
   type CoreMessage,
   type CompressionState,
   type CompressionBlock,
+  type Prompts,
 } from 'acp-kernel'
 
 import {
@@ -147,6 +150,14 @@ export interface AcpContextPluginOptions {
   config?: Partial<AcpConfig>
   /** 内置 ACP 工具名（默认全部注入，可用其中的子集） */
   toolIds?: Array<'compress' | 'decompress' | 'search_context' | 'acp_status'>
+  /**
+   * t1/t2/t3 压缩及压缩哲学的提示词覆盖（key 见 acp-kernel 的 Prompts：
+   * compressPhilosophy / howToCompressRules / tier2DistillRules / tier3CondenseRules）。
+   * 触发 resolvePrompts 合并默认提示（load-bearing，须 acknowledgeRisk）。
+   */
+  prompts?: Partial<Prompts>
+  /** 整段覆盖压缩系统提示（优先级最高，覆盖 prompts 合成的 buildCompressSystemPrompt 输出） */
+  systemPrompt?: string
 }
 
 /** 会话级 ACP 运行时上下文（内存态，跨轮保留；state 会持久化到 session.meta） */
@@ -191,6 +202,12 @@ interface AcpSessionCtx {
 export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): AgentPlugin {
   const modelContextLimit = options.modelContextLimit ?? 200_000
   const config = defaultConfig(modelContextLimit, options.config)
+  // 提示词覆盖：一次性解析 policy，nudge 渲染与压缩系统提示保持一致；缺省用内核默认。
+  const resolvedPrompts = options.prompts
+    ? resolvePrompts(options.prompts, { acknowledgeRisk: true })
+    : defaultPrompts
+  const makeSystemPrompt = (): string =>
+    options.systemPrompt ?? buildCompressSystemPrompt(resolvedPrompts)
   // 引擎纯态：state 由宿主显式传入/取回
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const engine = createCore() // 使用 kernel 默认 tokenizer（chars/4）
@@ -414,7 +431,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               engine,
               config,
               meta: input.meta,
-              makeSystemPrompt: () => buildCompressSystemPrompt(),
+              makeSystemPrompt,
+              prompts: resolvedPrompts,
               tempMessage,
               // 统一块模型：把每轮内部折叠（tier1/2/3）的 source:'acp' 块 push 给 host，
               // host 合并进 session.blocks，供视图/loader/reconstructHistory/revert 消费
@@ -468,6 +486,8 @@ interface RunPreModelDeps {
   /** session.meta 持久化访问器（用于保存/恢复压缩状态） */
   meta: { read: () => Promise<Record<string, unknown> | undefined>; patch: (patch: Record<string, unknown>) => Promise<void> }
   makeSystemPrompt: () => string
+  /** 解析后的提示词 policy（nudge 渲染与本轮压缩系统提示保持一致）；缺省走内核默认 */
+  prompts?: Prompts
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
   /**
    * 把本轮内部折叠的压缩块（统一块模型）回传给 host，供其合并进 session.blocks。
@@ -694,7 +714,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
   const nudge = res.nudge
   if (nudge?.shouldInject) {
-    const rendered = renderNudgeText(nudge)
+    const rendered = renderNudgeText(nudge, deps.prompts)
     request.push(deps.tempMessage('user', rendered.text, sessionId))
   }
 

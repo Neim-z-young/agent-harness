@@ -269,6 +269,19 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     // maskKey=false 时输出明文
     expect(buildConfigOverview({ providers: [{ id: 'a', type: 'openai', apiKey: 'sk-x' }] }, 'a', false)).toContain('sk-x')
   })
+
+  it('buildConfigOverview：展示 ACP 压缩启用/未启用与自定义提示词状态', () => {
+    // 未启用：提示如何开启
+    expect(buildConfigOverview({ model: 'm' }, 'mock')).toInclude('上下文压缩（ACP）：未启用')
+    // 启用：展示 fitWindow 与自定义提示词标记
+    const on = buildConfigOverview(
+      { model: 'm', compression: { enabled: true, modelContextLimit: 300000, prompts: { compressPhilosophy: 'x' } } },
+      'mock',
+    )
+    expect(on).toInclude('上下文压缩（ACP）：启用')
+    expect(on).toInclude('fitWindow=300000')
+    expect(on).toInclude('自定义提示词')
+  })
 })
 
 describe('ProviderTypeRegistry / 插件化扩展', () => {
