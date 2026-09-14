@@ -19,6 +19,7 @@
     "dev": "tsc --noEmit --watch",
     "build": "bun build src/index.ts --outdir dist --target bun",
     "test": "bun test",
+    "bench:acp-ratio": "bun run bench/ratio.ts",
     "typecheck": "tsc --noEmit"
   }
 }

@@ -1,5 +1,29 @@
 # Agent Harness 开发日志
 
+## 2026-09-14（续 115）ACP 压缩率压测：不同上下文长度下的输入瘦身压缩比
+
+### 背景
+需要量化「模型使用 ACP」在 40k/100k/200k/300k/1m token 上下文窗口下的输入瘦身压缩率，并沉淀可复用 bench。
+
+### 代码勘察结论（决定口径）
+- ACP 的**智能折叠靠模型驱动**：`engine.processTurn` 只指派 refs/裁剪/产出 nudge 建议并渲染调用链，真正的折叠由模型调 `compress` 工具 → `applyCompression`；`emergencyTruncateNode` 仅截超大工具输出。→ 纯 `runPreModel` 单轮测不出压缩，需模拟"模型主动压缩"。
+- `estimateTokens` = chars/4（与 acp-kernel 默认 tokenizer 一致），作为压缩率统一估算器。
+
+### 改动
+- 新增 `packages/plugins/acp-context/bench/ratio.ts` + `package.json` 脚本 `bench:acp-ratio`：
+  - 口径：`baseTok=系统提示+全量`，`requTok=系统提示+ACP 折叠后投影`；保留率=requTok/baseTok，压缩比 inverse。
+  - 模拟「理性模型」循环：每轮 `processTurn` 取 `nudge.compressibleRanges`,立即 `applyCompression`,直至无建议收敛（等价模型每次都顺从 ACP 建议）。
+  - 窗口口径：`modelContextLimit=L`、历史填满窗口触发压缩；`--lengths/--keep/--perMsg` 参数化；摘要用固定占位（≈50 token/块）。
+- 新增方案 `.trae/documents/上下文压缩-ACP压缩率压测.md`（口径、方法、结果、局限）。
+
+### 首压结果
+- 全压档(take0)：40k→24.2x(4.1%)、100k→34.9x(2.9%)、200k→41.3x(2.4%)、300k→44.0x(2.3%)、1m→85.9x(1.2%)；块数 13→157。
+- 保留近期 8k 档：40k→4.2x、100k→9.3x、200k→15.7x、300k→20.3x、1m→51.1x。
+- 解读：压缩比随上下文长度亚线性增长；固定保留占比随窗口稀释。真实使用（渐进压缩）稳态略低于此上限。
+
+### 局限
+- 摘要为占位（真实模型更长、受 maxSummaryLength=25000 封顶）；chars/4 在 CJK/真实 tokenizer 下压缩比会回调；一次性满载为"最高可达"而非长期逐轮稳态。
+
 ## 2026-09-13（续 114）上下文压缩·统一块模型性能压测（可复用 bench，mock 模型）
 
 ### 背景
