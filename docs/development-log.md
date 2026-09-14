@@ -11,6 +11,11 @@
 - 新增 `bench/report.ts` 离线分析脚本：glob 读遥测 JSONL（可选拼 session 文件 tokenUsage），输出和压测脚本同口径 Markdown 表。
 - index.ts 两处埋点：`runPreModel`（processTurn 返回后）+ `compressTool`（applyCompression 返回后）。类型安全，可选字段不破坏现有测试。
 - 与续 119 压测脚本口径一致：`rawTok`/`requestTok`/`occupancy`/`compressRatio`/`retention`/`acpCacheHit`/t1t2t3 块数同源，离线报告直接对比压测基线。
+- CLI 层接入（续 120.1）：
+  - `HarnessConfig.compression.telemetry?: { enabled?: boolean }` 新字段（默认 true），设为 false 关闭遥测。
+  - 装配点 `createAcpContextPlugin({ ..., telemetryEnabled, telemetryPathBuilder: (sid) => join(workspace.dataDir, 'sessions', `${sid}.telemetry.jsonl`) })`。
+  - 遥测文件落 `dataDir/sessions/{sessionId}.telemetry.jsonl`，与同目录下的 `{sessionId}.json` 配对，`bench/report.ts` 用同一 glob 即可收集。
+- 验证：全包 typecheck 通过、acp-context 24 测试全过。
 
 ## 2026-09-14（续 119）ACP 压缩压测脚本：`bench/compress-params.ts` 参数 × 上下文长度敏感性分析
 

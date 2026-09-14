@@ -290,6 +290,12 @@ export interface HarnessConfig {
     }
     /** 高级透传：不入上面的结构化字段的其它 kernel config（compress / truncate / protectedTools 等） */
     config?: Record<string, unknown>
+    /**
+     * 运行时遥测（默认开启）：每轮 preModel 把压缩指标 / ACP 缓存命中 / 配置快照
+     * 追加写入 `dataDir/sessions/{sessionId}.telemetry.jsonl`。
+     * 关闭后不写任何遥测文件（零开销）。离线用 `bench/report.ts` 分析。
+     */
+    telemetry?: { enabled?: boolean }
   }
 }
 
@@ -1378,11 +1384,18 @@ export class HarnessApp {
           ...(compression.nudge.emergencyThresholdPct != null ? { emergencyThresholdPct: compression.nudge.emergencyThresholdPct } : {}),
         }
       }
+      // 遥测默认开启：每轮 preModel 追加 dataDir/sessions/{sessionId}.telemetry.jsonl
+      const telemetryEnabled = compression.telemetry?.enabled !== false
+      const sessionsDir = join(this.workspace.dataDir, 'sessions')
       providerPlugins.push(acp.createAcpContextPlugin({
         modelContextLimit: compression.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000,
         systemPrompt: compression.systemPrompt,
         prompts: compression.prompts as any,
         config: acpConfig as any,
+        telemetryEnabled,
+        telemetryPathBuilder: telemetryEnabled
+          ? (sessionId: string) => join(sessionsDir, `${sessionId}.telemetry.jsonl`)
+          : undefined,
       }))
     }
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
