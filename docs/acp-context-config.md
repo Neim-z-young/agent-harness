@@ -3,6 +3,8 @@
 > 本文档列出的默认值以 acp-kernel `defaultConfig(modelContextLimit)` 的**实际默认**为准
 > （`node_modules/acp-kernel/dist/index.js` → `defaultConfig`）。带「🔧 = 可在 config.json 结构化配置」、
 > 「⬇ = 高级透传（`compression.config`）」标注的是本项目暴露的配置入口。
+>
+> **如何评估/调参？** 见 [ACP 压测与离线分析脚本使用参考](./acp-context-benchmark.md)（仿真压测 + 运行时遥测 + 参数组合分析）。
 
 ## 0. 启用与入口
 

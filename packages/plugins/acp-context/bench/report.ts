@@ -21,11 +21,12 @@ function glob(pattern: string): string[] {
   const tildeExpanded = pattern.replace(/^~/, process.env.HOME ?? '')
   const star = tildeExpanded.indexOf('*')
   if (star === -1) return existsSync(tildeExpanded) ? [tildeExpanded] : []
-  const dir = tildeExpanded.slice(0, star)
-  const base = tildeExpanded.slice(star + 1)
+  const dir = tildeExpanded.slice(0, tildeExpanded.lastIndexOf('/', star))
+  const prefix = tildeExpanded.slice(dir.length + 1, star)
+  const rest = tildeExpanded.slice(star + 1)
   if (!dir || !existsSync(dir)) return []
   const files = readdirSync(dir)
-  const re = new RegExp('^' + base.replace(/\./g, '\\.').replace(/\*/g, '.*') + '$')
+  const re = new RegExp('^' + prefix.replace(/\./g, '\\.') + '.*' + rest.replace(/\./g, '\\.') + '$')
   return files.filter((f) => re.test(f)).map((f) => join(dir, f))
 }
 
@@ -60,7 +61,7 @@ function run(): void {
     process.exit(1)
   }
 
-  const paths = globSync(glob.replace(/^~/, process.env.HOME ?? ''))
+  const paths = glob(glob.replace(/^~/, process.env.HOME ?? ''))
   console.log(`\n## ACP 遥测分析：${paths.length} 个会话\n`)
 
   // 读遥测
@@ -75,7 +76,7 @@ function run(): void {
   // 可选读 session 文件的 tokenUsage（provider 侧 cacheRead/cacheWrite）
   const provCache = new Map<string, Map<number, { cacheRead: number; cacheWrite: number }>>()
   if (sessGlob) {
-    const spaths = globSync(sessGlob.replace(/^~/, process.env.HOME ?? ''))
+    const spaths = glob(sessGlob.replace(/^~/, process.env.HOME ?? ''))
     for (const p of spaths) {
       try {
         const data = JSON.parse(readFileSync(p, 'utf8'))

@@ -1,5 +1,16 @@
 # Agent Harness 开发日志
 
+## 2026-09-14（续 121）ACP 参数组合离线分析脚本 + 压测/分析使用文档
+
+- 新增 `bench/analysis-params.ts`：按「参数组合签名 = params 快照 + window」归并遥测 JSONL 全量事件，
+  跨会话聚合同组合指标，输出每窗口「组合 → 会话数/轮数/占用率/ACP缓存命中/Provider命中/压缩比/保留率/t1t2t3」表
+  + 跨窗口 ACP 缓存命中率排行（前 15），直接对比不同参数组合的命中率与占用率（可选 `--sessions` 拼 Provider 侧 cacheRead）。
+- 修复 `report.ts` / `analysis-params.ts` 公共 `glob` 通配 bug：目录提取应取「星号前一 / 」，文件名按
+  `前缀 + .* + 后缀` 重建正则（原来丢弃了 `*` 前的文件名前缀，`t00_*.jsonl` 类 pattern 匹配不到）。
+- 新增 `docs/acp-context-benchmark.md`：汇总 `compress-params.ts`（仿真压测）/ `report.ts`（会话分析）/
+  `analysis-params.ts`（参数组合分析)三脚本作用、命令参数、输出与推荐工作流；`docs/acp-context-config.md` 顶部加引用链接。
+- 验证：`bench/analysis-params.ts` 用合成遥测数据跑通（5 组合正确归并、命中率降序排行正确），acp-context typecheck 通过、全仓库 typecheck 通过。
+
 ## 2026-09-14（续 120）ACP 运行时遥测：独立 JSONL 文件 + 离线分析
 
 - 新增 `packages/plugins/acp-context/src/telemetry.ts`：独立 JSONL 遥测模块，三类事件：
