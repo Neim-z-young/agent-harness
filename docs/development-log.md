@@ -1,5 +1,31 @@
 # Agent Harness 开发日志
 
+## 2026-09-14（续 120）ACP 运行时遥测：独立 JSONL 文件 + 离线分析
+
+- 新增 `packages/plugins/acp-context/src/telemetry.ts`：独立 JSONL 遥测模块，三类事件：
+  - **preModel**（每轮必记）：ACP 侧压缩指标（压缩比 / 占用率 / 保留率）+ ACP 侧缓存命中（同前缀占比）+ 配置参数快照 + t1/t2/t3 块分布 + nudge 触发建议数
+  - **compress**（模型主动调用时）：压缩范围 / 创建块数 / 折叠 token 数 / 块分布变化
+  - **providerCache**（模型返回后追加）：provider 侧 cacheRead/cacheWrite（preModel 阶段拿不到，离线从 session 文件 assistant.message.meta.tokenUsage 解析）
+- 独立 JSONL 文件，路径由宿主（cli）通过 `telemetryPathBuilder(sessionId)` 注入；debounce 500ms flush，失败吞掉。
+- 新增 `AcpContextPluginOptions.telemetryEnabled`（默认 true）+ `telemetryPathBuilder`；未注入时 writer 为 no-op，零额外开销。
+- 新增 `bench/report.ts` 离线分析脚本：glob 读遥测 JSONL（可选拼 session 文件 tokenUsage），输出和压测脚本同口径 Markdown 表。
+- index.ts 两处埋点：`runPreModel`（processTurn 返回后）+ `compressTool`（applyCompression 返回后）。类型安全，可选字段不破坏现有测试。
+- 与续 119 压测脚本口径一致：`rawTok`/`requestTok`/`occupancy`/`compressRatio`/`retention`/`acpCacheHit`/t1t2t3 块数同源，离线报告直接对比压测基线。
+
+## 2026-09-14（续 119）ACP 压缩压测脚本：`bench/compress-params.ts` 参数 × 上下文长度敏感性分析
+
+- 新增 `packages/plugins/acp-context/bench/compress-params.ts`：由用户 config.json `compression.*` 各可调参数驱动，
+  对不同上下文窗口（40k/100k/200k/300k/1m token）做「渐进填充 + 理性模型逐轮顺从 ACP 折叠」压测，
+  统计压缩比 / 保留率 / 上下文占用率 / 缓存命中率（相邻两轮投影请求的同前序 token）/ t1/t2/t3 活跃块分布。
+- 口径收敛：各窗口以「每步增量 = 窗口固定比例」填充到相近饱和占用率（`--rate=0.9 --steps=30`），
+  使不同长度的结果横向可比；同步修复原 `--perTurn` 固定增量导致小窗口步数不缩放、40k/100k 结果失真的问题。
+- 支持参数敏感性扫描：`--sweepPreserve`/`--sweepTier2`/`--sweepMaxSummary`/`--sweepMinCompress`。
+- 关键结论（基线 `preserveRecentTokens=50000, tier2Trigger=5, tier3Trigger=18, maxContextLimitPct=0.65`）：
+  - **缓存命中率随窗口增大而下降**（40k→~88%，1m→~22%）：窗口越大每步增量 token 越多，命中占比被新内容稀释。
+  - **`preserveRecentTokens` 相对窗口的比例是关键敏感项**：当其≥窗口（如 50k≥40k）时压缩完全失效、
+    占用率高达 91%；降到 8k 以下后 40k 窗口恢复折叠（占用 64%）。对 ≥100k 窗口影响消失。
+  - **`tier2Trigger` 仅在小窗口敏感**：越大越迟蒸馏、保留更多 t1 原稿（10→8~9 个 t1 块），大窗口（≥100k）影响甚微。
+
 ## 2026-09-14（续 118）ACP 配置文档化：新增 `docs/acp-context-config.md` 配置参考
 
 - 新增 `docs/acp-context-config.md`：ACP 上下文压缩全部配置项的**默认值与逐参数使用说明**。

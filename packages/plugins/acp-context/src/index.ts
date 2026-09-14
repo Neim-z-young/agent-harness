@@ -52,6 +52,12 @@ import {
   safeString,
 } from './adapter.js'
 import { loadPromptFiles } from './prompts.js'
+import {
+  createWriter as createTelemetryWriter,
+  buildPreModelEvent,
+  buildCompressEvent,
+  type TelemetryWriter,
+} from './telemetry.js'
 
 /** session.meta 中存储 ACP 压缩状态的键 */
 export const ACP_META_KEY = 'acp.v1'
@@ -157,6 +163,11 @@ export interface AcpContextPluginOptions {
   prompts?: Partial<Prompts>
   /** 整段覆盖压缩系统提示（优先级最高，覆盖 prompts 合成的 buildCompressSystemPrompt 输出） */
   systemPrompt?: string
+  // ---- 遥测 ----
+  /** 开启运行时遥测（默认 true）；关闭后不写任何 JSONL 遥测文件 */
+  telemetryEnabled?: boolean
+  /** 遥测文件路径 builder；未提供则不写遥测（no-op）。通常由 CLI 传入 dataDir/sessions/{sessionId}.telemetry.jsonl */
+  telemetryPathBuilder?: (sessionId: string) => string | undefined
 }
 
 /** 会话级 ACP 运行时上下文（内存态，跨轮保留；state 会持久化到 session.meta） */
@@ -188,6 +199,13 @@ interface AcpSessionCtx {
   lastTokens: number
   /** 会话 meta 写访问器（由 runPreModel 注入，供 compress 工具即时持久化状态） */
   meta?: { patch: (patch: Record<string, unknown>) => Promise<void> }
+  // ---- 遥测 ----
+  /** 每轮 preModel 递增的 round 序号，供事件打点用 */
+  round?: number
+  /** 遥测文件 writer（debounced flush；path 未注入时为 no-op） */
+  telemetry?: TelemetryWriter
+  /** 上轮 processTurn 返回的 cores（用于计算 ACP 侧缓存命中 = 同前缀占比） */
+  prevRequestCores?: CoreMessage[]
 }
 
 // ========================================================================
@@ -217,10 +235,13 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
 
   // 会话级上下文（进程内）
   const sessions = new Map<string, AcpSessionCtx>()
+  const telemetryEnabled = options.telemetryEnabled !== false
+  const telemetryPathBuilder = options.telemetryPathBuilder
 
   function getOrCreateCtx(sessionId: string): AcpSessionCtx {
     let ctx = sessions.get(sessionId)
     if (!ctx) {
+      const path = telemetryEnabled && telemetryPathBuilder ? telemetryPathBuilder(sessionId) : undefined
       ctx = {
         state: createInitialState(),
         archive: new Map(),
@@ -233,6 +254,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         prefixRender: [],
         needFull: true,
         lastTokens: 0,
+        round: 0,
+        telemetry: createTelemetryWriter(path),
       }
       sessions.set(sessionId, ctx)
     }
@@ -277,6 +300,23 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           sctx.state = applied.state
           // 压缩改变了块结构/历史 → 强制下一轮全量重建，失效增量缓存
           sctx.needFull = true
+
+          // ---- 遥测：compress 事件（模型主动调用时） ----
+          const telem = sctx.telemetry ?? createTelemetryWriter(undefined)
+          try {
+            const ev = buildCompressEvent({
+              sessionId: ctx.sessionId,
+              round: sctx.round ?? 0,
+              window: (config as any).modelContextLimit ?? 0,
+              state: applied.state,
+              result: applied.result,
+              ranges: ranges.map((r) => ({ topic: r.topic, chars: 0 })),
+            })
+            telem.write(ev)
+          } catch {
+            // 遥测失败不影响主流程
+          }
+
           return {
             ok: true,
             output: {
@@ -488,6 +528,8 @@ interface RunPreModelDeps {
   /** 解析后的提示词 policy（nudge 渲染与本轮压缩系统提示保持一致）；缺省走内核默认 */
   prompts?: Prompts
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
+  /** 遥测 JSONL 文件路径（可选，未注入则遥测 writer 为 no-op） */
+  telemetryPath?: string
   /**
    * 把本轮内部折叠的压缩块（统一块模型）回传给 host，供其合并进 session.blocks。
    * 缺省则仅落在 ACP 自身状态，不进统一块模型（测试/无 host blocksPatch 时）。
@@ -515,6 +557,9 @@ interface RunPreModelDeps {
 export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const { sessionId, messages, engine, config, meta } = deps
   const ctx = deps.getCtx()
+
+  // 遥测 writer 懒初始化：宿主注入 telemetryPath 时替换掉 no-op writer
+  if (deps.telemetryPath) ctx.telemetry = createTelemetryWriter(deps.telemetryPath)
 
   // 从 session.meta 水合压缩状态（仅首次）；水合后置 needFull，强制全量重建一次
   if (!ctx.hydrated) {
@@ -570,6 +615,26 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 就地更新会话上下文（ctx 是 Map 里的对象引用）
   ctx.state = res.state
   ctx.lastCores = res.messages
+
+  // ---- 遥测：preModel 事件（每轮必记） ----
+  ctx.round = (ctx.round ?? 0) + 1
+  const telem = ctx.telemetry ?? createTelemetryWriter(undefined)
+  try {
+    const ev = buildPreModelEvent({
+      sessionId,
+      round: ctx.round,
+      config: config as any,
+      state: res.state,
+      prevRequestCores: ctx.prevRequestCores,
+      inflatCores: inflat.cores,
+      requestCores: res.messages,
+      nudge: res.nudge,
+    })
+    telem.write(ev)
+    ctx.prevRequestCores = res.messages
+  } catch {
+    // 遥测失败不影响主流程
+  }
 
   // 持久化压缩状态（仅变化时写一次，避免每轮无谓 IO）
   const nextSnapshot = JSON.stringify(res.state)
