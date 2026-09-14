@@ -1,5 +1,15 @@
 # Agent Harness 开发日志
 
+## 2026-09-14（续 118）ACP 配置文档化：新增 `docs/acp-context-config.md` 配置参考
+
+- 新增 `docs/acp-context-config.md`：ACP 上下文压缩全部配置项的**默认值与逐参数使用说明**。
+- 默认值以 acp-kernel `defaultConfig` 实际默认核校：`preserveRecentMessages=5`、`preserveRecentTokens=5000`、
+  `promotionThreshold=5`、`tier2Trigger=5`、`tier3Trigger=10`、`nudge.max/min/emergency=0.75/0.45/0.95`、
+  `compress.minCompressRange/maxSummaryLength/minSummaryLength=5000/20000/50`、`truncate.threshold=0.95`、
+  窗口推导 `modelContextLimit→providers[].contextWindowTokens→200000`。
+- 纠正 `packages/cli/src/index.ts` `compression.promotionThreshold` 注释（内核默认是 5，非"极大=不提升"）。
+- AGENTS.md 文档索引登记 `docs/acp-context-config.md`。
+
 ## 2026-09-14（续 117）ACP 压缩：提示词落 txt、上下文窗口进模型配置、t1/t2/t3 阈值结构化配置
 
 ### 背景

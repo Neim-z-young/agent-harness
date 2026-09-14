@@ -270,7 +270,7 @@ export interface HarnessConfig {
     preserveRecentMessages?: number
     /** 层保留：最近 N tokens 的原始上下文始终保留不压缩 */
     preserveRecentTokens?: number
-    /** 块提升阈值：活跃块计数 ≥ 该值才升层（promotionThreshold，默认极大=不提升） */
+    /** 块"存活次数"达该值才升层（promotionThreshold，kernel 默认 5；设极大如 1e9 可选为不升层） */
     promotionThreshold?: number
     /** t1/t2/t3 各层压缩触发阈值 */
     tiers?: {
