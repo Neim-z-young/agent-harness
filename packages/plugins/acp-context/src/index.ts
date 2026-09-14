@@ -33,8 +33,6 @@ import {
   parseCompressInput,
   renderNudgeText,
   buildCompressSystemPrompt,
-  resolvePrompts,
-  defaultPrompts,
   assignRefs,
   highestUsedIndex,
   refForRaw,
@@ -53,6 +51,7 @@ import {
   baseId,
   safeString,
 } from './adapter.js'
+import { loadPromptFiles } from './prompts.js'
 
 /** session.meta 中存储 ACP 压缩状态的键 */
 export const ACP_META_KEY = 'acp.v1'
@@ -202,10 +201,10 @@ interface AcpSessionCtx {
 export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): AgentPlugin {
   const modelContextLimit = options.modelContextLimit ?? 200_000
   const config = defaultConfig(modelContextLimit, options.config)
-  // 提示词覆盖：一次性解析 policy，nudge 渲染与压缩系统提示保持一致；缺省用内核默认。
-  const resolvedPrompts = options.prompts
-    ? resolvePrompts(options.prompts, { acknowledgeRisk: true })
-    : defaultPrompts
+  // 提示词：默认来自插件目录 prompts/*.txt（可本地编辑），config 传入的 prompts 覆盖在其上，
+  // systemPrompt 整段覆盖为最高优先级。nudge 渲染与本轮压缩系统提示保持一致。
+  const filePrompts = loadPromptFiles()
+  const resolvedPrompts: Prompts = { ...filePrompts, ...(options.prompts ?? {}) }
   const makeSystemPrompt = (): string =>
     options.systemPrompt ?? buildCompressSystemPrompt(resolvedPrompts)
   // 引擎纯态：state 由宿主显式传入/取回

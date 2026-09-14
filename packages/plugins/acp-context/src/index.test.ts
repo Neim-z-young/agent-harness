@@ -23,8 +23,17 @@ import {
   ACP_ARCHIVE_KEY,
 } from './index'
 import { toCores, compactHistory, idBase, baseId } from './adapter'
+import { loadPromptFiles } from './prompts'
 
 // ===== helpers =====
+
+test('loadPromptFiles：从插件目录 prompts/*.txt 加载默认提示词', () => {
+  const prompts = loadPromptFiles()
+  expect(prompts.howToCompressRules).toInclude('HOW TO COMPRESS')
+  expect(prompts.tier2DistillRules).toInclude('TIER 2 COMPRESSION')
+  expect(prompts.tier3CondenseRules).toInclude('TIER 3 COMPRESSION')
+  expect(prompts.compressPhilosophy).toInclude('All compression serves the primary task')
+})
 
 function msg(role: Message['role'], text: string, i: number): Message {
   return { id: `m${i}`, role, parts: [{ type: 'text', text }], createdAt: i }

@@ -257,13 +257,38 @@ export interface HarnessConfig {
   compression?: {
     /** 是否启用 ACP 上下文压缩（默认 false）。 */
     enabled?: boolean
-    /** 模型上下文窗口（tokens）。缺省走插件默认 200_000。 */
+    /**
+     * 模型上下文窗口（输入 tokens）显式覆盖。缺省时按「当前默认 Provider 的
+     * providers[].contextWindowTokens → 插件默认 200_000」推导。
+     */
     modelContextLimit?: number
     /** 覆盖 t1/t2/t3 压缩及压缩哲学的提示词（key 见 acp-kernel Prompts，load-bearing） */
     prompts?: Partial<import('acp-kernel').Prompts>
     /** 整段覆盖压缩系统提示（优先级最高，覆盖 prompts 合成的压缩系统提示） */
     systemPrompt?: string
-    /** 透传 kernel 配置：preserveRecentTokens / preserveRecentMessages / tiers / nudge 等 */
+    /** 层保留：保留最近 N 条原始消息（其余按窗口折叠） */
+    preserveRecentMessages?: number
+    /** 层保留：最近 N tokens 的原始上下文始终保留不压缩 */
+    preserveRecentTokens?: number
+    /** 块提升阈值：活跃块计数 ≥ 该值才升层（promotionThreshold，默认极大=不提升） */
+    promotionThreshold?: number
+    /** t1/t2/t3 各层压缩触发阈值 */
+    tiers?: {
+      /** 活跃 t1 块数达到该值才把部分 t1 蒸馏为 t2（默认 5） */
+      tier2Trigger?: number
+      /** 活跃 t2 块数达到该值才把部分 t2 压缩为 t3（默认 10） */
+      tier3Trigger?: number
+    }
+    /** 上下文压力档位（nudge 触发阈值） */
+    nudge?: {
+      /** 触发"效率型"压缩提醒的上下文占用下限（默认 0.2 = 20%） */
+      maxContextLimitPct?: number
+      /** nudge 提示的上下文占用下限（默认 0.02） */
+      minContextLimitPct?: number
+      /** 紧急提醒占用：≥ 该比例无条件提醒（默认 0.98） */
+      emergencyThresholdPct?: number
+    }
+    /** 高级透传：不入上面的结构化字段的其它 kernel config（compress / truncate / protectedTools 等） */
     config?: Record<string, unknown>
   }
 }
@@ -1328,16 +1353,36 @@ export class HarnessApp {
     providerPlugins.push(createRevertPlugin())
     // 薄壳插件：/snapshot 快照信息命令（依赖 cli 注入的 snapshotService，见 cmdInput）
     providerPlugins.push(createSnapshotPlugin())
-    // ACP 上下文压缩：config.json → compression.enabled 为真时才惰性装配 @harness/acp-context，
-    // 并把 config.json 的 prompts / systemPrompt / config 透传给插件（提示词可配置）。
+    // ACP 上下文压缩：config.json → compression.enabled 为真时才惰性装配 @harness/acp-context。
+    // 上下文窗口推导优先级：compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 插件默认 200_000；
+    // t1/t2/t3 阈值与层保留从结构化字段翻译进 kernel config。
     const compression = cfg.compression
     if (compression?.enabled) {
       const acp = await lazyImport<{ createAcpContextPlugin: (o?: any) => AgentPlugin }>('@harness/acp-context')
+      const acpConfig: Record<string, unknown> = {
+        ...(compression.config ?? {}),
+        ...(compression.preserveRecentMessages != null ? { preserveRecentMessages: compression.preserveRecentMessages } : {}),
+        ...(compression.preserveRecentTokens != null ? { preserveRecentTokens: compression.preserveRecentTokens } : {}),
+        ...(compression.promotionThreshold != null ? { promotionThreshold: compression.promotionThreshold } : {}),
+      }
+      if (compression.tiers) {
+        acpConfig.tiers = {
+          ...(compression.tiers.tier2Trigger != null ? { tier2Trigger: compression.tiers.tier2Trigger } : {}),
+          ...(compression.tiers.tier3Trigger != null ? { tier3Trigger: compression.tiers.tier3Trigger } : {}),
+        }
+      }
+      if (compression.nudge) {
+        acpConfig.nudge = {
+          ...(compression.nudge.maxContextLimitPct != null ? { maxContextLimitPct: compression.nudge.maxContextLimitPct } : {}),
+          ...(compression.nudge.minContextLimitPct != null ? { minContextLimitPct: compression.nudge.minContextLimitPct } : {}),
+          ...(compression.nudge.emergencyThresholdPct != null ? { emergencyThresholdPct: compression.nudge.emergencyThresholdPct } : {}),
+        }
+      }
       providerPlugins.push(acp.createAcpContextPlugin({
-        modelContextLimit: compression.modelContextLimit,
+        modelContextLimit: compression.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000,
         systemPrompt: compression.systemPrompt,
         prompts: compression.prompts as any,
-        config: compression.config,
+        config: acpConfig as any,
       }))
     }
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，

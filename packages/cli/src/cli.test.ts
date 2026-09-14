@@ -752,6 +752,40 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('compression.enabled：装配 @harness/acp-context 并透传结构化阈值/提示词（含 Provider contextWindowTokens）', async () => {
+    const stdout = { write: () => {} }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'config.json'),
+      JSON.stringify({
+        provider: 'my-gw',
+        providers: [{ id: 'my-gw', type: 'openai', baseUrl: 'http://gw', apiKey: 'gw-key', contextWindowTokens: 128000 }],
+        compression: {
+          enabled: true,
+          preserveRecentTokens: 4000,
+          preserveRecentMessages: 6,
+          tiers: { tier2Trigger: 3, tier3Trigger: 8 },
+          nudge: { maxContextLimitPct: 0.25 },
+          prompts: { howToCompressRules: 'CUSTOM_T1' },
+        },
+      }, null, 2),
+    )
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'my-gw',
+      permissionMode: 'allow-all', stdout,
+    })
+    const { harness } = await app.boot()
+    // ACP 插件已随 boot 装配（id: context.acp；Provider contextWindowTokens 供其推导窗口不报错）
+    expect(app.pluginRegistry.get('context.acp')).toBeDefined()
+    expect(harness).toBeDefined()
+    // config.json 结构化字段被持久保留
+    const saved = JSON.parse(readFileSync(join(dataDir, 'config.json'), 'utf-8'))
+    expect(saved.compression.tiers.tier2Trigger).toBe(3)
+    expect(saved.compression.nudge.maxContextLimitPct).toBe(0.25)
+    await app.shutdown()
+  })
+
   it('startRepl 脚本模式：发送 prompt + /sessions + /new + /save + /exit 正常', async () => {
     const chunks: string[] = []
     const stdout = { write: (s: string) => { chunks.push(s) } }

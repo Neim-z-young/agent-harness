@@ -956,6 +956,11 @@ export interface ProviderConfig {
   maxTokens?: number
   /** 请求超时（ms） */
   timeoutMs?: number
+  /**
+   * 模型上下文窗口（输入 tokens）。供上下文压缩（@harness/acp-context）等工具据此判断
+   * 触发阈值；缺省时各消费者回退自己的默认（默认 200_000）。
+   */
+  contextWindowTokens?: number
   /** 额外透传字段（供特定 Provider 自定义配置，如 mock 的 defaultResponse） */
   [key: string]: unknown
 }

@@ -1,5 +1,44 @@
 # Agent Harness 开发日志
 
+## 2026-09-14（续 117）ACP 压缩：提示词落 txt、上下文窗口进模型配置、t1/t2/t3 阈值结构化配置
+
+### 背景
+承接续 116（ACP 插件接入 CLI + 提示词可配置）。本期落实三点：默认压缩提示词改为插件目录 txt 文件（可本地编辑）；模型上下文窗口从「模型/provider 配置」推导而非写在 compression 里；t1/t2/t3 各层压缩阈值与层保留（preserveRecent*）结构化进入 config.json。
+
+### 改动
+- **提示词 txt 化**（packages/plugins/acp-context）
+  - 新增 `prompts/compressPhilosophy.txt`、`howToCompressRules.txt`(t1)、`tier2DistillRules.txt`(t2)、`tier3CondenseRules.txt`(t3)——内容为 acp-kernel `defaultPrompts` 原始复制。
+  - 新增 `src/prompts.ts`：`loadPromptFiles()` 用 `fs.readFileSync` 读取上述 txt（`import.meta.url` 定位），任一文件缺失该项回退内核默认，全失败才整体回退内核 `defaultPrompts`。
+  - 工厂 `createAcpContextPlugin`：`resolvedPrompts = { ...loadPromptFiles(), ...options.prompts }`，`systemPrompt` 仍为最高优先级。移除 `resolvePrompts` 依赖（config 覆盖本就是显式 opt-in，无需 acknowledgeRisk）。
+- **上下文窗口进模型配置**（packages/plugin + packages/cli）
+  - `ProviderConfig` 新增 `contextWindowTokens?: number`（模型输入窗口，供压缩等消费者判断阈值）。
+  - CLI boot 装配 ACP 时窗口推导优先级：`compression.modelContextLimit → 默认 Provider 的 providers[].contextWindowTokens → 插件默认 200_000`。
+- **t1/t2/t3 阈值与层保留结构化配置**（packages/cli）
+  - `HarnessConfig.compression` 拆出结构化字段：`preserveRecentTokens` / `preserveRecentMessages` / `promotionThreshold` / `tiers.{tier2Trigger,tier3Trigger}` / `nudge.{maxContextLimitPct,minContextLimitPct,emergencyThresholdPct}`，并保留 `config` 高级透传。
+  - CLI boot 把这些结构化字段翻译为 kernel `Config` 的 `Partial`（仅填非空的 key）后再传给插件 `config`。
+- **测试**：插件新增 `loadPromptFiles` 用例（验证 txt 装载）；CLI 新增 boot 集成用例（compression.enabled 装配 `context.acp`、结构化阈值持久保留）。插件 24 测例、CLI 199 测例、根 typecheck 全绿。
+
+### 配置示例
+```jsonc
+{ "provider": "my-gw",
+  "providers": [{ "id": "my-gw", "type": "openai", "baseUrl": "…", "contextWindowTokens": 200000 }],
+  "compression": {
+    "enabled": true,
+    "preserveRecentTokens": 8000,
+    "preserveRecentMessages": 10,
+    "tiers": { "tier2Trigger": 5, "tier3Trigger": 10 },
+    "nudge": { "maxContextLimitPct": 0.2, "minContextLimitPct": 0.02, "emergencyThresholdPct": 0.98 },
+    "prompts": { "howToCompressRules": "…t1…" }   // 缺省则读 prompts/*.txt
+} }
+```
+
+### 决定
+- 提示词基线可本地编辑（txt），config `prompts`/`systemPrompt` 覆盖优先于文件。
+- `compression.modelContextLimit` 保留为显式覆盖；缺省走 Provider 的 `contextWindowTokens`，再回退 200000。
+
+### 验证
+- `packages/plugins/acp-context`：typecheck + 24 测例过；`packages/cli`：typecheck + 199 测例过；根 `bun run typecheck` 全绿。
+
 ## 2026-09-14（续 116）ACP 上下文压缩：接入 CLI 配置文件入口 + 提示词可配置
 
 ### 背景
