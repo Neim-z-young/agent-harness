@@ -697,9 +697,9 @@ async function settleEffects(setup: TestRendererSetup): Promise<void> {
   }
 }
 
-/** Meta+Enter 提交（多行输入下 Enter 为换行，提交需按 Meta/⌘+Enter） */
-function pressMetaEnter(setup: TestRendererSetup): void {
-  setup.mockInput.pressEnter({ meta: true })
+/** 提交输入：Enter（当前约定 Enter 提交；换行用 Shift+Enter 或 `\`+Enter） */
+function pressSubmit(setup: TestRendererSetup): void {
+  setup.mockInput.pressEnter()
 }
 
 async function waitFrame(setup: TestRendererSetup, predicate: (frame: string) => boolean, maxPasses = 600): Promise<string> {
@@ -744,14 +744,14 @@ function inputLine(setup: TestRendererSetup): string {
 }
 
 /**
- * 发送一条消息（含输入历史回看所需的真实事件间隙）。多行输入下 Enter 为换行、提交改用
- * Meta+Enter（pressMetaEnter）。本辅助在 typeText 后先 pump 若干拍让键入值提交（防同一同步帧
- * 内 setState 批处理跳帧），再按提交键，最后等待用户回显 + 输入框清空。
+ * 发送一条消息（含输入历史回看所需的真实事件间隙）。提交键为 Enter（pressSubmit）。
+ * 本辅助在 typeText 后先 pump 若干拍让键入值提交（防同一同步帧内 setState 批处理跳帧），
+ * 再按提交键，最后等待用户回显 + 输入框清空。
  */
 async function sendMessageWithGap(setup: TestRendererSetup, text: string): Promise<void> {
   setup.mockInput.typeText(text)
   for (let i = 0; i < 12; i++) { await pumpOnce(setup); await new Promise((r) => setTimeout(r, 5)) }
-  pressMetaEnter(setup)
+  pressSubmit(setup)
   await waitFrame(setup, (fr) => fr.includes('❯ ' + text) && fr.trimEnd().endsWith('❯'))
   for (let i = 0; i < 6; i++) await pumpOnce(setup)
 }
@@ -774,7 +774,7 @@ describe('TuiApp 集成（mock provider）', () => {
     expect(frame).toContain('输入问题开始对话')
     // 首条消息后欢迎页被对话块替换
     await f.setup.mockInput.typeText('hello')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
     await waitFrame(f.setup, (fr) => !fr.includes('welcome to agent-harness'))
     await f.cleanup()
@@ -786,7 +786,7 @@ describe('TuiApp 集成（mock provider）', () => {
     await waitFrame(f.setup, (fr) => fr.includes('welcome to agent-harness'))
     // 执行命令：应回显命令并让欢迎页消失（命令算作新会话活动）
     await f.setup.mockInput.typeText('/stats')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('/stats'))
     await waitFrame(f.setup, (fr) => !fr.includes('welcome to agent-harness'))
     // 命令输出（stats 文本）也进入聊天区
@@ -807,19 +807,26 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
-  it('Shift+Enter 提交（需终端支持 Kitty keyboard protocol 才能区分 Shift）', async () => {
-    // 传统终端下 Shift+Enter 与 Enter 同为 CR(0x0D)，无修饰信息；开启 kitty 协议才能区分
+  it('Shift+Enter 换行（需终端上报 Shift，如 Kitty 协议）：不被当作提交', async () => {
+    // 传统终端下 Shift+Enter 与 Enter 同为 CR(0x0D)，无修饰信息；开启 kitty 协议才能区分。
+    // 能区分时 Shift+Enter = 换行，提交仍是 Enter。
     const f = await mountTui({ kittyKeyboard: true })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
-    await f.setup.mockInput.typeText('shift-submit')
+    await f.setup.mockInput.typeText('第一行')
     f.setup.mockInput.pressEnter({ shift: true })
-    // 回显为 user 块，并触发 assistant 流式回复
-    await waitFrame(f.setup, (fr) => fr.includes('shift-submit'))
+    // 等待若干拍：若被误当作提交，会出现 assistant 回复
+    await new Promise((r) => setTimeout(r, 40))
+    for (let i = 0; i < 8; i++) await pumpOnce(f.setup)
+    expect(f.setup.captureCharFrame()).not.toContain('你好，我是 TUI 助手。')
+    // 继续键入第二行后 Enter 提交整段
+    await f.setup.mockInput.typeText('第二行')
+    pressSubmit(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('第一行') && fr.includes('第二行'))
     await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
     await f.cleanup()
   })
 
-  it('Ctrl+J（linefeed）提交：不依赖修饰键上报的可靠兜底', async () => {
+  it('Ctrl+J（linefeed）提交：兼容把 Enter 上报为 LF 的终端', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('ctrlj-submit')
@@ -829,19 +836,22 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
-  it('命令菜单展开时 Shift+Enter 提交正文，而非选中候选命令', async () => {
+  it('命令菜单展开时 Shift+Enter 不被菜单拦截（换行而非选中候选）', async () => {
     const f = await mountTui({ kittyKeyboard: true })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     // 输入不完整的命令前缀，让菜单展开且首个候选为 /stats
     f.setup.mockInput.typeText('/sta')
     for (let i = 0; i < 15; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
-    // Shift+Enter 应放行给输入框提交正文（'/sta'），而不是被菜单拦截选中 '/stats'
+    // Shift+Enter 应放行给输入框换行，而不是被菜单拦截选中 '/stats'
     f.setup.mockInput.pressEnter({ shift: true })
-    await waitFrame(f.setup, (fr) => fr.includes('❯') && fr.includes('/sta'))
+    await waitFrame(f.setup, (fr) => fr.includes('/sta'))
     await new Promise((r) => setTimeout(r, 40))
     for (let i = 0; i < 8; i++) await pumpOnce(f.setup)
+    const frame = f.setup.captureCharFrame()
     // 未执行候选命令 /stats（其输出含「LLM 调用」）
-    expect(f.setup.captureCharFrame()).not.toContain('LLM 调用')
+    expect(frame).not.toContain('LLM 调用')
+    // 输入未清空（未被当作提交）：换行后 /sta 仍在输入框
+    expect(frame).toContain('/sta')
     await f.cleanup()
   })
 
@@ -853,11 +863,11 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
-  it('输入 hello + Meta+Enter → echo 并以 markdown 流式渲染', async () => {
+  it('输入 hello + Enter → echo 并以 markdown 流式渲染', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('hello')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     // 用户回显（user 块：❯ hello）
     await waitFrame(f.setup, (frame) => frame.includes('❯') && frame.includes('hello'))
     // assistant 正文经 onEvent → markdown 渲染
@@ -865,27 +875,36 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
-  it('多行输入：Enter 插入换行而非提交，Meta+Enter 提交整段', async () => {
+  it('多行输入：行尾 `\\`+Enter 换行（不依赖修饰键），Enter 提交整段', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
-    // 第一行 + Enter（换行）+ 第二行 —— Enter 应插入换行而不是提交
-    f.setup.mockInput.typeText('第一行')
-    f.setup.mockInput.pressEnter() // newline
-    f.setup.mockInput.typeText('第二行')
-    // 等待若干拍，确认尚未触发提交（无 assistant 回复、欢迎页仍在）
+    // 行尾打反斜杠再回车 → 换行（并去掉转义反斜杠），不应提交
+    f.setup.mockInput.typeText('第一行\\')
+    f.setup.mockInput.pressEnter()
+    // 等待若干拍，确认尚未触发提交（无 assistant 回复）
     await new Promise((r) => setTimeout(r, 40))
     for (let i = 0; i < 8; i++) await pumpOnce(f.setup)
     expect(f.setup.captureCharFrame()).not.toContain('你好，我是 TUI 助手。')
-    // Meta+Enter 提交整段多行内容
-    pressMetaEnter(f.setup)
+    f.setup.mockInput.typeText('第二行')
+    for (let i = 0; i < 8; i++) await pumpOnce(f.setup)
+    // 换行只插一次（preventDefault 已拦住 textarea 默认换行）：输入区两行相邻、无空行
+    const inputLines = f.setup.captureCharFrame().split('\n')
+    const c1 = inputLines.findIndex((l) => l.includes('第一行'))
+    const c2 = inputLines.findIndex((l) => l.includes('第二行'))
+    expect(c1).toBeGreaterThanOrEqual(0)
+    expect(c2).toBe(c1 + 1)
+    // Enter 提交整段多行内容
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('第一行') && fr.includes('第二行'))
+    // 转义反斜杠已被消费，不应出现在正文里
+    expect(f.setup.captureCharFrame()).not.toContain('第一行\\')
     await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
     // 提交后输入框清空
     await waitFrame(f.setup, (fr) => fr.trimEnd().endsWith('❯'))
     await f.cleanup()
   })
 
-  it('粘贴换行文本保留为输入缓冲，Meta+Enter 提交', async () => {
+  it('粘贴换行文本保留为输入缓冲，Enter 提交', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     // 粘贴三行文本：换行应被完整保留（不被当作提交键）
@@ -893,8 +912,8 @@ describe('TuiApp 集成（mock provider）', () => {
     await new Promise((r) => setTimeout(r, 30))
     for (let i = 0; i < 6; i++) await pumpOnce(f.setup)
     expect(f.setup.captureCharFrame()).not.toContain('你好，我是 TUI 助手。')
-    // Meta+Enter 提交多行文本
-    pressMetaEnter(f.setup)
+    // Enter 提交多行文本
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('行一') && fr.includes('行二'))
     await waitFrame(f.setup, (fr) => fr.includes('行三') && fr.includes('你好，我是 TUI 助手。'))
     await f.cleanup()
@@ -922,7 +941,7 @@ describe('TuiApp 集成（mock provider）', () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('/exit')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     expect(await waitExit(f)).toBe('exit')
     await f.cleanup()
   })
@@ -947,7 +966,7 @@ describe('TuiApp 集成（mock provider）', () => {
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     // 输入触发 mock 返回工具调用 → 权限引擎 ask → 审批模态
     f.setup.mockInput.pressKeys(['h', 'i'])
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (frame) => frame.includes('权限审批'))
     // 按 y 允许单次
     f.setup.mockInput.pressKey('y')
@@ -962,7 +981,7 @@ describe('TuiApp 集成（mock provider）', () => {
     })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     f.setup.mockInput.pressKeys(['h', 'i'])
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (frame) => frame.includes('权限审批'))
     f.setup.mockInput.pressKey('n')
     await waitFrame(f.setup, (frame) => !frame.includes('权限审批') && frame.includes('权限被拒绝'))
@@ -983,7 +1002,7 @@ describe('TuiApp 集成（mock provider）', () => {
     await waitFrame(f.setup, (frame) => frame.includes('统计') && frame.includes('字符') && frame.includes('tok'))
     // 发送一条回复后，统计随块更新（assistant 块 + 用户块）
     await f.setup.mockInput.typeText('统计测试')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (frame) => frame.includes('你好，我是 TUI 助手。'))
     await waitFrame(f.setup, (frame) => frame.includes('消息') && frame.includes('1u'))
     await f.cleanup()
@@ -993,7 +1012,7 @@ describe('TuiApp 集成（mock provider）', () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('复制测试')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     // 用户回显 + assistant 回复各生成一个「⧉ 复制」按钮
     await waitFrame(f.setup, (frame) => frame.includes('你好，我是 TUI 助手。'))
     const frame = await waitFrame(f.setup, (fr) => fr.includes('⧉ 复制'))
@@ -1015,7 +1034,7 @@ describe('TuiApp 文件引用导航（Tab / 上下键选中 / Enter 打开）', 
     })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('file')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     // 回复流入 → 侧栏出现文件引用
     await waitFrame(f.setup, (frame) => frame.includes('src/foo.ts:12'))
 
@@ -1039,7 +1058,7 @@ describe('TuiApp 文件引用导航（Tab / 上下键选中 / Enter 打开）', 
     })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('bar')
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (frame) => frame.includes('src/foo.ts:12'))
 
     // Tab 进入并等待 fileMode 生效（否则方向键会落入非列表分支）
@@ -1117,7 +1136,7 @@ describe('TuiApp 输入历史导航', () => {
     await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
     await sendMessageWithGap(f.setup, 'hello world') // 普通消息
     f.setup.mockInput.typeText('/stats')             // / 命令（同时是命令菜单候选）
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('/stats'))
     for (let i = 0; i < 6; i++) await pumpOnce(f.setup)
 
@@ -1142,7 +1161,7 @@ describe('TuiApp 输入历史导航', () => {
 
     f.setup.mockInput.typeText('/history')
     for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('输入历史'))
     const frame = inputLine(f.setup)
     expect(frame).toBe('❯') // 输入框已清空且未后续提交为消息
@@ -1261,7 +1280,7 @@ describe('TuiApp /tree 磁盘目录树命令', () => {
 
       f.setup.mockInput.typeText('/tree ' + dir)
       for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
-      pressMetaEnter(f.setup)
+      pressSubmit(f.setup)
       await waitFrame(f.setup, (fr) => fr.includes('文件树（'))
       await waitFrame(f.setup, (fr) => fr.includes('src/') && fr.includes('a.ts*'))
       await waitFrame(f.setup, (fr) => fr.includes('* = 对话中引用过的文件'))
@@ -1279,7 +1298,7 @@ describe('TuiApp /tree 磁盘目录树命令', () => {
     await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
     f.setup.mockInput.typeText('/tree /no/such/dir')
     for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('目录不存在：/no/such/dir'))
     await f.cleanup()
   })
@@ -1327,7 +1346,7 @@ describe('TuiApp /edit 外部编辑器命令', () => {
     await waitFrame(f.setup, (fr) => fr.includes('/edit'))
     // 提交 /edit （无参数）→ 提示用法
     for (let i = 0; i < 6; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
-    pressMetaEnter(f.setup)
+    pressSubmit(f.setup)
     await waitFrame(f.setup, (fr) => fr.includes('/edit <file[:line]>'))
     await f.cleanup()
   })
@@ -1347,7 +1366,7 @@ describe('TuiApp /edit 外部编辑器命令', () => {
       await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
       f.setup.mockInput.typeText('/edit ' + ref)
       for (let i = 0; i < 8; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
-      pressMetaEnter(f.setup)
+      pressSubmit(f.setup)
       await waitFrame(f.setup, (fr) => fr.includes('打开 ' + tmpName + '/edit.ts'))
       // openFile 已用相对 path + 行号调用
       expect(opened).toEqual([[`${tmpName}/edit.ts`, 2]])

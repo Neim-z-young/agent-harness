@@ -105,10 +105,10 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: 'Tab', desc: '进入文件引用/会话列表' },
   { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
   { key: '◀ / ▶', desc: '侧栏模块切换（输入为空时）' },
-  { key: 'Enter', desc: '输入框内换行；列表/菜单中确认选中' },
-  { key: 'Shift+Enter', desc: '提交输入（需终端支持 Kitty 键盘协议才能识别 Shift）' },
-  { key: 'Ctrl+J', desc: '提交输入（最可靠：不依赖修饰键上报，传统终端也可用）' },
-  { key: 'Alt/Meta+Enter', desc: '提交输入（需终端把 Option 发送为 ESC 前缀）' },
+  { key: 'Enter', desc: '提交输入；列表/菜单中确认选中' },
+  { key: '\\ + Enter', desc: '输入框内换行（最可靠：行尾打反斜杠再回车，不依赖终端修饰键）' },
+  { key: 'Shift+Enter', desc: '输入框内换行（需终端上报 Shift，如 Kitty 键盘协议）' },
+  { key: 'Ctrl+J', desc: '提交输入（同 Enter；兼容把 Enter 上报为 LF 的终端）' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
   { key: '/help', desc: '查看特殊命令' },
 ]
@@ -1306,24 +1306,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       return true // 其余按键在审批中一律吞掉
     }
     if (key.ctrl && key.name === 'c') return finish('exit')
-    // 提交键：Shift+Enter / Ctrl+J（linefeed）
-    // 为什么写在这里而不是给 textarea 传 keyBindings：@opentui/react 不透传
-    // keyBindings（传了会被丢弃），自定义提交键只能在全局处理器里直接调用
-    // textarea.submit() 触发 onSubmit。
-    // 默认约定不变：Enter = 换行、Option/Meta+Enter = 提交（Textarea 默认绑定）。
-    // Ctrl+J 是最可靠的兜底：LF(0x0A) 与 CR(0x0D) 天然可区分，不依赖终端上报
-    // Shift/Meta 修饰（传统终端常把 Shift+Enter 也报成裸 CR，与 Enter 无法区分）。
-    if (key.name === 'return' && key.shift) {
-      key.preventDefault()
-      textareaRef.current?.submit()
-      return true
-    }
-    if (key.name === 'linefeed') {
-      key.preventDefault()
-      textareaRef.current?.submit()
-      return true
-    }
-    __KEYLOG.push(`${key.name}:${key.ctrl ? 'C' : ''}`)
+    // 诊断：连修饰键一起记录。此前只记 name/ctrl，导致「Shift+Enter 的修饰信息到底有没有
+    // 送达应用」在日志里无从判断（实测结论见开发日志续 125）。
+    __KEYLOG.push(`${key.name}${key.ctrl ? ':C' : ''}${key.shift ? ':S' : ''}${key.meta ? ':M' : ''}`)
     if (key.ctrl && key.name === 'b') return setShowSidebar((v) => !v)
     // 模块 D：帮助面板开关。Ctrl+/ 与 Ctrl+_ 均发 0x1F（OpenTUI 解码为 name '_'）;
     // 部分终端将 Ctrl+/ 上报为 '?'。三者等效触发。
@@ -1389,7 +1374,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         const head = input.split(/\s+/)[0] ?? ''
         setComposer(head); setInput(head); setCmdSel(0); return true
       }
-      // 仅拦截「无修饰」的 Enter 选中命令；Meta+Enter / Shift+Enter 放行提交正文
+      // 仅拦截「无修饰」的 Enter 选中候选命令；Meta/Shift+Enter 放行（走文末提交键分支）
       if (key.name === 'return' && !key.meta && !key.shift) {
         key.preventDefault()
         const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
@@ -1435,6 +1420,37 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         return
       }
       return true // 列表模式吞掉其余按键（preventDefault），避免误键入输入框
+    }
+    // —— 提交键 ——
+    // 实测结论（herdr 终端复用器，见开发日志续 125）：只有 Enter 的原生 CR(0x0D) 能送达到
+    // 应用，Option+Enter / Shift+Enter / Ctrl+J 的修饰信息全部丢失（一律降级为裸 CR），
+    // LF(0x0A) 同样送不进来。故提交键只能是 Enter 本身：
+    //   Enter / LF(Ctrl+J) → 提交（一并接受 LF：部分终端/复用器把 Enter 上报成 LF）
+    //   Shift+Enter        → 换行（仅终端上报修饰键时；传统终端下等同 Enter=提交）
+    //   `\` + Enter        → 换行（去掉行尾转义反斜杠；不依赖修饰键，任何终端可用）
+    // 为什么不给 textarea 传 keyBindings：@opentui/react 不透传该 prop（传了被静默丢弃），
+    // 自定义提交键只能在全局处理器里直接调用 textarea.submit() 触发 onSubmit。
+    if (!listMode && (key.name === 'return' || key.name === 'linefeed')) {
+      key.preventDefault()
+      const ta = textareaRef.current
+      // Shift+Enter：能区分修饰键的终端（Kitty 协议）保留「换行」直觉
+      if (key.name === 'return' && key.shift) {
+        ta?.newLine()
+        setInput(readComposer())
+        setHistIdxSync(-1)
+        return true
+      }
+      // `\` + Enter：通用换行兜底（仅认行尾反斜杠，键入场景光标即在末尾）
+      const text = readComposer()
+      if (key.name === 'return' && ta && text.endsWith('\\')) {
+        const next = `${text.slice(0, -1)}\n`
+        setComposer(next)
+        setInput(next)
+        setHistIdxSync(-1)
+        return true
+      }
+      ta?.submit()
+      return true
     }
     // 非列表模式：Tab 进入优先的列表（文件引用优先，其次会话）—— 同时切到对应侧栏 tab
     if (!listMode && key.name === 'tab') {
