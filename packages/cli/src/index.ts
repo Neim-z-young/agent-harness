@@ -320,6 +320,179 @@ export function formatModel(providerId: string | undefined, modelId: string | un
   return providerId ? `${providerId}/${modelId}` : modelId
 }
 
+/**
+ * 已归一化的 Provider 定义：`id` 必定存在（显式指定，或由 `normalizeProviderConfigs` 从 model 派生）。
+ * 归一化之后的下游代码（装配 / 路由 / 展示）一律按「id 必有」处理，无需到处判空。
+ */
+export interface ResolvedProviderConfig extends ProviderConfig {
+  id: string
+}
+
+/** 把任意字符串规整为可用的 id 片段：保留 [A-Za-z0-9._-]，其余折叠为 '-'，去首尾连字符 */
+export function sanitizeProviderId(raw: string): string {
+  return raw.trim().replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '')
+}
+
+/**
+ * 归一化 providers 数组：把可选的 `id` 补全为**确定性且唯一**的实例 id。
+ *
+ * 设计意图（本函数是「id 不再必须冗长/手写」的落点）：
+ * - 显式写了 `id` → 原样保留；重复则报错（沿用旧校验语义，避免静默覆盖注册）。
+ * - 未写 `id` 但写了 `model` → 由模型名派生（去 `provider/` 前缀、规整非法字符）；
+ *   与已占用 id 冲突时按数组顺序追加 `-2` / `-3`…（结果确定、可复现，无需人工起名）。
+ * - `id` 与 `model` 都缺失 → 报错（无从派生）。
+ *
+ * 纯函数（无 IO），`issues[].index` 对应原始数组下标，便于在报错中定位。
+ */
+export function normalizeProviderConfigs(raw: ProviderConfig[]): {
+  providers: ResolvedProviderConfig[]
+  issues: ProviderConfigIssue[]
+} {
+  const issues: ProviderConfigIssue[] = []
+  const taken = new Set<string>()
+  const providers: ResolvedProviderConfig[] = []
+  raw.forEach((pc, index) => {
+    const explicit = pc.id?.trim()
+    if (explicit) {
+      if (taken.has(explicit)) {
+        issues.push({
+          index,
+          message: `providers[${index}].id "${explicit}" 与前面的 provider 重复（显式 id 必须唯一，否则后注册的会被覆盖；也可省略 id，交由系统按 model 自动派生）`,
+        })
+      }
+      taken.add(explicit)
+      // 首个同 id 保留，保持与旧行为一致（默认 provider 仍能在数组中找到）
+      if (!providers.some((p) => p.id === explicit)) providers.push({ ...pc, id: explicit })
+      return
+    }
+    const derived = pc.model ? sanitizeProviderId(parseModelSpec(pc.model).modelId) : ''
+    if (!derived) {
+      issues.push({ index, message: `providers[${index}] 既未写 id 也未写 model，无法派生实例 id（至少填写其一）` })
+      return
+    }
+    let id = derived
+    for (let n = 2; taken.has(id); n++) id = `${derived}-${n}`
+    taken.add(id)
+    providers.push({ ...pc, id })
+  })
+  return { providers, issues }
+}
+
+/**
+ * `/model <arg>` 的解析结果。把「用户敲什么」与「怎么切」解耦：
+ * 由本函数一次性判定，调用方只负责按 kind 执行/提示，不再散落 `split('/')` 式判断。
+ */
+export type ModelResolution =
+  /** 命中某个配置实例（按序号 / 实例 id / 模型名），provider 与 model 一并确定 */
+  | { kind: 'instance'; providerId: string; modelId?: string; matchedBy: 'index' | 'id' | 'model'; index: number }
+  /** 显式 `provider/model`（provider 未在当前进程装配时 providerKnown=false，调用方提示即可） */
+  | { kind: 'explicit'; providerId?: string; modelId: string; providerKnown: boolean }
+  /** 裸模型名：挂到当前 Provider（仅当未配置 providers 实例时允许，保持旧用法） */
+  | { kind: 'model'; modelId: string }
+  /** 命中多个实例：必须消歧，不静默选第一个 */
+  | { kind: 'ambiguous'; arg: string; candidates: Array<{ index: number; id: string; model?: string; type: string; matchedBy: 'id' | 'model' }> }
+  /** 序号越界 */
+  | { kind: 'bad-index'; arg: string; total: number }
+  /** arg 是 Provider **类型**名而非实例，且没有可用模型 → 给出用法提示，不切换 */
+  | { kind: 'type-hint'; arg: string }
+  /** 已配置 providers 但 arg 谁都不匹配 → 拒绝并提示（避免把拼错的 provider 名当成模型名写进配置） */
+  | { kind: 'not-found'; arg: string }
+
+/**
+ * 解析 `/model` 的实参，支持四种写法（优先级由高到低）：
+ *
+ * 1. `id/model`        显式跨 Provider（旧写法，保留）；provider 是否已装配由调用方提示
+ * 2. `序号`（如 `2`）    按 `/model ?` 列表序号选择
+ * 3. `实例 id`          如 `hy3` —— 命中实例即同时采用其配置的 model
+ * 4. `模型名`           如 `hy3`（与实例 id 同名时同样命中）；跨实例重名则要求消歧
+ *
+ * 兜底（**仅当未配置任何 providers 实例时**）：裸模型名挂当前 Provider，
+ * 即 `/model claude-3-7-sonnet` 这类未声明实例的老用法。
+ *
+ * 为什么要有 `not-found`：旧实现把任何裸词都当模型名写进 config.model，
+ * 于是 `/model local-hy4` 这种「想切 provider 却拼错」会静默落成垃圾模型名。
+ * 现在只要配置了 providers，裸词必须命中实例，否则明确报错。
+ *
+ * 纯函数，便于单测。
+ */
+export function resolveModelArg(
+  arg: string,
+  providers: ResolvedProviderConfig[],
+  knownRefs: Iterable<string> = [],
+): ModelResolution {
+  const raw = arg.trim()
+  // 已知引用 = 显式传入的（实例 id / Provider 类型 / 默认 provider）+ 本次传入的实例 id
+  const known = new Set<string>(knownRefs)
+  for (const p of providers) known.add(p.id)
+
+  // 1) 显式 provider/model
+  if (raw.includes('/')) {
+    const { providerId, modelId } = parseModelSpec(raw)
+    const providerKnown = !providerId || known.has(providerId)
+    return { kind: 'explicit', providerId, modelId, providerKnown }
+  }
+
+  // 2) 纯数字 → 列表序号（1-based）
+  if (/^\d+$/.test(raw)) {
+    const idx = Number(raw)
+    if (idx >= 1 && idx <= providers.length) {
+      const p = providers[idx - 1]
+      return { kind: 'instance', providerId: p.id, modelId: p.model, matchedBy: 'index', index: idx }
+    }
+    return { kind: 'bad-index', arg: raw, total: providers.length }
+  }
+
+  // 3/4) 按实例 id 或模型名命中（两者取并集：仅唯一命中才自动选择）
+  const hits = providers
+    .map((p, i) => ({ p, index: i + 1 }))
+    .filter(({ p }) => p.id === raw || p.model === raw)
+  if (hits.length === 1) {
+    const { p, index } = hits[0]
+    return {
+      kind: 'instance',
+      providerId: p.id,
+      modelId: p.model,
+      matchedBy: p.id === raw ? 'id' : 'model',
+      index,
+    }
+  }
+  if (hits.length > 1) {
+    return {
+      kind: 'ambiguous',
+      arg: raw,
+      candidates: hits.map(({ p, index }) => ({
+        index,
+        id: p.id,
+        model: p.model,
+        type: p.type,
+        matchedBy: (p.id === raw ? 'id' : 'model') as 'id' | 'model',
+      })),
+    }
+  }
+
+  // 5) 谁都不匹配：未配置 providers → 旧用法（裸模型名挂当前 Provider）
+  if (!providers.length) {
+    if (known.has(raw)) return { kind: 'type-hint', arg: raw }
+    return { kind: 'model', modelId: raw }
+  }
+  if (known.has(raw)) return { kind: 'type-hint', arg: raw }
+  return { kind: 'not-found', arg: raw }
+}
+
+/** 把解析结果格式化成可展示的 `provider/model` 引用（用于「已切换模型 X」回显与持久化前预览） */
+export function formatResolutionRef(r: ModelResolution): string | undefined {
+  switch (r.kind) {
+    case 'instance':
+      return formatModel(r.providerId, r.modelId) ?? r.providerId
+    case 'explicit':
+      return formatModel(r.providerId, r.modelId) ?? r.modelId
+    case 'model':
+      return r.modelId
+    default:
+      return undefined
+  }
+}
+
 /** 合并 CLI 参数与 config.json（CLI 优先），供 main() 汇总默认值 */
 export function resolveConfig(args: CliArgs, cfg: HarnessConfig): {
   agentId: string
@@ -735,9 +908,11 @@ export interface ProviderConfigIssue {
 
 /**
  * 校验 providers 数组与默认 provider（已知类型由 ProviderTypeRegistry 动态提供，插件化）：
- * - id 缺失 / 重复 → 报错（避免静默覆盖注册）
  * - type 未知 → 报错（列出已注册类型）
  * - 默认 provider 指向未定义的 id（非内置 mock/anthropic）→ 报错
+ *
+ * 注：id 的存在性/唯一性由 `normalizeProviderConfigs` 前置保证（缺省按 model 派生、重名加序号、
+ * 显式重复报错），因此本函数收到的是已归一化的列表，`!pc.id` 分支仅为防御性兜底。
  */
 export function validateProviderConfigs(
   providers: ProviderConfig[],
@@ -767,6 +942,22 @@ export function validateProviderConfigs(
   return issues
 }
 
+/**
+ * 归一化 + 校验的组合入口（供 `config check` / `--check-config` 使用，与 boot 同一套语义）：
+ * 先按 model 派生缺省 id（`normalizeProviderConfigs`），再校验 type / 默认 provider（`validateProviderConfigs`），
+ * 返回归一化结果与扁平化的问题文本。避免「概览按派生 id 展示、校验却按原始 config 报 id 缺失」的不一致。
+ */
+export function checkProviderConfigs(
+  rawProviders: ProviderConfig[],
+  defaultProviderId: string,
+  knownTypes: Iterable<string>,
+): { providers: ResolvedProviderConfig[]; issues: string[] } {
+  const { providers, issues: idIssues } = normalizeProviderConfigs(rawProviders)
+  const issues = idIssues.map((i) => i.message)
+  for (const iss of validateProviderConfigs(providers, defaultProviderId, knownTypes)) issues.push(iss.message)
+  return { providers, issues }
+}
+
 /** 配置概览（--check-config / /config 共用），maskKey 为 true 时隐藏明文 apiKey */
 export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string, maskKey = true): string {
   const lines: string[] = []
@@ -778,11 +969,13 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
       ? `上下文压缩（ACP）：启用 fitWindow=${c.modelContextLimit ?? 200000}${c.prompts ? ' · 自定义提示词' : ''}`
       : '上下文压缩（ACP）：未启用（config.json → compression.enabled: true 开启）'
   )
-  const providers = cfg.providers ?? []
-  if (!providers.length) {
+  const rawProviders = cfg.providers ?? []
+  if (!rawProviders.length) {
     lines.push('providers：（未配置，使用内置 mock / anthropic）')
     return lines.join('\n')
   }
+  // 展示归一化后的实例 id（省略 id 的项按 model 派生），与实际装配结果一致
+  const providers = normalizeProviderConfigs(rawProviders).providers
   lines.push('providers：')
   for (const pc of providers) {
     const api = pc.apiKey
@@ -961,8 +1154,11 @@ export class HarnessApp {
   readonly pluginRegistry = new Map<string, AgentPlugin>()
   private harness!: Harness
   private options: Required<Pick<HarnessAppOptions, 'cwd' | 'dataDir' | 'agentId' | 'provider'>> & HarnessAppOptions
-  /** boot() 装载的 Provider 配置（CLI options.providers 优先，其次 config.json providers），供 /model ? 展示 */
-  private loadedProviders: ProviderConfig[] = []
+  /**
+   * boot() 装载的 Provider 配置（CLI options.providers 优先，其次 config.json providers），
+   * 已归一化（id 必定存在）——供 /model ? 展示，也是 /model 解析实例的直接数据源。
+   */
+  private loadedProviders: ResolvedProviderConfig[] = []
 
   constructor(options: HarnessAppOptions) {
     const cwd = resolve(options.cwd)
@@ -1089,10 +1285,14 @@ export class HarnessApp {
     await (harness.plugin as any)?.trigger?.('mcp.configure', { mcpServers: list })
   }
 
-  /** 当前生效模型（`provider/model` 展示）：优先读取活动 Agent 定义的 model，回退 options.model */
+  /**
+   * 当前生效模型展示（`provider/model`）：优先读取活动 Agent 定义的 model，回退 options.model。
+   * 只绑定了 provider、未指定 model 时显示 `<provider>/(默认模型)`——让 /model 输出不至于空着。
+   */
   getModel(agentId: string): string | undefined {
     const a = this.harness?.agent?.get?.(agentId)
-    if (a?.model?.modelId) return formatModel(a.model.providerId, a.model.modelId)
+    if (a?.model?.providerId) return formatModel(a.model.providerId, a.model.modelId) ?? `${a.model.providerId}/(provider 默认模型)`
+    if (a?.model?.modelId) return a.model.modelId
     return this.options.model
   }
 
@@ -1102,23 +1302,55 @@ export class HarnessApp {
     return h?.resolveChatProvider?.(providerId)
   }
 
+  /** 当前已配置的 Provider 实例（归一化后，id 必有）；供 /model 解析与展示 */
+  configuredProviders(): ResolvedProviderConfig[] {
+    return this.loadedProviders.length ? this.loadedProviders : normalizeProviderConfigs(this.options.providers ?? []).providers
+  }
+
   /**
-   * 运行时切换模型：接受 `[provider/]modelId` 规格（如 `openai/gpt-4o` 跨 Provider 切换），
-   * 更新指定 Agent 的 model 并持久化到 config.json（provider + model）作为下次启动默认。
+   * 运行时切换模型（兼容入口）：接受 `/model` 的全部写法（序号 / 实例 id / 模型名 / `provider/model`）。
+   * 解析不成立（歧义、序号越界、拼错）时返回 false，不产生任何副作用。
    */
   async setModel(agentId: string, spec: string): Promise<boolean> {
+    const r = resolveModelArg(spec, this.configuredProviders(), this.providerTypes.list())
+    switch (r.kind) {
+      case 'instance':
+        // 命中实例：provider 与其配置的 model 一并生效；实例未声明 model 时清空 modelId，
+        // 交由该 Provider 的默认模型接管（避免把上一个模型的 id 带到新 Provider）
+        return this.applyModel(agentId, r.providerId, r.modelId, { replaceModel: true })
+      case 'explicit':
+        return this.applyModel(agentId, r.providerId, r.modelId, { replaceModel: true })
+      case 'model':
+        return this.applyModel(agentId, undefined, r.modelId)
+      default:
+        return false
+    }
+  }
+
+  /**
+   * 落地一次模型切换：更新 Agent 的 model 覆盖 + 持久化到 config.json。
+   * `replaceModel`：即使 modelId 为空也覆盖（并删除旧的 modelId），用于「切到某实例」的语义。
+   */
+  private async applyModel(
+    agentId: string,
+    providerId: string | undefined,
+    modelId: string | undefined,
+    opts: { replaceModel?: boolean } = {},
+  ): Promise<boolean> {
     const a = this.harness?.agent?.get?.(agentId)
     if (!a) return false
-    const parsed = parseModelSpec(spec.trim())
-    a.model = {
-      ...(a.model ?? {}),
-      ...(parsed.providerId ? { providerId: parsed.providerId } : {}),
-      modelId: parsed.modelId,
-    }
-    // 持久化：provider 前缀命中则更新默认 provider；model 仅存 modelId（前缀在 /model 已显式跨 Provider 时由 provider 字段接管）
+    const next = { ...(a.model ?? {}) }
+    if (providerId) next.providerId = providerId
+    if (modelId) next.modelId = modelId
+    else if (opts.replaceModel) delete next.modelId
+    a.model = next
+    // provider 与 model 同步落盘：保证 config.provider/model 与运行时一致。
+    // （旧实现只在 `provider/` 前缀命中时改 provider，会出现 provider 指向 A、model 属于 B 的不自洽配置。）
     const cfg = await this.configStore.load()
-    const provider = parsed.providerId ?? this.options.provider ?? cfg.provider ?? a.model?.providerId
-    await this.configStore.save({ ...cfg, provider, model: parsed.modelId })
+    const nextCfg: HarnessConfig = { ...cfg, ...(providerId ? { provider: providerId } : {}) }
+    if (modelId) nextCfg.model = modelId
+    else if (opts.replaceModel) delete nextCfg.model
+    await this.configStore.save(nextCfg)
     return true
   }
 
@@ -1188,8 +1420,8 @@ export class HarnessApp {
    */
   listProviders(): string[] {
     const ids: string[] = []
-    // config 里显式定义的 Provider 实例 id 优先
-    for (const pc of this.options.providers ?? []) if (!ids.includes(pc.id)) ids.push(pc.id)
+    // config / CLI 定义的 Provider 实例 id 优先（已归一化：省略 id 的项也已按 model 派生）
+    for (const pc of this.configuredProviders()) if (!ids.includes(pc.id)) ids.push(pc.id)
     // 默认 provider（mock/anthropic 或自定义）放最前
     const def = this.options.provider ?? 'anthropic'
     if (!ids.includes(def)) ids.unshift(def)
@@ -1198,9 +1430,19 @@ export class HarnessApp {
     return ids
   }
 
-  /** 启动装载的 Provider 实例配置（含各自默认/附加模型），供 /model ? 展示 config.json / CLI 配置的模型 */
-  listConfiguredProviders(): Array<{ id: string; model?: string; baseUrl?: string; apiPath?: string; type?: string }> {
-    return this.loadedProviders.map((p) => ({ id: p.id, model: p.model, baseUrl: p.baseUrl, apiPath: p.apiPath, type: p.type }))
+  /**
+   * 启动装载的 Provider 实例配置（含各自默认/附加模型），供 /model ? 展示。
+   * `index` 为 1-based 列表序号，用户可直接 `/model <序号>` 选择。
+   */
+  listConfiguredProviders(): Array<{ index: number; id: string; model?: string; baseUrl?: string; apiPath?: string; type?: string }> {
+    return this.loadedProviders.map((p, i) => ({
+      index: i + 1,
+      id: p.id,
+      model: p.model,
+      baseUrl: p.baseUrl,
+      apiPath: p.apiPath,
+      type: p.type,
+    }))
   }
 
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
@@ -1229,7 +1471,10 @@ export class HarnessApp {
     // ------------------------------------------------------------------
     const cfg = await this.configStore.load()
     const rawProviderConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
-    this.loadedProviders = rawProviderConfigs
+    // 归一化：把可选的 id 补全为唯一实例 id（缺省由 model 派生、重名自动加序号）。
+    // 之后所有环节（装配 / 路由 / 校验 / 展示）都按「id 必定存在」处理，无需到处判空。
+    const normalized = normalizeProviderConfigs(rawProviderConfigs)
+    this.loadedProviders = normalized.providers
     const defaultProviderId = this.options.provider ?? cfg.provider ?? 'anthropic'
 
     // 加载外部插件（user ~/.harness/plugins → project .harness/plugins，后加载覆盖先加载）：
@@ -1243,15 +1488,17 @@ export class HarnessApp {
     // 显式校验 + 密钥解析（错误一次性汇总，避免静默跳过/误导）
     const cipher = new SecretCipher(this.workspace)
     const configIssues: string[] = []
-    const providerConfigs: ProviderConfig[] = []
-    for (const pc of rawProviderConfigs) {
+    // 归一化阶段的问题（id 重复 / id 与 model 均缺失）优先上报，避免后续就着残缺配置继续跑
+    for (const iss of normalized.issues) configIssues.push(iss.message)
+    const providerConfigs: ResolvedProviderConfig[] = []
+    for (const [index, pc] of normalized.providers.entries()) {
       try {
         providerConfigs.push({ ...pc, apiKey: await resolveSecret(pc.apiKey, cipher) })
       } catch (err: any) {
-        configIssues.push(`providers[${rawProviderConfigs.indexOf(pc)}]（id=${pc.id ?? '?'}）：${err?.message ?? String(err)}`)
+        configIssues.push(`providers[${index}]（id=${pc.id}）：${err?.message ?? String(err)}`)
       }
     }
-    for (const iss of validateProviderConfigs(rawProviderConfigs, defaultProviderId, this.providerTypes.list())) {
+    for (const iss of validateProviderConfigs(normalized.providers, defaultProviderId, this.providerTypes.list())) {
       configIssues.push(iss.message)
     }
     if (configIssues.length) {
@@ -1888,8 +2135,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
           out('  /switch ?          列出已注册 Agent\n')
           out('  /model             查看当前模型\n')
-          out('  /model <spec>      切换模型：provider/modelId 跨 Provider（如 /model openai/gpt-4o）\n')
-          out('  /model ?           列出已注册 Provider\n')
+          out('  /model <模型名>    切换模型：按已配置的 model 名（如 /model hy3）或实例 id 切换\n')
+          out('  /model <序号>      按 /model ? 列表序号切换（如 /model 2）\n')
+          out('  /model <id>/<模型>  显式跨 Provider（如 /model openai/gpt-4o）\n')
+          out('  /model ?           列出已注册 Provider 与已配置模型（带序号）\n')
           out('  /config            查看 Provider / 模型配置概览（config.json）\n')
           out('  /permission        查看权限交互模式与规则（permissions.json）\n')
           out('  /permission <mode>  切换交互模式：allow-all | ask | deny-all\n')
@@ -1983,11 +2232,11 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         }
         case '/model': {
           const agentId = current.agentId ?? 'default'
+          const configured = app.listConfiguredProviders()
           if (!arg || arg === '?') {
             const prods = app.listProviders()
             out('已注册 Provider：' + (prods.length ? prods.join(' / ') : '（默认 mock/anthropic）') + '\n')
-            // 展示 config.json / CLI 里配置的 Provider 实例及其默认/附加模型
-            const configured = app.listConfiguredProviders()
+            // 展示 config.json / CLI 里配置的 Provider 实例及其默认/附加模型（带序号，可直接 /model <序号>）
             if (configured.length) {
               out('配置的模型（providers）：\n')
               for (const p of configured) {
@@ -1997,8 +2246,11 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
                   p.apiPath ? `apiPath=${p.apiPath}` : '',
                   p.type ? `type=${p.type}` : '',
                 ].filter(Boolean).join(' · ')
-                out(`  - ${model}${extra ? `  (${extra})` : ''}\n`)
+                out(`  ${p.index}) ${model}${extra ? `  (${extra})` : ''}\n`)
               }
+              const first = configured[0]
+              const sample = first.model ?? first.id
+              out(`切换：/model ${sample}（按模型名）· /model ${first.index}（按序号）· /model ${first.id}/${first.model ?? '<model>'}（显式跨 Provider）\n`)
             }
             const m = app.getModel(agentId)
             if (m) out(`当前模型：${m}（agent=${agentId}）\n`)
@@ -2008,23 +2260,51 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             }
             return 'continue'
           }
-          // 校验：跨 Provider 切换时目标 provider 需已注册/配置
-          const parsed = parseModelSpec(arg.trim())
-          const providers = app.listProviders()
-          if (parsed.providerId && !providers.includes(parsed.providerId)) {
-            out(`Provider "${parsed.providerId}" 未注册。可用：${providers.join(' / ') || '（默认）'}\n`)
+          // 统一解析用户输入（序号 / 实例 id / 模型名 / provider/model），再按结果执行或提示
+          const knownRefs = app.listProviders()
+          const r = resolveModelArg(arg.trim(), app.configuredProviders(), knownRefs)
+          if (r.kind === 'ambiguous') {
+            out(`"${r.arg}" 同时命中多个 Provider 实例，请指明其一：\n`)
+            for (const c of r.candidates) {
+              out(`  ${c.index}) ${c.id}/${c.model ?? ''}  (type=${c.type}，命中其 ${c.matchedBy === 'id' ? 'id' : 'model'})\n`)
+            }
+            out(`   或直接写成 <id>/<model>，如 /model ${r.candidates[0].id}/${r.candidates[0].model ?? '<model>'}\n`)
+            return 'continue'
+          }
+          if (r.kind === 'bad-index') {
+            out(`序号 ${r.arg} 超出范围（当前配置 ${r.total} 个 Provider 实例；用 /model ? 查看列表）。\n`)
+            return 'continue'
+          }
+          if (r.kind === 'type-hint') {
+            out(`"${r.arg}" 是 Provider **类型**名，不是可用实例，无法直接切换。\n`)
+            out(`   · 想用该类型：/model ${r.arg}/<模型名>（如 /model ${r.arg}/gpt-4o）\n`)
+            out(`   · 想固定某个端点：在 config.json → providers 里写一项 { "type": "${r.arg}", "baseUrl": "...", "model": "..." }（id 可省略，会自动按 model 命名）\n`)
+            return 'continue'
+          }
+          if (r.kind === 'not-found') {
+            const refs = configured.map((p) => p.model ?? p.id)
+            out(`未找到 "${r.arg}" 对应的 Provider 实例或模型。\n`)
+            out(`   已配置可用：${refs.length ? refs.join(' / ') : '（无）'}\n`)
+            out(`   也可显式写成 <provider>/<model>，如 /model ${configured[0]?.id ?? 'openai'}/${configured[0]?.model ?? 'gpt-4o'}\n`)
+            return 'continue'
+          }
+          if (r.kind === 'explicit' && r.providerId && !r.providerKnown) {
+            out(`Provider "${r.providerId}" 未注册。可用：${knownRefs.join(' / ') || '（默认）'}\n`)
             out('   可在 <data-dir>/config.json → providers 中定义后重新启动。\n')
             return 'continue'
           }
           const ok = await app.setModel(agentId, arg.trim())
           if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
-          out(`已切换模型 ${arg.trim()}（agent=${agentId}，影响下次 send；已写入 config.json）\n`)
+          const ref = formatResolutionRef(r) ?? arg.trim()
+          // ref 已含 `provider/model`，无需再重复 provider；仅在实例未声明 model 时补充说明
+          const detail = r.kind === 'instance' && !r.modelId ? '（该 Provider 未声明 model，使用其默认模型）' : ''
+          out(`已切换模型 ${ref}${detail}（agent=${agentId}，影响下次 send；已写入 config.json）\n`)
           // 目标 Provider 若未装配到当前 harness，会静默回退默认（如 mock）——明确提示，避免「为什么一直 mock」
-          const parsedSpec = parseModelSpec(arg.trim())
-          if (parsedSpec.providerId) {
-            const actual = app.resolveChatProvider(parsedSpec.providerId)?.id
-            if (actual && actual !== parsedSpec.providerId) {
-              out(`⚠️  当前进程未装配 Provider "${parsedSpec.providerId}"，实际将以 "${actual}" 发送。\n` +
+          const targetProvider = r.kind === 'instance' || r.kind === 'explicit' ? r.providerId : undefined
+          if (targetProvider) {
+            const actual = app.resolveChatProvider(targetProvider)?.id
+            if (actual && actual !== targetProvider) {
+              out(`⚠️  当前进程未装配 Provider "${targetProvider}"，实际将以 "${actual}" 发送。\n` +
                 `   请重启 REPL 使 config.json → providers 中该 Provider 生效（或先写入后再启动）。\n`)
             }
           }
@@ -2535,12 +2815,12 @@ export async function runConfigCommand(options: {
   if (sub === 'check') {
     const registry = await buildCheckRegistry(workspace.cwd, write)
     const defaultProviderId = cfg.provider ?? 'anthropic'
-    const issues = validateProviderConfigs(providers, defaultProviderId, registry.list())
+    const { issues } = checkProviderConfigs(providers, defaultProviderId, registry.list())
     write(buildConfigOverview(cfg, defaultProviderId) + '\n')
     // 展示含外部插件的完整 Provider 类型清单（含用法提示）
     write(buildProviderTypesSection(registry) + '\n')
     if (issues.length) {
-      write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')
+      write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s}`).join('\n') + '\n')
       return 1
     }
     write('配置校验通过。\n')
@@ -2593,10 +2873,10 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
 
   if (args.checkConfig) {
     const registry = await buildCheckRegistry(cwd, write)
-    const issues = validateProviderConfigs(cfg.providers ?? [], provider, registry.list())
+    const { issues } = checkProviderConfigs(cfg.providers ?? [], provider, registry.list())
     write(buildConfigOverview(cfg, provider) + '\n')
     if (issues.length) {
-      write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s.message}`).join('\n') + '\n')
+      write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s}`).join('\n') + '\n')
       return 1
     }
     write('配置校验通过。\n')

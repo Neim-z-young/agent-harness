@@ -1,5 +1,57 @@
 # Agent Harness 开发日志
 
+## 2026-09-15（续 126）模型配置 id 优化：id 可省略 + `/model` 智能解析
+
+### 问题（用户反馈）
+
+> 优化模型配置 id，现在 id 很长还必须唯一，但现在切换模型时必须 id/model 才能切换成功，设计显然有问题。
+
+现象：配置里要写 `{ "id": "local-deepseek-v4.1-flash", "model": "deepseek-v4.1-flash" }` 这种把模型名重复一遍的长 id；切换时还得 `/model local-hy3/hy3`，同一个模型名敲两遍。
+
+### 根因
+
+`providers[].id` **一个字段承担了三件事**：
+
+1. **路由键** —— core 的 `chatProviders` 注册表 key，且 openai 等插件 id 派生为 `provider.{id}`，插件 id 必须唯一 → 于是 id 被迫全局唯一且越写越长；
+2. **显示名** —— `/model ?` 列表、`/model` 回显；
+3. **切换参数** —— `/model` 强制 `id/model`，而 model 明明已经是配置字段。
+
+即「机器身份」与「人类名字」耦合。附带一个真实故障：旧实现把任何裸词都当模型名写进 `config.model`，于是想切 provider 却拼错（如 `/model local-hy4`）会**静默落成垃圾模型名**——用户 `~/.harness/config.json` 里 `"provider": "local-hy3"` + `"model": "local-hy4"` 的不自洽配置正是这么来的。
+
+### 方案
+
+**1. `id` 变为可选，缺省由 `model` 自动派生**（`packages/plugin/src/index.ts` 契约 + `normalizeProviderConfigs`）
+
+- 省略 `id` → 取 `model`（去 `provider/` 前缀、非法字符折叠为 `-`）；同名按数组顺序追加 `-2`/`-3`（确定性，无需人工起名）；
+- 显式 `id` 仍支持（同模型多端点、或想让 id 更短）；显式重复仍报错（避免静默覆盖注册）；
+- `id` 与 `model` 都缺失 → 报错（无从派生）；
+- 归一化后引入 `ResolvedProviderConfig`（`id: string`），下游（装配/路由/校验/展示）一律按「id 必有」处理，不再到处判空。
+
+**2. `/model <arg>` 智能解析**（`resolveModelArg`，纯函数）
+
+优先级：`id/model` 显式 → 纯数字序号 → 按实例 id / 模型名命中唯一实例 → 兜底。
+结果类型化：`instance` / `explicit` / `model` / `ambiguous`（列出候选要求消歧）/ `bad-index` / `type-hint`（是 Provider 类型名，给用法提示）/ `not-found`。
+
+**关键取舍**：兜底「裸模型名挂当前 Provider」**仅当未配置任何 providers 实例时**才允许。
+已配置 providers 时裸词必须命中实例，否则拒绝 —— 这正是堵住「拼错静默写进 config.model」的那个洞。
+
+**3. 持久化自洽**：`applyModel` 把解析出的 provider 与 model **同步**写入 `config.json`；实例未声明 `model` 时清空 `modelId`，交由该 Provider 的默认模型接管（不再把上一个模型的 id 带过去）。
+
+**4. 展示**：`/model ?` 列表带 1-based 序号（可直接 `/model 2`）并给出三种写法示例；`/model` 回显解析后的 provider/model 与来源（`provider=x · model=y`）；`getModel` 在只绑 provider 时显示 `<provider>/(provider 默认模型)`。
+
+### 验证
+
+新增 `packages/cli/src/provider-model.test.ts`（19 用例）：归一化 6（派生/去重序号/显式保留/显式重复报错/两者皆缺报错/字符规整）+ 解析 10（序号/越界/模型名/实例 id/显式/歧义/旧用法兜底/**拼错拒绝**/类型名提示/引用格式化）+ 集成 3（省略 id 的 config 直接按模型名切换并落盘自洽、`/model ?` 序号列表、拼错不污染 `config.model`）。cli 全量 **257 用例通过**、全仓 typecheck 通过（`packages/revert` 为既有错误，与本次无关）。
+
+### 附带
+
+- `/help` 的 `/model` 说明补四种写法；`buildConfigOverview`（`config check` / `/config`）改为展示归一化后的实例 id，与实际装配一致。
+- 用户 `~/.harness/config.json` 迁移：删掉与模型名重复的 `local-*` 前缀 id（改用派生 id），保留 `online`（短且非模型名派生的有意义别名），修正 `provider: "local-hy3"` → `"hy3"`、`model: "local-hy4"`（垃圾值）→ `"hy3"`；改前已备份。
+
+### 踩坑记录（工具使用）
+
+在**同一条消息里对同一文件发两个 Edit** 会出现后发编辑覆盖先发编辑（两次都被静默丢弃过）。改同一文件的多处编辑必须**顺序分开发送**，改完用 grep 复核落盘结果。
+
 ## 2026-09-15（续 125）提交键反转：Enter 提交，`\`+Enter / Shift+Enter 换行
 
 ### 背景（接续 124）

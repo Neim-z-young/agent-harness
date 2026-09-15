@@ -389,27 +389,29 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 
 ```json
 {
-  "provider": "openai",
-  "model": "gpt-4o",
+  "provider": "deepseek-chat",
+  "model": "deepseek-chat",
   "providers": [
-    { "id": "openai",   "type": "openai",    "baseUrl": "https://api.openai.com",      "apiKey": "...", "model": "gpt-4o" },
-    { "id": "deepseek", "type": "openai",    "baseUrl": "https://api.deepseek.com",    "apiKey": "...", "model": "deepseek-chat" },
-    { "id": "ollama",   "type": "openai",    "baseUrl": "http://localhost:11434",       "model": "qwen2.5" },
-    { "id": "glm",      "type": "openai",    "baseUrl": "https://open.bigmodel.cn",     "apiPath": "/api/paas/v4/chat/completions", "model": "glm-4" },
-    { "id": "gemini",   "type": "gemini",    "apiKey": "...", "model": "gemini-2.0-flash" },
-    { "id": "anthropic","type": "anthropic", "apiKey": "...", "model": "claude-3-5-sonnet" }
+    { "type": "openai",    "baseUrl": "https://api.openai.com",    "apiKey": "...", "model": "gpt-4o" },
+    { "type": "openai",    "baseUrl": "https://api.deepseek.com",  "apiKey": "...", "model": "deepseek-chat" },
+    { "type": "openai",    "baseUrl": "http://localhost:11434",                     "model": "qwen2.5" },
+    { "id": "glm",         "type": "openai", "baseUrl": "https://open.bigmodel.cn", "apiPath": "/api/paas/v4/chat/completions", "model": "glm-4" },
+    { "type": "gemini",    "apiKey": "...", "model": "gemini-2.0-flash" },
+    { "type": "anthropic", "apiKey": "...", "model": "claude-3-5-sonnet" }
   ]
 }
 ```
 
+- **实例 id 可省略（默认由 model 派生）**：`normalizeProviderConfigs` 在 boot 时补全实例 id —— 缺省取 `model`（去 `provider/` 前缀、非法字符折叠为 `-`），同名按数组顺序追加 `-2`/`-3`（确定性，可复现）。因此「id 必须唯一且冗长」不再是配置负担：写 `{ "type": "openai", "baseUrl": "...", "model": "hy3" }` 即可，实例 id 就是 `hy3`，顶层 `provider: "hy3"` 直接引用。仅在「同一模型挂多个端点」或想让 id 比模型名更短时才显式写 `id`；显式写时仍须唯一，重复会报错（避免静默覆盖注册）
 - **分发**：core 维护 `chatProviders` 注册表，`resolveChatProvider(providerId)` 按 `agent.model.providerId` 路由请求到对应 Provider；无 providerId 或未知 id 回退默认 Provider（配置的 `provider`，未注册时 fallback mock）
-- **规格**：`provider/modelId` 前缀跨 Provider 指定模型，如 `-m openai/gpt-4o`、`/model deepseek/deepseek-chat`、`/model ollama/qwen2.5`；`parseModelSpec` 拆分 providerId 与 modelId，`formatModel` 拼回展示
+- **规格与解析**：`parseModelSpec` / `formatModel` 负责 `provider/modelId` 的拆分与拼回展示；`resolveModelArg` 把「用户敲什么」与「怎么切」解耦，输出结构化的解析结果（实例 / 显式 / 裸模型名 / 歧义 / 序号越界 / 类型名提示 / 未找到）
+- **`/model` 四种写法（不再必须 `id/model`）**：① `/model <序号>`（按 `/model ?` 列表，列表项带序号）② `/model <实例 id>` ③ `/model <模型名>` ④ `/model <id>/<model>` 显式跨 Provider。命中唯一实例即自动带上该实例配置的 `model`；跨实例重名要求消歧（列出候选）；已配置 providers 时陌生输入被拒绝（`not-found`）——避免 `/model local-hy4` 这类拼错静默落成垃圾 `config.model`。未配置任何 providers 实例时保留旧用法（裸模型名挂当前 Provider）
 - **插件安装**：`HarnessApp.boot()` 依次安装非默认 Provider 插件，默认 Provider 最后安装作兜底；openai 插件 id 随 `providerId` 派生（`provider.{providerId}`），多个兼容端点不冲突
-- **切换持久化**：`/model <provider/model>` 校验 provider 已注册后更新 Agent 并写入 `config.json`（provider + model）作为下次启动默认
+- **切换持久化**：`/model <任意写法>` 解析后**同步**写入 `config.json` 的 `provider` + `model`，保证二者自洽（旧实现只在前缀命中时改 provider，会出现 provider 指向 A、model 属于 B 的不一致配置）
 
 **配置健壮性（显式校验 / 密钥加密 / 自检）：**
 
-- **启动显式校验**：`validateProviderConfigs` 检查重复 id / 未知 type / 默认 provider 未定义（非内置 mock/anthropic），boot 时一次性输出所有问题并抛 `ConfigValidationError`（不再静默覆盖/丢弃或误导提示）
+- **启动显式校验**：`normalizeProviderConfigs` 负责实例 id 的补全与唯一性（`id` 与 `model` 均缺失 → 报错；显式 `id` 重复 → 报错）；`validateProviderConfigs` 检查未知 type / 默认 provider 未定义（非内置 mock/anthropic）。boot 时一次性输出所有问题并抛 `ConfigValidationError`（不再静默覆盖/丢弃或误导提示）
 - **apiKey 三种形式**（`resolveSecret` 统一解析）：
   - 明文（向后兼容）
   - `${ENV_VAR}` 环境变量引用（未设置报错）

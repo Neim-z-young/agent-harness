@@ -940,8 +940,16 @@ export function createPluginManager(options: PluginManagerOptions): PluginManage
 
 /** 单个 Provider 定义（config.json 的 providers 数组元素 / cli 传入） */
 export interface ProviderConfig {
-  /** 唯一 ID：运行时 `provider/model` 前缀据此分发（如 anthropic / openai / deepseek / ollama） */
-  id: string
+  /**
+   * 实例 ID：运行时按 `providerId` 路由到具体 ChatProvider（注册表 key + 插件 id `provider.<id>`）。
+   *
+   * **可省略**（推荐）：省略时由 CLI 的 `normalizeProviderConfigs` 依据 `model` 自动派生
+   * （如 model="hy3" → id="hy3"），同名时按数组顺序追加 `-2` / `-3` 保证唯一。
+   * 因此「id 必须全局唯一且冗长」不再是配置者的负担。
+   *
+   * 仅在需要「同一模型挂多个端点」或想让 id 比模型名更短时才显式写；显式写时仍必须唯一。
+   */
+  id?: string
   /** Provider 类型：内置支持 anthropic / openai / gemini / glm / qwen / mock；可经插件扩展任意自定义 type */
   type: string
   /** API 根路径（如 api.openai.com / api.deepseek.com / http://localhost:11434） */
