@@ -16,7 +16,7 @@
  */
 
 import type { CliCommandInput, AgentPlugin, Hooks, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
-import { globalMcpToolIndex, resolveMcpTool, type Tool } from '@harness/tool'
+import { globalMcpToolIndex, resolveMcpTool, formatToolWhitelist, type Tool } from '@harness/tool'
 import type { Bus, Unsubscribe } from '@harness/bus'
 import { LifecycleEvents } from '@harness/core'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
@@ -280,7 +280,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
           }
           const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
           const usable = agentUsableEntries(inp)
-          out(`Agent「${inp.agentId}」可用工具（白名单：${agentTools.join(', ') || '(空)'}）：\n${renderToolTable(inp, usable, disabledMcpServers)}\n`)
+          out(`Agent「${inp.agentId}」可用工具（白名单：${formatToolWhitelist(agentTools)}）：\n${renderToolTable(inp, usable, disabledMcpServers)}\n`)
           return
         }
 

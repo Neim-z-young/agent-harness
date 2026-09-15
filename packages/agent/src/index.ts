@@ -125,7 +125,11 @@ export interface AgentDefinition {
   writesTo?: string[]
 
   // === 能力白名单 ===
-  /** 工具 ID 列表，['*'] 表示全部工具 */
+  /**
+   * 工具 ID 列表，`['*']` 表示全部工具。
+   * `['@readonly']`（见 {@link READONLY_TOOLS_SENTINEL}）= 只读工具兜底，
+   * 是 markdown 定义**未声明 `tools:`** 时的缺省值（能读不能写，fail-safe）。
+   */
   tools: string[] | ['*']
   /** 技能 ID 白名单 */
   skills?: string[]
@@ -374,6 +378,27 @@ function parseStringArr(raw: unknown): string[] | undefined {
 }
 
 /**
+ * 工具白名单哨兵：『只读工具』（注册表中 `isReadOnly()` 为 true 的全部工具）。
+ *
+ * markdown 定义**未声明 `tools:`** 时的缺省值 —— 从配置目录读进来的 Agent 默认
+ * 只给读权限（能读不能写），要写权限必须显式声明。语义解析在 `@harness/tool` 的
+ * `ToolRegistry.filterByWhitelist`。
+ *
+ * 注意：该包与 `@harness/tool` 都是零依赖叶子包、不能互相 import，故字面量各留一份
+ * （同 `tool/READONLY_TOOLS_SENTINEL`），**改动必须同步**。
+ */
+export const READONLY_TOOLS_SENTINEL = '@readonly'
+
+/** {@link agentFromMarkdown} 的可选参数 */
+export interface ParseAgentOptions {
+  /**
+   * 告警回调：如「未声明 tools，已按只读工具兜底」。
+   * 解析保持纯函数、不引用日志设施，由调用方（core）把 warn 接到自己的 logger。
+   */
+  onWarn?: (message: string) => void
+}
+
+/**
  * 从 Markdown 配置文件内容构建 AgentDefinition。
  *
  * frontmatter 字段映射到 AgentDefinition 的字段：
@@ -382,13 +407,17 @@ function parseStringArr(raw: unknown): string[] | undefined {
  * - permission, model
  * - body（Markdown 正文）→ promptFragments[0]
  *
- * 必填字段缺失时抛错（id, name, mode, tools, permission）。
+ * 缺省行为（只有 id 缺失才抛错）：
+ * - `mode` 缺省 subagent；`permission` 缺省 `{ '*': 'ask' }`
+ * - `tools` 缺省 → {@link READONLY_TOOLS_SENTINEL}（只读工具兜底）并回调 `opts.onWarn`。
+ *   刻意不是 `['*']`：从配置目录读进来的定义不该默认拿到写权限。
  *
  * @param content Markdown 文件内容
  * @param fallbackId 如果 frontmatter 无 id，用此值（如文件名）
+ * @param opts.onWarn 告警回调（纯函数不依赖日志设施，由调用方接入 logger）
  * @returns AgentDefinition
  */
-export function agentFromMarkdown(content: string, fallbackId?: string): AgentDefinition {
+export function agentFromMarkdown(content: string, fallbackId?: string, opts?: ParseAgentOptions): AgentDefinition {
   const { frontmatter, body } = parseFrontmatter(content)
 
   const id = String(frontmatter.id ?? fallbackId ?? '')
@@ -400,13 +429,27 @@ export function agentFromMarkdown(content: string, fallbackId?: string): AgentDe
     throw new Error('Agent 配置文件缺少 id（frontmatter.id 或 fallbackId）')
   }
 
-  // tools: 支持 ['*'] 或 string[]
+  // tools: 支持 ['*'] / 'readonly'（只读哨兵）/ id 列表。
+  // 未声明 → 只读哨兵兜底 + 告警；显式 `tools: []` 仍是「一个工具都不给」，两者刻意区分。
   const toolsRaw = frontmatter.tools
-  const tools: string[] | ['*'] = Array.isArray(toolsRaw)
-    ? toolsRaw.map(String)
-    : typeof toolsRaw === 'string' && toolsRaw === '*'
-      ? ['*']
-      : []
+  let tools: string[] | ['*']
+  if (toolsRaw === undefined || toolsRaw === null || (typeof toolsRaw === 'string' && !toolsRaw.trim())) {
+    tools = [READONLY_TOOLS_SENTINEL]
+    opts?.onWarn?.(
+      `Agent "${id}" 未声明 tools，已按「只读工具」兜底（${READONLY_TOOLS_SENTINEL}：注册表中 isReadOnly 的工具）。`
+      + ' 需要写权限请显式声明，例如 tools: [read_file, write_file, bash] 或 tools: "*"。',
+    )
+  } else if (Array.isArray(toolsRaw)) {
+    tools = toolsRaw.map(String).map((s) => s.trim()).filter(Boolean)
+  } else if (typeof toolsRaw === 'string') {
+    const v = toolsRaw.trim()
+    if (v === '*') tools = ['*']
+    else if (v === 'readonly' || v === READONLY_TOOLS_SENTINEL) tools = [READONLY_TOOLS_SENTINEL]
+    else tools = v.split(',').map((s) => s.trim()).filter(Boolean)
+  } else {
+    tools = [READONLY_TOOLS_SENTINEL]
+    opts?.onWarn?.(`Agent "${id}" 的 tools 字段格式无法识别（应为数组或字符串），已按「只读工具」兜底。`)
+  }
 
   // permission: 简写 'allow'/'deny'/'ask' → { '*': value }
   // 或详细对象 { read: 'allow', write: 'ask', '*': 'deny' }

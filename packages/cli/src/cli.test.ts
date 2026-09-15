@@ -110,6 +110,48 @@ describe('parseCliArgs 命令解析', () => {
     expect(parseCliArgs(['--check-config', '-d', '/x'])).toMatchObject({ checkConfig: true, dataDir: '/x' })
     expect(parseCliArgs(['repl']).checkConfig).toBeUndefined()
   })
+
+  it('-c / --cwd / --cwd= 都解析到 cwd；未传则不设置（由工作目录兜底）', () => {
+    expect(parseCliArgs(['-c', '/tmp/a']).cwd).toBe('/tmp/a')
+    expect(parseCliArgs(['--cwd', '/tmp/b']).cwd).toBe('/tmp/b')
+    expect(parseCliArgs(['--cwd=/tmp/c']).cwd).toBe('/tmp/c')
+    expect(parseCliArgs(['-c=/tmp/d']).cwd).toBe('/tmp/d')
+    expect(parseCliArgs([]).cwd).toBeUndefined()
+  })
+})
+
+// ===== 工作目录：启动参数传入，未传才取当前目录 =====
+describe('工作目录（启动参数 > 当前目录）', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-cwd-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('传入 cwd → 以其为准，且项目级 .harness 落在该目录下', () => {
+    const workdir = join(dir, 'projA')
+    mkdirSync(workdir, { recursive: true })
+    const app = new HarnessApp({
+      cwd: workdir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+    })
+    expect(app.workspace.cwd).toBe(workdir)
+    expect(app.workspace.project.root).toBe(join(workdir, '.harness'))
+    // 会话指针也要跟着工作目录走（自动恢复的 id 记在工作目录里）
+    expect(app.sessionPointer.path()).toBe(join(workdir, '.harness', 'last-session.json'))
+  })
+
+  it('未传 cwd → 取当前进程目录', () => {
+    const app = new HarnessApp({
+      dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+    })
+    expect(app.workspace.cwd).toBe(process.cwd())
+  })
+
+  it('相对 cwd 会被规范化为绝对路径；未传 dataDir 取默认数据目录', () => {
+    const app = new HarnessApp({
+      cwd: '.', dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+    })
+    expect(app.workspace.cwd).toBe(process.cwd())
+    expect(app.workspace.cwd.startsWith('/')).toBe(true)
+  })
 })
 
 describe('ConfigStore 全局配置（config.json）', () => {

@@ -2065,11 +2065,16 @@ export class HarnessImpl implements Harness {
     const agentLoader = new MultiDirLoader(
       normalizeDirs(options.agentDirs ?? [], 'project').map((e) => ({ dir: resolve(cwd, e.dir), source: e.source })),
     )
+    const warnAgent = this.options.logger?.warn?.bind(this.options.logger)
     for (const item of agentLoader.scan({ kind: 'file', name: (n) => extname(n) === '.md' })) {
       try {
         const content = readFileSync(item.full, 'utf-8')
         // 文件名（不含扩展名）作为 fallbackId
-        const def = agentFromMarkdown(content, basename(item.name, '.md'))
+        // onWarn：md 未声明 tools 时会按「只读工具」兜底（fail-safe），必须让用户看见，
+        // 否则现象是「子 Agent 能派出但什么也干不了」——正是缺 tools 的隐蔽症状。
+        const def = agentFromMarkdown(content, basename(item.name, '.md'), {
+          onWarn: (msg) => (warnAgent ? warnAgent(msg) : console.warn(msg)),
+        })
         agentImpl.register(def)
       } catch (err) {
         this.options.logger?.warn?.(`Agent 配置文件加载失败: ${item.full}: ${(err as Error)?.message ?? err}`)

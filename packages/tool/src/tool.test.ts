@@ -19,6 +19,8 @@ import {
   filterMcpTools,
   McpToolIndex,
   resolveMcpTool,
+  READONLY_TOOLS_SENTINEL,
+  formatToolWhitelist,
 } from './index'
 
 // ===== 测试工具：简易 Schema 构造器（不依赖 zod） =====
@@ -288,6 +290,64 @@ describe('@harness/tool', () => {
       reg.registerAll([readFile])
       const picked = reg.filterByWhitelist(['read_file', 'nope'])
       expect(picked.map((t) => t.id)).toEqual(['read_file'])
+    })
+
+    // ===== 只读哨兵：Agent 未声明 tools 时的兜底白名单 =====
+    describe(`filterByWhitelist 哨兵 ${READONLY_TOOLS_SENTINEL}`, () => {
+      it('listReadOnly 只返回 isReadOnly() 为 true 的工具', () => {
+        reg.registerAll([readFile, writeFile])
+        expect(reg.listReadOnly().map((t) => t.id)).toEqual(['read_file'])
+      })
+
+      it('未声明 isReadOnly 的工具不算只读（Fail-Closed）', () => {
+        // defineTool 会把默认值补成 () => false，等价于「保守视为可写」
+        reg.registerAll([readFile, writeFile])
+        expect(reg.get('write_file')!.isReadOnly!(undefined)).toBe(false)
+        expect(reg.listReadOnly().map((t) => t.id)).not.toContain('write_file')
+      })
+
+      it('isReadOnly 抛错时按可写处理，不影响其他工具', () => {
+        reg.register(readFile)
+        reg.register({
+          ...writeFile,
+          isReadOnly: () => { throw new Error('boom') },
+        } as any)
+        expect(reg.listReadOnly().map((t) => t.id)).toEqual(['read_file'])
+      })
+
+      it('哨兵展开为全部只读工具（写工具被排除）', () => {
+        reg.registerAll([readFile, writeFile])
+        expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL]).map((t) => t.id)).toEqual(['read_file'])
+      })
+
+      it('哨兵可与普通 id 混写（展开处保持注册顺序，去重）', () => {
+        reg.registerAll([readFile, writeFile])
+        expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL, 'write_file']).map((t) => t.id))
+          .toEqual(['read_file', 'write_file'])
+        expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL, 'read_file']).map((t) => t.id))
+          .toEqual(['read_file'])
+      })
+
+      it('不是通配：只读哨兵不等于「全部工具」', () => {
+        reg.registerAll([readFile, writeFile])
+        expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL])).toHaveLength(1)
+        expect(reg.filterByWhitelist(['*'])).toHaveLength(2)
+      })
+    })
+  })
+
+  describe('formatToolWhitelist', () => {
+    it('哨兵渲染为「只读工具（缺省）」，不吐内部字面量', () => {
+      expect(formatToolWhitelist([READONLY_TOOLS_SENTINEL])).toBe('只读工具（缺省）')
+      expect(formatToolWhitelist([READONLY_TOOLS_SENTINEL])).not.toContain('@')
+    })
+    it('通配与空/缺失各有明确呈现', () => {
+      expect(formatToolWhitelist(['*'])).toContain('全部工具')
+      expect(formatToolWhitelist([])).toBe('（无）')
+      expect(formatToolWhitelist(undefined)).toBe('（无）')
+    })
+    it('普通白名单逐项列出', () => {
+      expect(formatToolWhitelist(['read_file', 'bash'])).toBe('read_file, bash')
     })
   })
 

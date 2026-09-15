@@ -399,6 +399,29 @@ export interface ToolRegisterOptions {
 }
 
 /**
+ * 工具白名单哨兵：『只读工具』。
+ *
+ * 语义由 {@link ToolRegistry.filterByWhitelist} 解析：展开为注册表中 `isReadOnly()` 为 true
+ * 的全部工具（Fail-Closed —— 未显式声明只读的工具不算只读）。
+ * 用途：Agent 没声明 `tools:` 时给一个「能读不能写」的安全兜底，
+ * 见 `@harness/agent` 的 markdown 解析（`agentFromMarkdown` 缺 tools 时写入本值）。
+ *
+ * 注意：`@harness/agent` 与该包都是零依赖叶子包、不能互相 import，故字面量各留一份
+ * （同 `agent/READONLY_TOOLS_SENTINEL`），**改动必须同步**。
+ */
+export const READONLY_TOOLS_SENTINEL = '@readonly'
+
+/**
+ * 工具白名单的人类可读呈现（供 /tools、/subagents 等展示）：
+ * 哨兵换成「只读工具」，空数组为「（无）」。
+ */
+export function formatToolWhitelist(whitelist: string[] | ['*'] | undefined): string {
+  if (!whitelist || whitelist.length === 0) return '（无）'
+  if (whitelist.length === 1 && whitelist[0] === '*') return '*（全部工具）'
+  return whitelist.map((t) => (t === READONLY_TOOLS_SENTINEL ? '只读工具（缺省）' : t)).join(', ')
+}
+
+/**
  * ToolRegistry：工具注册中心
  *
  * 负责：
@@ -461,6 +484,23 @@ export class ToolRegistry {
     return Array.from(this.byId.values())
   }
 
+  /**
+   * 只读工具（`isReadOnly()` 为 true 的）。
+   *
+   * Fail-Closed：未声明 `isReadOnly`、声明为 false、或求值抛错，一律视为可写（不返回）。
+   * 供白名单哨兵 {@link READONLY_TOOLS_SENTINEL} 展开用；也可用于展示/审计。
+   */
+  listReadOnly(): Tool[] {
+    return this.list().filter((t) => {
+      try {
+        const v = typeof t.isReadOnly === 'function' ? t.isReadOnly(undefined) : (t as { isReadOnly?: boolean }).isReadOnly
+        return v === true
+      } catch {
+        return false
+      }
+    })
+  }
+
   /** 当前注册数量 */
   get size(): number {
     return this.byId.size
@@ -471,6 +511,8 @@ export class ToolRegistry {
    *
    * 规则：
    * - whitelist = ['*'] → 全部放行
+   * - whitelist 含 {@link READONLY_TOOLS_SENTINEL} → 该位展开为全部只读工具
+   *   （可与普通 id 混写，展开处保持注册顺序）
    * - 否则：只保留 ID 在列表里的工具，并同时匹配 alias
    */
   filterByWhitelist(whitelist: string[] | ['*']): Tool[] {
@@ -478,9 +520,15 @@ export class ToolRegistry {
       return this.list()
     }
     const result: Tool[] = []
-    for (const id of whitelist as string[]) {
-      const t = this.get(id)
+    const push = (t: Tool | undefined): void => {
       if (t && !result.includes(t)) result.push(t)
+    }
+    for (const id of whitelist as string[]) {
+      if (id === READONLY_TOOLS_SENTINEL) {
+        for (const t of this.listReadOnly()) push(t)
+        continue
+      }
+      push(this.get(id))
     }
     return result
   }

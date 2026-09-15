@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { parseFrontmatter, agentFromMarkdown } from './index'
+import { parseFrontmatter, agentFromMarkdown, READONLY_TOOLS_SENTINEL } from './index'
 
 // ===== parseFrontmatter 测试 =====
 
@@ -171,6 +171,66 @@ tools: "*"
 ---`
     const def = agentFromMarkdown(content)
     expect(def.tools).toEqual(['*'])
+  })
+
+  // ===== tools 缺省：只读兜底（fail-safe）+ 告警 =====
+  // 背景：以前缺省是 []（一个工具都不给），现象是「子 Agent 能派出但什么也干不了」，
+  // 且没有任何提示；文档却承诺「tools 缺失抛错」。现在改为只读哨兵 + 显式告警。
+  describe('tools 缺省 → 只读哨兵', () => {
+    it('未声明 tools → [READONLY_TOOLS_SENTINEL] 并告警', () => {
+      const warns: string[] = []
+      const def = agentFromMarkdown(`---
+id: reviewer
+name: Reviewer
+mode: subagent
+description: 评审
+---`, undefined, { onWarn: (m) => warns.push(m) })
+
+      expect(def.tools).toEqual([READONLY_TOOLS_SENTINEL])
+      expect(READONLY_TOOLS_SENTINEL).toBe('@readonly')
+      expect(warns).toHaveLength(1)
+      // 告警要给出可执行的出口，而不只是「有问题」
+      expect(warns[0]).toContain('reviewer')
+      expect(warns[0]).toContain('tools')
+      expect(warns[0]).toContain('写权限')
+    })
+
+    it('不传 onWarn 时不抛错（纯函数不依赖日志设施）', () => {
+      const def = agentFromMarkdown('---\nid: x\nname: X\n---')
+      expect(def.tools).toEqual([READONLY_TOOLS_SENTINEL])
+    })
+
+    it('tools: 空字符串 → 视为未声明（只读兜底 + 告警）', () => {
+      const warns: string[] = []
+      const def = agentFromMarkdown('---\nid: x\nname: X\ntools: ""\n---', undefined, { onWarn: (m) => warns.push(m) })
+      expect(def.tools).toEqual([READONLY_TOOLS_SENTINEL])
+      expect(warns).toHaveLength(1)
+    })
+
+    it('显式 tools: []（block 形式）→ 仍是「一个工具都不给」，不告警', () => {
+      const warns: string[] = []
+      const def = agentFromMarkdown(`---
+id: mute
+name: Mute
+tools: []
+---`, undefined, { onWarn: (m) => warns.push(m) })
+      expect(def.tools).toEqual([])
+      expect(warns).toEqual([])
+    })
+
+    it('tools: readonly / "@readonly" → 哨兵（显式写法，不告警）', () => {
+      const warns: string[] = []
+      expect(agentFromMarkdown('---\nid: a\nname: A\ntools: readonly\n---', undefined, { onWarn: (m) => warns.push(m) }).tools)
+        .toEqual([READONLY_TOOLS_SENTINEL])
+      expect(agentFromMarkdown('---\nid: b\nname: B\ntools: "@readonly"\n---', undefined, { onWarn: (m) => warns.push(m) }).tools)
+        .toEqual([READONLY_TOOLS_SENTINEL])
+      expect(warns).toEqual([])
+    })
+
+    it('tools 逗号字符串 → 数组（与 mcpServers 等字段的写法保持一致）', () => {
+      const def = agentFromMarkdown('---\nid: a\nname: A\ntools: read_file, bash\n---')
+      expect(def.tools).toEqual(['read_file', 'bash'])
+    })
   })
 
   it('mcpServers/excludeMcpServers：块级列表 → 数组', () => {

@@ -18,6 +18,7 @@ import {
   type SubagentPluginOptions,
 } from './index'
 import { createBus } from '@harness/bus'
+import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
 import type { AgentDefinition } from '@harness/agent'
 import type { AgentRuntime, AgentStreamEvent } from '@harness/core'
 import type { SessionManager, Session, Message } from '@harness/session'
@@ -616,6 +617,51 @@ describe('createSubagentPlugin', () => {
     expect(text).not.toInclude('undefined')
     // primary 不是子 Agent，不该出现
     expect(text).not.toInclude('主 Agent')
+  })
+
+  it('/subagents：只读哨兵白名单渲染成「只读工具（缺省）」并解析出实际工具 id', async () => {
+    // md 未声明 tools 时由 agentFromMarkdown 写入只读哨兵，这里的展示必须让用户
+    // 看懂「它到底能用什么」——只写「只读工具」四个字等于没说。
+    const mdAgent: AgentDefinition = {
+      id: 'devops-architect',
+      name: 'DevOps 工程师',
+      description: 'CI/CD 与部署',
+      mode: 'subagent',
+      tools: [READONLY_TOOLS_SENTINEL],
+      permission: { '*': 'allow' },
+      promptFragments: [],
+    }
+    const plugin = createSubagentPlugin({ subagents: [] })
+    const { ctx } = makeCtx()
+    const hooks = await plugin.install(ctx)
+    const registry: AgentDefinition[] = [mdAgent]
+    const mockHarness = {
+      agent: {
+        register: () => {},
+        get: (id: string) => registry.find((a) => a.id === id),
+        list: () => registry,
+        query: async () => makeMessage('assistant', 'ok'),
+        queryStream: async function* () {},
+      } as any,
+      session: createMockSessionManager(new Map()),
+      // 哨兵由 ToolRegistry 展开；这里模拟「只读工具 = read_file + list_dir」
+      tools: {
+        filterByWhitelist: (w: string[]) => (w.includes(READONLY_TOOLS_SENTINEL) ? [{ id: 'read_file' }, { id: 'list_dir' }] : []),
+      },
+    }
+    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+
+    const out: string[] = []
+    await (hooks as any)['cli.command']?.({
+      command: 'subagents', arg: '', out: (s: string) => { out.push(s) },
+      sessionId: 's1', raw: 'subagents', result: undefined as any,
+    })
+    const text = out.join('')
+
+    expect(text).toInclude('只读工具（缺省）')
+    expect(text).toInclude('= read_file, list_dir')
+    // 不把内部字面量吐给用户
+    expect(text).not.toInclude(READONLY_TOOLS_SENTINEL)
   })
 
   it('插件未配置子 Agent、但注册表里有 md 定义的子 Agent 时，/subagents 仍注册', async () => {

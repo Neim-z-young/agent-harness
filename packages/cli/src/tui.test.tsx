@@ -1378,6 +1378,17 @@ describe('TuiApp /edit 外部编辑器命令', () => {
     expect(resolveEditPath('/abs/a.ts')).toBe('/abs/a.ts')
   })
 
+  // 工作目录是**启动参数**决定的（-c/--cwd），缺省才是进程启动目录：
+  // TUI 里所有相对路径都必须以它为基准，不能硬用 process.cwd()。
+  it('resolveEditPath：显式 base（启动工作目录）优先于 process.cwd()', () => {
+    const workdir = '/tmp/harness-workdir-base'
+    expect(resolveEditPath('relative/z.ts', workdir)).toBe(join(workdir, 'relative/z.ts'))
+    expect(resolveEditPath('a/b.ts', workdir)).not.toContain(process.cwd())
+    // 绝对路径与 ~ 不受 base 影响
+    expect(resolveEditPath('/abs/a.ts', workdir)).toBe('/abs/a.ts')
+    expect(resolveEditPath('~/x.ts', workdir)).toBe(join(require('node:os').homedir(), 'x.ts'))
+  })
+
   it('abbrevFileRef：~ 相对化 + 超宽中间省略保留目录与文件名', () => {
     const home = require('node:os').homedir()
     expect(abbrevFileRef(join(home, 'x/a.ts'))).toBe('~/x/a.ts')
@@ -1388,6 +1399,28 @@ describe('TuiApp /edit 外部编辑器命令', () => {
     expect(out.length).toBeLessThanOrEqual(30)
     expect(out.endsWith('engine.ts')).toBe(true)
     expect(out).toContain('…')
+  })
+
+  it('abbrevFileRef：显式 base 时按该目录做 `./` 相对化', () => {
+    const workdir = '/tmp/harness-workdir-base'
+    expect(abbrevFileRef(join(workdir, 'src/a.ts'), 40, workdir)).toBe('./src/a.ts')
+    expect(abbrevFileRef(workdir, 40, workdir)).toBe('.')
+    // 不在 base 下的路径原样保留（不会被错误地挂上 ./）
+    expect(abbrevFileRef('/other/place/a.ts', 40, workdir)).toBe('/other/place/a.ts')
+  })
+
+  it('buildDiskFileTree：根节点按 base 相对化，引用按 base 解析后打标', () => {
+    const workdir = mkdtempSync(join(tmpdir(), 'harness-tree-base-'))
+    try {
+      mkdirSync(join(workdir, 'src'), { recursive: true })
+      writeFileSync(join(workdir, 'src/app.ts'), 'x', 'utf8')
+      const { nodes } = buildDiskFileTree(workdir, ['src/app.ts'], { cwd: workdir })
+      expect(nodes[0].name).toBe('.')  // 根 = 工作目录本身
+      const src = nodes[0].children.find((c) => c.name === 'src')
+      expect(src?.children.some((c) => c.name === 'app.ts' && c.marked)).toBe(true)
+    } finally {
+      rmSync(workdir, { recursive: true, force: true })
+    }
   })
 
   it('buildEditorCommand 用 $EDITOR + 独立 +行号，绝不拼 path:line', () => {
@@ -1417,17 +1450,18 @@ describe('TuiApp /edit 外部编辑器命令', () => {
   })
 
   it('提交 /edit <file>:<line> 调用 openFile，回读尾部注入聊天区', async () => {
-    // 临时文件（相对 cwd），确保回读可命中
-    const tmpName = `__tui_edit_cmd_${Date.now()}`
-    const dirUnderCwd = join(process.cwd(), tmpName)
-    mkdirSync(dirUnderCwd, { recursive: true })
-    const editPath = join(dirUnderCwd, 'edit.ts')
-    writeFileSync(editPath, 'head\n---\ntail2\ntail3\n', 'utf8')
-    const ref = `${tmpName}/edit.ts:2`
     const opened: Array<[string, number | undefined]> = []
+    const f = await mountTui({ openFile: (p, l) => { opened.push([p, l]) } })
+    // 相对路径的基准是**启动时解析出的工作目录**（`-c/--cwd` 传入值，未传才是进程启动目录），
+    // 所以文件必须真的建在 fixture 的工作目录下 —— 这也是本用例要锁住的行为：
+    // 若基准退回 process.cwd()，回读就会落到别处、命中不到这个文件。
+    const tmpName = `__tui_edit_cmd_${Date.now()}`
+    const dirUnderCwd = join(f.app.workspace.cwd, tmpName)
+    mkdirSync(dirUnderCwd, { recursive: true })
+    writeFileSync(join(dirUnderCwd, 'edit.ts'), 'head\n---\ntail2\ntail3\n', 'utf8')
+    const ref = `${tmpName}/edit.ts:2`
 
     try {
-      const f = await mountTui({ openFile: (p, l) => { opened.push([p, l]) } })
       await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
       f.setup.mockInput.typeText('/edit ' + ref)
       for (let i = 0; i < 8; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
@@ -1438,9 +1472,37 @@ describe('TuiApp /edit 外部编辑器命令', () => {
       // 回读展示文件尾部（最新 8 行内包含 tail2）
       await waitFrame(f.setup, (fr) => fr.includes('tail2'))
       expect(f.setup.captureCharFrame()).toContain('已编辑')
-      await f.cleanup()
     } finally {
       rmSync(dirUnderCwd, { recursive: true, force: true })
+      await f.cleanup()
+    }
+  })
+})
+
+// ------------------------------------------------------------------------
+// /tree：根目录取「启动时解析出的工作目录」，不是进程启动目录
+// ------------------------------------------------------------------------
+
+describe('TuiApp /tree 与工作目录', () => {
+  it('/tree 无参数 → 以启动工作目录为根（不是进程启动目录）', async () => {
+    const f = await mountTui({ responses: [{ match: /hi/, response: 'READY-SIGNAL' }] })
+    // fixture 的工作目录是临时目录，而进程启动目录是仓库根 —— 两者必然不同，
+    // 所以根节点只需相对化到「工作目录本身」= `.`；若退回 process.cwd() 就会显示仓库路径。
+    expect(f.app.workspace.cwd).not.toBe(process.cwd())
+    try {
+      await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+      // 先发一句：只剩 system 块时聊天区由欢迎页顶替，/tree 这类系统输出看不见
+      await f.setup.mockInput.typeText('hi')
+      pressSubmit(f.setup)
+      await waitFrame(f.setup, (fr) => fr.includes('READY-SIGNAL'))
+
+      f.setup.mockInput.typeText('/tree')
+      for (let i = 0; i < 8; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
+      pressSubmit(f.setup)
+      const frame = await waitFrame(f.setup, (fr) => fr.includes('文件树（.'))
+      expect(frame).toContain('文件树（.）')
+    } finally {
+      await f.cleanup()
     }
   })
 })

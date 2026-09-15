@@ -323,6 +323,8 @@ export interface DiskTreeOptions {
   maxNodes?: number
   /** 排除的 basename（目录与文件；默认 .git / node_modules / .DS_Store） */
   exclude?: string[]
+  /** 工作目录基准（引用相对路径解析 + 根节点缩短用；缺省 process.cwd()） */
+  cwd?: string
 }
 
 /**
@@ -339,18 +341,19 @@ export function buildDiskFileTree(
   const maxDepth = opts.maxDepth ?? 3
   const maxNodes = opts.maxNodes ?? 100
   const exclude = new Set(opts.exclude ?? ['.git', 'node_modules', '.DS_Store'])
+  const baseCwd = opts.cwd ?? process.cwd()
   // 引用 → 绝对路径集合：cwd 基准 + 相对 root 基准双解析，覆盖 ~/绝对/相对三种形态
   const marked = new Set<string>()
   for (const ref of refs) {
     const base = ref.replace(/:\d+(?::\d+)?$/, '')
-    marked.add(resolveEditPath(base))
+    marked.add(resolveEditPath(base, baseCwd))
     marked.add(resolve(root, base))
   }
   let count = 0
   let truncated = false
   const rootNode: FileRefTreeNode = {
     key: `root:${root}`,
-    name: abbrevFileRef(root, 60),
+    name: abbrevFileRef(root, 60, baseCwd),
     kind: 'root',
     absPath: root,
     children: [],
@@ -916,6 +919,10 @@ export function approvalLine(q: string): string {
 }
 
 export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (r: TuiReplExit) => void }) {
+  // 工作目录取**启动时解析出的**（`-c/--cwd` 传入值，未传才是进程启动目录）。
+  // TUI 里凡是「相对路径基准 / 文件树根」都必须用它，不能用 process.cwd() —— 后者
+  // 是进程启动目录，`--cwd` 指定了别处时会把文件树/相对路径解析到错误的目录。
+  const workdir = options.app.workspace.cwd
   // 「本次启动如何决定当前会话」的说明（与 REPL 同一套文案）：自动恢复了哪个会话、
   // 或为什么没恢复。只在挂载时算一次；会话被 /new、/resume 切换后即失效并清空。
   const [restoreNotice, setRestoreNotice] = useState(() => describeSessionRestore(options.app.sessionRestore))
@@ -1242,7 +1249,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       // /tree [path]：扫描磁盘打印目录树，对话引用过的文件带 * 标记（不入历史栈、不进会话内核）
       if (v.startsWith('/tree')) {
         const arg = v.replace(/^\/tree\s*/, '').trim()
-        const root = arg ? resolveEditPath(arg) : process.cwd()
+        // 无参数时以工作目录为根（`--cwd` 指定别处时不能退化成进程启动目录）
+        const root = arg ? resolveEditPath(arg, workdir) : workdir
         setState((prev) => {
           let isDir = false
           try { isDir = statSync(root).isDirectory() } catch { isDir = false }
@@ -1250,7 +1258,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             return { ...prev, blocks: [...prev.blocks, { id: prev.nextId, kind: 'system', text: `目录不存在：${root}` }], nextId: prev.nextId + 1 }
           }
           const refs = collectFileReferences(prev, Number.MAX_SAFE_INTEGER)
-          const { nodes, truncated } = buildDiskFileTree(root, refs)
+          const { nodes, truncated } = buildDiskFileTree(root, refs, { cwd: workdir })
           const lines = [`文件树（${nodes[0].name}）${truncated ? '（截断）' : ''}：`, renderFileRefTree(nodes)]
           if (anyMarked(nodes)) lines.push('', '* = 对话中引用过的文件')
           return { ...prev, blocks: [...prev.blocks, { id: prev.nextId, kind: 'system', text: lines.join('\n') }], nextId: prev.nextId + 1 }
@@ -1281,7 +1289,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         const openPromise = open(parsed.path, parsed.line)
         void (openPromise ? Promise.resolve(openPromise) : Promise.resolve()).then(async () => {
           // 编辑结束回读磁盘（与编辑器打开用同一绝对路径基准解析），仅当文件可读时注入摘要
-          const abs = resolveEditPath(parsed.path)
+          const abs = resolveEditPath(parsed.path, workdir)
           let content = ''
           try { content = await readFile(abs, 'utf8') } catch { /* 文件不可读则不回读 */ }
           if (!content) return
@@ -1700,7 +1708,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                       : createTextAttributes({ dim: true, underline: true })
                     return (
                       <text key={p} attributes={attrs} wrapMode="word" width={SIDEBAR_WIDTH - 4}>
-                        {fileMode && options.openFile ? (active ? '▸' : ' ') : ''}{abbrevFileRef(p, SIDEBAR_WIDTH - 6)}
+                        {fileMode && options.openFile ? (active ? '▸' : ' ') : ''}{abbrevFileRef(p, SIDEBAR_WIDTH - 6, workdir)}
                       </text>
                     )
                   }))}
@@ -1837,10 +1845,13 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
 /**
  * 缩写：外层文件引用路径为"可读且保留目录层级"的单行形态。
- * 优先相对化到主目录（`~/...`）再相对化到 cwd；仍超宽时对中间目录做省略
+ * 优先相对化到主目录（`~/...`）再相对化到工作目录；仍超宽时对中间目录做省略
  * （`dir1/…/name.ext`），文件名与最近一级目录始终保留。
+ *
+ * @param base 工作目录基准（缺省 process.cwd()）。TUI 应传启动时解析出的工作目录，
+ *   否则以 `--cwd` 启动时 `./` 前缀会指向进程启动目录而非实际工作目录。
  */
-export function abbrevFileRef(path: string, maxLen = 40): string {
+export function abbrevFileRef(path: string, maxLen = 40, base?: string): string {
   if (!path) return path
   const home = homedir()
   const rels: string[] = []
@@ -1848,9 +1859,9 @@ export function abbrevFileRef(path: string, maxLen = 40): string {
   if (path === home) return '~'
   if (path.startsWith(home + '/')) rels.push(path === home ? '~' : '~' + path.slice(home.length))
   else if (path.startsWith('~/')) rels.push(path)
-  // cwd 相对化（`./...`），与主目录相对化并存、取较短者
+  // 工作目录相对化（`./...`），与主目录相对化并存、取较短者
   try {
-    const cwd = process.cwd()
+    const cwd = base ?? process.cwd()
     if (path === cwd) rels.push('.')
     else if (path.startsWith(cwd + '/')) rels.push('.' + path.slice(cwd.length))
     else if (path.startsWith('./')) rels.push(path)
@@ -1868,18 +1879,21 @@ export function abbrevFileRef(path: string, maxLen = 40): string {
     if (candidate.length + 2 + leaf.length > maxLen) break
     headFull = candidate
   }
-  const base = `${headFull}/…/${leaf}`
-  return base.length <= maxLen ? base : `…/${leaf}`
+  const collapsed = `${headFull}/…/${leaf}`
+  return collapsed.length <= maxLen ? collapsed : `…/${leaf}`
 }
 
 /**
- * 解析编辑器目标路径（双基准）：`~`/`~/` 开头 → 主目录；其余 → 基于（run 时）cwd。
+ * 解析编辑器目标路径（双基准）：`~`/`~/` 开头 → 主目录；其余 → 基于工作目录。
+ *
+ * @param base 相对路径的基准目录，缺省 `process.cwd()`。TUI 里应传**启动时解析出的
+ *   工作目录**（`--cwd` 可能不等于进程启动目录），否则相对路径会落到错误的目录。
  * 返回规范化的绝对路径，供编辑器打开与回读统一使用。
  */
-export function resolveEditPath(path: string): string {
+export function resolveEditPath(path: string, base: string = process.cwd()): string {
   if (path === '~' || path.startsWith('~/')) return join(homedir(), path.slice(2))
   if (path.startsWith('~')) return join(homedir(), path.slice(1))
-  return resolve(path)
+  return resolve(base, path)
 }
 
 /**
@@ -1905,8 +1919,8 @@ function isExecutableInPath(name: string): boolean {
 }
 
 /** 构造编辑器启动参数：编辑器命令 + 独立 `+<line>`（绝不拼 `path:line`）。 */
-function buildEditorArgv(path: string, line?: number): string[] {
-  const abs = resolveEditPath(path)
+function buildEditorArgv(path: string, line?: number, base?: string): string[] {
+  const abs = resolveEditPath(path, base)
   const cmd = pickEditor()
   if (!cmd) return [abs] // 无可用编辑器时退化：仅返回文件路径（调用方决定如何处理）
   return [...cmd, ...(line != null && line > 1 ? [`+${line}`] : []), abs]
@@ -1916,9 +1930,11 @@ function buildEditorArgv(path: string, line?: number): string[] {
  * 用本机编辑器打开文件。返回需前台运行的命令 argv（纯函数），由调用方决定如何执行
  * （TUI 下先 suspend 再前台 spawn inherit，避免 alt-screen 下后台 spawn 令编辑器拿不到
  * 前台焦点而"打不开"）。
+ *
+ * @param base 相对路径基准（缺省 process.cwd()）；TUI 应传启动时解析出的工作目录
  */
-export function buildEditorCommand(path: string, line?: number): string[] {
-  return buildEditorArgv(path, line)
+export function buildEditorCommand(path: string, line?: number, base?: string): string[] {
+  return buildEditorArgv(path, line, base)
 }
 
 /**
@@ -1940,7 +1956,9 @@ export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit
   const opts: TuiReplOptions = options.openFile ? options : {
     ...options,
     openFile: async (path, line) => {
-      const argv = buildEditorCommand(path, line)
+      // 相对路径按**启动时解析出的工作目录**解析（不是进程启动目录）：
+      // `--cwd X` 启动时，侧栏引用/`/edit` 的相对路径必须落在 X 下。
+      const argv = buildEditorCommand(path, line, options.app.workspace.cwd)
       // 无可用编辑器时 argv 退化为 [abs]（单路径，不可 spawn），此时直接返回、不做挂起
       if (argv.length < 2) return
       try {

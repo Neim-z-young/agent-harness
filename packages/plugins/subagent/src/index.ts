@@ -32,7 +32,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, Tool, ToolResult, Schema, ToolContext, formatToolWhitelist, READONLY_TOOLS_SENTINEL } from '@harness/tool'
 import type { AgentPlugin, Hooks, CliCommandInput, SubagentCapability } from '@harness/plugin'
 import type { AgentDefinition, AgentPermissionConfig } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
@@ -237,6 +237,8 @@ interface HarnessLike {
   bus?: Bus
   /** 全局工具工作目录（core 传入 HarnessImpl.cwd；子 Agent 判 git worktree 用） */
   cwd?: string
+  /** 工具注册表（可选）：把只读哨兵白名单解析成实际工具 id，供 /subagents 展示 */
+  tools?: { filterByWhitelist(whitelist: string[] | ['*']): Array<{ id: string }> }
 }
 
 // ===== Schema helper（自包含，避免跨包依赖）=====
@@ -1257,7 +1259,13 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
                 const hint = hiddenCount > 0 ? `（${hiddenCount} 个被权限过滤隐藏）` : ''
                 input.out(`可调用 ${accessible.length} 个子 Agent${hint}：\n`)
                 for (const a of accessible) {
-                  const tools = Array.isArray(a.tools) ? a.tools.join(', ') : '*'
+                  const whitelist: string[] = Array.isArray(a.tools) ? (a.tools as string[]) : ['*']
+                  // 哨兵白名单（md 未声明 tools 时的只读兜底）解析出实际工具 id ——
+                  // 只写「只读工具」四个字，用户仍然不知道它到底能用什么。
+                  const resolved = whitelist.includes(READONLY_TOOLS_SENTINEL)
+                    ? harness?.tools?.filterByWhitelist(whitelist).map((t) => t.id)
+                    : undefined
+                  const tools = formatToolWhitelist(whitelist) + (resolved ? ` = ${resolved.join(', ') || '（当前无只读工具）'}` : '')
                   // 标注来源：让「配置在插件里」与「md 定义进来的」一眼可分
                   const origin = fromRegistry ? `  [${own.has(a.id) ? '插件配置' : 'agent 定义'}]` : ''
                   input.out(`  ${a.id}  -  ${a.name}${origin}\n`)

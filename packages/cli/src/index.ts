@@ -1168,8 +1168,13 @@ function defaultCliAsk(write: (s: string) => void): (q: string) => Promise<strin
 // ========================================================================
 
 export interface HarnessAppOptions {
-  cwd: string
-  dataDir: string
+  /**
+   * 工作目录。启动时参数传入（CLI 上是 `-c/--cwd <dir>`）即以此为准；
+   * **不传时取当前进程目录**（`process.cwd()`）。
+   */
+  cwd?: string
+  /** 持久化目录。不传时取默认数据目录（`~/.harness`）；会话/配置/权限文件都在其下。 */
+  dataDir?: string
   agentId: string
   provider: string
   /** 默认模型 ID（如 claude-3-5-sonnet，或 provider/model 跨 Provider 指定），设置到默认 Agent 的 model */
@@ -1281,9 +1286,20 @@ export class HarnessApp {
   sessionRestore: SessionRestoreInfo = { source: 'new', sessionId: '' }
 
   constructor(options: HarnessAppOptions) {
-    const cwd = resolve(options.cwd)
-    this.options = { ...options, cwd, dataDir: resolve(options.dataDir), agentId: options.agentId, provider: options.provider }
-    this.workspace = resolveWorkspace({ cwd, dataDir: this.options.dataDir })
+    // 工作目录：**启动参数传入即用传入值，未传才取当前进程目录**（dataDir 同理，未传取默认数据目录）。
+    // 统一交给 resolveWorkspace 解析，避免「谁先算 cwd」两处各算一遍导致口径不一致。
+    this.workspace = resolveWorkspace({ cwd: options.cwd, dataDir: options.dataDir })
+    const cwd = this.workspace.cwd
+    this.options = {
+      ...options,
+      cwd,
+      dataDir: this.workspace.dataDir,
+      agentId: options.agentId,
+      provider: options.provider,
+      // 未注入输出流时落到真实 stdout：否则 logger 的 [WARN]/[ERROR] 会被静默丢掉
+      // （如「md 未声明 tools，按只读兜底」「内置插件预加载失败」——用户永远看不到）。
+      stdout: options.stdout ?? process.stdout,
+    }
     this.sessionStore = new SessionFileStore(this.workspace)
     this.sessionPointer = new SessionPointerStore(this.workspace)
     this.permissionStorePath = this.workspace.files.permissions
@@ -3076,7 +3092,9 @@ teammate 选项:
       --name <name>           成员名（sanitize 后）
 
 选项:
-  -c, --cwd <dir>            工作目录（默认当前目录）
+  -c, --cwd <dir>            工作目录（启动时传入即以此为准；不传才取当前目录）。
+                             决定项目级 .harness/（last-session.json、agents/、plugins/）
+                             与会话记录的归属，TUI 的 /tree、/edit 相对路径也以它为准
   -a, --agent <id>           默认 Agent ID（默认 default）
   -p, --provider <id>      默认 Provider id：mock / anthropic，或 config.providers 中定义的自定义 id（默认 anthropic，无 key 时 fallback mock）
   -m, --model <spec>       默认模型：provider/modelId 跨 Provider 指定（如 openai/gpt-4o）。运行时可用 /model 切换
