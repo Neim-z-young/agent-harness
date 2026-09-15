@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, readdirSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import type { AgentDefinition } from '@harness/core'
@@ -187,6 +187,192 @@ describe('启动时自动恢复上次会话', () => {
     }
     const after = readdirSync(join(dataDir, 'sessions')).filter((f) => f.endsWith('.json')).length
     expect(after).toBe(before + 2)
+  })
+})
+
+// ==========================================================================
+// 功能一续：「上次会话」记在**当前工作目录**里
+// ==========================================================================
+// 背景：sessions 目录（dataDir/sessions）是全局共享的，多个项目的会话全躺在同一层。
+// 只靠「会话里记的 cwd 字符串」反查该恢复哪条，路径写法一变（符号链接、相对路径）就会误判；
+// 现在把「本目录上次用的会话 id」写进 <cwd>/.harness/last-session.json：
+// 「谁属于谁」由文件位置决定，不同工作目录各自一份，不靠字符串比对。
+
+describe('自动恢复的会话 id 记在当前工作目录下', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-pointer-cli-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  /** 本目录的指针文件（不存在则 undefined） */
+  const readPointer = (cwd: string): { sessionId: string } | undefined => {
+    const p = join(cwd, '.harness', 'last-session.json')
+    return existsSync(p) ? JSON.parse(readFileSync(p, 'utf-8')) : undefined
+  }
+
+  /** 绕过 app 直接塞一条会话文件：模拟「别的入口 / 别的进程」写的会话（不会碰指针） */
+  const seedSessionFile = async (app: HarnessApp, cwd: string, id: string, updatedAt: number) => {
+    await app.sessionStore.ensureDir()
+    writeFileSync(app.sessionStore.pathFor(id), JSON.stringify({
+      id, title: 'seeded', createdAt: 1, updatedAt, agentId: 'default', cwd,
+      messages: [{ id: `${id}-m1`, role: 'user', parts: [{ type: 'text', text: 'seeded' }], createdAt: 1 }],
+    }, null, 2))
+  }
+
+  it('恢复的是「本目录记录的会话」，不是同目录里时间更新的一条', async () => {
+    const dataDir = join(dir, 'shared')
+    const proj = join(dir, 'proj'); mkdirSync(proj, { recursive: true })
+
+    const a1 = mount(proj, dataDir)
+    const { harness: h1, session: s1 } = await a1.app.boot()
+    await h1.session.addMessage(s1.id, { id: 'used', role: 'user', parts: [{ type: 'text', text: '上次用的' }], createdAt: 1 })
+    await a1.app.sessionStore.save((await h1.session.get(s1.id))!)
+    await a1.app.shutdown()
+
+    // 记录确实落在当前工作目录下
+    expect(readPointer(proj)?.sessionId).toBe(s1.id)
+
+    // 同目录里再放一条「时间更新」的会话：老逻辑（按 cwd 扫最新）会挑走它，
+    // 指针必须压过时间 —— 否则「上次用的会话」会被别的入口写进来的会话顶掉。
+    await seedSessionFile(a1.app, proj, 's_seeded_newer', Date.now() + 60_000)
+
+    const a2 = mount(proj, dataDir)
+    const { session: s2 } = await a2.app.boot()
+    expect(a2.app.sessionRestore.source).toBe('auto')
+    expect(s2.id).toBe(s1.id)
+    expect(s2.messages.map((m) => m.id)).toEqual(['used'])
+    await a2.app.shutdown()
+  })
+
+  it('各目录各一份指针：在别的目录启动不再影响本目录', async () => {
+    const dataDir = join(dir, 'shared')
+    const projA = join(dir, 'projA'); mkdirSync(projA, { recursive: true })
+    const projB = join(dir, 'projB'); mkdirSync(projB, { recursive: true })
+
+    const a = mount(projA, dataDir)
+    const { harness: ha, session: sa } = await a.app.boot()
+    await ha.session.addMessage(sa.id, { id: 'A1', role: 'user', parts: [{ type: 'text', text: 'in A' }], createdAt: 1 })
+    await a.app.sessionStore.save((await ha.session.get(sa.id))!)
+    await a.app.shutdown()
+
+    const b = mount(projB, dataDir)
+    const { harness: hb, session: sb } = await b.app.boot()
+    await hb.session.addMessage(sb.id, { id: 'B1', role: 'user', parts: [{ type: 'text', text: 'in B' }], createdAt: 2 })
+    await b.app.sessionStore.save((await hb.session.get(sb.id))!)
+    await b.app.shutdown()
+
+    // B 的会话在全局列表里更新，但两份指针各指各的
+    expect(readPointer(projA)?.sessionId).toBe(sa.id)
+    expect(readPointer(projB)?.sessionId).toBe(sb.id)
+
+    const a2 = mount(projA, dataDir)
+    const { session: s2 } = await a2.app.boot()
+    expect(a2.app.sessionRestore.source).toBe('auto')
+    expect(s2.id).toBe(sa.id)
+    await a2.app.shutdown()
+  })
+
+  it('在本目录 /resume 了外目录的会话：指针不会被改写，下次启动仍回本目录自己的会话', async () => {
+    const dataDir = join(dir, 'shared')
+    const projA = join(dir, 'projA'); mkdirSync(projA, { recursive: true })
+    const projB = join(dir, 'projB'); mkdirSync(projB, { recursive: true })
+
+    const b = mount(projB, dataDir)
+    const { harness: hb, session: sb } = await b.app.boot()
+    await hb.session.addMessage(sb.id, { id: 'B1', role: 'user', parts: [{ type: 'text', text: 'in B' }], createdAt: 1 })
+    await b.app.sessionStore.save((await hb.session.get(sb.id))!)
+    await b.app.shutdown()
+
+    const a = mount(projA, dataDir)
+    const { harness: ha, session: sa } = await a.app.boot()
+    await ha.session.addMessage(sa.id, { id: 'A1', role: 'user', parts: [{ type: 'text', text: 'in A' }], createdAt: 1 })
+    await a.app.sessionStore.save((await ha.session.get(sa.id))!)
+    await startRepl({
+      app: a.app, harness: ha, session: sa, stdout: a.stdout,
+      scriptedStdin: [`/resume ${sb.id}`, '/exit'],
+    })
+    expect(a.chunks.join('')).toInclude(`已恢复会话 ${sb.id}`)
+    await a.app.shutdown()
+
+    // A 的指针仍是 A 的会话：不因为「刚才手动恢复过 B 的」就把 A 目录的记录改成 B 的 ——
+    // 否则下次在 A 启动又会加载出别的目录的会话。
+    expect(readPointer(projA)?.sessionId).toBe(sa.id)
+
+    const a2 = mount(projA, dataDir)
+    const { session: s2 } = await a2.app.boot()
+    expect(s2.id).toBe(sa.id)
+    expect(s2.messages.map((m) => m.id)).toEqual(['A1'])
+    await a2.app.shutdown()
+  })
+
+  it('指针失效（会话被删 / 文件损坏）退回同目录兜底，不阻断启动', async () => {
+    const dataDir = join(dir, 'shared')
+    const proj = join(dir, 'proj'); mkdirSync(proj, { recursive: true })
+
+    const a1 = mount(proj, dataDir)
+    const { session: s1 } = await a1.app.boot()
+    await a1.app.shutdown()
+
+    const pointerFile = join(proj, '.harness', 'last-session.json')
+    // 兜底目标：同目录、时间更新的一条
+    await seedSessionFile(a1.app, proj, 's_fallback', Date.now() + 60_000)
+
+    // 1) 指针指向一个已不存在的会话（换了 dataDir / 会话被删）
+    writeFileSync(pointerFile, JSON.stringify({ sessionId: 's_gone', savedAt: Date.now() }))
+    const a2 = mount(proj, dataDir)
+    const { session: s2 } = await a2.app.boot()
+    expect(a2.app.sessionRestore.source).toBe('auto')
+    expect(s2.id).toBe('s_fallback')
+    // 兜底命中后会自愈：把指针改写成实际恢复的那条
+    expect(readPointer(proj)?.sessionId).toBe('s_fallback')
+    expect(s2.id).not.toBe(s1.id)
+    await a2.app.shutdown()
+
+    // 2) 指针文件本身坏掉（非 JSON）
+    writeFileSync(pointerFile, '{ 这不是 json')
+    const a3 = mount(proj, dataDir)
+    const { session: s3 } = await a3.app.boot()
+    expect(a3.app.sessionRestore.source).toBe('auto')
+    expect(s3.id).toBe('s_fallback')
+    await a3.app.shutdown()
+  })
+
+  it('/resume 无参与启动自动恢复判定一致；/sessions 标出本目录与「本目录上次」', async () => {
+    const dataDir = join(dir, 'shared')
+    const proj = join(dir, 'proj'); mkdirSync(proj, { recursive: true })
+    const other = join(dir, 'other'); mkdirSync(other, { recursive: true })
+
+    // other 目录先来一条（全局列表里更新，但不属于 proj）
+    const o = mount(other, dataDir)
+    const { harness: ho, session: so } = await o.app.boot()
+    await o.app.sessionStore.save((await ho.session.get(so.id))!)
+    await o.app.shutdown()
+
+    const a1 = mount(proj, dataDir)
+    const { harness: h1, session: s1 } = await a1.app.boot()
+    await h1.session.addMessage(s1.id, { id: 'p1', role: 'user', parts: [{ type: 'text', text: 'proj' }], createdAt: 1 })
+    await a1.app.sessionStore.save((await h1.session.get(s1.id))!)
+    await a1.app.shutdown()
+
+    const a2 = mount(proj, dataDir)
+    const { harness: h2, session: s2 } = await a2.app.boot()
+    expect(s2.id).toBe(s1.id)
+    const r = await startRepl({
+      app: a2.app, harness: h2, session: s2, stdout: a2.stdout,
+      scriptedStdin: ['/sessions', '/new', '/resume', '/exit'],
+    })
+    expect(r).toBe('exit')
+    const out = a2.chunks.join('')
+    // /sessions：本目录、本目录上次、以及别目录的会话都不加标记
+    expect(out).toInclude(`（本工作目录：${proj}；上次会话：${s1.id}）`)
+    expect(out).toInclude('← 本目录上次')
+    expect(out).toInclude(so.id)
+    // /new 之后 /resume 无参：与启动恢复同一套判定（此时指针已指向 /new 出来的会话，
+    // 与老逻辑「同目录最新」一致 —— 有意保持两条路径同源）
+    const newId = out.match(/已新建会话 (s_\w+)/)?.[1]
+    expect(newId).toBeTruthy()
+    expect(readPointer(proj)?.sessionId).toBe(newId as string)
+    expect(out).toInclude(`已在会话 ${newId}`)
+    await a2.app.shutdown()
   })
 })
 

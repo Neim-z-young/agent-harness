@@ -55,6 +55,7 @@ import defaultAgentPrompt from './prompts/default-agent.txt'
 import {
   ConfigStore,
   SessionFileStore,
+  SessionPointerStore,
   SecretCipher,
   ConfigValidationError,
   resolveSecret,
@@ -224,6 +225,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
 // 会话存储 / 配置 / 密钥存储已抽离至 @harness/workspace（消费 Workspace 解析路径），
 // 本模块统一重导出，保持对外（含测试）接口不变。
 export { SessionFileStore, type SessionFile } from '@harness/workspace'
+export { SessionPointerStore, LAST_SESSION_FILE, type SessionPointerFile } from '@harness/workspace'
 export { ConfigStore, SecretCipher, ConfigValidationError, resolveSecret } from '@harness/workspace'
 
 /** 全局配置（写 dataDir/config.json）与命令行参数合并、默认值收敛 */
@@ -1248,6 +1250,11 @@ export class HarnessApp {
   /** 工作区布局（两级目录 + 数据文件路径），由 cwd/dataDir 解析而得 */
   public readonly workspace: Workspace
   public readonly sessionStore: SessionFileStore
+  /**
+   * 项目级「上次会话」指针（`<cwd>/.harness/last-session.json`）。
+   * 自动恢复的会话 id 记在**当前工作目录**里，见 findResumeTarget / rememberSession。
+   */
+  public readonly sessionPointer: SessionPointerStore
   public readonly permissionStorePath: string
   /** 全局配置读写（config.json：model / provider / apiKey 持久化） */
   public readonly configStore: ConfigStore<HarnessConfig>
@@ -1278,6 +1285,7 @@ export class HarnessApp {
     this.options = { ...options, cwd, dataDir: resolve(options.dataDir), agentId: options.agentId, provider: options.provider }
     this.workspace = resolveWorkspace({ cwd, dataDir: this.options.dataDir })
     this.sessionStore = new SessionFileStore(this.workspace)
+    this.sessionPointer = new SessionPointerStore(this.workspace)
     this.permissionStorePath = this.workspace.files.permissions
     this.configStore = new ConfigStore<HarnessConfig>(this.workspace)
     // Provider 类型注册表：注册内置类型（openai/anthropic/gemini/glm/qwen/mock），
@@ -1910,6 +1918,9 @@ export class HarnessApp {
       }
     }
     await this.sessionStore.save(session)
+    // 记下「本工作目录下次要恢复的会话」：无论是显式 -s、自动恢复还是新建，
+    // 都要把指针指向本次实际在用的这条，否则下次启动会回到更早的会话。
+    await this.rememberSession(session)
 
     return { harness, session }
   }
@@ -1941,14 +1952,66 @@ export class HarnessApp {
   }
 
   /**
+   * 找出「本工作目录上次用的会话」。
+   *
+   * 判定顺序：
+   * 1. **项目级指针** `<cwd>/.harness/last-session.json`（权威）。会话 id 就写在当前工作
+   *    目录里，所以「哪个目录恢复哪条会话」由文件位置决定——不需要拿 cwd 字符串互相比对，
+   *    符号链接 / 相对路径 / 大小写差异都不会让判定漂移，也不会跨目录串台。
+   * 2. **兜底**：全局 sessions 里 cwd 与本目录一致的最新一条。只为兼容「指针出现之前建的
+   *    会话」；命中后 boot 会把它写进指针，此后一律走 1。
+   *
+   * 两处返回 undefined 的语义都是「本目录没有可恢复的会话」，调用方按新建处理。
+   */
+  async findResumeTarget(): Promise<
+    { id: string; updatedAt: number; messageCount: number; cwd?: string; saved: SessionFile } | undefined
+  > {
+    const pointer = await this.sessionPointer.read()
+    if (pointer) {
+      const saved = await this.sessionStore.load(pointer.sessionId)
+      // 指针里的会话文件不见了（被删 / 换了 dataDir）就往下走兜底，别让启动卡在一个坏指针上
+      if (saved) {
+        return {
+          id: saved.id,
+          updatedAt: saved.updatedAt,
+          messageCount: saved.messages.length,
+          cwd: saved.cwd,
+          saved,
+        }
+      }
+    }
+    const list = await this.sessionStore.list()
+    const cwd = this.workspace.cwd
+    const hit = list.find((s) => !!s.cwd && resolve(s.cwd) === cwd)
+    if (!hit) return undefined
+    const saved = await this.sessionStore.load(hit.id)
+    if (!saved) return undefined
+    return { id: hit.id, updatedAt: hit.updatedAt, messageCount: hit.messageCount, cwd: hit.cwd, saved }
+  }
+
+  /**
+   * 把「本目录下次要恢复的会话」写进项目级指针。
+   *
+   * 只在会话确实属于当前工作目录时写：本目录里 `/resume` 了别的目录的会话后，不该把本目录
+   * 的记录改成外目录会话——那正是「A 目录又恢复了 B 目录的会话」的来源。
+   *
+   * 写盘失败一律忽略（只读挂载、权限不足等）：这是启动路径上的记录动作，不能因为它
+   * 把整个 boot 拖挂。失败时下次启动退回「同 cwd 兜底」，功能仍在。
+   */
+  async rememberSession(session: Session): Promise<void> {
+    const cwd = this.workspace.cwd
+    if (resolve(session.cwd ?? cwd) !== cwd) return
+    try {
+      await this.sessionPointer.write(session.id)
+    } catch { /* 指针写不动不影响本次会话 */ }
+  }
+
+  /**
    * 挑「上次会话」用于自动恢复。
    *
-   * 规则：`sessions` 目录里的会话按 updatedAt 倒序（SessionFileStore.list 已排好），
-   * 取**第一个工作目录与当前一致的**。为什么必须比对 cwd —— 目录是全局共享的，
-   * 同一台机器上多个项目的会话都躺在一起，只按时间取会在 A 项目里恢复出 B 项目的会话。
-   *
-   * 没命中时把「最近的会话」原样回报给调用方：这样提示能说清是「目录不同」还是
-   * 「被 --no-resume 关掉了」，而不是让用户对着一个空会话猜。
+   * 命中判定交给 findResumeTarget（指针优先、同 cwd 兜底）。没命中时把「全局最近的会话」
+   * 原样回报给调用方：这样提示能说清是「目录不同」还是「被 --no-resume 关掉了」，而不是
+   * 让用户对着一个空会话猜。
    */
   private async pickResumeCandidate(): Promise<
     | { kind: 'hit'; item: { id: string; updatedAt: number; messageCount: number; cwd?: string }; saved: SessionFile }
@@ -1961,14 +2024,11 @@ export class HarnessApp {
     if (!autoResume) {
       return { kind: 'miss', skipped: { id: newest.id, cwd: newest.cwd, updatedAt: newest.updatedAt, reason: 'disabled' } }
     }
-    const cwd = this.options.cwd
-    const hit = list.find((s) => !!s.cwd && resolve(s.cwd) === cwd)
-    if (!hit) {
+    const target = await this.findResumeTarget()
+    if (!target) {
       return { kind: 'miss', skipped: { id: newest.id, cwd: newest.cwd, updatedAt: newest.updatedAt, reason: 'other-cwd' } }
     }
-    const saved = await this.sessionStore.load(hit.id)
-    if (!saved) return { kind: 'miss' }
-    return { kind: 'hit', item: hit, saved }
+    return { kind: 'hit', item: target, saved: target.saved }
   }
 
   /** 发送一次用户消息，得到 assistant Message（内部持久化） */
@@ -2355,6 +2415,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     const next = await app.restoreSession(saved)
     current = next
     options.setSession?.(next)
+    // 指针跟着走：本次在这个目录用的是哪条会话，下次启动就恢复哪条
+    await app.rememberSession(next)
     const totalMsg = (await app.loadFullHistory(saved.id).catch(() => []))?.length ?? saved.messages.length
     const ov = app.sessionModelOverride(next)
     out(
@@ -2423,9 +2485,16 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         case '/sessions': {
           const list = await app.sessionStore.list()
           if (list.length === 0) { out('（无持久化会话）\n'); return 'continue' }
+          // 会话目录是全局共享的（多个项目混在一起），所以标出「本目录上次恢复哪条」与
+          // 哪些属于本目录 —— 否则自动恢复「怎么挑的」纯黑盒，用户只能怀疑是不是恢复错了。
+          const pointer = await app.sessionPointer.read()
+          const cwd = app.workspace.cwd
+          out(`（本工作目录：${cwd}；上次会话：${pointer?.sessionId ?? '（无记录）'}）\n`)
           for (const s of list) {
             const when = new Date(s.updatedAt).toLocaleString()
-            out(`  ${s.id}  ${s.title ?? '(untitled)'}  ${s.messageCount} msgs  ${when}\n`)
+            const mine = !!s.cwd && resolve(s.cwd) === cwd
+            const mark = s.id === pointer?.sessionId ? '  ← 本目录上次' : mine ? '  ← 本目录' : ''
+            out(`  ${s.id}  ${s.title ?? '(untitled)'}  ${s.messageCount} msgs  ${when}${mark}\n`)
           }
           return 'continue'
         }
@@ -2450,18 +2519,19 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           current = next
           options.setSession?.(next)
           await app.sessionStore.save(next)
+          await app.rememberSession(next)
           out(`已新建会话 ${next.id}（沿用 agent=${next.agentId ?? 'default'}${carry ? ` · model=${app.resolveSessionModel(next)}` : ''}）\n`)
           return 'continue'
         }
         case '/resume': {
           if (!arg || !arg.trim()) {
-            // 无参 /resume = 接着「当前工作目录里最近更新」的会话（与启动时的自动恢复同一套判定）
-            const list = await app.sessionStore.list()
-            const hit = list.find((s) => !!s.cwd && resolve(s.cwd) === resolve(app.workspace.cwd))
-            if (!hit) { out('没有可恢复的会话（同目录下暂无历史）；/sessions 可查看全部。\n'); return 'continue' }
-            const saved = await app.sessionStore.load(hit.id)
-            if (!saved) { out(`会话 "${hit.id}" 读取失败。\n`); return 'continue' }
-            return await doResume(saved)
+            // 无参 /resume = 接着「本工作目录上次用过的会话」，与启动时的自动恢复同一套判定
+            // （项目级指针优先，其次是同 cwd 兜底）—— 两条路径必须一致，否则启动恢复的和
+            // 手敲 /resume 恢复的可能不是同一条。
+            const target = await app.findResumeTarget()
+            if (!target) { out('没有可恢复的会话（本工作目录下暂无历史）；/sessions 可查看全部。\n'); return 'continue' }
+            if (target.id === current.id) { out(`已在会话 ${target.id}\n`); return 'continue' }
+            return await doResume(target.saved)
           }
           const saved = await app.sessionStore.load(arg)
           if (!saved) { out(`会话 "${arg}" 不存在（可用 /sessions 查看）。\n`); return 'continue' }
@@ -3020,7 +3090,8 @@ teammate 选项:
       --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
 
 会话（启动即恢复 · 会话内可切 Agent / 模型）:
-  默认启动会接着「当前工作目录里最近更新」的会话继续；目录不匹配的会话不会被误恢复。
+  默认启动会接着「当前工作目录上次用的」会话继续；记录写在 <cwd>/.harness/last-session.json
+  （会话 id 与目录绑定，不同工作目录各自一份，不会在 A 目录恢复出 B 目录的会话）。
   关闭自动恢复：--no-resume，或 config.json 设 "autoResume": false。run "<prompt>" 始终新建（脚本化不该改写历史）。
   REPL/TUI 内：
     /agent [id]             查看/切换**本会话**的 Agent（立即保存；/switch 为旧写法）

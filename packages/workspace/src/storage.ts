@@ -7,7 +7,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { join } from 'node:path'
 import type { Message, Session } from '@harness/session'
@@ -117,6 +117,87 @@ export class SessionFileStore {
     // 因此同时间戳再按 id 兜底排序，保证同一个目录快照两次列出结果一致。
     items.sort((a, b) => (b.updatedAt - a.updatedAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
     return items
+  }
+}
+
+/** 项目级「上次会话」指针文件名（位于 `<cwd>/.harness/` 下） */
+export const LAST_SESSION_FILE = 'last-session.json'
+
+/**
+ * 确保 `dir/.gitignore` 含有一行 `entry`（目录/文件不存在则建，已含则不动）。
+ *
+ * 用途：把 harness 自己生成的状态文件挡在用户仓库之外。生成物一旦被 `git add -A`
+ * 收进暂存区就很难清（worktree 目录会记成 gitlink，得 `git worktree remove`），
+ * 所以**写状态文件前先落忽略规则**，别指望调用方记得。
+ *
+ * 注：subagent 插件的 `ensureWorktreeIgnored()` 是同一套逻辑的副本——那个包没有
+ * 依赖本包，故未合并；两处若要改行为需一起改。
+ */
+export async function ensureGitignoreEntry(dir: string, entry: string): Promise<void> {
+  const ignoreFile = join(dir, '.gitignore')
+  let content = ''
+  if (existsSync(ignoreFile)) {
+    try { content = await readFile(ignoreFile, 'utf-8') } catch { content = '' }
+  }
+  if (content.split('\n').some((l) => l.trim() === entry)) return
+  await mkdir(dir, { recursive: true })
+  const next = content.trimEnd() ? `${content.trimEnd()}\n${entry}\n` : `${entry}\n`
+  await writeFile(ignoreFile, next)
+}
+
+/** `<cwd>/.harness/last-session.json` 的结构 */
+export interface SessionPointerFile {
+  /** 该工作目录下次启动应恢复的会话 id（对应 dataDir/sessions/{id}.json） */
+  sessionId: string
+  /** 写入时刻（仅便于人工查看；判定不依赖它） */
+  savedAt: number
+}
+
+/**
+ * 项目级「上次会话」指针：`<cwd>/.harness/last-session.json`
+ *
+ * 为什么写在**工作目录**而不是 dataDir：dataDir（缺省 ~/.harness）是所有项目共用的，
+ * 所有项目的会话文件都躺在同一层，启动时只能拿「会话里记的 cwd 字符串」反查该恢复哪一条。
+ * 字符串比对天生脆弱——符号链接（macOS 的 /tmp → /private/tmp）、相对路径、大小写、
+ * 末尾斜杠任一有差异就会误判：轻则该恢复的没恢复，重则**在 A 目录里恢复出 B 目录的会话**。
+ *
+ * 把记录写进工作目录本身，「谁属于谁」由文件位置决定，天生按目录隔离：
+ * 不同工作目录各自一份指针，互不干扰，也不需要对 cwd 做任何字符串规范化。
+ */
+export class SessionPointerStore {
+  constructor(public readonly workspace: Workspace) {}
+
+  /** 指针文件路径：`<cwd>/.harness/last-session.json` */
+  path(): string {
+    return join(this.workspace.project.root, LAST_SESSION_FILE)
+  }
+
+  /** 读指针；文件缺失 / 解析失败 / sessionId 为空都按「没有记录」返回 undefined（调用方退回兜底判定） */
+  async read(): Promise<SessionPointerFile | undefined> {
+    const p = this.path()
+    if (!existsSync(p)) return undefined
+    try {
+      const raw = JSON.parse(await readFile(p, 'utf-8')) as Partial<SessionPointerFile>
+      const id = typeof raw?.sessionId === 'string' ? raw.sessionId.trim() : ''
+      if (!id) return undefined
+      return { sessionId: id, savedAt: typeof raw.savedAt === 'number' ? raw.savedAt : 0 }
+    } catch {
+      return undefined
+    }
+  }
+
+  /** 写入指针（顺手把文件加进 `<cwd>/.harness/.gitignore`，避免污染用户仓库） */
+  async write(sessionId: string): Promise<void> {
+    const id = sessionId.trim()
+    if (!id) return
+    await ensureGitignoreEntry(this.workspace.project.root, LAST_SESSION_FILE)
+    await writeFile(this.path(), JSON.stringify({ sessionId: id, savedAt: Date.now() }, null, 2) + '\n')
+  }
+
+  /** 清除指针（会话被删等场景） */
+  async clear(): Promise<void> {
+    const p = this.path()
+    if (existsSync(p)) await rm(p, { force: true })
   }
 }
 
