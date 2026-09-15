@@ -106,7 +106,9 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: '↑ / ↓', desc: '命令菜单或历史中选取' },
   { key: '◀ / ▶', desc: '侧栏模块切换（输入为空时）' },
   { key: 'Enter', desc: '输入框内换行；列表/菜单中确认选中' },
-  { key: 'Alt/Meta+Enter', desc: '提交输入' },
+  { key: 'Shift+Enter', desc: '提交输入（需终端支持 Kitty 键盘协议才能识别 Shift）' },
+  { key: 'Ctrl+J', desc: '提交输入（最可靠：不依赖修饰键上报，传统终端也可用）' },
+  { key: 'Alt/Meta+Enter', desc: '提交输入（需终端把 Option 发送为 ESC 前缀）' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
   { key: '/help', desc: '查看特殊命令' },
 ]
@@ -541,6 +543,7 @@ export function roleToKind(role: Message['role']): ChatBlockKind {
 
 /** 阶段四·按需渲染：单页渲染的历史消息条数上限（超出显示"更早省略"提示块） */
 export const HISTORY_PAGE = 100
+
 
 /** 把一条消息转成对话块（消息转块的公共入口；空消息返回 undefined） */
 function messageToBlock(m: Message, id: number): ChatBlock | undefined {
@@ -1303,6 +1306,23 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       return true // 其余按键在审批中一律吞掉
     }
     if (key.ctrl && key.name === 'c') return finish('exit')
+    // 提交键：Shift+Enter / Ctrl+J（linefeed）
+    // 为什么写在这里而不是给 textarea 传 keyBindings：@opentui/react 不透传
+    // keyBindings（传了会被丢弃），自定义提交键只能在全局处理器里直接调用
+    // textarea.submit() 触发 onSubmit。
+    // 默认约定不变：Enter = 换行、Option/Meta+Enter = 提交（Textarea 默认绑定）。
+    // Ctrl+J 是最可靠的兜底：LF(0x0A) 与 CR(0x0D) 天然可区分，不依赖终端上报
+    // Shift/Meta 修饰（传统终端常把 Shift+Enter 也报成裸 CR，与 Enter 无法区分）。
+    if (key.name === 'return' && key.shift) {
+      key.preventDefault()
+      textareaRef.current?.submit()
+      return true
+    }
+    if (key.name === 'linefeed') {
+      key.preventDefault()
+      textareaRef.current?.submit()
+      return true
+    }
     __KEYLOG.push(`${key.name}:${key.ctrl ? 'C' : ''}`)
     if (key.ctrl && key.name === 'b') return setShowSidebar((v) => !v)
     // 模块 D：帮助面板开关。Ctrl+/ 与 Ctrl+_ 均发 0x1F（OpenTUI 解码为 name '_'）;
@@ -1369,8 +1389,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         const head = input.split(/\s+/)[0] ?? ''
         setComposer(head); setInput(head); setCmdSel(0); return true
       }
-      // 仅拦截普通 Enter 选中命令；Meta+Enter 放行提交正文
-      if (key.name === 'return' && !key.meta) {
+      // 仅拦截「无修饰」的 Enter 选中命令；Meta+Enter / Shift+Enter 放行提交正文
+      if (key.name === 'return' && !key.meta && !key.shift) {
         key.preventDefault()
         const c = cmdCandidates[Math.min(Math.max(cmdSel, 0), last)]
         submitRef.current(c.command)

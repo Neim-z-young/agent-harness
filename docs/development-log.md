@@ -1,5 +1,49 @@
 # Agent Harness 开发日志
 
+## 2026-09-15（续 124）输入框提交键：新增 Shift+Enter 与 Ctrl+J 兜底
+
+### 背景
+
+用户在 herdr（tmux 式终端复用器）里 Option+Enter 无法提交。排查结论（详见续 123 前的排查记录）：
+提交键来自 OpenTUI Textarea 默认绑定（`Enter = newline`、`Meta+Enter = submit`），
+`meta` 只能来自 ESC 前缀，而 macOS 上 Option 默认用于「组合输入特殊字符」不发 ESC 前缀。
+用户要求改为 Shift+Enter 提交。
+
+### 两个关键发现（影响实现方式）
+
+1. **`@opentui/react` 不透传 textarea 的 `keyBindings`**（react 包中零匹配）。
+   该 prop 传了会被直接丢弃，因此自定义提交键**不能**靠 `keyBindings`
+   （虽然 core 的 `TextareaRenderable` 构造函数是用 `mergeKeyBindings` 合并的）。
+   最终改为在全局 `useKeyboard` 里直接调 `textareaRef.current.submit()` 触发 `onSubmit`。
+2. **传统终端下 Shift+Enter 无法与 Enter 区分**。OpenTUI 的测试 mock 层忠实反映了这点：
+   关闭 kitty 协议时，`pressEnter({ shift: true })` 走的路径既不处理转义序列也不处理
+   单字符修饰，最终发出的仍是裸 `\r`（shift 丢失）。只有开启 Kitty keyboard protocol
+   （或 modifyOtherKeys）才能编码 Shift 修饰。
+
+### 改动
+
+- `tui.tsx` 全局 `useKeyboard`：
+  - `return && shift` → `preventDefault()` + `textarea.submit()`；
+  - `linefeed`（Ctrl+J，LF 0x0A）→ 同样提交。**这是可靠兜底**：LF 与 CR 天然可区分，
+    不依赖终端上报修饰键。
+- `tui.tsx` 命令菜单分支：`return && !meta` 改为 `&& !key.shift`，
+  避免菜单展开时 Shift+Enter 被拦截去选中候选命令（否则提交不了）。
+- 帮助面板按键表补充 `Shift+Enter` / `Ctrl+J` 两条，并标注各自前提。
+- 默认约定不变：Enter 换行；Option+Enter 仍由 Textarea 默认绑定提交。
+
+### 测试
+
+- `tui.test.tsx` 的 `mountTui` 新增 `kittyKeyboard` 选项（透传给 `createTestRenderer`），
+  用于验证依赖修饰键的用例。
+- 新增 3 用例：Shift+Enter 提交（kitty 模式下）、Ctrl+J 提交（默认模式，证明不依赖协议）、
+  命令菜单展开时 Shift+Enter 提交正文而非选中候选。
+- cli 全量 **238 用例通过**、typecheck 通过。
+
+### 待办
+
+- 用户环境实测：herdr 是否转发 Kitty 协议协商未知，若不可用则 Ctrl+J 是唯一可靠提交键。
+- harness 的 Ctrl+B（侧栏）与 herdr 默认前缀键冲突，未处理。
+
 ## 2026-09-15（续 123）用量统计修复的代码评审：修 4 个缺陷 + 抽出当日归集模块
 
 ### 评审背景

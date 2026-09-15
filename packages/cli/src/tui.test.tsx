@@ -634,6 +634,12 @@ async function mountTui(
     openFile?: (path: string, line?: number) => void
     model?: string
     permissionMode?: 'allow-all' | 'ask' | 'deny-all'
+    /**
+     * 开启 Kitty keyboard protocol。传统终端里 Shift+Enter 与 Enter 都发 CR(0x0D)，
+     * 修饰信息无法表达；只有开启该协议（或 modifyOtherKeys）才能区分。
+     * 需要验证 Shift 修饰键的用例必须开启，否则按键会被当作裸 Enter。
+     */
+    kittyKeyboard?: boolean
   } = {},
 ): Promise<TuiFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-tui-test-'))
@@ -647,7 +653,10 @@ async function mountTui(
     },
   })
   const { harness, session } = await app.boot()
-  const setup = await createTestRenderer({ width: 80, height: 24, useMouse: true })
+  const setup = await createTestRenderer({
+    width: 80, height: 24, useMouse: true,
+    ...(extra.kittyKeyboard ? { kittyKeyboard: true } : {}),
+  })
   const root = createRoot(setup.renderer)
   let resolveExit!: (r: TuiReplExit) => void
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
@@ -795,6 +804,44 @@ describe('TuiApp 集成（mock provider）', () => {
     f.setup.mockInput.pressEnter()
     await waitFrame(f.setup, (fr) => !fr.includes('welcome to agent-harness'))
     await waitFrame(f.setup, (fr) => fr.includes('LLM 调用'))
+    await f.cleanup()
+  })
+
+  it('Shift+Enter 提交（需终端支持 Kitty keyboard protocol 才能区分 Shift）', async () => {
+    // 传统终端下 Shift+Enter 与 Enter 同为 CR(0x0D)，无修饰信息；开启 kitty 协议才能区分
+    const f = await mountTui({ kittyKeyboard: true })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('shift-submit')
+    f.setup.mockInput.pressEnter({ shift: true })
+    // 回显为 user 块，并触发 assistant 流式回复
+    await waitFrame(f.setup, (fr) => fr.includes('shift-submit'))
+    await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    await f.cleanup()
+  })
+
+  it('Ctrl+J（linefeed）提交：不依赖修饰键上报的可靠兜底', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('ctrlj-submit')
+    f.setup.mockInput.pressKey('LINEFEED')
+    await waitFrame(f.setup, (fr) => fr.includes('ctrlj-submit'))
+    await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    await f.cleanup()
+  })
+
+  it('命令菜单展开时 Shift+Enter 提交正文，而非选中候选命令', async () => {
+    const f = await mountTui({ kittyKeyboard: true })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    // 输入不完整的命令前缀，让菜单展开且首个候选为 /stats
+    f.setup.mockInput.typeText('/sta')
+    for (let i = 0; i < 15; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 4)) }
+    // Shift+Enter 应放行给输入框提交正文（'/sta'），而不是被菜单拦截选中 '/stats'
+    f.setup.mockInput.pressEnter({ shift: true })
+    await waitFrame(f.setup, (fr) => fr.includes('❯') && fr.includes('/sta'))
+    await new Promise((r) => setTimeout(r, 40))
+    for (let i = 0; i < 8; i++) await pumpOnce(f.setup)
+    // 未执行候选命令 /stats（其输出含「LLM 调用」）
+    expect(f.setup.captureCharFrame()).not.toContain('LLM 调用')
     await f.cleanup()
   })
 
