@@ -550,6 +550,105 @@ describe('createSubagentPlugin', () => {
     expect(cmdInput.commands[0].command).toBe('tasks')
   })
 
+  it('harness.start 后 /subagents 以注册表为准：md 定义的子 Agent（未配在插件里）也会列出并标注来源', async () => {
+    const coderAgent: AgentDefinition = {
+      id: 'coder',
+      name: 'Coder',
+      description: '', // 未提供描述 → 输出「（未提供）」而不是 undefined
+      mode: 'subagent',
+      tools: ['bash'],
+      permission: { '*': 'allow' },
+      promptFragments: [],
+    }
+    const plugin = createSubagentPlugin({ subagents: [coderAgent] })
+    const { ctx } = makeCtx()
+    const hooks = await plugin.install(ctx)
+
+    // 模拟真实装配：md 定义的子 Agent 由 core 经 agentDirs 直接注册进 AgentRuntime，不经本插件
+    const devopsAgent: AgentDefinition = {
+      id: 'devops-architect',
+      name: 'DevOps 工程师',
+      description: 'CI/CD 与部署',
+      mode: 'subagent',
+      tools: ['bash'],
+      permission: { '*': 'allow' },
+      promptFragments: [],
+    }
+    const primaryAgent: AgentDefinition = {
+      id: 'default',
+      name: '主 Agent',
+      description: 'primary 身份',
+      mode: 'primary',
+      tools: ['*'],
+      permission: { '*': 'allow' },
+      promptFragments: [],
+    }
+    const registry: AgentDefinition[] = [primaryAgent, devopsAgent]
+    const mockHarness = {
+      agent: {
+        register: (def: AgentDefinition) => { registry.push(def) },
+        get: (id: string) => registry.find((a) => a.id === id),
+        list: () => registry,
+        query: async () => makeMessage('assistant', 'ok'),
+        queryStream: async function* () {},
+      } as any,
+      session: createMockSessionManager(new Map()),
+    }
+    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+
+    const out: string[] = []
+    const cliInput = {
+      command: 'subagents', arg: '', out: (s: string) => { out.push(s) },
+      sessionId: 's1', raw: 'subagents', result: undefined as any,
+    }
+    await (hooks as any)['cli.command']?.(cliInput)
+    const text = out.join('')
+
+    // 注册表里两个 mode=subagent（coder 由插件注册、devops 来自 md）→ 都要列出
+    expect(text).toInclude('可调用 2 个子 Agent')
+    expect(text).toInclude('coder')
+    expect(text).toInclude('devops-architect')
+    // 来源标注区分「插件配置」与「agent 定义」
+    expect(text).toInclude('[插件配置]')
+    expect(text).toInclude('[agent 定义]')
+    // 缺描述时不打印 undefined
+    expect(text).toInclude('（未提供）')
+    expect(text).not.toInclude('undefined')
+    // primary 不是子 Agent，不该出现
+    expect(text).not.toInclude('主 Agent')
+  })
+
+  it('插件未配置子 Agent、但注册表里有 md 定义的子 Agent 时，/subagents 仍注册', async () => {
+    const plugin = createSubagentPlugin({ subagents: [] })
+    const { ctx } = makeCtx()
+    const hooks = await plugin.install(ctx)
+
+    const devopsAgent: AgentDefinition = {
+      id: 'devops-architect',
+      name: 'DevOps 工程师',
+      description: 'CI/CD',
+      mode: 'subagent',
+      tools: ['bash'],
+      permission: { '*': 'allow' },
+      promptFragments: [],
+    }
+    const mockHarness = {
+      agent: {
+        register: () => {},
+        get: () => undefined,
+        list: () => [devopsAgent],
+        query: async () => makeMessage('assistant', 'ok'),
+        queryStream: async function* () {},
+      } as any,
+      session: createMockSessionManager(new Map()),
+    }
+    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+
+    const cmdInput = { commands: [] as any[] }
+    ;(hooks as any)['cli.commands']?.(cmdInput)
+    expect(cmdInput.commands.some((c) => c.command === 'subagents')).toBe(true)
+  })
+
   it('uninstall 清理 harness 引用', async () => {
     const plugin = createSubagentPlugin({ subagents: [] })
     const { ctx } = makeCtx()

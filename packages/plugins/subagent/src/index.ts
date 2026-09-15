@@ -209,7 +209,13 @@ export interface SubagentToolOutput {
 
 /** createSubagentPlugin 的配置 */
 export interface SubagentPluginOptions {
-  /** 启动时注册的子 Agent 定义列表 */
+  /**
+   * 启动时**由本插件**注册的子 Agent 定义列表。
+   *
+   * 注意这不是「全部可调用的子 Agent」：md 定义的子 Agent 走 agentDirs 直接注册进
+   * AgentRuntime，不经过本插件。要枚举真正可调用的子 Agent 请查注册表
+   * （见 `registrySubagents`），`/subagents` 命令与 subagent 工具都以注册表为准。
+   */
   subagents?: AgentDefinition[]
   /** 子 Agent 执行超时（毫秒），缺省 120_000 */
   timeoutMs?: number
@@ -1058,6 +1064,28 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
   let worktreeEnabled = false
 
   /**
+   * 权威来源：AgentRuntime 注册表里所有 `mode === 'subagent'` 的 Agent。
+   *
+   * 为什么不能只看本插件的 `subagents` 配置数组：md 定义的子 Agent 经 `agentDirs`
+   * 被 core 直接注册进 AgentRuntime，**不经过本插件**。只列插件数组会漏掉它们，
+   * 让人误以为「只有配在插件里的那一个能调用」。
+   *
+   * 口径必须与 subagent 工具一致 —— 工具是用 `agent.get(agentId)` + `mode` 校验
+   * 解析目标的（见 createSubagentTool），同样只认注册表、不认插件数组。
+   *
+   * @returns 注册表里的子 Agent；harness 尚未就绪（如单测未触发 harness.start）时
+   *          返回 undefined，由调用方回退到插件配置数组。
+   */
+  const registrySubagents = (): AgentDefinition[] | undefined => {
+    const list = harness?.agent?.list?.()
+    if (!Array.isArray(list)) return undefined
+    return list.filter((a) => a.mode === 'subagent')
+  }
+
+  /** 本插件自己配置的子 Agent（用于标注来源 / harness 未就绪时兜底） */
+  const ownSubagents = (): AgentDefinition[] => subagents.filter((a) => a.mode === 'subagent')
+
+  /**
    * 为子 Agent 解析/创建隔离 worktree 目录。
    * - 未启用 → undefined。
    * - 续接：existingCwd 已在 worktree 下则复用，否则 undefined（保持原执行目录）。
@@ -1171,11 +1199,12 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         },
 
         'cli.commands'(input) {
-          const registered = subagents.filter((a) => a.mode === 'subagent')
-          if (registered.length > 0) {
+          // 注册条件也以注册表为准：插件自己没配、但 md 定义里有子 Agent 时，命令同样可用
+          const available = registrySubagents() ?? ownSubagents()
+          if (available.length > 0) {
             input.commands.push({
               command: 'subagents',
-              description: '列出已注册的子 Agent',
+              description: '列出可调用的子 Agent（读 AgentRuntime 注册表）',
               usage: '/subagents',
             })
           }
@@ -1198,7 +1227,10 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         async 'cli.command'(input) {
           // ===== /subagents 命令 =====
           if (input.command === 'subagents') {
-            const registered = subagents.filter((a) => a.mode === 'subagent')
+            // 注册表优先（与 subagent 工具同一口径）；harness 未就绪时回退插件配置数组
+            const fromRegistry = registrySubagents()
+            const registered = fromRegistry ?? ownSubagents()
+            const own = new Set(subagents.map((a) => a.id))
             if (registered.length === 0) {
               input.out('（无已注册的子 Agent）\n')
             } else {
@@ -1226,8 +1258,10 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
                 input.out(`可调用 ${accessible.length} 个子 Agent${hint}：\n`)
                 for (const a of accessible) {
                   const tools = Array.isArray(a.tools) ? a.tools.join(', ') : '*'
-                  input.out(`  ${a.id}  -  ${a.name}\n`)
-                  input.out(`    描述：${a.description}\n`)
+                  // 标注来源：让「配置在插件里」与「md 定义进来的」一眼可分
+                  const origin = fromRegistry ? `  [${own.has(a.id) ? '插件配置' : 'agent 定义'}]` : ''
+                  input.out(`  ${a.id}  -  ${a.name}${origin}\n`)
+                  input.out(`    描述：${a.description || '（未提供）'}\n`)
                   input.out(`    工具：${tools}\n`)
                   if (a.model?.modelId) input.out(`    模型：${a.model.modelId}\n`)
                 }
