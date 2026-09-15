@@ -583,7 +583,18 @@ export class OpenAIChatProvider implements ChatProvider {
       if (outerSignal.aborted) inner.abort()
       else outerSignal.addEventListener('abort', onOuter, { once: true })
     }
-    const timer = setTimeout(() => inner.abort(new Error(`OpenAI stream 超时（>${this.config.timeoutMs}ms）`)), this.config.timeoutMs)
+    // 空闲超时（idle），**不是**总时长超时：每收到一块数据就重新计时。
+    // 为什么不能用「请求开始即计时」的总时长：只要上游在稳定吐 token，就不该被判超时——
+    // 长回答（或本地网关首 token 后长时间推理）会被无理由掐断，且用户看到的是「明明已经有响应了却报失败」。
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const armIdleTimeout = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(
+        () => inner.abort(new Error(`OpenAI stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`)),
+        this.config.timeoutMs,
+      )
+    }
+    armIdleTimeout()
 
     try {
       const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`
@@ -615,9 +626,10 @@ export class OpenAIChatProvider implements ChatProvider {
       // tool_calls 增量累积状态：index → { id?, name?, argsBuf }
       const toolCallState: Map<number, { id?: string; name?: string; argsBuf: string; started: boolean }> = new Map()
 
-      while (true) {
+      readLoop: while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        armIdleTimeout() // 有数据到达 → 重新计时（idle 语义，持续输出不会被掐断）
         buf += decoder.decode(value, { stream: true })
 
         // SSE 按双换行分块
@@ -637,7 +649,11 @@ export class OpenAIChatProvider implements ChatProvider {
                   toolCallState.delete(idx)
                 }
               }
-              continue
+              // `[DONE]` 就是 SSE 的结束标记 —— 到此为止，**不能再等 socket EOF**。
+              // 部分 OpenAI 兼容实现（实测本地 127.0.0.1:8787 网关）发完 `[DONE]` 后并不关闭连接，
+              // 若继续 await reader.read()，循环会一直挂着，直到超时计时器把整次请求判失败：
+              // 内容早已渲染出来，用户却看到「❌ 发送失败：OpenAI stream 超时」。
+              break readLoop
             }
 
             let json: any
@@ -710,6 +726,9 @@ export class OpenAIChatProvider implements ChatProvider {
         }
       }
 
+      // 由 `[DONE]` 提前 break 时主动释放连接（服务端不关连接 → 不 cancel 会让连接滞留在池里）
+      try { await reader.cancel() } catch {}
+
       // 兜底：流结束时还有未 stop 的 tool_call
       for (const [idx, state] of toolCallState) {
         if (state.started) {
@@ -724,7 +743,7 @@ export class OpenAIChatProvider implements ChatProvider {
         tokenUsage,
       }
     } finally {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
     }
   }
