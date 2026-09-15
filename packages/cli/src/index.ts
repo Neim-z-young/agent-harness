@@ -75,6 +75,12 @@ import {
   renderStatsText,
   exportStatsJson,
   exportStatsMarkdown,
+  hydrateUsage,
+  dayStart,
+  todayUsage,
+  sumUsage,
+  isBlankUsage,
+  todayUsageLine,
   type UsageStats,
 } from './usage-stats'
 import { reconstructHistory, buildResolveBlock, type Message, type Session, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
@@ -1818,13 +1824,44 @@ export interface ProcessLineOptions {
 
 export type ProcessLineResult = 'continue' | 'exit'
 
-/** 解析当前会话用量统计：优先读 session.meta 持久化值；无则从消息历史重建 */
-async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
-  const fromMeta = usageFromMeta(current.meta)
-  if (fromMeta) return fromMeta
+/**
+ * 解析当前会话用量统计：meta 持久化的累积器（有数据时）优先 → 否则由消息历史重建。
+ * 与 TUI 共用 `hydrateUsage`，保证重连（resume）后能读到重连前累计的用量，
+ * 且不会被「空累积器」误判为无数据。
+ */
+export async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
+  const hydrated = hydrateUsage(current)
+  if (!isBlankUsage(hydrated)) return hydrated
+  // 内存态消息不全时，从 SessionManager 再取一次重试
   const sess = current.messages?.length ? current : await harness.session.get(current.id)
-  if (sess && sess.messages) return usageFromMessages(sess.messages)
-  return emptyUsage()
+  if (sess && sess !== current) return hydrateUsage(sess)
+  return hydrated
+}
+
+/**
+ * 归集当日（本地时区）跨会话用量：只读持久化会话文件、不写回，
+ * 因此重连前当天产生的用量依然可统计 / 可导出。失败时回落为当前会话当日用量。
+ */
+export async function resolveTodayUsage(app: HarnessApp | undefined, current: Session): Promise<UsageStats> {
+  const now = Date.now()
+  const from = dayStart(now)
+  try {
+    if (app?.sessionStore) {
+      const list = await app.sessionStore.list()
+      // 只加载当天有更新的会话，避免全量 IO
+      const recent = list.filter((s) => (s.updatedAt ?? 0) >= from)
+      const per: UsageStats[] = []
+      for (const s of recent) {
+        const f = s.id === current.id ? current : await app.sessionStore.load(s.id).catch(() => undefined)
+        if (f) per.push(todayUsage(hydrateUsage(f), now))
+      }
+      const merged = sumUsage(per)
+      if (!isBlankUsage(merged)) return merged
+    }
+  } catch {
+    // 归集失败回落当前会话
+  }
+  return todayUsage(hydrateUsage(current), now)
 }
 
 /**
@@ -2042,16 +2079,19 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         }
         case '/stats': {
           const u = await resolveCurrentUsage(harness, current)
+          const t = await resolveTodayUsage(app, current)
           out(renderStatsText(u) + '\n')
+          out(`\n${todayUsageLine(t)}（全部会话·当日）\n`)
           return 'continue'
         }
         case '/stats-export': {
           const u = await resolveCurrentUsage(harness, current)
+          const t = await resolveTodayUsage(app, current)
           const [fmtArg, pathArg] = (arg ?? '').trim().split(/\s+/)
           const isJson = fmtArg === 'json' || fmtArg === '--json'
           const content = isJson
-            ? exportStatsJson(u, { sessionId: current.id, title: current.title })
-            : exportStatsMarkdown(u, { sessionId: current.id, title: current.title })
+            ? exportStatsJson(u, { sessionId: current.id, title: current.title, today: t })
+            : exportStatsMarkdown(u, { sessionId: current.id, title: current.title, today: t })
           if (pathArg) {
             await writeFile(pathArg, content)
             out(`已导出统计报告 → ${pathArg}\n`)

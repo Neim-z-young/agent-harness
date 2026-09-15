@@ -245,6 +245,181 @@ export function uncachedInput(u: UsageStats): number {
   return Math.max(0, u.inputTokens - u.cacheReadTokens - u.cacheWriteTokens)
 }
 
+// ------------------------------------------------------------------------
+// 当日用量 / 水合 / 归并（跨重连累计）
+// ------------------------------------------------------------------------
+
+/** 本地时区「当天零点」时间戳（用于当日用量归集） */
+export function dayStart(ts: number = Date.now()): number {
+  const d = new Date(ts)
+  d.setHours(0, 0, 0, 0)
+  return d.getTime()
+}
+
+/** 累积器是否为空（无任何调用 / 小时桶 / 工具记录） */
+export function isBlankUsage(u: UsageStats | undefined): boolean {
+  if (!u) return true
+  return u.llmCalls === 0 && (u.hourly?.length ?? 0) === 0 && (u.tools?.length ?? 0) === 0
+}
+
+/**
+ * 截取 `fromTs`（含）之后的用量：按小时桶过滤后重算汇总。
+ * models / tools / agents 无法按天切分，置空（hourly 保留当日桶，便于时序展示）。
+ */
+export function usageSince(u: UsageStats, fromTs: number): UsageStats {
+  const buckets = (u.hourly ?? []).filter((h) => h.hour >= fromTs)
+  let llmCalls = 0
+  let inputTokens = 0
+  let outputTokens = 0
+  let cacheReadTokens = 0
+  let cacheWriteTokens = 0
+  for (const h of buckets) {
+    llmCalls += h.calls
+    inputTokens += h.inputTokens
+    outputTokens += h.outputTokens
+    cacheReadTokens += h.cacheRead
+    cacheWriteTokens += h.cacheWrite
+  }
+  return {
+    llmCalls,
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    models: [],
+    tools: [],
+    agents: [],
+    hourly: buckets,
+  }
+}
+
+/** 当日（本地时区）用量 */
+export function todayUsage(u: UsageStats, now: number = Date.now()): UsageStats {
+  return usageSince(u, dayStart(now))
+}
+
+/** 合并两个累积器（同 key 维度相加；hourly 按小时归并并保持升序） */
+export function mergeUsage(a: UsageStats, b: UsageStats): UsageStats {
+  const models = [...a.models]
+  for (const m of b.models) {
+    const i = models.findIndex((x) => x.model === m.model)
+    if (i === -1) models.push({ ...m })
+    else {
+      const c = models[i]
+      models[i] = {
+        ...c,
+        calls: c.calls + m.calls,
+        inputTokens: c.inputTokens + m.inputTokens,
+        outputTokens: c.outputTokens + m.outputTokens,
+        cacheRead: c.cacheRead + m.cacheRead,
+        cacheWrite: c.cacheWrite + m.cacheWrite,
+      }
+    }
+  }
+
+  const tools = [...a.tools]
+  for (const t of b.tools) {
+    const i = tools.findIndex((x) => x.tool === t.tool)
+    if (i === -1) tools.push({ ...t })
+    else {
+      const c = tools[i]
+      tools[i] = {
+        ...c,
+        count: c.count + t.count,
+        errors: c.errors + t.errors,
+        inputTokens: c.inputTokens + t.inputTokens,
+        outputTokens: c.outputTokens + t.outputTokens,
+      }
+    }
+  }
+
+  const agents = [...a.agents]
+  for (const g of b.agents) {
+    const i = agents.findIndex((x) => x.agentId === g.agentId)
+    if (i === -1) agents.push({ ...g })
+    else {
+      const c = agents[i]
+      agents[i] = {
+        ...c,
+        calls: c.calls + g.calls,
+        inputTokens: c.inputTokens + g.inputTokens,
+        outputTokens: c.outputTokens + g.outputTokens,
+        tasksDone: c.tasksDone + g.tasksDone,
+      }
+    }
+  }
+
+  const hourly = [...a.hourly]
+  for (const h of b.hourly) {
+    const i = hourly.findIndex((x) => x.hour === h.hour)
+    if (i === -1) hourly.push({ ...h })
+    else {
+      const c = hourly[i]
+      hourly[i] = {
+        ...c,
+        calls: c.calls + h.calls,
+        inputTokens: c.inputTokens + h.inputTokens,
+        outputTokens: c.outputTokens + h.outputTokens,
+        cacheRead: c.cacheRead + h.cacheRead,
+        cacheWrite: c.cacheWrite + h.cacheWrite,
+      }
+    }
+  }
+  hourly.sort((x, y) => x.hour - y.hour)
+
+  return {
+    llmCalls: a.llmCalls + b.llmCalls,
+    inputTokens: a.inputTokens + b.inputTokens,
+    outputTokens: a.outputTokens + b.outputTokens,
+    cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
+    cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    models,
+    tools,
+    agents,
+    hourly,
+  }
+}
+
+/** 汇总多个累积器（跨会话聚合当日用量用） */
+export function sumUsage(list: readonly UsageStats[]): UsageStats {
+  let acc = emptyUsage()
+  for (const u of list) acc = mergeUsage(acc, u)
+  return acc
+}
+
+/**
+ * 从会话水合用量统计（TUI 挂载 / /stats / /stats-export 共用）。
+ *
+ * 优先级：meta 持久化的累积器（有数据时）→ 由消息历史重建 → 空累积器。
+ * 这样重连（resume）后能立刻看到重连前累计的用量，而不是从 0 开始。
+ */
+export function hydrateUsage(s?: {
+  meta?: Record<string, unknown>
+  messages?: Array<{ meta?: Record<string, unknown>; createdAt?: number; parts?: Array<{ type: string; toolId?: string; isError?: boolean }> }>
+}): UsageStats {
+  const fromMeta = usageFromMeta(s?.meta)
+  if (fromMeta && !isBlankUsage(fromMeta)) return fromMeta
+  const rebuilt = usageFromMessages(s?.messages ?? [])
+  if (!isBlankUsage(rebuilt)) return rebuilt
+  return fromMeta ?? emptyUsage()
+}
+
+/** 当日用量单行摘要：`今日 N次 · inX/outY` */
+export function todayUsageLine(u: UsageStats): string {
+  return `今日 ${u.llmCalls}次 · in${u.inputTokens}/out${u.outputTokens}`
+}
+
+/**
+ * 是否应把 `next` 写入 session.meta：空累积器不得覆盖已持久化的历史。
+ *
+ * 回归背景：TUI 挂载时累积器初始为空，若无条件写回 meta 并落盘，
+ * 会把重连前累计的用量清零（/stats 显示 0、/stats-export 也导不出历史）。
+ */
+export function shouldPersistUsage(next: UsageStats, persisted: UsageStats | undefined): boolean {
+  if (isBlankUsage(next) && persisted && !isBlankUsage(persisted)) return false
+  return true
+}
+
 /** 单模型统计行：`model ×calls · inN(⚡cr)outN` */
 export function modelUsageRow(m: ModelUsage): string {
   const cache = m.cacheRead > 0 || m.cacheWrite > 0 ? `⚡${m.cacheRead}/w${m.cacheWrite} ` : ''
@@ -301,8 +476,11 @@ export function usageFromMeta(meta: Record<string, unknown> | undefined): UsageS
  * 由消息列表重建用量统计（用于 REPL/已恢复会话等未走 TuiApp onEvent 的场景）。
  * 逐条取 message.meta[{ model, tokenUsage }] 累加为 LLM 调用；工具调用无法反推
  * 但会按 tool part 依次记录 toolId（含 isError）。纯函数、可单测。
+ *
+ * 时间归属：按消息自身的 `createdAt` 归并小时桶（缺失才回落当前时间），
+ * 否则历史消息会被全部算到「今天」，导致当天用量虚高。
  */
-export function usageFromMessages(messages: Array<{ meta?: Record<string, unknown>; parts?: Array<{ type: string; toolId?: string; isError?: boolean }> }>): UsageStats {
+export function usageFromMessages(messages: Array<{ meta?: Record<string, unknown>; createdAt?: number; parts?: Array<{ type: string; toolId?: string; isError?: boolean }> }>): UsageStats {
   let u = emptyUsage()
   let pending: { input: number; output: number } | null = null
   let attributed = false
@@ -316,6 +494,7 @@ export function usageFromMessages(messages: Array<{ meta?: Record<string, unknow
         output: tu.output,
         cacheRead: tu.cacheRead,
         cacheWrite: tu.cacheWrite,
+        ts: typeof m.createdAt === 'number' ? m.createdAt : undefined,
       })
       pending = { input: tu.input ?? 0, output: tu.output ?? 0 }
       attributed = false
@@ -358,8 +537,16 @@ export function renderStatsText(u: UsageStats): string {
   return lines.join('\n')
 }
 
+/** 导出上下文：会话标识 + 可选的当日（跨会话）用量汇总 */
+export interface ExportStatsCtx {
+  sessionId?: string
+  title?: string
+  /** 当日（本地时区、跨会话归集）用量；提供时一并写入报告 */
+  today?: UsageStats
+}
+
 /** 导出为 JSON 报告文本 */
-export function exportStatsJson(u: UsageStats, ctx: { sessionId?: string; title?: string } = {}): string {
+export function exportStatsJson(u: UsageStats, ctx: ExportStatsCtx = {}): string {
   return JSON.stringify({
     sessionId: ctx.sessionId,
     title: ctx.title,
@@ -374,17 +561,42 @@ export function exportStatsJson(u: UsageStats, ctx: { sessionId?: string; title?
     tools: u.tools,
     agents: u.agents,
     hourly: u.hourly.map((h) => ({ ...h, label: hourLabel(h.hour) })),
+    ...(ctx.today
+      ? {
+          today: {
+            llmCalls: ctx.today.llmCalls,
+            inputTokens: ctx.today.inputTokens,
+            outputTokens: ctx.today.outputTokens,
+            cacheReadTokens: ctx.today.cacheReadTokens,
+            cacheWriteTokens: ctx.today.cacheWriteTokens,
+            uncachedInput: uncachedInput(ctx.today),
+            hourly: ctx.today.hourly.map((h) => ({ ...h, label: hourLabel(h.hour) })),
+          },
+        }
+      : {}),
   }, null, 2)
 }
 
 /** 导出为 Markdown 报告文本 */
-export function exportStatsMarkdown(u: UsageStats, ctx: { sessionId?: string; title?: string } = {}): string {
+export function exportStatsMarkdown(u: UsageStats, ctx: ExportStatsCtx = {}): string {
   const L: string[] = []
   L.push('# 会话用量统计报告')
   L.push('')
   L.push(`- 会话：${ctx.sessionId ?? '-'}${ctx.title ? `（${ctx.title}）` : ''}`)
   L.push(`- 导出时间：${new Date().toLocaleString()}`)
   L.push('')
+  if (ctx.today) {
+    L.push('## 当日汇总（全部会话）')
+    L.push('')
+    L.push('| 指标 | 值 |')
+    L.push('| --- | --- |')
+    L.push(`| 当日 LLM 调用次数 | ${ctx.today.llmCalls} |`)
+    L.push(`| 当日输入 token | ${ctx.today.inputTokens} |`)
+    L.push(`| 当日输出 token | ${ctx.today.outputTokens} |`)
+    L.push(`| 当日命中缓存 token | ${ctx.today.cacheReadTokens} |`)
+    L.push(`| 当日未命中缓存输入 token | ${uncachedInput(ctx.today)} |`)
+    L.push('')
+  }
   L.push('## 汇总')
   L.push('')
   L.push('| 指标 | 值 |')

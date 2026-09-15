@@ -1,5 +1,32 @@
 # Agent Harness 开发日志
 
+## 2026-09-15（续 122）用量统计：修复重连后 token 清零 + 新增当日（跨会话）用量
+
+### 问题
+
+- TUI 每次重连（resume）后 token 用量显示为 0。
+- 根因两处，且第二处会造成**数据丢失**：
+  1. `tui.tsx` 用量累积器初值恒为 `emptyUsage()`，从不从 `session.meta[usageStats]` 水合 → 重连后从 0 开始。
+  2. 持久化 effect 在挂载时无条件执行 `sess.meta = { ..., [USAGE_STATS_KEY]: usage }` 并防抖落盘 → 把已持久化的历史用量**覆盖成全 0**；又因 `usageFromMeta` 对「空累积器对象」照样返回值（非 undefined），`/stats` 显示 0、`/stats-export` 也导不出重连前数据。
+- 附带缺陷：`usageFromMessages` 重建时 `recordCall` 未传 `ts`，统一取 `Date.now()`，历史消息会被全部算到「今天」。
+
+### 修复
+
+- `packages/cli/src/usage-stats.ts`：
+  - 新增 `hydrateUsage`（meta 有数据优先 → 否则由消息历史重建）、`isBlankUsage`、`shouldPersistUsage`（空累积器不得覆盖已有历史）。
+  - 新增当日归集：`dayStart` / `usageSince` / `todayUsage` / `mergeUsage` / `sumUsage` / `todayUsageLine`。
+  - `usageFromMessages` 按消息 `createdAt` 归并小时桶（缺失才回落 now），修正跨天归属。
+  - 导出报告支持可选 `today`：JSON 增 `today` 字段，Markdown 增「当日汇总（全部会话）」小节。
+- `packages/cli/src/tui.tsx`：累积器初值改为 `hydrateUsage(options.session)`；持久化 effect 加 `hydratedSessionRef`（切换/恢复会话时重新水合）+ `shouldPersistUsage` 守卫；新增当日跨会话归集 effect（只读会话文件、不写回）与统计面板「今日 N次 · inX/outY（全部会话）」行。
+- `packages/cli/src/index.ts`：`resolveCurrentUsage` 统一走 `hydrateUsage`；新增并导出 `resolveTodayUsage`（跨会话归集当天，失败回落当前会话）；`/stats` 追加当日行，`/stats-export` 报告带当日汇总。
+
+### 验证
+
+- 新增 `packages/cli/src/usage-stats.test.ts`（23 用例：跨天时间归属、当日截取、跨会话小时桶归并、水合优先级、防覆盖守卫、导出字段）。
+- 新增 `packages/cli/src/usage-reconnect.test.ts`（3 用例端到端：落盘 → 从磁盘重连 → 用量不为 0；当日只算当天 2/3 次；导出含重连前数据；meta 被写空时由消息历史兜底重建）。
+- cli 全量 **225 用例通过**、typecheck 通过。
+  （`packages/revert` 的 `FakeSessionManager` 缺 `setBlocks` 为既有类型错误，本次未触碰。）
+
 ## 2026-09-14（续 121）ACP 参数组合离线分析脚本 + 压测/分析使用文档
 
 - 新增 `bench/analysis-params.ts`：按「参数组合签名 = params 快照 + window」归并遥测 JSONL 全量事件，

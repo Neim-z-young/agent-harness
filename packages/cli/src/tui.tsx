@@ -47,6 +47,14 @@ import {
   hourlyRow,
   sparkline,
   USAGE_STATS_KEY,
+  dayStart,
+  todayUsage,
+  sumUsage,
+  hydrateUsage,
+  isBlankUsage,
+  todayUsageLine,
+  usageFromMeta,
+  shouldPersistUsage,
   type UsageStats,
 } from './usage-stats'
 
@@ -698,6 +706,14 @@ export {
   renderStatsText,
   exportStatsJson,
   exportStatsMarkdown,
+  dayStart,
+  usageSince,
+  todayUsage,
+  mergeUsage,
+  sumUsage,
+  hydrateUsage,
+  isBlankUsage,
+  todayUsageLine,
 } from './usage-stats'
 
 export interface TuiStats {
@@ -948,8 +964,12 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   // setSession 时快照；会话继续增长时下标略有偏差（顶部旧段边缘可接受）。
   const allMessagesRef = useRef<Message[]>(options.session.messages)
   const earliestVisibleIdxRef = useRef(Math.max(0, options.session.messages.length - HISTORY_PAGE))
-  // 实际用量累积器（onEvent 驱动）：LLM 调用 token / 模型 / 工具粒度
-  const [usage, setUsage] = useState<UsageStats>(emptyUsage())
+  // 实际用量累积器（onEvent 驱动）：LLM 调用 token / 模型 / 工具粒度。
+  // 初值从会话水合（meta 持久化的累积器优先，否则由消息历史重建），
+  // 保证重连 / resume 后立刻看到重连前累计的用量，而不是从 0 开始。
+  const [usage, setUsage] = useState<UsageStats>(() => hydrateUsage(options.session))
+  // 当日（跨会话）用量：从持久化的会话文件归集当天小时桶，重连后仍能看到当天累计
+  const [todayTotals, setTodayTotals] = useState<UsageStats | null>(null)
   // 模块 4：侧栏各模块改为顶部图标 tab + 左右切换（每次仅展示一个面板）
   const [sidebarTab, setSidebarTab] = useState<SidebarTabId>('context')
   // 工具token归并状态：暂存本轮 LLM 用量，仅归并到紧随的第一个工具
@@ -1097,10 +1117,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
   // 模块 4：会话级持久化统计 —— 用量变化时写入 session.meta[usageStats] 并防抖落盘。
   // 这样切换/恢复会话后，/stats 与 /stats-export 都能从 meta 读到历史累计。
+  //
+  // 关键修复：空累积器不得覆盖已持久化的历史。此前挂载时 usage 恒为 emptyUsage()，
+  // 会立即把 meta[usageStats] 写成全 0 并落盘，导致重连后历史用量被清零、导出也丢失。
   const saveUsageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const hydratedSessionRef = useRef<string | undefined>(options.session?.id)
   useEffect(() => {
     const sess = options.session
     if (!sess) return
+    // 切换 / 恢复会话时重新水合：新会话的用量不应沿用上一个会话
+    if (hydratedSessionRef.current !== sess.id) {
+      hydratedSessionRef.current = sess.id
+      setUsage(hydrateUsage(sess))
+      return
+    }
+    // 防覆盖：本轮累积器为空、而 meta 里已有历史数据时，跳过写入
+    if (!shouldPersistUsage(usage, usageFromMeta(sess.meta))) return
     sess.meta = { ...(sess.meta ?? {}), [USAGE_STATS_KEY]: usage }
     if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current)
     saveUsageTimerRef.current = setTimeout(() => {
@@ -1108,6 +1140,34 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     }, 800)
     return () => { if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current) }
   }, [usage, options.session, options.app])
+
+  // 当日用量归集（跨会话）：每次 LLM 调用后重算。只读持久化文件、不写回，
+  // 因此重连后当天此前产生的用量依然可见（不依赖内存态）。
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const now = Date.now()
+        const from = dayStart(now)
+        const list = await options.app.sessionStore.list()
+        // 只加载当天有更新的会话，避免全量 IO
+        const recent = list.filter((s) => (s.updatedAt ?? 0) >= from)
+        const files = await Promise.all(
+          recent.map((s) =>
+            s.id === options.session.id
+              ? Promise.resolve(options.session)
+              : options.app.sessionStore.load(s.id).catch(() => undefined),
+          ),
+        )
+        if (cancelled) return
+        const per = files.map((f) => (f ? todayUsage(hydrateUsage(f), now) : emptyUsage()))
+        setTodayTotals(sumUsage(per))
+      } catch {
+        // 归集失败不影响主流程
+      }
+    })()
+    return () => { cancelled = true }
+  }, [usage.llmCalls, options.session, options.app])
 
   // 模块 C：加载 / 命令补全候选（内置 REPL 命令 + 插件注册命令 + TUI 专属 /edit）
   useEffect(() => {
@@ -1603,6 +1663,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                   <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
                     任务 {stats.tasksRunning}进行/{stats.tasksDone}完成 · {formatDuration(stats.elapsedMs)}
                   </text>
+                  {todayTotals && !isBlankUsage(todayTotals) && (
+                    <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                      {todayUsageLine(todayTotals)}（全部会话）
+                    </text>
+                  )}
                   <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
                     LLM {stats.usage.llmCalls}次 · in{stats.usage.inputTokens}/out{stats.usage.outputTokens}
                   </text>
