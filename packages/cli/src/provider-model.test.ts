@@ -198,7 +198,7 @@ function mount(providersConfig: unknown, provider = 'hy3') {
 }
 
 describe('/model 集成：省略 id 的配置也能直接按模型名切换', () => {
-  it('config 未写 id：boot 后按 model 派生实例，provider 字段直接引用派生 id', async () => {
+  it('config 未写 id：boot 后按 model 派生实例；/model 只改本会话、不写 config.json', async () => {
     const m = mount([
       { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'hy4-preview-f' },
       { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'hy3' },
@@ -213,12 +213,64 @@ describe('/model 集成：省略 id 的配置也能直接按模型名切换', ()
     expect(r).toBe('exit')
     const out = m.chunks.join('')
     expect(out).toInclude('已切换模型 hy4-preview-f/hy4-preview-f')
-    expect(m.app.getModel('default')).toBe('hy4-preview-f/hy4-preview-f')
+    expect(out).toInclude('仅本会话')
 
-    // 持久化自洽：provider 与 model 同步落盘
+    // 会话级覆盖生效：Session.meta.model 记下 provider + model，本会话的展示也据此解析
+    expect(m.app.sessionModelOverride(session)).toEqual({ providerId: 'hy4-preview-f', modelId: 'hy4-preview-f' })
+    expect(m.app.resolveSessionModel(session)).toBe('hy4-preview-f/hy4-preview-f')
+
+    // 旧实现会把 Agent 定义与 config.json 一起改掉（切一次影响所有会话），现在两者都不动
+    expect(m.app.getModel('default')).toBeUndefined()
     const cfg = await m.app.configStore.load()
-    expect(cfg.provider).toBe('hy4-preview-f')
-    expect(cfg.model).toBe('hy4-preview-f')
+    expect(cfg.provider).toBe('hy3')
+    expect(cfg.model).toBeUndefined()
+
+    await m.app.shutdown()
+    m.cleanup()
+  })
+
+  it('/model --global 写全局默认（Agent 定义 + config.json），并清除本会话覆盖', async () => {
+    const m = mount([
+      { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'hy4-preview-f' },
+      { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'hy3' },
+    ])
+    const { harness, session } = await m.app.boot()
+    const r = await startRepl({
+      app: m.app, harness, session, stdout: m.stdout,
+      // 先落一个会话级覆盖，再用 --global 改写全局：全局必须立刻对本会话生效
+      scriptedStdin: ['/model hy4-preview-f', '/model --global hy3', '/exit'],
+    })
+    expect(r).toBe('exit')
+    const out = m.chunks.join('')
+    expect(out).toInclude('已切换模型 hy3/hy3')
+    expect(out).toInclude('全局默认')
+    expect(out).toInclude('已一并清除本会话的模型覆盖')
+
+    expect(m.app.getModel('default')).toBe('hy3/hy3')
+    expect(m.app.sessionModelOverride(session)).toBeUndefined()
+    expect(m.app.resolveSessionModel(session)).toBe('hy3/hy3')
+    const cfg = await m.app.configStore.load()
+    expect(cfg.provider).toBe('hy3')
+    expect(cfg.model).toBe('hy3')
+    await m.app.shutdown()
+    m.cleanup()
+  })
+
+  it('/model reset 清除会话覆盖，回到 Agent 默认', async () => {
+    const m = mount([
+      { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'hy4-preview-f' },
+      { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'hy3' },
+    ])
+    const { harness, session } = await m.app.boot()
+    const r = await startRepl({
+      app: m.app, harness, session, stdout: m.stdout,
+      scriptedStdin: ['/model hy4-preview-f', '/model reset', '/model', '/exit'],
+    })
+    expect(r).toBe('exit')
+    const out = m.chunks.join('')
+    expect(out).toInclude('已清除本会话的模型覆盖')
+    expect(out).toInclude('来源：Agent "default" 的绑定（全局）')
+    expect(m.app.sessionModelOverride(session)).toBeUndefined()
     await m.app.shutdown()
     m.cleanup()
   })
@@ -369,8 +421,10 @@ describe('同配置不同 token 的集成：可区分 + 必须消歧', () => {
     expect(out).toInclude('改为 /model <序号>')
     // 用派生 id 才能精确切到第二个 token
     expect(out).toInclude('已切换模型 hy3-2/hy3')
+    // 会话级：两个 token 的区分结果只落到本会话，不改 config.provider
+    expect(m.app.sessionModelOverride(session)).toEqual({ providerId: 'hy3-2', modelId: 'hy3' })
     const cfg = await m.app.configStore.load()
-    expect(cfg.provider).toBe('hy3-2')
+    expect(cfg.provider).toBe('hy3')
     await m.app.shutdown()
     m.cleanup()
   })

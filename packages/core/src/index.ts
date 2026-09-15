@@ -209,6 +209,7 @@ import {
   COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
   buildView,
   renderBlocksAsMessage,
+  getSessionModelOverride,
 } from '@harness/session'
 import type {
   SnapshotID,
@@ -610,10 +611,14 @@ export class DefaultSessionManager implements SessionManager {
       createdAt: Date.now(),
     }
     await this.addMessage(sessionId, msg)
+    // 会话级模型覆盖（Session.meta.model）优先级最高：会话内用 /model 切换后
+    // 只影响本会话，不改 Agent 定义、不写 config.json，因此必须在这里透传给查询。
+    const model = getSessionModelOverride(sess)
     const assistant = await svc.agent.query({
       sessionId,
       agentId: sess.agentId ?? svc.currentAgentId(),
       message: text,
+      ...(model ? { model } : {}),
     })
     return assistant as Message
   }
@@ -631,10 +636,12 @@ export class DefaultSessionManager implements SessionManager {
     }
     await this.addMessage(sessionId, msg)
     // queryStream 内部会写入 user 消息（若不存在），这里已写入，故不会重复
+    const model = getSessionModelOverride(sess)
     const gen = svc.agent.queryStream({
       sessionId,
       agentId: sess.agentId ?? svc.currentAgentId(),
       message: text,
+      ...(model ? { model } : {}),
     })
     for await (const ev of gen) {
       yield ev

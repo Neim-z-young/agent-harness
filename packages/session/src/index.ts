@@ -155,6 +155,46 @@ export interface CompactMemory {
 /** 约定写入 Session.meta 的 key */
 export const COMPACT_META_KEY = 'compaction' as const
 export const COMPACT_MEMORY_KEY = 'compactMemory' as const
+export const SESSION_MODEL_META_KEY = 'model' as const
+
+// ===== 会话级模型覆盖（会话内自由切模型）=====
+// 语义：覆盖只作用于「本会话」，不写 Agent 定义、不写 config.json。
+// 优先级最高（高于 Agent 定义、启动参数），下一轮 query 即生效；
+// 置为 null / undefined 表示「清除覆盖」，回落到 Agent 定义与全局默认。
+//
+// 为什么不复用 Agent 定义：Agent 定义是全局共享对象（按 id 常驻注册表），
+// 改它等于把所有用该 Agent 的会话一起改掉 —— 这正是「切换模型串台」的根源。
+
+/** 会话级模型覆盖（约定写入 Session.meta.model） */
+export interface SessionModelOverride {
+  providerId?: string
+  modelId?: string
+}
+
+/**
+ * 读取会话级模型覆盖：形状非法或字段全空时返回 undefined（视作未覆盖）。
+ */
+export function getSessionModelOverride(
+  session: Pick<Session, 'meta'> | undefined | null,
+): SessionModelOverride | undefined {
+  const raw = session?.meta?.[SESSION_MODEL_META_KEY]
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const o = raw as Record<string, unknown>
+  const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
+  const providerId = str(o.providerId)
+  const modelId = str(o.modelId)
+  if (!providerId && !modelId) return undefined
+  return { ...(providerId ? { providerId } : {}), ...(modelId ? { modelId } : {}) }
+}
+
+/**
+ * 生成 updateMeta 用的 patch。
+ * `undefined` 会显式写成 null（而非删除 key）—— 因为 updateMeta 是浅合并，
+ * 只有显式给值才能把已有的覆盖清掉。
+ */
+export function sessionModelMetaPatch(override: SessionModelOverride | undefined): Record<string, unknown> {
+  return { [SESSION_MODEL_META_KEY]: override ?? null }
+}
 
 // ===== Session 压缩视图（上下文压缩·阶段二）=====
 // 目标：内存只驻留「摘要块 + 近期消息」，原文在盘按需懒加载。

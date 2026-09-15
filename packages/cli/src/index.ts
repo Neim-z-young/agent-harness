@@ -63,6 +63,7 @@ import {
   normalizeDirs,
   createWorkspaceOriginalStore,
   type Workspace,
+  type SessionFile,
 } from '@harness/workspace'
 import { createRevertPlugin, createSnapshotPlugin } from '@harness/revert'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
@@ -81,7 +82,7 @@ import {
   type UsageStats,
 } from './usage-stats'
 import { collectTodayUsage } from './usage-today'
-import { reconstructHistory, buildResolveBlock, type Message, type Session, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
+import { reconstructHistory, buildResolveBlock, getSessionModelOverride, sessionModelMetaPatch, type Message, type Session, type SessionModelOverride, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
 
@@ -117,6 +118,12 @@ export interface CliArgs {
   dataDir?: string
   permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   verbose?: boolean
+  /**
+   * 关闭「启动时自动恢复上次会话」（默认开启）。
+   * 开启时：不带 -s/--session 启动会接着当前工作目录里最近更新的会话继续；
+   * `harness run "<prompt>"` 一次性执行不受影响（始终是新会话，除非显式 -s）。
+   */
+  noResume?: boolean
   /** 开启文件快照 + /revert 能力（cli 传入时覆盖 config.json 的 harness.snapshot） */
   snapshot?: boolean
   /** 以 TUI（alt-screen 全屏）模式启动 REPL */
@@ -167,6 +174,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     if (a === '-v' || a === '--verbose') { out.verbose = true; continue }
     if (a === '--snapshot') { out.snapshot = true; continue }
     if (a === '--tui') { out.tui = true; continue }
+    if (a === '--no-resume') { out.noResume = true; continue }
     if (a === '--check-config') { out.checkConfig = true; continue }
     const [k, v] = a.startsWith('--')
       ? a.slice(2).split('=', 2) as [string, string | undefined]
@@ -249,6 +257,12 @@ export interface HarnessConfig {
   mcpServers?: McpServerEntry[]
   /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
   snapshot?: boolean
+  /**
+   * 启动时自动恢复上次会话（默认 **true**）。
+   * 规则：不带 `-s/--session` 启动 REPL/TUI 时，取「当前工作目录」内 updatedAt 最新的
+   * 会话继续；目录不匹配的会话不会被误恢复。`--no-resume` 可临时关闭。
+   */
+  autoResume?: boolean
   /**
    * 兼容的嵌套写法（表现同顶层 snapshot）：`{ "harness": { "snapshot": true } }`。
    * 若顶层 snapshot 未填，则回退读此字段。
@@ -1178,8 +1192,56 @@ export interface HarnessAppOptions {
    * 并挂载 meta.snapshot），REPL 提供 /revert stage|clear|commit|status。
    */
   snapshot?: boolean
+  /**
+   * 启动时自动恢复上次会话（默认 true，等价 config.autoResume）。
+   * `harness run "<prompt>"` 一次性执行请显式传 false —— 脚本化调用不该悄悄接着上一个会话写。
+   */
+  autoResume?: boolean
   /** 是否启用 boot 末尾的后台静默预加载内置插件/工具（多级加载 L2，默认 true）。设为 false 关闭。 */
   backgroundPreload?: boolean
+}
+
+/** boot() 的会话决策结果，供 REPL/TUI 提示（「已恢复上次会话」/「为何没恢复」） */
+export interface SessionRestoreInfo {
+  /** explicit：`-s/--session` 指定；auto：自动恢复最近会话；new：新建 */
+  source: 'explicit' | 'auto' | 'new'
+  sessionId: string
+  /** source=auto 时：该会话的消息条数 */
+  messageCount?: number
+  /** source=auto 时：该会话最后更新时间（ms） */
+  updatedAt?: number
+  /**
+   * 被跳过的「最近会话」：它属于其它工作目录（或自动恢复已关闭）。
+   * 明确记录是为了让「为什么这次没接着上次」有答案，而不是让用户对着空会话猜。
+   */
+  skipped?: { id: string; cwd?: string; updatedAt: number; reason: 'other-cwd' | 'disabled' }
+}
+
+/** 相对时间描述（仅用于「上次会话是多久以前」这类提示） */
+export function formatAgo(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ''
+  const min = Math.floor(ms / 60_000)
+  if (min < 1) return '刚刚'
+  if (min < 60) return `${min} 分钟前`
+  const hour = Math.floor(min / 60)
+  if (hour < 24) return `${hour} 小时前`
+  return `${Math.floor(hour / 24)} 天前`
+}
+
+/**
+ * 「本次启动如何决定当前会话」的一句话说明（REPL 与 TUI 共用文案）。
+ * 无提示（新会话且无跳过项）时返回空串。
+ */
+export function describeSessionRestore(restore: SessionRestoreInfo, now = Date.now()): string {
+  if (restore.source === 'auto') {
+    const ago = formatAgo(now - (restore.updatedAt ?? 0))
+    return `已自动恢复上次会话 ${restore.sessionId}（${restore.messageCount ?? 0} 条消息${ago ? `，${ago}` : ''}）；/new 开新会话 · --no-resume 关闭自动恢复`
+  }
+  if (restore.skipped?.reason === 'other-cwd') {
+    const s = restore.skipped
+    return `未自动恢复会话 ${s.id}：它属于其它工作目录（${s.cwd ?? '未记录'}）；要用它：/resume ${s.id}`
+  }
+  return ''
 }
 
 export class HarnessApp {
@@ -1204,6 +1266,12 @@ export class HarnessApp {
    * 已归一化（id 必定存在）——供 /model ? 展示，也是 /model 解析实例的直接数据源。
    */
   private loadedProviders: ResolvedProviderConfig[] = []
+
+  /**
+   * boot() 的会话决策结果（explicit / auto / new），供 REPL、TUI 提示用。
+   * 每次 boot 覆盖。
+   */
+  sessionRestore: SessionRestoreInfo = { source: 'new', sessionId: '' }
 
   constructor(options: HarnessAppOptions) {
     const cwd = resolve(options.cwd)
@@ -1339,6 +1407,38 @@ export class HarnessApp {
     if (a?.model?.providerId) return formatModel(a.model.providerId, a.model.modelId) ?? `${a.model.providerId}/(provider 默认模型)`
     if (a?.model?.modelId) return a.model.modelId
     return this.options.model
+  }
+
+  /**
+   * 「本会话实际会用的模型」展示标签 —— 优先级与 core 的解析链严格一致：
+   * 会话级覆盖（Session.meta.model）> Agent 定义 > 启动参数 -m > Provider 默认模型。
+   */
+  resolveSessionModel(session: Pick<Session, 'agentId' | 'meta'> | undefined): string | undefined {
+    const ov = getSessionModelOverride(session)
+    if (ov) {
+      if (ov.providerId) return formatModel(ov.providerId, ov.modelId) ?? `${ov.providerId}/(provider 默认模型)`
+      return ov.modelId
+    }
+    return this.getModel(session?.agentId ?? this.options.agentId)
+  }
+
+  /** 当前会话的模型覆盖（undefined = 未覆盖，跟随 Agent 定义与全局默认） */
+  sessionModelOverride(session: Pick<Session, 'meta'> | undefined): SessionModelOverride | undefined {
+    return getSessionModelOverride(session)
+  }
+
+  /**
+   * 写「会话级模型覆盖」并立即落盘：只影响本会话，**不动** Agent 定义、**不写** config.json。
+   * `override` 传 undefined 即清除覆盖（回落该 Agent 的默认模型）。
+   *
+   * 为什么必须落盘：重启后「自动恢复上次会话」要把这个选择一起带回来，
+   * 否则用户每次重启都得重新切一遍模型。
+   */
+  async setSessionModel(session: Session, override: SessionModelOverride | undefined): Promise<Session> {
+    await this.harness.session.updateMeta(session.id, sessionModelMetaPatch(override))
+    const fresh = (await this.harness.session.get(session.id)) ?? session
+    await this.sessionStore.save(fresh)
+    return fresh
   }
 
   /** 解析指定 providerId 在当前 harness 实际命中的 ChatProvider；未装配的 provider 会回退到默认 Provider */
@@ -1774,36 +1874,101 @@ export class HarnessApp {
     // allSettled，失败仅记录日志，不阻塞 boot、不向上抛错）。
     this.scheduleBuiltinPreload()
 
-    // 会话：恢复 / 新建
+    // 会话：显式指定 > 自动恢复上次 > 新建
     const sm = harness.session
     let session: Session
     const sid = this.options.sessionId
     if (sid) {
       const saved = await this.sessionStore.load(sid)
       if (saved) {
-        // 先 create 后回填 messages（SessionManager 接口没有批量 restore，这里创建新 session + 逐行 addMessage）
-        session = await sm.create({ title: saved.title, agentId: saved.agentId, cwd: this.options.cwd, meta: saved.meta })
-        // 将 session.id 改为 sid（通过直接操作 manager 内部）：这里简单使用默认 ID，但把 messages 写回去
-        for (const m of saved.messages) await sm.addMessage(session.id, m)
-        // 若用户明确 --session sid，实际文件 id ≠ sid，做个 save 用正确 id
-        await sm.setId(session.id, sid)
-        // 上下文压缩·阶段二（Route B）：恢复压缩块并注册惰性加载器，供 /history 等按需读盘还原被压缩原文
-        if (saved.blocks?.length) {
-          session.blocks = saved.blocks
-          sm.setHistoryLoader(session.id, {
-            load: (s, range) => this.loadFullHistory(s, range),
-          })
+        session = await this.restoreSession(saved)
+        this.sessionRestore = {
+          source: 'explicit',
+          sessionId: session.id,
+          messageCount: saved.messages.length,
+          updatedAt: saved.updatedAt,
         }
       } else {
+        // 指定了 id 但磁盘上不存在：沿用原语义建一个「同名」会话（用于预置 id 的场景）
         session = await sm.create({ title: sid, agentId: this.options.agentId, cwd: this.options.cwd })
         await sm.setId(session.id, sid)
+        this.sessionRestore = { source: 'explicit', sessionId: session.id }
       }
     } else {
-      session = await sm.create({ agentId: this.options.agentId, cwd: this.options.cwd })
+      const pick = await this.pickResumeCandidate()
+      if (pick.kind === 'hit') {
+        session = await this.restoreSession(pick.saved)
+        this.sessionRestore = {
+          source: 'auto',
+          sessionId: session.id,
+          messageCount: pick.item.messageCount,
+          updatedAt: pick.item.updatedAt,
+        }
+      } else {
+        session = await sm.create({ agentId: this.options.agentId, cwd: this.options.cwd })
+        this.sessionRestore = { source: 'new', sessionId: session.id, ...(pick.skipped ? { skipped: pick.skipped } : {}) }
+      }
     }
     await this.sessionStore.save(session)
 
     return { harness, session }
+  }
+
+  /**
+   * 把磁盘会话还原为运行中的 Session。
+   *
+   * SessionManager 接口没有批量 restore，只能 `create` 一个新会话 → 逐条 `addMessage`
+   * → 再 `setId` 把临时 id 换成磁盘里的原 id（setId 会同步内部索引键）。
+   * boot 的显式恢复与 `/resume` 共用这一份实现，避免两处各写一遍、各自漏掉压缩块。
+   */
+  async restoreSession(saved: SessionFile): Promise<Session> {
+    const sm = this.harness.session
+    const session = await sm.create({
+      title: saved.title,
+      agentId: saved.agentId,
+      cwd: saved.cwd ?? this.options.cwd,
+      meta: saved.meta,
+      ...(saved.parentId ? { parentId: saved.parentId } : {}),
+    })
+    for (const m of saved.messages) await sm.addMessage(session.id, m)
+    await sm.setId(session.id, saved.id)
+    // 上下文压缩·阶段二（Route B）：恢复压缩块并注册惰性加载器，供 /history 等按需读盘还原被压缩原文
+    if (saved.blocks?.length) {
+      session.blocks = saved.blocks
+      sm.setHistoryLoader(session.id, { load: (s, range) => this.loadFullHistory(s, range) })
+    }
+    return session
+  }
+
+  /**
+   * 挑「上次会话」用于自动恢复。
+   *
+   * 规则：`sessions` 目录里的会话按 updatedAt 倒序（SessionFileStore.list 已排好），
+   * 取**第一个工作目录与当前一致的**。为什么必须比对 cwd —— 目录是全局共享的，
+   * 同一台机器上多个项目的会话都躺在一起，只按时间取会在 A 项目里恢复出 B 项目的会话。
+   *
+   * 没命中时把「最近的会话」原样回报给调用方：这样提示能说清是「目录不同」还是
+   * 「被 --no-resume 关掉了」，而不是让用户对着一个空会话猜。
+   */
+  private async pickResumeCandidate(): Promise<
+    | { kind: 'hit'; item: { id: string; updatedAt: number; messageCount: number; cwd?: string }; saved: SessionFile }
+    | { kind: 'miss'; skipped?: SessionRestoreInfo['skipped'] }
+  > {
+    const autoResume = this.options.autoResume !== false
+    const list = await this.sessionStore.list()
+    if (list.length === 0) return { kind: 'miss' }
+    const newest = list[0]
+    if (!autoResume) {
+      return { kind: 'miss', skipped: { id: newest.id, cwd: newest.cwd, updatedAt: newest.updatedAt, reason: 'disabled' } }
+    }
+    const cwd = this.options.cwd
+    const hit = list.find((s) => !!s.cwd && resolve(s.cwd) === cwd)
+    if (!hit) {
+      return { kind: 'miss', skipped: { id: newest.id, cwd: newest.cwd, updatedAt: newest.updatedAt, reason: 'other-cwd' } }
+    }
+    const saved = await this.sessionStore.load(hit.id)
+    if (!saved) return { kind: 'miss' }
+    return { kind: 'hit', item: hit, saved }
   }
 
   /** 发送一次用户消息，得到 assistant Message（内部持久化） */
@@ -1963,7 +2128,7 @@ export interface ReplOptions {
 }
 
 /** 特殊 REPL 命令（以 / 开头） */
-const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills', '/stats', '/stats-export', '/permission', '/history', '/tree']
+const REPL_COMMANDS = ['/help', '/exit', '/quit', '/sessions', '/new', '/resume', '/agent', '/switch', '/model', '/config', '/save', '/compact', '/plugins', '/skills', '/stats', '/stats-export', '/permission', '/history', '/tree']
 
 /**
  * 收集 TUI `/` 命令补全候选：内置 REPL 命令 + 插件经 `cli.commands` hook 注册的命令。
@@ -2180,6 +2345,24 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
   const onEvent = options.onEvent
   let current = options.session
 
+  /**
+   * `/resume` 的共用落地：先把当前会话落盘，再还原目标会话并换绑指针。
+   * 与 boot() 的恢复共用 `app.restoreSession` —— 顺带把「会话级模型覆盖」也一起带回来。
+   */
+  const doResume = async (saved: SessionFile): Promise<ProcessLineResult> => {
+    const prev = await harness.session.get(current.id)
+    if (prev) await app.sessionStore.save(prev)
+    const next = await app.restoreSession(saved)
+    current = next
+    options.setSession?.(next)
+    const totalMsg = (await app.loadFullHistory(saved.id).catch(() => []))?.length ?? saved.messages.length
+    const ov = app.sessionModelOverride(next)
+    out(
+      `已恢复会话 ${saved.id}（${totalMsg} 条消息${ov ? ` · model=${app.resolveSessionModel(next)}（本会话覆盖）` : ''}）\n`,
+    )
+    return 'continue'
+  }
+
   return async (raw) => {
     const line = raw.trim()
     if (!line) return 'continue'
@@ -2197,14 +2380,17 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out('  /exit, /quit       退出 REPL\n')
           out('  /sessions          列出持久化会话\n')
           out('  /new               新建会话（保留当前历史到磁盘）\n')
-          out('  /resume <id>       恢复持久化会话继续交互（/sessions 查看 id）\n')
+          out('  /resume [id]       恢复会话：给 id 恢复指定会话，不给则接着同目录最近一次（/sessions 看 id）\n')
           out('  /save              手动保存当前会话\n')
-          out('  /switch <agentId>  切换默认 Agent（下一条 send 生效）\n')
-          out('  /switch ?          列出已注册 Agent\n')
-          out('  /model             查看当前模型\n')
-          out('  /model <模型名>    切换模型：按已配置的 model 名（如 /model hy3）或实例 id 切换\n')
+          out('  /agent             列出已注册 Agent（含各自绑定模型与当前项）\n')
+          out('  /agent <id>        切换**本会话**的 Agent（立即保存，下一条消息起）\n')
+          out('  /switch <id>       /agent 的旧写法，等价\n')
+          out('  /model             查看当前模型及其来源（本会话覆盖 / Agent 绑定）\n')
+          out('  /model <模型名>    切换模型（**仅本会话**）：按已配置的 model 名（如 /model hy3）或实例 id\n')
           out('  /model <序号>      按 /model ? 列表序号切换（如 /model 2）\n')
           out('  /model <id>/<模型>  显式跨 Provider（如 /model openai/gpt-4o）\n')
+          out('  /model --global <spec> 写成全局默认（同步 Agent 定义 + config.json）\n')
+          out('  /model reset       清除本会话覆盖，回到该 Agent 的默认模型\n')
           out('  /model ?           列出已注册 Provider 与已配置模型（带序号）\n')
           out('  /config            查看 Provider / 模型配置概览（config.json）\n')
           out('  /permission        查看权限交互模式与规则（permissions.json）\n')
@@ -2252,55 +2438,91 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         case '/new': {
           const cur = (await harness.session.get(current.id))!
           await app.sessionStore.save(cur)
-          const next = await harness.session.create({ agentId: current.agentId })
+          // 继承 agentId 与会话级模型覆盖：用户切完 agent/model 后开新会话，预期是「同样的设置、干净的上下文」，
+          // 让新会话回落到 Agent 默认反而像是设置被重置了。
+          const carry = app.sessionModelOverride(cur)
+          const next = await harness.session.create({
+            agentId: current.agentId,
+            cwd: cur.cwd ?? app.workspace.cwd,
+            meta: carry ? sessionModelMetaPatch(carry) : undefined,
+          })
           // 换绑当前会话：工厂内部指针 + 通知调用方
           current = next
           options.setSession?.(next)
-          out(`已新建会话 ${next.id}\n`)
+          await app.sessionStore.save(next)
+          out(`已新建会话 ${next.id}（沿用 agent=${next.agentId ?? 'default'}${carry ? ` · model=${app.resolveSessionModel(next)}` : ''}）\n`)
           return 'continue'
         }
         case '/resume': {
-          if (!arg || !arg.trim()) { out('用法：/resume <sessionId> 恢复持久化会话继续交互\n'); return 'continue' }
+          if (!arg || !arg.trim()) {
+            // 无参 /resume = 接着「当前工作目录里最近更新」的会话（与启动时的自动恢复同一套判定）
+            const list = await app.sessionStore.list()
+            const hit = list.find((s) => !!s.cwd && resolve(s.cwd) === resolve(app.workspace.cwd))
+            if (!hit) { out('没有可恢复的会话（同目录下暂无历史）；/sessions 可查看全部。\n'); return 'continue' }
+            const saved = await app.sessionStore.load(hit.id)
+            if (!saved) { out(`会话 "${hit.id}" 读取失败。\n`); return 'continue' }
+            return await doResume(saved)
+          }
           const saved = await app.sessionStore.load(arg)
           if (!saved) { out(`会话 "${arg}" 不存在（可用 /sessions 查看）。\n`); return 'continue' }
           if (saved.id === current.id) { out(`已在会话 ${arg}\n`); return 'continue' }
-          // 先保存当前会话历史
-          const cur = await harness.session.get(current.id)
-          if (cur) await app.sessionStore.save(cur)
-          // 与 boot() resume 一致：create 新会话 + 回填消息 + 复写 id 为原会话 id
-          const next = await harness.session.create({ title: saved.title, agentId: saved.agentId, cwd: saved.cwd, meta: saved.meta })
-          for (const m of saved.messages) await harness.session.addMessage(next.id, m)
-          await harness.session.setId(next.id, saved.id)
-          // 上下文压缩·阶段二（Route B）：恢复压缩块并注册惰性加载器
-          if (saved.blocks?.length) {
-            next.blocks = saved.blocks
-            harness.session.setHistoryLoader(next.id, {
-              load: (s, range) => app.loadFullHistory(s, range),
-            })
-          }
-          current = next
-          options.setSession?.(next)
-          const totalMsg = (await app.loadFullHistory(saved.id).catch(() => []))?.length ?? saved.messages.length
-          out(`已恢复会话 ${saved.id}（${totalMsg} 条消息）\n`)
-          return 'continue'
+          return await doResume(saved)
         }
-        case '/switch': {
+        case '/agent': case '/switch': {
+          const cur = (await harness.session.get(current.id))!
+          const currentAgentId = cur.agentId ?? 'default'
           if (!arg || arg === '?') {
-            out('已注册 Agent：\n')
-            for (const a of harness.agent.list()) out(`  ${a.id}  -  ${a.name}\n`)
+            out(`已注册 Agent（本会话当前：${currentAgentId}）：\n`)
+            for (const a of harness.agent.list()) {
+              const bound = app.getModel(a.id)
+              const mark = a.id === currentAgentId ? '  ← 当前' : ''
+              out(`  ${a.id}  -  ${a.name}${bound ? `  [model=${bound}]` : ''}${mark}\n`)
+            }
+            out('切换：/agent <id>（只改本会话，已注册即可切换）\n')
             return 'continue'
           }
           const exists = harness.agent.get(arg)
-          if (!exists) { out(`Agent "${arg}" 未注册。\n`); return 'continue' }
-          const cur = (await harness.session.get(current.id))!
+          if (!exists) {
+            out(`Agent "${arg}" 未注册。可用：${harness.agent.list().map((a) => a.id).join(' / ') || '（无）'}\n`)
+            return 'continue'
+          }
+          if (currentAgentId === arg) { out(`本会话已是 Agent ${arg}\n`); return 'continue' }
           cur.agentId = arg
-          out(`已切换到 Agent ${arg}（影响下次 send）\n`)
+          cur.updatedAt = Date.now()
+          // 立即落盘：agent 是会话属性，等到下一次 send 才保存会在「切完就退出」时丢掉
+          await app.sessionStore.save(cur)
+          out(`已切换到 Agent ${arg}（仅本会话，已保存；下一条消息起）\n`)
+          const ov = app.sessionModelOverride(cur)
+          if (ov) {
+            // 会话级模型覆盖优先级高于 Agent 绑定 —— 不同步说明会让人以为切换没生效
+            out(`  提示：本会话有模型覆盖 ${app.resolveSessionModel(cur)}，它会盖过该 Agent 的绑定模型；/model reset 可清除。\n`)
+          } else {
+            out(`  本会话将使用 model=${app.resolveSessionModel(cur) ?? '（Provider 默认）'}\n`)
+          }
           return 'continue'
         }
         case '/model': {
-          const agentId = current.agentId ?? 'default'
+          // `line.split(/\s+/, 2)` 只切出两个 token，表达不了 `/model --global hy3`，
+          // 这里按完整参数列表重切一次（最后一个参数才是模型 spec）。
+          const parts = line.slice('/model'.length).trim().split(/\s+/).filter(Boolean)
+          const useGlobal = parts.some((p) => p === '--global' || p === '-g' || p === 'global')
+          const spec = parts.filter((p) => p !== '--global' && p !== '-g' && p !== 'global').join(' ').trim()
+          const cur = (await harness.session.get(current.id))!
+          const agentId = cur.agentId ?? 'default'
           const configured = app.listConfiguredProviders()
-          if (!arg || arg === '?') {
+          // `/model reset`（等价 default / clear）：清除本会话覆盖，回到 Agent 的默认模型
+          if (spec === 'reset' || spec === 'default' || spec === 'clear') {
+            const before = app.sessionModelOverride(cur)
+            await app.setSessionModel(cur, undefined)
+            const eff = app.resolveSessionModel(cur)
+            out(
+              before
+                ? `已清除本会话的模型覆盖，回到 Agent "${agentId}" 的默认：${eff ?? '（Provider 默认）'}\n`
+                : `本会话本就没有模型覆盖，当前即 Agent "${agentId}" 的默认：${eff ?? '（Provider 默认）'}\n`,
+            )
+            return 'continue'
+          }
+          if (!spec || spec === '?') {
             const prods = app.listProviders()
             out('已注册 Provider：' + (prods.length ? prods.join(' / ') : '（默认 mock/anthropic）') + '\n')
             // 展示 config.json / CLI 里配置的 Provider 实例及其默认/附加模型（带序号，可直接 /model <序号>）
@@ -2336,9 +2558,15 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
               const sample = first.model ?? first.id
               out(`切换：/model ${sample}（按模型名）· /model ${first.index}（按序号）· /model ${first.id}/${first.model ?? '<model>'}（显式跨 Provider）\n`)
             }
-            const m = app.getModel(agentId)
-            if (m) out(`当前模型：${m}（agent=${agentId}）\n`)
-            else out(`Agent "${agentId}" 未绑定模型，使用 Provider 默认。\n`)
+            const ov = app.sessionModelOverride(cur)
+            const eff = app.resolveSessionModel(cur)
+            out(`当前模型：${eff ?? '（未绑定，用 Provider 默认）'}\n`)
+            if (ov) {
+              out('  来源：本会话模型覆盖（只影响本会话，已随会话落盘）\n')
+              out('        改回该 Agent 默认：/model reset；写成全局默认：/model --global <spec>\n')
+            } else {
+              out(`  来源：Agent "${agentId}" 的绑定（全局）；/model <spec> 只改本会话\n`)
+            }
             if (harness.agent.get(agentId)?.model?.options) {
               out(`模型附加选项：${JSON.stringify(harness.agent.get(agentId)!.model!.options)}\n`)
             }
@@ -2346,7 +2574,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           }
           // 统一解析用户输入（序号 / 实例 id / 模型名 / provider/model），再按结果执行或提示
           const knownRefs = app.listProviders()
-          const r = resolveModelArg(arg.trim(), app.configuredProviders(), knownRefs)
+          const r = resolveModelArg(spec, app.configuredProviders(), knownRefs)
           if (r.kind === 'ambiguous') {
             out(`"${r.arg}" 同时命中多个 Provider 实例，请指明其一：\n`)
             for (const c of r.candidates) {
@@ -2379,12 +2607,28 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             out('   可在 <data-dir>/config.json → providers 中定义后重新启动。\n')
             return 'continue'
           }
-          const ok = await app.setModel(agentId, arg.trim())
-          if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
-          const ref = formatResolutionRef(r) ?? arg.trim()
-          // ref 已含 `provider/model`，无需再重复 provider；仅在实例未声明 model 时补充说明
+          // 会话级覆盖的落值：实例未声明 model 时只记 providerId，交由该 Provider 的默认模型接管
+          const providerIdForOverride = r.kind === 'model' ? undefined : r.providerId
+          const override: SessionModelOverride = {
+            ...(providerIdForOverride ? { providerId: providerIdForOverride } : {}),
+            ...(r.modelId ? { modelId: r.modelId } : {}),
+          }
+          const ref = formatResolutionRef(r) ?? spec
           const detail = r.kind === 'instance' && !r.modelId ? '（该 Provider 未声明 model，使用其默认模型）' : ''
-          out(`已切换模型 ${ref}${detail}（agent=${agentId}，影响下次 send；已写入 config.json）\n`)
+          if (useGlobal) {
+            const ok = await app.setModel(agentId, spec)
+            if (!ok) { out(`Agent "${agentId}" 未注册。\n`); return 'continue' }
+            // 全局切换后必须清掉本会话覆盖：否则「已切全局」却仍走旧模型，用户会以为命令没生效
+            const had = app.sessionModelOverride(cur)
+            if (had) await app.setSessionModel(cur, undefined)
+            out(`已切换模型 ${ref}${detail}（Agent "${agentId}" 的全局默认，已写入 config.json）\n`)
+            if (had) out('  已一并清除本会话的模型覆盖，使该设置立刻对本会话生效。\n')
+          } else {
+            // 默认：只改本会话（不碰 Agent 定义、不写 config.json）
+            await app.setSessionModel(cur, override)
+            out(`已切换模型 ${ref}${detail}（仅本会话，已随会话保存；下一条消息起）\n`)
+            out('  其他会话与 Agent 默认不受影响；要写成全局默认用 /model --global <spec>\n')
+          }
           // 目标 Provider 若未装配到当前 harness，会静默回退默认（如 mock）——明确提示，避免「为什么一直 mock」
           const targetProvider = r.kind === 'instance' || r.kind === 'explicit' ? r.providerId : undefined
           if (targetProvider) {
@@ -2402,7 +2646,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out(`当前 agent=${agentId}\n`)
           const prods = app.listProviders()
           out(`已注册 Provider：${prods.length ? prods.join(' / ') : '（默认 mock/anthropic）'}\n`)
-          const m = app.getModel(agentId)
+          const cur = (await harness.session.get(current.id))!
+          const m = app.resolveSessionModel(cur)
           if (m) out(`当前模型：${m}\n`)
           out(buildConfigOverview(cfg, cfg.provider ?? 'anthropic') + '\n')
           return 'continue'
@@ -2646,7 +2891,9 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       return 'continue'
     }
     const duration = Date.now() - started
-    const modelLabel = app.getModel(assistant?.agentId ?? current.agentId ?? 'default')
+    // 用「本会话实际会用的模型」而非 Agent 绑定值：会话级覆盖（/model）后若还读 Agent 定义，
+    // 统计行会一直显示旧模型，看起来像切换没生效
+    const modelLabel = app.resolveSessionModel(current)
     out(`⏱️  ${duration}ms | agent=${assistant?.agentId ?? current.agentId ?? '?'}` +
       (modelLabel ? ` | model=${modelLabel}` : '') + '\n\n')
     return 'continue'
@@ -2685,7 +2932,13 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
   const out = (s: string) => (options.stdout ?? process.stdout).write(s)
 
   out(`Harness CLI (session=${session.id}, agent=${session.agentId ?? 'default'})\n`)
-  out(`输入问题开始对话；输入 /help 查看特殊命令；/exit 退出。\n\n`)
+  // 自动恢复的提示必须显式给出：否则用户会以为「怎么一进来就有历史」是 bug，
+  // 也不知道该用 /new 开新会话。没恢复时同样给出原因，避免对着空会话猜。
+  const notice = describeSessionRestore(app.sessionRestore)
+  if (notice) out(notice + '\n')
+  const modelNow = app.resolveSessionModel(session)
+  out(`输入问题开始对话；输入 /help 查看特殊命令；/exit 退出。\n`)
+  out(`当前 agent=${session.agentId ?? 'default'} · model=${modelNow ?? '（Provider 默认）'}；会话内可用 /agent、/model 切换。\n\n`)
 
   let idx = 0
   const scripted = options.scriptedStdin ? [...options.scriptedStdin] : null
@@ -2740,7 +2993,7 @@ export const HELP_TEXT = `harness — Agent Harness CLI
 用法:
   harness [repl|start] [options]        启动交互式 REPL（默认）
   harness list-sessions [options]       列出持久化会话
-  harness resume <sessionId> [opt]      恢复指定会话进入 REPL
+  harness resume [sessionId] [opt]      恢复会话进入 REPL（省略 id 则接着当前目录最近一次）
   harness run "<prompt>" [opt]          一次性执行 prompt，输出结果后退出
   harness teammate --team <t> --name <n> [opt]   以 out-of-process teammate 身份运行（终端后端 spawn）
   harness config set-key <providerId> <apiKey>   加密写入 provider 的 apiKey（enc:v1 密文）
@@ -2758,12 +3011,23 @@ teammate 选项:
   -p, --provider <id>      默认 Provider id：mock / anthropic，或 config.providers 中定义的自定义 id（默认 anthropic，无 key 时 fallback mock）
   -m, --model <spec>       默认模型：provider/modelId 跨 Provider 指定（如 openai/gpt-4o）。运行时可用 /model 切换
   -s, --session <id>       指定会话 ID（用于 resume/run 时复用历史）
+      --no-resume          本次启动不恢复上次会话（默认按工作目录自动恢复，见下）
   -d, --data-dir <dir>     持久化目录（默认 ~/.harness）
       --permission <mode>  allow-all / ask / deny-all（默认 ask）
   -v, --verbose            输出调试信息
       --tui                以 TUI（alt-screen 全屏）模式启动 REPL
       --snapshot           开启文件快照 + /revert 能力（默认 false；config.json 设 "snapshot": true 或 harness.snapshot 常开）
       --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
+
+会话（启动即恢复 · 会话内可切 Agent / 模型）:
+  默认启动会接着「当前工作目录里最近更新」的会话继续；目录不匹配的会话不会被误恢复。
+  关闭自动恢复：--no-resume，或 config.json 设 "autoResume": false。run "<prompt>" 始终新建（脚本化不该改写历史）。
+  REPL/TUI 内：
+    /agent [id]             查看/切换**本会话**的 Agent（立即保存；/switch 为旧写法）
+    /model <spec>           切换模型，**只影响本会话**（写入 Session.meta.model，随会话持久化）
+    /model --global <spec>  写成全局默认（同步 Agent 定义 + config.json，并清除本会话覆盖）
+    /model reset            清除本会话覆盖，回到该 Agent 的默认模型
+    /new                    新建会话（沿用当前 agent 与模型）；/resume [id] 恢复会话
 
 多 Provider（config.json → providers）:
   [
@@ -2978,6 +3242,9 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     providers: cfg.providers,
     anthropicProviderConfig: anthropicApiKey ? { apiKey: anthropicApiKey } : undefined,
     sessionId: args.command === 'resume' ? args.arg ?? args.sessionId : args.sessionId,
+    // 自动恢复上次会话：CLI --no-resume > config.json autoResume > 默认开启。
+    // `run "<prompt>"` 是脚本化一次性执行，强制关闭 —— 否则它会悄悄接着上一个会话往下写。
+    autoResume: args.command === 'run' ? false : args.noResume ? false : cfg.autoResume !== false,
     permissionMode, verbose: args.verbose, snapshot,
   })
   const { harness, session } = await app.boot()

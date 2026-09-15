@@ -812,7 +812,7 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
-  it('/model 查看与切换模型：更新 Agent.model + 持久化 config.json', async () => {
+  it('/model 切换模型：默认只改本会话（Session.meta.model），不动 Agent 与 config.json', async () => {
     const chunks: string[] = []
     const stdout = { write: (s: string) => { chunks.push(s) } }
     const app = new HarnessApp({
@@ -833,13 +833,49 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
 
     const output = chunks.join('')
     expect(output).toInclude('当前模型：claude-3-5-sonnet')
+    expect(output).toInclude('来源：Agent "default" 的绑定（全局）')
     expect(output).toInclude('已切换模型 claude-3-7-sonnet')
-    // 运行时切换已写入 Agent 定义 → 影响下次 send
-    expect(harness.agent.get('default')?.model?.modelId).toBe('claude-3-7-sonnet')
-    expect(app.getModel('default')).toBe('claude-3-7-sonnet')
-    // config.json 已持久化
+    expect(output).toInclude('仅本会话')
+    // 再查一次：来源应变成「本会话模型覆盖」
+    expect(output).toInclude('当前模型：claude-3-7-sonnet')
+    expect(output).toInclude('来源：本会话模型覆盖')
+
+    // 覆盖落在会话上：本会话的解析即刻改变
+    expect(app.sessionModelOverride(session)).toEqual({ modelId: 'claude-3-7-sonnet' })
+    expect(app.resolveSessionModel(session)).toBe('claude-3-7-sonnet')
+    // …而 Agent 定义与 config.json 都不动（旧行为是「切一次影响所有会话」）
+    expect(harness.agent.get('default')?.model?.modelId).toBe('claude-3-5-sonnet')
+    expect(app.getModel('default')).toBe('claude-3-5-sonnet')
     const cfg = await app.configStore.load()
-    expect(cfg.model).toBe('claude-3-7-sonnet')
+    expect(cfg.model).toBeUndefined()
+
+    await app.shutdown()
+  })
+
+  it('/model --global 才写 Agent 定义 + config.json（并清除本会话覆盖）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      model: 'claude-3-5-sonnet',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness, session } = await app.boot()
+    const r = await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/model claude-3-7-sonnet', '/model --global claude-3-5-sonnet', '/exit'],
+    })
+    expect(r).toBe('exit')
+    const output = chunks.join('')
+    expect(output).toInclude('全局默认')
+    expect(output).toInclude('已一并清除本会话的模型覆盖')
+
+    expect(harness.agent.get('default')?.model?.modelId).toBe('claude-3-5-sonnet')
+    expect(app.getModel('default')).toBe('claude-3-5-sonnet')
+    expect(app.sessionModelOverride(session)).toBeUndefined()
+    const cfg = await app.configStore.load()
+    expect(cfg.model).toBe('claude-3-5-sonnet')
 
     await app.shutdown()
   })

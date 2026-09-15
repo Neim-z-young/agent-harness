@@ -28,7 +28,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
-import { createProcessLine, listReplCommands } from './index'
+import { createProcessLine, listReplCommands, describeSessionRestore } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, HistoryLoadRange, Message, Session } from '@harness/session'
@@ -111,6 +111,7 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: 'Ctrl+J', desc: '提交输入（同 Enter；兼容把 Enter 上报为 LF 的终端）' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
   { key: '/help', desc: '查看特殊命令' },
+  { key: '/agent, /model', desc: '切换本会话的 Agent / 模型（只影响当前会话）' },
 ]
 
 // ------------------------------------------------------------------------
@@ -861,8 +862,14 @@ export function buildWelcomeBanner(word = 'HARNESS'): string[] {
 /** 欢迎页 ASCII 字标（多行字符串，供整块渲染/测试） */
 export const WELCOME_BANNER = buildWelcomeBanner().join('\n')
 
-/** 会话开始前的主对话区欢迎页组件（替换初始欢迎 system 块的可视化呈现） */
-export function WelcomePanel({ provider, model }: { provider: string; model?: string }) {
+/**
+ * 会话开始前的主对话区欢迎页组件（替换初始欢迎 system 块的可视化呈现）。
+ *
+ * `notice`：「本次启动如何决定当前会话」的一句话说明（自动恢复了哪个会话 /
+ * 为什么没恢复）。有历史时不走欢迎页（历史直接铺进聊天区，提示随对话流给出），
+ * 只有「无历史的空会话」才由这里补一句，否则这句提示会被欢迎页吞掉、用户看不到。
+ */
+export function WelcomePanel({ provider, model, notice }: { provider: string; model?: string; notice?: string }) {
   return (
     <box flexDirection="column" style={{ flexGrow: 1 }}>
       <text attributes={createTextAttributes({ reverse: true, bold: true })}>
@@ -881,6 +888,11 @@ export function WelcomePanel({ provider, model }: { provider: string; model?: st
       <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
         直接输入问题开始对话；输入 /help 查看特殊命令；Ctrl-C 或 /exit 退出。
       </text>
+      {notice ? (
+        <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+          {notice}
+        </text>
+      ) : null}
     </box>
   )
 }
@@ -904,14 +916,29 @@ export function approvalLine(q: string): string {
 }
 
 export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (r: TuiReplExit) => void }) {
+  // 「本次启动如何决定当前会话」的说明（与 REPL 同一套文案）：自动恢复了哪个会话、
+  // 或为什么没恢复。只在挂载时算一次；会话被 /new、/resume 切换后即失效并清空。
+  const [restoreNotice, setRestoreNotice] = useState(() => describeSessionRestore(options.app.sessionRestore))
+  // boot 是否恢复了已有会话（auto 自动恢复 / explicit 显式 -s），且确实带着历史。
+  // 有历史时聊天区直接铺历史（与 /resume 的表现一致）——「接着上次」的意义就在于看得见上次。
+  const bootSession = options.session
+  const restoredWithHistory = options.app.sessionRestore.source !== 'new' && bootSession.messages.length > 0
   // 初始状态直接在 useState 初始化：若用 mount effect 设置欢迎语，会覆盖
   // 已在 effect 之前开始处理的用户回复（processLine 于渲染期同步初始化，submit 可先于 effect）。
-  const [state, setState] = useState<ChatState>(() =>
-    initialChatWithWelcome('输入问题开始对话；输入 /help 查看特殊命令；Ctrl-C 或 /exit 退出。'),
-  )
+  const [state, setState] = useState<ChatState>(() => {
+    // 有历史 → 还原对话块；无历史 → 回落欢迎页
+    let s = restoredWithHistory
+      ? messagesToBlocks(bootSession.messages, bootSession.blocks)
+      : initialChatWithWelcome('输入问题开始对话；输入 /help 查看特殊命令；Ctrl-C 或 /exit 退出。')
+    // 提示归属：有历史时随对话流追加在最末（scrollbox 粘底，用户一眼能看到）；
+    // 无历史时欢迎页会整体替换块列表，改由 <WelcomePanel notice> 渲染，避免被吞掉。
+    if (restoredWithHistory && restoreNotice) s = pushConsole(s, restoreNotice)
+    return s
+  })
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
-  const [model, setModel] = useState<string | undefined>(options.model)
+  // 初始模型取「本会话实际会用的」：会话级覆盖 > Agent 定义 > 启动参数，避免 -s 恢复带旧模型时显示串台
+  const [model, setModel] = useState<string | undefined>(() => options.app.resolveSessionModel(options.session) ?? options.model)
   const [showSidebar, setShowSidebar] = useState(true)
   // 后台任务实时面板（模块 A）：由 subagent 监控器回调驱动，直接渲染到侧栏
   const [bgTasks, setBgTasks] = useState<BackgroundTaskViewLike[]>([])
@@ -1060,6 +1087,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         options.session = s
         allMessagesRef.current = s.messages
         earliestVisibleIdxRef.current = Math.max(0, s.messages.length - HISTORY_PAGE)
+        // 启动提示只描述「本次启动」的会话决策；用户主动切了会话就不再适用
+        setRestoreNotice('')
         setState(messagesToBlocks(s.messages, s.blocks))
       },
     })
@@ -1180,6 +1209,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       while (pendingLines.current.length > 0 && !exitRef.current) {
         const line = pendingLines.current.shift()!
         const r = await processLineRef.current!(line)
+        // /agent、/model、/resume、/new 会改变本会话的 agent / 模型，但它们不产生 done 事件，
+        // 状态栏不会自动刷新 —— 这里按命令名主动对齐。普通提问仍由 done 事件用「实际返回的模型」刷新（更真实）。
+        if (/^\/(agent|switch|model|resume|new)\b/.test(line.trim())) {
+          setModel(options.app.resolveSessionModel(options.session))
+        }
         if (r === 'exit') { finish('exit'); return }
       }
     })
@@ -1591,7 +1625,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       <box flexDirection="row" style={{ flexGrow: 1 }}>
         {/* ScrollBox 原生粘底滚动：日志追加时自动滚到底部（避免手动 scrollTop 竞态） */}
         <scrollbox stickyScroll stickyStart="bottom" style={{ flexGrow: 1, border: true, padding: 1 }}>
-          {hasChat ? state.blocks.map(renderBlock) : <WelcomePanel provider={provider} model={model} />}
+          {hasChat ? state.blocks.map(renderBlock) : <WelcomePanel provider={provider} model={model} notice={restoreNotice || undefined} />}
         </scrollbox>
         {showSidebar && (
           <box flexDirection="column" style={{ width: SIDEBAR_WIDTH, border: true, flexShrink: 0 }}>

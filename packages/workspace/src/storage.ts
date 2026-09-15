@@ -30,6 +30,8 @@ export interface SessionFile {
   updatedAt: number
   agentId?: string
   cwd?: string
+  /** 父会话 ID（子 Agent 派生时关联）；Session 有该字段，落盘时同步保存，否则恢复后链路断掉 */
+  parentId?: string
   meta?: Record<string, unknown>
   /** 已压缩摘要块（上下文压缩·阶段二 Route B；原文在盘 .cmp.orig 由 loader 还原） */
   blocks?: Session['blocks']
@@ -63,6 +65,7 @@ export class SessionFileStore {
       updatedAt: s.updatedAt,
       agentId: s.agentId,
       cwd: s.cwd,
+      parentId: s.parentId,
       meta: s.meta,
       blocks: s.blocks,
       messages: s.messages,
@@ -82,22 +85,37 @@ export class SessionFileStore {
     return JSON.parse(await readFile(p, 'utf-8')) as SessionFile
   }
 
-  /** 列出所有会话（按 updatedAt 倒序） */
-  async list(): Promise<Array<{ id: string; title?: string; updatedAt: number; messageCount: number }>> {
+  /**
+   * 列出所有会话（按 updatedAt 倒序）。
+   * 附带 `cwd` / `agentId` / `title`：`harness` 启动时的「自动恢复上次会话」需要按
+   * 工作目录筛选（磁盘里可能同时躺着好几个项目的会话），这里顺手带出，避免调用方
+   * 为了筛目录把每个会话文件再读一遍。
+   */
+  async list(): Promise<Array<{ id: string; title?: string; updatedAt: number; messageCount: number; cwd?: string; agentId?: string }>> {
     if (!existsSync(this.sessionsDir())) return []
     const files = await readdir(this.sessionsDir())
     const ids = files.filter((f) => f.endsWith('.json')).map((f) => f.slice(0, -5))
-    const items: Array<{ id: string; title?: string; updatedAt: number; messageCount: number }> = []
+    const items: Array<{ id: string; title?: string; updatedAt: number; messageCount: number; cwd?: string; agentId?: string }> = []
     // 压缩后 sessions/{id}.json 只存近期消息，原文归档在 .cmp.orig；计数需合并以反映全量
     const compaction = new SessionCompactionStore(this.workspace)
     for (const id of ids) {
       const s = await this.load(id)
       if (s) {
         const archived = await compaction.countOriginals(id).catch(() => 0)
-        items.push({ id, title: s.title, updatedAt: s.updatedAt, messageCount: s.messages.length + archived })
+        items.push({
+          id,
+          title: s.title,
+          updatedAt: s.updatedAt,
+          messageCount: s.messages.length + archived,
+          cwd: s.cwd,
+          agentId: s.agentId,
+        })
       }
     }
-    items.sort((a, b) => b.updatedAt - a.updatedAt)
+    // updatedAt 是毫秒精度，同毫秒的两条会话若只按时间排，顺序会取决于 readdir 的返回顺序
+    // （不同文件系统不同）—— 而「启动时恢复最近会话」依赖这个顺序，必须是确定的。
+    // 因此同时间戳再按 id 兜底排序，保证同一个目录快照两次列出结果一致。
+    items.sort((a, b) => (b.updatedAt - a.updatedAt) || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0))
     return items
   }
 }

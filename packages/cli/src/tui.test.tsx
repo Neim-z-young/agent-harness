@@ -624,6 +624,9 @@ interface TuiFixture {
   setup: TestRendererSetup
   exit: Promise<TuiReplExit>
   cleanup: () => Promise<void>
+  app: HarnessApp
+  /** 当前会话（TuiApp 收到的是可变 options 对象，/new、/resume 会回写 session 字段） */
+  currentSession: () => { id: string; agentId?: string; meta?: Record<string, unknown>; messages: unknown[] }
 }
 
 const activeFixtures: Array<() => Promise<void>> = []
@@ -640,11 +643,18 @@ async function mountTui(
      * 需要验证 Shift 修饰键的用例必须开启，否则按键会被当作裸 Enter。
      */
     kittyKeyboard?: boolean
+    /**
+     * 先造一个「上次会话」再启动，用于验证「启动即自动恢复」的提示与状态展示。
+     * - `true`：会话与本次同 cwd → 应自动恢复（历史 + 说明一起给出）
+     * - `'other-cwd'`：会话落在另一个工作目录 → 不该恢复，但要说明「为什么没接着上次」
+     */
+    resume?: boolean | 'other-cwd'
   } = {},
 ): Promise<TuiFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-tui-test-'))
-  const app = new HarnessApp({
-    cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+  const extraDirs: string[] = []
+  const mkApp = (cwd = dir) => new HarnessApp({
+    cwd, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
     model: extra.model,
     permissionMode: extra.permissionMode ?? 'allow-all',
     mockProviderConfig: {
@@ -652,6 +662,20 @@ async function mountTui(
       responses: extra.responses ?? [],
     },
   })
+  if (extra.resume) {
+    // 模拟「上次用完正常退出」：另一个 app 实例造会话 + 一条消息并落盘，随后第二次 boot 应自动恢复。
+    // sessions 目录是全局共享的，所以 'other-cwd' 只换 cwd、dataDir 仍指向同一处。
+    const seedDir = extra.resume === 'other-cwd' ? mkdtempSync(join(tmpdir(), 'harness-tui-other-')) : dir
+    if (seedDir !== dir) extraDirs.push(seedDir)
+    const seed = mkApp(seedDir)
+    const first = await seed.boot()
+    await first.harness.session.addMessage(first.session.id, {
+      id: 'seed1', role: 'user', parts: [{ type: 'text', text: '上次的提问' }], createdAt: 1,
+    })
+    await seed.sessionStore.save((await first.harness.session.get(first.session.id))!)
+    await seed.shutdown()
+  }
+  const app = mkApp()
   const { harness, session } = await app.boot()
   const setup = await createTestRenderer({
     width: 80, height: 24, useMouse: true,
@@ -660,7 +684,8 @@ async function mountTui(
   const root = createRoot(setup.renderer)
   let resolveExit!: (r: TuiReplExit) => void
   const exit = new Promise<TuiReplExit>((r) => { resolveExit = r })
-  root.render(<TuiApp options={{ app, harness, session, provider: 'mock', model: extra.model, openFile: extra.openFile }} onExit={resolveExit} />)
+  const tuiOptions = { app, harness, session, provider: 'mock', model: extra.model, openFile: extra.openFile }
+  root.render(<TuiApp options={tuiOptions} onExit={resolveExit} />)
 
   // 首次渲染后被动 effect（useKeyboard / 后台任务订阅 / 会话列表刷新等）异步 flush，
   // 先 pump 一拍并等待，确保后续交互测试按键时各钩子已注册（消除竞态）。
@@ -674,9 +699,10 @@ async function mountTui(
     setup.renderer.destroy()
     await app.shutdown()
     rmSync(dir, { recursive: true, force: true })
+    for (const d of extraDirs) rmSync(d, { recursive: true, force: true })
   }
   activeFixtures.push(cleanup)
-  return { setup, exit, cleanup }
+  return { setup, exit, cleanup, app, currentSession: () => tuiOptions.session }
 }
 
 afterEach(async () => {
@@ -860,6 +886,45 @@ describe('TuiApp 集成（mock provider）', () => {
     const frame = await waitFrame(f.setup, (fr) => fr.includes('model=claude-3-5-sonnet'))
     expect(frame).toContain('model=claude-3-5-sonnet')
     expect(frame).toContain('claude-3-5-sonnet')
+    await f.cleanup()
+  })
+
+  it('启动即自动恢复上次会话：历史铺进聊天区 + 说明与出口', async () => {
+    const f = await mountTui({ resume: true })
+    // 自动恢复 = 接着上次：上次的历史必须可见，否则「恢复」只恢复了 id，用户仍是空屏
+    await waitFrame(f.setup, (fr) => fr.includes('上次的提问'))
+    // 自动恢复的说明进入聊天区（否则用户会以为「一进来就有历史」是 bug）
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('已自动恢复上次会话'))
+    expect(frame).toContain('/new 开新会话')
+    expect(frame).toContain('--no-resume')
+    // 恢复的是磁盘上那个会话（不是新建的），且已带历史
+    expect(f.app.sessionRestore.source).toBe('auto')
+    expect(f.currentSession().messages.length).toBe(1)
+    await f.cleanup()
+  })
+
+  it('上次会话属于其它工作目录：不恢复，但欢迎页给出原因与出口', async () => {
+    const f = await mountTui({ resume: 'other-cwd' })
+    // 不恢复（来源为 new），所以走欢迎页；提示必须由欢迎页渲染，否则会被欢迎页整体替换掉
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('未自动恢复会话'))
+    expect(frame).toContain('它属于其它工作目录')
+    expect(frame).toContain('/resume')
+    expect(f.app.sessionRestore.source).toBe('new')
+    expect(f.app.sessionRestore.skipped?.reason).toBe('other-cwd')
+    expect(f.currentSession().messages.length).toBe(0)
+    await f.cleanup()
+  })
+
+  it('/model 只改本会话：状态栏立即刷新（不必等下一次回复的 done 事件）', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (fr) => fr.includes('model=-'))
+    f.setup.mockInput.typeText('/model claude-3-7-sonnet')
+    for (let i = 0; i < 8; i++) await pumpOnce(f.setup)
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('model=claude-3-7-sonnet'))
+    expect(frame).toContain('仅本会话')
+    // 会话级覆盖：Agent 定义与 config.json 都没被改
+    expect(f.app.sessionModelOverride(f.currentSession())).toEqual({ modelId: 'claude-3-7-sonnet' })
     await f.cleanup()
   })
 
