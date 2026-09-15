@@ -76,13 +76,11 @@ import {
   exportStatsJson,
   exportStatsMarkdown,
   hydrateUsage,
-  dayStart,
-  todayUsage,
-  sumUsage,
   isBlankUsage,
   todayUsageLine,
   type UsageStats,
 } from './usage-stats'
+import { collectTodayUsage } from './usage-today'
 import { reconstructHistory, buildResolveBlock, type Message, type Session, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
@@ -1832,9 +1830,14 @@ export type ProcessLineResult = 'continue' | 'exit'
 export async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
   const hydrated = hydrateUsage(current)
   if (!isBlankUsage(hydrated)) return hydrated
-  // 内存态消息不全时，从 SessionManager 再取一次重试
-  const sess = current.messages?.length ? current : await harness.session.get(current.id)
-  if (sess && sess !== current) return hydrateUsage(sess)
+  // 内存态可能是不完整视图（分页/裁剪/仅近期消息），只要水合结果为空就回源再试一次。
+  // 注意：不能按 current.messages.length 判断——消息非空也可能全是未带 tokenUsage 的
+  // 消息，此时若不回源，磁盘上的历史用量就永远读不到（/stats 与导出均显示 0）。
+  const sess = await harness.session.get(current.id).catch(() => undefined)
+  if (sess && sess !== current) {
+    const rebuilt = hydrateUsage(sess)
+    if (!isBlankUsage(rebuilt)) return rebuilt
+  }
   return hydrated
 }
 
@@ -1843,25 +1846,7 @@ export async function resolveCurrentUsage(harness: Harness, current: Session): P
  * 因此重连前当天产生的用量依然可统计 / 可导出。失败时回落为当前会话当日用量。
  */
 export async function resolveTodayUsage(app: HarnessApp | undefined, current: Session): Promise<UsageStats> {
-  const now = Date.now()
-  const from = dayStart(now)
-  try {
-    if (app?.sessionStore) {
-      const list = await app.sessionStore.list()
-      // 只加载当天有更新的会话，避免全量 IO
-      const recent = list.filter((s) => (s.updatedAt ?? 0) >= from)
-      const per: UsageStats[] = []
-      for (const s of recent) {
-        const f = s.id === current.id ? current : await app.sessionStore.load(s.id).catch(() => undefined)
-        if (f) per.push(todayUsage(hydrateUsage(f), now))
-      }
-      const merged = sumUsage(per)
-      if (!isBlankUsage(merged)) return merged
-    }
-  } catch {
-    // 归集失败回落当前会话
-  }
-  return todayUsage(hydrateUsage(current), now)
+  return collectTodayUsage(app?.sessionStore, current)
 }
 
 /**

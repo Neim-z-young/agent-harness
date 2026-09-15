@@ -181,6 +181,22 @@ describe('shouldPersistUsage（防止空累积器清零历史）', () => {
   it('双方都为空 → 允许写入（不阻塞初始化）', () => {
     expect(shouldPersistUsage(emptyUsage(), emptyUsage())).toBe(true)
   })
+
+  it('水合不全（本轮少于历史）→ 不写入，防止回退丢失调用记录', () => {
+    let persisted = emptyUsage()
+    for (let i = 0; i < 100; i++) persisted = recordCall(persisted, { model: 'm', input: 10, ts: at(0, 9) })
+    const partial = recordCall(emptyUsage(), { model: 'm', input: 10, ts: at(0, 9) })
+    expect(persisted.llmCalls).toBe(100)
+    expect(shouldPersistUsage(partial, persisted)).toBe(false)
+  })
+
+  it('正常累加（本轮多于历史）→ 允许写入', () => {
+    let persisted = emptyUsage()
+    persisted = recordCall(persisted, { model: 'm', input: 10, ts: at(0, 9) })
+    let next = persisted
+    next = recordCall(next, { model: 'm', input: 20, ts: at(0, 10) })
+    expect(shouldPersistUsage(next, persisted)).toBe(true)
+  })
 })
 
 describe('导出报告', () => {

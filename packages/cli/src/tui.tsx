@@ -47,9 +47,6 @@ import {
   hourlyRow,
   sparkline,
   USAGE_STATS_KEY,
-  dayStart,
-  todayUsage,
-  sumUsage,
   hydrateUsage,
   isBlankUsage,
   todayUsageLine,
@@ -57,6 +54,7 @@ import {
   shouldPersistUsage,
   type UsageStats,
 } from './usage-stats'
+import { collectTodayUsage } from './usage-today'
 
 // ------------------------------------------------------------------------
 // 类型
@@ -1143,30 +1141,15 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
   // 当日用量归集（跨会话）：每次 LLM 调用后重算。只读持久化文件、不写回，
   // 因此重连后当天此前产生的用量依然可见（不依赖内存态）。
+  // 防抖 800ms：LLM 调用与会话更新都很频繁，避免每次都全量扫描会话文件
   useEffect(() => {
     let cancelled = false
-    void (async () => {
-      try {
-        const now = Date.now()
-        const from = dayStart(now)
-        const list = await options.app.sessionStore.list()
-        // 只加载当天有更新的会话，避免全量 IO
-        const recent = list.filter((s) => (s.updatedAt ?? 0) >= from)
-        const files = await Promise.all(
-          recent.map((s) =>
-            s.id === options.session.id
-              ? Promise.resolve(options.session)
-              : options.app.sessionStore.load(s.id).catch(() => undefined),
-          ),
-        )
-        if (cancelled) return
-        const per = files.map((f) => (f ? todayUsage(hydrateUsage(f), now) : emptyUsage()))
-        setTodayTotals(sumUsage(per))
-      } catch {
-        // 归集失败不影响主流程
-      }
-    })()
-    return () => { cancelled = true }
+    const timer = setTimeout(() => {
+      void collectTodayUsage(options.app.sessionStore, options.session)
+        .then((t) => { if (!cancelled) setTodayTotals(t) })
+        .catch(() => { /* 归集失败不影响主流程 */ })
+    }, 800)
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [usage.llmCalls, options.session, options.app])
 
   // 模块 C：加载 / 命令补全候选（内置 REPL 命令 + 插件注册命令 + TUI 专属 /edit）

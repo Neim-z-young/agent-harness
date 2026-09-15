@@ -127,6 +127,35 @@ describe('用量统计：重连不清零 + 历史可导出', () => {
     }
   })
 
+  it('内存态消息无 tokenUsage 时，回源 SessionManager 重建出历史用量', async () => {
+    // 回归：此前按 current.messages.length 判断是否回源，导致「内存视图消息非空
+    // 但都不带 tokenUsage」时直接返回 0，磁盘上的历史用量永远读不到。
+    const diskSession = {
+      id: 's1',
+      meta: {},
+      messages: [
+        {
+          id: 'm1',
+          role: 'assistant' as const,
+          createdAt: at(0, 9),
+          parts: [{ type: 'text' as const, text: 'x' }],
+          meta: { model: 'mock/m1', tokenUsage: { input: 999, output: 9 } },
+        },
+      ],
+    }
+    // 内存里的不完整视图：消息非空，但没有任何 tokenUsage
+    const partialView = {
+      id: 's1',
+      meta: {},
+      messages: [{ id: 'm0', role: 'user' as const, parts: [{ type: 'text' as const, text: 'hi' }] }],
+    }
+    const harness = { session: { get: async () => diskSession } } as never
+    const u = await resolveCurrentUsage(harness, partialView as unknown as Session)
+    expect(u.llmCalls).toBe(1)
+    expect(u.inputTokens).toBe(999)
+    expect(u.outputTokens).toBe(9)
+  })
+
   it('当天无用量时，今日归集返回空而非报错', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'harness-usage3-'))
     const app = makeApp(dir)

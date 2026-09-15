@@ -1,5 +1,48 @@
 # Agent Harness 开发日志
 
+## 2026-09-15（续 123）用量统计修复的代码评审：修 4 个缺陷 + 抽出当日归集模块
+
+### 评审背景
+
+对续 122（重连后 token 清零修复）做提交后评审。核心修复（初值水合、空累积器防覆盖、消息时间归属）
+方向正确，但评审中另发现 4 个缺陷，均已当场修复并补回归测试。
+
+### 修复项
+
+- **P1 `resolveCurrentUsage` 回源失效**：回源条件写成 `current.messages?.length ? current : await get()`，
+  内存视图消息非空时短路，磁盘历史永远读不到。实测：磁盘有 999 输入 token 仍返回 `llmCalls=0`。
+  改为「水合结果为空才回源」，并注释说明不能用 `messages.length` 判断（消息非空也可能全无 `tokenUsage`）。
+- **P1 当日归集 effect 过频 + 会话文件读两遍**：`tui.tsx` effect 依赖 `[usage.llmCalls, options.session, options.app]`，
+  每次 LLM 调用都全量扫描；而 `workspace/storage.ts` 的 `list()` 内部已对每个 id `await load(id)`，
+  归集又对当日会话逐个 `load()`。改为 800ms 防抖（根因在读两遍，见遗留建议 A）。
+- **P2 `shouldPersistUsage` 不防「部分覆盖」**：只防全空覆盖，实测 persisted 100 次 vs next 1 次仍允许写入、丢 99 次。
+  加单调性守卫 `next.llmCalls < persisted.llmCalls` 时不写入。
+- **P2 归集逻辑重复 + 漏当前会话**：index 与 tui 各写一遍约 30 行，且只按 `list()` 归集——
+  新建会话未落盘时不在 list 里，其当日用量被漏掉（TUI「今日」不增长）。
+
+### 新增模块
+
+- `packages/cli/src/usage-today.ts`：`collectTodayUsage(store, current, now)`。
+  放独立模块而非 index/tui 的原因：两者互相 import 已存在循环依赖，公共逻辑放任一文件都会加重循环；
+  且 usage-stats.ts 需保持纯函数无 IO。当前会话无条件纳入（`ids.unshift(current.id)`），
+  按 `updatedAt >= 当日零点` 过滤避免全量 IO，任一步失败回落「仅当前会话」。
+- `packages/cli/src/usage-today.test.ts`（7 用例）：假 store 精确控制 list/load，覆盖跨会话合并、
+  历史会话不被加载、当前会话 updatedAt 早于零点仍纳入、只算今天桶、store 抛错回落、无 store 退化。
+
+### 遗留建议（未改）
+
+- A. `workspace/storage.ts` 的 `list()` 对每个 id 全量 `load()` 后丢弃 messages，归集需再 load 一次。
+  建议加 `listSince(ts)` 或 `loadMeta(id)`。属 workspace 接口变更，影响面大。
+- B. 时区：小时桶按 UTC 整点切，当日按本地零点切；整小时偏移（含 UTC+8）自洽，
+  印度 UTC+5:30 等半小时时区在零点前后有 30/45 分钟归错天。
+- C. 当日归集丢失 `models/tools/agents` 维度（小时桶不含模型信息），导出 today 段无模型明细。
+
+### 验证
+
+- cli 全量 **235 用例通过**（原 225 + 新增 10）、typecheck 通过。
+- 两个缺陷用探针测试实测确认后再修（非静态推断）。
+- 评审报告：`reference/workbuddy/code-review-usage-stats.html`。
+
 ## 2026-09-15（续 122）用量统计：修复重连后 token 清零 + 新增当日（跨会话）用量
 
 ### 问题

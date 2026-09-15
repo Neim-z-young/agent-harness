@@ -416,7 +416,12 @@ export function todayUsageLine(u: UsageStats): string {
  * 会把重连前累计的用量清零（/stats 显示 0、/stats-export 也导不出历史）。
  */
 export function shouldPersistUsage(next: UsageStats, persisted: UsageStats | undefined): boolean {
-  if (isBlankUsage(next) && persisted && !isBlankUsage(persisted)) return false
+  if (!persisted || isBlankUsage(persisted)) return true
+  // 空累积器不得覆盖已有历史
+  if (isBlankUsage(next)) return false
+  // 水合不全时不得回退：本轮调用数少于已持久化值，说明内存态没接上历史，
+  // 写回会静默丢失调用记录（比全空覆盖更隐蔽）。
+  if (next.llmCalls < persisted.llmCalls) return false
   return true
 }
 
