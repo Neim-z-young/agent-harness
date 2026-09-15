@@ -113,10 +113,15 @@ export interface WorktreeInfo {
 /**
  * 创建独立 worktree（detached HEAD）并返回其目录绝对路径。
  * 幂等：目录已存在则直接复用（续接/后台预创建场景）。
+ *
+ * 建目录**之前**先落 `.harness/.gitignore`（含 `worktrees/`）：否则宿主仓库会把
+ * worktree 目录当 untracked 扫描 —— 一次 `git add -A` 就会把它整个收进暂存区，
+ * 且因为目录内有 `.git` 文件还会被记成 gitlink，事后得手工 `worktree remove` 才清得掉。
  */
 export async function createWorktree(opts: { base: string; token: string; ref?: string }): Promise<string> {
   const dir = worktreeDirFor(opts.base, opts.token)
   if (existsSync(dir)) return dir
+  ensureWorktreeIgnored(opts.base)
   await runGit(opts.base, ['worktree', 'add', '--detach', '--force', dir, opts.ref ?? 'HEAD'])
   return dir
 }

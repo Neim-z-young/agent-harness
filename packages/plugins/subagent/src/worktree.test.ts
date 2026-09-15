@@ -88,6 +88,17 @@ describe('createWorktree', () => {
     const again = await createWorktree({ base: repo, token: 's_abc123' })
     expect(again).toBe(worktree)
   })
+  it('建目录时同时落好忽略规则（否则 worktree 会被 git add -A 误收）', async () => {
+    const fresh = await initRepo()
+    await createWorktree({ base: fresh, token: 's_ignore_me' })
+    const ignoreFile = join(fresh, '.harness', '.gitignore')
+    expect(existsSync(ignoreFile)).toBe(true)
+    expect(readFileSync(ignoreFile, 'utf-8')).toContain('worktrees/')
+    // 忽略规则生效：显式展开 untracked 也看不到 worktree 目录
+    const status = await runGit(fresh, ['status', '--short', '--untracked-files=all'])
+    expect(status.stdout.split('\n').some((l) => l.includes('.harness/worktrees'))).toBe(false)
+    rmSync(fresh, { recursive: true, force: true })
+  })
   it('listWorktrees 能看到创建的 worktree（含主工作区）', async () => {
     const all = await listWorktrees(repo)
     const paths = all.map((w) => w.path)
