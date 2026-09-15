@@ -487,7 +487,19 @@ export class AnthropicChatProvider implements ChatProvider {
       if (outerSignal.aborted) inner.abort()
       else outerSignal.addEventListener('abort', onOuter, { once: true })
     }
-    const timer = setTimeout(() => inner.abort(new Error(`Anthropic stream 超时（>${this.config.timeoutMs}ms）`)), this.config.timeoutMs)
+    // 空闲超时（idle），**不是**总时长超时：每收到一块数据就重新计时。
+    // 总时长语义下，只要模型持续输出超过 timeoutMs 就会把长回答无理由掐断，
+    // 用户看到的是「内容明明已经渲染出来了，却报发送失败」。判定结束的职责
+    // 交给 `message_stop`（Anthropic SSE 的终止事件），见下方 readLoop。
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const armIdleTimeout = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(
+        () => inner.abort(new Error(`Anthropic stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`)),
+        this.config.timeoutMs,
+      )
+    }
+    armIdleTimeout()
 
     try {
       const url = `${this.config.baseUrl.replace(/\/$/, '')}/v1/messages`
@@ -516,9 +528,10 @@ export class AnthropicChatProvider implements ChatProvider {
       // 当前 content block 的 index → 类型映射
       const blockTypes: Map<number, 'text' | 'tool_use'> = new Map()
 
-      while (true) {
+      readLoop: while (true) {
         const { done, value } = await reader.read()
         if (done) break
+        armIdleTimeout() // 有数据到达 → 重新计时（idle 语义，持续输出不会被掐断）
         buf += decoder.decode(value, { stream: true })
 
         // 按行解析 SSE
@@ -585,7 +598,11 @@ export class AnthropicChatProvider implements ChatProvider {
                 break
               }
               case 'message_stop': {
-                break
+                // `message_stop` 是 SSE 规范里的流终止事件 —— 到此为止，**不能再等 socket EOF**。
+                // 与 provider-openai 的 `data: [DONE]` 是同一类坑：部分自建网关/代理发完终止
+                // 事件后并不关闭连接，若继续 await reader.read()，循环会一直挂着，直到超时
+                // 计时器把整次请求判失败：内容早已渲染，用户却看到「发送失败」。
+                break readLoop
               }
               case 'error': {
                 throw new Error(`Anthropic stream error: ${json.error?.message ?? JSON.stringify(json)}`)
@@ -598,13 +615,16 @@ export class AnthropicChatProvider implements ChatProvider {
         }
       }
 
+      // 由 `message_stop` 提前 break 时主动释放连接（服务端不关连接 → 不 cancel 会让连接滞留在池里）
+      try { await reader.cancel() } catch {}
+
       yield {
         type: 'done',
         model: modelOut ?? model,
         tokenUsage,
       }
     } finally {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
     }
   }

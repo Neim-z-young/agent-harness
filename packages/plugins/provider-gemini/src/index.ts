@@ -512,10 +512,19 @@ export class GeminiChatProvider implements ChatProvider {
       if (outerSignal.aborted) inner.abort()
       else outerSignal.addEventListener('abort', onOuter, { once: true })
     }
-    const timer = setTimeout(
-      () => inner.abort(new Error(`Gemini stream 超时（>${this.config.timeoutMs}ms）`)),
-      this.config.timeoutMs,
-    )
+    // 空闲超时（idle），**不是**总时长超时：每收到一块数据就重新计时。
+    // 总时长语义下，只要模型持续输出超过 timeoutMs 就会把长回答无理由掐断，
+    // 用户看到的是「内容明明已经渲染出来了，却报发送失败」。判定结束的职责
+    // 交给 `candidate.finishReason`，见下方 readLoop。
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const armIdleTimeout = () => {
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(
+        () => inner.abort(new Error(`Gemini stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`)),
+        this.config.timeoutMs,
+      )
+    }
+    armIdleTimeout()
 
     try {
       const url = this.buildUrl(model, true)
@@ -545,11 +554,36 @@ export class GeminiChatProvider implements ChatProvider {
       let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number } | undefined
       // functionCall 在 stream 中可能跨 chunk，用 id 累积
       const pendingToolCalls: Map<string, { id: string; name: string; args: unknown }> = new Map()
+      // 是否已看到 candidate.finishReason（= 模型生成已结束）
+      let sawFinishReason = false
 
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        buf += decoder.decode(value, { stream: true })
+      // Gemini 的 SSE **没有** OpenAI 的 `data: [DONE]` 终止帧，结束只能靠
+      // `candidate.finishReason` 判定。真实端点会在末帧后关闭连接，但自建网关/代理
+      // 常常发完就不关 —— 那种情况下若只认 EOF，循环会一直挂着直到超时计时器把整次
+      // 请求判失败（内容早已渲染，用户却看到「发送失败」，同 provider-openai 的坑）。
+      //
+      // 已看到 finishReason 后再给一小段「收尾窗口」：usageMetadata 偶尔是单独一帧、
+      // 排在 finishReason 之后，直接 break 会丢掉 token 统计。窗口内持续有新数据就
+      // 不断续期；直到窗口内没有新数据才收工并 cancel 连接。
+      const DRAIN_MS = Math.min(300, Math.max(50, Math.floor(this.config.timeoutMs / 4)))
+      let drainTimer: ReturnType<typeof setTimeout> | undefined
+      const readOrDrain = async () => {
+        const pending = reader.read()
+        const drain = new Promise<'drain'>((resolve) => {
+          drainTimer = setTimeout(() => resolve('drain'), DRAIN_MS)
+        })
+        try {
+          return await Promise.race([pending, drain])
+        } finally {
+          if (drainTimer) clearTimeout(drainTimer)
+        }
+      }
+
+      readLoop: while (true) {
+        const next = sawFinishReason ? await readOrDrain() : await reader.read()
+        if (next === 'drain' || next.done) break
+        armIdleTimeout() // 有数据到达 → 重新计时（idle 语义，持续输出不会被掐断）
+        buf += decoder.decode(next.value, { stream: true })
 
         // SSE 按双换行分块
         const parts = buf.split('\n\n')
@@ -573,8 +607,22 @@ export class GeminiChatProvider implements ChatProvider {
               throw new Error(`Gemini stream error: ${json.error.message ?? JSON.stringify(json)}`)
             }
 
+            // usageMetadata 可能在最后一个 chunk，也**可能单独一帧、不带 candidates**
+            // （部分网关/代理仿 OpenAI 的 include_usage 行为）。必须在 `!candidate` 分支
+            // 之前解析，否则这一帧会被整个跳过、token 统计直接丢失。
+            if (json.usageMetadata) {
+              tokenUsage = {
+                input: json.usageMetadata.promptTokenCount ?? 0,
+                output: json.usageMetadata.candidatesTokenCount ?? 0,
+                total: json.usageMetadata.totalTokenCount,
+                ...(json.usageMetadata.cachedContentTokenCount != null ? { cacheRead: json.usageMetadata.cachedContentTokenCount } : {}),
+              }
+            }
+
             const candidate = json.candidates?.[0]
             if (!candidate) continue
+            // finishReason 出现即代表生成结束（STOP / MAX_TOKENS / SAFETY…）
+            if (candidate.finishReason) sawFinishReason = true
 
             for (const p of candidate.content.parts) {
               if ('text' in p && p.text) {
@@ -595,19 +643,12 @@ export class GeminiChatProvider implements ChatProvider {
                 pendingToolCalls.set(id, { id, name: fc.name, args: fc.args })
               }
             }
-
-            // usageMetadata 可能在最后一个 chunk
-            if (json.usageMetadata) {
-              tokenUsage = {
-                input: json.usageMetadata.promptTokenCount ?? 0,
-                output: json.usageMetadata.candidatesTokenCount ?? 0,
-                total: json.usageMetadata.totalTokenCount,
-                ...(json.usageMetadata.cachedContentTokenCount != null ? { cacheRead: json.usageMetadata.cachedContentTokenCount } : {}),
-              }
-            }
           }
         }
       }
+
+      // 提前 break 时主动释放连接（服务端不关连接 → 不 cancel 会让连接滞留在池里）
+      try { await reader.cancel() } catch {}
 
       yield {
         type: 'done',
@@ -615,7 +656,7 @@ export class GeminiChatProvider implements ChatProvider {
         tokenUsage,
       }
     } finally {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
     }
   }
