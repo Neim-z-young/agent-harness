@@ -958,6 +958,59 @@ export function checkProviderConfigs(
   return { providers, issues }
 }
 
+/**
+ * apiKey 展示标签（配置概览与 `/model` 列表共用，避免两处口径不一）：
+ * - 未配置 → `（未配置）`
+ * - 加密态（`enc:v1:`）→ `已加密`（无法回显指纹）
+ * - `${ENV}` 引用 → `env(ENV)`（引用名非机密，可直接展示）
+ * - 明文：默认脱敏为 `已配置`；`fingerprint` 时附末 4 位（`已配置(…AB12)`），
+ *   供「同端点同模型、仅 token 不同」的实例之间互相区分；`reveal` 时原样输出明文
+ *   （仅在显式要求回显明文的路径上使用，如 `buildConfigOverview(maskKey=false)`）。
+ */
+export function formatApiKeyTag(
+  apiKey: string | undefined,
+  opts: { fingerprint?: boolean; reveal?: boolean } = {},
+): string {
+  const raw = apiKey?.trim()
+  if (!raw) return '（未配置）'
+  if (raw.startsWith('enc:v1:')) return '已加密'
+  if (/^\$\{.*\}$/.test(raw)) return `env(${raw.slice(2, -1)})`
+  if (opts.reveal) return raw
+  if (!opts.fingerprint) return '已配置'
+  return raw.length > 4 ? `已配置(…${raw.slice(-4)})` : '已配置'
+}
+
+/**
+ * 找出「type + baseUrl + model 完全相同」的实例组——即**同配置不同 token**（或多端点同模型）的场景。
+ *
+ * 为什么要单独识别：这类实例的内容差异只在 apiKey 上，而 `/model ?` 列表里 type/baseUrl/model 全同、
+ * 人眼无法区分；它们又只能靠 `normalizeProviderConfigs` 派生出的 `-2`/`-3` id 区分，而派生 id 与
+ * **数组顺序绑定**（调整顺序后同名 id 会指向另一个 token），因此值得显式提示用户手写 id。
+ *
+ * `distinctKeys` = 组内不同 apiKey 的个数：1 表示完全重复（多余项，建议删除），>1 即同配置不同 token。
+ * 纯函数，便于单测。
+ */
+export function findTokenOnlyDuplicates(providers: ResolvedProviderConfig[]): Array<{
+  key: string
+  members: ResolvedProviderConfig[]
+  distinctKeys: number
+}> {
+  const groups = new Map<string, ResolvedProviderConfig[]>()
+  for (const p of providers) {
+    const key = `${p.type}|${p.baseUrl ?? ''}|${p.model ?? ''}`
+    const list = groups.get(key)
+    if (list) list.push(p)
+    else groups.set(key, [p])
+  }
+  const out: Array<{ key: string; members: ResolvedProviderConfig[]; distinctKeys: number }> = []
+  for (const [key, members] of groups) {
+    if (members.length < 2) continue
+    const distinctKeys = new Set(members.map((m) => m.apiKey ?? '')).size
+    out.push({ key, members, distinctKeys })
+  }
+  return out
+}
+
 /** 配置概览（--check-config / /config 共用），maskKey 为 true 时隐藏明文 apiKey */
 export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string, maskKey = true): string {
   const lines: string[] = []
@@ -978,15 +1031,7 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   const providers = normalizeProviderConfigs(rawProviders).providers
   lines.push('providers：')
   for (const pc of providers) {
-    const api = pc.apiKey
-      ? pc.apiKey.startsWith('enc:v1:')
-        ? '已加密'
-        : /^\$\{.*\}$/.test(pc.apiKey.trim())
-          ? `env(${pc.apiKey.trim().slice(2, -1)})`
-          : maskKey
-            ? '已配置'
-            : pc.apiKey
-      : '（未配置）'
+    const api = formatApiKeyTag(pc.apiKey, { reveal: !maskKey })
     const isDefault = pc.id === (cfg.provider ?? defaultProviderId) ? ' ← 默认' : ''
     const path = [pc.type, pc.baseUrl ?? '（默认端点）', pc.apiPath ?? ''].filter(Boolean).join(' · ')
     lines.push(`  - ${pc.id}${isDefault}  type=${path}  model=${pc.model ?? '（Provider 默认）'}  apiKey=${api}`)
@@ -1433,8 +1478,20 @@ export class HarnessApp {
   /**
    * 启动装载的 Provider 实例配置（含各自默认/附加模型），供 /model ? 展示。
    * `index` 为 1-based 列表序号，用户可直接 `/model <序号>` 选择。
+   *
+   * `keyTag`：apiKey 展示标签。**仅当该实例与别的实例「type+baseUrl+model 全同」时才附指纹**
+   * （`已配置(…AB12)`），因为只有这种情况下列表行会完全一样、只能靠 token 区分；其余场景保持简洁。
    */
-  listConfiguredProviders(): Array<{ index: number; id: string; model?: string; baseUrl?: string; apiPath?: string; type?: string }> {
+  listConfiguredProviders(): Array<{
+    index: number
+    id: string
+    model?: string
+    baseUrl?: string
+    apiPath?: string
+    type?: string
+    keyTag?: string
+  }> {
+    const dupIds = new Set(findTokenOnlyDuplicates(this.loadedProviders).flatMap((g) => g.members.map((m) => m.id)))
     return this.loadedProviders.map((p, i) => ({
       index: i + 1,
       id: p.id,
@@ -1442,7 +1499,17 @@ export class HarnessApp {
       baseUrl: p.baseUrl,
       apiPath: p.apiPath,
       type: p.type,
+      ...(dupIds.has(p.id) ? { keyTag: formatApiKeyTag(p.apiKey, { fingerprint: true }) } : {}),
     }))
+  }
+
+  /**
+   * 「同端点同模型」实例组（同配置不同 token / 完全重复）——供 /model ? 提示：
+   * 这类实例的 id 是从 model 派生的（`-2`/`-3`），与数组顺序绑定，调整顺序会让
+   * `config.provider` 悄悄指到另一个 token，因此建议显式写 id。
+   */
+  tokenOnlyDuplicateGroups(): ReturnType<typeof findTokenOnlyDuplicates> {
+    return findTokenOnlyDuplicates(this.loadedProviders)
   }
 
   /** 装配并启动 Harness，返回已 start 的实例；加载/恢复 session */
@@ -2245,8 +2312,25 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
                   p.baseUrl ? `baseUrl=${p.baseUrl}` : '',
                   p.apiPath ? `apiPath=${p.apiPath}` : '',
                   p.type ? `type=${p.type}` : '',
+                  p.keyTag ? `key=${p.keyTag}` : '',
                 ].filter(Boolean).join(' · ')
                 out(`  ${p.index}) ${model}${extra ? `  (${extra})` : ''}\n`)
+              }
+              // 同端点同模型（仅 token 不同 / 完全重复）时给出明确提示：这类实例只能靠派生 id 区分，
+              // 而派生 id 与数组顺序绑定 —— 调整顺序会让 config.provider 悄悄指向另一个 token
+              const dups = app.tokenOnlyDuplicateGroups()
+              if (dups.length) {
+                out(`⚠️  有 ${dups.length} 组实例的 type/baseUrl/model 完全相同：\n`)
+                for (const g of dups) {
+                  const ids = g.members.map((m) => m.id).join(' / ')
+                  out(
+                    g.distinctKeys > 1
+                      ? `   ${ids}（仅 apiKey 不同，列表里已用 key=…<末4位> 区分）\n`
+                      : `   ${ids}（apiKey 也完全相同，属重复项，建议删掉多余的那条）\n`,
+                  )
+                }
+                out('   这些 id 是按 model 自动派生的（-2/-3），与 providers 数组顺序绑定：调整顺序会让\n' +
+                  '   config.provider 指向另一个实例，删掉前面一条也会让 -2 变成无名可指。建议为其显式写 id。\n')
               }
               const first = configured[0]
               const sample = first.model ?? first.id
@@ -2266,9 +2350,11 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           if (r.kind === 'ambiguous') {
             out(`"${r.arg}" 同时命中多个 Provider 实例，请指明其一：\n`)
             for (const c of r.candidates) {
-              out(`  ${c.index}) ${c.id}/${c.model ?? ''}  (type=${c.type}，命中其 ${c.matchedBy === 'id' ? 'id' : 'model'})\n`)
+              // key 指纹：同端点同模型、仅 token 不同时，光看 id/type 无法判断是哪个 key
+              const keyTag = configured[c.index - 1]?.keyTag
+              out(`  ${c.index}) ${c.id}/${c.model ?? ''}  (type=${c.type}${keyTag ? ` · key=${keyTag}` : ''}，命中其 ${c.matchedBy === 'id' ? 'id' : 'model'})\n`)
             }
-            out(`   或直接写成 <id>/<model>，如 /model ${r.candidates[0].id}/${r.candidates[0].model ?? '<model>'}\n`)
+            out(`   改为 /model <序号>（如 /model ${r.candidates[0].index}），或直接写成 <id>/<model>，如 /model ${r.candidates[0].id}/${r.candidates[0].model ?? '<model>'}\n`)
             return 'continue'
           }
           if (r.kind === 'bad-index') {

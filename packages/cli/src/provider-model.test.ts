@@ -9,6 +9,8 @@ import {
   resolveModelArg,
   formatResolutionRef,
   sanitizeProviderId,
+  formatApiKeyTag,
+  findTokenOnlyDuplicates,
   startRepl,
 } from './index'
 import type { ProviderConfig } from '@harness/plugin'
@@ -261,5 +263,133 @@ describe('/model 集成：省略 id 的配置也能直接按模型名切换', ()
     expect(m.app.getModel('default')).toBeUndefined()
     await m.app.shutdown()
     m.cleanup()
+  })
+})
+
+// ==========================================================================
+// 同配置不同 token：识别 + 可区分展示
+// ==========================================================================
+// 背景：同一 type/baseUrl/model 只换 apiKey（两个额度 / 两个账号）是常见诉求，本机制允许它，
+// 但这类实例只能靠按 model 派生的 `-2` id 区分，而派生 id 与数组顺序绑定，容易出现两个坑：
+//   1) 调整数组顺序 → 同名 id 悄悄指向另一个 token；
+//   2) 列表里 type/baseUrl/model 全同，人眼无法判断哪条是哪个 token。
+// 因此补上：组识别（findTokenOnlyDuplicates）+ key 指纹展示（formatApiKeyTag fingerprint）。
+
+describe('formatApiKeyTag：apiKey 展示口径', () => {
+  it('未配置 / 加密 / env 引用 / 明文（脱敏与指纹）', () => {
+    expect(formatApiKeyTag(undefined)).toBe('（未配置）')
+    expect(formatApiKeyTag('  ')).toBe('（未配置）')
+    expect(formatApiKeyTag('enc:v1:abc')).toBe('已加密')
+    expect(formatApiKeyTag('${DEEPSEEK_KEY}')).toBe('env(DEEPSEEK_KEY)')
+    expect(formatApiKeyTag('sk-TOKEN-A')).toBe('已配置')
+    expect(formatApiKeyTag('sk-TOKEN-A', { fingerprint: true })).toBe('已配置(…EN-A)')
+    expect(formatApiKeyTag('sk-TOKEN-A', { reveal: true })).toBe('sk-TOKEN-A')
+    // reveal 优先于 fingerprint；加密态即便 reveal 也不回显密文
+    expect(formatApiKeyTag('sk-TOKEN-A', { fingerprint: true, reveal: true })).toBe('sk-TOKEN-A')
+    expect(formatApiKeyTag('enc:v1:abc', { reveal: true })).toBe('已加密')
+    // 极短 key 不做尾部截取（避免整串被回显）
+    expect(formatApiKeyTag('abc', { fingerprint: true })).toBe('已配置')
+  })
+})
+
+describe('findTokenOnlyDuplicates：同端点同模型实例组识别', () => {
+  const p = (raw: ProviderConfig[]) => normalizeProviderConfigs(raw).providers
+
+  it('仅 apiKey 不同 → 归为一组，distinctKeys=2', () => {
+    const dups = findTokenOnlyDuplicates(
+      p([
+        { type: 'openai', baseUrl: 'http://x/v1', apiKey: 'sk-A', model: 'hy3' },
+        { type: 'openai', baseUrl: 'http://x/v1', apiKey: 'sk-B', model: 'hy3' },
+      ]),
+    )
+    expect(dups).toHaveLength(1)
+    expect(dups[0].members.map((m) => m.id)).toEqual(['hy3', 'hy3-2'])
+    expect(dups[0].distinctKeys).toBe(2)
+  })
+
+  it('apiKey 也相同 → 仍是同组，但 distinctKeys=1（属重复项）', () => {
+    const dups = findTokenOnlyDuplicates(
+      p([
+        { type: 'openai', baseUrl: 'http://x/v1', apiKey: 'sk-A', model: 'hy3' },
+        { type: 'openai', baseUrl: 'http://x/v1', apiKey: 'sk-A', model: 'hy3' },
+      ]),
+    )
+    expect(dups).toHaveLength(1)
+    expect(dups[0].distinctKeys).toBe(1)
+  })
+
+  it('baseUrl / model / type 任一不同则不算同组', () => {
+    expect(
+      findTokenOnlyDuplicates(
+        p([
+          { type: 'openai', baseUrl: 'http://a', apiKey: 'sk-A', model: 'hy3' },
+          { type: 'openai', baseUrl: 'http://b', apiKey: 'sk-B', model: 'hy3' },
+          { type: 'openai', baseUrl: 'http://a', apiKey: 'sk-C', model: 'hy4' },
+          { type: 'anthropic', baseUrl: 'http://a', apiKey: 'sk-D', model: 'hy3' },
+        ]),
+      ),
+    ).toHaveLength(0)
+  })
+})
+
+describe('同配置不同 token 的集成：可区分 + 必须消歧', () => {
+  const twoTokens = [
+    { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-TOKEN-A', model: 'hy3' },
+    { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-TOKEN-B', model: 'hy3' },
+  ]
+
+  it('装配出两个独立实例（各自 apiKey 独立路由），id 派生为 hy3 / hy3-2', async () => {
+    const m = mount(twoTokens)
+    const { harness } = await m.app.boot()
+    const anyH = harness as unknown as { resolveChatProvider: (id?: string) => { id: string } }
+    expect(anyH.resolveChatProvider('hy3').id).toBe('hy3')
+    expect(anyH.resolveChatProvider('hy3-2').id).toBe('hy3-2')
+    await m.app.shutdown()
+    m.cleanup()
+  })
+
+  it('/model ? 列出 key 指纹 + 顺序绑定提示；/model <模型名> 要求消歧；/model hy3-2 可切换', async () => {
+    const m = mount(twoTokens)
+    const { harness, session } = await m.app.boot()
+    const r = await startRepl({
+      app: m.app, harness, session, stdout: m.stdout,
+      scriptedStdin: ['/model ?', '/model hy3', '/model hy3-2', '/exit'],
+    })
+    expect(r).toBe('exit')
+    const out = m.chunks.join('')
+    // 同组实例才附 key 指纹，用于区分两个 token（只回显末 4 位，不泄露完整 key）
+    expect(out).toInclude('1) hy3/hy3')
+    expect(out).toInclude('key=已配置(…EN-A)')
+    expect(out).toInclude('key=已配置(…EN-B)')
+    expect(out).not.toContain('sk-TOKEN-A')
+    expect(out).toInclude('type/baseUrl/model 完全相同')
+    expect(out).toInclude('与 providers 数组顺序绑定')
+    // 模型名命中两条 → 消歧提示里也带 key，且给出序号写法
+    expect(out).toInclude('同时命中多个 Provider 实例')
+    expect(out).toInclude('改为 /model <序号>')
+    // 用派生 id 才能精确切到第二个 token
+    expect(out).toInclude('已切换模型 hy3-2/hy3')
+    const cfg = await m.app.configStore.load()
+    expect(cfg.provider).toBe('hy3-2')
+    await m.app.shutdown()
+    m.cleanup()
+  })
+
+  it('回归：删掉「hy3-2」对应实例后启动报错可定位（派生 id 与数组绑定，config.provider 会悬空）', async () => {
+    // 直接构造「config.provider 指向派生 id hy3-2，但数组里只剩一条」的状态（= 用户删掉了第二条 token）
+    const dir = mkdtempSync(join(tmpdir(), 'harness-token-'))
+    writeFileSync(
+      join(dir, 'config.json'),
+      JSON.stringify({ provider: 'hy3-2', model: 'hy3', providers: [twoTokens[0]] }, null, 2),
+    )
+    const chunks: string[] = []
+    const app = new HarnessApp({
+      cwd: dir, dataDir: dir, agentId: 'default', provider: 'hy3-2',
+      permissionMode: 'allow-all', stdout: { write: (s: string) => { chunks.push(s) } },
+    })
+    const failed = await app.boot().then(() => undefined, (e: Error) => e.message)
+    expect(failed).toInclude('默认 provider "hy3-2" 未在 providers 数组中定义')
+    expect(chunks.join('')).toInclude('配置错误（config.json → providers）')
+    rmSync(dir, { recursive: true, force: true })
   })
 })
