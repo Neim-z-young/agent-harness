@@ -1138,6 +1138,25 @@ Claude Code 文件副本方案保留为**非 git 项目 fallback**（见 10.4 �
 
 > **实现状态（2026-08-31 补录）**：模块 A/B/C/D 均已落地并收尾（development-log 续 30~34）。D 的两个"后续增强"项（鼠标点击复制、选区复制）也已实现：续 33 每消息「复制」按钮、续 34 选区复制 + 欢迎页。新增模块 E「侧栏用量统计面板」已在续 35 落地（见下）。
 
+### 11.7 输入框提交键约定（续 125）
+
+> 记录日期：2026-09-15。落点：`tui.tsx` 全局 `useKeyboard` 提交键分支（位于文件/会话列表分支**之后**，保证列表 Enter 优先）。
+
+**约束（实测）**：在 tmux 式终端复用器（herdr）下，**只有 Enter 的原生 CR(0x0D) 能送达应用**；`Option+Enter`（ESC 前缀）、`Shift+Enter`（需 Kitty 协议）、`Ctrl+J`（LF 0x0A）的修饰/区分信息全部丢失或被吞。故提交键必须落在 Enter 本身，否则用户无法发送消息。
+
+| 按键 | 行为 | 前提 |
+| --- | --- | --- |
+| `Enter` | 提交 | 始终（列表/命令菜单中为确认选中） |
+| `Ctrl+J`（LF） | 提交 | 兼容把 Enter 上报为 LF 的终端 |
+| `Shift+Enter` | 换行 | 仅终端上报 Shift（Kitty 键盘协议） |
+| `` `\` `` + `Enter` | 换行 | 始终：消费行尾转义反斜杠，不依赖修饰键 |
+
+**实现要点**：
+
+- 自定义提交键**不能**用 textarea 的 `keyBindings`（`@opentui/react` 不透传该 prop，传了被静默丢弃），只能在全局处理器里调 `textareaRef.current.submit()` / `newLine()`；换行后需自行 `setInput(readComposer())`（早返回不会落到文末的微任务同步）。
+- `` `\` ``+Enter 仅认**整段缓冲行尾**的反斜杠（不做 `cursorOffset` 偏移计算，避免 CJK 下单位歧义误删字符）；多行缓冲中间行插反斜杠不生效，会走提交。
+- `__KEYLOG` 记录 `name:C/S/M`（ctrl/shift/meta）——排查按键问题时先看它。
+
 ## 十二、命令审批交互链路（续 39）
 
 > 记录日期：2026-08-31。权限从「规则匹配」升级为「可交互的审批链路」，并在 TUI 提供专属审批模态。核心代码：core [resolvePermission / safeExecuteTool](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/core/src/index.ts) + cli [CliPermissionEngine](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/index.ts#L751-L814) + TUI [审批模态](file:///Users/oyoungy/Documents/project/XiaoZhi-new/packages/cli/src/tui.tsx#L1222-L1232)。
