@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, symlinkSync, readlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveWorkspace, createWorkspaceOriginalStore } from '@harness/workspace'
@@ -22,6 +22,8 @@ import {
   getBuiltinRegistry,
   getBuiltinToolRegistry,
   preloadBuiltinToolMetas,
+  resolveBuiltinPlugins,
+  unknownBuiltinPluginIds,
   BuiltinToolRegistry,
   loadPluginDirs,
   startRepl,
@@ -603,6 +605,105 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     expect(warns.some((w) => w.includes('已忽略'))).toBe(true)
     expect(result.plugins).toEqual([])
   })
+
+  it('loadPluginDirs：插件目录在 harness 安装位置之外时先补解析锚点再导入（裸导入 @harness/*）', async () => {
+    // 临时目录（/tmp 下）上溯没有 node_modules —— 正是「工作目录不在仓库内」的形态：
+    // 不预置锚点就直接 import 会抛 Cannot find module '@harness/tool'，整个插件文件被忽略。
+    const pluginDir = join(dir, 'outside', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'mcp.ts'), `
+      import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
+      export const plugins = [
+        { id: 'ext.outside', version: '1', name: READONLY_TOOLS_SENTINEL, async install() { return {} } },
+      ]
+    `)
+    const logs: string[] = []
+    const reg = new ProviderTypeRegistry()
+    const result = await loadPluginDirs(reg, [pluginDir], (s) => logs.push(s))
+    expect(result.plugins.map((p) => p.id)).toEqual(['ext.outside'])
+    expect(result.plugins[0].name).toBe('@readonly')
+    expect(logs.some((l) => l.includes('插件加载失败'))).toBe(false)
+    expect(logs.some((l) => l.includes('已补解析锚点'))).toBe(true)
+    // 锚点：node_modules 软链 + .gitignore 条目（避免软链被收进用户仓库）
+    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(true)
+    expect(readFileSync(join(pluginDir, '.gitignore'), 'utf-8')).toContain('node_modules')
+  })
+
+  it('loadPluginDirs：已有锚点覆盖不到缺失依赖时改指向（旧锚点自愈）', async () => {
+    const pluginDir = join(dir, 'stale-anchor', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'mcp.ts'), `
+      import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
+      export const plugins = [
+        { id: 'ext.stale', version: '1', name: READONLY_TOOLS_SENTINEL, async install() { return {} } },
+      ]
+    `)
+    // 旧版本可能留下的锚点：存在但不含 @harness
+    mkdirSync(join(dir, 'stale-anchor', 'empty-nm'), { recursive: true })
+    symlinkSync(join(dir, 'stale-anchor', 'empty-nm'), join(pluginDir, 'node_modules'), 'dir')
+    const logs: string[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s))
+    expect(result.plugins.map((p) => p.id)).toEqual(['ext.stale'])
+    expect(logs.some((l) => l.includes('已更新插件解析锚点'))).toBe(true)
+    // 锚点已改指向含 @harness 的 node_modules
+    expect(existsSync(join(readlinkSync(join(pluginDir, 'node_modules')), '@harness'))).toBe(true)
+  })
+
+  it('loadPluginDirs：相对路径导入失败不补锚点，仍按原样告警（预检只针对裸依赖）', async () => {
+    const pluginDir = join(dir, 'relative-plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    // 用上导入的绑定，避免被 Bun 当死代码消除而根本不解析
+    writeFileSync(join(pluginDir, 'bad.ts'), `
+      import { x } from './nowhere'
+      export const plugins = [{ id: 'ext.bad', version: '1', name: String(x), async install() { return {} } }]
+    `)
+    const logs: string[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s))
+    expect(result.plugins).toEqual([])
+    expect(logs.some((l) => l.includes('插件加载失败'))).toBe(true)
+    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(false)
+  })
+
+  it('loadPluginDirs：裸依赖确实无法解析时，告警附带「改用 config.json → plugins」提示', async () => {
+    const pluginDir = join(dir, 'missing-dep-plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'bad.ts'), `
+      import { y } from 'definitely-not-installed-xyz'
+      export const plugins = [{ id: 'ext.bad2', version: '1', name: String(y), async install() { return {} } }]
+    `)
+    const logs: string[] = []
+    await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s))
+    const text = logs.join('')
+    expect(text).toContain('插件加载失败')
+    expect(text).toContain('config.json → "plugins"')
+  })
+})
+
+describe('内置插件声明式启用（config.json → plugins）', () => {
+  it('BuiltinPluginRegistry 登记 mcp.server-registry（进程内 MCP server 的宿主）', () => {
+    const entry = getBuiltinRegistry().get('mcp.server-registry')!
+    expect(entry).toBeDefined()
+    expect(entry.source).toBe('builtin')
+    // 宿主插件自身不提供工具，无需 metaSource
+    expect(entry.metaSource).toBeUndefined()
+  })
+
+  it('resolveBuiltinPlugins：按 id 实例化，并用 dependsOn 自动补齐依赖闭包', async () => {
+    const { plugins, unknown } = await resolveBuiltinPlugins(['code-intel'])
+    expect(plugins.map((p) => p.id)).toEqual(['code-intel', 'mcp.server-registry'])
+    expect(unknown).toEqual([])
+  })
+
+  it('resolveBuiltinPlugins：未登记 id 与重复项只记入 unknown/去重，不抛错', async () => {
+    const { plugins, unknown } = await resolveBuiltinPlugins(['no-such-plugin', 'code-intel', 'code-intel'])
+    expect(unknown).toEqual(['no-such-plugin'])
+    expect(plugins.map((p) => p.id)).toEqual(['code-intel', 'mcp.server-registry'])
+  })
+
+  it('unknownBuiltinPluginIds：只查表不加载模块', () => {
+    expect(unknownBuiltinPluginIds(undefined)).toEqual([])
+    expect(unknownBuiltinPluginIds(['code-intel', ' nope '])).toEqual(['nope'])
+  })
 })
 
 describe('SessionFileStore 会话持久化', () => {
@@ -1028,6 +1129,43 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.boot()
     const cfg = await app.configStore.load()
     expect(cfg.mcpServers?.[0]?.name).toBe('alpha')
+    await app.shutdown()
+  })
+
+  it('boot：config.json → plugins 声明式启用内置插件（免写 .harness/plugins 代码）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(join(dataDir, 'config.json'), JSON.stringify({ plugins: ['code-intel'] }, null, 2))
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    const ids = harness.plugin.list().map((p) => p.plugin.id)
+    expect(ids).toContain('mcp.server-registry') // 依赖闭包自动补齐（code-intel → 宿主 registry）
+    expect(ids).toContain('code-intel')
+    // 装配工具池后 mcp__code-intel__* 真正可调用（不再是「仅元信息」）
+    await harness.assembleTools()
+    expect(harness.tools.list().map((t) => t.id)).toContain('mcp__code-intel__code_symbols')
+    await app.shutdown()
+  })
+
+  it('boot：config.json → plugins 有未登记 id 时只告警，不阻断启动', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(join(dataDir, 'config.json'), JSON.stringify({ plugins: ['no-such-plugin'] }, null, 2))
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    await app.boot()
+    expect(chunks.join('')).toContain('config.json → plugins 有未生效项：no-such-plugin')
     await app.shutdown()
   })
 

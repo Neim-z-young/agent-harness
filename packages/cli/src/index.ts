@@ -63,6 +63,7 @@ import {
   MultiDirLoader,
   normalizeDirs,
   createWorkspaceOriginalStore,
+  ensureGitignoreEntry,
   type Workspace,
   type SessionFile,
 } from '@harness/workspace'
@@ -87,11 +88,11 @@ import { reconstructHistory, buildResolveBlock, getSessionModelOverride, session
 import { formatSkillSource } from '@harness/skill'
 import type { ToolContext, Tool } from '@harness/tool'
 
-import { join, resolve } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
-import { readFile, writeFile, mkdir, unlink } from 'node:fs/promises'
+import { readFile, writeFile, mkdir, unlink, symlink, readlink } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 // ========================================================================
 // 1. 参数解析
@@ -257,6 +258,15 @@ export interface HarnessConfig {
    * 启动时经 mcp.configure Hook 注入 mcp-server-registry 插件；/mcp 命令可即时启用/禁用并写回。
    */
   mcpServers?: McpServerEntry[]
+  /**
+   * 内置插件启用列表（**声明式，无需写 `.harness/plugins/*.ts`**）。
+   *
+   * 元素取 BuiltinPluginRegistry 的 id，例如 `["code-intel", "computer-use"]`。
+   * 依赖按插件上的 dependsOn 自动补齐（如 computer-use → mcp.server-registry），
+   * 安装顺序由 core 的拓扑排序保证（宿主先装）；未登记的 id 只告警、不阻断启动。
+   * 与外部插件目录并存时按 id 去重（外部插件目录优先，便于临时替换实现）。
+   */
+  plugins?: string[]
   /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
   snapshot?: boolean
   /**
@@ -606,6 +616,8 @@ export interface BuiltinGeneralPlugin {
   /**
    * 仅登记 metaSource，不参与后台预加载/运行时实例化。用于 computer-use 这类进程内 MCP server 插件：
    * 其工具经 mcp-client 连接后才可用，CLI 只预登记元信息（/tools 可展示），不自动 register server。
+   * 注意：`metaOnly` 只挡「自动预加载」这一条路，仍可经 config.json → `plugins` 声明式启用，
+   * 或由外部插件目录（.harness/plugins）显式装配。
    */
   metaOnly?: boolean
 }
@@ -698,7 +710,8 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
     })
     // code-intel：进程内 MCP server（mcp__code-intel__*），工具经 mcp-client 连接后才可用。
     // 仅携带 metaSource（/tools 可提前展示），metaOnly=true 使其不被后台预加载实例化——
-    // 需经 .harness/plugins 或 ~/.harness/plugins 外部插件目录装配（createMcpServerRegistryPlugin + createCodeIntelPlugin）。
+    // 启用方式二选一（都无需改动 CLI/core）：config.json → plugins: ["code-intel"]，或
+    // 外部插件目录 .harness/plugins 里显式装配 createMcpServerRegistryPlugin + createCodeIntelPlugin。
     defaultBuiltinRegistry.register({
       id: 'code-intel',
       name: 'Code Intel',
@@ -719,8 +732,65 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       load: async () => (await lazyImport<{ createComputerUsePlugin: () => AgentPlugin }>('@harness/computer-use')).createComputerUsePlugin(),
       metaSource: lazyToolMetaSource('@harness/computer-use/meta'),
     })
+    // mcp.server-registry：computer-use / code-intel 这类「进程内 MCP server 插件」的宿主
+    // （自身不提供工具，故无 metaSource）。默认不自动装配——不给用不到的能力拉起 MCP 通道；
+    // 由 config.json → plugins 声明式启用时经依赖闭包自动补上（见 resolveBuiltinPlugins），
+    // 也可被外部插件目录显式装配（.harness/plugins/mcp.ts）。
+    defaultBuiltinRegistry.register({
+      id: 'mcp.server-registry',
+      name: 'MCP Server Registry',
+      description: 'MCP Server 注册表（连接进程内/外部 MCP server 并暴露其工具，提供 /mcp 命令）',
+      source: 'builtin',
+      load: async () => (await lazyImport<{ createMcpServerRegistryPlugin: () => AgentPlugin }>('@harness/mcp-server-registry')).createMcpServerRegistryPlugin(),
+    })
   }
   return defaultBuiltinRegistry
+}
+
+/**
+ * 校验 config.json → `plugins` 里的 id 是否都在 BuiltinPluginRegistry 登记（只查表，不加载模块）。
+ * 供 `harness config check` 与 boot 的告警使用。
+ */
+export function unknownBuiltinPluginIds(ids: string[] | undefined, registry = getBuiltinRegistry()): string[] {
+  const wanted = [...new Set((ids ?? []).map((s) => String(s).trim()).filter(Boolean))]
+  return wanted.filter((id) => !registry.has(id))
+}
+
+/**
+ * 解析 config.json → `plugins`（内置插件 id）→ 插件实例（含 dependsOn 依赖闭包）。
+ *
+ * 这是与「外部插件目录 .harness/plugins」并列的第二条装配路径：只想开一个内置能力的用户
+ * 改一行配置即可，**不必写代码**，也不必知道 mcp.server-registry 这种宿主插件的存在——
+ * 依赖按实例上的 dependsOn 递归补齐（如 computer-use → mcp.server-registry）。
+ * 同一批实例交给 core 的 loadInternal，由它按 dependsOn 拓扑排序保证宿主先安装。
+ *
+ * 失败隔离：未登记的 id / 单个模块加载失败都只记入 `unknown` 并继续，不阻断 boot。
+ *
+ * @returns plugins：按声明顺序去重的实例；unknown：未登记或加载失败的 id 描述
+ */
+export async function resolveBuiltinPlugins(
+  ids: string[] | undefined,
+  registry = getBuiltinRegistry(),
+): Promise<{ plugins: AgentPlugin[]; unknown: string[] }> {
+  const plugins: AgentPlugin[] = []
+  const unknown: string[] = []
+  const done = new Set<string>()
+  const queue = [...(ids ?? [])]
+  while (queue.length) {
+    const id = String(queue.shift() ?? '').trim()
+    if (!id || done.has(id)) continue
+    const entry = registry.get(id)
+    if (!entry) { unknown.push(id); continue }
+    done.add(id)
+    try {
+      const plugin = await entry.load()
+      plugins.push(plugin)
+      for (const dep of plugin.dependsOn ?? []) if (!done.has(dep)) queue.push(dep)
+    } catch (err) {
+      unknown.push(`${id}（加载失败：${(err as Error)?.message ?? String(err)}）`)
+    }
+  }
+  return { plugins, unknown }
 }
 
 // ------------------------------------------------------------------------
@@ -886,6 +956,11 @@ function registerProviderTypeFactory(
  *   1. 通用 AgentPlugin（Hooks 插件）：default / plugin / plugins
  *   2. Provider 类型工厂（扩展 config.type）：providerTypeFactory 或 providerType + createProviderPlugin
  * 通用插件汇总返回；Provider 类型工厂按 type 注册进 registry（供 config.type 动态解析）。
+ *
+ * 跨目录解析：插件文件里的裸导入（`@harness/*` 等）按 node 规则从**插件文件所在目录**逐级
+ * 上溯找 node_modules；而 `<cwd>/.harness/plugins` 往往不在任何 node_modules 的下游（工作目录
+ * 在仓库/安装位置之外时），直接 `import()` 会抛 `Cannot find module` 并让整个插件文件被忽略——
+ * 表现为「插件静默没生效」。这里在导入前探测并补解析锚点，见 importPluginModule。
  */
 export async function loadPluginDirs(
   registry: ProviderTypeRegistry,
@@ -900,16 +975,183 @@ export async function loadPluginDirs(
   for (const item of items) {
     const full = item.full
     try {
-      const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
+      const mod = await importPluginModule(full, out)
       // 1) 通用 AgentPlugin
       for (const p of collectAgentPlugins(mod)) byId.set(p.id, p)
       // 2) Provider 类型工厂
       registerProviderTypeFactory(registry, mod, full, out)
     } catch (err) {
-      out(`插件加载失败 ${full}：${(err as Error)?.message ?? String(err)}`)
+      const msg = (err as Error)?.message ?? String(err)
+      out(`插件加载失败 ${full}：${msg}\n`)
+      if (/Cannot find (?:module|package)\s+["']/.test(msg)) {
+        out('  （该插件目录无法解析裸依赖：若只是要启用内置能力，改用 config.json → "plugins": ["code-intel"] 即可，无需插件文件）\n')
+      }
     }
   }
   return { plugins: [...byId.values()] }
+}
+
+// ------------------------------------------------------------------------
+// 2.2.0 外部插件跨目录解析 —— 插件目录不在 harness 安装位置内时补 node_modules 锚点
+// ------------------------------------------------------------------------
+
+/**
+ * 从插件源码里抽出**裸导入**的包名（相对/绝对路径、`node:` 等协议前缀忽略）。
+ * 只服务于「首次 import 前是否需要补解析锚点」的判断，故用宽松正则即可：
+ * 误报（注释/字符串里长得像导入）只会多建一个无害的软链，而漏报才会退回静默失败。
+ */
+function bareImportSpecifiers(code: string): string[] {
+  const out = new Set<string>()
+  const re = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(code))) {
+    const spec = m[1]!.trim()
+    if (!spec) continue
+    if (spec.startsWith('.') || spec.startsWith('/') || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec)) continue
+    out.add(spec)
+  }
+  return [...out]
+}
+
+/** 裸包名 → 包根名（`@scope/pkg/sub` → `@scope/pkg`；`pkg/sub` → `pkg`） */
+function packageRootOf(spec: string): string {
+  const seg = spec.split('/')
+  return spec.startsWith('@') ? seg.slice(0, 2).join('/') : seg[0]!
+}
+
+/**
+ * 该裸包能否从 `from` 目录解析到 —— **纯文件系统判断**（按 node 的 node_modules 上溯规则查目录）。
+ *
+ * 这里刻意不用 `Bun.resolveSync` 探测：它对同一目录的解析失败会写进进程级解析缓存，
+ * 导致随后补好锚点再 `import()` 依然报 Cannot find module（实测 A/B 对照确认）。
+ * 判断偏保守——漏判只是多补一个无害锚点，误判则由 import 的真实错误与提示日志兜底。
+ */
+function canResolveBarePackage(pkg: string, from: string): boolean {
+  let dir = from
+  for (;;) {
+    if (existsSync(join(dir, 'node_modules', pkg))) return true
+    const parent = dirname(dir)
+    if (parent === dir) return false
+    dir = parent
+  }
+}
+
+/** 插件源码里**无法从插件目录解析**的裸依赖（相对/绝对路径与 `node:` 等协议前缀不算） */
+async function unresolvedBareSpecifiers(full: string): Promise<string[]> {
+  let code: string
+  try { code = await readFile(full, 'utf-8') } catch { return [] }
+  const from = dirname(full)
+  return bareImportSpecifiers(code).filter((spec) => !canResolveBarePackage(packageRootOf(spec), from))
+}
+
+/**
+ * harness 侧所有可用的 node_modules 候选（从本模块所在目录逐级上溯，近 → 远）。
+ *
+ * 起点是**本模块自己的路径**而非 cwd：无论用户从哪个目录启动 CLI，插件都应能复用同一套依赖。
+ * 会依次经过 `packages/cli/node_modules`（包自身依赖）与仓库根 `node_modules`（全部 workspace 包）——
+ * 两者覆盖面不同（如 `@harness/code-intel` 只在根 node_modules 里），所以要全部收集后再挑。
+ */
+function harnessNodeModulesCandidates(): string[] {
+  const out: string[] = []
+  let dir = dirname(fileURLToPath(import.meta.url))
+  let nearest: string | undefined
+  for (;;) {
+    const nm = join(dir, 'node_modules')
+    if (existsSync(join(nm, '@harness'))) out.push(nm)
+    else if (!nearest && existsSync(nm)) nearest = nm
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return out.length ? out : nearest ? [nearest] : []
+}
+
+/**
+ * 为锚点挑目标 node_modules：优先**覆盖面最大**的候选（能解析最多缺失裸依赖），并列取最近的一个。
+ * 兜底：没有任何 @harness 候选时用最近的 node_modules；都没有则 undefined。
+ */
+function harnessNodeModules(missing: string[] = []): string | undefined {
+  const candidates = harnessNodeModulesCandidates()
+  if (!candidates.length) return undefined
+  const score = (nm: string) => missing.filter((s) => existsSync(join(nm, packageRootOf(s)))).length
+  let best = candidates[0]!
+  let bestScore = score(best)
+  for (const nm of candidates.slice(1)) {
+    const sc = score(nm)
+    if (sc > bestScore) { best = nm; bestScore = sc }
+  }
+  return best
+}
+
+/**
+ * 给插件目录补一个 `node_modules` 软链 → harness 安装位置的 node_modules，并落 `.gitignore` 条目。
+ *
+ * 为什么用软链而不是模块解析钩子：Bun 的 `Bun.plugin()` 只作用于打包器，运行时 `import()`
+ * 不吃其 onResolve（实测无效）；而裸导入的解析根由**被导入文件的位置**决定，无法从调用侧注入。
+ * 把解析锚点放回文件自身目录，是唯一既不篡改插件源码、也不依赖非标 API 的做法。
+ *
+ * 软链只**追加**一个解析根，不遮蔽原有链路：锚点里没有的包仍会继续向上找到宿主项目的
+ * node_modules，因此不会破坏本就依赖宿主依赖的插件。
+ *
+ * 已有锚点的处理：只有在它**是自己建的软链**（读得到 readlink）且覆盖不了本次缺失依赖时
+ * 才改指向；用户自己的真实 node_modules 目录一律不碰。
+ *
+ * @param missing 本次探测到无法解析的裸依赖（用于挑覆盖面最大的目标）
+ * @returns true=本次新建/更新了锚点；false=无需或无法处理（调用方保留原错误并给提示）
+ */
+export async function ensurePluginResolverAnchor(
+  pluginDir: string,
+  out: (s: string) => void,
+  missing: string[] = [],
+): Promise<boolean> {
+  const target = harnessNodeModules(missing)
+  if (!target) return false
+  const link = join(pluginDir, 'node_modules')
+  const linkType = process.platform === 'win32' ? 'junction' : 'dir'
+  if (existsSync(link)) {
+    let current: string | undefined
+    try { current = await readlink(link) } catch { return false } // 真实目录（用户自带）→ 不碰
+    if (!current || current === target) return false
+    const covered = missing.every((s) => existsSync(join(current!, packageRootOf(s))))
+    if (covered) return false
+    try {
+      await unlink(link)
+      await symlink(target, link, linkType)
+      out(`已更新插件解析锚点：${link} → ${target}\n`)
+      return true
+    } catch (err) {
+      out(`更新解析锚点失败（${link}）：${(err as Error)?.message ?? String(err)}\n`)
+      return false
+    }
+  }
+  try {
+    await mkdir(pluginDir, { recursive: true })
+    await symlink(target, link, linkType)
+    await ensureGitignoreEntry(pluginDir, 'node_modules')
+    out(`插件目录不在 harness 安装位置内，已补解析锚点：${link} → ${target}\n`)
+    return true
+  } catch (err) {
+    out(`补解析锚点失败（${link}）：${(err as Error)?.message ?? String(err)}\n`)
+    return false
+  }
+}
+
+/**
+ * 导入插件模块：**首次 import 之前**先确保裸依赖可解析（探测 → 补锚点 → 导入）。
+ *
+ * 顺序是关键：Bun 会把「解析失败」按 (导入文件, 裸包名) 缓存在进程内——同一插件文件事后
+ * 重试（改 URL、加 query 都一样）仍然报 Cannot find module，所以必须赶在第一次 import 前
+ * 把锚点放好。相对导入失败时不补锚点（补了也无用）。
+ */
+async function importPluginModule(full: string, out: (s: string) => void): Promise<Record<string, unknown>> {
+  const missing = await unresolvedBareSpecifiers(full)
+  if (missing.length) {
+    const dir = dirname(full)
+    if (!(await ensurePluginResolverAnchor(dir, out, missing))) {
+      out(`插件 ${full} 的裸依赖无法从插件目录解析：${missing.join('、')}\n`)
+    }
+  }
+  return (await import(pathToFileURL(full).href)) as Record<string, unknown>
 }
 
 // ------------------------------------------------------------------------
@@ -1801,6 +2043,16 @@ export class HarnessApp {
     providerPlugins.push(createRevertPlugin())
     // 薄壳插件：/snapshot 快照信息命令（依赖 cli 注入的 snapshotService，见 cmdInput）
     providerPlugins.push(createSnapshotPlugin())
+    // 内置插件声明式启用（config.json → plugins）：与外部插件目录并列的第二条装配路径，
+    // 让「只想开个内置能力」的用户改一行配置即可（依赖闭包自动补齐，如 computer-use → mcp.server-registry）。
+    // 这里只解析实例，实际入列在外部插件之后（见下方按 id 去重），避免与 .harness/plugins 里的同 id 重复安装。
+    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins)
+    if (declaredPlugins.unknown.length) {
+      this.options.stdout?.write?.(
+        `[WARN] config.json → plugins 有未生效项：${declaredPlugins.unknown.join('、')}\n` +
+        `       可用内置插件：${getBuiltinRegistry().list().map((p) => p.id).join(' / ')}\n`,
+      )
+    }
     // ACP 上下文压缩：config.json → compression.enabled 为真时才惰性装配 @harness/acp-context。
     // 上下文窗口推导优先级：compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 插件默认 200_000；
     // t1/t2/t3 阈值与层保留从结构化字段翻译进 kernel config。
@@ -1843,6 +2095,11 @@ export class HarnessApp {
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
+    // config.json → plugins 声明的内置插件：与外部插件目录按 id 去重（外部插件目录优先，便于临时替换实现）
+    if (declaredPlugins.plugins.length) {
+      const present = new Set(providerPlugins.map((p) => p.id))
+      for (const p of declaredPlugins.plugins) if (!present.has(p.id)) providerPlugins.push(p)
+    }
     if (this.options.extraPlugins?.length) providerPlugins.push(...this.options.extraPlugins)
 
     // 登记「可管理」插件（/plugins enable 需要对象引用重新安装）：
@@ -3258,10 +3515,20 @@ export async function runConfigCommand(options: {
     write(buildConfigOverview(cfg, defaultProviderId) + '\n')
     // 展示含外部插件的完整 Provider 类型清单（含用法提示）
     write(buildProviderTypesSection(registry) + '\n')
+    // config.json → plugins（内置插件声明式启用）自检：只查 BuiltinPluginRegistry，不加载模块
+    const unknownPlugins = unknownBuiltinPluginIds(cfg.plugins)
+    if (cfg.plugins?.length) write(`内置插件（config.json → plugins）：${cfg.plugins.join('、')}\n`)
+    if (unknownPlugins.length) {
+      write(
+        `配置错误（config.json → plugins）：未登记的内置插件 ${unknownPlugins.join('、')}\n` +
+        `  可用：${getBuiltinRegistry().list().map((p) => p.id).join(' / ')}\n`,
+      )
+    }
     if (issues.length) {
       write('配置错误（config.json → providers）：\n' + issues.map((s) => `  - ${s}`).join('\n') + '\n')
       return 1
     }
+    if (unknownPlugins.length) return 1
     write('配置校验通过。\n')
     return 0
   }

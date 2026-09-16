@@ -4,18 +4,50 @@
 
 ## 1. 概述
 
-项目支持两种方式接入 MCP Server：
+项目支持三种方式接入 MCP Server：
 
 | 方式       | 装配位置                                           | 说明                                           | 启停                                                               |
 | -------- | ---------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------- |
+| **声明式启用** | `config.json` 的 `plugins` 数组（内置插件 id）          | **零代码**：自动补齐依赖（如 `mcp.server-registry`）      | 改配置即生效（重启后）                                                      |
 | **代码注册** | `.harness/plugins/mcp.ts`（`registerMcpServer`） | 进程内/自定义 transport（computer-use、code-intel 等） | 随插件装卸（`/plugins enable\|disable`）；或 `/mcp enable\|disable` 会话内启停 |
 | **配置托管** | `config.json` 的 `mcpServers` 数组                | 外部 stdio / http / sse server                 | `/mcp enable\|disable` 即时启停（持久化）                                 |
 
 - 所有 server 统一由 `@harness/mcp-server-registry` 插件在 `harness.start` 时连接，复用 `@harness/mcp-client` 管理连接，工具经 `tool.pool.assemble` 暴露为 `mcp__<server>__<tool>`。
 
-- 插件化约束：core/CLI 不硬编码任何 MCP server；删除 `.harness/plugins/mcp.ts` 即停用所有进程内 MCP server 能力。
+- 插件化约束：core/CLI 不硬编码任何 MCP server；删除 `.harness/plugins/mcp.ts` 即停用所有进程内 MCP server 能力（改用下面的 `plugins` 声明式启用亦可）。
 
-## 2. 配置托管（config.json）
+## 2. 零代码启用内置插件（config.json → plugins）
+
+只想「开一个内置能力」时**不必写 `.harness/plugins/*.ts`**：在 `dataDir/config.json` 顶层写 `plugins` 数组即可，元素取内置插件 id。
+
+```json
+{
+  "plugins": ["code-intel", "computer-use"]
+}
+```
+
+- **依赖自动补齐**：`code-intel` / `computer-use` 都依赖 `mcp.server-registry`（进程内 MCP server 的宿主），解析时按插件声明的 `dependsOn` 递归补上，安装顺序由 core 拓扑排序保证（宿主先装）。
+- **工具开箱即用**：boot 末尾的后台预加载会装配工具池，`/tools` 里这些工具直接是「已加载」，不再停留在「仅元信息·源自mcp」。
+- **失败不阻断**：未登记的 id 只告警并跳过；`harness config check` 会把未登记项报成配置错误。
+- **与外部插件目录按 id 去重**（外部插件目录优先），因此 `.harness/plugins/mcp.ts` 与 `plugins` 声明可并存，也可删掉前者。
+
+当前已登记的内置插件 id：
+
+| id                    | 说明                                              |
+| --------------------- | ----------------------------------------------- |
+| `mcp.server-registry` | MCP Server 注册表（连接进程内/外部 MCP server，提供 `/mcp` 命令） |
+| `code-intel`          | 代码情报 MCP server（`mcp__code-intel__*`）           |
+| `computer-use`        | 电脑控制 MCP server（`mcp__computer-use__*`）         |
+
+> **外部 MCP server 同样可零代码启用**：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`，无需再手写 `.harness/plugins/mcp.ts`。
+
+### 2.1 插件目录可位于任意工作目录
+
+外部插件目录（`<cwd>/.harness/plugins`、`~/.harness/plugins`）里的裸导入（`@harness/*` 等）按 node 规则从**插件文件所在目录**上溯查找 `node_modules`。工作目录不在仓库/安装位置内时该链路断开，插件会因 `Cannot find module` 被整体忽略（表现为「插件静默不生效」）。
+
+CLI 现在会在导入前探测插件的裸依赖：无法解析时就在插件目录补一个 `node_modules` 软链指向 harness 安装位置，并写入 `.gitignore`（`node_modules`）。软链只**追加**解析根、不遮蔽原有链路，因此依赖宿主项目 node_modules 的插件不受影响。
+
+## 3. 配置托管（config.json）
 
 在 `dataDir/config.json` 顶层写 `mcpServers` 数组，元素复用 `@harness/mcp-client` 的 `McpServerConfig` 字段，并附加两级启停开关：
 
@@ -52,7 +84,7 @@
 | `enabled`                  | boolean                     | **服务器级开关**，缺省 `true`                       |
 | `tools`                    | Record\<string, boolean>    | **工具级开关**，`{ 工具名: false }` 停用单个工具，缺省全开     |
 
-## 3. /mcp 命令
+## 4. /mcp 命令
 
 `/mcp` 提供运行时查看与管理（REPL 内输入）：
 
@@ -84,7 +116,7 @@
 
 > 说明：**代码注册** server（computer-use、code-intel 等）无 config.json 槽位，`/mcp disable` 为**本次进程生效**（重启后自动恢复连接）；随插件整体装卸请用 `/plugins disable|enable <pluginId>`——插件卸载时其注册的 MCP server 自动断开、工具从工具池移除，重载后自动重连。
 
-## 4. 运行时机制
+## 5. 运行时机制
 
 - **启动**：CLI boot 时 `applyMcpServers` 读 `config.json` 的 `mcpServers`，经 `mcp.configure` Hook 注入 registry 插件（仅建立配置态）；`harness.start` 时按 `enabled` 开关连接。
 
@@ -98,7 +130,7 @@
 
 - **失败容错**：单个 server 连接失败不阻塞其他 server（仅记错误日志），也不阻塞 harness 启动。
 
-## 5. 凭证安全
+## 6. 凭证安全
 
 `env` / `auth` 中的敏感值支持三种格式（同 Provider API key 规范）：
 
@@ -110,7 +142,7 @@
 
 HTTP/SSE 的 OAuth2 授权流程见 `@harness/mcp-client` 的 OAuth 实现（PKCE S256 + token 刷新），token 加密存储在 `dataDir/oauth-tokens.json`。
 
-## 6. 相关文档
+## 7. 相关文档
 
 - 架构分层与 MCP Client 插件示例：`docs/agent-harness-architecture.md`
 

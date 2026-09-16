@@ -10,6 +10,12 @@
  *
  * 可插拔：删除本文件（或改名为非 .ts/.js/.mjs）即停用所有进程内 MCP server 能力，
  * 无需改动 CLI/core。
+ *
+ * ── 不想写代码？两种「零代码」替代（与本文件等价，二选一即可，不必都留）──
+ * 1) 内置能力：在 config.json 写 `"plugins": ["code-intel", "computer-use"]`，
+ *    依赖（mcp.server-registry）会按 dependsOn 自动补齐；
+ * 2) 外部 MCP server：config.json 写 `"plugins": ["mcp.server-registry"]` + `"mcpServers": [...]`。
+ * 详见 docs/mcp-services.md §2；并存的同 id 插件按「外部插件目录优先」去重。
  */
 import { createMcpServerRegistryPlugin } from '@harness/mcp-server-registry'
 import { createComputerUsePlugin } from '@harness/computer-use'

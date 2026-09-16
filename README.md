@@ -129,8 +129,24 @@ bun run typecheck           # 全部类型检查
 | `providers` | ProviderConfig[] | 自定义 Provider 定义（见下） |
 | `agents` | AgentOverride[] | 按 id 覆盖 Agent 的工具白名单 / MCP server 白名单 |
 | `mcpServers` | McpServerEntry[] | 托管的外部 MCP server（支持运行时 `/mcp` 启停，写回本字段） |
+| `plugins` | string[] | 声明式启用**内置插件**（如 `["code-intel","computer-use"]`），依赖按 `dependsOn` 自动补齐；**无需写 `.harness/plugins/*.ts`** |
 | `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
 | `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
+
+### plugins 数组（内置插件声明式启用）
+
+不想写插件代码时，用一行配置开内置能力（依赖自动补齐、安装顺序由 core 拓扑排序保证）：
+
+```json
+{
+  "plugins": ["code-intel", "computer-use"]
+}
+```
+
+- 已登记的内置插件 id：`mcp.server-registry`（MCP Server 注册表，进程内/外部 MCP server 的宿主）、`code-intel`、`computer-use`。
+- 后两者依赖 `mcp.server-registry`，**不必显式写出**；外部 MCP server 也可零代码启用：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`。
+- 未登记的 id 只告警不阻断启动；`harness config check` 会报为配置错误。
+- 与外部插件目录（`.harness/plugins`）**按 id 去重**，外部插件优先，两者可并存。
 
 ### providers 数组
 
