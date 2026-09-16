@@ -79,4 +79,39 @@ describe('项目级「上次会话」指针', () => {
     expect((await store.read())?.sessionId).toBe('s_a')
     expect((await otherStore.read())?.sessionId).toBe('s_b')
   })
+
+  describe('指针绑定 dataDir（readIfOwnedBy）', () => {
+    it('dataDir 匹配返回指针；不匹配返回 undefined（不会恢复错 dataDir 的会话）', async () => {
+      await store.write('s_abc')
+      // store 的 dataDir = join(dir, 'data')
+      expect((await store.readIfOwnedBy(join(dir, 'data')))?.sessionId).toBe('s_abc')
+      // 同 cwd、不同 dataDir → 不恢复
+      expect(await store.readIfOwnedBy(join(dir, 'other-data'))).toBeUndefined()
+    })
+
+    it('旧指针（无 dataDir 字段）仍返回，保持向后兼容', async () => {
+      mkdirSync(join(dir, '.harness'), { recursive: true })
+      writeFileSync(store.path(), JSON.stringify({ sessionId: 's_old', savedAt: Date.now() }))
+      // 即便 dataDir 对不上，旧指针也照常返回
+      expect((await store.readIfOwnedBy(join(dir, 'whatever')))?.sessionId).toBe('s_old')
+    })
+
+    it('写入的指针确实带 dataDir 字段', async () => {
+      await store.write('s_abc')
+      const raw = JSON.parse(readFileSync(store.path(), 'utf-8'))
+      expect(raw.dataDir).toBe(join(dir, 'data'))
+    })
+  })
+
+  describe('并发写不损坏（原子写）', () => {
+    it('多轮 Promise.all 并发 write，每轮读回都可 JSON.parse 且 sessionId 合法', async () => {
+      const ids = Array.from({ length: 12 }, (_, i) => `s_conc_${i}`)
+      for (let round = 0; round < 30; round++) {
+        await Promise.all(ids.map((id) => store.write(id)))
+        const raw = JSON.parse(readFileSync(store.path(), 'utf-8'))
+        expect(typeof raw.sessionId).toBe('string')
+        expect(ids.includes(raw.sessionId)).toBe(true)
+      }
+    })
+  })
 })

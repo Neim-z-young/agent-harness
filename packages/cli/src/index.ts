@@ -2164,7 +2164,9 @@ export class HarnessApp {
   async findResumeTarget(): Promise<
     { id: string; updatedAt: number; messageCount: number; cwd?: string; saved: SessionFile } | undefined
   > {
-    const pointer = await this.sessionPointer.read()
+    // 指针绑定了 dataDir：同 cwd 换 --data-dir 时不该把另一个 dataDir 的会话恢复出来
+    // （sessionId 形如 s_<ts>_<5位随机>，理论上可能撞号）。旧指针无 dataDir 字段 → 兼容照常返回。
+    const pointer = await this.sessionPointer.readIfOwnedBy(this.workspace.dataDir)
     if (pointer) {
       const saved = await this.sessionStore.load(pointer.sessionId)
       // 指针里的会话文件不见了（被删 / 换了 dataDir）就往下走兜底，别让启动卡在一个坏指针上

@@ -6,13 +6,30 @@
  * 仅做「定位 + 读写」，不含业务装配逻辑。
  */
 
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { existsSync, realpathSync } from 'node:fs'
+import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { Message, Session } from '@harness/session'
 import type { Workspace } from './index'
 import { SessionCompactionStore } from './compaction-store'
+
+/**
+ * 原子写：先写临时文件再 `rename` 到目标路径。
+ * tmp 必须落在**同一目录**（`${path}.${process.pid}.${Date.now()}.<rand>.tmp`）才能同文件系统
+ * rename（跨文件系统 rename 部分平台会失败/退化为拷贝）；末尾带随机串避免同毫秒同 pid 的并发
+ * 调用互相覆盖 tmp。写入失败时清理 tmp，避免留下半截 `.tmp` 污染目录。
+ */
+async function writeFileAtomic(path: string, content: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+  try {
+    await writeFile(tmp, content)
+    await rename(tmp, path)
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {})
+    throw err
+  }
+}
 
 /** 配置校验 / 密钥解析等一次性启动失败 */
 export class ConfigValidationError extends Error {
@@ -135,14 +152,15 @@ export const LAST_SESSION_FILE = 'last-session.json'
  */
 export async function ensureGitignoreEntry(dir: string, entry: string): Promise<void> {
   const ignoreFile = join(dir, '.gitignore')
+  // 先确保目录存在再读：目录不存在时 direct 读会出现「判断通过却写不进」的竞态
+  await mkdir(dir, { recursive: true })
   let content = ''
   if (existsSync(ignoreFile)) {
     try { content = await readFile(ignoreFile, 'utf-8') } catch { content = '' }
   }
   if (content.split('\n').some((l) => l.trim() === entry)) return
-  await mkdir(dir, { recursive: true })
   const next = content.trimEnd() ? `${content.trimEnd()}\n${entry}\n` : `${entry}\n`
-  await writeFile(ignoreFile, next)
+  await writeFileAtomic(ignoreFile, next)
 }
 
 /** `<cwd>/.harness/last-session.json` 的结构 */
@@ -151,6 +169,12 @@ export interface SessionPointerFile {
   sessionId: string
   /** 写入时刻（仅便于人工查看；判定不依赖它） */
   savedAt: number
+  /**
+   * 指针绑定的 dataDir：同 cwd 用不同 `--data-dir` 启动时，若 sessionId 恰好相同
+   * （`s_<ts>_<5位随机>`），凭此字段区分，避免恢复出另一个 dataDir 里的会话。
+   * 旧版本写入的指针无此字段，`readIfOwnedBy` 兼容返回（不做 stricter 校验）。
+   */
+  dataDir?: string
 }
 
 /**
@@ -180,7 +204,12 @@ export class SessionPointerStore {
       const raw = JSON.parse(await readFile(p, 'utf-8')) as Partial<SessionPointerFile>
       const id = typeof raw?.sessionId === 'string' ? raw.sessionId.trim() : ''
       if (!id) return undefined
-      return { sessionId: id, savedAt: typeof raw.savedAt === 'number' ? raw.savedAt : 0 }
+      const dataDir = typeof raw.dataDir === 'string' && raw.dataDir.trim() ? raw.dataDir.trim() : undefined
+      return {
+        sessionId: id,
+        savedAt: typeof raw.savedAt === 'number' ? raw.savedAt : 0,
+        ...(dataDir ? { dataDir } : {}),
+      }
     } catch {
       return undefined
     }
@@ -191,7 +220,26 @@ export class SessionPointerStore {
     const id = sessionId.trim()
     if (!id) return
     await ensureGitignoreEntry(this.workspace.project.root, LAST_SESSION_FILE)
-    await writeFile(this.path(), JSON.stringify({ sessionId: id, savedAt: Date.now() }, null, 2) + '\n')
+    await writeFileAtomic(
+      this.path(),
+      JSON.stringify({ sessionId: id, savedAt: Date.now(), dataDir: this.workspace.dataDir }, null, 2) + '\n',
+    )
+  }
+
+  /**
+   * 仅当指针属于给定 dataDir 时才返回，否则返回 undefined（视为「本 dataDir 没有可恢复会话」）。
+   * 用于「自动恢复上次会话」：避免同 cwd 换 `--data-dir` 时把另一个 dataDir 的会话恢复出来。
+   *
+   * @param dataDir 调用方当前使用的 dataDir（绝对路径，允许带符号链接差异）
+   * @returns 归属匹配的指针；指针无 `dataDir` 字段（旧版）照常返回；不匹配返回 undefined
+   */
+  async readIfOwnedBy(dataDir: string): Promise<SessionPointerFile | undefined> {
+    const pointer = await this.read()
+    if (!pointer) return undefined
+    // 旧指针（无 dataDir 字段）兼容返回，保持向后兼容
+    if (!pointer.dataDir) return pointer
+    if (normalizeDataDir(pointer.dataDir) === normalizeDataDir(dataDir)) return pointer
+    return undefined
   }
 
   /** 清除指针（会话被删等场景） */
@@ -199,6 +247,16 @@ export class SessionPointerStore {
     const p = this.path()
     if (existsSync(p)) await rm(p, { force: true })
   }
+}
+
+/**
+ * 规范化 dataDir 用于归属比较：resolve 为绝对路径并去掉尾部分隔符；
+ * macOS 上 `/tmp` 与 `/private/tmp` 这类软链差异用 `realpathSync` 兜底（失败则退回 resolve）。
+ */
+function normalizeDataDir(d: string): string {
+  let p = resolve(d)
+  try { p = realpathSync(p) } catch { /* 目录尚不存在 / 未挂载 → 退回 resolve 结果 */ }
+  return p.replace(/[/\\]$/, '')
 }
 
 /** dataDir/config.json 读写（泛型 T，幂等：文件缺失 / 解析失败均返回空对象） */
