@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync, symlinkSync, readlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveWorkspace, createWorkspaceOriginalStore } from '@harness/workspace'
@@ -90,6 +90,12 @@ describe('parseCliArgs 命令解析', () => {
     expect(parseCliArgs(['--snapshot']).snapshot).toBe(true)
     expect(parseCliArgs(['repl', '--snapshot', '-v'])).toMatchObject({ snapshot: true, verbose: true })
     expect(parseCliArgs([]).snapshot).toBeUndefined()
+  })
+
+  it('--allow-plugin-code 布尔标记（默认关闭：不传即为 undefined）', () => {
+    expect(parseCliArgs(['--allow-plugin-code']).allowPluginCode).toBe(true)
+    expect(parseCliArgs(['repl', '--allow-plugin-code']).allowPluginCode).toBe(true)
+    expect(parseCliArgs([]).allowPluginCode).toBeUndefined()
   })
 
   it('--model / -m 解析模型 ID', () => {
@@ -540,7 +546,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     `)
     const reg = new ProviderTypeRegistry()
     registerBuiltinProviderTypes(reg)
-    const result = await loadPluginDirs(reg, [pluginDir])
+    const result = await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
     expect(reg.list()).toContain('my-gw')
     const plugin = (await reg.resolve('my-gw')!.createPlugin({ id: 'gw', type: 'my-gw', baseUrl: 'http://x', apiKey: 'k' }))!
     expect(plugin.id).toBe('provider.my-gw')
@@ -558,7 +564,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
       }
     `)
     const reg = new ProviderTypeRegistry()
-    await loadPluginDirs(reg, [pluginDir])
+    await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
     expect((await reg.resolve('local-gw')?.createPlugin({ id: 'x', type: 'local-gw' }))?.id).toBe('provider.local-gw')
   })
 
@@ -573,7 +579,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
       export const plugins = [ { id: 'ext.arr', version: '1', name: 'Arr', async install() { return {} } } ]
     `)
     const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [pluginDir])
+    const result = await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
     const ids = result.plugins.map((p) => p.id).sort()
     expect(ids).toEqual(['ext.arr', 'ext.default', 'ext.named'])
   })
@@ -588,7 +594,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     writeFileSync(join(userDir, 'gen.ts'), `export default { id: 'ext.same', version: '1', name: 'user', async install(){} }`)
     writeFileSync(join(projDir, 'gen.ts'), `export default { id: 'ext.same', version: '2', name: 'proj', async install(){} }`)
     const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [userDir, projDir])
+    const result = await loadPluginDirs(reg, [userDir, projDir], undefined, { allowCode: true })
     expect((await reg.resolve('dup')!.createPlugin({ id: 'x', type: 'dup' }))!.id).toBe('provider.dup.proj')
     // 通用插件：project 覆盖 user（name=proj，且只保留一份）
     expect(result.plugins).toHaveLength(1)
@@ -601,55 +607,46 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     writeFileSync(join(pluginDir, 'bad.ts'), `export const foo = 1`)
     const warns: string[] = []
     const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [pluginDir], (s) => warns.push(s))
+    const result = await loadPluginDirs(reg, [pluginDir], (s) => warns.push(s), { allowCode: true })
     expect(warns.some((w) => w.includes('已忽略'))).toBe(true)
     expect(result.plugins).toEqual([])
   })
 
-  it('loadPluginDirs：插件目录在 harness 安装位置之外时先补解析锚点再导入（裸导入 @harness/*）', async () => {
-    // 临时目录（/tmp 下）上溯没有 node_modules —— 正是「工作目录不在仓库内」的形态：
-    // 不预置锚点就直接 import 会抛 Cannot find module '@harness/tool'，整个插件文件被忽略。
-    const pluginDir = join(dir, 'outside', 'plugins')
+  it('loadPluginDirs：默认不加载插件代码（防代码注入），且绝不补 node_modules 软链', async () => {
+    // 插件目录里的 .ts 是可执行代码：克隆来的仓库只要带一个 .harness/plugins/*.ts，
+    // 在该目录跑一次 harness 就会被 import 执行 —— 默认必须挡住。
+    const pluginDir = join(dir, 'injected', 'plugins')
     mkdirSync(pluginDir, { recursive: true })
     writeFileSync(join(pluginDir, 'mcp.ts'), `
       import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
       export const plugins = [
-        { id: 'ext.outside', version: '1', name: READONLY_TOOLS_SENTINEL, async install() { return {} } },
+        { id: 'ext.injected', version: '1', name: READONLY_TOOLS_SENTINEL, async install() { return {} } },
       ]
     `)
     const logs: string[] = []
     const reg = new ProviderTypeRegistry()
     const result = await loadPluginDirs(reg, [pluginDir], (s) => logs.push(s))
-    expect(result.plugins.map((p) => p.id)).toEqual(['ext.outside'])
-    expect(result.plugins[0].name).toBe('@readonly')
-    expect(logs.some((l) => l.includes('插件加载失败'))).toBe(false)
-    expect(logs.some((l) => l.includes('已补解析锚点'))).toBe(true)
-    // 锚点：node_modules 软链 + .gitignore 条目（避免软链被收进用户仓库）
-    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(true)
-    expect(readFileSync(join(pluginDir, '.gitignore'), 'utf-8')).toContain('node_modules')
+    expect(result.plugins).toEqual([])
+    const text = logs.join('')
+    expect(text).toContain('已跳过')
+    expect(text).toContain('防止代码注入')
+    // 绝不为插件目录创建任何 node_modules 软链 / .gitignore（不允许软链关联 harness 内核文件）
+    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(false)
+    expect(existsSync(join(pluginDir, '.gitignore'))).toBe(false)
   })
 
-  it('loadPluginDirs：已有锚点覆盖不到缺失依赖时改指向（旧锚点自愈）', async () => {
-    const pluginDir = join(dir, 'stale-anchor', 'plugins')
+  it('loadPluginDirs：allowCode: true 时才真正加载插件代码', async () => {
+    const pluginDir = join(dir, 'optin', 'plugins')
     mkdirSync(pluginDir, { recursive: true })
     writeFileSync(join(pluginDir, 'mcp.ts'), `
-      import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
-      export const plugins = [
-        { id: 'ext.stale', version: '1', name: READONLY_TOOLS_SENTINEL, async install() { return {} } },
-      ]
+      export const plugins = [{ id: 'ext.optin', version: '1', name: 'OptIn', async install() { return {} } }]
     `)
-    // 旧版本可能留下的锚点：存在但不含 @harness
-    mkdirSync(join(dir, 'stale-anchor', 'empty-nm'), { recursive: true })
-    symlinkSync(join(dir, 'stale-anchor', 'empty-nm'), join(pluginDir, 'node_modules'), 'dir')
-    const logs: string[] = []
-    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s))
-    expect(result.plugins.map((p) => p.id)).toEqual(['ext.stale'])
-    expect(logs.some((l) => l.includes('已更新插件解析锚点'))).toBe(true)
-    // 锚点已改指向含 @harness 的 node_modules
-    expect(existsSync(join(readlinkSync(join(pluginDir, 'node_modules')), '@harness'))).toBe(true)
+    const reg = new ProviderTypeRegistry()
+    const result = await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
+    expect(result.plugins.map((p) => p.id)).toEqual(['ext.optin'])
   })
 
-  it('loadPluginDirs：相对路径导入失败不补锚点，仍按原样告警（预检只针对裸依赖）', async () => {
+  it('loadPluginDirs：相对路径导入失败按原样告警（不再有补锚点逻辑）', async () => {
     const pluginDir = join(dir, 'relative-plugins')
     mkdirSync(pluginDir, { recursive: true })
     // 用上导入的绑定，避免被 Bun 当死代码消除而根本不解析
@@ -658,7 +655,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
       export const plugins = [{ id: 'ext.bad', version: '1', name: String(x), async install() { return {} } }]
     `)
     const logs: string[] = []
-    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s))
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s), { allowCode: true })
     expect(result.plugins).toEqual([])
     expect(logs.some((l) => l.includes('插件加载失败'))).toBe(true)
     expect(existsSync(join(pluginDir, 'node_modules'))).toBe(false)
@@ -672,7 +669,7 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
       export const plugins = [{ id: 'ext.bad2', version: '1', name: String(y), async install() { return {} } }]
     `)
     const logs: string[] = []
-    await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s))
+    await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s), { allowCode: true })
     const text = logs.join('')
     expect(text).toContain('插件加载失败')
     expect(text).toContain('config.json → "plugins"')
@@ -1261,6 +1258,8 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
       cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
       permissionMode: 'allow-all', stdout,
       mockProviderConfig: { defaultResponse: 'hi' },
+      // 默认不加载插件代码（防注入），本用例就是要验证插件目录生效，故显式开闸
+      allowPluginCode: true,
     })
     await app.boot()
     expect(app.listProviders()).toContain('mock')           // 默认 provider

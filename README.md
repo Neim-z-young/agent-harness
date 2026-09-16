@@ -130,6 +130,8 @@ bun run typecheck           # 全部类型检查
 | `agents` | AgentOverride[] | 按 id 覆盖 Agent 的工具白名单 / MCP server 白名单 |
 | `mcpServers` | McpServerEntry[] | 托管的外部 MCP server（支持运行时 `/mcp` 启停，写回本字段） |
 | `plugins` | string[] | 声明式启用**内置插件**（如 `["code-intel","subagent","coordinator"]`），依赖按 `dependsOn` 自动补齐；**无需写 `.harness/plugins/*.ts`** |
+| `allowPluginCode` | boolean | 是否**执行** `.harness/plugins/*.ts\|js\|mjs` 的插件代码（默认 **false**，防代码注入）。开闸后也不会补任何 `node_modules` 软链 |
+| `allowPluginCode` | boolean | 是否加载 `.harness/plugins/*.ts` 里的**插件代码**（默认 **false**，防代码注入）。绝大多数场景用上面那行即可，不需要开 |
 | `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
 | `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
 
@@ -159,9 +161,12 @@ bun run typecheck           # 全部类型检查
   以「仅元信息」现身——避免把「没装」误读成「可用」。
 - 声明式装配的实例**一律无参**：子 Agent 定义以 AgentRuntime 注册表（md frontmatter）为准，
   `coordinator` 的 `forceAsync` 走环境变量 `HARNESS_FORCE_ASYNC`。需要带参装配（自定义 `subagents` 数组等）
-  请改用外部插件目录 `.harness/plugins/*.ts`（见 `.harness/plugins/README.md`）。
+  请改用外部插件目录 `.harness/plugins/*.ts`，并同时开 `allowPluginCode`（见 `.harness/plugins/README.md`）。
 - 未登记的 id 只告警不阻断启动；`harness config check` 会报为配置错误。
 - 与外部插件目录（`.harness/plugins`）**按 id 去重**，外部插件优先，两者可并存。
+- **安全**：外部插件目录里的 `.ts/.js/.mjs` 默认**不执行**（只登记并提示），需 `allowPluginCode: true`
+  或 `--allow-plugin-code` 才加载 —— 否则克隆一个带 `.harness/plugins` 的仓库、在该目录跑一次
+  harness 就会执行他人代码。开闸后也**不会**为插件目录创建指向 harness 内核的 `node_modules` 软链。
 
 ### providers 数组
 

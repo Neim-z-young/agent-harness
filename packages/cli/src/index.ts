@@ -63,7 +63,6 @@ import {
   MultiDirLoader,
   normalizeDirs,
   createWorkspaceOriginalStore,
-  ensureGitignoreEntry,
   type Workspace,
   type SessionFile,
 } from '@harness/workspace'
@@ -90,9 +89,9 @@ import type { ToolContext, Tool } from '@harness/tool'
 
 import { dirname, join, resolve } from 'node:path'
 import { existsSync } from 'node:fs'
-import { readFile, writeFile, mkdir, unlink, symlink, readlink } from 'node:fs/promises'
+import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 
 // ========================================================================
 // 1. 参数解析
@@ -133,6 +132,8 @@ export interface CliArgs {
   /** 仅校验 config.json 配置并打印概览后退出 */
   checkConfig?: boolean
   showHelp?: boolean
+  /** 允许加载外部插件目录里的代码（默认 false，防代码注入；等价于 config.json 的 allowPluginCode） */
+  allowPluginCode?: boolean
 }
 
 /**
@@ -177,6 +178,8 @@ export function parseCliArgs(raw: string[]): CliArgs {
     if (a === '--snapshot') { out.snapshot = true; continue }
     if (a === '--tui') { out.tui = true; continue }
     if (a === '--no-resume') { out.noResume = true; continue }
+    // 代码注入防护：默认不加载外部插件代码，需显式开闸
+    if (a === '--allow-plugin-code') { out.allowPluginCode = true; continue }
     if (a === '--check-config') { out.checkConfig = true; continue }
     const [k, v] = a.startsWith('--')
       ? a.slice(2).split('=', 2) as [string, string | undefined]
@@ -268,9 +271,20 @@ export interface HarnessConfig {
    *
    * 这里的插件实例一律用**无参工厂**创建：需要的配置从别处来（子 Agent 定义取 AgentRuntime
    * 注册表、coordinator 的 forceAsync 走 HARNESS_FORCE_ASYNC 环境变量）；要带参装配
-   * （如自定义 subagents 数组）请改用外部插件目录 `.harness/plugins/*.ts`。
+   * （如自定义 subagents 数组）请改用外部插件目录 `.harness/plugins/*.ts` + 下方 `allowPluginCode`。
    */
   plugins?: string[]
+  /**
+   * 是否允许加载**外部插件目录里的代码**（`.harness/plugins/*.ts|js|mjs`，默认 **false**）。
+   *
+   * 为什么默认关：那些文件是可执行代码。若无条件 `import()`，克隆一个带 `.harness/plugins`
+   * 的仓库、在该目录里跑一次 harness 就会执行他人代码（代码注入）。声明式 `plugins` 数组已能
+   * 覆盖内置能力，绝大多数场景不需要开这个闸。
+   *
+   * 注意：开闸后**不会**为插件目录补任何 node_modules 软链（那等于把 harness 内核依赖树暴露
+   * 给工作目录下的任意文件），插件需放在能解析到其依赖的位置。
+   */
+  allowPluginCode?: boolean
   /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
   snapshot?: boolean
   /**
@@ -1001,25 +1015,44 @@ function registerProviderTypeFactory(
  *   2. Provider 类型工厂（扩展 config.type）：providerTypeFactory 或 providerType + createProviderPlugin
  * 通用插件汇总返回；Provider 类型工厂按 type 注册进 registry（供 config.type 动态解析）。
  *
- * 跨目录解析：插件文件里的裸导入（`@harness/*` 等）按 node 规则从**插件文件所在目录**逐级
- * 上溯找 node_modules；而 `<cwd>/.harness/plugins` 往往不在任何 node_modules 的下游（工作目录
- * 在仓库/安装位置之外时），直接 `import()` 会抛 `Cannot find module` 并让整个插件文件被忽略——
- * 表现为「插件静默没生效」。这里在导入前探测并补解析锚点，见 importPluginModule。
+ * ## 安全：插件代码默认不加载
+ * 插件目录里的 `.ts/.js/.mjs` 是**可执行代码**。若无条件 `import()`，那么克隆一个带
+ * `.harness/plugins/*.ts` 的仓库、在该目录里跑一次 harness 就会执行他人代码（代码注入）。
+ * 故默认**只扫描不加载**：`opts.allowCode` 为 false 时仅告警并返回空。真正需要扩展能力时二选一：
+ *   1. **声明式启用内置插件**（推荐，零代码）：`config.json → "plugins": ["code-intel"]`；
+ *   2. **显式开闸**：`config.json → "allowPluginCode": true` 或启动参数 `--allow-plugin-code`。
+ *
+ * ## 安全：不为插件目录补任何 node_modules 软链
+ * 曾实现过「裸依赖解析不到就软链到 harness 内核的 node_modules」，已移除：那等于把 harness
+ * 内核的整棵依赖树暴露给工作目录下的任意文件（且软链会被写进用户仓库、被提交、还可能悬空）。
+ * 裸依赖解析不到就是解析不到——自定义插件应放在能解析到其依赖的位置。
  */
 export async function loadPluginDirs(
   registry: ProviderTypeRegistry,
   dirs: Array<string | { dir: string; source?: 'user' | 'project' }>,
   log?: (s: string) => void,
+  opts: { allowCode?: boolean } = {},
 ): Promise<PluginLoadResult> {
   const out = log ?? ((s: string) => { if (typeof process !== 'undefined') process.stderr.write(s + '\n') })
   // 枚举交给通用多级目录加载器（workspace 收敛「scan + 来源标注」），来源顺序 user → project
   const items = new MultiDirLoader(normalizeDirs(dirs)).scan({ name: (n) => /\.(ts|js|mjs)$/.test(n) })
+  // 默认闸门：代码注入防护 —— 只登记文件、不执行
+  if (!opts.allowCode) {
+    if (items.length) {
+      out(`已跳过 ${items.length} 个插件代码文件（默认不加载外部插件代码，防止代码注入）：\n`)
+      for (const it of items.slice(0, 5)) out(`  - ${it.full}\n`)
+      if (items.length > 5) out(`  …… 其余 ${items.length - 5} 个\n`)
+      out('  启用内置能力请改用 config.json → "plugins": ["code-intel"]（零代码，推荐）；\n')
+      out('  确需加载自定义插件代码时，设置 config.json → "allowPluginCode": true 或启动参数 --allow-plugin-code。\n')
+    }
+    return { plugins: [] }
+  }
   // 通用插件按 id 去重：后加载覆盖先加载（project 覆盖 user，扫描顺序即覆盖顺序）
   const byId = new Map<string, AgentPlugin>()
   for (const item of items) {
     const full = item.full
     try {
-      const mod = await importPluginModule(full, out)
+      const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
       // 1) 通用 AgentPlugin
       for (const p of collectAgentPlugins(mod)) byId.set(p.id, p)
       // 2) Provider 类型工厂
@@ -1028,174 +1061,11 @@ export async function loadPluginDirs(
       const msg = (err as Error)?.message ?? String(err)
       out(`插件加载失败 ${full}：${msg}\n`)
       if (/Cannot find (?:module|package)\s+["']/.test(msg)) {
-        out('  （该插件目录无法解析裸依赖：若只是要启用内置能力，改用 config.json → "plugins": ["code-intel"] 即可，无需插件文件）\n')
+        out('  （该插件目录无法解析裸依赖：请把它放在能解析到依赖的位置；或改用 config.json → "plugins" 声明式启用内置能力）\n')
       }
     }
   }
   return { plugins: [...byId.values()] }
-}
-
-// ------------------------------------------------------------------------
-// 2.2.0 外部插件跨目录解析 —— 插件目录不在 harness 安装位置内时补 node_modules 锚点
-// ------------------------------------------------------------------------
-
-/**
- * 从插件源码里抽出**裸导入**的包名（相对/绝对路径、`node:` 等协议前缀忽略）。
- * 只服务于「首次 import 前是否需要补解析锚点」的判断，故用宽松正则即可：
- * 误报（注释/字符串里长得像导入）只会多建一个无害的软链，而漏报才会退回静默失败。
- */
-function bareImportSpecifiers(code: string): string[] {
-  const out = new Set<string>()
-  const re = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)['"]([^'"\n]+)['"]/g
-  let m: RegExpExecArray | null
-  while ((m = re.exec(code))) {
-    const spec = m[1]!.trim()
-    if (!spec) continue
-    if (spec.startsWith('.') || spec.startsWith('/') || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(spec)) continue
-    out.add(spec)
-  }
-  return [...out]
-}
-
-/** 裸包名 → 包根名（`@scope/pkg/sub` → `@scope/pkg`；`pkg/sub` → `pkg`） */
-function packageRootOf(spec: string): string {
-  const seg = spec.split('/')
-  return spec.startsWith('@') ? seg.slice(0, 2).join('/') : seg[0]!
-}
-
-/**
- * 该裸包能否从 `from` 目录解析到 —— **纯文件系统判断**（按 node 的 node_modules 上溯规则查目录）。
- *
- * 这里刻意不用 `Bun.resolveSync` 探测：它对同一目录的解析失败会写进进程级解析缓存，
- * 导致随后补好锚点再 `import()` 依然报 Cannot find module（实测 A/B 对照确认）。
- * 判断偏保守——漏判只是多补一个无害锚点，误判则由 import 的真实错误与提示日志兜底。
- */
-function canResolveBarePackage(pkg: string, from: string): boolean {
-  let dir = from
-  for (;;) {
-    if (existsSync(join(dir, 'node_modules', pkg))) return true
-    const parent = dirname(dir)
-    if (parent === dir) return false
-    dir = parent
-  }
-}
-
-/** 插件源码里**无法从插件目录解析**的裸依赖（相对/绝对路径与 `node:` 等协议前缀不算） */
-async function unresolvedBareSpecifiers(full: string): Promise<string[]> {
-  let code: string
-  try { code = await readFile(full, 'utf-8') } catch { return [] }
-  const from = dirname(full)
-  return bareImportSpecifiers(code).filter((spec) => !canResolveBarePackage(packageRootOf(spec), from))
-}
-
-/**
- * harness 侧所有可用的 node_modules 候选（从本模块所在目录逐级上溯，近 → 远）。
- *
- * 起点是**本模块自己的路径**而非 cwd：无论用户从哪个目录启动 CLI，插件都应能复用同一套依赖。
- * 会依次经过 `packages/cli/node_modules`（包自身依赖）与仓库根 `node_modules`（全部 workspace 包）——
- * 两者覆盖面不同（如 `@harness/code-intel` 只在根 node_modules 里），所以要全部收集后再挑。
- */
-function harnessNodeModulesCandidates(): string[] {
-  const out: string[] = []
-  let dir = dirname(fileURLToPath(import.meta.url))
-  let nearest: string | undefined
-  for (;;) {
-    const nm = join(dir, 'node_modules')
-    if (existsSync(join(nm, '@harness'))) out.push(nm)
-    else if (!nearest && existsSync(nm)) nearest = nm
-    const parent = dirname(dir)
-    if (parent === dir) break
-    dir = parent
-  }
-  return out.length ? out : nearest ? [nearest] : []
-}
-
-/**
- * 为锚点挑目标 node_modules：优先**覆盖面最大**的候选（能解析最多缺失裸依赖），并列取最近的一个。
- * 兜底：没有任何 @harness 候选时用最近的 node_modules；都没有则 undefined。
- */
-function harnessNodeModules(missing: string[] = []): string | undefined {
-  const candidates = harnessNodeModulesCandidates()
-  if (!candidates.length) return undefined
-  const score = (nm: string) => missing.filter((s) => existsSync(join(nm, packageRootOf(s)))).length
-  let best = candidates[0]!
-  let bestScore = score(best)
-  for (const nm of candidates.slice(1)) {
-    const sc = score(nm)
-    if (sc > bestScore) { best = nm; bestScore = sc }
-  }
-  return best
-}
-
-/**
- * 给插件目录补一个 `node_modules` 软链 → harness 安装位置的 node_modules，并落 `.gitignore` 条目。
- *
- * 为什么用软链而不是模块解析钩子：Bun 的 `Bun.plugin()` 只作用于打包器，运行时 `import()`
- * 不吃其 onResolve（实测无效）；而裸导入的解析根由**被导入文件的位置**决定，无法从调用侧注入。
- * 把解析锚点放回文件自身目录，是唯一既不篡改插件源码、也不依赖非标 API 的做法。
- *
- * 软链只**追加**一个解析根，不遮蔽原有链路：锚点里没有的包仍会继续向上找到宿主项目的
- * node_modules，因此不会破坏本就依赖宿主依赖的插件。
- *
- * 已有锚点的处理：只有在它**是自己建的软链**（读得到 readlink）且覆盖不了本次缺失依赖时
- * 才改指向；用户自己的真实 node_modules 目录一律不碰。
- *
- * @param missing 本次探测到无法解析的裸依赖（用于挑覆盖面最大的目标）
- * @returns true=本次新建/更新了锚点；false=无需或无法处理（调用方保留原错误并给提示）
- */
-export async function ensurePluginResolverAnchor(
-  pluginDir: string,
-  out: (s: string) => void,
-  missing: string[] = [],
-): Promise<boolean> {
-  const target = harnessNodeModules(missing)
-  if (!target) return false
-  const link = join(pluginDir, 'node_modules')
-  const linkType = process.platform === 'win32' ? 'junction' : 'dir'
-  if (existsSync(link)) {
-    let current: string | undefined
-    try { current = await readlink(link) } catch { return false } // 真实目录（用户自带）→ 不碰
-    if (!current || current === target) return false
-    const covered = missing.every((s) => existsSync(join(current!, packageRootOf(s))))
-    if (covered) return false
-    try {
-      await unlink(link)
-      await symlink(target, link, linkType)
-      out(`已更新插件解析锚点：${link} → ${target}\n`)
-      return true
-    } catch (err) {
-      out(`更新解析锚点失败（${link}）：${(err as Error)?.message ?? String(err)}\n`)
-      return false
-    }
-  }
-  try {
-    await mkdir(pluginDir, { recursive: true })
-    await symlink(target, link, linkType)
-    await ensureGitignoreEntry(pluginDir, 'node_modules')
-    out(`插件目录不在 harness 安装位置内，已补解析锚点：${link} → ${target}\n`)
-    return true
-  } catch (err) {
-    out(`补解析锚点失败（${link}）：${(err as Error)?.message ?? String(err)}\n`)
-    return false
-  }
-}
-
-/**
- * 导入插件模块：**首次 import 之前**先确保裸依赖可解析（探测 → 补锚点 → 导入）。
- *
- * 顺序是关键：Bun 会把「解析失败」按 (导入文件, 裸包名) 缓存在进程内——同一插件文件事后
- * 重试（改 URL、加 query 都一样）仍然报 Cannot find module，所以必须赶在第一次 import 前
- * 把锚点放好。相对导入失败时不补锚点（补了也无用）。
- */
-async function importPluginModule(full: string, out: (s: string) => void): Promise<Record<string, unknown>> {
-  const missing = await unresolvedBareSpecifiers(full)
-  if (missing.length) {
-    const dir = dirname(full)
-    if (!(await ensurePluginResolverAnchor(dir, out, missing))) {
-      out(`插件 ${full} 的裸依赖无法从插件目录解析：${missing.join('、')}\n`)
-    }
-  }
-  return (await import(pathToFileURL(full).href)) as Record<string, unknown>
 }
 
 // ------------------------------------------------------------------------
@@ -1492,6 +1362,12 @@ export interface HarnessAppOptions {
   autoResume?: boolean
   /** 是否启用 boot 末尾的后台静默预加载内置插件/工具（多级加载 L2，默认 true）。设为 false 关闭。 */
   backgroundPreload?: boolean
+  /**
+   * 允许加载外部插件目录里的**代码**（默认 false）。
+   * 等价于 config.json 的 `allowPluginCode`；两者任一为真即开闸（CLI 参数优先）。
+   * 关闭时插件目录里的文件只被登记、不 import —— 防止克隆来的仓库借 `.harness/plugins` 执行代码。
+   */
+  allowPluginCode?: boolean
 }
 
 /** boot() 的会话决策结果，供 REPL/TUI 提示（「已恢复上次会话」/「为何没恢复」） */
@@ -1957,10 +1833,13 @@ export class HarnessApp {
     // 加载外部插件（user ~/.harness/plugins → project .harness/plugins，后加载覆盖先加载）：
     // 通用 AgentPlugin 汇总到 externalPlugins 参与 Hooks 生命周期；Provider 类型工厂注册进 providerTypes 供 config.type 动态解析
     // 路径统一来自解析好的 workspace（dataDir 支持 --data-dir 覆盖，非写死 $HOME）
+    // 代码注入防护：默认**不执行**插件目录里的代码（只登记告警），需 allowPluginCode 显式开闸
     const externalPlugins = await loadPluginDirs(this.providerTypes, [
       { dir: this.workspace.user.plugins, source: 'user' },
       { dir: this.workspace.project.plugins, source: 'project' },
-    ], (s) => this.options.stdout?.write?.(s + '\n'))
+    ], (s) => this.options.stdout?.write?.(s + '\n'), {
+      allowCode: this.options.allowPluginCode ?? cfg.allowPluginCode ?? false,
+    })
 
     // 显式校验 + 密钥解析（错误一次性汇总，避免静默跳过/误导）
     const cipher = new SecretCipher(this.workspace)
@@ -2275,6 +2154,8 @@ export class HarnessApp {
    * 1. **项目级指针** `<cwd>/.harness/last-session.json`（权威）。会话 id 就写在当前工作
    *    目录里，所以「哪个目录恢复哪条会话」由文件位置决定——不需要拿 cwd 字符串互相比对，
    *    符号链接 / 相对路径 / 大小写差异都不会让判定漂移，也不会跨目录串台。
+   *    指针另带 `dataDir`：同一 cwd 换 `--data-dir` 启动时，sessionId 撞号也不会把
+   *    另一个 dataDir 的会话恢复出来（旧指针无该字段 → 兼容照常返回）。
    * 2. **兜底**：全局 sessions 里 cwd 与本目录一致的最新一条。只为兼容「指针出现之前建的
    *    会话」；命中后 boot 会把它写进指针，此后一律走 1。
    *
@@ -3407,6 +3288,7 @@ teammate 选项:
   -v, --verbose            输出调试信息
       --tui                以 TUI（alt-screen 全屏）模式启动 REPL
       --snapshot           开启文件快照 + /revert 能力（默认 false；config.json 设 "snapshot": true 或 harness.snapshot 常开）
+      --allow-plugin-code  允许加载 .harness/plugins/*.ts 的插件代码（默认**关闭**，防代码注入）
       --check-config       校验 config.json 配置并打印 Provider/模型概览后退出
 
 会话（启动即恢复 · 会话内可切 Agent / 模型）:
@@ -3499,15 +3381,24 @@ export async function runTeammateCli(options: {
   return 0
 }
 
-/** 构造用于配置自检的 Provider 类型注册表（内置 + 外部 plugins 插件注册的 Provider 类型工厂） */
-export async function buildCheckRegistry(cwd: string, log: (s: string) => void): Promise<ProviderTypeRegistry> {
+/**
+ * 构造用于配置自检的 Provider 类型注册表（内置 + 外部 plugins 插件注册的 Provider 类型工厂）。
+ *
+ * `allowPluginCode` 与 boot 同一闸门：默认不加载插件代码，避免 `harness config check`
+ * 在一个克隆来的仓库里顺手执行了 `.harness/plugins/*.ts`。
+ */
+export async function buildCheckRegistry(
+  cwd: string,
+  log: (s: string) => void,
+  allowPluginCode = false,
+): Promise<ProviderTypeRegistry> {
   const registry = new ProviderTypeRegistry()
   registerBuiltinProviderTypes(registry)
   const ws = resolveWorkspace({ cwd })
   await loadPluginDirs(registry, [
     { dir: ws.user.plugins, source: 'user' },
     { dir: ws.project.plugins, source: 'project' },
-  ], log)
+  ], log, { allowCode: allowPluginCode })
   return registry
 }
 
@@ -3554,7 +3445,7 @@ export async function runConfigCommand(options: {
   }
 
   if (sub === 'check') {
-    const registry = await buildCheckRegistry(workspace.cwd, write)
+    const registry = await buildCheckRegistry(workspace.cwd, write, cfg.allowPluginCode ?? false)
     const defaultProviderId = cfg.provider ?? 'anthropic'
     const { issues } = checkProviderConfigs(providers, defaultProviderId, registry.list())
     write(buildConfigOverview(cfg, defaultProviderId) + '\n')
@@ -3623,7 +3514,7 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
   }
 
   if (args.checkConfig) {
-    const registry = await buildCheckRegistry(cwd, write)
+    const registry = await buildCheckRegistry(cwd, write, args.allowPluginCode ?? cfg.allowPluginCode ?? false)
     const { issues } = checkProviderConfigs(cfg.providers ?? [], provider, registry.list())
     write(buildConfigOverview(cfg, provider) + '\n')
     if (issues.length) {
@@ -3647,6 +3538,8 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
     // `run "<prompt>"` 是脚本化一次性执行，强制关闭 —— 否则它会悄悄接着上一个会话往下写。
     autoResume: args.command === 'run' ? false : args.noResume ? false : cfg.autoResume !== false,
     permissionMode, verbose: args.verbose, snapshot,
+    // 代码注入防护：默认不加载插件目录里的代码（CLI 参数 > config.json > 关闭）
+    allowPluginCode: args.allowPluginCode ?? cfg.allowPluginCode ?? false,
   })
   const { harness, session } = await app.boot()
 
