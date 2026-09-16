@@ -335,10 +335,8 @@ describe('formatApiKeyTag：apiKey 展示口径', () => {
     expect(formatApiKeyTag('${DEEPSEEK_KEY}')).toBe('env(DEEPSEEK_KEY)')
     expect(formatApiKeyTag('sk-TOKEN-A')).toBe('已配置')
     expect(formatApiKeyTag('sk-TOKEN-A', { fingerprint: true })).toBe('已配置(…EN-A)')
-    expect(formatApiKeyTag('sk-TOKEN-A', { reveal: true })).toBe('sk-TOKEN-A')
-    // reveal 优先于 fingerprint；加密态即便 reveal 也不回显密文
-    expect(formatApiKeyTag('sk-TOKEN-A', { fingerprint: true, reveal: true })).toBe('sk-TOKEN-A')
-    expect(formatApiKeyTag('enc:v1:abc', { reveal: true })).toBe('已加密')
+    // 加密态不回显明文、也不给指纹
+    expect(formatApiKeyTag('enc:v1:abc', { fingerprint: true })).toBe('已加密')
     // 极短 key 不做尾部截取（避免整串被回显）
     expect(formatApiKeyTag('abc', { fingerprint: true })).toBe('已配置')
   })

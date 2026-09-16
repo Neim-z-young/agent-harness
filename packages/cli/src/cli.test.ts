@@ -316,8 +316,8 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(overview).toInclude('apiKey=已配置')     // 明文被脱敏
     expect(overview).toInclude('apiKey=env(DEEPSEEK_KEY)') // 环境变量引用显式展示
     expect(overview).not.toContain('sk-plain')      // 明文不输出
-    // maskKey=false 时输出明文
-    expect(buildConfigOverview({ providers: [{ id: 'a', type: 'openai', apiKey: 'sk-x' }] }, 'a', false)).toContain('sk-x')
+    // 反向保护：buildConfigOverview 永不应回显明文 apiKey（即使传入明文 key）
+    expect(buildConfigOverview({ providers: [{ id: 'a', type: 'openai', apiKey: 'sk-x' }] }, 'a')).not.toContain('sk-x')
   })
 
   it('buildConfigOverview：展示 ACP 压缩启用/未启用与自定义提示词状态', () => {

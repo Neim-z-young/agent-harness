@@ -1136,18 +1136,16 @@ export function checkProviderConfigs(
  * - 加密态（`enc:v1:`）→ `已加密`（无法回显指纹）
  * - `${ENV}` 引用 → `env(ENV)`（引用名非机密，可直接展示）
  * - 明文：默认脱敏为 `已配置`；`fingerprint` 时附末 4 位（`已配置(…AB12)`），
- *   供「同端点同模型、仅 token 不同」的实例之间互相区分；`reveal` 时原样输出明文
- *   （仅在显式要求回显明文的路径上使用，如 `buildConfigOverview(maskKey=false)`）。
+ *   供「同端点同模型、仅 token 不同」的实例之间互相区分。
  */
 export function formatApiKeyTag(
   apiKey: string | undefined,
-  opts: { fingerprint?: boolean; reveal?: boolean } = {},
+  opts: { fingerprint?: boolean } = {},
 ): string {
   const raw = apiKey?.trim()
   if (!raw) return '（未配置）'
   if (raw.startsWith('enc:v1:')) return '已加密'
   if (/^\$\{.*\}$/.test(raw)) return `env(${raw.slice(2, -1)})`
-  if (opts.reveal) return raw
   if (!opts.fingerprint) return '已配置'
   return raw.length > 4 ? `已配置(…${raw.slice(-4)})` : '已配置'
 }
@@ -1183,8 +1181,8 @@ export function findTokenOnlyDuplicates(providers: ResolvedProviderConfig[]): Ar
   return out
 }
 
-/** 配置概览（--check-config / /config 共用），maskKey 为 true 时隐藏明文 apiKey */
-export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string, maskKey = true): string {
+/** 配置概览（--check-config / /config 共用），apiKey 默认脱敏展示 */
+export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string): string {
   const lines: string[] = []
   lines.push(`默认 provider：${cfg.provider ?? defaultProviderId}`)
   if (cfg.model) lines.push(`默认 model：${cfg.model}`)
@@ -1203,7 +1201,7 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   const providers = normalizeProviderConfigs(rawProviders).providers
   lines.push('providers：')
   for (const pc of providers) {
-    const api = formatApiKeyTag(pc.apiKey, { reveal: !maskKey })
+    const api = formatApiKeyTag(pc.apiKey)
     const isDefault = pc.id === (cfg.provider ?? defaultProviderId) ? ' ← 默认' : ''
     const path = [pc.type, pc.baseUrl ?? '（默认端点）', pc.apiPath ?? ''].filter(Boolean).join(' · ')
     lines.push(`  - ${pc.id}${isDefault}  type=${path}  model=${pc.model ?? '（Provider 默认）'}  apiKey=${api}`)
