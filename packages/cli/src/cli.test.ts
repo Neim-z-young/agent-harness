@@ -424,11 +424,11 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image', 'mcp__computer-use__list_apps', 'mcp__code-intel__code_symbols']) {
       expect(reg.has(id)).toBe(true)
     }
-    // metaOnly 插件（computer-use / code-intel）仅登记元信息，不参与后台预加载实例化
+    // optIn 插件（computer-use / code-intel）仅登记元信息，不参与后台预加载实例化
     const cuEntry = getBuiltinRegistry().get('computer-use')!
-    expect(cuEntry.metaOnly).toBe(true)
+    expect(cuEntry.optIn).toBe(true)
     const ciEntry = getBuiltinRegistry().get('code-intel')!
-    expect(ciEntry.metaOnly).toBe(true)
+    expect(ciEntry.optIn).toBe(true)
     const permByTool: Record<string, string> = {
       web_fetch: 'network', list_dir: 'read', glob: 'read', view_image: 'read',
     }
@@ -703,6 +703,34 @@ describe('内置插件声明式启用（config.json → plugins）', () => {
   it('unknownBuiltinPluginIds：只查表不加载模块', () => {
     expect(unknownBuiltinPluginIds(undefined)).toEqual([])
     expect(unknownBuiltinPluginIds(['code-intel', ' nope '])).toEqual(['nope'])
+  })
+
+  it('BuiltinPluginRegistry 登记 Agent 编排类插件 subagent / coordinator / swarm', () => {
+    for (const id of ['subagent', 'coordinator', 'swarm']) {
+      const entry = getBuiltinRegistry().get(id)!
+      expect(entry).toBeDefined()
+      expect(entry.source).toBe('builtin')
+      // optIn：登记只让它们「可声明」，不参与后台预加载 → 不会被自动装配
+      expect(entry.optIn).toBe(true)
+      // 这三个包不提供 /meta 模块：未装配时不应在 /tools 里以「仅元信息」现身（避免误导为可用）
+      expect(entry.metaSource).toBeUndefined()
+    }
+  })
+
+  it('resolveBuiltinPlugins：工厂**不传参**即可实例化（配置不写在组合根）', async () => {
+    const { plugins, unknown } = await resolveBuiltinPlugins(['subagent', 'coordinator', 'swarm'])
+    expect(unknown).toEqual([])
+    // 声明顺序即实例顺序；coordinator 的依赖 subagent 已显式声明，不重复追加
+    expect(plugins.map((p) => p.id)).toEqual(['subagent', 'coordinator', 'swarm'])
+    // 无参默认：coordinator 只认注册表里的依赖，不自带 subagents/forceAsync 等组合根参数
+    const coordinator = plugins.find((p) => p.id === 'coordinator')!
+    expect(coordinator.dependsOn).toContain('subagent')
+  })
+
+  it('resolveBuiltinPlugins：只声明 coordinator 时经 dependsOn 自动补上 subagent', async () => {
+    const { plugins, unknown } = await resolveBuiltinPlugins(['coordinator'])
+    expect(unknown).toEqual([])
+    expect(plugins.map((p) => p.id)).toEqual(['coordinator', 'subagent'])
   })
 })
 
@@ -1166,6 +1194,32 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     })
     await app.boot()
     expect(chunks.join('')).toContain('config.json → plugins 有未生效项：no-such-plugin')
+    await app.shutdown()
+  })
+
+  it('boot：optIn 内置插件未被声明时不参与后台预加载（登记 ≠ 自动装配）', async () => {
+    const stdout = { write: () => {} }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    // 不声明任何 plugins：这些插件应保持「仅登记」状态
+    writeFileSync(join(dataDir, 'config.json'), JSON.stringify({}, null, 2))
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    // 等 fire-and-forget 预加载结束（若它们会被自动装配，此时必然已经装上）
+    await new Promise((r) => setTimeout(r, 300))
+    const ids = harness.plugin.list().map((p) => p.plugin.id)
+    for (const id of ['subagent', 'coordinator', 'swarm', 'code-intel', 'computer-use', 'mcp.server-registry']) {
+      expect(ids).not.toContain(id)
+    }
+    await harness.assembleTools()
+    const tools = harness.tools.list().map((t) => t.id)
+    for (const t of ['subagent', 'send_message', 'team_create', 'task_create']) {
+      expect(tools).not.toContain(t)
+    }
     await app.shutdown()
   })
 

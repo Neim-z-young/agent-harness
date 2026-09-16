@@ -261,10 +261,14 @@ export interface HarnessConfig {
   /**
    * 内置插件启用列表（**声明式，无需写 `.harness/plugins/*.ts`**）。
    *
-   * 元素取 BuiltinPluginRegistry 的 id，例如 `["code-intel", "computer-use"]`。
-   * 依赖按插件上的 dependsOn 自动补齐（如 computer-use → mcp.server-registry），
+   * 元素取 BuiltinPluginRegistry 的 id，例如 `["code-intel", "subagent", "coordinator"]`。
+   * 依赖按插件上的 dependsOn 自动补齐（如 coordinator → subagent、computer-use → mcp.server-registry），
    * 安装顺序由 core 的拓扑排序保证（宿主先装）；未登记的 id 只告警、不阻断启动。
    * 与外部插件目录并存时按 id 去重（外部插件目录优先，便于临时替换实现）。
+   *
+   * 这里的插件实例一律用**无参工厂**创建：需要的配置从别处来（子 Agent 定义取 AgentRuntime
+   * 注册表、coordinator 的 forceAsync 走 HARNESS_FORCE_ASYNC 环境变量）；要带参装配
+   * （如自定义 subagents 数组）请改用外部插件目录 `.harness/plugins/*.ts`。
    */
   plugins?: string[]
   /** 开启文件快照 + /revert 能力（默认 false）；CLI `--snapshot` 优先覆盖此行 */
@@ -614,12 +618,17 @@ export interface BuiltinGeneralPlugin {
    */
   metaSource?: () => Promise<ToolMetaSource>
   /**
-   * 仅登记 metaSource，不参与后台预加载/运行时实例化。用于 computer-use 这类进程内 MCP server 插件：
-   * 其工具经 mcp-client 连接后才可用，CLI 只预登记元信息（/tools 可展示），不自动 register server。
-   * 注意：`metaOnly` 只挡「自动预加载」这一条路，仍可经 config.json → `plugins` 声明式启用，
-   * 或由外部插件目录（.harness/plugins）显式装配。
+   * **登记但默认不装配**：不参与 boot 末尾的后台预加载（scheduleBuiltinPreload），
+   * 因而不会被自动安装——需经 `config.json → plugins` 声明式启用，或由外部插件目录
+   * （.harness/plugins）显式装配。
+   *
+   * 两种典型用法：
+   *  1. 进程内 MCP server 类插件（computer-use / code-intel）：工具要靠 mcp-client 连上才可用，
+   *     故只预登记 metaSource 供 /tools 展示，不自动拉起 MCP 通道；
+   *  2. 可选能力插件（subagent / coordinator / swarm）：默认不给所有 Agent 注入额外工具与编排 Hook，
+   *     由用户按需声明（这类插件通常不提供 metaSource）。
    */
-  metaOnly?: boolean
+  optIn?: boolean
 }
 
 /** 内置通用插件注册表：`内置插件也要支持加载`的统一入口（与外部插件目录 loadPluginDirs 并列） */
@@ -709,7 +718,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       metaSource: lazyToolMetaSource('@harness/tools-media/meta'),
     })
     // code-intel：进程内 MCP server（mcp__code-intel__*），工具经 mcp-client 连接后才可用。
-    // 仅携带 metaSource（/tools 可提前展示），metaOnly=true 使其不被后台预加载实例化——
+    // 仅携带 metaSource（/tools 可提前展示），optIn=true 使其不被后台预加载实例化——
     // 启用方式二选一（都无需改动 CLI/core）：config.json → plugins: ["code-intel"]，或
     // 外部插件目录 .harness/plugins 里显式装配 createMcpServerRegistryPlugin + createCodeIntelPlugin。
     defaultBuiltinRegistry.register({
@@ -717,31 +726,66 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       name: 'Code Intel',
       description: '代码情报 MCP server 插件（mcp__code-intel__*）',
       source: 'builtin',
-      metaOnly: true,
+      optIn: true,
       load: async () => (await lazyImport<{ createCodeIntelPlugin: () => AgentPlugin }>('@harness/code-intel')).createCodeIntelPlugin(),
       metaSource: lazyToolMetaSource('@harness/code-intel/meta'),
     })
     // computer-use：进程内 MCP server，工具经 mcp-client 连接后才可用。仅携带 metaSource
-    // （/tools 可提前展示 mcp__computer-use__* 元信息），metaOnly=true 使其不被后台预加载实例化。
+    // （/tools 可提前展示 mcp__computer-use__* 元信息），optIn=true 使其不被后台预加载实例化。
     defaultBuiltinRegistry.register({
       id: 'computer-use',
       name: 'Computer Use',
       description: '电脑控制 MCP server 插件（mcp__computer-use__*）',
       source: 'builtin',
-      metaOnly: true,
+      optIn: true,
       load: async () => (await lazyImport<{ createComputerUsePlugin: () => AgentPlugin }>('@harness/computer-use')).createComputerUsePlugin(),
       metaSource: lazyToolMetaSource('@harness/computer-use/meta'),
     })
     // mcp.server-registry：computer-use / code-intel 这类「进程内 MCP server 插件」的宿主
-    // （自身不提供工具，故无 metaSource）。默认不自动装配——不给用不到的能力拉起 MCP 通道；
-    // 由 config.json → plugins 声明式启用时经依赖闭包自动补上（见 resolveBuiltinPlugins），
-    // 也可被外部插件目录显式装配（.harness/plugins/mcp.ts）。
+    // （自身不提供工具，故无 metaSource）。optIn=true → 默认不自动装配：不给用不到的能力拉起
+    // MCP 通道；**必须在 harness.start 之前**装好，否则 applyMcpServers 的 mcp.configure
+    // 注入与 start 时的连接都会落空（这正是它不能靠「后台预加载」补装的原因）。
+    // 由 config.json → plugins 声明式启用（依赖闭包也会自动补上），或外部插件目录显式装配。
     defaultBuiltinRegistry.register({
       id: 'mcp.server-registry',
       name: 'MCP Server Registry',
       description: 'MCP Server 注册表（连接进程内/外部 MCP server 并暴露其工具，提供 /mcp 命令）',
       source: 'builtin',
+      optIn: true,
       load: async () => (await lazyImport<{ createMcpServerRegistryPlugin: () => AgentPlugin }>('@harness/mcp-server-registry')).createMcpServerRegistryPlugin(),
+    })
+    // ── Agent 编排类插件（subagent / coordinator / swarm）──
+    // 与 tools-* 的区别是 **optIn**：登记只让它们「可声明」（config.json → plugins 校验/补全、
+    // /plugins 可见），不自动装配——不给用不到的会话注入 subagent 工具与编排 Hook。
+    //
+    // **工厂一律不传参**：这些能力的「配置」本就不该写在组合根——
+    //   · 子 Agent 定义以 AgentRuntime 注册表为准（md frontmatter 定义），插件里的
+    //     `subagents` 数组只是「本插件自注册」的兜底，写死会与注册表形成两个口径；
+    //   · coordinator 的 forceAsync 走环境变量 HARNESS_FORCE_ASYNC，其余选项取默认。
+    // 需要带参的装配用外部插件目录（.harness/plugins/*.ts）。
+    defaultBuiltinRegistry.register({
+      id: 'subagent',
+      name: 'Subagent',
+      description: '子 Agent 派工：subagent 工具 + /subagents 命令（目标取 AgentRuntime 注册表）',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createSubagentPlugin: () => AgentPlugin }>('@harness/subagent')).createSubagentPlugin(),
+    })
+    defaultBuiltinRegistry.register({
+      id: 'coordinator',
+      name: 'Coordinator',
+      description: '主 Agent 编排：四阶段派工 + barrier 自动续轮 + send_message（依赖 subagent，自动补齐）',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createCoordinatorPlugin: () => AgentPlugin }>('@harness/coordinator')).createCoordinatorPlugin(),
+    })
+    defaultBuiltinRegistry.register({
+      id: 'swarm',
+      name: 'Swarm',
+      description: '长期在线团队协作：Team / Mailbox / Task List 工具（leader 侧；teammate 由 `harness teammate` 启动）',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createSwarmPlugin: () => AgentPlugin }>('@harness/swarm')).createSwarmPlugin(),
     })
   }
   return defaultBuiltinRegistry
@@ -2410,9 +2454,10 @@ export class HarnessApp {
     const items = getBuiltinRegistry().list()
     if (!items.length || !harness) return
     void (async () => {
-      // metaOnly 插件（如 computer-use）仅预登记元信息（preloadBuiltinToolMetas 处理），
-      // 不在此实例化，避免自动 register MCP server。
-      const loadable = items.filter((p) => !p.metaOnly)
+      // optIn 插件（computer-use / code-intel / subagent / coordinator / swarm）只「登记」，
+      // 不在此实例化：要么其工具需 mcp-client 连上才可用，要么是不该默认注入的可选能力。
+      // 它们的启用路径是 config.json → plugins 声明式启用，或外部插件目录显式装配。
+      const loadable = items.filter((p) => !p.optIn)
       const results = await Promise.allSettled(loadable.map((p) => p.load()))
       const installedIds = new Set(harness.plugin.list().map((lp) => lp.plugin.id))
       const toInstall: AgentPlugin[] = []

@@ -129,7 +129,7 @@ bun run typecheck           # 全部类型检查
 | `providers` | ProviderConfig[] | 自定义 Provider 定义（见下） |
 | `agents` | AgentOverride[] | 按 id 覆盖 Agent 的工具白名单 / MCP server 白名单 |
 | `mcpServers` | McpServerEntry[] | 托管的外部 MCP server（支持运行时 `/mcp` 启停，写回本字段） |
-| `plugins` | string[] | 声明式启用**内置插件**（如 `["code-intel","computer-use"]`），依赖按 `dependsOn` 自动补齐；**无需写 `.harness/plugins/*.ts`** |
+| `plugins` | string[] | 声明式启用**内置插件**（如 `["code-intel","subagent","coordinator"]`），依赖按 `dependsOn` 自动补齐；**无需写 `.harness/plugins/*.ts`** |
 | `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
 | `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
 
@@ -139,12 +139,27 @@ bun run typecheck           # 全部类型检查
 
 ```json
 {
-  "plugins": ["code-intel", "computer-use"]
+  "plugins": ["code-intel", "computer-use", "subagent", "coordinator"]
 }
 ```
 
-- 已登记的内置插件 id：`mcp.server-registry`（MCP Server 注册表，进程内/外部 MCP server 的宿主）、`code-intel`、`computer-use`。
-- 后两者依赖 `mcp.server-registry`，**不必显式写出**；外部 MCP server 也可零代码启用：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`。
+- 已登记的内置插件 id：
+
+  | id | 能力 | 依赖 |
+  | --- | --- | --- |
+  | `mcp.server-registry` | MCP Server 注册表（进程内/外部 MCP server 的宿主）+ `/mcp` 命令 | — |
+  | `code-intel` | 代码情报 MCP server（`mcp__code-intel__*`） | `mcp.server-registry` |
+  | `computer-use` | 电脑控制 MCP server（`mcp__computer-use__*`） | `mcp.server-registry` |
+  | `subagent` | 子 Agent 派工：`subagent` 工具 + `/subagents` 命令 | — |
+  | `coordinator` | 主 Agent 编排：四阶段派工 + barrier 续轮 + `send_message` | `subagent` |
+  | `swarm` | 长期在线团队协作：Team / Mailbox / Task List 工具 | — |
+
+- 依赖**不必显式写出**；外部 MCP server 也可零代码启用：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`。
+- **这些插件一律「登记但不自动装配」**（`optIn`）：不写进 `plugins` 就不会被装上，也不会在 `/tools` 里
+  以「仅元信息」现身——避免把「没装」误读成「可用」。
+- 声明式装配的实例**一律无参**：子 Agent 定义以 AgentRuntime 注册表（md frontmatter）为准，
+  `coordinator` 的 `forceAsync` 走环境变量 `HARNESS_FORCE_ASYNC`。需要带参装配（自定义 `subagents` 数组等）
+  请改用外部插件目录 `.harness/plugins/*.ts`（见 `.harness/plugins/README.md`）。
 - 未登记的 id 只告警不阻断启动；`harness config check` 会报为配置错误。
 - 与外部插件目录（`.harness/plugins`）**按 id 去重**，外部插件优先，两者可并存。
 

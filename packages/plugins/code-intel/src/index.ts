@@ -45,7 +45,7 @@ export const CODE_INTEL_SERVER_NAME = 'code-intel'
  * 代码情报插件（进程内 MCP server，装配方式对齐 computer-use：纯 MCP、可插拔）
  *
  * 通过 `.harness/plugins`（或 user `~/.harness/plugins`）外部插件目录显式装配，
- * CLI 不做硬编码依赖（code-intel 在 BuiltinPluginRegistry 登记为 metaOnly，仅预登记元信息、
+ * CLI 不做硬编码依赖（code-intel 在 BuiltinPluginRegistry 登记为 optIn，仅预登记元信息、
  * 不自动实例化）。装配后：
  *
  * - `install` 钩子内注册进程内 MCP server（registerMcpServer，同名覆盖、幂等）；

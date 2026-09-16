@@ -8,13 +8,14 @@
 
 | 方式       | 装配位置                                           | 说明                                           | 启停                                                               |
 | -------- | ---------------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------- |
-| **声明式启用** | `config.json` 的 `plugins` 数组（内置插件 id）          | **零代码**：自动补齐依赖（如 `mcp.server-registry`）      | 改配置即生效（重启后）                                                      |
-| **代码注册** | `.harness/plugins/mcp.ts`（`registerMcpServer`） | 进程内/自定义 transport（computer-use、code-intel 等） | 随插件装卸（`/plugins enable\|disable`）；或 `/mcp enable\|disable` 会话内启停 |
+| **声明式启用** | `config.json` 的 `plugins` 数组（内置插件 id）          | **零代码**（推荐）：自动补齐依赖（如 `mcp.server-registry`）    | 改配置即生效（重启后）                                                      |
+| **代码注册** | `.harness/plugins/<name>.ts`（`registerMcpServer`） | 需带参/自定义的进程内 transport                        | 随插件装卸（`/plugins enable\|disable`）；或 `/mcp enable\|disable` 会话内启停 |
 | **配置托管** | `config.json` 的 `mcpServers` 数组                | 外部 stdio / http / sse server                 | `/mcp enable\|disable` 即时启停（持久化）                                 |
 
 - 所有 server 统一由 `@harness/mcp-server-registry` 插件在 `harness.start` 时连接，复用 `@harness/mcp-client` 管理连接，工具经 `tool.pool.assemble` 暴露为 `mcp__<server>__<tool>`。
 
-- 插件化约束：core/CLI 不硬编码任何 MCP server；删除 `.harness/plugins/mcp.ts` 即停用所有进程内 MCP server 能力（改用下面的 `plugins` 声明式启用亦可）。
+- 插件化约束：core/CLI 不硬编码任何 MCP server；本仓库的 `.harness/plugins/` 已不带 MCP 插件文件，进程内
+  MCP server 能力改由下面的 `plugins` 声明式启用（`.harness/plugins/README.md` 记录了两条路径的取舍）。
 
 ## 2. 零代码启用内置插件（config.json → plugins）
 
@@ -27,9 +28,11 @@
 ```
 
 - **依赖自动补齐**：`code-intel` / `computer-use` 都依赖 `mcp.server-registry`（进程内 MCP server 的宿主），解析时按插件声明的 `dependsOn` 递归补上，安装顺序由 core 拓扑排序保证（宿主先装）。
-- **工具开箱即用**：boot 末尾的后台预加载会装配工具池，`/tools` 里这些工具直接是「已加载」，不再停留在「仅元信息·源自mcp」。
+- **登记 ≠ 自动装配**：这些插件在注册表里标了 `optIn`，不写进 `plugins` 就不会被后台预加载装上，也不会在 `/tools` 里以「仅元信息」现身（避免把「没装」误读成「可用」）。`mcp.server-registry` 必须在 `harness.start` **之前**装好，否则 `mcp.configure` 注入与连接都会落空——这正是它不能靠后台预加载补装的原因。
+- **工具开箱即用**：声明后 boot 末尾的后台预加载会装配工具池，`/tools` 里这些工具直接是「已加载」，不再停留在「仅元信息·源自mcp」。
 - **失败不阻断**：未登记的 id 只告警并跳过；`harness config check` 会把未登记项报成配置错误。
-- **与外部插件目录按 id 去重**（外部插件目录优先），因此 `.harness/plugins/mcp.ts` 与 `plugins` 声明可并存，也可删掉前者。
+- **声明式实例一律无参**：需要带参装配（自定义 `subagents`、`forceAsync: true` 等）请用外部插件目录 `.harness/plugins/*.ts`。
+- **与外部插件目录按 id 去重**（外部插件目录优先），因此插件文件与 `plugins` 声明可并存，也可只留后者。
 
 当前已登记的内置插件 id：
 
@@ -38,8 +41,11 @@
 | `mcp.server-registry` | MCP Server 注册表（连接进程内/外部 MCP server，提供 `/mcp` 命令） |
 | `code-intel`          | 代码情报 MCP server（`mcp__code-intel__*`）           |
 | `computer-use`        | 电脑控制 MCP server（`mcp__computer-use__*`）         |
+| `subagent`            | 子 Agent 派工：`subagent` 工具 + `/subagents` 命令        |
+| `coordinator`         | 主 Agent 编排（依赖 `subagent`）                       |
+| `swarm`               | 长期在线团队协作：Team / Mailbox / Task List 工具           |
 
-> **外部 MCP server 同样可零代码启用**：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`，无需再手写 `.harness/plugins/mcp.ts`。
+> **外部 MCP server 同样可零代码启用**：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`，无需再手写插件文件。
 
 ### 2.1 插件目录可位于任意工作目录
 
