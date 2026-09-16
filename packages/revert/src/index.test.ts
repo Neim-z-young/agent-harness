@@ -9,7 +9,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
-import type { Session, SessionManager, SessionView } from '@harness/session'
+import type { CompactionBlock, Session, SessionManager, SessionView } from '@harness/session'
 import { buildView } from '@harness/session'
 import { createBus } from '@harness/bus'
 import { createSnapshotService } from '@harness/snapshot'
@@ -73,6 +73,15 @@ class FakeSessionManager implements SessionManager {
   async setMessages(sessionId: string, messages: Session['messages']): Promise<void> {
     const session = this.sessions.get(sessionId)
     if (session) session.messages = messages
+  }
+  async setBlocks(sessionId: string, blocks: CompactionBlock[]): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session || blocks.length === 0) return
+    const map = new Map<string, CompactionBlock>((session.blocks ?? []).map((b) => [b.id, b]))
+    const now = Date.now()
+    for (const b of blocks) map.set(b.id, { ...b, at: now })
+    session.blocks = [...map.values()]
+    session.updatedAt = now
   }
   async updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void> {
     const session = this.sessions.get(sessionId)
