@@ -511,8 +511,11 @@ export class ToolRegistry {
    *
    * 规则：
    * - whitelist = ['*'] → 全部放行
-   * - whitelist 含 {@link READONLY_TOOLS_SENTINEL} → 该位展开为全部只读工具
-   *   （可与普通 id 混写，展开处保持注册顺序）
+   * - 优先直选：若注册表里存在该 id（含名为 {@link READONLY_TOOLS_SENTINEL} 的普通工具），
+   *   则直接返回该工具（优先于哨兵语义）—— 这样同名工具可被直选，不占用哨兵命名空间。
+   * - whitelist 含 {@link READONLY_TOOLS_SENTINEL} 且没有同名工具时 → 该位展开为全部只读工具
+   *   （可与普通 id 混写，展开处保持注册顺序）。
+   *   注意：哨兵在**查询期**动态展开——同一份白名单在 MCP 只读工具晚注册的前后两次调用结果可能不同。
    * - 否则：只保留 ID 在列表里的工具，并同时匹配 alias
    */
   filterByWhitelist(whitelist: string[] | ['*']): Tool[] {
@@ -524,11 +527,14 @@ export class ToolRegistry {
       if (t && !result.includes(t)) result.push(t)
     }
     for (const id of whitelist as string[]) {
-      if (id === READONLY_TOOLS_SENTINEL) {
-        for (const t of this.listReadOnly()) push(t)
+      const direct = this.get(id)
+      if (direct) {
+        push(direct)
         continue
       }
-      push(this.get(id))
+      if (id === READONLY_TOOLS_SENTINEL) {
+        for (const t of this.listReadOnly()) push(t)
+      }
     }
     return result
   }

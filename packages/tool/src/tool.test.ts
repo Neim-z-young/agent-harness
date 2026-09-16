@@ -333,6 +333,45 @@ describe('@harness/tool', () => {
         expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL])).toHaveLength(1)
         expect(reg.filterByWhitelist(['*'])).toHaveLength(2)
       })
+
+      it('同名普通工具优先直选：注册 id 恰为 @readonly 的普通（非只读）工具时，filterByWhitelist(["@readonly"]) 返回该工具本身', () => {
+        const readonlyNamed = defineTool({
+          id: '@readonly',
+          description: '一个恰好叫 @readonly 的普通可写工具',
+          inputSchema: ReadWriteSchema,
+          async call() {
+            return { ok: true }
+          },
+        })
+        reg.register(readonlyNamed)
+        reg.registerAll([readFile, writeFile])
+        const picked = reg.filterByWhitelist([READONLY_TOOLS_SENTINEL])
+        expect(picked).toHaveLength(1)
+        expect(picked[0]).toBe(readonlyNamed)
+        expect(picked[0]!.id).toBe('@readonly')
+        expect(reg.listReadOnly().map((t) => t.id)).not.toContain('@readonly')
+      })
+
+      it('未注册同名工具时，哨兵仍展开为全部只读工具（回归保护）', () => {
+        reg.registerAll([readFile, writeFile])
+        expect(reg.has(READONLY_TOOLS_SENTINEL)).toBe(false)
+        expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL]).map((t) => t.id)).toEqual(['read_file'])
+      })
+
+      it('@readonly 与普通 id 混写时遵循新优先级（同名工具直选，无同名才展开哨兵）', () => {
+        const readonlyNamed = defineTool({
+          id: '@readonly',
+          description: '恰好叫 @readonly 的普通工具',
+          inputSchema: ReadWriteSchema,
+          async call() {
+            return { ok: true }
+          },
+        })
+        reg.register(readonlyNamed)
+        reg.registerAll([readFile, writeFile])
+        expect(reg.filterByWhitelist([READONLY_TOOLS_SENTINEL, 'write_file']).map((t) => t.id))
+          .toEqual(['@readonly', 'write_file'])
+      })
     })
   })
 
