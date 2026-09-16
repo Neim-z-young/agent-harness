@@ -691,6 +691,29 @@ describe('@harness/provider-gemini：流结束与超时语义', () => {
     }
   })
 
+  it('极短 timeoutMs 下收尾窗口短于 idle 超时（正常结束不被误判为空闲超时）', async () => {
+    const ctl = mockFetchSseControllable()
+    const prev = globalThis.fetch
+    globalThis.fetch = ctl.fetch
+    // timeoutMs=20：旧公式 DRAIN_MS = min(300, max(50, 5)) = 50ms，而 idle 计时器
+    // 在 finishReason 之后不再续期、20ms 就触发 → 还没收工就被判「空闲超时」。
+    // 新公式 DRAIN_MS = max(1, min(300, 20, 5)) = 5ms，先于 idle 收工。
+    const p = new GeminiChatProvider({ apiKey: 'k', timeoutMs: 20 })
+
+    try {
+      const promise = collect(p)
+      ctl.push(sseGeminiText('你好'))
+      ctl.push(sseGeminiFinish())
+      // 故意不调用 ctl.close()：连接一直开着，只能靠收尾窗口收工
+      const chunks = await promise
+
+      expect(chunks.filter((c) => c.type === 'text_delta').map((c) => c.text).join('')).toBe('你好')
+      expect(chunks.find((c) => c.type === 'done')).toBeDefined()
+    } finally {
+      globalThis.fetch = prev
+    }
+  })
+
   it('持续慢速吐数据（永不结束）触发总时长兜底，而非空闲超时', async () => {
     const ctl = mockFetchSseControllable()
     const prev = globalThis.fetch

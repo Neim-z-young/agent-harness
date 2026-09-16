@@ -578,7 +578,15 @@ export class GeminiChatProvider implements ChatProvider {
       // 已看到 finishReason 后再给一小段「收尾窗口」：usageMetadata 偶尔是单独一帧、
       // 排在 finishReason 之后，直接 break 会丢掉 token 统计。窗口内持续有新数据就
       // 不断续期；直到窗口内没有新数据才收工并 cancel 连接。
-      const DRAIN_MS = Math.min(300, Math.max(50, Math.floor(this.config.timeoutMs / 4)))
+      // 窗口必须**短于** timeoutMs，不能只是「不超过」：收到 finishReason 后 idle
+      // 计时器不再续期，若窗口 ≥ timeoutMs（旧实现的 max(50,…) 在 timeoutMs<200 时
+      // 恰好造成这种倒挂），idle 会先触发，把已经正常结束的流误判成「空闲超时」。
+      // 故取 min(300, timeoutMs, timeoutMs/4)，且不再用 50ms 硬下限顶住——
+      // 正常配置（timeoutMs ≥ 1200）下结果仍是 300ms，与旧行为一致。
+      const DRAIN_MS = Math.max(
+        1,
+        Math.min(300, this.config.timeoutMs, Math.floor(this.config.timeoutMs / 4)),
+      )
       let drainTimer: ReturnType<typeof setTimeout> | undefined
       const readOrDrain = async () => {
         const pending = reader.read()
