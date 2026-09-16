@@ -2171,12 +2171,18 @@ export class HarnessApp {
       const saved = await this.sessionStore.load(pointer.sessionId)
       // 指针里的会话文件不见了（被删 / 换了 dataDir）就往下走兜底，别让启动卡在一个坏指针上
       if (saved) {
-        return {
-          id: saved.id,
-          updatedAt: saved.updatedAt,
-          messageCount: saved.messages.length,
-          cwd: saved.cwd,
-          saved,
+        // 指针只校验了「dataDir 归属」，没校验「会话自己的 cwd」：把 .harness/ 整目录复制到
+        // 别处后，在新目录启动会恢复出旧目录的会话（跨目录串台）。这里再比对 saved.cwd 与当前
+        // cwd，不一致（含旧会话 saved.cwd 为 undefined）就**不**从指针分支返回，落到同 cwd 兜底
+        // 分支——rememberSession 只在会话属于当前目录时才写指针，两边语义要对齐，复制目录不该串台。
+        if (resolve(saved.cwd ?? '') === this.workspace.cwd) {
+          return {
+            id: saved.id,
+            updatedAt: saved.updatedAt,
+            messageCount: saved.messages.length,
+            cwd: saved.cwd,
+            saved,
+          }
         }
       }
     }

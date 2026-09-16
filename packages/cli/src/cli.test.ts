@@ -763,6 +763,66 @@ describe('SessionFileStore 会话持久化', () => {
   })
 })
 
+describe('findResumeTarget 自动恢复目标选择（含跨目录串台防护）', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-resume-test-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  function makeApp(workdir: string): HarnessApp {
+    const dataDir = join(workdir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    return new HarnessApp({ cwd: workdir, dataDir, agentId: 'default', provider: 'mock' })
+  }
+
+  function fakeSession(id: string, cwd: string | undefined, updatedAt: number): any {
+    return { id, title: id, createdAt: updatedAt, updatedAt, agentId: 'default', cwd, messages: [] }
+  }
+
+  it('指针指向的会话 cwd 与当前 cwd 一致 → 从指针分支命中返回', async () => {
+    const app = makeApp(join(dir, 'projA'))
+    await app.sessionStore.save(fakeSession('s_match', app.workspace.cwd, 100))
+    await app.sessionPointer.write('s_match')
+    const target = await app.findResumeTarget()
+    expect(target?.id).toBe('s_match')
+  })
+
+  it('指针指向的会话 cwd 是别的目录 → 不返回指针会话，落到同 cwd 兜底（有同目录会话）', async () => {
+    const app = makeApp(join(dir, 'projA'))
+    const otherCwd = join(dir, 'projB')
+    // 指针指向一个属于别的目录的会话：修复前会错误地从指针分支返回它
+    await app.sessionStore.save(fakeSession('s_other', otherCwd, 200))
+    // 当前目录下另有一个会话，作为同 cwd 兜底目标
+    await app.sessionStore.save(fakeSession('s_same', app.workspace.cwd, 100))
+    await app.sessionPointer.write('s_other')
+    const target = await app.findResumeTarget()
+    // 指针分支不应命中 s_other；应退回同 cwd 兜底得到 s_same（改前会错误地拿到 s_other）
+    expect(target?.id).toBe('s_same')
+    expect(target?.id).not.toBe('s_other')
+  })
+
+  it('指针指向的会话 cwd 是别的目录且无同 cwd 会话 → 返回 undefined', async () => {
+    const app = makeApp(join(dir, 'projA'))
+    const otherCwd = join(dir, 'projB')
+    await app.sessionStore.save(fakeSession('s_other', otherCwd, 200))
+    await app.sessionPointer.write('s_other')
+    const target = await app.findResumeTarget()
+    // 指针分支不命中，且没有任何同 cwd 会话 → undefined（改前会错误地返回 s_other）
+    expect(target).toBeUndefined()
+  })
+
+  it('指针指向的会话 cwd 为 undefined（旧数据）→ 不命中指针分支，退回同 cwd 兜底', async () => {
+    const app = makeApp(join(dir, 'projA'))
+    // 旧会话无 cwd 字段：修复前会从指针分支返回它
+    await app.sessionStore.save(fakeSession('s_old', undefined, 200))
+    await app.sessionStore.save(fakeSession('s_same', app.workspace.cwd, 100))
+    await app.sessionPointer.write('s_old')
+    const target = await app.findResumeTarget()
+    // cwd 不匹配（含 undefined）应降级到同 cwd 兜底，拿到 s_same（改前会错误地拿到 s_old）
+    expect(target?.id).toBe('s_same')
+    expect(target?.id).not.toBe('s_old')
+  })
+})
+
 describe('CliPermissionEngine', () => {
   it('mode=allow-all 直接放行', async () => {
     const e = new CliPermissionEngine({}, { mode: 'allow-all' })
