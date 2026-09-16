@@ -27,6 +27,10 @@ import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFac
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
 
+// 流式总时长兜底系数：空闲超时负责「卡住不吐数据」，总时长兜底负责「一直慢慢吐、永不结束」。
+// 取 idle 的 10 倍作为宽松上限，正常请求不会触及。
+const STREAM_TOTAL_TIMEOUT_FACTOR = 10
+
 // ===== 配置 =====
 
 export interface OpenAIProviderConfig {
@@ -595,6 +599,15 @@ export class OpenAIChatProvider implements ChatProvider {
       )
     }
     armIdleTimeout()
+
+    // 总时长兜底：即使上游持续慢速吐数据（每次间隔 < timeoutMs，idle 计时器永远被续期），
+    // 一旦累计超过总时长上限也必须结束，否则请求会永远挂住。该计时器**不**随数据续期。
+    const totalMs = this.config.timeoutMs * STREAM_TOTAL_TIMEOUT_FACTOR
+    let totalTimer: ReturnType<typeof setTimeout> | undefined
+    totalTimer = setTimeout(
+      () => inner.abort(new Error(`OpenAI stream 总时长超时（>${totalMs}ms）`)),
+      totalMs,
+    )
 
     try {
       const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`

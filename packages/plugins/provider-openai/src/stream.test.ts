@@ -329,4 +329,25 @@ describe('OpenAIChatProvider.stream：结束与超时语义', () => {
     expect(err).toInclude('40ms')
     globalThis.fetch = originalFetch
   })
+
+  it('持续慢速吐数据（永不结束）触发总时长兜底，而非空闲超时', async () => {
+    const ctl = mockFetchSseControllable()
+    globalThis.fetch = ctl.fetch
+    const provider = new OpenAIChatProvider({ apiKey: 'k', timeoutMs: 20 })
+    // 总时长上限 = 20 × 10 = 200ms。每 10ms 吐一块 → idle 永远被续期，
+    // 但永不发 [DONE]，原逻辑会永远挂住；总时长计时器应在 ~200ms 兜底结束。
+    const pushLoop = setInterval(() => ctl.push(sseChunk('x')), 10)
+    try {
+      const err = await Promise.race([
+        collect(provider).then(() => undefined, (e: Error) => e.message),
+        new Promise<string>((_, rej) => setTimeout(() => rej(new Error('test timeout: stream 未在 1s 内结束')), 1000)),
+      ])
+      expect(err).toInclude('总时长超时')
+      expect(err).not.toInclude('空闲超时')
+      expect(err).toInclude('200ms')
+    } finally {
+      clearInterval(pushLoop)
+      globalThis.fetch = originalFetch
+    }
+  })
 })
