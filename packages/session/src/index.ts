@@ -439,6 +439,38 @@ export interface SessionListOptions {
 /** 压缩策略 */
 export type CompactionStrategy = 'prune' | 'summary' | 'agent'
 
+/** token 折算口径 */
+export type TokenCalibration = 'auto' | 'chars4'
+
+/**
+ * CJK 感知的 token 估算（默认口径）。
+ *
+ * 中日韩字符按 1 token/字、其余按 4 字符/token。**口径必须与 acp-kernel 的
+ * `defaultCountTokens` 保持一致** —— 那是 ACP 插件占用率闸门的唯一输入，而这里是会话
+ * 自动压缩阈值的输入；两边只要有一侧不同，就会出现「ACP 认为已超窗、会话层判定远未到
+ * 阈值」的错位（历史上英文会话两者逐位等价、中文会话低估约 4 倍）。
+ *
+ * 之所以在 session 包里独立实现一份而不直接 import acp-kernel：acp-kernel 只被
+ * @harness/acp-context 依赖，core/session 拉它会让第三方压缩内核成为底层包的硬依赖；
+ * 代价是要靠 `session.test` 里的定值断言守住漂移。
+ */
+export function countTokensCJK(text: string): number {
+  if (!text) return 0
+  const cjk = text.match(/[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/g)
+  const cjkCount = cjk?.length ?? 0
+  return cjkCount + Math.ceil((text.length - cjkCount) / 4)
+}
+
+/** 旧口径：一律 `chars/4`（Claude Code 的 roughTokenCountEstimation）。仅作回退与 A-B 对照。 */
+export function countTokensChars4(text: string): number {
+  return text ? Math.ceil(text.length / 4) : 0
+}
+
+/** 按口径取计数函数；缺省取 CJK 感知口径 */
+export function resolveCountTokens(calibration?: TokenCalibration): (text: string) => number {
+  return calibration === 'chars4' ? countTokensChars4 : countTokensCJK
+}
+
 /** compact() / compactIfNeeded() 共用选项 */
 export interface CompactOptions {
   /**
@@ -449,11 +481,20 @@ export interface CompactOptions {
    */
   strategy?: CompactionStrategy
   /**
-   * 模型上下文窗口大小（tokens）。
-   * 与 autoCompactThresholdPct / reservedTokens 配合，计算百分比阈值。
-   * 默认 200000（200K 窗口）
+   * 上下文窗口（tokens）。**必须显式传入**——调用方（CLI）要按「显式覆盖 → 默认 Provider
+   * 的 contextWindowTokens → 兜底」推导，core 内的 200000 只是兜底。
+   * 传错窗口的直接后果：阈值 = (窗口 − reserved) × pct%，窗口虚高时阈值高于真实窗口上限，
+   * 自动压缩永远不可能触发（"配了但从不生效"）。
    */
   contextWindowTokens?: number
+  /**
+   * token 折算口径（默认 `'auto'` = CJK 感知）。
+   * - `'auto'`：中日韩 1 token/字，其余 4 字符/token，与 ACP 层同一口径
+   * - `'chars4'`：一律 chars/4。中文会话会低估约 4 倍 ⇒ 自动压缩阈值更难达到
+   * @see countTokensCJK
+   */
+  tokenCalibration?: TokenCalibration
+  /**
   /**
    * 触发百分比：估算 token 占"可用窗口"（contextWindow - reserved）的百分比达到此值才压缩。
    * 默认 80（即 80% 使用率才触发），适配从 128K 到 1M 窗口的模型。
@@ -547,8 +588,8 @@ export interface SessionManager {
   compact(sessionId: string, strategy?: CompactionStrategy, options?: CompactOptions): Promise<void>
   /** 估算当前上下文长度达到阈值时才压缩（无触发时为 no-op）；返回是否真的执行了压缩 */
   compactIfNeeded(sessionId: string, options?: CompactOptions): Promise<boolean>
-  /** 估算当前会话的 token 数（按字符长度 / 4） */
-  estimateTokens(sessionId: string): Promise<number>
+  /** 估算当前会话的 token 数（默认 CJK 感知口径；传 'chars4' 走旧的 chars/4） */
+  estimateTokens(sessionId: string, calibration?: TokenCalibration): Promise<number>
   /** 读取当前压缩记忆（CompactMemory + 元数据），供 Agent 注入 system prompt */
   getCompactionInfo(sessionId: string): Promise<{ meta?: CompactionMeta; memory?: CompactMemory }>
   /** 组装发送给模型的精简视图（摘要块 + 近期完整消息）；无压缩块时退化为全量 messages */

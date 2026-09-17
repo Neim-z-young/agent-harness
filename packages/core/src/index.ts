@@ -203,14 +203,23 @@ import type {
   HistoryLoader,
   HistoryLoadRange,
   SessionOriginalStore,
+  TokenCalibration,
 } from '@harness/session'
 import {
   COMPACT_META_KEY as COMPACT_META_KEY_VAL,
   COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
   buildView,
+  countTokensCJK,
   renderBlocksAsMessage,
   getSessionModelOverride,
+  resolveCountTokens,
 } from '@harness/session'
+export {
+  countTokensCJK,
+  countTokensChars4,
+  resolveCountTokens,
+} from '@harness/session'
+export type { TokenCalibration } from '@harness/session'
 import type {
   SnapshotID,
   SnapshotService,
@@ -940,15 +949,20 @@ export class DefaultSessionManager implements SessionManager {
   async compactIfNeeded(sessionId: string, options: CompactOptions = {}): Promise<boolean> {
     const sess = this.sessions.get(sessionId)
     if (!sess) return false
-    // token 估算：优先用旧的 tokensPerMessage（向后兼容），否则用字符长度 / 4
+    // token 估算：优先用旧的 tokensPerMessage（向后兼容），否则按 tokenCalibration 口径
+    const countTokens = resolveCountTokens(options.tokenCalibration)
     const estimated = options.tokensPerMessage != null
       ? sess.messages.length * options.tokensPerMessage
-      : this.estimateTokensForMessages(sess.messages)
+      : this.estimateTokensForMessages(sess.messages, countTokens)
     // 阈值计算：固定阈值优先，否则用百分比
     let threshold: number
     if (options.thresholdTokens != null) {
       threshold = options.thresholdTokens
     } else {
+      // contextWindowTokens 缺省只作兜底：真实窗口应由调用方（CLI）按「显式覆盖 →
+      // 默认 Provider 的 contextWindowTokens → 200000」推导后显式传入。这里若默默用
+      // 200000，小窗口模型（如 102400）会算出阈值 136000 > 窗口本身 ⇒ 永远压不到 ⇒
+      // 自动压缩"配了但从不生效"，还不报错。
       const ctx = options.contextWindowTokens ?? 200000
       const reserved = options.reservedTokens ?? 30000
       const pct = options.autoCompactThresholdPct ?? 80
@@ -959,34 +973,45 @@ export class DefaultSessionManager implements SessionManager {
     return true
   }
 
-  async estimateTokens(sessionId: string): Promise<number> {
+  async estimateTokens(sessionId: string, calibration?: TokenCalibration): Promise<number> {
     const sess = this.sessions.get(sessionId)
     if (!sess) return 0
-    return this.estimateTokensForMessages(sess.messages)
+    return this.estimateTokensForMessages(sess.messages, resolveCountTokens(calibration))
   }
 
   /**
-   * 粗估 messages 的 token 数：按字符长度 / 4（参考 Claude Code 的 roughTokenCountEstimation）。
-   * text part: text.length / 4
-   * tool part: JSON.stringify(result + input).length / 4
-   * 其他 part: JSON.stringify(part).length / 4
+   * 粗估 messages 的 token 数。
+   *
+   * 计数口径由 `countTokens` 决定（默认 CJK 感知，与 ACP 层一致）；旧口径 chars/4 会系统性
+   * 低估中文会话约 4 倍 —— 那是 Claude Code 的 roughTokenCountEstimation，按英文语料标定。
+   * text part: countTokens(text)
+   * tool part: countTokens(JSON.stringify(result) + JSON.stringify(input))
+   * 其他 part: countTokens(JSON.stringify(part))
    */
-  private estimateTokensForMessages(messages: Message[]): number {
-    let chars = 0
+  private estimateTokensForMessages(
+    messages: Message[],
+    countTokens: (text: string) => number = countTokensCJK,
+  ): number {
+    // 先拼成一整段再计数（而不是每段各自计数后相加）：逐段 ceiling 会累积出系统性高估，
+    // 也让"英文会话下新旧口径逐位等价"这条不变量失效。
+    let all = ''
+    const add = (s: string): void => {
+      all += s
+    }
     for (const m of messages) {
       for (const p of m.parts) {
         const pt = p as any
         if (pt.type === 'text') {
-          chars += String(pt.text ?? '').length
+          add(String(pt.text ?? ''))
         } else if (pt.type === 'tool') {
-          try { chars += JSON.stringify(pt.result ?? '').length } catch { chars += 100 }
-          try { chars += JSON.stringify(pt.input ?? {}).length } catch { /* ignore */ }
+          try { add(JSON.stringify(pt.result ?? '')) } catch { add('x'.repeat(100)) }
+          try { add(JSON.stringify(pt.input ?? {})) } catch { /* ignore */ }
         } else {
-          try { chars += JSON.stringify(pt).length } catch { /* ignore */ }
+          try { add(JSON.stringify(pt)) } catch { /* ignore */ }
         }
       }
     }
-    return Math.ceil(chars / 4)
+    return countTokens(all)
   }
 
   async getCompactionInfo(sessionId: string) {

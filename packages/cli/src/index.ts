@@ -82,6 +82,7 @@ import {
   todayUsageLine,
   type UsageStats,
 } from './usage-stats'
+import type { CompactOptions } from '@harness/session'
 import { collectTodayUsage } from './usage-today'
 import { reconstructHistory, buildResolveBlock, getSessionModelOverride, sessionModelMetaPatch, type Message, type Session, type SessionModelOverride, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
 import { formatSkillSource } from '@harness/skill'
@@ -362,6 +363,47 @@ export interface HarnessConfig {
      * 关闭后不写任何遥测文件（零开销）。离线用 `bench/report.ts` 分析。
      */
     telemetry?: { enabled?: boolean }
+  }
+  /**
+   * **会话压缩**（`session.compact` / `/compact`，与上面的 ACP 是**两套独立机制**）。
+   *
+   * 区别：ACP 按 token 分级折叠、**每轮自动**、摘要可解压回溯；会话压缩按**消息条数**裁剪
+   * （丢弃旧消息原文 + 留一段摘要），只在 REPL 启动与 `/compact` 时判定一次。
+   * 两者可并存，但会话压缩会丢原文，与 ACP 同时激进启用会造成重复压缩。
+   */
+  compaction?: {
+    /**
+     * 压缩策略（默认 `'summary'`）
+     * - `prune`：只截断旧消息，不生成摘要（信息全丢）
+     * - `summary`：对被截断的窗口做轻量规则摘要（按消息类型统计 + 首尾要点）
+     * - `agent`：调 LLM 生成摘要（失败自动 fallback 到 summary）
+     */
+    strategy?: 'prune' | 'summary' | 'agent'
+    /**
+     * 自动压缩的触发阈值（估算 token 占「可用窗口 = 窗口 − reservedTokens」的百分比，默认 80）。
+     *
+     * 注意：窗口**不在本段配置**，按 `compaction.contextWindowTokens → compression.modelContextLimit
+     * → 默认 Provider 的 contextWindowTokens → 200000` 推导。早些版本 core 内硬编码 200000，
+     * 于是 providers 写 102400 时阈值算成 136000 > 窗口本身 ⇒ 永远压不到；
+     * 想临时指定窗口可用 `contextWindowTokens` 覆盖。
+     */
+    autoCompactThresholdPct?: number
+    /** 给摘要生成预留的 tokens（默认 30000，参考 Claude Code 的 20K max output + 13K buffer） */
+    reservedTokens?: number
+    /**
+     * 上下文窗口显式覆盖。缺省时按上述优先级推导（推荐留空，跟着 Provider 走）。
+     * 乱填会把阈值算到窗口之上或之下，同样导致"配了却不生效"。
+     */
+    contextWindowTokens?: number
+    /** 压缩后保留的最近消息数（user+assistant 算一对；默认 10 条 = 5 轮对话） */
+    keepRecentMessages?: number
+    /** 摘要最大字符数（仅 summary / agent 策略；默认 8000） */
+    summaryMaxChars?: number
+    /**
+     * token 折算口径（默认 `'auto'` = CJK 感知，与 ACP 层同一口径）。
+     * `'chars4'` 会让中文会话的估算只有真值约 1/4 ⇒ 自动压缩更难触发。仅作回退与 A-B 对照。
+     */
+    tokenCalibration?: 'auto' | 'chars4'
   }
 }
 
@@ -1352,20 +1394,98 @@ export function checkCompressionConfig(c: unknown): string[] {
   return out
 }
 
+/** compaction 段合法键（与 HarnessConfig.compaction 一一对应） */
+const COMPACTION_KEYS: Record<keyof NonNullable<HarnessConfig['compaction']>, true> = {
+  strategy: true,
+  autoCompactThresholdPct: true,
+  reservedTokens: true,
+  contextWindowTokens: true,
+  keepRecentMessages: true,
+  summaryMaxChars: true,
+  tokenCalibration: true,
+}
+const COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['prune', 'summary', 'agent'])
+
+/**
+ * 上下文窗口推导（ACP 默认 Provider 口径）：
+ * `compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 200000`。
+ *
+ * 抽成函数是因为**三处**都要它：boot 装配 ACP、配置概览、会话压缩选项。此前概览与 boot
+ * 各写一份、会话压缩干脆硬编码 200000，于是同一份 config 能同时得出 200000 和 102400
+ * 两个窗口 —— 按概览做的判断全部落空，会话压缩则因阈值 136000 > 真实窗口而从不触发。
+ * 默认 provider 的 id 可能省略（由 model 派生），故同样走 normalizeProviderConfigs。
+ */
+export function resolveContextWindowTokens(cfg: HarnessConfig, defaultProviderId: string): number {
+  const { providers } = normalizeProviderConfigs(cfg.providers ?? [])
+  const defaultPc = providers.find((p) => p.id === defaultProviderId)
+  return cfg.compression?.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000
+}
+
+/** 校验 `config.json → compaction`：未知键 + `strategy` / `tokenCalibration` 非法取值 */
+export function checkCompactionConfig(c: unknown): string[] {
+  if (!isPlainObject(c)) return []
+  const out: string[] = []
+  for (const k of collectUnknown(c, Object.keys(COMPACTION_KEYS), 'compaction')) {
+    out.push(`${k} 未被识别，该配置不会生效`)
+  }
+  if (c.strategy !== undefined && !COMPACTION_STRATEGIES.has(c.strategy as string)) {
+    out.push(
+      `compaction.strategy 取值 ${JSON.stringify(c.strategy)} 未知（可选：prune / summary / agent），已按默认 summary 处理`,
+    )
+  }
+  if (c.tokenCalibration !== undefined && c.tokenCalibration !== 'auto' && c.tokenCalibration !== 'chars4') {
+    out.push(
+      `compaction.tokenCalibration 取值 ${JSON.stringify(c.tokenCalibration)} 未知（可选：auto / chars4），已按默认 auto 处理`,
+    )
+  }
+  return out
+}
+
+/** 会话压缩的 `CompactOptions`：配置 → core 的入参。**窗口按统一优先级推导**（见 resolveContextWindowTokens） */
+export function buildCompactionOptions(cfg: HarnessConfig, defaultProviderId: string): CompactOptions {
+  const k = cfg.compaction
+  return {
+    contextWindowTokens: k?.contextWindowTokens ?? resolveContextWindowTokens(cfg, defaultProviderId),
+    ...(k?.strategy != null ? { strategy: k.strategy } : {}),
+    ...(k?.keepRecentMessages != null ? { keepRecentMessages: k.keepRecentMessages } : {}),
+    ...(k?.summaryMaxChars != null ? { summaryMaxChars: k.summaryMaxChars } : {}),
+    ...(k?.autoCompactThresholdPct != null ? { autoCompactThresholdPct: k.autoCompactThresholdPct } : {}),
+    ...(k?.reservedTokens != null ? { reservedTokens: k.reservedTokens } : {}),
+    ...(k?.tokenCalibration != null ? { tokenCalibration: k.tokenCalibration } : {}),
+  }
+}
+
+/**
+ * 会话压缩的**阈值可达性**提醒：阈值 = (窗口 − reservedTokens) × pct%，
+ * 若阈值 ≥ 窗口，则无论会话多长都不可能自动触发 —— 配置写了一堆却零效果，且全程静默。
+ *
+ * 这条必须由配置算出而不是靠人记住：窗口来自 Provider，阈值来自本段配置，两边任一改动
+ * 都可能悄悄越过这条线。返回 undefined 表示可达。
+ */
+export function checkCompactionReachability(cfg: HarnessConfig, defaultProviderId: string): string | undefined {
+  const opt = buildCompactionOptions(cfg, defaultProviderId)
+  const window = opt.contextWindowTokens ?? 200_000
+  const reserved = opt.reservedTokens ?? 30_000
+  const pct = opt.autoCompactThresholdPct ?? 80
+  const threshold = Math.floor((window - reserved) * (pct / 100))
+  if (threshold < window) return undefined
+  return (
+    `会话压缩阈值（${threshold} tokens）≥ 上下文窗口（${window}），自动压缩永远不会触发。` +
+    `请降低 compaction.autoCompactThresholdPct 或 reservedTokens，或确认 providers[].contextWindowTokens 填写正确`
+  )
+}
+
 /** 配置概览（--check-config / /config 共用），apiKey 默认脱敏展示 */
 export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string): string {
   const lines: string[] = []
   lines.push(`默认 provider：${cfg.provider ?? defaultProviderId}`)
   if (cfg.model) lines.push(`默认 model：${cfg.model}`)
   const c = cfg.compression
-  // 窗口必须与 boot 装配处同一套推导：compression.modelContextLimit → 默认 provider 的
-  // contextWindowTokens → 兜底 200_000。此前概览直接兜底 200000，于是「概览显示 200k、
-  // 插件实际按 providers[].contextWindowTokens（如 102400）跑」——同一个数两处两个值，
-  // 会让按概览做的判断全部落空（与早年"占用率显示 26% 实际 103%"同源）。
-  // 默认 provider 的 id 可能省略（由 model 派生），故同样走 normalizeProviderConfigs。
-  const { providers: resolvedProviders } = normalizeProviderConfigs(cfg.providers ?? [])
-  const defaultPc = resolvedProviders.find((p) => p.id === defaultProviderId)
-  const acpWindow = c?.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000
+  // 窗口必须与 boot 装配处、会话压缩处同一套推导：compression.modelContextLimit →
+  // 默认 provider 的 contextWindowTokens → 兜底 200_000。此前概览直接兜底 200000、会话压缩
+  // 在 core 内另摊一个硬编码 200000，于是同一份 config 能同时得出 200000 和 102400 两个窗口
+  // ——按概览做的判断全部落空，会话压缩则因阈值 136000 > 真实窗口而从不触发。
+  const acpWindow = resolveContextWindowTokens(cfg, defaultProviderId)
   const acpMode = c?.autoTune
     ? `按窗口自动适配参数（autoTune，窗口 ${acpWindow}）`
     : `原始压缩参数控制（autoTune 关闭）`
@@ -1381,6 +1501,26 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   if (compressionIssues.length) {
     lines.push('上下文压缩（ACP）配置告警（下列项不会被应用）：')
     for (const m of compressionIssues) lines.push(`  - ${m}`)
+  }
+  // 会话压缩（/compact 与启动自动判定）：与 ACP 是两套机制，单独展示窗口与阈值，
+  // 因为"阈值 ≥ 窗口 ⇒ 永远不触发"这类问题只能在这儿看出来。
+  {
+    const k = cfg.compaction
+    const opt = buildCompactionOptions(cfg, defaultProviderId)
+    const window = opt.contextWindowTokens ?? 200_000
+    const reserved = opt.reservedTokens ?? 30_000
+    const pct = opt.autoCompactThresholdPct ?? 80
+    const threshold = Math.floor((window - reserved) * (pct / 100))
+    lines.push(
+      `会话压缩（/compact）：窗口 ${window} · 阈值 ${threshold} tokens（${pct}% ×（窗口−${reserved}））· ` +
+        `策略 ${opt.strategy ?? 'summary'} · 保留最近 ${opt.keepRecentMessages ?? 10} 条 · ` +
+        `token 口径 ${opt.tokenCalibration === 'chars4' ? 'chars/4（旧）' : '自动（CJK 感知）'}` +
+        (k ? '' : '（全部默认值，config.json → compaction 可配）'),
+    )
+    const compactionIssues = checkCompactionConfig(k)
+    for (const m of compactionIssues) lines.push(`  - ${m}`)
+    const unreachable = checkCompactionReachability(cfg, defaultProviderId)
+    if (unreachable) lines.push(`  - ${unreachable}`)
   }
   const rawProviders = cfg.providers ?? []
   if (!rawProviders.length) {
@@ -2178,6 +2318,16 @@ export class HarnessApp {
           '\n',
       )
     }
+    // 会话压缩（另一套机制）：同样会因未知键 / 拼错取值静默失效；
+    // 额外的「阈值 ≥ 窗口 ⇒ 永不触发」检查尤其重要 —— 它没有任何其它症状。
+    const compactionIssues = checkCompactionConfig(cfg.compaction)
+    const compactionUnreachable = checkCompactionReachability(cfg, defaultProviderId)
+    if (compactionIssues.length || compactionUnreachable) {
+      const all = compactionUnreachable ? [...compactionIssues, compactionUnreachable] : compactionIssues
+      this.options.stdout?.write?.(
+        `[WARN] config.json → compaction 有以下问题：\n` + all.map((m) => `       - ${m}`).join('\n') + '\n',
+      )
+    }
     if (compression?.enabled) {
       const acp = await lazyImport<{ createAcpContextPlugin: (o?: any) => AgentPlugin }>('@harness/acp-context')
       const acpConfig: Record<string, unknown> = {
@@ -2203,7 +2353,8 @@ export class HarnessApp {
       const telemetryEnabled = compression.telemetry?.enabled !== false
       const sessionsDir = join(this.workspace.dataDir, 'sessions')
       providerPlugins.push(acp.createAcpContextPlugin({
-        modelContextLimit: compression.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000,
+        // 与配置概览、会话压缩共用同一套窗口推导（此前三处各算一次，同份 config 能出两个值）
+        modelContextLimit: resolveContextWindowTokens(cfg, defaultProviderId),
         systemPrompt: compression.systemPrompt,
         prompts: compression.prompts as any,
         config: acpConfig as any,
@@ -3133,17 +3284,26 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         }
         case '/compact': {
           const curSessionId = current.id
+          // 会话压缩参数统一取自 config.json → compaction（窗口按 Provider 推导）。
+          // 此前 core 内硬编码 200000，小窗口模型（如 102400）的阈值算成 136000 > 窗口本身，
+          // 于是「配了却在正常会话下永远不触发」，且跳过的提示里也没有任何线索。
+          const cfg = await app.configStore.load()
+          const compactOpts = buildCompactionOptions(cfg, cfg.provider ?? 'anthropic')
           if (arg === 'auto' || arg === 'ifneeded') {
-            const did = await harness.session.compactIfNeeded(curSessionId)
+            const did = await harness.session.compactIfNeeded(curSessionId, compactOpts)
             const info = await harness.session.getCompactionInfo(curSessionId)
             if (did) out(`已触发压缩（阈值命中）：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)
             else {
-              const est = await harness.session.estimateTokens(curSessionId)
-              out(`未达阈值（估算 ${est} tokens），跳过压缩。\n`)
+              const est = await harness.session.estimateTokens(curSessionId, compactOpts.tokenCalibration)
+              const window = compactOpts.contextWindowTokens ?? 200_000
+              const reserved = compactOpts.reservedTokens ?? 30_000
+              const pct = compactOpts.autoCompactThresholdPct ?? 80
+              const threshold = Math.floor((window - reserved) * (pct / 100))
+              out(`未达阈值（估算 ${est} / 阈值 ${threshold} tokens，窗口 ${window}），跳过压缩。\n`)
             }
           } else {
             const strategy = (arg === 'prune' || arg === 'summary' || arg === 'agent') ? arg : 'summary'
-            await harness.session.compact(curSessionId, strategy)
+            await harness.session.compact(curSessionId, strategy, compactOpts)
             const info = await harness.session.getCompactionInfo(curSessionId)
             out(`已压缩会话（策略=${strategy}）：`)
             out(`累计压缩次数=${info.meta?.count ?? 0}，累计压缩消息=${info.meta?.totalPrunedMessages ?? 0}\n`)
@@ -3774,7 +3934,9 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
 
     // repl / resume / start → REPL（--tui 时进入 alt-screen 全屏 TUI）
     {
-      const did = await harness.session.compactIfNeeded(session.id)
+      // 窗口按统一优先级推导后显式传入（此前走 core 内的硬编码 200000，
+      // providers 写 102400 时阈值 136000 > 窗口 ⇒ 这次判定恒为 false）
+      const did = await harness.session.compactIfNeeded(session.id, buildCompactionOptions(cfg, provider))
       if (did) {
         const info = await harness.session.getCompactionInfo(session.id)
         write(`[会话] 自动压缩：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)

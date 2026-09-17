@@ -177,6 +177,36 @@ bun run typecheck           # 全部类型检查
 
 **关于工具结果的自主续轮**：当前的 Agent 执行是**单轮**的——一次模型调用后执行工具，工具结果**不会**自动回喂触发下一次推理；续轮由用户输入或 coordinator 的 barrier（后台子任务集齐）驱动。自主多步（read → edit → bash 链式执行）的改造计划见 [Agentic Loop 改造计划](docs/agentic-loop-plan.md)。
 
+### compaction 对象（会话压缩，与 ACP 是两套机制）
+
+`/compact` 命令与 REPL 启动时的自动判定走的是**会话压缩**：按消息条数把旧会话裁掉、留一段摘要。它和上面的 ACP 互不相干——ACP 按 token 分级折叠、**每轮**自动跑、摘要可解压回溯；会话压缩只在 REPL 启动与 `/compact` 时判定一次，且**丢弃原文**。
+
+```json
+{
+  "compaction": {
+    "strategy": "summary",
+    "keepRecentMessages": 10,
+    "summaryMaxChars": 8000,
+    "autoCompactThresholdPct": 80,
+    "reservedTokens": 30000
+  }
+}
+```
+
+| 字段 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `strategy` | `'prune'` \| `'summary'` \| `'agent'` | `'summary'` | `prune` 只截断不留摘要；`agent` 调 LLM 生成摘要（失败自动回退 `summary`） |
+| `keepRecentMessages` | number | 10 | 压缩后保留的最近消息数（user+assistant 算一对） |
+| `summaryMaxChars` | number | 8000 | 摘要最大字符数（仅 `summary` / `agent`） |
+| `autoCompactThresholdPct` | number | 80 | 触发阈值：估算 token 占「可用窗口 = 窗口 − `reservedTokens`」的百分比 |
+| `reservedTokens` | number | 30000 | 给摘要生成预留的 tokens |
+| `contextWindowTokens` | number | 按 Provider 推导 | 本段专用覆盖，一般不填 |
+| `tokenCalibration` | `'auto'` \| `'chars4'` | `'auto'` | token 折算口径，与 `compression.tokenCalibration` 同义；**必须两边一致**，否则 ACP 判定已超窗、会话层却说远未到阈值 |
+
+**窗口不在本段硬填**：按 `compaction.contextWindowTokens → compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 200000` 推导。
+
+**最隐蔽的一个坑：阈值 ≥ 窗口**。自动压缩的触发线是 `(窗口 − reservedTokens) × pct%`，一旦算出的阈值高于窗口本身，无论会话多长都不会触发，而且**没有任何报错**（`/compact auto` 只会回一句"未达阈值"）。常见成因是给了一个大 `reservedTokens` 或过高的 `pct`。`harness config check` 与 `/config` 会显式检查这一条并告警。
+
 ### plugins 数组（内置插件声明式启用）
 
 不想写插件代码时，用一行配置开内置能力（依赖自动补齐、安装顺序由 core 拓扑排序保证）：

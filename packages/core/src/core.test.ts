@@ -569,6 +569,68 @@ describe('@harness/core', () => {
       await h.stop()
     })
 
+    /** 施加 n 对中文 user/assistant 消息（默认每条 1000 字，用于撑到万级 token） */
+    async function fillChineseMessages(h: Harness, sessId: string, pairs: number, chars = 1000): Promise<void> {
+      const base = '这是一段用于验证上下文压缩阈值的中文会话内容，编号为'
+      for (let i = 0; i < pairs; i++) {
+        const body = new Array(Math.ceil(chars / base.length)).fill(base).join('').slice(0, chars)
+        const at = Date.now() + i * 2
+        await h.session.addMessage(sessId, { id: `zu_${i}`, role: 'user', parts: [{ type: 'text', text: body }], createdAt: at })
+        await h.session.addMessage(sessId, { id: `za_${i}`, role: 'assistant', parts: [{ type: 'text', text: body }], createdAt: at + 1 })
+      }
+    }
+
+    it('自动压缩的窗口来自调用方：同一会话在真实窗口 102400 下触发，在旧硬编码 200000 下永不触发', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      // 120 条 × 1000 字中文 ≈ 119k tokens（auto 口径）
+      await fillChineseMessages(h, sess.id, 60)
+      // 旧行为：core 内硬编码 200000 ⇒ 阈值 (200000−30000)×80% = 136000 > 119k ⇒ 永不触发，
+      // 于是 providers 写 102400 的用户"配了自动压缩却从没见过它生效"，且没有任何报错。
+      const legacy = await h.session.compactIfNeeded(sess.id, { contextWindowTokens: 200_000 })
+      expect(legacy).toBe(false)
+      const afterLegacy = (await h.session.get(sess.id))!
+      expect(afterLegacy.messages.length).toBe(120)
+      // 修好之后：窗口按「显式覆盖 → Provider contextWindowTokens」推导并显式传入
+      // ⇒ 阈值 (102400−30000)×80% = 57920 < 119k ⇒ 触发压缩
+      const did = await h.session.compactIfNeeded(sess.id, {
+        contextWindowTokens: 102_400,
+        keepRecentMessages: 10,
+      })
+      expect(did).toBe(true)
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBeLessThan(120)
+      await h.stop()
+    })
+
+    it('estimateTokens：中文会话在 auto 与 chars4 下相差约 4 倍', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fillChineseMessages(h, sess.id, 10) // 20 条 × 1000 字 ≈ 20k tokens
+      const auto = await h.session.estimateTokens(sess.id)
+      const legacy = await h.session.estimateTokens(sess.id, 'chars4')
+      expect(auto).toBeGreaterThan(19_000)
+      expect(auto / legacy).toBeGreaterThan(3.5)
+      // 缺省即 auto（与 ACP 层同一口径）
+      expect(await h.session.estimateTokens(sess.id, 'auto')).toBe(auto)
+      await h.stop()
+    })
+
+    it('同一中文会话：chars4 口径判定未达阈值，auto 口径判定命中并压缩', async () => {
+      const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+      const sess = await h.session.create()
+      await fillChineseMessages(h, sess.id, 15) // 30 条 × 1000 字 ≈ 30k tokens（chars4 只有 ~7.5k）
+      const opts = { contextWindowTokens: 40_000, reservedTokens: 5_000, autoCompactThresholdPct: 80, keepRecentMessages: 10 }
+      // 阈值 = (40000−5000)×80% = 28000
+      const oldCaliber = await h.session.compactIfNeeded(sess.id, { ...opts, tokenCalibration: 'chars4' })
+      expect(oldCaliber).toBe(false)
+      const hit = await h.session.compactIfNeeded(sess.id, { ...opts, tokenCalibration: 'auto' })
+      expect(hit).toBe(true)
+      const s = (await h.session.get(sess.id))!
+      expect(s.messages.length).toBeLessThan(30)
+      await h.stop()
+    })
+
     it('AgentRuntime.query 把 CompactMemory 注入为 system prompt 片段', async () => {
       const provider = mockChatProvider('text')
       const h = await createHarness({ agents: [makeAgent()], chatProvider: provider })

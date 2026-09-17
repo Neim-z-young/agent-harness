@@ -20,6 +20,10 @@ import {
   validateProviderConfigs,
   buildConfigOverview,
   checkCompressionConfig,
+  resolveContextWindowTokens,
+  buildCompactionOptions,
+  checkCompactionConfig,
+  checkCompactionReachability,
   registerBuiltinProviderTypes,
   getBuiltinRegistry,
   getBuiltinToolRegistry,
@@ -449,6 +453,103 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     // 干净配置不应多出告警标题段
     const clean = buildConfigOverview({ model: 'm', compression: { enabled: true } }, 'mock')
     expect(clean).not.toContain('配置告警')
+  })
+
+  it('resolveContextWindowTokens：与 ACP 装配、概览共用同一套三级推导', () => {
+    const providers = [
+      { id: 'other', type: 'openai', model: 'gpt-4o', contextWindowTokens: 1_000_000 },
+      { type: 'openai', model: 'hy3', contextWindowTokens: 102_400 },
+    ] as HarnessConfig['providers']
+    expect(resolveContextWindowTokens({ providers, compression: { modelContextLimit: 300_000 } }, 'hy3')).toBe(300_000)
+    // 默认 provider 省略 id（按 model 派生）时同样命中，而不是漏过去落兜底
+    expect(resolveContextWindowTokens({ providers }, 'hy3')).toBe(102_400)
+    expect(resolveContextWindowTokens({ providers }, 'other')).toBe(1_000_000)
+    expect(resolveContextWindowTokens({}, 'mock')).toBe(200_000)
+  })
+
+  it('buildCompactionOptions：窗口按 Provider 推导，配置字段逐项透传', () => {
+    const providers = [{ type: 'openai', model: 'hy3', contextWindowTokens: 102_400 }] as HarnessConfig['providers']
+    // 缺省：只带推导出的窗口（102400，而不是 core 内那个硬编码的 200000）
+    expect(buildCompactionOptions({ providers }, 'hy3')).toEqual({ contextWindowTokens: 102_400 })
+    const opt = buildCompactionOptions(
+      {
+        providers,
+        compaction: {
+          strategy: 'prune',
+          keepRecentMessages: 20,
+          summaryMaxChars: 5_000,
+          autoCompactThresholdPct: 70,
+          reservedTokens: 10_000,
+          tokenCalibration: 'chars4',
+        },
+      },
+      'hy3',
+    )
+    expect(opt).toEqual({
+      contextWindowTokens: 102_400,
+      strategy: 'prune',
+      keepRecentMessages: 20,
+      summaryMaxChars: 5_000,
+      autoCompactThresholdPct: 70,
+      reservedTokens: 10_000,
+      tokenCalibration: 'chars4',
+    })
+    // compaction.contextWindowTokens 是本段专用覆盖，优先级高于 Provider
+    expect(buildCompactionOptions({ providers, compaction: { contextWindowTokens: 60_000 } }, 'hy3').contextWindowTokens)
+      .toBe(60_000)
+  })
+
+  it('checkCompactionConfig：拼错键与非法取值都能被点名', () => {
+    const issues = checkCompactionConfig({
+      keepRecentMessage: 20,
+      strategy: 'summarize',
+      tokenCalibration: 'chars/4',
+    })
+    expect(issues).toContain('compaction.keepRecentMessage 未被识别，该配置不会生效')
+    expect(issues).toContain('compaction.strategy 取值 "summarize" 未知（可选：prune / summary / agent），已按默认 summary 处理')
+    expect(issues).toContain('compaction.tokenCalibration 取值 "chars/4" 未知（可选：auto / chars4），已按默认 auto 处理')
+    expect(issues.length).toBe(3)
+  })
+
+  it('checkCompactionConfig：全部合法键写满 → 零告警（白名单完整性守卫）', () => {
+    expect(
+      checkCompactionConfig({
+        strategy: 'agent',
+        autoCompactThresholdPct: 70,
+        reservedTokens: 10_000,
+        contextWindowTokens: 60_000,
+        keepRecentMessages: 20,
+        summaryMaxChars: 5_000,
+        tokenCalibration: 'chars4',
+      }),
+    ).toEqual([])
+    expect(checkCompactionConfig(undefined)).toEqual([])
+  })
+
+  it('checkCompactionReachability：阈值 ≥ 窗口时告警（自动压缩形同虚设的主要成因）', () => {
+    // 默认参数 + 真实小窗口：(102400−30000)×80% = 57920 < 102400 ⇒ 可达
+    const providers = [{ type: 'openai', model: 'hy3', contextWindowTokens: 102_400 }] as HarnessConfig['providers']
+    expect(checkCompactionReachability({ providers }, 'hy3')).toBeUndefined()
+    // 阈值被抬到窗口之上：无论会话多长都不会触发，且此前没有任何症状
+    const bad = checkCompactionReachability(
+      { providers, compaction: { autoCompactThresholdPct: 150, reservedTokens: 0 } },
+      'hy3',
+    )
+    expect(bad).toInclude('永远不会触发')
+    expect(bad).toInclude('102400')
+  })
+
+  it('buildConfigOverview：会话压缩展示窗口与阈值，并对不可达阈值给出告警', () => {
+    const providers = [{ type: 'openai', model: 'hy3', contextWindowTokens: 102_400 }] as HarnessConfig['providers']
+    const ok = buildConfigOverview({ providers }, 'hy3')
+    expect(ok).toInclude('会话压缩（/compact）：窗口 102400 · 阈值 57920 tokens')
+    expect(ok).toInclude('策略 summary · 保留最近 10 条 · token 口径 自动（CJK 感知）')
+    expect(ok).toInclude('（全部默认值，config.json → compaction 可配）')
+    const bad = buildConfigOverview({ providers, compaction: { autoCompactThresholdPct: 150, reservedTokens: 0 } }, 'hy3')
+    expect(bad).toInclude('永远不会触发')
+    // 拼错键也一并点名（必须绕开结构类型：多余键正是本用例要模拟的脏数据）
+    const typo = { compaction: { keepRecentMessage: 20 } } as unknown as HarnessConfig
+    expect(buildConfigOverview(typo, 'mock')).toInclude('compaction.keepRecentMessage 未被识别')
   })
 })
 

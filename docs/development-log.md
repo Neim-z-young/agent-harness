@@ -1,12 +1,61 @@
 # Agent Harness 开发日志
 
+## 2026-09-17（续 140）会话压缩（session compaction）：窗口按 Provider 推导 + CJK 口径 + 参数可配置
+
+### 起因：项目里有两套压缩，此前只调了其中一套
+
+排查「筛选层」时发现 `packages/session` 另有一套 compaction（`/compact` 命令 + REPL 启动时的 `compactIfNeeded`），
+与 ACP 完全独立：ACP 按 token 分级折叠、**每轮**跑、摘要可解压；会话压缩按**消息条数**裁剪 + 规则摘要、
+只在启动与 `/compact` 判定一次、且丢弃原文。它的参数确实比 ACP 小一档（`summaryMaxChars` 8000 vs 10000）。
+
+更麻烦的是这套**长期形同虚设**：
+
+1. **窗口硬编码 200000**（`core:952`）：`compactIfNeeded` 从不接窗口，阈值 = `(200000−30000)×80% = 136000`。
+   任何窗口小于 136000 的 provider ⇒ 阈值高于窗口本身 ⇒ **永远不可能触发**，且毫无症状
+   （`/compact auto` 只会回一句「未达阈值（估算 xxx tokens）」）。
+2. **估算仍用 chars/4**（`estimateTokensForMessages`）：没跟 ACP 一起改 CJK 感知，中文会话再低约 4 倍。
+3. **完全不可配置**：所有只能通过改代码调整。
+
+### 方案（三件事）
+
+- **① 窗口**：抽 `resolveContextWindowTokens(cfg, defaultProviderId)`（三级推导），
+  boot 装配 ACP、配置概览、`buildCompactionOptions` **三处共用**；两处 `compactIfNeeded` 调用点显式传入。
+- **② 口径**：`packages/session` 新增 `countTokensCJK` / `countTokensChars4` / `resolveCountTokens`
+  （与 `acp-kernel` 的 `defaultCountTokens` 同口径：中日韩 1 token/字 + 其余 4 字符/token；
+  不直接 import 内核，避免把第三方压缩内核变成底层包的硬依赖，代价是靠 `token-count.test.ts`
+  的定值断言守漂移）。`core.estimateTokensForMessages` 改为接收 `countTokens`，
+  并**先拼整段再计数**（逐段 ceiling 会累积出系统性高估，也会让「英文两口径逐位等价」失效）。
+- **③ 配置**：新增顶层 `compaction` 段（strategy / keepRecentMessages / summaryMaxChars /
+  autoCompactThresholdPct / reservedTokens / contextWindowTokens / tokenCalibration），
+  CLI 透传给 `compact` / `compactIfNeeded`。
+
+### 额外的一道防线：阈值可达性
+
+新增 `checkCompactionReachability(cfg, id)`：**阈值 ≥ 窗口**就告警（这条此前完全无声，是本类问题的主要成因）。
+`checkCompactionConfig` 同步做未知键白名单 diff（同样用 `Record<keyof ..., true>`）+ `strategy` /
+`tokenCalibration` 取值校验，两处都接进 boot 告警与 `/config`、`--check-config` 概览。
+
+### 验证
+
+- session 32 / core 44 / cli 330 全通过；全仓 typecheck 0 错误。
+- 新测试 16 例：口径定值断言 8 例（含「中文相差 4 倍」「英文逐位等价」两条不变量）
+  + core 3 例（**同一会话在 102400 触发、在旧硬编码 200000 下永不触发**；两种口径下一触发一不触发）
+  + cli 5 例（窗口三级推导 / 选项透传 / 拼错键点名 / 白名单完整性 / 阈值可达性）。
+- README 新增 `### compaction 对象`，写明两套机制的区别与「阈值 ≥ 窗口」这个坑。
+
 ## 2026-09-17（续 139）配置概览的 ACP 窗口改为与 boot 同一套推导（+ 现网配置优化）
 
 ### 起因：一个把三份评估全部作废的显示 bug
 
 概览里的 `fitWindow` 此前直接兜底 `200000`，不看 `providers[].contextWindowTokens`；而 boot 装配插件时用的是「`compression.modelContextLimit` → 默认 provider 的 `contextWindowTokens` → 200000」三级推导。**同一个数两处两个值**，按概览做的判断全部落空。
 
-现网就是活例：所有 provider 都写着 `contextWindowTokens: 102400`，概览一直显示 `fitWindow=200000`。修正后发现**真实窗口 102400 下，原配置是灾难性超窗**——`config.preserveRecentTokens: 50000` 吃掉了半个窗口，末轮占用 134% → 164% → 209%，缓存命中从 85% 腰斩到 53%~60%。
+> **更正（当日晚些核实，见续 140）**：本条开头写的「所有 provider 都写着 `contextWindowTokens: 102400`」
+> **与事实不符**。实读配置：默认 provider `hy3` 是 `200000`，其余三个（`online` / `deepseek-v4.1-flash` /
+> `hy4-preview-f`）是 `300000`，全仓没有任何 `102400`（那是 `@harness/plugin` 里 ProviderConfig 的文档示例值）。
+> 因此下面的收益数字是在**错误窗口前提**下算出来的，真实（200K）收益见续 140。**逻辑上要改的那些键依然
+> 是死键/有害键**，改动方向没错，错的只是收益幅度。
+
+~~现网~~ 排查时误以为 providers 写着 `contextWindowTokens: 102400`，据此认为概览一直显示 `fitWindow=200000` 是偏差，并在 102400 窗口下算出了下面那组触目惊心的数字（本段保留作为「前提错了会把结论带偏多远」的记录）。
 
 改为同样走 `normalizeProviderConfigs`（默认 provider 的 id 可能省略、由 model 派生），再按三级回退。cli 全包 324 通过。
 
@@ -14,9 +63,11 @@
 
 删掉 5 类键，全部交回 autoTune 推导：`config.preserveRecentTokens: 50000`（主因）、`config.compress.minCompressRange: 30000`、`nudge.growthRatio/Floor/Cap/minGrowthFloor`（层级写错，从未生效）、`compression.maxSummaryLength`、`telemetry.maxEvents`（均不存在）。
 
-改后 `--check-config` 零告警、`fitWindow=102400`，生效值 R=15000 / GF=22500 / MC=60000。三点均值有效成本 **52573 → 11938（−77.3%）**，末轮占用 209.5% → 95.9%，命中 60.3% → 85.9%。
+删掉 5 类键，全部交回 autoTune 推导：`config.preserveRecentTokens: 50000`（主因）、`config.compress.minCompressRange: 30000`、`nudge.growthRatio/Floor/Cap/minGrowthFloor`（层级写错，从未生效）、`compression.maxSummaryLength`、`telemetry.maxEvents`（均不存在）。
 
-R 扫描（steps=140）显示 15000 正是最优（10000 反而变差到 12728，块更碎），恰好等于 autoTune 推导值 ⇒ **删键让它推导就是最优解**。`docs/acp-context-config.md` §7.5⑥ 补入该档实测，与既有「102400、10× 窗口峰值 96.2%」的结论吻合（实测 95.91%）。
+**当时报的收益作废**：称「`fitWindow=102400`、生效值 R=15000 / GF=22500 / MC=60000、三点均值 52573 → 11938（−77.3%）」，全部建立在「窗口 = 102400」这个错误前提上。真实窗口 200000 下的实测见续 140：**16068 → 12833（−20.1%）**。
+
+R 扫描（steps=140，W=102400）本身是独立实验，结论仍成立（10000 反而变差到 12728，块更碎，15000 最优）——它证明的是「小窗口别手写大 R」，不构成对现网的判断。
 
 ## 2026-09-17（续 138）CLI 侧 compression 配置写错键 / 写错取值时告警
 
