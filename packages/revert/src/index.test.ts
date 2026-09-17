@@ -131,6 +131,9 @@ class FakeSessionManager implements SessionManager {
   drainNotifications(): string[] {
     return []
   }
+  peekNotifications(): string[] {
+    return []
+  }
 }
 
 interface Env {

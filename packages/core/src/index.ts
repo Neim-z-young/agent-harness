@@ -1205,6 +1205,11 @@ export class DefaultSessionManager implements SessionManager {
     return queue
   }
 
+  /** 只读查看（不消费）：供自动续轮前的空转判断使用 */
+  peekNotifications(sessionId: string): string[] {
+    return [...(this.pendingNotifications.get(sessionId) ?? [])]
+  }
+
   // --------- 内部摘要实现 ---------
 
   /** 规则摘要：简单但稳定的基于消息类型/文本要点的摘要；无需 LLM */

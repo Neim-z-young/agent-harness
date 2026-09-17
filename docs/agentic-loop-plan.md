@@ -311,21 +311,42 @@ async *queryStream(input) {
   `turn_end` 只发一次且在最后 / 中断同样以 `turn_end` 收尾）；cli 330、subagent 113、swarm 65、
   session 32、provider-mock 16 全绿；全仓 typecheck 0 错误。
 
-**S4 — 插件协调（风险最高，最后做）**
+**S4 — 插件协调（风险最高，最后做）** ✅ 已完成（代码侧）
 
-明确三层职责，避免双重驱动：
+三层职责（最终形态）：
 
-| 层 | 职责 |
-|---|---|
-| 引擎内循环 | 工具结果回喂 → 继续推理（同步、同会话、步数受限） |
-| coordinator barrier | 后台 subagent 任务集齐后的一次跨轮推进 |
-| REPL `<continue/>` | 保留，但只在 barrier 场景使用，不再承担链式执行 |
+| 层 | 职责 | 触发条件 |
+|---|---|---|
+| 引擎内循环 | 工具结果回喂 → 继续推理（同步、同会话、受步数限制） | 本步**有工具调用** |
+| coordinator barrier | 后台 subagent 任务集齐后的一次跨轮推进 | **所有后台任务完成** |
+| REPL/TUI `<continue/>` | barrier 的载体（伪输入），不再承担链式执行 | 由 barrier 事件注入 |
 
-需要回归的三个插件：
+两者的触发条件天然不同（「有工具调用」vs「后台任务集齐」），因此**不会互相递归**。
+真正的问题是**空转**：`<continue/>` 的唯一目的是让模型看到后台结果，没有结果时白跑一轮 ——
+内部循环上线后一轮可能是多步，代价被放大。
 
-- **coordinator**：barrier 续轮与内部循环可能叠加 → 内部循环跑完后再收到 `<continue/>`，应识别为"上一轮已自然结束"的空转并忽略（可借助 assistant 消息的 step 计数判断）
-- **subagent**：`subagent/src/index.ts:743` 调 `queryStream` 一次，循环上线后会跑完整多轮 —— 大概率是改善，但需确认其进度事件与超时假设仍成立
-- **swarm**：tick 间隔 × 内部循环步数 的乘积可能超时，需给 tick 设总时长预算
+- **coordinator / `<continue/>` 空转识别**（cli）：续轮前 `peekNotifications()`，
+  无待处理通知就跳过并提示「无待处理的后台任务结果，跳过本次自动续轮」。
+  ⚠️ **必须让出一个宏任务再判断**：subagent 里 `bus.publish(completed)` 排在
+  `enqueueNotification()` **之前**，而 publish 会同步驱动 coordinator 的 barrier → 本函数 ——
+  同步 peek 会在通知入队前读到空队列而**误判空转**、把真正的结果吞掉。
+  REPL 与 TUI 共用 `createProcessLine`，一处改动两条链路同时生效。
+- **subagent 接上真 signal**（之前的真 bug）：超时只做了 `Promise.race`，
+  **没把 signal 传进 `query()` / `queryStream()`** —— 超时后上层放弃等待，底层仍在后台继续跑
+  （内部循环上线后可能几十步），白烧 token 并继续产生工具副作用。两处调用点已传
+  `controller.signal`（前台 `query` 的注释「agent.query 不接受 signal」已过时 —— S3 打通后它接受了）。
+- **swarm tick 防重叠**：`setInterval(tick, 1000)` + `void tick()` 不等待上一次结束。
+  单轮几秒时侥幸无碍，**自主多步后一次 tick 轻易超过 1s** ⇒ 每秒叠加一次新的子 Agent 查询。
+  已加 `running` 标志跳过重叠 tick —— 这比「给 tick 设总时长预算」更根本（预算是治标）。
+
+> ⚠️ **未做真实端到端验证**：本阶段的结论基于代码路径分析 + 单元测试（subagent 113 / swarm 65 全绿）。
+> 真实的 barrier 场景（派发后台任务 → 任务完成 → barrier → 续轮）需要在开着 coordinator 的
+> 实际会话里验证一次；我无法在这里构造真实后台任务。
+>
+> 📌 **需你决策的权衡（我没擅自改）**：subagent 默认超时 120s，而子 Agent 现在最多可自主跑
+> `AgentDefinition.maxSteps`（默认 30）步 —— 30 步很容易超过 120s 而被判超时。两个方向：
+> ① 给子 Agent 设更小的 `maxSteps`（任务聚焦，10 步左右通常足够）；
+> ② 调大 subagent 的超时。我倾向 ①（子 Agent 的职责是聚焦执行，不是长链探索）。
 
 ---
 

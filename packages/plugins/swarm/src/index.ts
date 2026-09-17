@@ -1513,6 +1513,8 @@ export function startTeammateLoop(
   const intervalMs = options?.intervalMs ?? 1000
   let timer: ReturnType<typeof setInterval> | undefined
   let stopped = false
+  /** 上一 tick 是否仍在执行（用于跳过重叠 tick） */
+  let running = false
 
   async function tick(): Promise<void> {
     if (stopped || state.status === 'shutdown') {
@@ -1520,7 +1522,16 @@ export function startTeammateLoop(
       if (timer) clearInterval(timer)
       return
     }
-    await runTeammateTick(state, deps).catch(() => undefined)
+    // 防重叠：`setInterval` 不会等待上一次 tick 结束。引擎内自主多步上线后，单次 tick
+    // （内部会跑一轮 query，可能多步、耗时数十秒）**很容易超过 intervalMs**，
+    // 于是每秒都会再叠加一次子 Agent 查询 —— 既烧 token 又让并发状态互相打架。
+    if (running) return
+    running = true
+    try {
+      await runTeammateTick(state, deps).catch(() => undefined)
+    } finally {
+      running = false
+    }
   }
 
   timer = setInterval(() => { void tick() }, intervalMs)

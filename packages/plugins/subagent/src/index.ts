@@ -745,6 +745,10 @@ export function createSubagentTool(
                 agentId: input.agentId,
                 message: effectivePromptBg,
                 model: input.model,
+                // 把超时信号真正传进去：否则 Promise.race 只是"上层放弃等待"，
+                // 底层 queryStream 仍在后台跑（内部循环上线后一次可能几十步，
+                // 白烧 token 并继续产生工具副作用）。S3 打通 signal 后这条链才闭环。
+                signal: controller.signal,
               })
               for await (const ev of stream) {
                 if (ev.type === 'tool_call_start') {
@@ -915,12 +919,15 @@ export function createSubagentTool(
       const effectivePrompt = directive ? `${directive}\n\n${input.prompt}` : input.prompt
 
       try {
-        // 注意：agent.query 不接受 signal，我们用 Promise.race 模拟超时
+        // signal 现在能真正透传（S3 打通了 core 的 tool/请求中断链）。
+        // 早先 query 不接受 signal，只能用 Promise.race 模拟超时 —— 那样超时后
+        // 底层仍在后台继续跑（内部循环上线后一次可能几十步），白白消耗 token 与工具副作用。
         const queryPromise = agent.query({
           sessionId: subSessionId,
           agentId: input.agentId,
           message: effectivePrompt,
           model: input.model,
+          signal: controller.signal,
         })
 
         const timeoutPromise = new Promise<never>((_resolve, reject) => {

@@ -3482,7 +3482,20 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     // 正常发送（流式）
     // 自动续轮（<continue/>）是系统注入的伪输入，不回显用户前缀
     const isAutoContinue = line === AUTO_CONTINUE_LINE
-    if (!isAutoContinue) {
+    if (isAutoContinue) {
+      // 空转识别：自动续轮的**唯一目的**是让模型看到后台任务结果（`<task-notification>`）。
+      // 没有任何待处理通知时，这一轮不会带来新信息 —— 白烧一次完整模型调用
+      // （内部循环上线后尤其明显：一轮可能是多步）。
+      //
+      // ⚠️ 必须先让出一个宏任务再 peek：subagent 里 `bus.publish(completed)` 排在
+      // `enqueueNotification()` **之前**，而 publish 会同步驱动 coordinator 的 barrier →
+      // 本函数。若在此同步读取，会在通知入队之前看到空队列而误判空转。
+      await new Promise((resolve) => setTimeout(resolve, 0))
+      if (harness.session.peekNotifications(current.id).length === 0) {
+        out('ℹ️  无待处理的后台任务结果，跳过本次自动续轮\n')
+        return 'continue'
+      }
+    } else {
       await options.onLine?.(line)
       out(`\n🧑  ${line}\n`)
     }

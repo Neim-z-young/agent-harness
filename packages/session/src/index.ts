@@ -630,4 +630,11 @@ export interface SessionManager {
    * 在 AgentRuntime.query 开始时调用，将通知作为 user-role 消息注入对话。
    */
   drainNotifications(sessionId: string): string[]
+  /**
+   * 只读查看待处理通知（**不消费**）。
+   *
+   * 用途：自动续轮（CLI 注入的 `<continue/>`）前判断"是否真有后台结果要处理" ——
+   * 没有待处理通知的续轮是纯空转，会白烧一次完整模型调用。
+   */
+  peekNotifications(sessionId: string): string[]
 }

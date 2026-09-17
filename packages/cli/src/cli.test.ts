@@ -19,6 +19,7 @@ import {
   resolveSecret,
   validateProviderConfigs,
   buildConfigOverview,
+  createProcessLine,
   checkCompressionConfig,
   resolveContextWindowTokens,
   buildCompactionOptions,
@@ -2210,6 +2211,64 @@ describe('Coordinator 自动续轮 attachAutoContinue', () => {
     detach()
 
     expect(injected).toEqual(['<continue/>'])
+    await app.shutdown()
+  })
+
+  /**
+   * 自动续轮（`<continue/>`）的空转识别。
+   *
+   * 内部循环上线后，一次自动续轮可能跑多步（每步都是一次模型调用），所以
+   * 「没有后台结果却仍续轮」的代价被放大了 —— 这类空转必须被识别出来。
+   */
+  it('自动续轮空转识别：无待处理通知时跳过，不发起查询', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+    const sess = await harness.session.create()
+
+    const out: string[] = []
+    const processLine = createProcessLine({
+      app, harness, session: sess, out: (s) => { out.push(s) },
+    })
+
+    const r = await processLine('<continue/>')
+
+    expect(r).toBe('continue')
+    expect(out.join('')).toContain('跳过本次自动续轮')
+    // 关键：确实没有发起模型调用
+    expect(out.join('')).not.toContain('hi')
+    await app.shutdown()
+  })
+
+  it('自动续轮：有待处理通知时正常执行（不误跳）', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: '汇总完成' },
+    })
+    const { harness } = await app.boot()
+    const sess = await harness.session.create()
+
+    harness.session.enqueueNotification(sess.id, '[task-notification] 后台任务已完成')
+
+    const out: string[] = []
+    const processLine = createProcessLine({
+      app, harness, session: sess, out: (s) => { out.push(s) },
+    })
+
+    await processLine('<continue/>')
+
+    expect(out.join('')).not.toContain('跳过本次自动续轮')
+    expect(out.join('')).toContain('汇总完成')
+    // 通知被消费（drain）掉了
+    expect(harness.session.peekNotifications(sess.id)).toEqual([])
     await app.shutdown()
   })
 
