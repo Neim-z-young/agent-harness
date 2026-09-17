@@ -1199,6 +1199,159 @@ export function findTokenOnlyDuplicates(providers: ResolvedProviderConfig[]): Ar
   return out
 }
 
+// ------------------------------------------------------------------------
+// 2.4 compression 配置校验（未知键 / 非法取值）
+// ------------------------------------------------------------------------
+
+/**
+ * 内核 `defaultConfig` 的合并尾部是 `{...base, ...overrides, 子树:{...}}` ⇒ **未知键被静默丢弃**；
+ * 而 `tokenCalibration` 走的是 `=== 'chars4' ? 旧口径 : 自动`，拼错会**静默降级到默认值 auto**
+ * （概览还照常显示"自动（CJK 感知）"，全无症状）。
+ *
+ * 后者的实际代价不是"少一行提示"而是**实验结论反向**：想用 `chars4` 做 A-B 对照组却写成
+ * `'chars/4'`，两组都跑 auto ⇒ 实测差 ≈ 0 ⇒ 得出"两个口径没差"，而真相是差约 4 倍。
+ *
+ * 下列白名单刻意写成 `Record<keyof X, true>` 而不是 `string[]`：内核字段新增 / 改名时**编译期即报错**，
+ * 白名单不会静默过期 —— 这是本函数能长期有效的唯一保证。
+ */
+const KERNEL_CONFIG_KEYS: Record<keyof import('acp-kernel').Config, true> = {
+  tiers: true,
+  nudge: true,
+  promotionThreshold: true,
+  truncate: true,
+  compress: true,
+  protectedTools: true,
+  isToolProtected: true,
+  preserveRecentMessages: true,
+  preserveRecentTokens: true,
+  modelContextLimit: true,
+  absorb: true,
+  messageFilters: true,
+}
+const KERNEL_TIER_KEYS: Record<keyof import('acp-kernel').TierConfig, true> = {
+  enabled: true,
+  tier2Trigger: true,
+  tier3Trigger: true,
+}
+const KERNEL_NUDGE_KEYS: Record<keyof import('acp-kernel').NudgeConfig, true> = {
+  maxContextLimitPct: true,
+  minContextLimitPct: true,
+  frequency: true,
+  iterationThreshold: true,
+  force: true,
+  growthRatio: true,
+  growthFloor: true,
+  growthCap: true,
+  minGrowthFloor: true,
+  minGrowthRatio: true,
+  emergencyThresholdPct: true,
+  tier2GrowthMultiplier: true,
+  minPressureBenefitTokens: true,
+}
+const KERNEL_COMPRESS_KEYS: Record<keyof import('acp-kernel').CompressValidationConfig, true> = {
+  minCompressRange: true,
+  maxSummaryLength: true,
+  minSummaryLength: true,
+}
+const KERNEL_TRUNCATE_KEYS: Record<keyof import('acp-kernel').TruncateConfig, true> = { threshold: true }
+const KERNEL_ABSORB_KEYS: Record<keyof import('acp-kernel').AbsorbConfig, true> = {
+  enabled: true,
+  toolName: true,
+  minToolTokens: true,
+  contextThresholdPct: true,
+  excludeTools: true,
+}
+const PROMPT_KEYS: Record<keyof import('acp-kernel').Prompts, true> = {
+  compressPhilosophy: true,
+  howToCompressRules: true,
+  tier2DistillRules: true,
+  tier3CondenseRules: true,
+}
+/** compression 顶层合法键（与 HarnessConfig.compression 一一对应） */
+const COMPRESSION_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>, true> = {
+  enabled: true,
+  autoTune: true,
+  tokenCalibration: true,
+  modelContextLimit: true,
+  prompts: true,
+  systemPrompt: true,
+  preserveRecentMessages: true,
+  preserveRecentTokens: true,
+  promotionThreshold: true,
+  tiers: true,
+  nudge: true,
+  config: true,
+  telemetry: true,
+}
+const COMPRESSION_TIER_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>['tiers'], true> = {
+  tier2Trigger: true,
+  tier3Trigger: true,
+}
+const COMPRESSION_NUDGE_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>['nudge'], true> = {
+  maxContextLimitPct: true,
+  minContextLimitPct: true,
+  emergencyThresholdPct: true,
+}
+const COMPRESSION_TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>['telemetry'], true> = {
+  enabled: true,
+}
+
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+}
+
+/** 收集 `obj` 里不属于 `allowed` 的键，返回 `[问题路径]`（空值/非对象视为无问题） */
+function collectUnknown(obj: unknown, allowed: Iterable<string>, path: string): string[] {
+  if (!isPlainObject(obj)) return []
+  const ok = new Set(allowed)
+  return Object.keys(obj)
+    .filter((k) => !ok.has(k))
+    .map((k) => `${path}.${k}`)
+}
+
+/**
+ * 校验 `config.json → compression`：未知键 + `tokenCalibration` 非法取值。
+ *
+ * 纯函数（无 IO），便于单测。返回**人类可读**的问题列表（空数组表示无问题）。
+ *
+ * 形参刻意标为 `unknown` 而不是 `HarnessConfig['compression']`：本函数存在的理由就是
+ * "config.json 由 `JSON.parse` 得来、形状完全不受编译期保护"。若标成结构化类型，反而会让
+ * 调用方误以为形状已被类型系统保证（TS 也**不会**拦住运行时的多余键，只拦字面量）。
+ *
+ * 检查深度只到"内核真正消费的那一层"：比 `config.nudge.xxx` 更深的键不报 ——
+ * 内核读的就是 `tiers` / `nudge` / `compress` / `truncate` / `absorb` 这几个子树本身，
+ * 越级的字段既不会被读取也没有默认值可言。
+ */
+export function checkCompressionConfig(c: unknown): string[] {
+  if (!isPlainObject(c)) return []
+  const out: string[] = []
+  const push = (paths: string[], tail: string): void => {
+    for (const p of paths) out.push(`compression${p} ${tail}`)
+  }
+
+  push(collectUnknown(c, Object.keys(COMPRESSION_KEYS), ''), '未被识别，该配置不会生效')
+  if (c.tokenCalibration !== undefined && c.tokenCalibration !== 'auto' && c.tokenCalibration !== 'chars4') {
+    out.push(
+      `compression.tokenCalibration 取值 ${JSON.stringify(c.tokenCalibration)} 未知（可选：auto / chars4），已按默认 auto 处理`,
+    )
+  }
+  push(collectUnknown(c.tiers, Object.keys(COMPRESSION_TIER_KEYS), '.tiers'), '未被识别，该配置不会生效')
+  push(collectUnknown(c.nudge, Object.keys(COMPRESSION_NUDGE_KEYS), '.nudge'), '未被识别，该配置不会生效')
+  push(collectUnknown(c.telemetry, Object.keys(COMPRESSION_TELEMETRY_KEYS), '.telemetry'), '未被识别，该配置不会生效')
+  push(collectUnknown(c.prompts, Object.keys(PROMPT_KEYS), '.prompts'), '不是 acp-kernel Prompts 的字段，该配置不会生效')
+
+  // config：高级透传，原样喂给内核 defaultConfig 的 overrides ⇒ 按内核 Config 形状校验
+  if (isPlainObject(c.config)) {
+    push(collectUnknown(c.config, Object.keys(KERNEL_CONFIG_KEYS), '.config'), '内核 Config 无此字段，该配置不会生效')
+    push(collectUnknown(c.config.tiers, Object.keys(KERNEL_TIER_KEYS), '.config.tiers'), '内核 TierConfig 无此字段，该配置不会生效')
+    push(collectUnknown(c.config.nudge, Object.keys(KERNEL_NUDGE_KEYS), '.config.nudge'), '内核 NudgeConfig 无此字段，该配置不会生效')
+    push(collectUnknown(c.config.compress, Object.keys(KERNEL_COMPRESS_KEYS), '.config.compress'), '内核 CompressValidationConfig 无此字段，该配置不会生效')
+    push(collectUnknown(c.config.truncate, Object.keys(KERNEL_TRUNCATE_KEYS), '.config.truncate'), '内核 TruncateConfig 无此字段，该配置不会生效')
+    push(collectUnknown(c.config.absorb, Object.keys(KERNEL_ABSORB_KEYS), '.config.absorb'), '内核 AbsorbConfig 无此字段，该配置不会生效')
+  }
+  return out
+}
+
 /** 配置概览（--check-config / /config 共用），apiKey 默认脱敏展示 */
 export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string): string {
   const lines: string[] = []
@@ -1215,6 +1368,13 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
       ? `上下文压缩（ACP）：启用 fitWindow=${acpWindow} · ${acpMode} · ${acpCaliber}${c.prompts ? ' · 自定义提示词' : ''}`
       : '上下文压缩（ACP）：未启用（config.json → compression.enabled: true 开启）'
   )
+  // compression 的未生效项：未知键被内核静默丢弃、tokenCalibration 拼错会静默降级到 auto，
+  // 两者都「看起来完全正常」，只能在概览/check 时显式比对白名单才发现（详见 checkCompressionConfig 注释）。
+  const compressionIssues = checkCompressionConfig(c)
+  if (compressionIssues.length) {
+    lines.push('上下文压缩（ACP）配置告警（下列项不会被应用）：')
+    for (const m of compressionIssues) lines.push(`  - ${m}`)
+  }
   const rawProviders = cfg.providers ?? []
   if (!rawProviders.length) {
     lines.push('providers：（未配置，使用内置 mock / anthropic）')
@@ -2001,6 +2161,16 @@ export class HarnessApp {
     // 上下文窗口推导优先级：compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 插件默认 200_000；
     // t1/t2/t3 阈值与层保留从结构化字段翻译进 kernel config。
     const compression = cfg.compression
+    // 未生效项告警（未知键被静默丢弃 / tokenCalibration 拼错静默降级）：
+    // 放在 enabled 判断之外 —— 开关关着时恰好是「照抄参数表却怎么也不生效」最常发生的场景。
+    const compressionIssues = checkCompressionConfig(compression)
+    if (compressionIssues.length) {
+      this.options.stdout?.write?.(
+        `[WARN] config.json → compression 有以下未生效项：\n` +
+          compressionIssues.map((m) => `       - ${m}`).join('\n') +
+          '\n',
+      )
+    }
     if (compression?.enabled) {
       const acp = await lazyImport<{ createAcpContextPlugin: (o?: any) => AgentPlugin }>('@harness/acp-context')
       const acpConfig: Record<string, unknown> = {

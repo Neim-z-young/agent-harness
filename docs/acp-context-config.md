@@ -958,9 +958,33 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 | `protectedTools` | [] |
 | `absorb.enabled` | false |
 
-## 10. 校验规则（kernel `validateConfig`）
+## 10. 校验规则
+
+### ① kernel `validateConfig`（违反即 boot 抛错）
 
 - `nudge.minContextLimitPct ≤ nudge.maxContextLimitPct ≤ nudge.emergencyThresholdPct`
 - `promotionThreshold ≥ 1`
 - `tiers.tier2Trigger ≥ 2`、`tiers.tier3Trigger ≥ 2`，且 `tier3Trigger > tier2Trigger`
 - 任一违反会抛配置错误（boot 报错而非静默）。
+
+### ② CLI 侧形状校验（写错键 / 写错取值 → **告警**，不阻断启动）
+
+`defaultConfig` 的合并尾部是 `{...base, ...overrides, 子树:{...}}` ⇒ **未知键被静默丢弃**；
+`tokenCalibration` 又是 `=== 'chars4' ? 旧口径 : 自动`，拼错会**静默降级到默认值 auto** ——
+两者都"看起来完全正常"（概览照常显示 `token 口径 自动（CJK 感知）`），必须显式比对白名单才能发现。
+
+现已接入 CLI 校验（`checkCompressionConfig`），启动时打印、`--check-config` 与 `/config` 概览里展示：
+
+```
+[WARN] config.json → compression 有以下未生效项：
+       - compression.preserveRecentToken 未被识别，该配置不会生效
+       - compression.tokenCalibration 取值 "chars/4" 未知（可选：auto / chars4），已按默认 auto 处理
+       - compression.nudge.growthFloar 未被识别，该配置不会生效
+```
+
+- **校验范围**：`compression` 顶层 / `tiers` / `nudge` / `telemetry` / `prompts`，
+  以及高级透传 `config` 的 `config.tiers` / `config.nudge` / `config.compress` / `config.truncate` / `config.absorb`。
+- **不阻断**：这是告警不是错误，`--check-config` 的退出码不受影响（只有 providers 的错误才返回 1）。
+- **白名单不过期**：用 `Record<keyof 内核类型, true>` 书写，内核增删/改名时**编译期即报错**。
+- ⚠️ 最典型的踩法：照抄 §7.5 参数表时把 `preserveRecentTokens` 写成单数、把 `tokenCalibration: "chars4"`
+  写成 `"chars/4"` —— 前者完全不生效，后者会把 A-B 对照实验跑成"两组都是 auto"（实测差 ≈ 0 ⇒ 结论反向）。

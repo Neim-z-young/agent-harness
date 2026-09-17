@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveWorkspace, createWorkspaceOriginalStore } from '@harness/workspace'
 import type { Message } from '@harness/session'
+import type { HarnessConfig } from './index'
 import {
   parseCliArgs,
   SessionFileStore,
@@ -18,6 +19,7 @@ import {
   resolveSecret,
   validateProviderConfigs,
   buildConfigOverview,
+  checkCompressionConfig,
   registerBuiltinProviderTypes,
   getBuiltinRegistry,
   getBuiltinToolRegistry,
@@ -357,6 +359,76 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
       'mock',
     )
     expect(legacy).toInclude('token 口径 chars/4（旧）')
+  })
+
+  it('checkCompressionConfig：合法配置（含全部可选键）零告警', () => {
+    // 全键写满是"白名单本身正确"的守卫：任何一处白名单漏列合法键，这条就会误报
+    expect(
+      checkCompressionConfig({
+        enabled: true,
+        autoTune: true,
+        tokenCalibration: 'chars4',
+        modelContextLimit: 300_000,
+        systemPrompt: 'x',
+        prompts: { compressPhilosophy: 'a', howToCompressRules: 'b', tier2DistillRules: 'c', tier3CondenseRules: 'd' },
+        preserveRecentMessages: 5,
+        preserveRecentTokens: 50_000,
+        promotionThreshold: 5,
+        tiers: { tier2Trigger: 5, tier3Trigger: 10 },
+        nudge: { maxContextLimitPct: 0.75, minContextLimitPct: 0.45, emergencyThresholdPct: 0.95 },
+        telemetry: { enabled: false },
+        config: {
+          truncate: { threshold: 0.95 },
+          compress: { minCompressRange: 200_000, maxSummaryLength: 20_000, minSummaryLength: 50 },
+          protectedTools: ['x'],
+          absorb: { enabled: true, toolName: 'absorb', minToolTokens: 1_000, contextThresholdPct: 0, excludeTools: [] },
+          nudge: {
+            maxContextLimitPct: 0.75, minContextLimitPct: 0.45, frequency: 5, iterationThreshold: 15,
+            force: 'soft', growthRatio: 0, growthFloor: 75_000, growthCap: 75_000,
+            minGrowthFloor: 75_000, minGrowthRatio: 0, emergencyThresholdPct: 0.95,
+            tier2GrowthMultiplier: 1.5, minPressureBenefitTokens: 0,
+          },
+          tiers: { enabled: true, tier2Trigger: 5, tier3Trigger: 10 },
+        },
+      }),
+    ).toEqual([])
+    // 空 / undefined 也不应产生任何输出（否则每次概览都会挂一行空标题）
+    expect(checkCompressionConfig(undefined)).toEqual([])
+    expect(checkCompressionConfig({})).toEqual([])
+  })
+
+  it('checkCompressionConfig：拼错的键一律被抓出（否则会被内核静默丢弃）', () => {
+    const issues = checkCompressionConfig({
+      enabled: true,
+      preserveRecentToken: 50_000,          // 少个 s —— 照抄参数表最典型的错法
+      tokenCalibration: 'chars/4',          // 取值拼错
+      nudge: { growthFloar: 75_000 },       // 结构化字段里拼错
+      tiers: { tier2trigger: 5 },           // 大小写错（内核是 camelCase）
+      config: {
+        preserveRecentToken: 50_000,        // 高级透传里同样的错
+        nudge: { minGrowthFloar: 75_000 },
+      },
+    })
+    expect(issues).toContain('compression.preserveRecentToken 未被识别，该配置不会生效')
+    expect(issues).toContain(
+      'compression.tokenCalibration 取值 "chars/4" 未知（可选：auto / chars4），已按默认 auto 处理',
+    )
+    expect(issues).toContain('compression.nudge.growthFloar 未被识别，该配置不会生效')
+    expect(issues).toContain('compression.tiers.tier2trigger 未被识别，该配置不会生效')
+    expect(issues).toContain('compression.config.preserveRecentToken 内核 Config 无此字段，该配置不会生效')
+    expect(issues).toContain('compression.config.nudge.minGrowthFloar 内核 NudgeConfig 无此字段，该配置不会生效')
+    expect(issues.length).toBe(6)
+  })
+
+  it('buildConfigOverview：未生效项作为告警行输出，且不影响原有概览内容', () => {
+    // 必须绕开结构类型：多余的属性正是本用例要模拟的脏数据（真实来源是被 JSON.parse 的 config.json）
+    const dirty = { model: 'm', compression: { enabled: true, preserveRecentToken: 50_000 } } as unknown as HarnessConfig
+    const bad = buildConfigOverview(dirty, 'mock')
+    expect(bad).toInclude('上下文压缩（ACP）：启用')
+    expect(bad).toInclude('preserveRecentToken 未被识别')
+    // 干净配置不应多出告警标题段
+    const clean = buildConfigOverview({ model: 'm', compression: { enabled: true } }, 'mock')
+    expect(clean).not.toContain('配置告警')
   })
 })
 
