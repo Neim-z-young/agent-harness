@@ -332,6 +332,20 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(on).toInclude('fitWindow=300000')
     expect(on).toInclude('自定义提示词')
   })
+
+  it('buildConfigOverview：区分 autoTune 自动适配 / 原始参数两种控制方式', () => {
+    // 默认（未写 autoTune）：原始压缩参数控制
+    const manual = buildConfigOverview({ model: 'm', compression: { enabled: true } }, 'mock')
+    expect(manual).toInclude('原始压缩参数控制')
+    expect(manual).not.toInclude('按窗口自动适配参数')
+    // autoTune: true：按窗口自动适配
+    const auto = buildConfigOverview(
+      { model: 'm', compression: { enabled: true, autoTune: true, modelContextLimit: 1000000 } },
+      'mock',
+    )
+    expect(auto).toInclude('按窗口自动适配参数')
+    expect(auto).toInclude('fitWindow=1000000')
+  })
 })
 
 describe('ProviderTypeRegistry / 插件化扩展', () => {
@@ -1012,6 +1026,46 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     expect(saved.compression.tiers.tier2Trigger).toBe(3)
     expect(saved.compression.nudge.maxContextLimitPct).toBe(0.25)
     await app.shutdown()
+  })
+
+  it('compression.autoTune：装配不报错，且与原始参数模式可切换（窗口取自 Provider contextWindowTokens）', async () => {
+    const stdout = { write: () => {} }
+    const dataDir = join(dir, '.harness')
+    mkdirSync(dataDir, { recursive: true })
+    writeFileSync(
+      join(dataDir, 'config.json'),
+      JSON.stringify({
+        provider: 'my-gw',
+        providers: [{ id: 'my-gw', type: 'openai', baseUrl: 'http://gw', apiKey: 'gw-key', contextWindowTokens: 128000 }],
+        compression: { enabled: true, autoTune: true },
+      }, null, 2),
+    )
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'my-gw',
+      permissionMode: 'allow-all', stdout,
+    })
+    const { harness } = await app.boot()
+    expect(app.pluginRegistry.get('context.acp')).toBeDefined()
+    expect(harness).toBeDefined()
+    await app.shutdown()
+
+    // 切回原始参数模式（autoTune 置 false）：同样能正常装配
+    writeFileSync(
+      join(dataDir, 'config.json'),
+      JSON.stringify({
+        provider: 'my-gw',
+        providers: [{ id: 'my-gw', type: 'openai', baseUrl: 'http://gw', apiKey: 'gw-key', contextWindowTokens: 128000 }],
+        compression: { enabled: true, autoTune: false, preserveRecentTokens: 4000, nudge: { maxContextLimitPct: 0.25 } },
+      }, null, 2),
+    )
+    const app2 = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'my-gw',
+      permissionMode: 'allow-all', stdout,
+    })
+    const boot2 = await app2.boot()
+    expect(app2.pluginRegistry.get('context.acp')).toBeDefined()
+    expect(boot2.harness).toBeDefined()
+    await app2.shutdown()
   })
 
   it('startRepl 脚本模式：发送 prompt + /sessions + /new + /save + /exit 正常', async () => {

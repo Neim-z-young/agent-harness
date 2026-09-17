@@ -306,6 +306,14 @@ export interface HarnessConfig {
     /** 是否启用 ACP 上下文压缩（默认 false）。 */
     enabled?: boolean
     /**
+     * 按上下文窗口自动推导 compression/nudge 参数（默认 false = 用下面的原始参数控制）。
+     *
+     * 开启后 `preserveRecentTokens` / `nudge.*` / `compress.minCompressRange` 会按
+     * `modelContextLimit` 推导（见 docs/acp-context-config.md §7.4）；**显式写出**的字段
+     * 仍优先覆盖推导值，故可「自动打底 + 手工钉一两个键」。
+     */
+    autoTune?: boolean
+    /**
      * 模型上下文窗口（输入 tokens）显式覆盖。缺省时按「当前默认 Provider 的
      * providers[].contextWindowTokens → 插件默认 200_000」推导。
      */
@@ -1187,9 +1195,13 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   lines.push(`默认 provider：${cfg.provider ?? defaultProviderId}`)
   if (cfg.model) lines.push(`默认 model：${cfg.model}`)
   const c = cfg.compression
+  const acpWindow = c?.modelContextLimit ?? 200000
+  const acpMode = c?.autoTune
+    ? `按窗口自动适配参数（autoTune，窗口 ${acpWindow}）`
+    : `原始压缩参数控制（autoTune 关闭）`
   lines.push(
     c?.enabled
-      ? `上下文压缩（ACP）：启用 fitWindow=${c.modelContextLimit ?? 200000}${c.prompts ? ' · 自定义提示词' : ''}`
+      ? `上下文压缩（ACP）：启用 fitWindow=${acpWindow} · ${acpMode}${c.prompts ? ' · 自定义提示词' : ''}`
       : '上下文压缩（ACP）：未启用（config.json → compression.enabled: true 开启）'
   )
   const rawProviders = cfg.providers ?? []
@@ -2007,6 +2019,8 @@ export class HarnessApp {
         systemPrompt: compression.systemPrompt,
         prompts: compression.prompts as any,
         config: acpConfig as any,
+        // autoTune：按窗口推导 compression/nudge 参数（显式字段仍优先，见 compression.autoTune 注释）
+        autoTune: compression.autoTune === true,
         telemetryEnabled,
         telemetryPathBuilder: telemetryEnabled
           ? (sessionId: string) => join(sessionsDir, `${sessionId}.telemetry.jsonl`)

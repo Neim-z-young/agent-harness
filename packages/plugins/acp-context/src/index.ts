@@ -51,6 +51,7 @@ import {
   baseId,
   safeString,
 } from './adapter.js'
+import { applyAutoTune, describeAutoTune, type LooseAcpConfig } from './auto-tune.js'
 import { loadPromptFiles } from './prompts.js'
 import {
   createWriter as createTelemetryWriter,
@@ -151,8 +152,14 @@ export interface AcpStatusOutput {
 export interface AcpContextPluginOptions {
   /** 模型上下文窗口（tokens）。默认 200_000。 */
   modelContextLimit?: number
-  /** 覆盖 kernel 的默认 config（tiers / nudge / protectedTools 等） */
-  config?: Partial<AcpConfig>
+  /** 覆盖 kernel 的默认 config（tiers / nudge / protectedTools 等）。嵌套对象可只给部分字段。 */
+  config?: LooseAcpConfig
+  /**
+   * 按模型上下文窗口**自动推导** compression/nudge 参数（默认 false = 用 `config` 里的原始值）。
+   * 推导规则见 `./auto-tune.ts`。开启后 `config` 里**显式写出**的键仍然优先覆盖推导值，
+   * 因此可以「自动打底 + 手工钉一两个键」。
+   */
+  autoTune?: boolean
   /** 内置 ACP 工具名（默认全部注入，可用其中的子集） */
   toolIds?: Array<'compress' | 'decompress' | 'search_context' | 'acp_status'>
   /**
@@ -213,12 +220,30 @@ interface AcpSessionCtx {
 // ========================================================================
 
 /**
+ * 由 `modelContextLimit` + 用户 config 求解最终内核 config。
+ *
+ * `autoTune` 为真时先用 `applyAutoTune` 按窗口推导一套参数作为**底**，用户显式写出的键
+ * 覆盖在其上；为假时完全按用户 config（缺省回落 kernel 默认值）。
+ * 抽成纯函数便于单测与诊断（`describeAutoTune` 可打印推导摘要）。
+ */
+export function resolveAcpConfig(
+  modelContextLimit: number,
+  userConfig?: LooseAcpConfig,
+  autoTune?: boolean,
+): AcpConfig {
+  const effective: LooseAcpConfig = autoTune
+    ? applyAutoTune(modelContextLimit, userConfig ?? {})
+    : (userConfig ?? {})
+  return defaultConfig(modelContextLimit, effective as Partial<AcpConfig>)
+}
+
+/**
  * 创建 ACP 上下文压缩插件。
  * 每轮通过 session.preModel 运行 acp-kernel 的 processTurn，并注入 4 个模型驱动工具。
  */
 export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): AgentPlugin {
   const modelContextLimit = options.modelContextLimit ?? 200_000
-  const config = defaultConfig(modelContextLimit, options.config)
+  const config = resolveAcpConfig(modelContextLimit, options.config, options.autoTune)
   // 提示词：默认来自插件目录 prompts/*.txt（可本地编辑），config 传入的 prompts 覆盖在其上，
   // systemPrompt 整段覆盖为最高优先级。nudge 渲染与本轮压缩系统提示保持一致。
   const filePrompts = loadPromptFiles()
@@ -453,7 +478,15 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     name: 'ACP 上下文压缩',
     description: '模型驱动 3 层 LSM 上下文压缩（基于 acp-kernel）',
     async install(plgCtx) {
-      plgCtx.log.info('ACP 上下文压缩插件已加载', { modelContextLimit })
+      plgCtx.log.info('ACP 上下文压缩插件已加载', {
+        modelContextLimit,
+        autoTune: options.autoTune === true,
+        // autoTune 关闭时为 undefined，日志里不会出现该键
+        autoTuneParams: options.autoTune ? describeAutoTune(modelContextLimit) : undefined,
+        preserveRecentTokens: config.preserveRecentTokens,
+        growthFloor: config.nudge?.growthFloor,
+        minCompressRange: config.compress?.minCompressRange,
+      })
 
       return {
         async 'tool.pool.assemble'(_input, pool) {
