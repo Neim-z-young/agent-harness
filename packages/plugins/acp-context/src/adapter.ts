@@ -18,7 +18,16 @@ import {
   type MessageContentType,
   type TokenCountFn,
 } from 'acp-kernel'
-import type { Message, Part, ToolCallPart, TextPart } from '@harness/session'
+import type {
+  Message,
+  Part,
+  ToolCallPart,
+  TextPart,
+  ReasoningPart,
+  FilePart,
+  ImagePart,
+  PatchPart,
+} from '@harness/session'
 
 const SEP = '#'
 
@@ -56,10 +65,10 @@ function renderText(m: Message): string {
   const parts: string[] = []
   for (const p of m.parts) {
     if (p.type === 'text') parts.push((p as TextPart).text)
-    else if (p.type === 'reasoning') parts.push(`<reasoning>\n${(p as any).text ?? ''}`)
-    else if (p.type === 'file') parts.push(`[file: ${(p as any).path ?? 'inline'}]`)
-    else if (p.type === 'image') parts.push(`[image: ${(p as any).path ?? 'inline'}]`)
-    else if (p.type === 'patch') parts.push(`[patch: ${(p as any).path ?? 'unknown'}]`)
+    else if (p.type === 'reasoning') parts.push(`<reasoning>\n${(p as ReasoningPart).text ?? ''}`)
+    else if (p.type === 'file') parts.push(`[file: ${(p as FilePart).path ?? 'inline'}]`)
+    else if (p.type === 'image') parts.push(`[image: ${(p as ImagePart).path ?? 'inline'}]`)
+    else if (p.type === 'patch') parts.push(`[patch: ${(p as PatchPart).path ?? 'unknown'}]`)
     else parts.push(`[${p.type ?? 'part'}]`)
   }
   return parts.join('\n')

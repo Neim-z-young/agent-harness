@@ -273,9 +273,9 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const engine = createCore({ countTokens })
 
-  const allowToolIds = new Set(options.toolIds)
+  const allowToolIds = new Set<string>(options.toolIds)
   const want = (id: string): boolean =>
-    !options.toolIds || options.toolIds.length === 0 || allowToolIds.has(id as any)
+    !options.toolIds || options.toolIds.length === 0 || allowToolIds.has(id)
 
   // 会话级上下文（进程内）
   const sessions = new Map<string, AcpSessionCtx>()
@@ -351,7 +351,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             const ev = buildCompressEvent({
               sessionId: ctx.sessionId,
               round: sctx.round ?? 0,
-              window: (config as any).modelContextLimit ?? 0,
+              window: config.modelContextLimit,
               state: applied.state,
               result: applied.result,
               ranges: ranges.map((r) => ({ topic: r.topic, chars: 0 })),
@@ -685,7 +685,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     const ev = buildPreModelEvent({
       sessionId,
       round: ctx.round,
-      config: config as any,
+      config,
       state: res.state,
       prevRequestCores: ctx.prevRequestCores,
       inflatCores: inflat.cores,
