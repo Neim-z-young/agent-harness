@@ -23,6 +23,7 @@
  */
 
 import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
+import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
@@ -532,6 +533,8 @@ export class OpenAIChatProvider implements ChatProvider {
           total: parsed.usage.total_tokens,
           ...(parsed.usage.prompt_tokens_details?.cached_tokens != null ? { cacheRead: parsed.usage.prompt_tokens_details.cached_tokens } : {}),
         },
+        finish: normalizeFinishReason(choice.finish_reason),
+        ...(choice.finish_reason ? { finishRaw: choice.finish_reason } : {}),
         raw: parsed,
       }
     } finally {
@@ -635,6 +638,8 @@ export class OpenAIChatProvider implements ChatProvider {
       let buf = ''
       let modelOut: string | undefined
       let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number } | undefined
+      // 原生 finish_reason（流中间帧为 null，只记最后一次非空值 —— 末帧才是终态）
+      let finishRaw: string | undefined
 
       // tool_calls 增量累积状态：index → { id?, name?, argsBuf }
       const toolCallState: Map<number, { id?: string; name?: string; argsBuf: string; started: boolean }> = new Map()
@@ -735,6 +740,11 @@ export class OpenAIChatProvider implements ChatProvider {
                 }
               }
             }
+
+            // 记录终态 finish（中间帧为 null，只覆盖非空值）
+            if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+              finishRaw = choice.finish_reason
+            }
           }
         }
       }
@@ -754,6 +764,8 @@ export class OpenAIChatProvider implements ChatProvider {
         type: 'done',
         model: modelOut ?? (params.modelId ?? this.config.defaultModel),
         tokenUsage,
+        finish: normalizeFinishReason(finishRaw),
+        ...(finishRaw ? { finishRaw } : {}),
       }
     } finally {
       if (timer) clearTimeout(timer)

@@ -4,7 +4,7 @@
 >
 > 调研基准：`reference/claude-code-analysis-main`（Claude Code 反编译源码）、`reference/opencode-dev`（Opencode 开源源码）。
 >
-> 状态：**计划阶段，未动码**。所有改造点均已定位到具体文件行号。
+> 状态：**S0 已完成并提交，S1 待启动**。所有改造点均已定位到具体文件行号。
 
 ---
 
@@ -125,7 +125,7 @@ swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每个 ti
 
 | # | 阻塞点 | 位置 | 现状 |
 |---|---|---|---|
-| P0 | **finish reason 未透传** | `ChatCompletionOutput` core:378 | provider 层**已有**该数据但未暴露 |
+| ~~P0~~ | ~~**finish reason 未透传**~~ | `ChatCompletionOutput` | ✅ **S0 已解决**（`finish` + `finishRaw` 已贯穿 provider → core → 流式事件） |
 | P1 | `_prepareQuery` 每轮重跑 | core:1519-1636 | 循环内重复组装 system/hooks/工具池 |
 | P1 | barrier 与内部循环语义重叠 | coordinator:493 + cli:2740 | 可能双重续轮 |
 | P2 | abort 是空壳 | core:1503 / 1778 | `new AbortController().signal` 每次新建 |
@@ -188,12 +188,21 @@ async *queryStream(input) {
 
 ### 各阶段任务
 
-**S0 — finish reason 透传（零行为变化）**
+**S0 — finish reason 透传（零行为变化）** ✅ 已完成
 
-- `ChatCompletionOutput` 加 `finish?: 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'error'`
-- 6 个 provider 补齐映射：anthropic / openai / gemini / glm / qwen / mock
-- `ChatStreamChunk` 的 `done` 类型补 `finish`
-- 验收：全仓 typecheck 0 错误 + 全部既有测试通过；`finish` 为可选字段 ⇒ 不改任何分支行为
+- `ChatFinishReason` 联合类型 + `normalizeFinishReason()` 映射（`core/src/index.ts`；含 `'unknown'`，
+  缺失/未知值**不落** `'stop'` —— "没有 finish 信息"与"模型明确结束"是两件事）
+- `ChatCompletionOutput` / `ChatStreamChunk(done)` / `AgentStreamEvent(done)` 三处加 `finish` + `finishRaw`
+- Provider 侧补映射：**实际只改 4 处**——`provider-glm` / `provider-qwen` 复用 `OpenAIChatProvider`，
+  改了 openai 即自动覆盖；另有 anthropic（`message_delta.stop_reason`）、gemini（`candidate.finishReason`）、
+  mock（按有无 toolCalls 推导）
+- 验收：全仓 typecheck 0 错误；core 55 / cli 330 / 6 个 provider 全绿；新增 11 例测试
+  （映射定值 7 + core 端到端透传 4）；真实网关（本地 8787 / hy3）实测 `finish=stop finishRaw="stop"`
+
+> ⚠️ **S1 必须知道的语义**：`finish` 与「本轮有工具调用」**并不互斥**。Gemini 在返回 `functionCall`
+> 时 `finishReason` 仍是 `STOP`（已由 `provider-gemini/src/index.test.ts` 断言固定）。所以续轮判定
+> 必须是 **finish 与 toolCalls 的合取**：`toolCalls 非空 ⇒ 续轮`，`toolCalls 为空且 finish ∈ {stop,length,content_filter} ⇒ 终止`；
+> 只看 finish 会在 Gemini 上直接退化成单轮（改造白做），只看 toolCalls 则无法区分 length/error 的异常终止。
 
 **S1 — `maxSteps=1` 循环骨架（证明等价）**
 
@@ -251,7 +260,8 @@ async *queryStream(input) {
 
 ## 六、验收清单
 
-- [ ] S0：typecheck 全绿、既有测试全通过、`finish` 字段可选 ⇒ 零行为变化已验证
+- [x] S0：typecheck 全绿、既有测试全通过、`finish` 字段可选 ⇒ 零行为变化已验证
+  （core 55 / cli 330 / provider 6 包全绿；真实网关实测 finish 正确解析）
 - [ ] S1：S0 与 S1 在相同输入下输出**逐事件等价**（mock provider 对比）
 - [ ] S2：连续多步工具链能自主跑完；doom-loop 在第 3 次被拦；步数到顶注入收尾提示
 - [ ] S3：循环中途中断能在步边界停下且状态完整

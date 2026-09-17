@@ -182,6 +182,10 @@ export class MockChatProvider implements ChatProvider {
     }
     if (reasoning) output.reasoning = reasoning
     if (toolCalls && toolCalls.length > 0) output.toolCalls = toolCalls
+    // 对齐真实 Provider 语义：有工具调用 ⇒ 因工具调用结束（tool_calls），否则自然结束（stop）。
+    // 引擎的 agentic loop 依赖这个字段决定是否续轮，mock 若不给就会退化成"finish 缺失"的路径，
+    // 测不到主流程。
+    output.finish = toolCalls && toolCalls.length > 0 ? 'tool_calls' : 'stop'
     return output
   }
 
@@ -261,6 +265,8 @@ export class MockChatProvider implements ChatProvider {
         ...(tokenUsage.cacheRead != null ? { cacheRead: tokenUsage.cacheRead } : {}),
         ...(tokenUsage.cacheWrite != null ? { cacheWrite: tokenUsage.cacheWrite } : {}),
       },
+      // 与 complete() 同一套语义（见该处注释）
+      finish: toolCalls && toolCalls.length > 0 ? 'tool_calls' : 'stop',
     }
   }
 

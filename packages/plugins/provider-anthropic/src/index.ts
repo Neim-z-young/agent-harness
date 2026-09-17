@@ -23,6 +23,7 @@
  */
 
 import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
+import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
@@ -414,6 +415,8 @@ export class AnthropicChatProvider implements ChatProvider {
           ...(parsed.usage.cache_read_input_tokens != null ? { cacheRead: parsed.usage.cache_read_input_tokens } : {}),
           ...(parsed.usage.cache_creation_input_tokens != null ? { cacheWrite: parsed.usage.cache_creation_input_tokens } : {}),
         },
+        finish: normalizeFinishReason(parsed.stop_reason),
+        ...(parsed.stop_reason ? { finishRaw: parsed.stop_reason } : {}),
         raw: parsed,
       }
     } finally {
@@ -538,6 +541,8 @@ export class AnthropicChatProvider implements ChatProvider {
       let buf = ''
       let modelOut: string | undefined
       let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number; cacheWrite?: number } | undefined
+      // 原生 stop_reason（`message_start` 里为 null，终值随 `message_delta` 到达）
+      let finishRaw: string | undefined
       // 当前 content block 的 index → 类型映射
       const blockTypes: Map<number, 'text' | 'tool_use'> = new Map()
 
@@ -608,6 +613,10 @@ export class AnthropicChatProvider implements ChatProvider {
                   tokenUsage.output = u.output_tokens ?? tokenUsage.output
                   tokenUsage.total = tokenUsage.input + tokenUsage.output
                 }
+                // 终态 stop_reason 随 message_delta 到达（message_start 里是 null）
+                if (typeof json.delta?.stop_reason === 'string' && json.delta.stop_reason) {
+                  finishRaw = json.delta.stop_reason
+                }
                 break
               }
               case 'message_stop': {
@@ -635,6 +644,8 @@ export class AnthropicChatProvider implements ChatProvider {
         type: 'done',
         model: modelOut ?? model,
         tokenUsage,
+        finish: normalizeFinishReason(finishRaw),
+        ...(finishRaw ? { finishRaw } : {}),
       }
     } finally {
       if (timer) clearTimeout(timer)

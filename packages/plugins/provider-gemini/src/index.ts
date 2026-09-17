@@ -28,6 +28,7 @@
  */
 
 import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
+import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
@@ -463,6 +464,8 @@ export class GeminiChatProvider implements ChatProvider {
               ...(usage.cachedContentTokenCount != null ? { cacheRead: usage.cachedContentTokenCount } : {}),
             }
           : undefined,
+        finish: normalizeFinishReason(candidate.finishReason),
+        ...(candidate.finishReason ? { finishRaw: candidate.finishReason } : {}),
         raw: parsed,
       }
     } finally {
@@ -569,6 +572,8 @@ export class GeminiChatProvider implements ChatProvider {
       const pendingToolCalls: Map<string, { id: string; name: string; args: unknown }> = new Map()
       // 是否已看到 candidate.finishReason（= 模型生成已结束）
       let sawFinishReason = false
+      // 原生 finishReason（大写，如 STOP / MAX_TOKENS / SAFETY / MALFORMED_FUNCTION_CALL）
+      let finishRaw: string | undefined
 
       // Gemini 的 SSE **没有** OpenAI 的 `data: [DONE]` 终止帧，结束只能靠
       // `candidate.finishReason` 判定。真实端点会在末帧后关闭连接，但自建网关/代理
@@ -643,7 +648,10 @@ export class GeminiChatProvider implements ChatProvider {
             const candidate = json.candidates?.[0]
             if (!candidate) continue
             // finishReason 出现即代表生成结束（STOP / MAX_TOKENS / SAFETY…）
-            if (candidate.finishReason) sawFinishReason = true
+            if (candidate.finishReason) {
+              sawFinishReason = true
+              finishRaw = candidate.finishReason
+            }
 
             for (const p of candidate.content.parts) {
               if ('text' in p && p.text) {
@@ -675,6 +683,8 @@ export class GeminiChatProvider implements ChatProvider {
         type: 'done',
         model: modelOut ?? model,
         tokenUsage,
+        finish: normalizeFinishReason(finishRaw),
+        ...(finishRaw ? { finishRaw } : {}),
       }
     } finally {
       if (timer) clearTimeout(timer)

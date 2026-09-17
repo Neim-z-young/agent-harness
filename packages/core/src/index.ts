@@ -383,6 +383,84 @@ export interface TokenUsage {
   cacheWrite?: number
 }
 
+/**
+ * 模型结束原因（跨 Provider **规范化后**的取值）。
+ *
+ * 各家原生值域不同（Anthropic `end_turn`/`tool_use`/`max_tokens`、OpenAI `stop`/`tool_calls`/
+ * `length`/`content_filter`、Gemini 大写 `STOP`/`SAFETY`/`MALFORMED_FUNCTION_CALL`…），
+ * 引擎只认这一套；原生值保留在 `finishRaw`，便于排障与新增枚举排查。
+ *
+ * 用途：agentic loop 的退出判定（`stop`/`length`/`content_filter` ⇒ 本轮即终点；
+ * `tool_calls` ⇒ 需回喂工具结果续轮）。
+ */
+export type ChatFinishReason =
+  /** 自然结束（本轮无待执行的工具调用） */
+  | 'stop'
+  /** 因工具调用而结束（工具结果需回喂后继续） */
+  | 'tool_calls'
+  /** 触达输出长度上限，内容被截断 */
+  | 'length'
+  /** 被内容安全策略拦截 */
+  | 'content_filter'
+  /** Provider 侧异常结束 */
+  | 'error'
+  /** 原生值不在已知集合内（语义未定，勿据此做退出判定） */
+  | 'unknown'
+
+/**
+ * 原生 finish 值 → 规范化 {@link ChatFinishReason} 的映射表。
+ *
+ * 键一律**小写**（比较前对原生值做 trim + toLowerCase），故 `STOP` / `stop` / `' stop '`
+ * 都能命中。表里没有的值落 `'unknown'` 而非猜一个近义项 —— 猜错会让循环提前退出或空转。
+ */
+export const FINISH_REASON_MAP: Readonly<Record<string, ChatFinishReason>> = {
+  // 自然结束
+  stop: 'stop',
+  end_turn: 'stop',
+  stop_sequence: 'stop',
+  eos: 'stop',
+  end: 'stop',
+  complete: 'stop',
+  // 工具调用
+  tool_calls: 'tool_calls',
+  tool_use: 'tool_calls',
+  function_call: 'tool_calls',
+  function_calls: 'tool_calls',
+  // 触达上限
+  length: 'length',
+  max_tokens: 'length',
+  max_output_tokens: 'length',
+  token_limit: 'length',
+  // 内容安全
+  content_filter: 'content_filter',
+  safety: 'content_filter',
+  recitation: 'content_filter',
+  blocklist: 'content_filter',
+  prohibited_content: 'content_filter',
+  spii: 'content_filter',
+  image_safety: 'content_filter',
+  // 异常
+  error: 'error',
+  malformed_function_call: 'error',
+  failed: 'error',
+  cancelled: 'error',
+  timeout: 'error',
+}
+
+/**
+ * 把 Provider 原生 finish 值规范化为 {@link ChatFinishReason}。
+ *
+ * 纯函数、无副作用；`null` / `undefined` / 空串 / 未知值一律返回 `'unknown'`
+ * （**不是** `'stop'` —— "没有 finish 信息"与"模型明确表示结束"是两件事，
+ * 前者只能靠 toolCalls 是否为空来判断，不能被误当成终点）。
+ */
+export function normalizeFinishReason(raw: string | null | undefined): ChatFinishReason {
+  if (typeof raw !== 'string') return 'unknown'
+  const key = raw.trim().toLowerCase()
+  if (!key) return 'unknown'
+  return FINISH_REASON_MAP[key] ?? 'unknown'
+}
+
 /** LLM 完成消息（文本或流式） */
 export interface ChatCompletionOutput {
   /** 文本内容 */
@@ -399,6 +477,13 @@ export interface ChatCompletionOutput {
   model?: string
   /** token 统计 */
   tokenUsage?: TokenUsage
+  /**
+   * 结束原因（规范化）。缺失表示该 Provider 未提供此信息 —— 循环退出判定此时
+   * 必须回退到「toolCalls 是否为空」，不能把缺失当作 `'stop'`。
+   */
+  finish?: ChatFinishReason
+  /** Provider 原生 finish 值（如 `end_turn` / `tool_calls` / `STOP`），仅用于排障 */
+  finishRaw?: string
   /** 原始响应，透传给插件 */
   raw?: unknown
 }
@@ -426,6 +511,10 @@ export interface ChatStreamChunk {
   model?: string
   /** done 时的 token 统计 */
   tokenUsage?: TokenUsage
+  /** done 时的结束原因（规范化），语义同 ChatCompletionOutput.finish */
+  finish?: ChatFinishReason
+  /** done 时的 Provider 原生 finish 值，仅用于排障 */
+  finishRaw?: string
   /** done 时的原始响应 */
   raw?: unknown
 }
@@ -446,6 +535,13 @@ export interface AgentStreamEvent {
   isError?: boolean
   /** done 时的最终 assistant 消息 */
   message?: Message
+  /**
+   * done 时的结束原因（规范化）。agentic loop 据此判定是否续轮；
+   * 缺失表示 Provider 未提供 —— 此时只能回退到「本轮是否产生工具调用」来判断。
+   */
+  finish?: ChatFinishReason
+  /** done 时的 Provider 原生 finish 值，仅用于排障 */
+  finishRaw?: string
 }
 
 /**
@@ -1674,6 +1770,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
     let model: string | undefined
     let tokenUsage: TokenUsage | undefined
     let raw: unknown
+    // 本轮结束原因（Provider 未提供时为 undefined —— 调用方须回退到「是否有工具调用」判断）
+    let finish: ChatFinishReason | undefined
+    let finishRaw: string | undefined
 
     if (provider.stream) {
       // 流式路径
@@ -1715,6 +1814,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
             model = chunk.model
             tokenUsage = chunk.tokenUsage
             raw = chunk.raw
+            finish = chunk.finish
+            finishRaw = chunk.finishRaw
             break
         }
       }
@@ -1739,6 +1840,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
       model = completion.model
       tokenUsage = completion.tokenUsage
       raw = completion.raw
+      finish = completion.finish
+      finishRaw = completion.finishRaw
       // 一次性 yield 文本
       if (textBuf) yield { type: 'text_delta', text: textBuf }
       if (reasoningBuf) yield { type: 'reasoning_delta', text: reasoningBuf }
@@ -1820,7 +1923,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
 
     await this.deps.session.addMessage(sessionId, assistant)
-    yield { type: 'done', message: assistant }
+    yield {
+      type: 'done',
+      message: assistant,
+      ...(finish ? { finish } : {}),
+      ...(finishRaw ? { finishRaw } : {}),
+    }
   }
 }
 

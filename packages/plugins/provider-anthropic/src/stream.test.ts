@@ -140,6 +140,9 @@ describe('AnthropicChatProvider.stream', () => {
     expect(done?.tokenUsage?.input).toBe(15)
     expect(done?.tokenUsage?.output).toBe(8)
     expect(done?.tokenUsage?.total).toBe(23)
+    // finish 透传：结束原因在 message_delta 上，归一后 stop_reason='end_turn' ⇒ 'stop'
+    expect(done?.finish).toBe('stop')
+    expect(done?.finishRaw).toBe('end_turn')
   })
 
   it('文本 + tool_use 流式', async () => {
@@ -176,6 +179,11 @@ describe('AnthropicChatProvider.stream', () => {
     // tool_use_stop
     const stop = chunks.find((c) => c.type === 'tool_use_stop')
     expect(stop).toBeDefined()
+
+    // finish 透传：stop_reason='tool_use' ⇒ 'tool_calls'（循环需据此续轮）
+    const done = chunks.find((c) => c.type === 'done')
+    expect(done?.finish).toBe('tool_calls')
+    expect(done?.finishRaw).toBe('tool_use')
   })
 
   it('HTTP 错误抛出异常', async () => {

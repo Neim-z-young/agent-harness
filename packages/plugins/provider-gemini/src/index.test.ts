@@ -329,6 +329,11 @@ describe('@harness/provider-gemini', () => {
         expect(out.toolCalls![0].input).toEqual({ path: 'a.txt' })
         expect(out.tokenUsage).toEqual({ input: 10, output: 20, total: 30 })
         expect(out.raw).toBeDefined()
+        // ⚠️ 语义关键点：Gemini 在**带 functionCall** 时 finishReason 同样是 'STOP'。
+        // 也就是说 finish='stop' 与「本轮有工具调用」并不互斥 —— 引擎的续轮判定
+        // 必须同时看 toolCalls 是否为空，否则会在模型要求调工具时提前退出。
+        expect(out.finish).toBe('stop')
+        expect(out.toolCalls!.length).toBeGreaterThan(0)
       } finally {
         restore()
       }
@@ -424,6 +429,9 @@ describe('@harness/provider-gemini', () => {
         const done = chunks.find((c) => c.type === 'done')
         expect(done).toBeDefined()
         expect(done.tokenUsage).toEqual({ input: 5, output: 10, total: 15 })
+        // finish 透传：Gemini 回大写 STOP，归一为 'stop'，原生值保留
+        expect(done.finish).toBe('stop')
+        expect(done.finishRaw).toBe('STOP')
       } finally {
         restore()
       }

@@ -28,6 +28,8 @@ describe('MockChatProvider.stream', () => {
     expect(done?.model).toBe('mock-v1')
     expect(done?.tokenUsage?.input).toBe(10)
     expect(done?.tokenUsage?.output).toBe(5)
+    // 无工具调用 ⇒ 自然结束
+    expect(done?.finish).toBe('stop')
   })
 
   it('reasoning + text + tool_call 流式', async () => {
@@ -69,6 +71,8 @@ describe('MockChatProvider.stream', () => {
     // done
     const done = chunks.find((c) => c.type === 'done')
     expect(done).toBeDefined()
+    // 有工具调用 ⇒ 因工具调用结束（循环需据此续轮，不能当作终点）
+    expect(done?.finish).toBe('tool_calls')
   })
 
   it('calls 记录与 complete 一致', async () => {

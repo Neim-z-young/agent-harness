@@ -163,6 +163,9 @@ describe('OpenAIChatProvider.stream', () => {
     expect(done?.tokenUsage?.input).toBe(15)
     expect(done?.tokenUsage?.output).toBe(8)
     expect(done?.tokenUsage?.total).toBe(23)
+    // finish 透传：agentic loop 据此判定退出（纯文本流 ⇒ stop）
+    expect(done?.finish).toBe('stop')
+    expect(done?.finishRaw).toBe('stop')
   })
 
   it('文本 + tool_calls 流式', async () => {
@@ -199,6 +202,12 @@ describe('OpenAIChatProvider.stream', () => {
     // tool_use_stop
     const stop = chunks.find((c) => c.type === 'tool_use_stop')
     expect(stop).toBeDefined()
+
+    // finish 透传：带 tool_calls 的流必须以 'tool_calls' 收尾（而非 'stop'），
+    // 否则循环会以为模型已收工、把工具结果丢掉
+    const done = chunks.find((c) => c.type === 'done')
+    expect(done?.finish).toBe('tool_calls')
+    expect(done?.finishRaw).toBe('tool_calls')
   })
 
   it('HTTP 错误抛出异常', async () => {
