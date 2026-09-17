@@ -175,7 +175,25 @@ bun run typecheck           # 全部类型检查
 2. **窗口并非写死的 200000**：实际取 `modelContextLimit` → 默认 Provider 的 `contextWindowTokens` → 200000 三级回退。若 Provider 声明了较小的窗口（如 `102400`）却手写大 `preserveRecentTokens`，会直接吃掉半个窗口导致严重超窗——**小窗口请交给 autoTune 推导**。
 3. **写错键完全无声**：未知键被静默丢弃、写错取值降级到默认值，而概览照常显示正常。调参前后请跑 `harness config check`。
 
-**关于工具结果的自主续轮**：当前的 Agent 执行是**单轮**的——一次模型调用后执行工具，工具结果**不会**自动回喂触发下一次推理；续轮由用户输入或 coordinator 的 barrier（后台子任务集齐）驱动。自主多步（read → edit → bash 链式执行）的改造计划见 [Agentic Loop 改造计划](docs/agentic-loop-plan.md)。
+### Agentic Loop（引擎内自主多步执行）
+
+Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具结果会自动回喂并触发下一步推理，
+直到模型不再要求工具调用、被判定为死循环、被中断，或触及步数上限。
+
+- **步数上限**：默认 `30`。优先级 `AgentQueryInput.maxSteps` > `AgentDefinition.maxSteps` > 默认；`-1` 表示不限。
+  传 `maxSteps: 1` 即**显式单轮**（与旧行为一致，子 Agent 与旧调用方常用）。
+- **续轮判据**：本步**有工具调用** 且 `finish` 不是 `length`/`content_filter`/`error`。
+  注意 `finish` 与「有工具调用」并不互斥（Gemini 返回 `functionCall` 时 `finishReason` 仍是 `STOP`），
+  故不能只看 `finish`。
+- **死循环保护**：同一工具 + 完全相同的入参连续 3 次 ⇒ 在执行前拦下并走权限确认；
+  拒绝则标 `DOOM_LOOP` 错误并终止。
+- **步数到顶**：追加一条收尾提示再跑一步，而不是硬截断。
+- **中断**：Ctrl-C（REPL SIGINT / TUI Ctrl-C）在**执行中 = 中断本次查询**、空闲 = 退出；
+  已完成的步骤成果保留，未执行的工具标 `ABORTED`。
+- **流式事件**：`done` 是「**一步**结束」（带 `step`，多步时会出现多次），
+  `turn_end` 才是「**整轮**结束」（只出现一次）。UI 收尾应挂在 `turn_end` 上。
+
+改动过程与阶段记录见 [Agentic Loop 改造计划](docs/agentic-loop-plan.md)（S0~S4 已完成）。
 
 ### compaction 对象（会话压缩，与 ACP 是两套机制）
 
@@ -711,7 +729,7 @@ const mcpPlugin = createMcpClientPlugin({
 
 ## Documentation
 
-- [架构设计文档](docs/agent-harness-architecture.md) — 设计理念、总体架构、核心模块详解（含 §16 Agentic Loop 现状）、实现路径
+- [架构设计文档](docs/agent-harness-architecture.md) — 设计理念、总体架构、核心模块详解（含 §16 Agentic Loop 已落地形态）、实现路径
 - [开发日志](docs/development-log.md) — 每日开发进度、遇到的问题与修复、下一步计划
 - [MCP 服务](docs/mcp-services.md) — MCP server 注册方法、配置字段、命令用法、运行机制与凭据安全
 - [工作区管理](docs/workspace-management.md) — 两级工作区目录、config/permissions/sessions 数据布局

@@ -377,8 +377,10 @@ async *queryStream(input) {
   步数到顶注入收尾提示且提示确实进了请求；`maxSteps=1` 不追加收尾步
 - [x] S3：循环中途中断能在步边界停下且状态完整（`ToolContext.signal` 已接通真信号；
   剩余工具标 `ABORTED`、已完成的成果保留；REPL SIGINT / TUI Ctrl-C 已接线）
-- [ ] S4：coordinator / subagent / swarm 三插件在循环上线后行为符合预期，无双重驱动
-- [ ] 文档：`README.md` 与 `agent-harness-architecture.md` 同步更新 loop 章节
+- [x] S4：coordinator / subagent / swarm 三层职责厘清（触发条件天然不同，不互相递归）；
+  `<continue/>` 空转识别 / subagent signal 透传 / swarm tick 防重叠 已落地；
+  **真实 barrier 全链路（派发后台任务 → 完成 → 续轮）待实测**
+- [x] 文档：`README.md`（新增 Agentic Loop 小节）与 `agent-harness-architecture.md` §16（改为落地后的形态）已同步
 
 ---
 

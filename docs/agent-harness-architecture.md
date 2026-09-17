@@ -708,7 +708,7 @@ const h = await createHarness({
 | Bus | 类型安全 define/publish/subscribe | P0 |
 | Tool Protocol | Tool.define + 默认 Fail-Closed | P0 |
 | Tool Pipeline | Schema + 语义校验 + Permission.check | P0 |
-| Agent Runtime | Query Engine 主循环 + 单轮推理 | P0 |
+| Agent Runtime | Query Engine 主循环 + 引擎内自主多步（见 §16） | P0 |
 | Session Manager | 内存态 Message/Part + Todo List | P0 |
 
 ### Phase 2：配置化与扩展能力
@@ -994,7 +994,7 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] Task List Plane：`TaskListPlane`（tasks.json 共享任务池，状态机 available → in_progress → completed/failed/cancelled + 生命周期校验 + claim 冲突检测），工具 task_create/list/claim/update/stop
 - [x] Leader Permission Bridge：`registerLeaderConfirmQueue`（module-level，CLI/REPL 注册 leader 的 confirm queue）+ `requestPermissionThroughLeader`（teammate ask 权限请求带 workerBadge 回流 leader；无桥 fail-closed 拒绝）
 - [x] in-process teammate 基础：`TeammateRegistry` + `withTeammateIdentity` AsyncLocalStorage 身份隔离 + `formatAgentId`
-- [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（单轮：mailbox 未读消息处理——普通消息 query 后回复写回发送者、`shutdown_request` 注入模型决策（不直接关停）；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止）
+- [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（每 tick 处理 mailbox 未读消息——普通消息 query 后回复写回发送者、`shutdown_request` 注入模型决策（不直接关停）；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止；**含防重叠保护**：内部 query 支持自主多步后单次 tick 可能超过 intervalMs，用 running 标志跳过重叠 tick）
 - [ ] tmux/iTerm2 进程后端（out-of-process teammate）→ 后续增强
 - [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套 / approve_shutdown / reject_shutdown，`tool.pool.assemble` 注入全部 Agent
 
@@ -1239,40 +1239,59 @@ TUI 通过 `app.permission.setAskPrompt(cb)` 接管 `ask` 交互，渲染审批�
 - **dataDir**：`args.dataDir ?? ~/.harness`，承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。
 - **可插拔目录**：`plugins` / `skills` / `agents` 均支持 user+project 两级，来源标注（内置/用户/项目/MCP/插件）。
 
-## 十六、Agentic Loop：现状与改造方向
+## 十六、Agentic Loop：引擎内自主多步（已落地）
 
-> 记录日期：2026-09-17。完整改造计划见独立文档 [agentic-loop-plan.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agentic-loop-plan.md)。本节只列架构层面的现状结论。
+> 记录日期：2026-09-17。完整改造过程、阶段验收与踩坑记录见独立文档 [agentic-loop-plan.md](agentic-loop-plan.md)。
+> 本节只列架构层面的最终形态。
 
-### 16.1 现状：控制权在引擎外
+### 16.1 结构：循环移入引擎，barrier 退居其位
 
-`AgentRuntimeImpl.query()`（`packages/core/src/index.ts:1332`）与 `queryStream()`（`core:1638`）**都是单轮**：一次模型调用 → 执行工具 → `addMessage` → 结束。没有循环、没有 turn 计数、没有 finish reason 概念。
-
-当前的"续轮"由**引擎外部**驱动：
+`AgentRuntimeImpl.queryStream()` 现在是「准备一次 + 循环若干步」：
 
 ```
-coordinator 检测到 barrier 完成（后台 subagent 任务全部集齐）
-  → bus.publish('coordinator.barrier.completed')    coordinator/src/index.ts:493
-  → CLI attachAutoContinue 订阅                     cli/src/index.ts:2740
-  → 注入伪输入 '<continue/>'（rl.emit('line')）      cli:3455
-  → readline 的 'line' 处理器再走一次 processLine    cli:3457
+_prepareQueryOnce          一次：Agent 解析 / 工具池 / 权限 / system prompt / provider-model
+while (step <= maxSteps)                    默认 30；maxSteps=1 为显式单轮
+  ├─ _buildStepMessages    每轮：重读会话 + getView + llm.params/headers + session.preModel 裁剪
+  ├─ _runOneStep           每步：调模型（流式 / complete）→ 执行工具（含 doom-loop 拦截）→ 写回 assistant
+  ├─ yield done(step, finish)               每步各一次
+  └─ shouldContinueStep ? 续轮 : 结束
+yield turn_end                              整轮只一次
 ```
 
-这是**有意解耦**——coordinator 插件注释明确写着「插件只负责检测 barrier 完成 + 发布事件，不直接驱动 query」，符合 §九 的多 Agent 职责边界。但代价是：**只有后台任务集齐才续轮，普通工具链（read → edit → bash）无法自主多步**。swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每 tick 只调一次 `agent.query()`。
+`query()` 复用同一循环（只取最后一个 `done.message`），因此 **subagent / swarm 也获得了多步能力**。
 
-### 16.2 与两个参考架构的差距
+三层职责各有明确触发条件，不再重叠：
+
+| 层 | 职责 | 触发条件 |
+|---|---|---|
+| 引擎内循环 | 工具结果回喂 → 继续推理（同步、同会话、受步数限制） | 本步**有工具调用** |
+| coordinator barrier | 后台 subagent 任务集齐后的一次跨轮推进 | **所有后台任务完成** |
+| CLI `<continue/>` | barrier 的载体（伪输入），并做**空转识别** | 由 barrier 事件注入 |
+
+四条关键设计（细节见计划文档）：
+
+1. **续轮判据是「有工具调用」与「finish」的合取**：不能只看 `finish` —— Gemini 返回 `functionCall` 时
+   `finishReason` 仍是 `STOP`，只看它会在该续轮时退出、退化成单轮；反向地 `length`/`content_filter`/`error`
+   属被截断/拦截，即便残留 toolCalls 也不续。
+2. **`done` 与 `turn_end` 分离**：前者是「一步结束」（多步时多次，带 `step`），后者是「整轮结束」（一次）。
+   UI 状态收尾（busy/spinner）必须挂在 `turn_end` 上。
+3. **中断**：`AgentQueryInput.signal` 贯穿到 Provider 请求与 `ToolContext.signal`，在步边界与每个工具执行前生效；
+   已完成的成果保留，未执行的工具标 `ABORTED`。
+4. **`<continue/>` 空转识别**：续轮前查待处理通知，没有就跳过 —— 避免白跑一整轮（多步后一轮可能是几十步）。
+
+### 16.2 与两个参考架构的对比（落地后）
 
 | 维度 | Claude Code | Opencode | 本项目 |
 |---|---|---|---|
-| 主循环 | `queryLoop()`（query.ts:241，1729 行） | `runLoop`（session/prompt.ts:1098） | 无（外部 `<continue/>`） |
-| 终止依据 | finish reason 无 tool results | `finish` 非 `tool-calls` + `hasToolCalls` 兜底 | —— |
-| 步数上限 | `maxTurns` + `turnCount` | `agent.steps` + `MAX_STEPS_PROMPT` 收尾提示 | 无 |
-| 重复调用保护 | maxTurns 兜底 | `DOOM_LOOP_THRESHOLD=3` 主动检测 | 无 |
-| 压缩挂载点 | 循环体内 autoCompact | compaction 作为 continue 分支 | `session.preModel`（已有） |
+| 主循环 | `queryLoop()`（query.ts:241，1729 行） | `runLoop`（session/prompt.ts:1098） | `queryStream` 的 while 循环 |
+| 终止依据 | finish reason 无 tool results | `finish` 非 `tool-calls` + `hasToolCalls` 兜底 | 「有无 toolCalls」为主 + finish 排除异常终止 |
+| 步数上限 | `maxTurns` + `turnCount` | `agent.steps` + `MAX_STEPS_PROMPT` | `maxSteps`（默认 30）+ 收尾提示 |
+| 重复调用保护 | maxTurns 兜底 | `DOOM_LOOP_THRESHOLD=3` 主动检测 | 同阈值 + 执行前拦 + 权限确认 |
+| 压缩挂载点 | 循环体内 autoCompact | compaction 作为 continue 分支 | `session.preModel`（每步都跑） |
+| 中断 | abort 检查 | cleanup 收尾 | `signal` 贯穿到工具与 Provider |
 
-参考实现有两条值得抄的细节：
-
-1. **退出判断不能只看 finish reason**：部分 provider 返回 `stop` 但消息体里仍带 tool calls（opencode `prompt.ts:1123` 的 `hasToolCalls` 兜底），只看 reason 会提前退出、工具结果永远送不回模型；同时要排除被打断的孤儿工具以免多跑一轮。
-2. **步数到顶要"请模型收尾"而非硬截断**：opencode 在 `isLastStep` 时往 messages 尾部追加 `MAX_STEPS_PROMPT`（`prompt.ts:1298`）。
+从参考实现抄到的两条（均已落地）：finish reason 不可单独作判据（opencode `prompt.ts:1123` 的
+`hasToolCalls` 兜底）；步数到顶「请模型收尾」而非硬截断（`MAX_STEPS_PROMPT`）。
 
 ### 16.3 改造的阻塞点与已有基础
 
