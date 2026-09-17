@@ -181,7 +181,9 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 直到模型不再要求工具调用、被判定为死循环、被中断，或触及步数上限。
 
 - **步数上限**：默认 `30`。优先级 `AgentQueryInput.maxSteps` > `AgentDefinition.maxSteps` > 默认；`-1` 表示不限。
-  传 `maxSteps: 1` 即**显式单轮**（与旧行为一致，子 Agent 与旧调用方常用）。
+  传 `maxSteps: 1` 即**显式单轮**（与旧行为一致，旧调用方常用）。
+  **子 Agent 更保守**：subagent 派出的子 Agent 默认 `10` 步（聚焦执行，且步数越多越容易撞上
+  subagent 的 120s 超时）；个别子 Agent 需要长链时在自己的 `AgentDefinition` 里写 `maxSteps` 覆盖。
 - **续轮判据**：本步**有工具调用** 且 `finish` 不是 `length`/`content_filter`/`error`。
   注意 `finish` 与「有工具调用」并不互斥（Gemini 返回 `functionCall` 时 `finishReason` 仍是 `STOP`），
   故不能只看 `finish`。

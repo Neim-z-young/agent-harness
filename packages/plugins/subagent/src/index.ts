@@ -227,7 +227,24 @@ export interface SubagentPluginOptions {
   maxResultLines?: number
   /** 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），要求子 Agent 简洁结构化回复 */
   directive?: string
+  /**
+   * 子 Agent 的引擎内自主多步步数上限（缺省 {@link DEFAULT_SUBAGENT_MAX_STEPS} = 10）。
+   *
+   * 为什么比主 Agent 的默认 30 小：子 Agent 的职责是**聚焦执行**（分析一个文件、改一处、
+   * 跑一条命令），不是长链探索；步数越多越容易撞上 `timeoutMs`（缺省 120s）而被判超时。
+   * 注意**子 Agent 自己的 `AgentDefinition.maxSteps` 优先**（md 定义的子 Agent 可显式覆盖）。
+   */
+  maxSteps?: number
 }
+
+/**
+ * 子 Agent 默认步数上限。
+ *
+ * 取 10 的理由：多步上线后子 Agent 单次执行的耗时随步数线性增长，而 subagent 的超时是
+ * 固定 120s —— 30 步（主 Agent 默认）在多数模型下会超时。10 步足够覆盖「读→查→改→验」，
+ * 需要更长的子 Agent 应在自己的 AgentDefinition 里显式写 `maxSteps`。
+ */
+export const DEFAULT_SUBAGENT_MAX_STEPS = 10
 
 /** Harness 引用的最小接口（避免 import core 导致循环依赖） */
 interface HarnessLike {
@@ -526,7 +543,16 @@ export function createSubagentTool(
   directive?: string,
   getRegistry?: () => BackgroundTaskRegistry | undefined,
   worktree?: WorktreeHooks,
+  subagentMaxSteps: number = DEFAULT_SUBAGENT_MAX_STEPS,
 ): Tool<SubagentToolInput, SubagentToolOutput> {
+  /**
+   * 本次子 Agent 执行的步数上限：**子 Agent 自己的定义优先**（md 里写了 `maxSteps` 就用它），
+   * 否则用插件配置（缺省 {@link DEFAULT_SUBAGENT_MAX_STEPS}）。
+   * 这个优先级让"某个子 Agent 确实需要长链"能在定义里单独放宽，而不必改全局配置。
+   */
+  const resolveSteps = (agentId: string): number =>
+    getHarness()?.agent.get(agentId)?.maxSteps ?? subagentMaxSteps
+
   return defineTool<SubagentToolInput, SubagentToolOutput>({
     id: 'subagent',
     aliases: ['agent', 'run_agent', 'task'],
@@ -749,6 +775,9 @@ export function createSubagentTool(
                 // 底层 queryStream 仍在后台跑（内部循环上线后一次可能几十步，
                 // 白烧 token 并继续产生工具副作用）。S3 打通 signal 后这条链才闭环。
                 signal: controller.signal,
+                // 子 Agent 步数上限比主 Agent 保守（缺省 10）：它的任务是聚焦执行，
+                // 步数越多越容易撞上 timeoutMs 被判超时。
+                maxSteps: resolveSteps(input.agentId),
               })
               for await (const ev of stream) {
                 if (ev.type === 'tool_call_start') {
@@ -928,6 +957,8 @@ export function createSubagentTool(
           message: effectivePrompt,
           model: input.model,
           signal: controller.signal,
+          // 同上：子 Agent 用更保守的步数上限
+          maxSteps: resolveSteps(input.agentId),
         })
 
         const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -1060,6 +1091,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     maxResultLength = 2000,
     maxResultLines = 500,
     directive,
+    maxSteps: subagentMaxSteps = DEFAULT_SUBAGENT_MAX_STEPS,
   } = options
 
   let harness: HarnessLike | undefined
@@ -1162,6 +1194,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         directive,
         () => registry,
         { resolve: resolveWorktree, attachDiff: attachWorktreeDiff },
+        subagentMaxSteps,
       )
 
 

@@ -321,9 +321,15 @@ const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\brm\s+(-[a-z]*f[a-z]*\s*)*~\s/, // rm -rf ~
   /\bmkfs\.\w+/, // mkfs.*
   /\bdd\b.*\bof=\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/, // dd 写裸盘
-  /\b>(>>)?\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/, // 重定向裸设备
+  // 重定向裸设备。注意用 `(?:^|\s)` 而非 `\b`：`\b` 要求左侧是单词字符，
+  // 于是 `echo x > /dev/sda`（`>` 前是空格）这种最常见写法反而**漏报**（测试已固定）。
+  /(?:^|\s)>>?\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/,
   /\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b/, // 关机/重启
-  />\s*\/dev\/null\b|\/dev\/sda|format\s+\/\s*\/s\s*\/f\/q/, // 常见破坏性
+  /format\s+\/\s*\/s\s*\/f\/q/i, // Windows format /s /f /q（清盘）
+  // 注：曾有一条 `>\s*\/dev\/null\b|\/dev\/sda`，已删除 ——
+  // - `>/dev/null` / `2>/dev/null` 是最常见的**无害**重定向（丢弃输出），把它判为危险会
+  //   大面积误伤正常命令（实测：`git rev-parse --is-inside-work-tree 2>/dev/null` 直接被拒）；
+  // - `/dev/sda` 已由上面「重定向裸设备」那条更完整的规则覆盖（含 sd/hd/nvme/rdisk/disk/vd）。
   /\bcurl\b[^|;]*\|\s*(bash|sh)\b|\bwget\b[^|;]*\|\s*(bash|sh)\b/, // curl|bash
   /\bchmod\s+-R\s+777\s+\//, // 递归改根目录权限
   /\bsudo\s+rm\s+-rf\s+(\/|\*)/, // sudo rm -rf /

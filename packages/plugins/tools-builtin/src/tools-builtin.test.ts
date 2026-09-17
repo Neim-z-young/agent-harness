@@ -281,6 +281,24 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
     })
 
+    it('无害重定向不被误拦：`2>/dev/null` / `>/dev/null` 正常放行', async () => {
+      // 回归：曾有一条 `>\s*\/dev\/null\b` 危险模式，把最常见的「丢弃输出」写法判为危险，
+      // 实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 这类命令会被直接拒绝。
+      const tool = createBashTool()
+      const res = await tool.call(
+        { command: 'pwd 2>/dev/null && echo ok > /dev/null', cwd: TMP_DIR },
+        makeCtx(),
+      )
+      expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
+    })
+
+    it('裸设备重定向仍被拦截（删掉 /dev/null 规则不影响真正的破坏性写入）', async () => {
+      const tool = createBashTool()
+      const res = await tool.call({ command: 'echo x > /dev/sda' }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+    })
+
     it('危险命令检测可关闭（dangerousDetection=false）', async () => {
       const tool = createBashTool({ dangerousDetection: false })
       // dangerously rm 一个临时文件确认可执行（沙箱关闭）
@@ -458,13 +476,15 @@ describe('@harness/tools-builtin', () => {
       await h.start()
 
       const sess = await h.session.create()
-      const denied = await h.agent.query({ sessionId: sess.id, message: '拒绝' })
+      // 本组用例统一带 maxSteps: 1：mock provider 每次都返回同一个 toolCall，
+      // 放任引擎自主多步会一路续轮到 doom-loop 拦截，取到的就不是本次要验证的那一步。
+      const denied = await h.agent.query({ sessionId: sess.id, message: '拒绝', maxSteps: 1 })
       const deniedTool = denied.parts.find((p: any) => p.type === 'tool') as any
       expect(deniedTool).toBeDefined()
       // 白名单拒绝返回 error ToolResult（result = { message, code }）
       expect((deniedTool.result as any).code).toBe('SANDBOX_ALLOWLIST')
 
-      const allowed = await h.agent.query({ sessionId: sess.id, message: '允许' })
+      const allowed = await h.agent.query({ sessionId: sess.id, message: '允许', maxSteps: 1 })
       const allowedTool = allowed.parts.find((p: any) => p.type === 'tool') as any
       expect(allowedTool).toBeDefined()
       expect((allowedTool.result as any).stdout?.trim()).toBe('hi')
@@ -517,7 +537,7 @@ describe('@harness/tools-builtin', () => {
       await h.start()
 
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: '读取文件' })
+      const reply = await h.agent.query({ sessionId: sess.id, message: '读取文件', maxSteps: 1 })
 
       // 应该有 tool 部件
       const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
@@ -554,7 +574,7 @@ describe('@harness/tools-builtin', () => {
       await h.start()
 
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: '写入文件' })
+      const reply = await h.agent.query({ sessionId: sess.id, message: '写入文件', maxSteps: 1 })
 
       const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
       expect(toolPart.toolId).toBe('write_file')
@@ -592,7 +612,7 @@ describe('@harness/tools-builtin', () => {
       await h.start()
 
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: '执行命令' })
+      const reply = await h.agent.query({ sessionId: sess.id, message: '执行命令', maxSteps: 1 })
 
       const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
       expect(toolPart.toolId).toBe('bash')
@@ -628,7 +648,7 @@ describe('@harness/tools-builtin', () => {
       await h.start()
 
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: '写入文件' })
+      const reply = await h.agent.query({ sessionId: sess.id, message: '写入文件', maxSteps: 1 })
 
       // write_file 未注入 → tool call 找不到工具 → isError
       const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any

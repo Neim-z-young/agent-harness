@@ -6,6 +6,7 @@ import { runGit, gitTopLevel } from './worktree'
 import {
   createSubagentPlugin,
   createSubagentTool,
+  DEFAULT_SUBAGENT_MAX_STEPS,
   BackgroundTaskRegistry,
   BackgroundTaskMonitor,
   subagentCapability,
@@ -160,6 +161,35 @@ describe('SubagentTool', () => {
     expect(res.output!.sessionId).toStartWith('s_')
     expect(res.output!.message).toBe('Task done: refactored foo()')
     expect(res.output!.messageCount).toBe(2)
+  })
+
+  it('子 Agent 步数上限：缺省用保守的 10，子 Agent 定义显式写了则优先', async () => {
+    const sessions = new Map<string, Session>()
+    const session = createMockSessionManager(sessions)
+
+    // 1) 定义里没写 maxSteps ⇒ 用 DEFAULT_SUBAGENT_MAX_STEPS（比主 Agent 的 30 保守：
+    //    子 Agent 是聚焦执行，步数越多越容易撞上 timeoutMs）
+    const seen: Array<number | undefined> = []
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      seen.push((input as { maxSteps?: number }).maxSteps)
+      return makeMessage('assistant', 'done')
+    })
+    const tool = createSubagentTool(() => ({ agent, session }), 5000, false)
+    await tool.call({ agentId: 'coder', prompt: 'x' }, makeToolContext())
+    expect(seen[0]).toBe(DEFAULT_SUBAGENT_MAX_STEPS)
+
+    // 2) 子 Agent 定义里写了 maxSteps ⇒ 以定义为准（个别子 Agent 确实需要长链）
+    const seen2: Array<number | undefined> = []
+    const longAgent = createMockAgentRuntime(
+      [{ ...coderAgent, maxSteps: 25 }],
+      async (input) => {
+        seen2.push((input as { maxSteps?: number }).maxSteps)
+        return makeMessage('assistant', 'done')
+      },
+    )
+    const tool2 = createSubagentTool(() => ({ agent: longAgent, session }), 5000, false)
+    await tool2.call({ agentId: 'coder', prompt: 'x' }, makeToolContext())
+    expect(seen2[0]).toBe(25)
   })
 
   it('Agent 未注册时返回 AGENT_NOT_FOUND', async () => {

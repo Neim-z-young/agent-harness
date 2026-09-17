@@ -1,5 +1,66 @@
 # Agent Harness 开发日志
 
+## 2026-09-17（续 142）多步上线后暴露的三个真问题：thinking 回传 / 沙箱误报 + 漏报 / 子 Agent 步数
+
+用户用带工具的模型实测时报错，顺着一查发现三处问题 —— 都属于「单轮时代不会暴露、
+多步后必现」的类型。
+
+### 1. thinking 模式的 `reasoning_content` 从未回传（阻塞性）
+
+**现象**：第二步请求被服务端拒绝：
+`The reasoning_content in the thinking mode must be passed back to the API.`
+
+**根因**（两处，缺一不可）：
+- `provider-openai` 的**流式解析只读 `delta.content`**，完全没解析 `delta.reasoning_content`
+  ⇒ 推理内容压根没进 core，自然也无从回传；
+- 序列化 assistant 消息时，ReasoningPart 被**拼进 `content` 文本**（加 `[thinking]` 前缀），
+  而 thinking 端点要求它以**独立字段 `reasoning_content`** 回传。
+
+**为什么单轮没事**：单轮时 assistant 消息不回喂给模型，这条路径根本不走。多步上线后
+第二步必然带上第一步的 assistant 消息 ⇒ 必现。
+
+**修法**：流式解析补 `delta.reasoning_content` → `reasoning_delta` 事件；非流式补
+`choice.message.reasoning_content` → `completion.reasoning`；序列化时改写独立字段
+（**只在确实有推理内容时才带** —— 非 thinking 模型不产生 reasoning part，于是标准 OpenAI
+端点永远不会收到它们不认识的参数）。
+
+### 2. 沙箱危险命令正则：一处误报 + 一处漏报
+
+**误报**：`>\s*\/dev\/null\b` 把 `2>/dev/null` / `>/dev/null` 判为危险 —— 这是最常见的
+「丢弃输出」写法。实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 直接被拒。
+（该模式与更完整的「重定向裸设备」规则重复，属多余。）
+**漏报**：`\b>(>>)?\s*\/dev\/(sd|...)` 里的 `\b` 要求 `>` 左侧是单词字符，于是
+`echo x > /dev/sda`（`>` 前是空格）**不匹配** —— 真正的破坏性写入反而放过去了。
+改为 `(?:^|\s)>>?\s*\/dev\/...`。两处都有新测试固定。
+
+### 3. 子 Agent 步数收窄到 10（用户决策）
+
+子 Agent 默认继承 30 步，但它的任务是聚焦执行，且 subagent 超时固定 120s ——
+30 步很容易超时。新增 `SubagentPluginOptions.maxSteps`（缺省 `DEFAULT_SUBAGENT_MAX_STEPS = 10`），
+**子 Agent 自己的 `AgentDefinition.maxSteps` 优先**（个别需要长链的可单独放宽）。
+
+### 顺带：`query()` 不该被顺带改成走流式
+
+`query()` 复用循环后发现它开始走 `provider.stream()` —— 但它是**非流式入口**，只要最终消息，
+走流式既多一层解析开销，也让「只实现 complete 的端点/测试替身」直接失效（一个 provider-openai
+集成测试就是这么挂的）。新增 `AgentQueryInput.preferComplete`（内部标志）让 `query()` 走 complete，
+并加测试锁定两条路径的分离。
+
+### 附带：又是同一类测试适配
+
+`tools-builtin` 有 6 处端到端测试用「每次返回同一工具调用」的 mock + `h.agent.query()` ⇒
+多步后会跑到 doom-loop 拦截、取错那一步。统一加 `maxSteps: 1`（这已是第 4 个包出现同类问题，
+说明「固定剧本 mock + query()」是本仓测试的常见写法）。
+
+### 验证
+core 74 / cli 332 / subagent 114 / swarm 65 / tools-builtin 67 / provider-mock 16 /
+provider-anthropic 20 / provider-gemini 24 / revert 36 全绿；全仓 typecheck 0 错误。
+
+### 已知限制（未修）
+`provider-anthropic` 的 thinking 仍是「降级为 `[thinking]` 文本」（源码注释称 thinking block
+未公开）。若启用 Anthropic extended thinking，会遇到与 openai 系同类的问题（需回传
+`signature`）—— 当前未实现，留待需要时补。
+
 ## 2026-09-17（续 141）Agentic Loop 改造 S0~S4：引擎内自主多步执行
 
 ### 起因

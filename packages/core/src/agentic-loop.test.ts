@@ -478,6 +478,34 @@ describe('S3 真 abort', () => {
     expect(events[events.length - 1].type).toBe('turn_end')
     await h.stop()
   })
+
+  it('路径分离：query() 走非流式 complete，queryStream() 才走流式', async () => {
+    // 复用同一循环后最容易踩的坑：query() 被顺带改成走 stream —— 它只要最终消息，
+    // 走流式既多一层解析开销，也会让「只实现 complete 的端点/测试替身」直接失效。
+    const calls = { complete: 0, stream: 0 }
+    const provider: ChatProvider = {
+      id: 'both',
+      async complete() {
+        calls.complete++
+        return { content: '来自 complete', finish: 'stop' }
+      },
+      async *stream() {
+        calls.stream++
+        yield { type: 'text_delta', text: '来自 stream' }
+        yield { type: 'done', finish: 'stop' }
+      },
+    }
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    const sess = await h.session.create()
+
+    const msg = await h.agent.query({ sessionId: sess.id, message: 'a', maxSteps: 1 })
+    expect(msg.parts.some((p) => p.type === 'text' && (p as { text?: string }).text === '来自 complete')).toBe(true)
+    expect(calls).toEqual({ complete: 1, stream: 0 })
+
+    await collect(h.session.promptStream(sess.id, 'b', 1))
+    expect(calls).toEqual({ complete: 1, stream: 1 })
+    await h.stop()
+  })
 })
 
 

@@ -71,6 +71,15 @@ type OpenAIChatMessage = {
     function: { name: string; arguments: string }
   }>
   tool_call_id?: string
+  /**
+   * thinking 模式下的推理内容（DeepSeek / GLM / Qwen / 自建网关的 thinking 模型通用字段名）。
+   *
+   * **必须作为独立字段回传**：这类端点在多轮里会校验它 —— 若上一轮 assistant 带过
+   * `reasoning_content` 却不在下一次请求里回传，会直接报
+   * `The reasoning_content in the thinking mode must be passed back to the API.`
+   * 并把整次请求判失败。单轮时不会暴露（assistant 消息不回喂），**引擎内自主多步后必现**。
+   */
+  reasoning_content?: string
 }
 
 type OpenAIToolDef = {
@@ -112,6 +121,8 @@ type OpenAIChoice = {
   message: {
     role: 'assistant'
     content: string | null
+    /** thinking 模式的推理内容（非流式响应）；需在后续请求里原样回传 */
+    reasoning_content?: string
     tool_calls?: Array<{
       id: string
       type: 'function'
@@ -148,6 +159,7 @@ function toOpenAIMessages(messages: Message[]): OpenAIChatMessage[] {
 
     if (msg.role === 'assistant') {
       const textParts: string[] = []
+      const reasoningParts: string[] = []
       const toolCalls: NonNullable<OpenAIChatMessage['tool_calls']> = []
       const imageParts: Array<{ url: string }> = []
 
@@ -173,7 +185,10 @@ function toOpenAIMessages(messages: Message[]): OpenAIChatMessage[] {
             break
           }
           case 'reasoning':
-            textParts.push(`[thinking]\n${(part as any).text ?? ''}`)
+            // 不能拼进 content！thinking 模式的端点要求推理内容以**独立字段**
+            // `reasoning_content` 回传，塞进正文既不符合协议，还会被服务端判为
+            // "reasoning_content 未回传"而整次请求失败（多步回喂时必现）。
+            reasoningParts.push((part as any).text ?? '')
             break
           case 'image': {
             const ip = part as any
@@ -207,6 +222,10 @@ function toOpenAIMessages(messages: Message[]): OpenAIChatMessage[] {
         content: textParts.join('\n') || '',
       }
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls
+      // 只在**确实有推理内容**时才带该字段：非 thinking 模型不会产生 reasoning part，
+      // 于是标准 OpenAI 端点永远不会收到这个它们不认识的参数（避免 400）。
+      const reasoningJoined = reasoningParts.filter((t) => t).join('\n')
+      if (reasoningJoined) assistantMsg.reasoning_content = reasoningJoined
       // 注意：OpenAI assistant 消息即使有 tool_calls 也可以有 content（可空）
       out.push(assistantMsg)
       continue
@@ -523,9 +542,13 @@ export class OpenAIChatProvider implements ChatProvider {
         throw new Error('OpenAI 响应内容为空')
       }
 
+      // thinking 模式的推理内容（非流式）：同样要落进 ReasoningPart，供下一轮回传
+      const reasoningText = choice.message.reasoning_content
+
       return {
         content: textParts.join('\n'),
         toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+        ...(reasoningText ? { reasoning: reasoningText } : {}),
         model: parsed.model,
         tokenUsage: {
           input: parsed.usage.prompt_tokens,
@@ -695,6 +718,14 @@ export class OpenAIChatProvider implements ChatProvider {
             if (!choice) continue
             const delta = choice.delta
             if (!delta) continue
+
+            // 推理增量（thinking 模式：DeepSeek / GLM / Qwen / 自建网关）
+            // 必须解析出来并作为 ReasoningPart 落库 —— 否则下一轮无法回传
+            // `reasoning_content`，服务端会直接报「must be passed back to the API」。
+            if (typeof (delta as { reasoning_content?: unknown }).reasoning_content === 'string'
+              && (delta as { reasoning_content: string }).reasoning_content) {
+              yield { type: 'reasoning_delta', text: (delta as { reasoning_content: string }).reasoning_content }
+            }
 
             // 文本增量
             if (typeof delta.content === 'string' && delta.content) {

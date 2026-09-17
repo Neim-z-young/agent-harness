@@ -1379,6 +1379,13 @@ export interface AgentQueryInput {
    * 尚未执行的工具被标记为 `ABORTED` 错误 —— 对齐 opencode 的 cleanup 收尾语义。
    */
   signal?: AbortSignal
+  /**
+   * 优先使用**非流式** `complete()`（`query()` 走这条）。
+   *
+   * 非流式入口不需要增量事件，走 complete 更省流式解析开销，也兼容只实现 complete 的端点。
+   * `queryStream()` 不设此标志 —— 它要的就是逐 chunk 的增量。
+   */
+  preferComplete?: boolean
 }
 
 export interface AgentRuntime {
@@ -1589,7 +1596,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
    */
   async query(input: AgentQueryInput): Promise<Message> {
     let last: Message | undefined
-    for await (const ev of this.queryStream(input)) {
+    // preferComplete：非流式入口不该被迫走流式解析（它只要最终消息），
+    // 也让只实现 complete 的端点/测试替身继续可用。
+    for await (const ev of this.queryStream({ ...input, preferComplete: true })) {
       if (ev.type === 'done' && ev.message) last = ev.message
     }
     if (!last) throw new Error('query() 未产生 assistant 消息（Provider 未返回任何内容）')
@@ -1752,7 +1761,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       if (signal?.aborted) break
 
       step++
-      const outcome = yield* this._runOneStep(prepared, step, recentSigs, signal)
+      const outcome = yield* this._runOneStep(prepared, step, recentSigs, signal, !!input.preferComplete)
       if (outcome.toolSigs.length > 0) {
         recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
       }
@@ -1793,6 +1802,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     step: number,
     priorSigs: readonly string[] = [],
     signal?: AbortSignal,
+    preferComplete = false,
   ): AsyncGenerator<AgentStreamEvent, StepOutcome, unknown> {
     const { agentId, sessionId, allowedTools, providerId, modelId } = prepared
     const provider = this.deps.chatProvider(providerId)
@@ -1816,7 +1826,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     /** 本步是否被外部中断（模型请求被 abort 或工具执行前发现已中断） */
     let aborted = false
 
-    if (provider.stream) {
+    if (provider.stream && !preferComplete) {
       // 流式路径
       const gen = provider.stream({
         providerId: providerId,
