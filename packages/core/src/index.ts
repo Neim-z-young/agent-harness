@@ -1408,6 +1408,63 @@ interface StepOutcome {
   finish?: ChatFinishReason
   /** 本步实际发起的工具调用数（> 0 是续轮的必要条件之一，见 docs/agentic-loop-plan.md） */
   toolCallCount: number
+  /** 本步工具调用的签名（`toolId|稳定序列化的 input`），跨步累积后用于 doom-loop 检测 */
+  toolSigs: string[]
+  /** 本步是否因 doom-loop 被拒而中断（中断后不再续轮） */
+  doomLoopTripped?: boolean
+}
+
+/**
+ * agentic loop 的默认步数上限（含首次模型调用）。
+ *
+ * 30 是权衡值：够跑完 read → edit → bash → verify 这类典型链条（含若干次重试），
+ * 又不至于在一次查询里烧掉失控的 token。可用 `AgentDefinition.maxSteps` 或
+ * `AgentQueryInput.maxSteps` 覆盖（后者优先）；`-1` 表示不限。
+ */
+export const DEFAULT_MAX_STEPS = 30
+
+/**
+ * doom-loop 拦截阈值：同一工具 + 完全相同的入参连续出现的次数。
+ * 对齐 opencode `processor.ts` 的 `DOOM_LOOP_THRESHOLD = 3`。
+ */
+export const DOOM_LOOP_THRESHOLD = 3
+
+/** 步数到顶时追加的最后一条 user 消息（对齐 opencode `MAX_STEPS_PROMPT`） */
+const MAX_STEPS_WRAP_UP =
+  '[系统] 本次执行已达到最大步数上限。请立即停止调用工具，基于已经获得的信息给出最终答复；' +
+  '若任务尚未完成，请说明已完成的部分与剩余待办。'
+
+/**
+ * 判断签名序列尾部是否已构成 doom-loop（末尾 threshold 个完全相同）。
+ *
+ * 纯函数、只看最近 threshold 个 —— 早于窗口的重复不算（避免把"开了三个文件再回头重开第一个"
+ * 这种正常行为误判成死循环）。
+ */
+export function isDoomLoop(sigs: readonly string[], threshold = DOOM_LOOP_THRESHOLD): boolean {
+  if (threshold <= 0 || sigs.length < threshold) return false
+  const tail = sigs[sigs.length - 1]
+  for (let i = sigs.length - threshold; i < sigs.length; i++) {
+    if (sigs[i] !== tail) return false
+  }
+  return true
+}
+
+/**
+ * 续轮判据：**本步有工具调用** 且 finish 不表示异常终止。
+ *
+ * 不要写成「finish === 'tool_calls' 才续轮」—— Gemini 在返回 `functionCall` 时
+ * `finishReason` 仍是 `STOP`（`provider-gemini/src/index.test.ts` 已断言固定），
+ * 那种写法会让它在该续轮时直接退出，退化成单轮。
+ *
+ * 反过来，`length` / `content_filter` / `error` 表示本步是**被截断/拦截**的异常结束，
+ * 即便消息里残留 toolCalls 也不该续 —— 回喂一个残缺的调用链没有意义。
+ *
+ * finish 缺失（Provider 未提供）时不阻断续轮：宁可多跑一步，也不能丢掉工具结果。
+ */
+function shouldContinueStep(o: StepOutcome): boolean {
+  if (o.toolCallCount === 0) return false
+  if (o.finish === 'length' || o.finish === 'content_filter' || o.finish === 'error') return false
+  return true
 }
 
 export class AgentRuntimeImpl implements AgentRuntime {
@@ -1497,194 +1554,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
     return Array.from(this.agents.values())
   }
 
+  /**
+   * 非流式执行：复用 `queryStream` 的完整循环，只取最后一步的 assistant 消息。
+   *
+   * 此处原有一份与 `_prepareQuery` 平行的逻辑副本（各自维护 system prompt、工具池、
+   * hooks、消息组装），与流式链路重复且极易分叉。改为复用后，循环语义（步数上限、
+   * doom-loop、续轮判据）对两条链路天然一致 —— 这也正是 subagent / swarm 需要的。
+   */
   async query(input: AgentQueryInput): Promise<Message> {
-    const { sessionId, message } = input
-    const agentId = input.agentId ?? this.defaultAgentId
-    const agent = this.agents.get(agentId)
-    if (!agent) throw new Error(`Agent "${agentId}" not registered`)
-
-    // 工具池组装（触发 tool.pool.assemble Hook）
-    const pool = new DefaultToolPool(this.deps.toolRegistry)
-    await this.deps.triggerPlugin('tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
-    const allowedTools = filterMcpTools(
-      this.deps.toolRegistry.filterByWhitelist(agent.tools),
-      agent.mcpServers,
-      agent.excludeMcpServers,
-    )
-
-    // 把 agent 的权限规则写回 PermissionEngine（若配置项比默认更具体）
-    this.deps.permission.updateRules({
-      ...this.deps.permission.getRules(),
-      ...(agent.permission as PermissionRuleset),
-    })
-
-    // 写入 user 消息（若还未在 session.prompt 里写入）
-    const sess = await this.deps.session.get(sessionId)
-    if (!sess) throw new Error(`Session "${sessionId}" not found`)
-
-    // 在处理用户输入前，先 drain 待处理通知（如后台任务完成通知），
-    // 将其作为 user-role 消息注入对话，大模型在后续 turn 自动感知任务完成，
-    // 不需要主动调用 task_status 工具轮询。参考 Claude Code enqueueAgentNotification。
-    const notifications = this.deps.session.drainNotifications(sessionId)
-    for (const notif of notifications) {
-      await this.deps.session.addMessage(sessionId, {
-        id: `notif_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-        role: 'user',
-        parts: [{ type: 'text', text: notif }],
-        createdAt: Date.now(),
-      })
+    let last: Message | undefined
+    for await (const ev of this.queryStream(input)) {
+      if (ev.type === 'done' && ev.message) last = ev.message
     }
-
-    if (!sess.messages.some((m) => m.role === 'user' && m.parts.some((p) => p.type === 'text' && (p as any).text === message))) {
-      await this.deps.session.addMessage(sessionId, {
-        id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-        role: 'user',
-        parts: [{ type: 'text', text: message }],
-        createdAt: Date.now(),
-      })
-    }
-
-    const session2 = (await this.deps.session.get(sessionId))!
-    // 构建 system prompt
-    const sysParts: string[] = agent.promptFragments ? [...agent.promptFragments] : []
-    if (agent.systemPrompt) sysParts.length = 0, sysParts.push(agent.systemPrompt)
-    await this.appendCompactionMemory(sessionId, sysParts)
-    const promptIn: PromptInput = { agentId, sessionId }
-    await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
-
-    // 最终 messages：system + session.messages
-    const finalMessages: Message[] = []
-    if (sysParts.length > 0) {
-      finalMessages.push({
-        id: `sys_${Date.now()}`,
-        role: 'system',
-        parts: [{ type: 'text', text: sysParts.join('\n\n') }],
-        createdAt: Date.now(),
-      })
-    }
-    // 上下文压缩·阶段二（D1）：有压缩块时用「精简视图」组装请求历史
-    // （摘要占位 + 近期消息），不再全量拼接原文；无块则零变化。
-    const view = await this.deps.session.getView(sessionId)
-    if (view.slimmed) {
-      const summaryMsg = renderBlocksAsMessage(view.blocks)
-      if (summaryMsg) finalMessages.push(summaryMsg)
-      finalMessages.push(...view.messages)
-    } else {
-      finalMessages.push(...session2.messages)
-    }
-
-    // LLM params + headers（触发 llm.params / llm.headers hooks）
-    // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
-    const llmIn: LLMInput = {
-      providerId: input.model?.providerId ?? agent.model?.providerId ?? 'default',
-      modelId: input.model?.modelId ?? agent.model?.modelId,
-      messages: finalMessages,
-    }
-    const params: LLMParams = {
-      temperature: input.model?.temperature ?? agent.model?.temperature ?? 0.7,
-      ...(agent.model?.options ?? {}),
-    }
-    const headers: Record<string, string> = {}
-    await this.deps.triggerPlugin('llm.params', llmIn, params)
-    await this.deps.triggerPlugin('llm.headers', llmIn, headers)
-
-    // 每轮进入模型前：交给上下文压缩插件裁剪/改写 messages（原地生效），并回写精简后的会话
-    const preModelBlocks: NonNullable<import('@harness/plugin').SessionPreModelInput['blocksPatch']> = []
-    await this.deps.triggerPlugin(
-      'session.preModel',
-      {
-        sessionId,
-        agentId,
-        providerId: llmIn.providerId,
-        modelId: llmIn.modelId,
-        save: async (msgs) => {
-          await this.deps.session.setMessages(sessionId, msgs as Message[])
-        },
-        meta: {
-          read: async () => (await this.deps.session.get(sessionId))?.meta,
-          patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
-        },
-        blocksPatch: preModelBlocks,
-      },
-      finalMessages,
-    )
-    // 统一块模型：把插件（ACP）每轮内部折叠的 source:'acp' 块合并进 session.blocks（按 id 去重覆盖）
-    if (preModelBlocks.length > 0) this.deps.session.setBlocks(sessionId, preModelBlocks)
-
-    const provider = this.deps.chatProvider(llmIn.providerId)
-    const completion = await provider.complete({
-      providerId: llmIn.providerId,
-      modelId: llmIn.modelId,
-      messages: finalMessages,
-      params,
-      headers,
-      sessionId,
-      agentId,
-    })
-
-    // 本轮开始时自动 capture 快照并挂到 assistant 消息（供 revert 收集回滚目标）
-    const snap = await this.captureForMessage(sessionId)
-
-    // 创建 assistant 消息
-    const assistantId = `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
-    const assistant: Message = {
-      id: assistantId,
-      role: 'assistant',
-      parts: [],
-      createdAt: Date.now(),
-      agentId,
-      meta: {
-        model: completion.model,
-        tokenUsage: completion.tokenUsage ? {
-          input: completion.tokenUsage.input,
-          output: completion.tokenUsage.output,
-          ...(completion.tokenUsage.cacheRead !== undefined ? { cacheRead: completion.tokenUsage.cacheRead } : {}),
-          ...(completion.tokenUsage.cacheWrite !== undefined ? { cacheWrite: completion.tokenUsage.cacheWrite } : {}),
-        } : undefined,
-        ...(snap ? { snapshot: { start: snap.start, files: snap.files } } : {}),
-      },
-    }
-    if (completion.reasoning) assistant.parts.push({ type: 'reasoning', text: completion.reasoning })
-    if (completion.content) assistant.parts.push({ type: 'text', text: completion.content })
-
-    // 执行 tool calls（若有）
-    if (completion.toolCalls?.length) {
-      for (const tc of completion.toolCalls) {
-        const tool = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
-        const resultPart: any = {
-          type: 'tool',
-          toolUseId: tc.toolUseId,
-          toolId: tc.toolId,
-          input: tc.input,
-        }
-        if (!tool) {
-          resultPart.result = undefined
-          resultPart.isError = true
-          assistant.parts.push(resultPart)
-          continue
-        }
-        const tctx: ToolContext = {
-          sessionId,
-          agentId,
-          messageId: assistantId,
-          toolUseId: tc.toolUseId,
-          signal: new AbortController().signal,
-          variables: {},
-          cwd: session2.cwd ?? this.deps.cwd,
-          requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
-        }
-        const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, tc.input, tctx)
-        resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
-        resultPart.isError = !res.ok
-        assistant.parts.push(resultPart)
-      }
-    }
-
-    await this.deps.session.addMessage(sessionId, assistant)
-    return assistant
+    if (!last) throw new Error('query() 未产生 assistant 消息（Provider 未返回任何内容）')
+    return last
   }
-
-  /** query/queryStream 共用的准备逻辑：返回构建好的 messages/params/headers/allowedTools */
   /**
    * 一次查询内**只做一次**的准备：Agent 解析、工具池组装、权限规则、待处理通知与
    * 用户消息注入、system prompt 片段、provider/model 解析。
@@ -1823,16 +1707,42 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
   async *queryStream(input: AgentQueryInput): AsyncGenerator<AgentStreamEvent, void, unknown> {
     const prepared = await this._prepareQueryOnce(input)
+    const { sessionId } = prepared
 
-    // S1：默认 1 步 —— 与改造前的单轮实现逐事件等价（只多 done.step 字段）。
-    // 放开步数与续轮判据（finish × toolCalls 取合取）在 S2，见 docs/agentic-loop-plan.md。
-    const maxSteps = Math.max(1, Math.floor(input.maxSteps ?? 1))
+    // 步数上限优先级：input.maxSteps > AgentDefinition.maxSteps > DEFAULT_MAX_STEPS
+    const configured = input.maxSteps ?? this.agents.get(prepared.agentId)?.maxSteps ?? DEFAULT_MAX_STEPS
+    const maxSteps = configured === -1 ? Number.POSITIVE_INFINITY : Math.max(1, Math.floor(configured))
 
-    for (let step = 1; step <= maxSteps; step++) {
-      // 单步执行：流式事件原样转发，返回值供续轮判定
-      const outcome = yield* this._runOneStep(prepared, step)
-      // S1 只有一步，恒等于「跑完即结束」；S2 在此按 outcome 决定续轮 / 注入收尾提示 / 退出
-      void outcome
+    let step = 0
+    let wrapUpInjected = false
+    // 最近若干次工具调用签名（跨步累积，供 doom-loop 检测）。保持 threshold-1 个即可：
+    // 本步自己的签名会在 _runOneStep 内顺序追加，足够凑出连续 threshold 个。
+    let recentSigs: string[] = []
+
+    while (true) {
+      step++
+      const outcome = yield* this._runOneStep(prepared, step, recentSigs)
+      if (outcome.toolSigs.length > 0) {
+        recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
+      }
+
+      // doom-loop 被拒 ⇒ 立刻收手，不再续轮
+      if (outcome.doomLoopTripped) break
+      if (!shouldContinueStep(outcome)) break
+
+      if (step >= maxSteps) {
+        // 到顶但模型仍想继续：给一次收尾机会（追加提示再跑一步），而非硬截断。
+        // 例外：maxSteps=1 是「显式单轮」语义（子 Agent 只要一次工具结果、旧调用方要单轮行为），
+        // 此时不追加收尾步 —— 否则「1 步」会变成 2 次模型调用。
+        if (wrapUpInjected || maxSteps <= 1) break
+        wrapUpInjected = true
+        await this.deps.session.addMessage(sessionId, {
+          id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+          role: 'user',
+          parts: [{ type: 'text', text: MAX_STEPS_WRAP_UP }],
+          createdAt: Date.now(),
+        })
+      }
     }
   }
 
@@ -1846,6 +1756,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
   private async *_runOneStep(
     prepared: PreparedQuery,
     step: number,
+    priorSigs: readonly string[] = [],
   ): AsyncGenerator<AgentStreamEvent, StepOutcome, unknown> {
     const { agentId, sessionId, allowedTools, providerId, modelId } = prepared
     const provider = this.deps.chatProvider(providerId)
@@ -1967,6 +1878,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const tctxCwd = sessCwd ?? this.deps.cwd
 
     // 执行 tool calls
+    const toolSigs: string[] = []
+    let doomLoopTripped = false
+    // 跨步累积（priorSigs）+ 本步顺序追加 ⇒ 尾部连续 threshold 个相同即判定死循环
+    const sigs = [...priorSigs]
+
     for (const tc of toolCalls) {
       const inputJson = tc.inputParts.join('')
       let parsedInput: unknown
@@ -1981,7 +1897,41 @@ export class AgentRuntimeImpl implements AgentRuntime {
         input: parsedInput,
       }
 
+      // doom-loop 检测挡在**执行之前**：第 3 次不再真的跑一遍，而是交给人确认；
+      // 拒绝则中断本步剩余调用并由循环终止（不再续轮）。
+      const sig = `${tc.toolId}|${JSON.stringify(parsedInput)}`
+      sigs.push(sig)
+      toolSigs.push(sig)
+
       yield { type: 'tool_call_start', toolUseId: tc.toolUseId, toolId: tc.toolId, input: parsedInput }
+
+      if (isDoomLoop(sigs)) {
+        const decision = (await this.deps.permission.ask({
+          toolKey: tc.toolId,
+          patterns: [sig],
+          input: parsedInput,
+          from: `doom-loop:${agentId}`,
+        } as ToolPermissionRequest)) as ToolPermissionDecision
+        if (decision?.behavior !== 'allow') {
+          doomLoopTripped = true
+          resultPart.result = {
+            message:
+              `检测到重复调用：同一工具（${tc.toolId}）与完全相同的入参已连续 ${DOOM_LOOP_THRESHOLD} 次，` +
+              '已中断以避免陷入死循环。请调整策略或提供更多信息后重试。',
+            code: 'DOOM_LOOP',
+          }
+          resultPart.isError = true
+          assistant.parts.push(resultPart)
+          yield {
+            type: 'tool_call_result',
+            toolUseId: tc.toolUseId,
+            toolId: tc.toolId,
+            result: resultPart.result,
+            isError: true,
+          }
+          break
+        }
+      }
 
       if (!tool) {
         resultPart.result = undefined
@@ -2017,7 +1967,6 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
     await this.deps.session.addMessage(sessionId, assistant)
     // A 方案：每步都发 done（语义 =「这一步结束」），step 让上层能区分中间步与最终步。
-    // S1 只有一步 ⇒ 与改造前的单一 done 等价。
     yield {
       type: 'done',
       message: assistant,
@@ -2025,7 +1974,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
       ...(finish ? { finish } : {}),
       ...(finishRaw ? { finishRaw } : {}),
     }
-    return { assistant, finish, toolCallCount: toolCalls.length }
+    return {
+      assistant,
+      finish,
+      toolCallCount: toolCalls.length,
+      toolSigs,
+      ...(doomLoopTripped ? { doomLoopTripped } : {}),
+    }
   }
 }
 

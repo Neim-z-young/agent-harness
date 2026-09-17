@@ -270,7 +270,9 @@ describe('@harness/core', () => {
       })
       expect(h.tools.has('echo')).toBe(false) // 组装前不注册全局
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: '调用工具试试' })
+      // maxSteps: 1 —— 本用例只验证「单轮工具执行 + pre/post hook」；
+      // 该 mock provider 每次都返回同一个 toolCall，若放任自主多步会一路跑到 doom-loop 拦截。
+      const reply = await h.agent.query({ sessionId: sess.id, message: '调用工具试试', maxSteps: 1 })
       expect(reply.role).toBe('assistant')
       const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
       expect(toolPart).toBeDefined()
@@ -371,7 +373,8 @@ describe('@harness/core', () => {
         internalPlugins: [ToolPlugin],
       })
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: 'x' })
+      // maxSteps: 1 —— 理由同上：本用例只验证白名单工具能被执行
+      const reply = await h.agent.query({ sessionId: sess.id, message: 'x', maxSteps: 1 })
       const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
       expect(toolPart.toolId).toBe('echo')
       // 成功执行

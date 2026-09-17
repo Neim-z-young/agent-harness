@@ -3481,7 +3481,17 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       let inReasoning = false
       let inText = false
       let inToolOutput = false
+      // 引擎自主多步（agentic loop）：A 方案下**每步**都发一次 done，故 done ≠ 整轮结束。
+      // 这里把 done 当作「这一步的收尾渲染」；若之后还有事件到来，说明引擎在自主续轮，
+      // 打一行分隔让人看得出它自己在往下走，而不是长时间无反馈。
+      let lastDoneStep: number | null = null
       for await (const ev of gen) {
+        if (ev.type !== 'done' && lastDoneStep != null) {
+          if (!onEvent) out(`\n🔄  第 ${lastDoneStep + 1} 步（自主续轮）\n`)
+          lastDoneStep = null
+          inText = false
+          inReasoning = false
+        }
         switch (ev.type) {
           case 'reasoning_delta':
             // TUI 结构化模式（onEvent）：推理增量直接回传，由 TUI 渲染成 thinking 块；
@@ -3519,6 +3529,12 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           }
           case 'done':
             assistant = ev.message
+            // 本步收尾：结束当前文本/推理行（多步时每步各占一段），并记下步号。
+            // 后续若再来事件即视为续轮，由循环顶部的分隔逻辑接手。
+            if (!onEvent && (inText || inReasoning)) out('\n')
+            inText = false
+            inReasoning = false
+            if (ev.step != null) lastDoneStep = ev.step
             onEvent?.(ev)
             break
         }
@@ -3921,7 +3937,10 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       const gen = app.sendStream(session.id, prompt)
       for await (const ev of gen) {
         if (ev.type === 'text_delta') write(ev.text ?? '')
-        else if (ev.type === 'done') {
+        else if (ev.type === 'tool_call_start') {
+          // 引擎自主多步时把工具活动写到 stderr —— stdout 保持「纯结果」，脚本可安全消费
+          process.stderr.write(`\n[工具] ${ev.toolId}\n`)
+        } else if (ev.type === 'done') {
           if (ev.message) {
             // 换行收尾
             const textParts = ev.message.parts.filter((p: any) => p.type === 'text')

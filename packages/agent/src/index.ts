@@ -158,6 +158,15 @@ export interface AgentDefinition {
   /** 模型偏好（覆盖默认 Provider/模型） */
   model?: AgentModelPreference
 
+  // === 执行上限 ===
+  /**
+   * 单次查询内允许的最大步数（工具结果回喂续轮的次数上限，含首次模型调用）。
+   *
+   * 语义对齐 opencode 的 `agent.steps`：-1 表示不限（仅受 doom-loop 保护约束）。
+   * 未设置时用引擎默认值；`AgentQueryInput.maxSteps` 优先级最高。
+   */
+  maxSteps?: number
+
   // === Prompt 片段（可组合叠加） ===
   /** System Prompt 片段数组（按顺序拼接） */
   promptFragments?: string[]

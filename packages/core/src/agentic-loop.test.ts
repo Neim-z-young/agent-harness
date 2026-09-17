@@ -2,6 +2,10 @@ import { describe, it, expect } from 'bun:test'
 import {
   createHarness,
   defineTool,
+  DefaultPermissionEngine,
+  isDoomLoop,
+  DOOM_LOOP_THRESHOLD,
+  DEFAULT_MAX_STEPS,
   type AgentDefinition,
   type AgentStreamEvent,
   type ChatProvider,
@@ -87,7 +91,7 @@ async function collect(gen: AsyncGenerator<AgentStreamEvent, void, unknown>): Pr
 }
 
 describe('S1 循环骨架', () => {
-  it('maxSteps 缺省为 1：只调一次模型，done 带 step=1', async () => {
+  it('缺省步数（30）下若模型不给工具调用 ⇒ 只调一次模型，done 带 step=1', async () => {
     const provider = scriptedProvider([finalTextChunks])
     const h = await createHarness({ agents: [agent], chatProvider: provider })
     const sess = await h.session.create()
@@ -155,3 +159,153 @@ describe('S1 循环骨架', () => {
     await h.stop()
   })
 })
+
+// ============================================================================
+// S2：续轮判据 + 保护（doom-loop / 步数到顶）
+// ============================================================================
+
+/** 「调用 echo」剧本；`idx` 用于制造不同入参（避免 doom-loop 干扰无关用例） */
+function toolCallScript(idx: number | string, finish?: 'stop' | 'tool_calls' | 'length'): ChatStreamChunk[] {
+  return [
+    { type: 'tool_use_start', toolUseId: `tu_${idx}`, toolId: 'echo' },
+    { type: 'tool_use_delta', inputDelta: JSON.stringify({ msg: String(idx) }) },
+    { type: 'tool_use_stop', toolUseId: `tu_${idx}` },
+    { type: 'done', model: 'm', finish: finish ?? 'tool_calls' },
+  ]
+}
+
+function textScript(text: string): ChatStreamChunk[] {
+  return [{ type: 'text_delta', text }, { type: 'done', model: 'm', finish: 'stop' }]
+}
+
+/** ask 一律放行的权限引擎（用于验证「用户允许时不误伤」） */
+class AllowAskEngine extends DefaultPermissionEngine {
+  override async ask() {
+    return { behavior: 'allow' as const }
+  }
+}
+
+describe('S2 续轮判据与保护', () => {
+  it('连续多步工具链：自主跑完并以文本收尾', async () => {
+    const provider = scriptedProvider([
+      toolCallScript(1),
+      toolCallScript(2),
+      toolCallScript(3),
+      textScript('全部完成'),
+    ])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'chain'))
+    const dones = events.filter((e) => e.type === 'done')
+
+    expect(provider.calls).toBe(4)
+    expect(dones.map((d) => d.step)).toEqual([1, 2, 3, 4])
+    expect(dones[3].finish).toBe('stop')
+
+    const assistants = (await h.session.get(sess.id))!.messages.filter((m) => m.role === 'assistant')
+    expect(assistants).toHaveLength(4)
+    expect(assistants[3].parts.some((p) => p.type === 'text')).toBe(true)
+    await h.stop()
+  })
+
+  it('finish=length（输出被截断）：即使带 toolCalls 也不续轮', async () => {
+    const provider = scriptedProvider([toolCallScript(1, 'length')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'truncated'))
+    expect(provider.calls).toBe(1)
+    await h.stop()
+  })
+
+  it('doom-loop：同工具同入参连续 3 次被拦（无人交互 ⇒ 保守拒绝）', async () => {
+    const provider = scriptedProvider([toolCallScript('same')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'loop'))
+    const results = events.filter((e) => e.type === 'tool_call_result')
+
+    // 第 3 次模型调用仍发生（模型请求了），但工具**没有真的再执行一遍** ⇒ 循环终止在 step 3
+    expect(provider.calls).toBe(DOOM_LOOP_THRESHOLD)
+    const last = results[results.length - 1]
+    expect(last?.isError).toBe(true)
+    expect(JSON.stringify(last?.result)).toContain('DOOM_LOOP')
+    // 只有前两次真的执行成功
+    expect(results.filter((r) => r.isError !== true)).toHaveLength(DOOM_LOOP_THRESHOLD - 1)
+    await h.stop()
+  })
+
+  it('doom-loop 且用户允许 ⇒ 继续执行，不误伤合法重试', async () => {
+    const provider = scriptedProvider([
+      toolCallScript('same'),
+      toolCallScript('same'),
+      toolCallScript('same'),
+      textScript('收尾'),
+    ])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      permission: new AllowAskEngine({ '*': 'allow' }),
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'retry'))
+    const results = events.filter((e) => e.type === 'tool_call_result')
+
+    // 三次都真的执行了（用户放行），之后模型给出文本收尾
+    expect(results).toHaveLength(DOOM_LOOP_THRESHOLD)
+    expect(results.every((r) => r.isError !== true)).toBe(true)
+    expect(provider.calls).toBe(4)
+    await h.stop()
+  })
+
+  it('步数到顶：注入收尾提示后额外跑一步，且提示确实进了请求', async () => {
+    const seen: Message[][] = []
+    const provider = scriptedProvider(
+      [toolCallScript(1), toolCallScript(2), toolCallScript(3)],
+      (m) => seen.push(m),
+    )
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'top', 2))
+
+    // maxSteps=2 ⇒ 跑满 2 步后仍要续轮 ⇒ 追加收尾提示再跑第 3 步，然后停止
+    expect(provider.calls).toBe(3)
+    expect(JSON.stringify(seen[2])).toContain('最大步数上限')
+    await h.stop()
+  })
+
+  it('maxSteps=1 是显式单轮：即使有工具调用也不追加收尾步', async () => {
+    const provider = scriptedProvider([toolCallScript(1), textScript('不该被调用')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'single', 1))
+    expect(provider.calls).toBe(1)
+    await h.stop()
+  })
+
+  it('isDoomLoop：只看窗口内连续相同，早于窗口的重复不算', () => {
+    expect(isDoomLoop([])).toBe(false)
+    expect(isDoomLoop(['a', 'a'])).toBe(false)
+    expect(isDoomLoop(['a', 'a', 'a'])).toBe(true)
+    expect(isDoomLoop(['a', 'a', 'b'])).toBe(false)
+    expect(isDoomLoop(['a', 'b', 'a', 'a', 'a'])).toBe(true)
+    expect(isDoomLoop(['a', 'a', 'a'], 2)).toBe(true)
+    expect(isDoomLoop(['a'], 0)).toBe(false)
+  })
+
+  it('默认步数是 30（防被误改成 1）', () => {
+    expect(DEFAULT_MAX_STEPS).toBe(30)
+  })
+})
+

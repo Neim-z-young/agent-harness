@@ -75,6 +75,26 @@ describe('MockChatProvider.stream', () => {
     expect(done?.finish).toBe('tool_calls')
   })
 
+  it('once 规则：只命中一次，之后落到下一条（模拟真实模型的行为序列）', async () => {
+    const provider = new MockChatProvider({
+      responses: [
+        { match: 'hi', once: true, response: '第一次', toolCalls: [{ toolUseId: 't1', toolId: 'echo', input: { msg: 'x' } }] },
+        { match: 'hi', response: '第二次' },
+      ],
+    })
+
+    const first = await provider.complete({ providerId: 'p', messages: makeMessages('hi'), params: {} })
+    expect(first.content).toBe('第一次')
+    expect(first.toolCalls).toHaveLength(1)
+    expect(first.finish).toBe('tool_calls')
+
+    // 第二次请求（工具结果回喂后）落到下一条规则，给出文本收尾
+    const second = await provider.complete({ providerId: 'p', messages: makeMessages('hi'), params: {} })
+    expect(second.content).toBe('第二次')
+    expect(second.toolCalls).toBeUndefined()
+    expect(second.finish).toBe('stop')
+  })
+
   it('calls 记录与 complete 一致', async () => {
     const provider = new MockChatProvider({ defaultResponse: 'test', recordCalls: true })
     for await (const _ of provider.stream({

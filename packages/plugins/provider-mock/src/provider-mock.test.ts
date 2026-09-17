@@ -282,8 +282,9 @@ describe('@harness/provider-mock', () => {
       const r1 = await h.agent.query({ sessionId: sess.id, message: '你好' })
       expect(r1.parts.some((p: any) => p.type === 'text' && p.text === '无工具')).toBe(true)
 
-      // 触发工具 → echo 执行
-      const r2 = await h.agent.query({ sessionId: sess.id, message: '调用' })
+      // 触发工具 → echo 执行（maxSteps: 1 —— 本用例只验证工具链装配与执行一次，
+      // 该 mock 规则可重复命中，放任自主多步会一路跑到 doom-loop 拦截）
+      const r2 = await h.agent.query({ sessionId: sess.id, message: '调用', maxSteps: 1 })
       const toolPart = r2.parts.find((p: any) => p.type === 'tool') as any
       expect(toolPart).toBeDefined()
       expect((toolPart.result as any).reply).toBe('echo:mock-echo')

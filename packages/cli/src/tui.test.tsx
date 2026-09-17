@@ -633,7 +633,7 @@ const activeFixtures: Array<() => Promise<void>> = []
 
 async function mountTui(
   extra: {
-    responses?: Array<{ match: string | RegExp; response: string; toolCalls?: Array<{ toolUseId: string; toolId: string; input: unknown }> }>
+    responses?: Array<{ match: string | RegExp; response: string; toolCalls?: Array<{ toolUseId: string; toolId: string; input: unknown }>; once?: boolean }>
     openFile?: (path: string, line?: number) => void
     model?: string
     permissionMode?: 'allow-all' | 'ask' | 'deny-all'
@@ -1026,7 +1026,13 @@ describe('TuiApp 集成（mock provider）', () => {
   it('权限审批模态：ask 模式工具调用触发弹窗，y 允许后继续', async () => {
     const f = await mountTui({
       permissionMode: 'ask',
-      responses: [{ match: 'hi', response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'echo ok' } }] }],
+      responses: [
+        // 第一步：要求调用工具（引擎自主多步的第一步）
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'echo ok' } }] },
+        // 第二步：看到工具结果后给出文本结论。
+        // 不加这条的话 mock 会一直要求调同一个工具，测试会陷在反复弹审批里。
+        { match: 'hi', response: '已完成' },
+      ],
     })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     // 输入触发 mock 返回工具调用 → 权限引擎 ask → 审批模态
@@ -1042,7 +1048,11 @@ describe('TuiApp 集成（mock provider）', () => {
   it('权限审批模态：n 拒绝后工具被拒，会话正常收尾', async () => {
     const f = await mountTui({
       permissionMode: 'ask',
-      responses: [{ match: 'hi', response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'rm -rf /' } }] }],
+      responses: [
+        // 同上一用例：先要求调工具，被拒后由第二步给出文本收尾
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'rm -rf /' } }] },
+        { match: 'hi', response: '已改用更安全的做法' },
+      ],
     })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     f.setup.mockInput.pressKeys(['h', 'i'])

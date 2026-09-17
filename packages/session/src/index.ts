@@ -550,8 +550,19 @@ export interface SessionManager {
   search(query: string, options?: SessionListOptions): Promise<Session[]>
   /** 发送 prompt（触发 LLM 调用，返回 assistant 消息） */
   prompt(sessionId: string, text: string): Promise<Message>
-  /** 流式发送 prompt：逐事件 yield AgentStreamEvent，最后一个为 done（含最终 Message） */
-  promptStream(sessionId: string, text: string): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown>
+  /**
+   * 流式发送 prompt：逐事件 yield AgentStreamEvent。
+   *
+   * 注意 `done` 的语义是「**这一步**结束」而非「整轮结束」—— 引擎内自主多步时
+   * 每个 step 都会发一次 done（带 `step` 序号），上层应由"是否还有后续事件"判断收尾。
+   *
+   * @param maxSteps 引擎内自主多步步数上限；缺省用引擎默认值（AgentDefinition.maxSteps 或全局默认）
+   */
+  promptStream(
+    sessionId: string,
+    text: string,
+    maxSteps?: number,
+  ): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown>
 
   /** 更新整条消息（部分字段） */
   updateMessage(sessionId: string, messageId: string, patch: Partial<Message>): Promise<void>

@@ -49,6 +49,13 @@ export interface MockResponseRule {
   reasoning?: string
   /** 覆盖模型名 */
   model?: string
+  /**
+   * 只匹配一次（命中后不再参与后续匹配）。
+   *
+   * 用于模拟"真实模型的行为序列"——例如引擎内自主多步时，第一步要求调用工具、
+   * 第二步（看到工具结果后）给出文本结论。缺省 `false` 表示可重复命中。
+   */
+  once?: boolean
 }
 
 /** Mock Provider 配置 */
@@ -94,6 +101,9 @@ export class MockChatProvider implements ChatProvider {
     Pick<MockProviderConfig, 'defaultResponse' | 'defaultReasoning' | 'model' | 'tokenUsage' | 'recordCalls' | 'delayMs'>
   > & { responses: MockResponseRule[] }
 
+  /** 已命中的 `once` 规则（用对象引用去重，允许同一规则对象被多个 provider 复用） */
+  private readonly consumedOnce = new Set<MockResponseRule>()
+
   constructor(config: MockProviderConfig = {}) {
     this.config = {
       defaultResponse: config.defaultResponse ?? 'This is a mock response.',
@@ -121,10 +131,14 @@ export class MockChatProvider implements ChatProvider {
   /** 按 user 消息内容匹配响应规则 */
   private matchRule(userText: string): MockResponseRule | undefined {
     for (const rule of this.config.responses) {
-      if (typeof rule.match === 'string') {
-        if (userText.includes(rule.match)) return rule
-      } else {
-        if (rule.match.test(userText)) return rule
+      // 已耗尽的 once 规则直接跳过（complete 与 stream 共享同一份计数）
+      if (rule.once && this.consumedOnce.has(rule)) continue
+      const hit = typeof rule.match === 'string'
+        ? userText.includes(rule.match)
+        : rule.match.test(userText)
+      if (hit) {
+        if (rule.once) this.consumedOnce.add(rule)
+        return rule
       }
     }
     return undefined

@@ -4,15 +4,15 @@
 >
 > 调研基准：`reference/claude-code-analysis-main`（Claude Code 反编译源码）、`reference/opencode-dev`（Opencode 开源源码）。
 >
-> 状态：**S0 / S1 已完成并提交，S2 待启动**。所有改造点均已定位到具体文件行号。
+> 状态：**S0 / S1 / S2 已完成并提交，S3 待启动**。所有改造点均已定位到具体文件行号。
 
 ---
 
 ## 一、结论先行
 
-本项目**不是"没有 loop"，而是 loop 的控制权在引擎外**。
+本项目**不是"没有 loop"，而是 loop 的控制权在引擎外**（S0~S2 已把它移到引擎内）。
 
-| | Claude Code | Opencode | 本项目 |
+| | Claude Code | Opencode | 本项目（**改造前**；已完成部分见 §四） |
 |---|---|---|---|
 | 主循环 | `queryLoop()` async generator | `runLoop` + `processor` 两层 | **无引擎内循环** |
 | 位置 | `query.ts:241`（1729 行） | `session/prompt.ts:1098` | `core/src/index.ts:1332 / 1638` |
@@ -97,15 +97,19 @@ if (
   → cli processLine (cli/src/index.ts:2811)
   → app.sendStream (cli:2511)            // 仅转发，无循环
   → session.promptStream (core:626)
-  → AgentRuntimeImpl.queryStream (core:1638)  ← 单轮
-       ├─ _prepareQuery (core:1519)：组装 system / hooks / 工具池 / messages
-       ├─ triggerPlugin('session.preModel')   // ACP 在此裁剪
-       ├─ provider.stream / complete          // 一次模型调用
-       ├─ for (tc of toolCalls) 串行执行工具
-       └─ addMessage(assistant) + yield done
+  → AgentRuntimeImpl.queryStream (core)  ← S1/S2 后：引擎内自主多步
+       ├─ _prepareQueryOnce              // 一次：agent/工具池/权限/system prompt/model 解析
+       └─ while (step <= maxSteps)       // 默认上限 30；maxSteps=1 为显式单轮
+            ├─ _buildStepMessages         // 每轮：重读会话 + getView + llm.params/hooks + preModel 裁剪
+            ├─ provider.stream / complete // 每步一次模型调用
+            ├─ for (tc of toolCalls) 串行执行工具（含 doom-loop 拦截）
+            ├─ addMessage(assistant) + yield done(step, finish)
+            └─ shouldContinueStep ? 续轮 : 结束（到顶则先注入收尾提示）
 ```
 
-**模型看不到自己上一轮的工具结果**（除用户输入或 barrier 触发的新一轮）。
+**模型现在能看到自己上一轮的工具结果** —— 工具结果在下一步的请求里以合规格式回喂
+（provider 层序列化时已支持，改造未动消息模型）。引擎自主续轮，直到模型不再要求工具调用、
+finish 表示异常终止、被 doom-loop 拦下，或触及步数上限。
 
 ### 3.2 现有的"外部续轮"机制
 
@@ -129,7 +133,7 @@ swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每个 ti
 | ~~P1~~ | ~~`_prepareQuery` 每轮重跑~~ | core | ✅ **S1 已解决**（拆成 `_prepareQueryOnce` + `_buildStepMessages`） |
 | P1 | barrier 与内部循环语义重叠 | coordinator:493 + cli:2740 | 可能双重续轮 |
 | P2 | abort 是空壳 | core:1503 / 1778 | `new AbortController().signal` 每次新建 |
-| P2 | 无步数上限 / 无重复调用检测 | —— | 跑飞无保护 |
+| ~~P2~~ | ~~无步数上限 / 无重复调用检测~~ | core | ✅ **S2 已解决**（默认 30 步 + doom-loop 阈值 3） |
 | OK | 工具结果回喂格式 | provider-anthropic / provider-openai | **已支持，零改动** |
 | OK | ACP 多轮适应性 | acp-context | **本就按"轮"设计** |
 
@@ -199,10 +203,13 @@ async *queryStream(input) {
 - 验收：全仓 typecheck 0 错误；core 55 / cli 330 / 6 个 provider 全绿；新增 11 例测试
   （映射定值 7 + core 端到端透传 4）；真实网关（本地 8787 / hy3）实测 `finish=stop finishRaw="stop"`
 
-> ⚠️ **S1 必须知道的语义**：`finish` 与「本轮有工具调用」**并不互斥**。Gemini 在返回 `functionCall`
-> 时 `finishReason` 仍是 `STOP`（已由 `provider-gemini/src/index.test.ts` 断言固定）。所以续轮判定
-> 必须是 **finish 与 toolCalls 的合取**：`toolCalls 非空 ⇒ 续轮`，`toolCalls 为空且 finish ∈ {stop,length,content_filter} ⇒ 终止`；
-> 只看 finish 会在 Gemini 上直接退化成单轮（改造白做），只看 toolCalls 则无法区分 length/error 的异常终止。
+> ⚠️ **续轮判据的最终形态**（S2 定稿，实现见 `shouldContinueStep`）：
+> **续轮 ⇔ 本步有工具调用 且 finish 不是异常终止（length / content_filter / error）。**
+> `finish === 'stop'` 且带工具调用时**仍要续轮** —— Gemini 在返回 `functionCall` 时 `finishReason`
+> 就是 `STOP`（已由 `provider-gemini/src/index.test.ts` 断言固定），按"只有 tool_calls 才续轮"
+> 写会在 Gemini 上直接退化成单轮。反过来 `length`/`content_filter`/`error` 是本步被截断或拦截，
+> 即便残留 toolCalls 也不该续。finish 缺失时按"有工具调用即续轮"处理（宁可多跑一步，
+> 也不能丢掉工具结果）。
 
 **S1 — `maxSteps=1` 循环骨架（证明等价）** ✅ 已完成
 
@@ -235,12 +242,48 @@ async *queryStream(input) {
 > 📌 **S2 需要同步改 CLI/TUI**：A 方案下"收到 done"不再等于"本轮结束"，CLI 的 `processLine`
 > 与 TUI 的收尾渲染要改成「done 只做收尾渲染 + 由 `step` 与后续事件判断是否继续」。
 
-**S2 — 放开步数 + 保护**
+**S2 — 放开步数 + 保护** ✅ 已完成
 
-- `maxSteps` 默认值取 20~50（参照 opencode `agent.steps` 语义，可由 Agent 定义覆盖）
-- doom-loop 检测：最近 3 次同一 `toolId` 且 `JSON.stringify(input)` 相同 → 请示权限（对齐 opencode）或强制退出
-- 到顶时注入收尾提示再跑一轮（对齐 `MAX_STEPS_PROMPT`），而非硬截断
-- 验收：构造"模型永远返回同一工具调用"的 mock，验证在第 3 次被拦住；构造"连续 5 步工具链"，验证自主跑完并以文本收尾
+- **步数上限**：`DEFAULT_MAX_STEPS = 30`（导出常量），优先级 `AgentQueryInput.maxSteps` >
+  `AgentDefinition.maxSteps` > 默认。`-1` 表示不限。30 是权衡值：够跑完 read → edit → bash → verify
+  这类链条（含几次重试），又不至于一次查询烧掉失控的 token。
+- **续轮判据**（`shouldContinueStep`，**这是本阶段最容易写错的一处**）：
+  ```
+  续轮 ⇔ 本步有工具调用 且 finish ∉ { length, content_filter, error }
+  ```
+  - **不能写成「finish === 'tool_calls' 才续轮」**：Gemini 在返回 `functionCall` 时
+    `finishReason` 仍是 `STOP`，那种写法会让它在该续轮时退出、退化成单轮（S0 已用断言固定该语义）。
+  - `length` / `content_filter` / `error` 表示本步是**被截断/拦截**的异常结束，即便消息里残留
+    toolCalls 也不该续 —— 回喂一个残缺的调用链没有意义。
+  - finish 缺失时不阻断续轮：宁可多跑一步，也不能丢掉工具结果。
+- **doom-loop 检测**：`DOOM_LOOP_THRESHOLD = 3`，同一 `toolId` + 完全相同的 `JSON.stringify(input)`
+  连续 3 次 ⇒ **在执行之前**拦下（第 3 次不真的跑），走 `permission.ask()` 征求确认；
+  拒绝则把该工具结果标为 `error`（code `DOOM_LOOP`）并终止循环。
+  无人交互时 `DefaultPermissionEngine.ask` 默认 deny ⇒ 保守中断，不会静默跑到底。
+- **步数到顶**：注入一条收尾提示（对齐 opencode `MAX_STEPS_PROMPT`）再跑一步，而非硬截断。
+  **例外：`maxSteps=1` 是「显式单轮」语义**，不追加收尾步 —— 否则「1 步」会变成 2 次模型调用，
+  破坏子 Agent 与旧调用方的预期。
+- **`query()` 复用同一循环**：删掉原先那份与 `_prepareQuery` 平行的 186 行逻辑副本，改为
+  `for await (queryStream)` 取最后一个 `done.message`。循环语义（步数 / doom-loop / 续轮判据）
+  对 subagent / swarm 天然一致 —— 它们此前只能单轮。
+- **CLI/TUI 多步呈现**：
+  - REPL：`done` 改为「本步收尾」——结束时结束当前文本行并记下 `step`；**若之后还有事件到来**
+    （说明引擎在自主续轮）就打一行 `🔄 第 N 步（自主续轮）` 分隔，避免长时间无反馈。
+  - `run`：工具活动写到 **stderr**，stdout 保持「纯结果」以利脚本消费。
+  - TUI：`onEvent` 已携带 `done.step`，分隔由 TUI 自行渲染（不向控制台混入文本行）。
+- **mock provider 增补 `once?: boolean`**：规则命中一次后不再参与匹配。用于模拟真实模型的
+  行为序列（第一步要求调工具、第二步给出文本结论），是测试多步链路的关键设施 ——
+  没有它，可重复命中的规则会让引擎一直续轮直到 doom-loop。
+- 验收：core 66 通过（新增 8 例：多步链自主收尾 / `length` 不续轮 / doom-loop 拦截 /
+  用户放行时不误伤 / 步数到顶注入提示 / `maxSteps=1` 不追加收尾 / `isDoomLoop` 边界 /
+  默认步数守卫）；cli 330、subagent 113、swarm 65、session 32、agent 33、provider-mock 16 全绿；
+  全仓 typecheck 0 错误。
+
+> 📌 **S2 暴露的真实行为变化**（测试与文档都要跟上）：
+> 1. 用「每次返回同一工具调用」的 mock 写单轮用例，现在会一路续轮到 doom-loop 才停 ——
+>    这类用例应显式传 `maxSteps: 1`（本阶段已改 3 处：core 2 处、provider-mock 1 处）。
+> 2. TUI 的权限审批模态在自主多步下**每步都可能弹**（工具真的要被调用）。这是正确行为，
+>    但测试剧本必须让第二步收敛（用 `once` 规则），否则会陷在反复弹窗里。
 
 **S3 — abort / 中断**
 
@@ -289,7 +332,8 @@ async *queryStream(input) {
   （core 55 / cli 330 / provider 6 包全绿；真实网关实测 finish 正确解析）
 - [x] S1：S0 与 S1 在相同输入下输出**逐事件等价**（mock provider 对比）
   —— 除 `done.step` 外逐字节相同；hook 次数 / provider 调用次数 / 会话消息结构均一致
-- [ ] S2：连续多步工具链能自主跑完；doom-loop 在第 3 次被拦；步数到顶注入收尾提示
+- [x] S2：连续多步工具链能自主跑完（4 步用例）；doom-loop 在第 3 次被拦（用户放行时不误伤）；
+  步数到顶注入收尾提示且提示确实进了请求；`maxSteps=1` 不追加收尾步
 - [ ] S3：循环中途中断能在步边界停下且状态完整
 - [ ] S4：coordinator / subagent / swarm 三插件在循环上线后行为符合预期，无双重驱动
 - [ ] 文档：`README.md` 与 `agent-harness-architecture.md` 同步更新 loop 章节
