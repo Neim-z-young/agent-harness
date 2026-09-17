@@ -1358,7 +1358,14 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   lines.push(`默认 provider：${cfg.provider ?? defaultProviderId}`)
   if (cfg.model) lines.push(`默认 model：${cfg.model}`)
   const c = cfg.compression
-  const acpWindow = c?.modelContextLimit ?? 200000
+  // 窗口必须与 boot 装配处同一套推导：compression.modelContextLimit → 默认 provider 的
+  // contextWindowTokens → 兜底 200_000。此前概览直接兜底 200000，于是「概览显示 200k、
+  // 插件实际按 providers[].contextWindowTokens（如 102400）跑」——同一个数两处两个值，
+  // 会让按概览做的判断全部落空（与早年"占用率显示 26% 实际 103%"同源）。
+  // 默认 provider 的 id 可能省略（由 model 派生），故同样走 normalizeProviderConfigs。
+  const { providers: resolvedProviders } = normalizeProviderConfigs(cfg.providers ?? [])
+  const defaultPc = resolvedProviders.find((p) => p.id === defaultProviderId)
+  const acpWindow = c?.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000
   const acpMode = c?.autoTune
     ? `按窗口自动适配参数（autoTune，窗口 ${acpWindow}）`
     : `原始压缩参数控制（autoTune 关闭）`

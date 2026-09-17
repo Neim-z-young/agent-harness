@@ -420,6 +420,26 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(issues.length).toBe(6)
   })
 
+  it('buildConfigOverview：窗口按 modelContextLimit → 默认 provider 的 contextWindowTokens → 200000 推导', () => {
+    // 关键回归点：概览曾直接兜底 200000，与插件实际收到的窗口（providers[].contextWindowTokens）不符
+    const base = { model: 'm', compression: { enabled: true } }
+    // ① 显式覆盖优先
+    expect(
+      buildConfigOverview({ ...base, compression: { enabled: true, modelContextLimit: 300_000 } }, 'mock'),
+    ).toInclude('fitWindow=300000')
+    // ② 回退默认 provider 的 contextWindowTokens（默认 provider 省略 id 时按 model 派生，同样要命中）
+    const withWin = {
+      ...base,
+      providers: [
+        { id: 'other', type: 'openai', model: 'gpt-4o', contextWindowTokens: 1_000_000 },
+        { type: 'openai', model: 'hy3', contextWindowTokens: 102_400 },
+      ],
+    } as unknown as HarnessConfig
+    expect(buildConfigOverview(withWin, 'hy3')).toInclude('fitWindow=102400')
+    // ③ 都没有才兜底 200000
+    expect(buildConfigOverview(base, 'mock')).toInclude('fitWindow=200000')
+  })
+
   it('buildConfigOverview：未生效项作为告警行输出，且不影响原有概览内容', () => {
     // 必须绕开结构类型：多余的属性正是本用例要模拟的脏数据（真实来源是被 JSON.parse 的 config.json）
     const dirty = { model: 'm', compression: { enabled: true, preserveRecentToken: 50_000 } } as unknown as HarnessConfig
