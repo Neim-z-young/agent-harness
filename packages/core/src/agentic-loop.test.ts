@@ -309,3 +309,175 @@ describe('S2 续轮判据与保护', () => {
   })
 })
 
+// ============================================================================
+// S3：真 abort
+// ============================================================================
+
+/** echo 工具，但执行时回调（用于注入中断）；同时把收到的 signal 暴露出来供断言 */
+function makeSignalEchoTool(onCall: (signal: AbortSignal) => void, seen?: { signal?: AbortSignal }) {
+  return defineTool({
+    id: 'echo',
+    description: '回显 msg（并回调 signal）',
+    inputSchema: {
+      parse: (v: unknown) => v as { msg: string },
+      safeParse: (v: unknown) => ({ success: true as const, data: v as { msg: string } }),
+    },
+    isReadOnly: () => true,
+    async call(input, ctx) {
+      if (seen) seen.signal = ctx.signal
+      onCall(ctx.signal)
+      return { ok: true as const, output: { reply: `echo:${input.msg}` } }
+    },
+  })
+}
+
+describe('S3 真 abort', () => {
+  it('ToolContext.signal 就是调用方传入的那个信号（不再是永不 abort 的空壳）', async () => {
+    const controller = new AbortController()
+    const seen: { signal?: AbortSignal } = {}
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: scriptedProvider([toolCallScript(1), textScript('不该跑到')]),
+    })
+    h.tools.register(makeSignalEchoTool(() => {}, seen))
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'go', 1, controller.signal))
+
+    // 最直接的证据：工具拿到的就是同一个对象（此前是每次 new AbortController().signal）
+    expect(seen.signal).toBe(controller.signal)
+    await h.stop()
+  })
+
+  it('中断在步边界生效：不再开新步，已完成的步骤成果保留', async () => {
+    const controller = new AbortController()
+    const provider = scriptedProvider([toolCallScript(1), textScript('第二步不该被调用')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    // 工具执行期间中断（模拟用户按 Ctrl-C）
+    h.tools.register(makeSignalEchoTool(() => controller.abort()))
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', undefined, controller.signal))
+
+    expect(provider.calls).toBe(1) // 第二步没有开始
+    // 第一步的成果保留：assistant 消息 + 工具结果都在会话里
+    const assistants = (await h.session.get(sess.id))!.messages.filter((m) => m.role === 'assistant')
+    expect(assistants).toHaveLength(1)
+    expect(assistants[0].parts.some((p) => p.type === 'tool')).toBe(true)
+    expect(events.some((e) => e.type === 'done')).toBe(true)
+    await h.stop()
+  })
+
+  it('中断后剩余工具被标记为 ABORTED，已执行的那个不受影响', async () => {
+    const controller = new AbortController()
+    const provider = scriptedProvider([
+      [
+        { type: 'tool_use_start', toolUseId: 'a', toolId: 'echo' },
+        { type: 'tool_use_delta', inputDelta: '{"msg":"1"}' },
+        { type: 'tool_use_stop', toolUseId: 'a' },
+        { type: 'tool_use_start', toolUseId: 'b', toolId: 'never-run' },
+        { type: 'tool_use_delta', inputDelta: '{"msg":"2"}' },
+        { type: 'tool_use_stop', toolUseId: 'b' },
+        { type: 'done', model: 'm', finish: 'tool_calls' },
+      ],
+    ])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    // 第一个工具执行时中断；第二个工具若被执行则测试失败（不应跑到）
+    let secondRan = false
+    h.tools.register(makeSignalEchoTool(() => controller.abort()))
+    h.tools.register(
+      defineTool({
+        id: 'never-run',
+        description: '不应被执行',
+        inputSchema: {
+          parse: (v: unknown) => v as { msg: string },
+          safeParse: (v: unknown) => ({ success: true as const, data: v as { msg: string } }),
+        },
+        isReadOnly: () => true,
+        async call() {
+          secondRan = true
+          return { ok: true as const, output: '不该出现' }
+        },
+      }),
+    )
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', undefined, controller.signal))
+    const results = events.filter((e) => e.type === 'tool_call_result')
+
+    expect(secondRan).toBe(false)
+    expect(results).toHaveLength(2)
+    expect(results[0].isError).toBeFalsy() // 第一个正常完成
+    expect(results[1].isError).toBe(true) // 第二个被标中断
+    expect(JSON.stringify(results[1].result)).toContain('ABORTED')
+    await h.stop()
+  })
+
+  it('流式中途中断：保留已收到的部分内容，不向上抛错', async () => {
+    const controller = new AbortController()
+    const provider: ChatProvider = {
+      id: 'aborting',
+      async complete() {
+        throw new Error('本用例只走流式')
+      },
+      async *stream() {
+        yield { type: 'text_delta', text: '前半段' }
+        controller.abort()
+        // 真实 provider 在 signal abort 时会抛 AbortError
+        throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' })
+      },
+    }
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', undefined, controller.signal))
+    const done = events.find((e) => e.type === 'done')
+
+    // 已收到的文本被写回 assistant，而不是整轮变成"发送失败"
+    expect(done?.message?.parts.some((p) => p.type === 'text' && (p as { text?: string }).text === '前半段')).toBe(true)
+    expect(events.filter((e) => e.type === 'text_delta')).toHaveLength(1)
+    await h.stop()
+  })
+
+  it('不传 signal 时行为不变（向后兼容）', async () => {
+    const provider = scriptedProvider([textScript('正常结束')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go'))
+    expect(events.some((e) => e.type === 'done')).toBe(true)
+    expect(provider.calls).toBe(1)
+    await h.stop()
+  })
+
+  it('turn_end：整轮只发一次且在最后（done 则是每步都发）', async () => {
+    const provider = scriptedProvider([toolCallScript(1), toolCallScript(2), textScript('完成')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go'))
+    const types = events.map((e) => e.type)
+
+    expect(types.filter((t) => t === 'turn_end')).toHaveLength(1)
+    expect(types[types.length - 1]).toBe('turn_end')
+    expect(types.filter((t) => t === 'done')).toHaveLength(3)
+    // turn_end 不带 message（它是状态收尾信号，不是某一步的产出）
+    expect((events[events.length - 1] as { message?: unknown }).message).toBeUndefined()
+    await h.stop()
+  })
+
+  it('中断时同样以 turn_end 收尾（UI 的 busy 状态不会卡住）', async () => {
+    const controller = new AbortController()
+    const provider = scriptedProvider([toolCallScript(1), textScript('不该跑到')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(makeSignalEchoTool(() => controller.abort()))
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', undefined, controller.signal))
+    expect(events[events.length - 1].type).toBe('turn_end')
+    await h.stop()
+  })
+})
+
+

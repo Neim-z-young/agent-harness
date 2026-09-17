@@ -4,7 +4,7 @@
 >
 > 调研基准：`reference/claude-code-analysis-main`（Claude Code 反编译源码）、`reference/opencode-dev`（Opencode 开源源码）。
 >
-> 状态：**S0 / S1 / S2 已完成并提交，S3 待启动**。所有改造点均已定位到具体文件行号。
+> 状态：**S0 / S1 / S2 / S3 已完成并提交，S4 待启动**。所有改造点均已定位到具体文件行号。
 
 ---
 
@@ -132,7 +132,7 @@ swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每个 ti
 | ~~P0~~ | ~~**finish reason 未透传**~~ | `ChatCompletionOutput` | ✅ **S0 已解决**（`finish` + `finishRaw` 已贯穿 provider → core → 流式事件） |
 | ~~P1~~ | ~~`_prepareQuery` 每轮重跑~~ | core | ✅ **S1 已解决**（拆成 `_prepareQueryOnce` + `_buildStepMessages`） |
 | P1 | barrier 与内部循环语义重叠 | coordinator:493 + cli:2740 | 可能双重续轮 |
-| P2 | abort 是空壳 | core:1503 / 1778 | `new AbortController().signal` 每次新建 |
+| ~~P2~~ | ~~abort 是空壳~~ | core | ✅ **S3 已解决**（signal 贯穿 + 步边界/工具前中断 + REPL/TUI 接线） |
 | ~~P2~~ | ~~无步数上限 / 无重复调用检测~~ | core | ✅ **S2 已解决**（默认 30 步 + doom-loop 阈值 3） |
 | OK | 工具结果回喂格式 | provider-anthropic / provider-openai | **已支持，零改动** |
 | OK | ACP 多轮适应性 | acp-context | **本就按"轮"设计** |
@@ -285,11 +285,31 @@ async *queryStream(input) {
 > 2. TUI 的权限审批模态在自主多步下**每步都可能弹**（工具真的要被调用）。这是正确行为，
 >    但测试剧本必须让第二步收敛（用 `once` 规则），否则会陷在反复弹窗里。
 
-**S3 — abort / 中断**
+**S3 — abort / 中断** ✅ 已完成
 
-- 打通真实 abort：`ToolContext.signal` 不能再每次 `new AbortController()`，需从 harness 会话级传入
-- 中断时把未完成的工具标记为 error（对齐 opencode `cleanup()` 的强制收尾）
-- 验收：循环进行中发中断，进程能在一步边界内停下且不丢已完成的 part
+- **`ToolContext.signal` 接上真信号**：此前每次 `new AbortController().signal`，是个永不 abort 的空壳
+  —— 下游其实早已认真实现（`tool` 的 pipeline 有 `ctx.signal.throwIfAborted()`、`tools-builtin`
+  的 bash 会据此 kill 子进程、`tools-web` 用它中止 fetch），**整条链只差 core 这一环**。
+  现在传 `AgentQueryInput.signal`；未传时退回新建（向后兼容）。`session.promptStream` 加第四个参数透传。
+- **中断生效点**（两处，都不切碎一步）：
+  - **步边界**：`signal.aborted` ⇒ 不再开始新的一步；
+  - **每个工具执行前**：已 abort ⇒ 该工具不执行，结果标记为 `ABORTED` 错误（对齐 opencode cleanup）。
+    检查放在 `tool_call_start` **之前** —— 没执行就不该报"开始"。
+- **不丢已完成的部分**：中断时本步已产生的 assistant 消息（含已执行工具的结果、已收到的流式文本）
+  照常写回会话。流式路径里 `AbortError` 被**吞掉**而不是穿透 —— 否则上层只会看到一句"发送失败"，
+  已渲染的内容全丢。只吞中断类异常，其它错误照旧上抛（不能把真实故障伪装成"用户取消"）。
+- **新增 `turn_end` 事件**（A 方案的补全）：`done` 每步都发，上层无法据此判断"整轮跑完"。
+  TUI 的 busy 状态此前在第一个 `done` 就置 false，引擎还在跑第二步时界面已显示空闲 —— 这是 A 方案
+  必然带来的缺口。现在在循环结束后收一条 `turn_end`（不带 message，纯状态收尾信号）：
+  - REPL：`turn_end` 不触发续轮分隔（它不是"下一步开始了"）；
+  - TUI：`busy=false` 从 `done` 移到 `turn_end`，并在 `processLine` 返回处兜底（防事件流异常时卡住）。
+- **CLI 接线**：REPL 的 `SIGINT` 与 TUI 的 Ctrl-C 统一为两段语义 ——
+  **执行中 ⇒ 中断本次查询**（提示"已请求中断，已完成的步骤会保留"），**空闲 ⇒ 退出**。
+  通过 `ProcessLineOptions.activeAbort` 句柄传递（执行期间写入当前 controller，`finally` 清空）。
+- 验收：core 73 通过（新增 7 例：`ToolContext.signal` 同一性 / 步边界中断且成果保留 /
+  剩余工具标 ABORTED 且第二个工具确实没跑 / 流式中断保留 partial 不抛错 / 不传 signal 行为不变 /
+  `turn_end` 只发一次且在最后 / 中断同样以 `turn_end` 收尾）；cli 330、subagent 113、swarm 65、
+  session 32、provider-mock 16 全绿；全仓 typecheck 0 错误。
 
 **S4 — 插件协调（风险最高，最后做）**
 
@@ -334,7 +354,8 @@ async *queryStream(input) {
   —— 除 `done.step` 外逐字节相同；hook 次数 / provider 调用次数 / 会话消息结构均一致
 - [x] S2：连续多步工具链能自主跑完（4 步用例）；doom-loop 在第 3 次被拦（用户放行时不误伤）；
   步数到顶注入收尾提示且提示确实进了请求；`maxSteps=1` 不追加收尾步
-- [ ] S3：循环中途中断能在步边界停下且状态完整
+- [x] S3：循环中途中断能在步边界停下且状态完整（`ToolContext.signal` 已接通真信号；
+  剩余工具标 `ABORTED`、已完成的成果保留；REPL SIGINT / TUI Ctrl-C 已接线）
 - [ ] S4：coordinator / subagent / swarm 三插件在循环上线后行为符合预期，无双重驱动
 - [ ] 文档：`README.md` 与 `agent-harness-architecture.md` 同步更新 loop 章节
 

@@ -557,11 +557,13 @@ export interface SessionManager {
    * 每个 step 都会发一次 done（带 `step` 序号），上层应由"是否还有后续事件"判断收尾。
    *
    * @param maxSteps 引擎内自主多步步数上限；缺省用引擎默认值（AgentDefinition.maxSteps 或全局默认）
+   * @param signal 中断信号：在步边界与每个工具执行前生效，中断时保留已完成的成果
    */
   promptStream(
     sessionId: string,
     text: string,
     maxSteps?: number,
+    signal?: AbortSignal,
   ): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown>
 
   /** 更新整条消息（部分字段） */

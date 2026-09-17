@@ -2658,10 +2658,17 @@ export class HarnessApp {
     return out
   }
 
-  /** 流式发送：逐事件 yield AgentStreamEvent，完成后自动持久化 session */
-  async *sendStream(sessionId: string, text: string): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown> {
+  /**
+   * 流式发送：逐事件 yield AgentStreamEvent，完成后自动持久化 session。
+   * `signal` 用于中断（引擎会在步边界与每个工具执行前响应它）。
+   */
+  async *sendStream(
+    sessionId: string,
+    text: string,
+    signal?: AbortSignal,
+  ): AsyncGenerator<import('@harness/core').AgentStreamEvent, void, unknown> {
     const h = this.harness
-    const gen = h.session.promptStream(sessionId, text)
+    const gen = h.session.promptStream(sessionId, text, undefined, signal)
     for await (const ev of gen) {
       yield ev
     }
@@ -2917,6 +2924,12 @@ export interface ProcessLineOptions {
   onEvent?: (ev: AgentStreamEvent) => void
   /** /new 换绑新会话后回调（让调用方同步自身会话引用） */
   setSession?: (session: Session) => void
+  /**
+   * 中断句柄：`processLine` 执行查询期间会把当前查询的 `AbortController` 写进 `current`，
+   * 结束后清空。上层（REPL 的 SIGINT / TUI 的 Ctrl-C）据此实现「执行中按键 = 中断当前查询，
+   * 空闲时按键 = 退出」。
+   */
+  activeAbort?: { current: AbortController | null }
 }
 
 export type ProcessLineResult = 'continue' | 'exit'
@@ -3475,9 +3488,13 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     }
     const started = Date.now()
     let assistant: Message | undefined
+    // 中断句柄：执行期间暴露给上层（REPL 的 SIGINT / TUI 的 Ctrl-C），
+    // 让「执行中按键 = 中断当前查询」而不是直接退出进程。
+    const ctl = new AbortController()
+    if (options.activeAbort) options.activeAbort.current = ctl
     try {
       const curSessionId = current.id
-      const gen = app.sendStream(curSessionId, line)
+      const gen = app.sendStream(curSessionId, line, ctl.signal)
       let inReasoning = false
       let inText = false
       let inToolOutput = false
@@ -3486,7 +3503,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       // 打一行分隔让人看得出它自己在往下走，而不是长时间无反馈。
       let lastDoneStep: number | null = null
       for await (const ev of gen) {
-        if (ev.type !== 'done' && lastDoneStep != null) {
+        // turn_end 是「整轮结束」标记，不是「下一步开始了」⇒ 不能触发续轮分隔
+        if (ev.type !== 'done' && ev.type !== 'turn_end' && lastDoneStep != null) {
           if (!onEvent) out(`\n🔄  第 ${lastDoneStep + 1} 步（自主续轮）\n`)
           lastDoneStep = null
           inText = false
@@ -3537,6 +3555,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             if (ev.step != null) lastDoneStep = ev.step
             onEvent?.(ev)
             break
+          case 'turn_end':
+            // 整轮结束：转发给 TUI 收尾（busy 状态等），REPL 的收尾在循环外统一做
+            onEvent?.(ev)
+            break
         }
       }
       // 结构化模式（onEvent）下收尾换行由 TUI 负责，避免向控制台混入空行
@@ -3544,8 +3566,13 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     } catch (err: any) {
       out(`\n❌  发送失败：${err?.message ?? String(err)}\n`)
       return 'continue'
+    } finally {
+      // 正常结束 / 中断 / 报错都要清掉句柄，否则下一次 SIGINT 会 abort 一个早已结束的查询
+      if (options.activeAbort) options.activeAbort.current = null
     }
     const duration = Date.now() - started
+    // 中断过就明说：core 会吞掉 AbortError 并保留已完成的部分，不提示的话看起来像"正常跑完了"
+    if (ctl.signal.aborted) out('⏹️  已中断（保留已完成的部分）\n')
     // 用「本会话实际会用的模型」而非 Agent 绑定值：会话级覆盖（/model）后若还读 Agent 定义，
     // 统计行会一直显示旧模型，看起来像切换没生效
     const modelLabel = app.resolveSessionModel(current)
@@ -3598,6 +3625,10 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
   let idx = 0
   const scripted = options.scriptedStdin ? [...options.scriptedStdin] : null
 
+  // 中断句柄：执行查询期间由 processLine 写入当前 AbortController，
+  // SIGINT（Ctrl-C）据此区分「执行中 ⇒ 中断本次查询」与「空闲 ⇒ 退出」
+  const activeAbort: { current: AbortController | null } = { current: null }
+
   // 会话处理内核（与 TUI 共用）：流式渲染、/ 命令、插件 cli.command hook
   const processLine = createProcessLine({
     app,
@@ -3606,6 +3637,7 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
     out,
     onLine: options.onLine,
     setSession: (s) => { (options as any).session = s },
+    activeAbort,
   })
 
   if (scripted) {
@@ -3636,6 +3668,21 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
       else rl.prompt()
     })
     rl.on('close', () => { detachAutoContinue(); resolve('eof') })
+    /**
+     * Ctrl-C 的两段语义（对齐主流 CLI 的习惯）：
+     * - **正在执行查询** ⇒ 中断本次查询（引擎在步边界与每个工具执行前响应，已完成的部分照常保留），
+     *   而不是把整个进程杀掉；
+     * - **空闲** ⇒ 退出 REPL。
+     */
+    rl.on('SIGINT', () => {
+      if (activeAbort.current) {
+        activeAbort.current.abort()
+        out('\n⏹️  已请求中断，正在停止…（已完成的步骤会保留）\n')
+        return
+      }
+      rl.close()
+      resolve('exit')
+    })
   })
 }
 

@@ -526,7 +526,8 @@ export interface AgentStreamEvent {
     | 'reasoning_delta'
     | 'tool_call_start'  // 工具开始执行（含 input 完整值）
     | 'tool_call_result' // 工具执行结果
-    | 'done'             // 全部完成（含最终 assistant Message）
+    | 'done'             // **一步**结束（A 方案：引擎内自主多步时每个 step 都发一次，含 step 序号）
+    | 'turn_end'         // **整轮**结束：所有 step 已跑完，本次查询不会再有任何事件
   text?: string
   toolUseId?: string
   toolId?: string
@@ -740,6 +741,7 @@ export class DefaultSessionManager implements SessionManager {
     sessionId: string,
     text: string,
     maxSteps?: number,
+    signal?: AbortSignal,
   ): AsyncGenerator<AgentStreamEvent, void, unknown> {
     const sess = await this.get(sessionId)
     if (!sess) throw new Error(`Session "${sessionId}" not found`)
@@ -760,6 +762,7 @@ export class DefaultSessionManager implements SessionManager {
       message: text,
       ...(model ? { model } : {}),
       ...(maxSteps != null ? { maxSteps } : {}),
+      ...(signal ? { signal } : {}),
     })
     for await (const ev of gen) {
       yield ev
@@ -1362,6 +1365,15 @@ export interface AgentQueryInput {
    * 引擎内自主多步在 S2 放开，届时默认值提高（参照 opencode `agent.steps`）。
    */
   maxSteps?: number
+  /**
+   * 中断信号。传入后可在**步边界**（不再开始新的一步）与**每个工具执行前**生效，
+   * 并会透传给 Provider 请求（chat completion）与 `ToolContext.signal`
+   * （bash 会据此 kill 子进程、web 工具会中止 fetch）。
+   *
+   * 中断时不会丢弃已有成果：本步已产生的 assistant 消息（含已执行工具的结果）照常写回会话，
+   * 尚未执行的工具被标记为 `ABORTED` 错误 —— 对齐 opencode 的 cleanup 收尾语义。
+   */
+  signal?: AbortSignal
 }
 
 export interface AgentRuntime {
@@ -1412,6 +1424,15 @@ interface StepOutcome {
   toolSigs: string[]
   /** 本步是否因 doom-loop 被拒而中断（中断后不再续轮） */
   doomLoopTripped?: boolean
+  /** 本步是否因外部中断（`signal`）而提前结束（中断后不再续轮） */
+  aborted?: boolean
+}
+
+/** 判断一个异常是否为 AbortError（各家实现细节不一，按 name/形状兜底判断） */
+function isAbortError(e: unknown): boolean {
+  if (!e || typeof e !== 'object') return false
+  const name = (e as { name?: unknown }).name
+  return name === 'AbortError' || name === 'TimeoutError'
 }
 
 /**
@@ -1715,19 +1736,24 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
     let step = 0
     let wrapUpInjected = false
+    const signal = input.signal
     // 最近若干次工具调用签名（跨步累积，供 doom-loop 检测）。保持 threshold-1 个即可：
     // 本步自己的签名会在 _runOneStep 内顺序追加，足够凑出连续 threshold 个。
     let recentSigs: string[] = []
 
     while (true) {
+      // 中断只在**步边界**生效：当前步已在 _runOneStep 内做工具级中断检查。
+      // 这样不会把一步切成两半，已产生的 assistant 消息与工具结果都保持完整。
+      if (signal?.aborted) break
+
       step++
-      const outcome = yield* this._runOneStep(prepared, step, recentSigs)
+      const outcome = yield* this._runOneStep(prepared, step, recentSigs, signal)
       if (outcome.toolSigs.length > 0) {
         recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
       }
 
-      // doom-loop 被拒 ⇒ 立刻收手，不再续轮
-      if (outcome.doomLoopTripped) break
+      // doom-loop 被拒 / 被中断 ⇒ 立刻收手，不再续轮
+      if (outcome.doomLoopTripped || outcome.aborted) break
       if (!shouldContinueStep(outcome)) break
 
       if (step >= maxSteps) {
@@ -1744,6 +1770,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         })
       }
     }
+
+    // 整轮结束标记。`done` 每个 step 都会发（A 方案），上层无法据此判断"全部跑完"——
+    // 而 TUI 的 busy 状态、REPL 的收尾都需要这个信息，因此显式收一条终态事件。
+    yield { type: 'turn_end' }
   }
 
   /**
@@ -1757,6 +1787,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     prepared: PreparedQuery,
     step: number,
     priorSigs: readonly string[] = [],
+    signal?: AbortSignal,
   ): AsyncGenerator<AgentStreamEvent, StepOutcome, unknown> {
     const { agentId, sessionId, allowedTools, providerId, modelId } = prepared
     const provider = this.deps.chatProvider(providerId)
@@ -1777,6 +1808,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 本轮结束原因（Provider 未提供时为 undefined —— 调用方须回退到「是否有工具调用」判断）
     let finish: ChatFinishReason | undefined
     let finishRaw: string | undefined
+    /** 本步是否被外部中断（模型请求被 abort 或工具执行前发现已中断） */
+    let aborted = false
 
     if (provider.stream) {
       // 流式路径
@@ -1788,67 +1821,87 @@ export class AgentRuntimeImpl implements AgentRuntime {
         headers,
         sessionId,
         agentId,
+        ...(signal ? { signal } : {}),
       })
-      for await (const chunk of gen) {
-        switch (chunk.type) {
-          case 'text_delta':
-            if (chunk.text) {
-              textBuf += chunk.text
-              yield { type: 'text_delta', text: chunk.text }
-            }
-            break
-          case 'reasoning_delta':
-            if (chunk.text) {
-              reasoningBuf += chunk.text
-              yield { type: 'reasoning_delta', text: chunk.text }
-            }
-            break
-          case 'tool_use_start':
-            toolCalls.push({ toolUseId: chunk.toolUseId ?? '', toolId: chunk.toolId ?? '', inputParts: [] })
-            break
-          case 'tool_use_delta':
-            if (chunk.inputDelta && toolCalls.length > 0) {
-              toolCalls[toolCalls.length - 1].inputParts.push(chunk.inputDelta)
-            }
-            break
-          case 'tool_use_stop':
-            // 不单独 yield，tool_call_start 在执行时发
-            break
-          case 'done':
-            model = chunk.model
-            tokenUsage = chunk.tokenUsage
-            raw = chunk.raw
-            finish = chunk.finish
-            finishRaw = chunk.finishRaw
-            break
+      // 中断时 Provider 会抛 AbortError：这里吞掉并保留**已收到的部分**（partial assistant），
+      // 而不是让异常穿透 —— 否则上层只会看到一句"发送失败"，已渲染的内容与已执行的工具全丢。
+      try {
+        for await (const chunk of gen) {
+          switch (chunk.type) {
+            case 'text_delta':
+              if (chunk.text) {
+                textBuf += chunk.text
+                yield { type: 'text_delta', text: chunk.text }
+              }
+              break
+            case 'reasoning_delta':
+              if (chunk.text) {
+                reasoningBuf += chunk.text
+                yield { type: 'reasoning_delta', text: chunk.text }
+              }
+              break
+            case 'tool_use_start':
+              toolCalls.push({ toolUseId: chunk.toolUseId ?? '', toolId: chunk.toolId ?? '', inputParts: [] })
+              break
+            case 'tool_use_delta':
+              if (chunk.inputDelta && toolCalls.length > 0) {
+                toolCalls[toolCalls.length - 1].inputParts.push(chunk.inputDelta)
+              }
+              break
+            case 'tool_use_stop':
+              // 不单独 yield，tool_call_start 在执行时发
+              break
+            case 'done':
+              model = chunk.model
+              tokenUsage = chunk.tokenUsage
+              raw = chunk.raw
+              finish = chunk.finish
+              finishRaw = chunk.finishRaw
+              break
+          }
         }
+      } catch (e) {
+        // 只吞中断类异常；其它错误照旧向上抛（不能把真实故障伪装成"用户取消"）
+        if (isAbortError(e) || signal?.aborted) aborted = true
+        else throw e
       }
     } else {
       // Fallback：非流式 complete()，模拟单次 yield
-      const completion = await provider.complete({
-        providerId: providerId,
-        modelId: modelId,
-        messages: finalMessages,
-        params,
-        headers,
-        sessionId,
-        agentId,
-      })
-      textBuf = completion.content
-      reasoningBuf = completion.reasoning ?? ''
-      if (completion.toolCalls) {
-        for (const tc of completion.toolCalls) {
-          toolCalls.push({ toolUseId: tc.toolUseId, toolId: tc.toolId, inputParts: [JSON.stringify(tc.input)] })
-        }
+      let completion
+      try {
+        completion = await provider.complete({
+          providerId: providerId,
+          modelId: modelId,
+          messages: finalMessages,
+          params,
+          headers,
+          sessionId,
+          agentId,
+          ...(signal ? { signal } : {}),
+        })
+      } catch (e) {
+        if (isAbortError(e) || signal?.aborted) {
+          completion = undefined
+          aborted = true
+        } else throw e
       }
-      model = completion.model
-      tokenUsage = completion.tokenUsage
-      raw = completion.raw
-      finish = completion.finish
-      finishRaw = completion.finishRaw
-      // 一次性 yield 文本
-      if (textBuf) yield { type: 'text_delta', text: textBuf }
-      if (reasoningBuf) yield { type: 'reasoning_delta', text: reasoningBuf }
+      if (completion) {
+        textBuf = completion.content
+        reasoningBuf = completion.reasoning ?? ''
+        if (completion.toolCalls) {
+          for (const tc of completion.toolCalls) {
+            toolCalls.push({ toolUseId: tc.toolUseId, toolId: tc.toolId, inputParts: [JSON.stringify(tc.input)] })
+          }
+        }
+        model = completion.model
+        tokenUsage = completion.tokenUsage
+        raw = completion.raw
+        finish = completion.finish
+        finishRaw = completion.finishRaw
+        // 一次性 yield 文本
+        if (textBuf) yield { type: 'text_delta', text: textBuf }
+        if (reasoningBuf) yield { type: 'reasoning_delta', text: reasoningBuf }
+      }
     }
 
     // 构建 assistant 消息
@@ -1903,6 +1956,24 @@ export class AgentRuntimeImpl implements AgentRuntime {
       sigs.push(sig)
       toolSigs.push(sig)
 
+      // 中断检查：已 abort ⇒ 不再执行剩余工具（含当前这个），逐个标记为 ABORTED。
+      // **不丢已完成的部分**：本步此前已 push 的工具结果与已收到的 assistant 文本照常写回会话
+      // （对齐 opencode cleanup 的收尾语义）。放在 tool_call_start 之前 —— 没执行就不该报"开始"。
+      if (signal?.aborted) {
+        aborted = true
+        resultPart.result = { message: '执行已中断，该工具未运行。', code: 'ABORTED' }
+        resultPart.isError = true
+        assistant.parts.push(resultPart)
+        yield {
+          type: 'tool_call_result',
+          toolUseId: tc.toolUseId,
+          toolId: tc.toolId,
+          result: resultPart.result,
+          isError: true,
+        }
+        continue
+      }
+
       yield { type: 'tool_call_start', toolUseId: tc.toolUseId, toolId: tc.toolId, input: parsedInput }
 
       if (isDoomLoop(sigs)) {
@@ -1946,7 +2017,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
         agentId,
         messageId: assistantId,
         toolUseId: tc.toolUseId,
-        signal: new AbortController().signal,
+        // 接上真正会 abort 的信号：bash 据此 kill 子进程、web 工具据此中止 fetch。
+        // 未传 signal 时才退回新建（保持向后兼容 —— 旧调用方行为不变）。
+        signal: signal ?? new AbortController().signal,
         variables: {},
         cwd: tctxCwd,
         requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
@@ -1980,6 +2053,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       toolCallCount: toolCalls.length,
       toolSigs,
       ...(doomLoopTripped ? { doomLoopTripped } : {}),
+      ...(aborted ? { aborted } : {}),
     }
   }
 }

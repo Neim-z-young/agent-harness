@@ -1018,6 +1018,11 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   // 会话处理内核（与 REPL 共用）：结构化 onEvent 驱动 markdown 流，out 归类控制台文本。
   // onEvent 增量被缓冲并按宏任务批合并提交，避免高频 chunk 逐次全量重解析 markdown。
   const processLineRef = useRef<((raw: string) => Promise<'continue' | 'exit'>) | null>(null)
+  /**
+   * 中断句柄：`createProcessLine` 在执行查询期间写入当前 `AbortController`，结束后清空。
+   * Ctrl-C 据此区分「执行中 ⇒ 中断本次查询」与「空闲 ⇒ 退出」。
+   */
+  const abortCtlRef = useRef<{ current: AbortController | null }>({ current: null })
   const exitRef = useRef(false)
   const pendingEvsRef = useRef<AgentStreamEvent[]>([])
   const flushScheduledRef = useRef(false)
@@ -1036,10 +1041,12 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       harness: options.harness,
       session: options.session,
       out: (s) => setState((prev) => pushConsole(prev, s)),
+      activeAbort: abortCtlRef.current,
       onEvent: (ev) => {
         // 轻量副作用立即处理（不触渲染重解析）
         if (ev.type === 'done') {
-          setBusy(false)
+          // 注意：A 方案下 done 是「一步结束」，引擎可能还在跑下一步 ⇒ 这里**不**置 busy=false
+          // （否则多步时 UI 会在仍在推理时显示空闲）。改由 turn_end 统一收尾。
           const msg = ev.message
           setModel(msg?.meta?.model)
           // 记录一次 LLM 调用与 API 实际返回的 token 用量（含缓存命中/写入），
@@ -1074,6 +1081,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           }
         } else if (ev.type === 'text_delta' || ev.type === 'reasoning_delta' || ev.type === 'tool_call_start') {
           setBusy(true)
+        } else if (ev.type === 'turn_end') {
+          // 整轮结束（所有 step 跑完）—— 这里才是真正该收 busy 的时机
+          setBusy(false)
         }
         // 渲染状态：缓冲批量提交
         pendingEvsRef.current.push(ev)
@@ -1216,6 +1226,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       while (pendingLines.current.length > 0 && !exitRef.current) {
         const line = pendingLines.current.shift()!
         const r = await processLineRef.current!(line)
+        // 兜底收 busy：正常路径由 turn_end 事件收尾，这里防止事件流异常（如抛错）时
+        // spinner 永久转下去。
+        setBusy(false)
         // /agent、/model、/resume、/new 会改变本会话的 agent / 模型，但它们不产生 done 事件，
         // 状态栏不会自动刷新 —— 这里按命令名主动对齐。普通提问仍由 done 事件用「实际返回的模型」刷新（更真实）。
         if (/^\/(agent|switch|model|resume|new)\b/.test(line.trim())) {
@@ -1347,7 +1360,17 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       else if (key.shift && key.name === 'n') submitApproval('never')            // 始终拒绝
       return true // 其余按键在审批中一律吞掉
     }
-    if (key.ctrl && key.name === 'c') return finish('exit')
+    if (key.ctrl && key.name === 'c') {
+      // 执行中 ⇒ 中断本次查询（引擎在步边界与每个工具执行前响应，已完成的部分保留）；
+      // 空闲 ⇒ 退出。与 REPL 的 SIGINT 语义一致。
+      const ctl = abortCtlRef.current.current
+      if (ctl) {
+        ctl.abort()
+        setState((prev) => pushConsole(prev, '\n⏹️  已请求中断，正在停止…（已完成的步骤会保留）\n'))
+        return true
+      }
+      return finish('exit')
+    }
     // 诊断：连修饰键一起记录。此前只记 name/ctrl，导致「Shift+Enter 的修饰信息到底有没有
     // 送达应用」在日志里无从判断（实测结论见开发日志续 125）。
     __KEYLOG.push(`${key.name}${key.ctrl ? ':C' : ''}${key.shift ? ':S' : ''}${key.meta ? ':M' : ''}`)
