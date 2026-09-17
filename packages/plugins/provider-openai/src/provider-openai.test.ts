@@ -329,6 +329,64 @@ describe('@harness/provider-openai', () => {
       }
     })
 
+    it('thinking 端点：命中 reasoning_content 400 后自动补字段重发（旧历史也能救回）', async () => {
+      // 实测 DeepSeek：thinking 模式下**每条** assistant 都必须带 reasoning_content，
+      // 缺就直接 400 —— 即使这条消息本来没有推理内容（如旧版本存下的历史消息）。
+      // 而标准 OpenAI 恰恰相反（多传未知参数会 400），所以只能探测后自适应。
+      let calls = 0
+      const bodies: string[] = []
+      const restore = installMock(async ({ init }) => {
+        calls++
+        bodies.push(String(init?.body ?? ''))
+        if (calls === 1) {
+          return new Response(
+            JSON.stringify({ error: { message: 'The `reasoning_content` in the thinking mode must be passed back to the API.' } }),
+            { status: 400 },
+          )
+        }
+        return new Response(okResponse('重发成功', 'deepseek-flash'))
+      })
+      try {
+        const p = new OpenAIChatProvider({ apiKey: 'k', defaultModel: 'deepseek-flash' })
+        const msgs = [
+          { id: 'u', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+          // 旧形态：assistant 没有 reasoning part
+          { id: 'a', role: 'assistant', parts: [{ type: 'text', text: 'ok' }], createdAt: 2 },
+        ]
+        const out = await p.complete({ providerId: 'openai', messages: msgs as never, params: {} })
+
+        expect(out.content).toBe('重发成功')
+        expect(calls).toBe(2) // 首发 400 → 自动重发
+        const second = JSON.parse(bodies[1]) as { messages: Array<Record<string, unknown>> }
+        const asst = second.messages.find((m) => m.role === 'assistant')!
+        expect(asst.reasoning_content).toBe('') // 无推理内容 ⇒ 空串兜底
+      } finally {
+        restore()
+      }
+    })
+
+    it('标准 OpenAI 端点：不补 reasoning_content（避免未知参数 400）', async () => {
+      const bodies: string[] = []
+      const restore = installMock(async ({ init }) => {
+        bodies.push(String(init?.body ?? ''))
+        return new Response(okResponse('ok', 'gpt-4o'))
+      })
+      try {
+        const p = new OpenAIChatProvider({ apiKey: 'k', defaultModel: 'gpt-4o' })
+        const msgs = [
+          { id: 'u', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+          { id: 'a', role: 'assistant', parts: [{ type: 'text', text: 'ok' }], createdAt: 2 },
+        ]
+        await p.complete({ providerId: 'openai', messages: msgs as never, params: {} })
+
+        const body = JSON.parse(bodies[0]) as { messages: Array<Record<string, unknown>> }
+        const asst = body.messages.find((m) => m.role === 'assistant')!
+        expect('reasoning_content' in asst).toBe(false)
+      } finally {
+        restore()
+      }
+    })
+
     it('未配 API Key → 立即抛错', async () => {
       const p = new OpenAIChatProvider()
       const restore = installMock(async () => { throw new Error('不应到达真实 fetch') })

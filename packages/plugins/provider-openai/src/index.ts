@@ -144,7 +144,14 @@ type OpenAIResponseBody = {
 // ===== Part 序列化工具 =====
 
 /** 把单条 Harness Message 转成 OpenAI Chat Message（可能产生多条：assistant tool_calls + 后续 tool results） */
-function toOpenAIMessages(messages: Message[]): OpenAIChatMessage[] {
+/**
+ * 序列化会话消息 → OpenAI Chat Completions 消息。
+ *
+ * @param forceReasoningContent 给**没有**推理内容的 assistant 消息也补一个 `reasoning_content: ''`。
+ *   某些 thinking 端点（实测 DeepSeek）会强制校验「assistant 消息必须带该字段」——即使这条消息
+ *   本来就没有推理内容（例如旧版本存下的历史消息），缺字段直接 400。由调用方按探测结果决定。
+ */
+function toOpenAIMessages(messages: Message[], forceReasoningContent = false): OpenAIChatMessage[] {
   const out: OpenAIChatMessage[] = []
   for (const msg of messages) {
     if (msg.role === 'system') {
@@ -222,10 +229,12 @@ function toOpenAIMessages(messages: Message[]): OpenAIChatMessage[] {
         content: textParts.join('\n') || '',
       }
       if (toolCalls.length > 0) assistantMsg.tool_calls = toolCalls
-      // 只在**确实有推理内容**时才带该字段：非 thinking 模型不会产生 reasoning part，
-      // 于是标准 OpenAI 端点永远不会收到这个它们不认识的参数（避免 400）。
+      // 有推理内容 ⇒ 必带。没有时：标准 OpenAI 端点不认识这个参数（会 400），所以默认不带；
+      // 但 thinking 端点恰恰相反 —— 它要求**每条** assistant 都带（缺字段=400，实测 DeepSeek），
+      // 于是由 forceReasoningContent 补空串兜底。两种端点的要求相反，只能靠探测区分。
       const reasoningJoined = reasoningParts.filter((t) => t).join('\n')
       if (reasoningJoined) assistantMsg.reasoning_content = reasoningJoined
+      else if (forceReasoningContent) assistantMsg.reasoning_content = ''
       // 注意：OpenAI assistant 消息即使有 tool_calls 也可以有 content（可空）
       out.push(assistantMsg)
       continue
@@ -384,6 +393,19 @@ export class OpenAIChatProvider implements ChatProvider {
 
   private toolsGetter: () => Tool[]
 
+  /**
+   * 端点是否强制要求 assistant 消息回传 `reasoning_content`（thinking 模式的特性）。
+   *
+   * 两种端点的要求**相反**，且无法从配置事先判断：
+   * - 标准 OpenAI：不认识该参数（多传会 400）
+   * - thinking 端点（实测 DeepSeek）：**每条** assistant 都必须带（缺就直接 400，
+   *   即使这条消息本来没有推理内容 —— 例如旧版本存下的历史消息）
+   *
+   * 故采用自适应探测：首次命中相关 400 后置为 true 并重发一次（见 complete / stream），
+   * 之后该 provider 实例的所有请求都补 `reasoning_content`（无内容时用空串）。
+   */
+  private requiresReasoningField = false
+
   constructor(
     config: OpenAIProviderConfig = {},
     toolsGetter: () => Tool[] = () => []
@@ -427,8 +449,13 @@ export class OpenAIChatProvider implements ChatProvider {
     messages: Message[]
     llmParams: Record<string, unknown>
     stream?: boolean
+    /** 覆盖实例级探测结果（一般不用传，见 requiresReasoningField） */
+    forceReasoningContent?: boolean
   }): OpenAIRequestBody {
-    const messages = toOpenAIMessages(params.messages)
+    const messages = toOpenAIMessages(
+      params.messages,
+      params.forceReasoningContent ?? this.requiresReasoningField,
+    )
     const model = params.modelId ?? this.config.defaultModel
     const llmParams = params.llmParams ?? {}
     const toolsDefs = this.toolsGetter().map(toolToOpenAIDef)
@@ -494,14 +521,31 @@ export class OpenAIChatProvider implements ChatProvider {
 
       const headers = this.buildHeaders(params.headers)
       const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`
-      const resp = await fetch(url, {
+      let resp = await fetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
         signal: inner.signal,
       })
 
-      const text = await resp.text()
+      let text = await resp.text()
+      // 自适应：thinking 端点要求「每条 assistant 必须带 reasoning_content」，
+      // 首次命中该 400 时打开开关重发（此后该实例的所有请求都会补该字段，无内容时给空串）。
+      if (!resp.ok && !this.requiresReasoningField && /reasoning_content/i.test(text)) {
+        this.requiresReasoningField = true
+        resp = await fetch(url, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(this.buildBody({
+            modelId: params.modelId,
+            messages: params.messages,
+            llmParams: params.params,
+            stream: false,
+          })),
+          signal: inner.signal,
+        })
+        text = await resp.text()
+      }
       let parsed: OpenAIResponseBody
       try {
         parsed = JSON.parse(text)
@@ -637,7 +681,7 @@ export class OpenAIChatProvider implements ChatProvider {
 
     try {
       const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`
-      const resp = await fetch(url, {
+      let resp = await fetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
@@ -651,7 +695,33 @@ export class OpenAIChatProvider implements ChatProvider {
           const j = JSON.parse(text)
           if (j.error?.message) msg = j.error.message
         } catch {}
-        throw new Error(`OpenAI stream 错误：${msg}`)
+        // 自适应：见 requiresReasoningField 的说明。重发时给所有 assistant 补 reasoning_content
+        // （无推理内容的消息给空串），仍失败才向上抛。
+        if (!this.requiresReasoningField && /reasoning_content/i.test(msg)) {
+          this.requiresReasoningField = true
+          resp = await fetch(url, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(this.buildBody({
+              modelId: params.modelId,
+              messages: params.messages,
+              llmParams: params.params,
+              stream: true,
+            })),
+            signal: inner.signal,
+          })
+          if (!resp.ok) {
+            const t2 = await resp.text()
+            let m2 = `HTTP ${resp.status}`
+            try {
+              const j = JSON.parse(t2)
+              if (j.error?.message) m2 = j.error.message
+            } catch {}
+            throw new Error(`OpenAI stream 错误：${m2}`)
+          }
+        } else {
+          throw new Error(`OpenAI stream 错误：${msg}`)
+        }
       }
 
       const reader = resp.body?.getReader()
