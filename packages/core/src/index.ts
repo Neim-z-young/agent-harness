@@ -536,6 +536,14 @@ export interface AgentStreamEvent {
   /** done 时的最终 assistant 消息 */
   message?: Message
   /**
+   * done 时的步序号（从 1 开始）。
+   *
+   * A 方案：**每个 step 结束都发一次 done**（语义 = "这一步结束"），而不是只在最末轮发。
+   * 上层据此把 done 当作"一次收尾渲染"信号，由 `step` 与后续是否再来 done 判断整轮是否结束；
+   * 不要用"收到 done"作为"本次查询全部完成"的依据。
+   */
+  step?: number
+  /**
    * done 时的结束原因（规范化）。agentic loop 据此判定是否续轮；
    * 缺失表示 Provider 未提供 —— 此时只能回退到「本轮是否产生工具调用」来判断。
    */
@@ -728,7 +736,11 @@ export class DefaultSessionManager implements SessionManager {
     return assistant as Message
   }
 
-  async *promptStream(sessionId: string, text: string): AsyncGenerator<AgentStreamEvent, void, unknown> {
+  async *promptStream(
+    sessionId: string,
+    text: string,
+    maxSteps?: number,
+  ): AsyncGenerator<AgentStreamEvent, void, unknown> {
     const sess = await this.get(sessionId)
     if (!sess) throw new Error(`Session "${sessionId}" not found`)
     const svc = this.services?.()
@@ -747,6 +759,7 @@ export class DefaultSessionManager implements SessionManager {
       agentId: sess.agentId ?? svc.currentAgentId(),
       message: text,
       ...(model ? { model } : {}),
+      ...(maxSteps != null ? { maxSteps } : {}),
     })
     for await (const ev of gen) {
       yield ev
@@ -1342,6 +1355,13 @@ export interface AgentQueryInput {
   message: string
   /** 模型覆盖（SubagentTool 派出子 Agent 时可指定模型，优先级高于 agent 定义） */
   model?: { providerId?: string; modelId?: string; temperature?: number }
+  /**
+   * 单次 queryStream 的最多步数（工具结果回喂续轮的次数上限）。
+   *
+   * 默认 `1` —— 即「单轮」：一次模型调用 + 执行工具后结束，与改造前行为一致。
+   * 引擎内自主多步在 S2 放开，届时默认值提高（参照 opencode `agent.steps`）。
+   */
+  maxSteps?: number
 }
 
 export interface AgentRuntime {
@@ -1361,6 +1381,33 @@ export interface AgentRuntime {
    * 若 ChatProvider 未实现 stream()，内部自动 fallback 到 complete() 并只发一个 done 事件。
    */
   queryStream(input: AgentQueryInput): AsyncGenerator<AgentStreamEvent, void, unknown>
+}
+
+/**
+ * 一次查询内**不变**的准备产物（`_prepareQueryOnce` 的返回）。
+ * 随轮次变化的部分（消息历史、llm.params/headers、preModel 裁剪）不在这里，
+ * 由 `_buildStepMessages` 每轮重建。
+ */
+interface PreparedQuery {
+  agentId: string
+  sessionId: string
+  /** system prompt 片段（已过 `prompt.system.transform` 与压缩记忆注入） */
+  sysParts: string[]
+  allowedTools: Tool[]
+  providerId: string
+  modelId?: string
+  /** 基础 LLM 参数（temperature / agent.model.options），每轮浅拷贝后交给 `llm.params` hook */
+  paramsBase: LLMParams
+}
+
+/** 单个 step 的终值（`_runOneStep` 的 return）——供循环决定是否续轮 */
+interface StepOutcome {
+  /** 本步写回会话的 assistant 消息 */
+  assistant: Message
+  /** 本步结束原因（Provider 未提供时为 undefined） */
+  finish?: ChatFinishReason
+  /** 本步实际发起的工具调用数（> 0 是续轮的必要条件之一，见 docs/agentic-loop-plan.md） */
+  toolCallCount: number
 }
 
 export class AgentRuntimeImpl implements AgentRuntime {
@@ -1638,16 +1685,16 @@ export class AgentRuntimeImpl implements AgentRuntime {
   }
 
   /** query/queryStream 共用的准备逻辑：返回构建好的 messages/params/headers/allowedTools */
-  private async _prepareQuery(input: AgentQueryInput): Promise<{
-    agentId: string
-    sessionId: string
-    finalMessages: Message[]
-    params: LLMParams
-    headers: Record<string, string>
-    allowedTools: Tool[]
-    providerId: string
-    modelId?: string
-  }> {
+  /**
+   * 一次查询内**只做一次**的准备：Agent 解析、工具池组装、权限规则、待处理通知与
+   * 用户消息注入、system prompt 片段、provider/model 解析。
+   *
+   * 与 `_buildStepMessages` 的分界依据是「是否随轮次变化」：
+   * 工具池 / 权限规则 / system prompt / model 解析在同一次查询内不变；
+   * 而消息历史（含 ACP 折叠后的块）每轮都不同，必须每轮重建 —— 分错会丢 hook
+   * 或重复执行（详见 docs/agentic-loop-plan.md 的 P1）。
+   */
+  private async _prepareQueryOnce(input: AgentQueryInput): Promise<PreparedQuery> {
     const { sessionId, message } = input
     const agentId = input.agentId ?? this.defaultAgentId
     const agent = this.agents.get(agentId)
@@ -1689,19 +1736,45 @@ export class AgentRuntimeImpl implements AgentRuntime {
       })
     }
 
-    const session2 = (await this.deps.session.get(sessionId))!
+    // —— system prompt 片段（一次查询内不变）——
     const sysParts: string[] = agent.promptFragments ? [...agent.promptFragments] : []
     if (agent.systemPrompt) { sysParts.length = 0; sysParts.push(agent.systemPrompt) }
     await this.appendCompactionMemory(sessionId, sysParts)
     const promptIn: PromptInput = { agentId, sessionId }
     await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
 
-    const finalMessages: Message[] = []
-    if (sysParts.length > 0) {
-      finalMessages.push({
+    // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
+    const providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'
+    const modelId = input.model?.modelId ?? agent.model?.modelId
+    // 基础参数一次算好（浅拷贝给每轮的 params）；`llm.params` hook 仍每轮跑 ——
+    // 它的入参含本轮 messages，提前到一次阶段会让 hook 看到过期的历史。
+    const paramsBase: LLMParams = {
+      temperature: input.model?.temperature ?? agent.model?.temperature ?? 0.7,
+      ...(agent.model?.options ?? {}),
+    }
+
+    return { agentId, sessionId, sysParts, allowedTools, providerId, modelId, paramsBase }
+  }
+
+  /**
+   * 每个 step 都重建的「消息 + 参数」。
+   *
+   * 必须每轮重做：上一轮的 assistant 消息与工具结果已写回会话，ACP 也可能刚折叠过
+   * 消息（`setMessages` / `setBlocks`），因此会话内容与 `getView()` 的精简视图都会变。
+   */
+  private async _buildStepMessages(
+    p: PreparedQuery,
+  ): Promise<{ messages: Message[]; params: LLMParams; headers: Record<string, string> }> {
+    const { sessionId } = p
+    const sess = await this.deps.session.get(sessionId)
+    if (!sess) throw new Error(`Session "${sessionId}" not found`)
+
+    const messages: Message[] = []
+    if (p.sysParts.length > 0) {
+      messages.push({
         id: `sys_${Date.now()}`,
         role: 'system',
-        parts: [{ type: 'text', text: sysParts.join('\n\n') }],
+        parts: [{ type: 'text', text: p.sysParts.join('\n\n') }],
         createdAt: Date.now(),
       })
     }
@@ -1710,22 +1783,14 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const view = await this.deps.session.getView(sessionId)
     if (view.slimmed) {
       const summaryMsg = renderBlocksAsMessage(view.blocks)
-      if (summaryMsg) finalMessages.push(summaryMsg)
-      finalMessages.push(...view.messages)
+      if (summaryMsg) messages.push(summaryMsg)
+      messages.push(...view.messages)
     } else {
-      finalMessages.push(...session2.messages)
+      messages.push(...sess.messages)
     }
 
-    // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
-    const llmIn: LLMInput = {
-      providerId: input.model?.providerId ?? agent.model?.providerId ?? 'default',
-      modelId: input.model?.modelId ?? agent.model?.modelId,
-      messages: finalMessages,
-    }
-    const params: LLMParams = {
-      temperature: input.model?.temperature ?? agent.model?.temperature ?? 0.7,
-      ...(agent.model?.options ?? {}),
-    }
+    const llmIn: LLMInput = { providerId: p.providerId, modelId: p.modelId, messages }
+    const params: LLMParams = { ...p.paramsBase }
     const headers: Record<string, string> = {}
     await this.deps.triggerPlugin('llm.params', llmIn, params)
     await this.deps.triggerPlugin('llm.headers', llmIn, headers)
@@ -1736,9 +1801,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
       'session.preModel',
       {
         sessionId,
-        agentId,
-        providerId: llmIn.providerId,
-        modelId: llmIn.modelId,
+        agentId: p.agentId,
+        providerId: p.providerId,
+        modelId: p.modelId,
         save: async (msgs) => {
           await this.deps.session.setMessages(sessionId, msgs as Message[])
         },
@@ -1748,17 +1813,45 @@ export class AgentRuntimeImpl implements AgentRuntime {
         },
         blocksPatch: preModelBlocks,
       },
-      finalMessages,
+      messages,
     )
     // 统一块模型：把插件（ACP）每轮内部折叠的 source:'acp' 块合并进 session.blocks（按 id 去重覆盖）
     if (preModelBlocks.length > 0) this.deps.session.setBlocks(sessionId, preModelBlocks)
 
-    return { agentId, sessionId, finalMessages, params, headers, allowedTools, providerId: llmIn.providerId, modelId: llmIn.modelId }
+    return { messages, params, headers }
   }
 
   async *queryStream(input: AgentQueryInput): AsyncGenerator<AgentStreamEvent, void, unknown> {
-    const { agentId, sessionId, finalMessages, params, headers, allowedTools, providerId, modelId } = await this._prepareQuery(input)
+    const prepared = await this._prepareQueryOnce(input)
+
+    // S1：默认 1 步 —— 与改造前的单轮实现逐事件等价（只多 done.step 字段）。
+    // 放开步数与续轮判据（finish × toolCalls 取合取）在 S2，见 docs/agentic-loop-plan.md。
+    const maxSteps = Math.max(1, Math.floor(input.maxSteps ?? 1))
+
+    for (let step = 1; step <= maxSteps; step++) {
+      // 单步执行：流式事件原样转发，返回值供续轮判定
+      const outcome = yield* this._runOneStep(prepared, step)
+      // S1 只有一步，恒等于「跑完即结束」；S2 在此按 outcome 决定续轮 / 注入收尾提示 / 退出
+      void outcome
+    }
+  }
+
+  /**
+   * 执行一个 step：重建消息 → capture 快照 → 调模型（流式或 complete fallback）→
+   * 执行工具 → 写回 assistant 消息 → 发 done 事件。返回续轮判定所需的信息。
+   *
+   * 用 async generator 而非普通函数，是为了让流式增量照常 `yield` 给上层；
+   * 终值（StepOutcome）通过 `yield*` 的返回值传出，避免再引一条回调通道。
+   */
+  private async *_runOneStep(
+    prepared: PreparedQuery,
+    step: number,
+  ): AsyncGenerator<AgentStreamEvent, StepOutcome, unknown> {
+    const { agentId, sessionId, allowedTools, providerId, modelId } = prepared
     const provider = this.deps.chatProvider(providerId)
+
+    // 每轮重建：会话已被上一轮写回（assistant + 工具结果），ACP 也可能刚折叠过消息
+    const { messages: finalMessages, params, headers } = await this._buildStepMessages(prepared)
 
     // 本轮开始时自动 capture 快照（挂到 assistant 消息 meta.snapshot）
     const snap = await this.captureForMessage(sessionId)
@@ -1923,12 +2016,16 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
 
     await this.deps.session.addMessage(sessionId, assistant)
+    // A 方案：每步都发 done（语义 =「这一步结束」），step 让上层能区分中间步与最终步。
+    // S1 只有一步 ⇒ 与改造前的单一 done 等价。
     yield {
       type: 'done',
       message: assistant,
+      step,
       ...(finish ? { finish } : {}),
       ...(finishRaw ? { finishRaw } : {}),
     }
+    return { assistant, finish, toolCallCount: toolCalls.length }
   }
 }
 

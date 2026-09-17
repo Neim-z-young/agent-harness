@@ -4,7 +4,7 @@
 >
 > 调研基准：`reference/claude-code-analysis-main`（Claude Code 反编译源码）、`reference/opencode-dev`（Opencode 开源源码）。
 >
-> 状态：**S0 已完成并提交，S1 待启动**。所有改造点均已定位到具体文件行号。
+> 状态：**S0 / S1 已完成并提交，S2 待启动**。所有改造点均已定位到具体文件行号。
 
 ---
 
@@ -126,7 +126,7 @@ swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每个 ti
 | # | 阻塞点 | 位置 | 现状 |
 |---|---|---|---|
 | ~~P0~~ | ~~**finish reason 未透传**~~ | `ChatCompletionOutput` | ✅ **S0 已解决**（`finish` + `finishRaw` 已贯穿 provider → core → 流式事件） |
-| P1 | `_prepareQuery` 每轮重跑 | core:1519-1636 | 循环内重复组装 system/hooks/工具池 |
+| ~~P1~~ | ~~`_prepareQuery` 每轮重跑~~ | core | ✅ **S1 已解决**（拆成 `_prepareQueryOnce` + `_buildStepMessages`） |
 | P1 | barrier 与内部循环语义重叠 | coordinator:493 + cli:2740 | 可能双重续轮 |
 | P2 | abort 是空壳 | core:1503 / 1778 | `new AbortController().signal` 每次新建 |
 | P2 | 无步数上限 / 无重复调用检测 | —— | 跑飞无保护 |
@@ -204,11 +204,36 @@ async *queryStream(input) {
 > 必须是 **finish 与 toolCalls 的合取**：`toolCalls 非空 ⇒ 续轮`，`toolCalls 为空且 finish ∈ {stop,length,content_filter} ⇒ 终止`；
 > 只看 finish 会在 Gemini 上直接退化成单轮（改造白做），只看 toolCalls 则无法区分 length/error 的异常终止。
 
-**S1 — `maxSteps=1` 循环骨架（证明等价）**
+**S1 — `maxSteps=1` 循环骨架（证明等价）** ✅ 已完成
 
-- 拆出 `_prepareQueryOnce`（只做一次的部分）与 `_buildMessagesForStep`（每轮重建 messages + `session.preModel`）
-- 循环体上线，但 `maxSteps` 默认 `1`
-- 验收：**用同一组 mock provider 对比 S0 与 S1 的输出，逐事件、逐消息相同**——这是最关键的回归闸门
+- 拆出 `_prepareQueryOnce`（一次：Agent 解析 / 工具池 / 权限 / 用户消息注入 / system prompt /
+  provider-model 解析 / paramsBase）与 `_buildStepMessages`（每轮：重读会话 → getView →
+  组装 system+历史 → `llm.params`+`llm.headers` → `session.preModel` → 回写 blocks）
+- 单步执行体抽成 `_runOneStep(prepared, step)`（async generator，终值经 `yield*` 传出 `StepOutcome`），
+  `queryStream` 只剩「准备一次 + for 循环」
+- `AgentQueryInput.maxSteps` 默认 `1`；`session.promptStream(sessionId, text, maxSteps?)` 透传
+- **A 方案落地**：`done` 事件加 `step`（从 1 开始），**每步都发** —— 语义是"这一步结束"而非
+  "本次查询全部结束"；上层不得用"收到 done"判断整轮完成（`AgentStreamEvent.step` 的 doc 已写明）
+- 验收：**逐事件等价对照通过**。同一组 mock 剧本（纯文本 / 带工具调用）跑 S0 与 S1，
+  除 `done` 新增的 `step` 字段外**逐字节相同**：
+  ```
+  4c4
+  < EVENT done parts=[text] finish=stop step=-
+  ---
+  > EVENT done parts=[text] finish=stop step=1
+  ```
+  同时对照了 hook 调用次数（`tool.pool.assemble` / `prompt.system.transform` / `llm.params` /
+  `llm.headers` / `session.preModel` 各恰好 1 次 —— 证明拆分既没丢 hook 也没重复执行）、
+  provider 调用次数、会话消息结构
+- 另加 3 例测试锁定骨架本身：缺省 1 步只调一次模型；`maxSteps=2` 时**第二步请求里含第一步的
+  assistant 消息与工具结果**（回喂机制的证据，S2 的前提）；两步各自发 done 且 step 递增
+
+> 📌 **计划调整**：本阶段只改 `queryStream`（流式链路，CLI/TUI 走这条）。
+> `query()`（非流式，`subagent` / `swarm` 插件走这条）暂未改，留到 S2 与 `query()` 复用同一循环体，
+> 避免一次动两条链路、回归面翻倍。
+>
+> 📌 **S2 需要同步改 CLI/TUI**：A 方案下"收到 done"不再等于"本轮结束"，CLI 的 `processLine`
+> 与 TUI 的收尾渲染要改成「done 只做收尾渲染 + 由 `step` 与后续事件判断是否继续」。
 
 **S2 — 放开步数 + 保护**
 
@@ -250,7 +275,7 @@ async *queryStream(input) {
 | 循环骨架 | 低 | ~200 行，形态明确可参照 |
 | finish reason 透传 | 低 | 6 个 provider 各补一行映射 |
 | `_prepareQuery` 拆分 | 中 | 要精确区分"一次"与"每轮"，拆错会丢 hook 或重复执行 |
-| done 事件语义 | 中 | CLI / TUI 都假设收到 `done` 即结束，需区分 `turn_end` 与 `all_done` |
+| done 事件语义 | 中 | ✅ 已定 **A 方案**（每步发 done + `step` 序号）；S2 需同步改 CLI/TUI 的"收到 done 即结束"假设 |
 | 插件协调（S4） | 高 | 三个插件的行为回归，且 barrier 与循环语义天然重叠 |
 | 无 ACP 成本 | — | ACP 本就按轮设计，参数不用重调 |
 
@@ -262,7 +287,8 @@ async *queryStream(input) {
 
 - [x] S0：typecheck 全绿、既有测试全通过、`finish` 字段可选 ⇒ 零行为变化已验证
   （core 55 / cli 330 / provider 6 包全绿；真实网关实测 finish 正确解析）
-- [ ] S1：S0 与 S1 在相同输入下输出**逐事件等价**（mock provider 对比）
+- [x] S1：S0 与 S1 在相同输入下输出**逐事件等价**（mock provider 对比）
+  —— 除 `done.step` 外逐字节相同；hook 次数 / provider 调用次数 / 会话消息结构均一致
 - [ ] S2：连续多步工具链能自主跑完；doom-loop 在第 3 次被拦；步数到顶注入收尾提示
 - [ ] S3：循环中途中断能在步边界停下且状态完整
 - [ ] S4：coordinator / subagent / swarm 三插件在循环上线后行为符合预期，无双重驱动
