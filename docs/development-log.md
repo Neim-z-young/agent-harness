@@ -1,5 +1,81 @@
 # Agent Harness 开发日志
 
+## 2026-09-17（续 141）Agentic Loop 改造 S0~S4：引擎内自主多步执行
+
+### 起因
+此前 Agent 执行是**单轮**的：一次模型调用 → 执行工具 → 结束，工具结果不会自动回喂。
+续轮只能靠用户输入或 coordinator 的 barrier（后台子任务集齐）注入 `<continue/>` 伪输入。
+代价是 read → edit → bash 这类连续工具链无法自主跑完，模型看完文件就停了。
+
+调研 `reference/claude-code-analysis-main`（`queryLoop()`，1729 行）与 `reference/opencode-dev`
+（`runLoop` + `processor` 两层）后结论：本项目不是"没有 loop"，而是 **loop 的控制权在引擎外**。
+完整计划见 `docs/agentic-loop-plan.md`，按 S0~S4 分阶段实施，每步独立可验证。
+
+### S0（`8ac6c55`）finish reason 端到端透传
+数据一直存在但被 Provider 内部消费掉就丢（anthropic `stop_reason`、openai `finish_reason`
+都只用于内部分支），引擎看不到 ⇒ 无法判断该不该续轮。
+- 新增 `ChatFinishReason` + `FINISH_REASON_MAP` + `normalizeFinishReason()`，`finish` / `finishRaw`
+  贯穿 `ChatCompletionOutput` → `ChatStreamChunk(done)` → `AgentStreamEvent(done)`。
+- **关键设计**：缺失/未知 finish 落 `'unknown'`，**绝不落 `'stop'`** —— "没有 finish 信息"与
+  "模型明确结束"是两件事，混同会让循环在"有工具调用但 finish 缺失"时直接退出、退化成单轮。
+- Provider 实为 4 处：`provider-glm` / `provider-qwen` 复用 `OpenAIChatProvider`。
+
+### S1（`5ce98c2`）循环骨架（maxSteps 默认 1）
+`_prepareQuery` 一分为三：`_prepareQueryOnce`（一次）/ `_buildStepMessages`（每轮）/
+`_runOneStep`（单步，终值经 `yield*` 传出）。分界依据是「hook 入参是否随轮次变化」——
+`llm.params`/`llm.headers` 因此刻意留在每轮。
+**逐事件等价对照通过**：用同一组 mock 剧本在 S0 与 S1 各跑一遍，diff 仅 `done.step` 一处不同，
+其余（事件序列/消息结构/5 个 hook 各自调用次数/provider 调用次数）逐字节相同。
+
+### S2（`f330686`）放开步数 + 保护
+- 续轮判据（`shouldContinueStep`）：`续轮 ⇔ 有工具调用 且 finish ∉ {length, content_filter, error}`。
+  **不能写成「finish === 'tool_calls' 才续轮」**—— Gemini 返回 `functionCall` 时 `finishReason` 仍是
+  `STOP`（S0 已用断言固定），那样写会在该续轮时退出。
+- 默认 30 步（`input.maxSteps` > `AgentDefinition.maxSteps` > 默认）；**`maxSteps=1` 保留"显式单轮"**
+  语义、不追加收尾步（否则 1 步变 2 次模型调用 —— 这个是踩出来的：hook 顺序断言立刻炸了）。
+- doom-loop：同工具 + 完全同入参连续 3 次 ⇒ 执行前拦下 + 权限确认，拒绝则标 `DOOM_LOOP` 并终止。
+- 步数到顶注入收尾提示再跑一步（对齐 opencode `MAX_STEPS_PROMPT`）。
+- **`query()` 复用同一循环**，删掉 186 行重复副本 ⇒ subagent / swarm 也获得多步能力。
+- provider-mock 增补 `once` 规则（模拟"先调工具、再给结论"的行为序列，测多步的关键设施）。
+
+### S3（`b2f2aa3`）真 abort + turn_end
+- `ToolContext.signal` 此前是每次 `new AbortController().signal`（永不 abort 的空壳），
+  而 `tool` 的 pipeline、`tools-builtin` 的 bash、`tools-web` **早已实现 signal 响应** ——
+  整条链只差 core 这一环。现在传 `AgentQueryInput.signal`。
+- 中断在**步边界**与**每个工具执行前**生效（后者放在 `tool_call_start` 之前）；
+  已完成的成果照常写回，未执行的标 `ABORTED`；流式 `AbortError` 被吞掉（只吞中断类，
+  其它错误照旧上抛，不能把真实故障伪装成"用户取消"）。
+- 新增 `turn_end` 事件：`done` 每步都发 ⇒ 上层无法判断"整轮跑完"（TUI 的 busy 曾因此在引擎
+  仍在跑时显示空闲）。UI 收尾改为挂 `turn_end`。
+- REPL SIGINT / TUI Ctrl-C = 「执行中中断、空闲退出」。
+
+### S4（`bc7e4ce`）插件协调
+厘清后确认**不会双重驱动**：引擎循环由「本步有工具调用」触发，barrier 由「后台任务集齐」触发。
+真正的代价是空转，据此三处修复：
+- `<continue/>` 空转识别：无待处理通知则跳过。⚠️ 判断前必须让出一个宏任务 —— subagent 里
+  `bus.publish(completed)` 排在 `enqueueNotification()` **之前**，同步 peek 会误判空转。
+  为此给 `SessionManager` 加只读的 `peekNotifications()`。
+- **subagent 接上真 signal**（真 bug）：超时此前只做 `Promise.race`，signal 没传进去 ⇒
+  超时后底层仍在后台跑（多步后可能几十步），白烧 token。
+- **swarm tick 防重叠**：`setInterval(tick, 1000)` + `void tick()` 不等待 ⇒ 多步后单次 tick
+  轻易超过 1s，每秒叠加一次新的子 Agent 查询。加 `running` 标志跳过重叠。
+
+### 文档（`a487e46`）
+README 新增 Agentic Loop 小节；architecture §16 由「现状与改造方向」改写为落地后形态；
+功能矩阵与 swarm 描述同步修正。
+
+### 验证
+core 73 / cli 332 / subagent 113 / swarm 65 / session 32 / agent 33 / revert 36 / provider 系列全绿；
+全仓 typecheck 0 错误。**未做**真实 barrier 全链路实测（需实际后台任务）。
+待决策：subagent 默认超时 120s vs 子 Agent 可跑 30 步 —— 倾向给子 Agent 设更小 `maxSteps`（~10）。
+
+### 方法论沉淀
+- **逐事件等价对照法**：先写对照脚本 → 工作区跑 → `git stash` → 基线跑 → `pop` → diff；
+  hook 调用次数必须纳入对照（拆分"一次 vs 每轮"时，丢 hook / 重复执行只体现在次数上）。
+- **引用数值前必须实读那个文件**（本项目已两次因把文档示例值当配置实况而得出错误结论）。
+- 新增事件类型后要回头检查所有"非 X 即 Y"的判断（`turn_end` 曾被 REPL 误当成"下一步开始了"）。
+- 新增 session 接口方法会打破所有测试替身（`grep -rn "implements SessionManager"`）。
+
 ## 2026-09-17（续 140）会话压缩（session compaction）：窗口按 Provider 推导 + CJK 口径 + 参数可配置
 
 ### 起因：项目里有两套压缩，此前只调了其中一套
