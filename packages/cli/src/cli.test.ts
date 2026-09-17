@@ -346,6 +346,18 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(auto).toInclude('按窗口自动适配参数')
     expect(auto).toInclude('fitWindow=1000000')
   })
+
+  it('buildConfigOverview：显示 token 折算口径（默认 auto / 显式 chars4）', () => {
+    // 未写 tokenCalibration：默认 CJK 感知口径
+    const auto = buildConfigOverview({ model: 'm', compression: { enabled: true } }, 'mock')
+    expect(auto).toInclude('token 口径 自动（CJK 感知）')
+    // 显式回退旧口径
+    const legacy = buildConfigOverview(
+      { model: 'm', compression: { enabled: true, tokenCalibration: 'chars4' } },
+      'mock',
+    )
+    expect(legacy).toInclude('token 口径 chars/4（旧）')
+  })
 })
 
 describe('ProviderTypeRegistry / 插件化扩展', () => {
@@ -1066,6 +1078,36 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     expect(app2.pluginRegistry.get('context.acp')).toBeDefined()
     expect(boot2.harness).toBeDefined()
     await app2.shutdown()
+  })
+
+  it('compression.tokenCalibration：两种口径都能装配，缺省即 auto', async () => {
+    const stdout = { write: () => {} }
+    for (const tokenCalibration of ['auto', 'chars4', undefined] as const) {
+      const dataDir = join(dir, '.harness')
+      mkdirSync(dataDir, { recursive: true })
+      writeFileSync(
+        join(dataDir, 'config.json'),
+        JSON.stringify({
+          provider: 'my-gw',
+          providers: [{ id: 'my-gw', type: 'openai', baseUrl: 'http://gw', apiKey: 'gw-key', contextWindowTokens: 128000 }],
+          compression: tokenCalibration ? { enabled: true, tokenCalibration } : { enabled: true },
+        }, null, 2),
+      )
+      const app = new HarnessApp({
+        cwd: dir, dataDir, agentId: 'default', provider: 'my-gw',
+        permissionMode: 'allow-all', stdout,
+      })
+      const { harness } = await app.boot()
+      expect(app.pluginRegistry.get('context.acp')).toBeDefined()
+      expect(harness).toBeDefined()
+      // 概览反映口径
+      const overview = buildConfigOverview(
+        { model: 'm', compression: { enabled: true, tokenCalibration } },
+        'mock',
+      )
+      expect(overview).toInclude(tokenCalibration === 'chars4' ? 'token 口径 chars/4（旧）' : 'token 口径 自动（CJK 感知）')
+      await app.shutdown()
+    }
   })
 
   it('startRepl 脚本模式：发送 prompt + /sessions + /new + /save + /exit 正常', async () => {

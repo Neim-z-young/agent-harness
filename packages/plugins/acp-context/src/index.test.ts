@@ -8,6 +8,7 @@ import {
   type Config,
   type CompressionState,
   type CompressionBlock,
+  type CoreMessage,
 } from 'acp-kernel'
 import type { Message } from '@harness/session'
 import type { CompactionContext, Hooks } from '@harness/plugin'
@@ -22,7 +23,7 @@ import {
   ACP_META_KEY,
   ACP_ARCHIVE_KEY,
 } from './index'
-import { toCores, compactHistory, idBase, baseId } from './adapter'
+import { toCores, compactHistory, idBase, baseId, estimateTokens, chars4CountTokens } from './adapter'
 import { loadPromptFiles } from './prompts'
 
 // ===== helpers =====
@@ -757,4 +758,71 @@ test('runPreModel：压缩块创建后原文持久化到 ACP_ARCHIVE_KEY（断�
   const restored = restoreBlockMessages(fresh.engine, fresh.ctx.state, fresh.ctx.archive, block!.blockId)
   expect(restored.length).toBeGreaterThan(0)
   expect(restored.some((r) => r.text.includes('Message number 3'))).toBe(true)
+})
+
+// ===== token 折算口径（CJK 感知 vs chars/4）=====
+//
+// 背景：插件上报的 tokenCount 决定占用率百分比（maxContextLimitPct / emergencyThresholdPct），
+// 而内核内部用同一函数数可压缩范围与保护区。旧口径一律 chars/4，中文会话下占用率恒为真值的
+// 约 1/4，压缩触发被拖到真实已超窗之后。以下用例锁住"两侧同口径 + 中文按 1 字≈1 token"。
+
+test('estimateTokens：中文按 1 字 ≈ 1 token 记账（默认口径 = 内核 defaultCountTokens）', () => {
+  const zh = '压缩上下文参数调优与口径对齐验证'
+  const cores: CoreMessage[] = [{ id: 'a', role: 'user', contentType: 'text', text: zh }]
+  expect(estimateTokens(cores)).toBe(zh.length)
+  // 旧口径把同一段内容算成约 1/4
+  expect(estimateTokens(cores, chars4CountTokens)).toBe(Math.ceil(zh.length / 4))
+})
+
+test('estimateTokens：英文两种口径逐位等价（旧行为零回归）', () => {
+  const en = 'Estimate tokens for an English sentence of a typical length.'
+  const cores: CoreMessage[] = [{ id: 'a', role: 'assistant', contentType: 'text', text: en }]
+  expect(estimateTokens(cores, chars4CountTokens)).toBe(Math.ceil(en.length / 4))
+  expect(estimateTokens(cores)).toBe(estimateTokens(cores, chars4CountTokens))
+})
+
+test('estimateTokens：中英混排按各自折算率累加', () => {
+  const cores: CoreMessage[] = [
+    { id: 'a', role: 'user', contentType: 'text', text: '中文四个字abcd' },
+  ]
+  // 5 个汉字 → 5 token；4 个 ASCII → ceil(4/4) = 1
+  expect(estimateTokens(cores)).toBe(6)
+})
+
+test('estimateTokens：thinkingTokens 计入总量（与内核 countMessageTokens 一致）', () => {
+  const cores: CoreMessage[] = [
+    { id: 'a', role: 'assistant', contentType: 'text', text: 'abcd', thinkingTokens: 50 },
+  ]
+  expect(estimateTokens(cores)).toBe(1 + 50)
+})
+
+test('端到端：tokenCalibration 决定 acp_status 上报的 tokenCount（中文口径修正）', async () => {
+  const zhText = '压'.repeat(4000) // 4000 个汉字 ≈ 4000 token（旧口径只算 1000）
+
+  async function statusOf(tokenCalibration?: 'auto' | 'chars4'): Promise<number> {
+    const plugin = createAcpContextPlugin({ modelContextLimit: 1_000_000, tokenCalibration })
+    const tools = new Map<string, any>()
+    const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
+    await hooks['tool.pool.assemble']!({} as any, { add: (t: any) => tools.set(t.id, t) } as any)
+    const messages = [msg('user', zhText, 0), msg('assistant', zhText, 1)]
+    await hooks['session.preModel']!(
+      {
+        sessionId: 's',
+        meta: { read: async () => undefined, patch: async () => {} },
+        blocksPatch: [],
+      } as any,
+      messages,
+    )
+    const res = await tools.get('acp_status')!.call({}, { sessionId: 's' } as any)
+    expect(res.ok).toBe(true)
+    return res.output.tokenCount as number
+  }
+
+  const auto = await statusOf('auto')
+  const defaulted = await statusOf(undefined) // 缺省即 auto
+  const legacy = await statusOf('chars4')
+
+  expect(defaulted).toBe(auto) // 默认口径 = auto
+  expect(auto).toBeGreaterThan(legacy * 3) // 中文下旧口径低估约 4 倍
+  expect(legacy).toBeLessThanOrEqual(Math.ceil((zhText.length * 2) / 4) + 128) // ≈ 真实字符数的 1/4
 })

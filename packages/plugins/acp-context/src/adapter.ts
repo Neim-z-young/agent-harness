@@ -10,10 +10,13 @@
  *   未被我方压缩过的原始消息尽量复用对象（保留图片/附件等 part），kernel 生成的摘要块则为新消息。
  */
 
-import type {
-  CoreMessage,
-  MessageRole as CoreRole,
-  MessageContentType,
+import {
+  countMessageTokens,
+  defaultCountTokens,
+  type CoreMessage,
+  type MessageRole as CoreRole,
+  type MessageContentType,
+  type TokenCountFn,
 } from 'acp-kernel'
 import type { Message, Part, ToolCallPart, TextPart } from '@harness/session'
 
@@ -210,9 +213,37 @@ export function compactHistory(inFlat: Flat, outCores: CoreMessage[]): CompactRe
   return { messages, changed }
 }
 
-/** 估算文本 token 数（chars/4，与 acp-kernel 默认 tokenizer 一致） */
-export function estimateTokens(cores: CoreMessage[]): number {
+/**
+ * token 折算口径（CJK 感知）。直接复用 acp-kernel 的 `defaultCountTokens`——
+ * 中日韩字符按 **1 token/字**、其余按 **4 字符/token** 记账。
+ *
+ * 必须与 `createCore({ countTokens })` 注入的是**同一个函数**：内核内部的
+ * 可压缩范围、保护区、工具输出截断都用它计数，而插件传给 `processTurn` 的
+ * `tokenCount` 决定占用率百分比（`maxContextLimitPct` / `emergencyThresholdPct`）。
+ * 两侧口径一旦分裂，闸门就会按一把尺子量、按另一把尺子裁。
+ */
+export const cjkAwareCountTokens: TokenCountFn = defaultCountTokens
+
+/**
+ * 旧口径：一律 `chars/4`。英文与 `cjkAwareCountTokens` 逐位等价，
+ * 但中文会话下会把占用率**低估约 4 倍** ⇒ 压缩触发整体偏晚。仅用于回退 / A-B 对照。
+ */
+export const chars4CountTokens: TokenCountFn = (text: string): number =>
+  text ? Math.ceil(text.length / 4) : 0
+
+/**
+ * 估算 cores 的总 token 数。
+ *
+ * 逐条走内核的 `countMessageTokens`（含 `thinkingTokens`），因此与内核内部
+ * 各计数点（范围推荐、保护区、status、截断）**完全同口径**。
+ *
+ * @param countTokens 折算函数，默认 CJK 感知口径；传 `chars4CountTokens` 可回退旧行为。
+ */
+export function estimateTokens(
+  cores: CoreMessage[],
+  countTokens: TokenCountFn = defaultCountTokens,
+): number {
   let n = 0
-  for (const c of cores) n += (c.text ?? '').length
-  return Math.ceil(n / 4)
+  for (const c of cores) n += countMessageTokens(c, countTokens)
+  return n
 }

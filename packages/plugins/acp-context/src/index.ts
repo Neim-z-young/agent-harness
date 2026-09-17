@@ -30,6 +30,7 @@ import {
   createCore,
   createInitialState,
   defaultConfig,
+  defaultCountTokens,
   parseCompressInput,
   renderNudgeText,
   buildCompressSystemPrompt,
@@ -42,12 +43,15 @@ import {
   type CompressionState,
   type CompressionBlock,
   type Prompts,
+  type TokenCountFn,
 } from 'acp-kernel'
 
 import {
   toCores,
   requestMessages,
   estimateTokens,
+  cjkAwareCountTokens,
+  chars4CountTokens,
   baseId,
   safeString,
 } from './adapter.js'
@@ -160,6 +164,18 @@ export interface AcpContextPluginOptions {
    * 因此可以「自动打底 + 手工钉一两个键」。
    */
   autoTune?: boolean
+  /**
+   * token 折算口径（默认 `'auto'`）。
+   *
+   * - `'auto'`（推荐）：与 acp-kernel 共用 `defaultCountTokens` —— 中日韩字符 1 token/字、
+   *   其余 4 字符/token。**英文会话与旧口径逐位等价**；中文会话修正原先约 4 倍的低估。
+   * - `'chars4'`：旧口径（一律 `chars/4`）。中文会话下占用率被低估约 4 倍，会让
+   *   `maxContextLimitPct` / `emergencyThresholdPct` / 工具输出截断整体偏晚。仅作回退与 A-B 对照。
+   *
+   * ⚠️ 该口径同时决定内核内部计数（注入 `createCore`）与插件上报的 `tokenCount`，
+   * 两者必须一致——这正是早年"占用率显示 26% 而实际已 103%"的根因。
+   */
+  tokenCalibration?: 'auto' | 'chars4'
   /** 内置 ACP 工具名（默认全部注入，可用其中的子集） */
   toolIds?: Array<'compress' | 'decompress' | 'search_context' | 'acp_status'>
   /**
@@ -250,9 +266,12 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   const resolvedPrompts: Prompts = { ...filePrompts, ...(options.prompts ?? {}) }
   const makeSystemPrompt = (): string =>
     options.systemPrompt ?? buildCompressSystemPrompt(resolvedPrompts)
+  // token 折算口径：默认与内核同一份实现（CJK 感知）。'auto' 显式注入等价于内核默认值，
+  // 目的是把口径**钉死在一处**——插件上报的 tokenCount 与内核内部计数永远是同一把尺子。
+  const countTokens = options.tokenCalibration === 'chars4' ? chars4CountTokens : cjkAwareCountTokens
   // 引擎纯态：state 由宿主显式传入/取回
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const engine = createCore() // 使用 kernel 默认 tokenizer（chars/4）
+  const engine = createCore({ countTokens })
 
   const allowToolIds = new Set(options.toolIds)
   const want = (id: string): boolean =>
@@ -439,7 +458,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           if (!sctx) {
             return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
           }
-          const tokenCount = estimateTokens(sctx.lastCores)
+          const tokenCount = estimateTokens(sctx.lastCores, countTokens)
           const rep = engine.status(sctx.state, tokenCount, config)
           return {
             ok: true,
@@ -483,6 +502,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         autoTune: options.autoTune === true,
         // autoTune 关闭时为 undefined，日志里不会出现该键
         autoTuneParams: options.autoTune ? describeAutoTune(modelContextLimit) : undefined,
+        // token 折算口径：auto = CJK 感知（1 字≈1 token），chars4 = 旧口径
+        tokenCalibration: options.tokenCalibration === 'chars4' ? 'chars4' : 'auto',
         preserveRecentTokens: config.preserveRecentTokens,
         growthFloor: config.nudge?.growthFloor,
         minCompressRange: config.compress?.minCompressRange,
@@ -502,6 +523,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               getCtx: () => getOrCreateCtx(input.sessionId),
               engine,
               config,
+              countTokens,
               meta: input.meta,
               makeSystemPrompt,
               prompts: resolvedPrompts,
@@ -555,6 +577,11 @@ interface RunPreModelDeps {
   getCtx: () => AcpSessionCtx
   engine: ReturnType<typeof createCore>
   config: AcpConfig
+  /**
+   * token 折算口径；**必须与 engine 注入的同一函数**，否则占用率闸门与内核内部计数会分裂。
+   * 缺省 = 内核 CJK 感知口径（`defaultCountTokens`）。
+   */
+  countTokens?: TokenCountFn
   /** session.meta 持久化访问器（用于保存/恢复压缩状态） */
   meta: { read: () => Promise<Record<string, unknown> | undefined>; patch: (patch: Record<string, unknown>) => Promise<void> }
   makeSystemPrompt: () => string
@@ -589,6 +616,8 @@ interface RunPreModelDeps {
  */
 export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const { sessionId, messages, engine, config, meta } = deps
+  // token 折算口径：必须与 engine（createCore）注入的一致，缺省即内核 CJK 感知口径
+  const countTokens = deps.countTokens ?? defaultCountTokens
   const ctx = deps.getCtx()
 
   // 遥测 writer 懒初始化：宿主注入 telemetryPath 时替换掉 no-op writer
@@ -636,7 +665,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   } catch {
     // 读取失败不影响主流程
   }
-  const tokenCount = estimateTokens(inflat.cores)
+  const tokenCount = estimateTokens(inflat.cores, countTokens)
   const res = engine.processTurn({
     messages: inflat.cores,
     state: ctx.state,
@@ -662,6 +691,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
       inflatCores: inflat.cores,
       requestCores: res.messages,
       nudge: res.nudge,
+      countTokens,
     })
     telem.write(ev)
     ctx.prevRequestCores = res.messages

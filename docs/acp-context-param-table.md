@@ -101,9 +101,14 @@ MC = clamp( 4 × R, 8000, 2 × ( W − R ) )                    // chars；上�
    `pendingByTier` 把候选范围全部过滤掉 → nudge 被抑制 → **压缩彻底失效**，请求一路涨到窗口后
    只能靠 `truncate` 兜底（实测 200K 窗口 MC=600000 chars 时峰值 103% 超窗）。公式里的 `2 × (W − R)`
    就是这条护栏。
-2. **中文内容下 `chars` 口径会偏 4 倍。** 内核按 `chars/4` 估 token（英文适用），而中文约 1 字 ≈ 1 token
-   ⇒ 同一窗口的可压缩区（chars）只有英文的 1/4，`minCompressRange` 必须同步压到 1/4。
-   **所以它绝不能写成绝对下限**（这正是上一版公式 `max(200000, 4R)` 失效的原因）。
+2. **`MC` 是 chars，但窗口/保护区是 tokens，两者之间差一个折算率。** `MC` 是折叠粒度，比较对象是
+   **真实字符数**（`buildCompressibleRanges` 记 `chars: (msg.text ?? '').length`）；而 `4R` 与护栏
+   `2 × (W − R)` 都按 **4 chars/token** 折算——中文约 1 字 = 1 token 时，同一公式给出的 `MC`
+   相对中文可压缩区就**粗了 4 倍**（护栏也随之松 4 倍）。**所以绝不能写成绝对下限**
+   （这正是上一版公式 `max(200000, 4R)` 失效的原因）。实测（300K 窗口、40 条中文消息共 413k 字、
+   R=50k、MC=200k）可压缩区 353k chars，**尚未越界，但余量已从"4 倍"缩到 1.7 倍**。
+   ⚠️ 更正：早前此处写"内核按 `chars/4` 估 token"是**错的**——内核默认口径本就 CJK 感知，
+   详见 §六（那里有完整实测与已落地的修复）。
 
 ## 五、偏离参数表的代价（300K 实测，能不改就别改）
 
@@ -122,3 +127,91 @@ MC = clamp( 4 × R, 8000, 2 × ( W − R ) )                    // chars；上�
 
 若确实想少折叠、让前缀更稳：**只抬 `GF`（≤2R）、`MC` 留在 `4R`**，代价约 1%。
 若想更保真：抬 `maxSummaryLength`（大窗口档压缩比 40:1 的主要来源）比降 `MC` 划算。
+
+
+## 六、中文会话的 token 口径（已落地：`tokenCalibration`，默认 `auto`）
+
+### 1. 问题不是"内核用 chars/4"，而是**两侧口径分裂**
+
+先更正一条早期误判（我只读了 `.d.ts` 注释就下结论，属事实错误）：
+
+- **内核默认口径本来就是 CJK 感知的**。`createCore(ports = {})` 取 `ports.countTokens ?? defaultCountTokens`，
+  而 `defaultCountTokens` 是 `中日韩字符 1 token/字 + 其余 4 字符/token` 的混合式
+  （`matches /[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/`）。且 `computeProtectedRefs` /
+  `buildCompressibleRanges` / `pendingByTier` / `truncateLargeToolOutputs` 全部传 `ctx.countTokens` ⇒
+  **内核内部计数一直是 CJK 口径**。
+- **真正错的是插件侧**：`adapter.ts` 的 `estimateTokens()` 一律 `ceil(Σ chars / 4)`，而它算出的
+  `tokenCount` 正是占用率百分比（`maxContextLimitPct` / `emergencyThresholdPct` / `truncate.threshold`）
+  的唯一输入。于是形成「**内核按 CJK 口径数范围，闸门按 chars/4 判占用**」的分裂。
+
+### 2. 分裂的实际后果（真实插件链路实测）
+
+`createAcpContextPlugin` → `session.preModel` 驱动，300K 窗口、每轮 1 万中文字、`autoTune` 开启，
+读 `acp_status` 上报的占用率与真实占用（真实 = 逐 part 走 `defaultCountTokens`）对比：
+
+| 轮次 | `chars4` 上报 / 真实 | 偏差 | `auto` 上报 / 真实 | 偏差 |
+|---|---|---|---|---|
+| 11 | 9.7% / 35.4% | **0.27×** | 34.7% / 35.4% | **0.98×** |
+| 21 | 19.2% / 67.7% | 0.28× | 67.0% / 67.7% | 0.99× |
+| 31 | 29.5% / **100.8%（已超窗）** | 0.29× | 103.8% / 105.0% | 0.99× |
+| 40 | 39.3% / 131.1% | 0.30× | 139.2% / 140.4% | 0.99× |
+
+第 31 轮真实已 **100.8%**，旧口径只报 **29.5%**——低于 `maxContextLimitPct=0.65`，
+**压缩根本不会触发**；`emergencyThresholdPct=0.80` 同样永不达成。这不是参数值问题，是口径问题，
+调 `R`/`GF`/`MC` 一个都救不了。
+
+### 3. 修复：两侧共用同一函数 + 一个开关
+
+```ts
+// adapter.ts —— 口径的两个候选，均直接复用内核实现
+export const cjkAwareCountTokens: TokenCountFn = defaultCountTokens          // 1 字≈1 token（默认）
+export const chars4CountTokens: TokenCountFn = (t) => t ? Math.ceil(t.length / 4) : 0  // 旧口径
+export function estimateTokens(cores, countTokens = defaultCountTokens): number  // 逐条 countMessageTokens
+```
+
+插件把**同一个函数**同时注入内核与自己的上报路径，口径不可能再分裂：
+
+```ts
+const countTokens = options.tokenCalibration === 'chars4' ? chars4CountTokens : cjkAwareCountTokens
+const engine = createCore({ countTokens })            // 内核内部计数
+const tokenCount = estimateTokens(inflat.cores, countTokens)  // 占用率闸门
+```
+
+配置（默认 `auto`，无需显式写）：
+
+```jsonc
+{ "compression": { "enabled": true, "tokenCalibration": "auto" } }   // "chars4" 回退旧口径
+```
+
+顺带修好：`acp_status` 占用率、遥测 `rawTok` / `requestTok` / `occupancy`（TUI 那条链）、
+工具输出截断阈值——它们都走 `estimateTokens`，一处改全线同步。
+
+### 4. 对参数表的影响：**不用重扫**（这也是实测结论）
+
+`defaultCountTokens` 对纯 ASCII 返回 `ceil(len/4)`，与旧口径逐位一致 ⇒ **英文会话零回归**。
+同一内核链路（`processTurn` + `applyCompression`，模拟模型按 nudge 折叠）跑 300K / 60 轮对照：
+
+| 场景 | 指标 | 旧口径 | 新口径 |
+|---|---|---|---|
+| **中文**（每轮 2 万字） | 首次折叠 | 第 15 轮（真实已 **103.3%**） | 第 12 轮（真实 84.7%） |
+| | 折叠次数 | 2 | 19 |
+| | 真实峰值 / 占窗 | 621540 = **207.2% 超窗** | 274654 = **91.6%** |
+| | 末轮真实占窗 | 123.4% | 73.9% |
+| **英文**（每轮 2 万字符） | 首次折叠 / 折叠次数 | 第 29 轮 / 2 次 | 第 29 轮 / 2 次 |
+| | 真实峰值 / 占窗 | 157965 / 52.7% | **157965 / 52.7%（差 0.00%）** |
+
+⇒ **英文逐位等价（唯一差异是 reason 里 `growth 40197 → 40198`，+1 token 的逐条 ceil 舍入），
+§一 的三窗口参数表继续有效，不需要按新坐标系重扫。**
+
+### 5. 唯一还"悬"着的：`MC` 的 chars 与折算率
+
+`minCompressRange` 是**真实字符数**口径（`buildCompressibleRanges` 里 `chars: (msg.text ?? '').length`，
+`pendingByTier` 用 `(r.chars ?? r.tokens * 4) >= minCompressRange` 过滤），**不随 tokenizer 变**。
+所以 `MC = 4R` 的本义是「折叠粒度 ≈ R tokens 的内容量」（英文 4 字符/token ⇒ 4R chars）。
+
+中文 1 字 ≈ 1 token ⇒ 同一个 `MC = 4R` chars 对应的其实是 **4R tokens** 的粒度，相对保护区
+（`R` tokens）**粗了 4 倍**。实测在 300K 中文会话里**并不会越界**（MC 越界被拒 0 次，
+可压缩区仍是 MC 的 1.7 倍余量），只是单次折叠吞得更多、锯齿更大。
+
+要不要按折算率重算（纯中文 ≈ `MC = R`，即令 `MC = R × 折算率`）属于**下一步的可选优化**，
+不是本次修复的前置条件；真要做，`AUTO_TUNE_MIN_COMPRESS_FACTOR` 是唯一改动点。

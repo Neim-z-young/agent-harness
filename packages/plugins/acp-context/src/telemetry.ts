@@ -9,12 +9,14 @@
  * 写入：append JSONL，debounce flush；文件路径由宿主（core/cli）通过 deps.telemetryPath 注入。
  * 本模块只采集 + 写入，不关心文件存放规则。
  *
- * token 估算 = chars/4（与 acp-kernel 默认 tokenizer 一致）。
+ * token 估算口径跟随插件配置（`tokenCalibration`）：默认 `auto` = acp-kernel 的 CJK 感知
+ * `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/token），`chars4` 为旧口径。
+ * 遥测的 `rawTok` / `requestTok` / `occupancy` 因此与内核决策口径一致。
  */
 
 import { writeFileSync, mkdirSync, existsSync } from 'node:fs'
 import { dirname } from 'node:path'
-import type { Config, CoreMessage, CompressionState } from 'acp-kernel'
+import { defaultCountTokens, type Config, type CoreMessage, type CompressionState, type TokenCountFn } from 'acp-kernel'
 import { estimateTokens } from './adapter.js'
 
 // ===== 配置快照：每轮 preModel 都记，便于事后还原"参数 × 指标"关系 =====
@@ -175,6 +177,8 @@ export interface PreModelBuildInput {
   inflatCores: CoreMessage[]     // 压平后、未压缩的 cores
   requestCores: CoreMessage[]    // processTurn 返回、发往模型的 cores
   nudge: { compressibleRanges?: unknown[]; emergencyCompressed?: boolean } | undefined
+  /** token 折算口径；缺省 = 内核 CJK 感知口径。应与 `createCore({ countTokens })` 传的一致。 */
+  countTokens?: TokenCountFn
 }
 
 export function buildPreModelEvent(inp: PreModelBuildInput): PreModelEvent {

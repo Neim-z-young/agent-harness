@@ -27,6 +27,10 @@
 { "compression": { "enabled": true, "autoTune": true } }   // 换窗口不用改参数
 ```
 
+另有一个与参数无关、但会决定**所有百分比闸门是否可信**的开关：`compression.tokenCalibration`
+（默认 `"auto"`，CJK 感知口径）。中文会话若回退成 `"chars4"`，占用率只剩真值的约 1/3~1/4，
+压缩会一路拖到真实超窗之后才触发——详见 **§7.6**。
+
 ---
 
 ## 1. 模型上下文窗口（输入 tokens）
@@ -800,6 +804,59 @@ MC = clamp(4 × R, 8000, 2 × (W − R))               // chars
 
 ---
 
+## 7.6 token 折算口径（`compression.tokenCalibration`，默认 `auto`）
+
+### ① 它修的是什么
+
+ACP 的所有百分比闸门（`maxContextLimitPct` / `minContextLimitPct` / `emergencyThresholdPct` /
+`truncate.threshold`）都建立在**一个数字**上：本轮请求的 token 量。这个数字由插件算出来传给内核
+（`runPreModel` → `engine.processTurn({ tokenCount })`）。
+
+早年插件侧用 `chars/4` 估它，而**内核内部**（可压缩范围、保护区、工具输出截断）用的是内核自带的
+CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/token）。两侧分裂的后果是
+**中文会话下上报占用率只有真实值的约 1/3~1/4**：
+
+| 轮次（300K 窗口、每轮 1 万中文字） | 旧口径上报 | 真实占用 | 修复后上报 |
+|---|---|---|---|
+| 第 11 轮 | 9.7% | 35.4% | **34.7%** |
+| 第 21 轮 | 19.2% | 67.7% | **67.0%** |
+| 第 31 轮 | 29.5% | **100.8%（已超窗）** | **103.8%** |
+| 第 40 轮 | 39.3% | 131.1% | **139.2%** |
+
+即：真实已超窗的那一轮，旧口径还显示 29.5% —— 远低于 `maxContextLimitPct`，**压缩永不触发**，
+`emergencyThresholdPct` 也永不达成。完整实测与机理见速查卡
+[`acp-context-param-table.md`](./acp-context-param-table.md) §六。
+
+### ② 怎么配
+
+| 配置项 | 默认值 | 说明 |
+|--------|--------|------|
+| 🔧 `compression.tokenCalibration` | **`"auto"`** | `"auto"` = 与内核共用 `defaultCountTokens`（中日韩 1 token/字）。**一般不用写**。 |
+| | | `"chars4"` = 旧口径（一律 `chars/4`），仅作回退 / A-B 对照。中文会话下会让上述闸门整体偏晚。 |
+
+```jsonc
+{ "compression": { "enabled": true } }                                  // 默认即 auto，推荐
+{ "compression": { "enabled": true, "tokenCalibration": "chars4" } }    // 回退旧口径
+```
+
+### ③ 影响面
+
+口径同时注入两处（`createCore({ countTokens })` 与 `estimateTokens(cores, countTokens)`），
+因此以下表面全部同步：占用率闸门、`acp_status` 显示的占用、遥测 `rawTok` / `requestTok` /
+`occupancy`（导出报告与 TUI 同源）、工具输出截断阈值。
+
+### ④ 对参数表的影响：**不需要重扫**
+
+`defaultCountTokens` 对纯 ASCII 返回 `ceil(len/4)`，与旧口径**逐位等价** ⇒ **英文会话零回归**
+（实测英文 60 轮对照：首次折叠轮次、折叠次数、真实峰值 157965 全部一致，差 0.00%）。
+所以 §7.5 的三窗口参数表继续有效；只有中文会话的**触发时机**被修正。
+
+> 唯一遗留项：`minCompressRange` 是 **chars** 口径，`MC = 4R` 里的 `4` 按英文折算率推得。
+> 中文下同一个 `MC` 相对保护区粗 4 倍（不会越界，实测 MC 被拒 0 次），属可选优化，
+> 详见速查卡 §六.5。
+
+---
+
 ## 8. 完整配置示例
 
 **模式 A：原始压缩参数控制（`autoTune: false`，默认，行为与升级前一致）**
@@ -876,6 +933,7 @@ MC = clamp(4 × R, 8000, 2 × (W − R))               // chars
 | **最优参数表（200K/300K/1M）** | 200K → `R=35000 / GF=52500 / MC=140000`；300K → **`50000 / 75000 / 200000`**；1M → **`100000 / 150000 / 400000`**（见 §7.5①） |
 | `autoTune: true` 的推导组合 | `preserveRecentTokens=R(W)`；`nudge.growthFloor = growthCap = minGrowthFloor = round500(1.5R)`；`compress.minCompressRange = clamp(4R, 8000, 2×(W−R))`；`growthRatio=minGrowthRatio=0`（见 §7.4②/§7.5③） |
 | 固定 R 后的其余参数 | 只有 `nudge.growthFloor`（折叠块大小）与 `compress.minCompressRange` 有效：200k/R=35k → **52500 / 140000**；300k/R=50k → **75000 / 200000**；1m/R=100k → **150000 / 400000**（见 §7.5②，取代 §7.3 的旧值） |
+| `tokenCalibration` | **`"auto"`**（CJK 感知：中日韩 1 token/字）、`"chars4"` 回退旧口径（见 §7.6）<br>⚠️ 旧口径下中文会话的占用率只有真值的约 1/3~1/4，百分比闸门整体偏晚 |
 | 有效成本口径 | `均请求 tok × [(1−命中) + 命中 × 0.04]`（命中缓存按未命中的 **1/25** 计价，见 §7.2②） |
 | 谷请求 tok | 后半程最小请求体 = 请求地板（系统提示词 + R + 累积压缩块），随会话单调抬升（见 §7.3⑥） |
 | `prompts.*` | 插件 `prompts/*.txt`（= 内核 defaultPrompts） |

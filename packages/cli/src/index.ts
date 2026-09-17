@@ -314,6 +314,16 @@ export interface HarnessConfig {
      */
     autoTune?: boolean
     /**
+     * token 折算口径（默认 `'auto'`）。
+     *
+     * - `'auto'`：与 acp-kernel 共用 `defaultCountTokens` —— 中日韩字符 1 token/字、
+     *   其余 4 字符/token。**英文会话与旧口径逐位等价**；中文会话修正原先约 4 倍的低估
+     *   （旧口径下中文占用率恒显示真值的 1/4，`maxContextLimitPct` /
+     *   `emergencyThresholdPct` 等百分比闸门整体偏晚，折叠会被拖到真实已超窗之后）。
+     * - `'chars4'`：旧口径，一律 `chars/4`。仅作回退与 A-B 对照。
+     */
+    tokenCalibration?: 'auto' | 'chars4'
+    /**
      * 模型上下文窗口（输入 tokens）显式覆盖。缺省时按「当前默认 Provider 的
      * providers[].contextWindowTokens → 插件默认 200_000」推导。
      */
@@ -1199,9 +1209,10 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
   const acpMode = c?.autoTune
     ? `按窗口自动适配参数（autoTune，窗口 ${acpWindow}）`
     : `原始压缩参数控制（autoTune 关闭）`
+  const acpCaliber = c?.tokenCalibration === 'chars4' ? 'token 口径 chars/4（旧）' : 'token 口径 自动（CJK 感知）'
   lines.push(
     c?.enabled
-      ? `上下文压缩（ACP）：启用 fitWindow=${acpWindow} · ${acpMode}${c.prompts ? ' · 自定义提示词' : ''}`
+      ? `上下文压缩（ACP）：启用 fitWindow=${acpWindow} · ${acpMode} · ${acpCaliber}${c.prompts ? ' · 自定义提示词' : ''}`
       : '上下文压缩（ACP）：未启用（config.json → compression.enabled: true 开启）'
   )
   const rawProviders = cfg.providers ?? []
@@ -2021,6 +2032,8 @@ export class HarnessApp {
         config: acpConfig as any,
         // autoTune：按窗口推导 compression/nudge 参数（显式字段仍优先，见 compression.autoTune 注释）
         autoTune: compression.autoTune === true,
+        // token 折算口径：缺省 auto（CJK 感知），与内核内部计数共用同一函数
+        tokenCalibration: compression.tokenCalibration,
         telemetryEnabled,
         telemetryPathBuilder: telemetryEnabled
           ? (sessionId: string) => join(sessionsDir, `${sessionId}.telemetry.jsonl`)
