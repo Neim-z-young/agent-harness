@@ -153,6 +153,36 @@ test('applyAutoTune：用户可单独钉住 growthFloor 系列', () => {
   expect(cfg.preserveRecentTokens).toBe(50_000) // 仍自动
 })
 
+test('applyAutoTune：只写三键中的一键时其余两键跟随（防止 floor 被 cap 静默截断）', () => {
+  // 用例背景：300k 窗口推导 GF=75000。内核取 nudgeGrowthTokens = min(growthCap, max(growthFloor, …))，
+  // 所以「显式 floor 90000 + 自动 cap 75000」会让用户写的值被静默截断到 75000。
+  const up = applyAutoTune(300_000, { nudge: { growthFloor: 90_000 } })
+  expect(up.nudge!.growthFloor).toBe(90_000)
+  expect(up.nudge!.growthCap).toBe(90_000) // 修复前是 75_000（推导值）⇒ floor 被截断
+  expect(up.nudge!.minGrowthFloor).toBe(90_000)
+
+  // 反向：只想压节奏时 floor 跟随下降，而不是造出 floor > cap 的矛盾组合
+  const down = applyAutoTune(300_000, { nudge: { growthCap: 10_000 } })
+  expect(down.nudge!.growthCap).toBe(10_000)
+  expect(down.nudge!.growthFloor).toBe(10_000)
+  expect(down.nudge!.minGrowthFloor).toBe(10_000)
+  expect(down.nudge!.growthFloor!).toBeLessThanOrEqual(down.nudge!.growthCap!)
+
+  // 三键都显式写 → 原样采用（不做联动改写）
+  const all = applyAutoTune(300_000, {
+    nudge: { growthFloor: 30_000, growthCap: 40_000, minGrowthFloor: 35_000 },
+  })
+  expect([all.nudge!.growthFloor, all.nudge!.growthCap, all.nudge!.minGrowthFloor]).toEqual([
+    30_000, 40_000, 35_000,
+  ])
+
+  // 一键都不写 → 三键同为推导值
+  const none = applyAutoTune(300_000)
+  expect([none.nudge!.growthFloor, none.nudge!.growthCap, none.nudge!.minGrowthFloor]).toEqual([
+    75_000, 75_000, 75_000,
+  ])
+})
+
 test('describeAutoTune：输出可读摘要且含推导三参数与折叠比', () => {
   const s = describeAutoTune(200_000)
   expect(s).toContain('35000')

@@ -211,6 +211,10 @@ export function applyAutoTune(
   const uNudge = userConfig.nudge ?? {}
   const uCompress = userConfig.compress ?? {}
   const uTiers = userConfig.tiers ?? {}
+  // 生效的折叠块大小（GF）：显式写了 nudge 三键中任意一键就跟随它，否则用窗口推导值。
+  // 三键同源的理由见下方 nudge 组装处的注释。
+  const effectiveGrowthFloor =
+    uNudge.growthFloor ?? uNudge.growthCap ?? uNudge.minGrowthFloor ?? p.growthFloor
   return {
     ...userConfig,
     preserveRecentTokens: userConfig.preserveRecentTokens ?? p.retainTokens,
@@ -222,10 +226,19 @@ export function applyAutoTune(
     compress: { ...AUTO_TUNE_FIXED.compress, ...uCompress, minCompressRange: uCompress.minCompressRange ?? p.minCompressRange },
     nudge: {
       ...AUTO_TUNE_FIXED.nudge,
-      growthFloor: p.growthFloor,
-      growthCap: p.growthFloor,
-      minGrowthFloor: p.growthFloor,
       ...uNudge,
+      // 三键最后写入并**同源联动**：内核取 `nudgeGrowthTokens = min(growthCap, max(growthFloor, …))`、
+      // `cadenceFloor = max(minGrowthFloor, …)`，三键本就是这个模式里的同一个概念（GF）。
+      // 若只显式写其中一键而不联动，未写的两键仍是窗口推导值，会出现
+      // `growthFloor > growthCap` ⇒ 用户显式写的 floor 被 cap **静默截断**
+      // （例：窗口 300k 推导 GF=75000，只写 `nudge.growthFloor: 90000` ⇒ 实际增长仍按 75000）。
+      // 故：显式写了任一键，未显式写的两键跟随它；一个都没写时才取窗口推导值。
+      //   · 只写 floor=90000 → 90000/90000/90000（原先退化为 90000/75000/75000）
+      //   · 只写 cap=10000   → 10000/10000/10000（用户想压节奏，floor 跟着降而不是被截断）
+      //   · 三键都写         → 原样采用（若 floor > cap 属配置矛盾，内核以 cap 为准，见文档）
+      growthFloor: uNudge.growthFloor ?? effectiveGrowthFloor,
+      growthCap: uNudge.growthCap ?? effectiveGrowthFloor,
+      minGrowthFloor: uNudge.minGrowthFloor ?? effectiveGrowthFloor,
     },
   }
 }

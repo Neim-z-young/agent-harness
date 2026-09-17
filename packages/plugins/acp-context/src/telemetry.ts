@@ -182,8 +182,11 @@ export interface PreModelBuildInput {
 }
 
 export function buildPreModelEvent(inp: PreModelBuildInput): PreModelEvent {
-  const rawTok = estimateTokens(inp.inflatCores)
-  const requestTok = estimateTokens(inp.requestCores)
+  // 必须与 engine（createCore）和 acp_status 用同一个折算函数：缺省时落到内核 CJK 感知口径，
+  // 但如果配置了 tokenCalibration: 'chars4' 而此处漏参，遥测就会与决策口径分裂
+  // （占用率/rawTok 用另一把尺子，导出报告与 TUI 无法与内核行为互相印证）。
+  const rawTok = estimateTokens(inp.inflatCores, inp.countTokens)
+  const requestTok = estimateTokens(inp.requestCores, inp.countTokens)
   const acpCacheHit = commonPrefixHit(inp.prevRequestCores, inp.requestCores)
   return {
     kind: 'preModel',
