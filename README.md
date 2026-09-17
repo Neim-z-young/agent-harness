@@ -57,6 +57,11 @@ harness [repl|start] [options]        启动交互式 REPL（默认）
 harness list-sessions [options]       列出持久化会话
 harness resume <sessionId> [options]  恢复指定会话
 harness run "<prompt>" [options]      一次性执行 prompt
+harness teammate --team <t> --name <n> [options]   以 teammate 身份运行（终端后端 spawn）
+harness config                        配置概览（Provider / 模型 / 压缩 概览 + 校验）
+harness config set-key <providerId> <apiKey>       加密写入 apiKey（enc:v1 密文）
+harness config get-key <providerId>   解密查看 apiKey
+harness config check [options]        校验 config.json 并打印概览（等同于 --check-config）
 harness help                          显示帮助
 
 选项：
@@ -67,8 +72,14 @@ harness help                          显示帮助
   -d, --data-dir <dir>      持久化目录（默认 ~/.harness）
       --permission <mode>   allow-all / ask（默认 ask）
       --tui                 以 TUI（alt-screen 全屏）模式启动 REPL
+      --check-config        校验配置并打印概览后退出
   -v, --verbose             调试日志
 ```
+
+> `harness config check` / `--check-config` 会做**配置形状校验**：写错键、写错取值、层级写错都会被指出来
+> （例如把 `preserveRecentTokens` 写成单数、把 `tokenCalibration` 写成 `'chars/4'`）。这些错误在默认情况下
+> **完全无声**——未知键会被 `defaultConfig` 静默丢弃，写错取值会降级到默认值，而概览照常显示正常。
+> 详见 [上下文压缩配置](docs/acp-context-config.md) §10。校验属告警级别，不影响退出码（只有 Provider 错误才返回 1）。
 
 ### REPL 内斜杠命令
 
@@ -134,6 +145,37 @@ bun run typecheck           # 全部类型检查
 | `allowPluginCode` | boolean | 是否加载 `.harness/plugins/*.ts` 里的**插件代码**（默认 **false**，防代码注入）。绝大多数场景用上面那行即可，不需要开 |
 | `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
 | `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
+| `compression` | object | 上下文压缩（ACP）配置，见下节 |
+
+### compression 对象（上下文压缩 ACP）
+
+启用内置的上下文压缩能力。完整字段说明见 [docs/acp-context-config.md](docs/acp-context-config.md)，参数速查见 [docs/acp-context-param-table.md](docs/acp-context-param-table.md)。
+
+```json
+{
+  "compression": {
+    "enabled": true,
+    "autoTune": true,
+    "tokenCalibration": "auto"
+  }
+}
+```
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `enabled` | boolean | 是否启用（缺省 false） |
+| `autoTune` | boolean | **按上下文窗口自动推导**保护 tokens / 增长阈值 / 最小压缩区间（缺省 **false**）。开启后无需手写下面那些参数 |
+| `tokenCalibration` | `'auto'` \| `'chars4'` | token 折算口径。`auto`（默认）为 CJK 感知——中日韩按 1 字 1 token，与内核 `defaultCountTokens` 同口径；`chars4` 为旧的 `chars/4` 回退 |
+| `modelContextLimit` | number | 手动指定上下文窗口；缺省取默认 Provider 的 `contextWindowTokens`，再兜底 200000 |
+| `preserveRecentTokens` | number | 保护区 tokens（推荐交给 autoTune） |
+
+**三个容易踩的点**：
+
+1. **`autoTune` 默认关闭**，不写就按内核默认值跑；推荐显式开启让参数随窗口自适应。
+2. **窗口并非写死的 200000**：实际取 `modelContextLimit` → 默认 Provider 的 `contextWindowTokens` → 200000 三级回退。若 Provider 声明了较小的窗口（如 `102400`）却手写大 `preserveRecentTokens`，会直接吃掉半个窗口导致严重超窗——**小窗口请交给 autoTune 推导**。
+3. **写错键完全无声**：未知键被静默丢弃、写错取值降级到默认值，而概览照常显示正常。调参前后请跑 `harness config check`。
+
+**关于工具结果的自主续轮**：当前的 Agent 执行是**单轮**的——一次模型调用后执行工具，工具结果**不会**自动回喂触发下一次推理；续轮由用户输入或 coordinator 的 barrier（后台子任务集齐）驱动。自主多步（read → edit → bash 链式执行）的改造计划见 [Agentic Loop 改造计划](docs/agentic-loop-plan.md)。
 
 ### plugins 数组（内置插件声明式启用）
 
@@ -639,11 +681,22 @@ const mcpPlugin = createMcpClientPlugin({
 
 ## Documentation
 
-- [架构设计文档](docs/agent-harness-architecture.md) — 设计理念、总体架构、核心模块详解、实现路径
+- [架构设计文档](docs/agent-harness-architecture.md) — 设计理念、总体架构、核心模块详解（含 §16 Agentic Loop 现状）、实现路径
 - [开发日志](docs/development-log.md) — 每日开发进度、遇到的问题与修复、下一步计划
 - [MCP 服务](docs/mcp-services.md) — MCP server 注册方法、配置字段、命令用法、运行机制与凭据安全
 - [工作区管理](docs/workspace-management.md) — 两级工作区目录、config/permissions/sessions 数据布局
 - [代码情报插件](docs/codeintel-plugin.md) — CodeIntel 插件规划与实现说明
+
+上下文压缩（ACP）系列：
+
+- [ACP 配置参考](docs/acp-context-config.md) — 全部配置字段、推导公式、窗口选择、校验规则与排障
+- [ACP 参数速查表](docs/acp-context-param-table.md) — 200K / 300K / 1M 最优参数表与偏离代价实测
+- [ACP 压测报告](docs/acp-context-benchmark.md) — 不同上下文长度下的压缩比与敏感性问题
+- [上下文压缩改造计划](docs/context-compression-plan.md) — 阶段划分与里程碑
+
+Agent 执行链路：
+
+- [Agentic Loop 改造计划](docs/agentic-loop-plan.md) — 三方（Claude Code / Opencode / 本项目）循环机制对比、阻塞点清单、S0~S4 分阶段实施方案
 
 ## Tech Stack
 

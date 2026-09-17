@@ -1,5 +1,178 @@
 # Agent Harness 开发日志
 
+## 2026-09-17（续 139）配置概览的 ACP 窗口改为与 boot 同一套推导（+ 现网配置优化）
+
+### 起因：一个把三份评估全部作废的显示 bug
+
+概览里的 `fitWindow` 此前直接兜底 `200000`，不看 `providers[].contextWindowTokens`；而 boot 装配插件时用的是「`compression.modelContextLimit` → 默认 provider 的 `contextWindowTokens` → 200000」三级推导。**同一个数两处两个值**，按概览做的判断全部落空。
+
+现网就是活例：所有 provider 都写着 `contextWindowTokens: 102400`，概览一直显示 `fitWindow=200000`。修正后发现**真实窗口 102400 下，原配置是灾难性超窗**——`config.preserveRecentTokens: 50000` 吃掉了半个窗口，末轮占用 134% → 164% → 209%，缓存命中从 85% 腰斩到 53%~60%。
+
+改为同样走 `normalizeProviderConfigs`（默认 provider 的 id 可能省略、由 model 派生），再按三级回退。cli 全包 324 通过。
+
+### 现网 `~/.harness/config.json` 优化（备份 `config.json.bak-20260917-1347`）
+
+删掉 5 类键，全部交回 autoTune 推导：`config.preserveRecentTokens: 50000`（主因）、`config.compress.minCompressRange: 30000`、`nudge.growthRatio/Floor/Cap/minGrowthFloor`（层级写错，从未生效）、`compression.maxSummaryLength`、`telemetry.maxEvents`（均不存在）。
+
+改后 `--check-config` 零告警、`fitWindow=102400`，生效值 R=15000 / GF=22500 / MC=60000。三点均值有效成本 **52573 → 11938（−77.3%）**，末轮占用 209.5% → 95.9%，命中 60.3% → 85.9%。
+
+R 扫描（steps=140）显示 15000 正是最优（10000 反而变差到 12728，块更碎），恰好等于 autoTune 推导值 ⇒ **删键让它推导就是最优解**。`docs/acp-context-config.md` §7.5⑥ 补入该档实测，与既有「102400、10× 窗口峰值 96.2%」的结论吻合（实测 95.91%）。
+
+## 2026-09-17（续 138）CLI 侧 compression 配置写错键 / 写错取值时告警
+
+### 根因
+
+`JSON.parse(config.json)` 无编译期保护 → CLI 白名单搬运 → `defaultConfig` 合并尾部 `{...base, ...overrides, 子树:{...}}` **静默丢弃所有未知键**。于是 `preserveRecentToken`（少 s）、`nudge.growthFloar`、`tokenCalibration: 'chars/4'` 一律无声。
+
+后者尤其危险：它**静默降级到默认值 auto**，而 CLI 概览照常显示「token 口径 自动（CJK 感知）」。想拿 `chars4` 做 A/B 对照组却拼错 ⇒ 两组都跑 auto ⇒ 实测差 ≈ 0 ⇒ 得出「两个口径没差」的反向结论（真相差约 4 倍）。**与「遥测漏传 countTokens」是同一类假阴性**。
+
+### 方案
+
+新增纯函数 `checkCompressionConfig(c: unknown): string[]`，白名单 diff 覆盖 `compression` 顶层 / `tiers` / `nudge` / `telemetry` / `prompts`，以及高级透传里的 `config.tiers` / `config.nudge` / `config.compress` / `config.truncate` / `config.absorb`，外加 `tokenCalibration` 取值校验。
+
+两处接线：boot 装配 ACP 前（放在 `enabled` 判断之外——「开关关着却怎么也不生效」正是最高发的困惑场景）；`buildConfigOverview` 的「配置告警」段（`--check-config` 与 `/config` 均可见）。**不改退出码**，告警不属错误，只有 providers 问题才 `return 1`。
+
+### 三个实现取舍
+
+1. 白名单写成 `Record<keyof 内核类型, true>` ⇒ 内核增删/改名时**编译期即报错**，白名单不会静默过期；
+2. 形参标 `unknown` 而非 `HarnessConfig['compression']`——本函数存在的理由就是 `JSON.parse` 的形状不受保护，标成结构化类型反而让调用方误以为已受保护（TS 只拦字面量，不拦运行时多余键）；
+3. 测试加一条「所有合法键写满 ⇒ 零告警」的守卫，防白名单漏列变成误报噪音。
+
+验证：真实 CLI 跑 `--check-config` 端到端确认「深层拼错精确命中 + 合法配置零告警」；对现网配置一跑就抓出 6 个死键（其中一个 `minCompressRange: 30000` 正在付出约 25% 成本）。cli 全包 323 → 326。
+
+## 2026-09-17（续 137）清理四处多余的 `as any` 类型逃逸
+
+上一轮代码审查遗留项。逐处删掉后 `tsc --noEmit` **干净通过**、48 测试 / 202 断言全绿、`renderText` 输出逐位不变 ⇒ 确认四处**均非必需**：
+
+- `index.ts` allowToolIds 改 `new Set<string>(...)`：`toolIds` 是字面量联合数组，`Set<联合>.has(string)` 才不兼容；正解是放宽集合元素类型，不是对入参投毒。
+- `index.ts` `buildCompressEvent` 的 window 直接用 `config.modelContextLimit`：内核 `types.d.ts:168` 里该字段是**必填** number，`defaultConfig`（`dist/index.js:331`）也确实写入产物 ⇒ 原来的 `?? 0` 是**永不执行的死分支**，却让读者误以为该字段可能缺失。顺带证明遥测里 `window` 一直是真窗口值，历史数据没被污染。
+- `index.ts` `buildPreModelEvent` 的 config 去掉断言：形参 `Config` 与插件 `AcpConfig` 是同一类型别名。
+- `adapter.ts` renderText 分支改 cast 到具体 Part interface：**唯一有实质价值的一处**。`Part` 联合末尾的兜底成员 `{ type: string; [key: string]: unknown }`（`session/src/index.ts:89`）使 `p.type === 'reasoning'` 无法 narrowing，作者只好上 `any`；代价是字段名写错（如 `FilePart.path` 写成 `filePath`）编译照样过、运行时被 `?? 'inline'` 兜住 ⇒ 每条附件都变 `[file: inline]`，模型看不见文件名，全程无声。现在编译器能兜住。
+
+## 2026-09-17（续 136）独立代码审查修复：遥测口径透传 + nudge 三键同源
+
+提交后派子代理（无我的上下文包袱、直接读代码）做独立审查，抓出两处自审两轮漏掉的问题：
+
+**P1 —— telemetry 漏传 `countTokens`（假阴性）**：`59e296e` 本应让遥测跟随同一口径，但 `telemetry.ts` 里两处 `estimateTokens(inp.xxx, inp.countTokens)` 被**同文件并行 Edit 静默回滚**，而提交信息已经写了「遥测跟随同一口径」。表象与上次修的 P1 同源：**日志/提交信息声称在生效，实际没有**。已修复并新增测试断言该分支（`telemetry.test.ts` 3 例，含 chars4 分支与"两口径占用率差约 4 倍"）。
+
+**P2 —— applyAutoTune 单键覆盖时 cap/floor 不联动**：只写 `growthFloor: 90000`（300K 推导 cap=75000）⇒ 内核 `min()` 静默截断成 75000，显式值失效。改为三键同源 `effectiveGrowthFloor = uNudge.growthFloor ?? uNudge.growthCap ?? uNudge.minGrowthFloor ?? p.growthFloor`。中间曾写 `cap = Math.max(自动值, 生效floor)`，自否（会抬高用户显式 cap），最终取「让自动值向显式值让步」。
+
+方法论固化：**提交后再跑一次独立审查**；以及**提交信息里每一句"改了什么"，提交前都要 grep 核对**。
+
+## 2026-09-17（续 135）token 折算口径对齐内核（`tokenCalibration`，默认 auto）
+
+### 根因更正
+
+此前我判断"内核默认 `chars/4`"——**错了**。读 JS 实现发现 `createCore` 取 `ports.countTokens ?? defaultCountTokens`，而 `defaultCountTokens` **本就 CJK 感知**（中日韩 1 token/字 + 其余 4 char/token）。真正错在**插件侧**：`adapter.estimateTokens` 一律 `ceil(Σchars/4)`，而它产出的 `tokenCount` 是占用率闸门的唯一输入 ⇒ 中文会话上报仅占真值的 0.27~0.30×，两侧口径分裂。
+
+### 方案
+
+新增 `tokenCalibration?: 'auto' | 'chars4'`（默认 `auto`）：`auto` 走内核 `defaultCountTokens`，`chars4` 保留旧口径回退。`createCore({ countTokens })` 传参，`runPreModel` / `acp_status` 上报同一口径。
+
+### 实测（真实插件链路）
+
+中文会话上报/真值偏差：`chars4` 0.27~0.30× → `auto` **0.98~0.99×**。第 31 轮真值超窗 100.8% 时，旧口径只报 29.5%。内核链路中文峰值 207.2% 超窗 → 91.6%；**英文零回归（差 0.00%）**。
+
+一处不追求的目标说明：新实现逐条 ceil 累加、旧实现先求和再 ceil，纯 ASCII 下最多差 `core 数 − 1` token（7 条实测 265 → 268，约 1%）。「逐位等价」过强，与内核口径一致才是目标；英文 60 轮折叠指标逐位相同。
+
+## 2026-09-17（续 134）压缩参数按窗口自动适配（autoTune）+ 200K/300K/1M 最优参数表
+
+### 需求
+
+> 200K/300K/1M 的上下文窗口，给一个最优参数表，其他上下文大小的窗口用这个调优方法自动适配。
+
+### 方案：三锚点分段插值（而非单条对数拟合）
+
+`AUTO_TUNE_ANCHORS = [[200000, 35000], [300000, 50000], [1000000, 100000]]`，在 `log10(W)` 上分段线性插值、两端延伸，夹 `[15000, 150000]`。**刻意选插值而非拟合**：保证「参数表给出的值 = 公式在锚点处的取值」，文档与实现对得上，不会出现"表里写 50000、公式算出 48130"的割裂。
+
+推导式：`R = clamp(round500(interp(W)), 15000, 150000)`；`GF = round500(1.5R)`（growthFloor = growthCap = minGrowthFloor）；`MC = clamp(4R, 8000, 2(W−R))`（**chars 口径**）。
+
+注意 `MC = 4R` 里的 `4` 按英文折算率，中文下相对保护区粗 4 倍（实测不越界）；若改为 `R × 折算率` 需重扫中文锚点，留作后续。
+
+### 实测
+
+300K 偏离对照（表值 R=50k/GF=75k/MC=200k = 13588）：GF=100k + MC=150k = 13795（**+1.5%**）；仅 MC→150k = +3.1%，仅 GF→100k = +1.0%；峰值占窗 58.6% → 65.5%（贴 0.65 线）。`GF = 2R` 在 1M 会 +9.3%，**不可推广**。
+
+`autoTune` 默认 `false`（零行为变化），需显式开启。测试：acp-context 48 例、cli 320 例全绿，34 个 typecheck 目标 0 错误。新增 `docs/acp-context-param-table.md` 速查卡。
+
+## 2026-09-16（续 133）revert 测试替身补 `setBlocks`，修复 HEAD 上的 typecheck 失败
+
+既有问题，与近期改动无关。commit `3aaa096`（ACP 每轮内部压缩块同步进 `session.blocks`）给 `SessionManager` 接口加了 `setBlocks`，但漏改 `packages/revert` 的测试替身 `FakeSessionManager`，导致全仓 typecheck 在该包报 exit 2：
+
+```
+index.test.ts(30,7)   TS2420: FakeSessionManager incorrectly implements SessionManager
+index.test.ts(179/210/221/247/272/299/320,42)  TS2741: Property 'setBlocks' is missing
+```
+
+补 `setBlocks`，实现与 `packages/core/src/index.ts:704` 逐行对齐（**不是** `throw 'not implemented'`——该替身是内存实现，其余成员都真实改内存状态，抛异常会让走到该路径的用例挂掉）：blocks 为空或会话不存在则直接返回，否则按块 id 建 Map 去重覆盖，每块 `at` 更新为 `now`，写回 `session.blocks` 并刷新 `updatedAt`。
+
+同时逐条比对 `SessionManager` 的 27 个成员，确认除 `setBlocks` 外无其它遗漏——**TS2420 只报第一个缺失成员，很容易漏掉后面的**。
+
+验证：revert 包 8 条错误全消、36 pass / 0 fail；全仓 34 个 typecheck 目标全部 exit 0（此前 revert 是唯一失败项）。
+
+## 2026-09-16（续 132）删除 apiKey 明文回显链路（`reveal` / `maskKey`）
+
+`formatApiKeyTag` 的 `reveal` 选项会把 apiKey 明文原样输出，它唯一的真实用途是给 `buildConfigOverview(cfg, id, maskKey)` 当透传参数（`{ reveal: !maskKey }`）。而 `buildConfigOverview` 的 3 个生产调用方（`/config`、两处 `--check-config`）全部使用默认 `maskKey=true` ⇒ **reveal 在生产运行时恒为 false，CLI 没有任何入口能触发它**。
+
+一个"有测试覆盖、但永远走不到的明文回显密钥能力"：留着意味着将来谁手滑传个 `false`，就会把密钥打到终端或日志里。整条删掉，含 `maskKey` 参数本身：
+
+- `formatApiKeyTag` 的 opts 收敛为 `{ fingerprint?: boolean }`；
+- `buildConfigOverview` 去掉第三个参数，内部改为 `formatApiKeyTag(pc.apiKey)`——这正是当前生产行为（默认脱敏为「已配置」），**无行为变化**。
+
+`fingerprint`（附末 4 位）保留：用于区分「同端点同模型、仅 token 不同」的实例，唯一调用方只在重复组上才附指纹，有实际价值。
+
+测试删除 5 条 reveal/maskKey 断言，**新增反向保护**：`buildConfigOverview` 的输出不得包含明文 apiKey——将来若有人把明文回显加回来，测试会红。cli 316 pass / 0 fail。
+
+## 2026-09-16（续 131）provider-gemini：收尾窗口不再长于 idle 超时
+
+`DRAIN_MS` 原为 `min(300, max(50, timeoutMs/4))`。50ms 的硬下限在 `timeoutMs < 200` 时把窗口顶到 50ms，**反而长于请求自己的空闲超时**；而 idle 计时器在收到 finishReason 后**不再续期**（没有新数据），于是还没收工就被 idle 抢先触发，把已经正常输出完毕的流判成「空闲超时」，用户看到「发送失败」。
+
+改为 `min(300, timeoutMs, timeoutMs/4)` 并去掉 50ms 硬下限（下限只保留 1ms 防 0）：正常配置（`timeoutMs ≥ 1200`，默认 120s）结果仍是 300ms，与旧行为完全一致；`timeoutMs = 20` 时为 5ms，先于 20ms 的 idle 收工。
+
+注意窗口必须**严格短于** timeoutMs——只是「不超过」仍会与 idle 撞在一起。已 A/B 验证：旧公式下新用例失败（实测 24.89ms，正是 idle 20ms 抢先触发），新公式下通过。gemini 24 pass / 0 fail。
+
+## 2026-09-16（续 130）`@readonly` 哨兵让真实工具优先，不再霸占命名空间
+
+`filterByWhitelist` 先判哨兵再查注册表，于是哨兵值 `'@readonly'` 霸占了同名工具的命名空间：万一某个工具（内置或 MCP）真的叫 `@readonly`，用户把它写进白名单后拿到的却是「全部只读工具」，**永远无法直选到它本身**。
+
+改为真实工具优先、哨兵兜底：
+
+```ts
+const direct = this.get(id)
+if (direct) { push(direct); continue }            // 含真叫 @readonly 的工具
+if (id === READONLY_TOOLS_SENTINEL) { 展开只读 }   // 无同名工具时才展开
+```
+
+对现有行为零影响（当前注册表里没有 `'@readonly'` 这个 id）。JSDoc 一并写清两点此前没说破的语义：哨兵是**查询期动态展开**（同一份白名单在 MCP 只读工具晚注册的前后两次调用结果可能不同，不是静态快照）；注册表里若存在同名工具则优先直选。tool 62 pass（新增 3 例），改前确认新用例失败。
+
+## 2026-09-16（续 129）会话恢复指针再校验 `saved.cwd`，避免 `.harness` 被复制后跨目录串台
+
+`findResumeTarget` 的指针分支此前只校验「指针归属的 dataDir」（上一提交加的），不校验会话自己的 cwd。于是把 `.harness/` 整目录（含指针文件）复制到别处后，在新目录启动会恢复出**旧目录的会话**——与注释里「不会跨目录串台」的说法不符。
+
+同 cwd 兜底分支本来就有 `resolve(s.cwd) === this.workspace.cwd` 的比对，指针分支是个漏网的。现在补上：指针命中后 `saved.cwd` 与当前 cwd 不一致（含旧会话 `saved.cwd` 为 undefined）时不从指针分支返回，静默落到兜底分支。
+
+语义与 `rememberSession` 对齐——后者只在会话属于当前目录时才写指针，**「写指针时认目录，读指针时也该认目录」**。cli 316 pass（新增 4 例，含「指针失效时仍能走同 cwd 兜底」），已确认新用例在改动前失败。
+
+## 2026-09-16（续 128）流式请求补回总时长上限（空闲超时之外的兜底）
+
+三个 provider 的流控从「总时长超时」改成「空闲超时」后丢掉了总时长上限：上游**持续慢速吐数据**（每帧间隔 < timeoutMs，默认 120s）时，idle 计时器被不断重置，请求永不结束——旧行为至少还有总时长兜底。
+
+openai / anthropic / gemini 各加一个总时长计时器：`STREAM_TOTAL_TIMEOUT_FACTOR = 10`，即 `timeoutMs × 10` 作为整条流的硬上限，与 idle 计时器并存、谁先到谁生效，`finally` 里统一清理。
+
+系数取 10 是刻意的宽松值：只兜「真的卡死了」，不干扰正常的长回复——**长回复表现为持续有帧，idle 不会触发，但也不该被总时长误杀**。三个包各新增 1 例「持续慢速吐数据（永不结束）触发总时长兜底，而非空闲超时」（openai 22 / anthropic 20 / gemini 23 pass）。
+
+## 2026-09-16（续 127）会话指针原子写 + 绑定 dataDir
+
+会话恢复指针（`.harness/last-session.json` 一类）此前有两个隐患：
+
+**1. 非原子写**：`write()` 直接 `writeFile` 覆盖，同目录多进程并发写会损坏文件（JSON 尾部出现 NUL / 长度异常），`read()` 的容错会静默返回 undefined，表现为「指针无故失效」——不崩溃但恢复路径退到兜底。`ensureGitignoreEntry` 同样是 read-modify-write，一并中招。
+→ 新增 `writeFileAtomic(path, content)`：同目录写 `.tmp` 再 `rename`（同文件系统才保证原子），失败清理临时文件；`write()` 与 `ensureGitignoreEntry` 均改用，且后者先 mkdir 再读，避免首次无目录时读失败。
+
+**2. 指针不绑定 dataDir**：只存 sessionId，同 cwd 用不同 `--data-dir` 且 sessionId 恰好相同（形如 `s_<ts>_<5位随机>`）时会把另一个 dataDir 的会话恢复出来。
+→ `SessionPointerFile` 新增 `dataDir?: string`；新增 `readIfOwnedBy(dataDir)`：解析出 dataDir 才比对归属，**旧指针无该字段照常返回**（向后兼容）。内部 `normalizeDataDir` 做 `resolve` + 去尾分隔符 + `realpathSync`（失败兜底），以兼容 `/tmp ↔ /private/tmp` 这类符号链接差异。
+
+workspace 38 pass（新增 5 例）、cli 312 pass。
+
 ## 2026-09-15（续 126）模型配置 id 优化：id 可省略 + `/model` 智能解析
 
 ### 问题（用户反馈）

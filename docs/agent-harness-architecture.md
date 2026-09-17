@@ -1238,3 +1238,49 @@ TUI 通过 `app.permission.setAskPrompt(cb)` 接管 `ask` 交互，渲染审批�
 - **两级加载**：user 级 `~/.harness/…` 与 project 级 `<cwd>/.harness/…`，project 覆盖 user。
 - **dataDir**：`args.dataDir ?? ~/.harness`，承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。
 - **可插拔目录**：`plugins` / `skills` / `agents` 均支持 user+project 两级，来源标注（内置/用户/项目/MCP/插件）。
+
+## 十六、Agentic Loop：现状与改造方向
+
+> 记录日期：2026-09-17。完整改造计划见独立文档 [agentic-loop-plan.md](file:///Users/oyoungy/Documents/project/XiaoZhi-new/docs/agentic-loop-plan.md)。本节只列架构层面的现状结论。
+
+### 16.1 现状：控制权在引擎外
+
+`AgentRuntimeImpl.query()`（`packages/core/src/index.ts:1332`）与 `queryStream()`（`core:1638`）**都是单轮**：一次模型调用 → 执行工具 → `addMessage` → 结束。没有循环、没有 turn 计数、没有 finish reason 概念。
+
+当前的"续轮"由**引擎外部**驱动：
+
+```
+coordinator 检测到 barrier 完成（后台 subagent 任务全部集齐）
+  → bus.publish('coordinator.barrier.completed')    coordinator/src/index.ts:493
+  → CLI attachAutoContinue 订阅                     cli/src/index.ts:2740
+  → 注入伪输入 '<continue/>'（rl.emit('line')）      cli:3455
+  → readline 的 'line' 处理器再走一次 processLine    cli:3457
+```
+
+这是**有意解耦**——coordinator 插件注释明确写着「插件只负责检测 barrier 完成 + 发布事件，不直接驱动 query」，符合 §九 的多 Agent 职责边界。但代价是：**只有后台任务集齐才续轮，普通工具链（read → edit → bash）无法自主多步**。swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每 tick 只调一次 `agent.query()`。
+
+### 16.2 与两个参考架构的差距
+
+| 维度 | Claude Code | Opencode | 本项目 |
+|---|---|---|---|
+| 主循环 | `queryLoop()`（query.ts:241，1729 行） | `runLoop`（session/prompt.ts:1098） | 无（外部 `<continue/>`） |
+| 终止依据 | finish reason 无 tool results | `finish` 非 `tool-calls` + `hasToolCalls` 兜底 | —— |
+| 步数上限 | `maxTurns` + `turnCount` | `agent.steps` + `MAX_STEPS_PROMPT` 收尾提示 | 无 |
+| 重复调用保护 | maxTurns 兜底 | `DOOM_LOOP_THRESHOLD=3` 主动检测 | 无 |
+| 压缩挂载点 | 循环体内 autoCompact | compaction 作为 continue 分支 | `session.preModel`（已有） |
+
+参考实现有两条值得抄的细节：
+
+1. **退出判断不能只看 finish reason**：部分 provider 返回 `stop` 但消息体里仍带 tool calls（opencode `prompt.ts:1123` 的 `hasToolCalls` 兜底），只看 reason 会提前退出、工具结果永远送不回模型；同时要排除被打断的孤儿工具以免多跑一轮。
+2. **步数到顶要"请模型收尾"而非硬截断**：opencode 在 `isLastStep` 时往 messages 尾部追加 `MAX_STEPS_PROMPT`（`prompt.ts:1298`）。
+
+### 16.3 改造的阻塞点与已有基础
+
+**唯一 P0 阻塞点**：`ChatCompletionOutput`（`core:378`）没有 finish 字段，而它恰恰是循环终止的核心依据。好消息是**数据已在 provider 层、只是没透传**——`provider-anthropic:115` 有 `stop_reason`、`provider-openai:120` 有 `finish_reason`（openai 甚至已在用它判 `tool_calls`，见 `:730`），故这一步是纯加法、零行为变化。
+
+**已有基础（零改动）**：
+
+- **工具结果回喂格式就绪**：两个主流 provider 都会把 assistant 消息里带 result 的 tool part 自动拆成合规角色（Anthropic → `tool_result` block；OpenAI → `role:'tool'` 消息带 `tool_call_id`，`provider-openai:227/292`）。session 层保持"assistant 消息内嵌工具结果"的统一模型，序列化时再拆 ⇒ **不需要动消息模型**。
+- **ACP 按轮设计**：`session.preModel` 本就每轮执行，`bench/compress-params.ts` 的 `--steps=100/140/200` 就是模拟多轮，参数表在此基础上实测 ⇒ 循环上线后无需重调参数。
+
+**主要风险**在协调层：`coordinator` 的 barrier 续轮已在承担「链式执行」职责，内部循环上线后两者可能双重驱动。计划把 S0~S3 在关闭 coordinator 的前提下验证，S4 再单独协调三层职责（引擎内循环 = 工具结果回喂；barrier = 跨轮推进；`<continue/>` = 仅 barrier 场景）。
