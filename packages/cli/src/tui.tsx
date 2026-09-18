@@ -998,6 +998,15 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const approvalResolveRef = useRef<((ans: string) => void) | null>(null)
   // 鼠标复制（模块 D3）：正在展示「✓ 已复制」提示的块 id（临时高亮，配合 onMouseUp 复制）
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  // thinking 折叠：用户显式展开过的 thinking 块 id（default 长推理折叠成一行标题，点击开关）
+  const [collapsedThinking, setCollapsedThinking] = useState<Set<number>>(new Set())
+  const toggleThinking = useCallback((id: number) => {
+    setCollapsedThinking((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id); else next.add(id)
+      return next
+    })
+  }, [])
   // 统计面板计时起点：组件挂载时刻
   const startTimeRef = useRef(Date.now())
   // 阶段四·按需渲染：会话全量消息引用 + 当前可见最旧消息下标（loadmore 分页用）。
@@ -1598,18 +1607,53 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             ❯ {b.text}
           </text>
         )
-      case 'thinking':
+      case 'thinking': {
+        // 可折叠推理：标题行始终可点。默认长推理（> 160 字符）折叠成一行标题（带摘要预览），
+        // 避免占屏；显式展开过的块保持展开。流式中 ├ 体正常显示。
+        const collapsed =
+          !collapsedThinking.has(b.id) && !b.streaming && b.text.length > 160
+        const onClick = (e: { preventDefault(): void }) => {
+          e.preventDefault()
+          toggleThinking(b.id)
+        }
+        const header = collapsed
+          ? `▸ 💭 推理 · ${b.text.trim().replace(/\s+/g, ' ').slice(0, 52)}…`
+          : '▾ 💭 推理'
         return (
-          <text key={b.id} attributes={createTextAttributes({ italic: true, dim: true })} wrapMode="word">
-            💭 {b.text}
-          </text>
+          <box key={b.id} flexDirection="column">
+            <text
+              attributes={createTextAttributes({
+                italic: true,
+                dim: true,
+                underline: collapsed || !b.streaming,
+              })}
+              onMouseUp={onClick}
+              wrapMode="word"
+            >
+              {header}
+            </text>
+            {!collapsed && (
+              <text attributes={createTextAttributes({ italic: true, dim: true })} wrapMode="word">
+                {b.text}
+              </text>
+            )}
+          </box>
         )
-      case 'tool':
+      }
+      case 'tool': {
+        // 树状工具输出：首行（工具调用）加粗，结果行前加竖线缩进，视觉上与 system 命令输出区分
+        const lines = b.text.split('\n')
+        const first = lines[0] ?? ''
+        const body = lines.length > 1
+          ? lines.slice(1).map((l, i) => `${i === lines.length - 2 ? '└ ' : '│ '}${l}`).join('\n')
+          : ''
         return (
-          <text key={b.id} attributes={createTextAttributes({ dim: true })} wrapMode="word">
-            {b.text}
-          </text>
+          <box key={b.id} flexDirection="column">
+            <text attributes={createTextAttributes({ bold: true, dim: true })} wrapMode="word">{first}</text>
+            {body && <text attributes={createTextAttributes({ dim: true })} wrapMode="word">{body}</text>}
+          </box>
         )
+      }
       case 'compact': {
         // 阶段四：压缩块提示行（不渲染内容），点击经 loader 惰性展开原文
         const onExpand = b.blockId

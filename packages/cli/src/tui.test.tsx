@@ -646,7 +646,7 @@ const activeFixtures: Array<() => Promise<void>> = []
 
 async function mountTui(
   extra: {
-    responses?: Array<{ match: string | RegExp; response: string; toolCalls?: Array<{ toolUseId: string; toolId: string; input: unknown }>; once?: boolean }>
+    responses?: Array<{ match: string | RegExp; response: string; toolCalls?: Array<{ toolUseId: string; toolId: string; input: unknown }>; reasoning?: string; once?: boolean }>
     openFile?: (path: string, line?: number) => void
     model?: string
     permissionMode?: 'allow-all' | 'ask' | 'deny-all'
@@ -1109,6 +1109,45 @@ describe('TuiApp 集成（mock provider）', () => {
     // 点击该按钮单元格坐标（0-based），触发 onMouseUp 复制并临时高亮
     await f.setup.mockMouse.click(pos!.x, pos!.y)
     await waitFrame(f.setup, (fr) => fr.includes('✓ 已复制'))
+    await f.cleanup()
+  })
+
+  it('thinking 长推理默认折叠成标题行，点击展开显示完整正文，再点击收起', async () => {
+    const sentence = '我先分析用户意图，再规划工具调用顺序，最后综合结果给出结论。'
+    const longReasoning = sentence.repeat(8) // 240 字符 > 160，触发折叠
+    const tail = longReasoning.slice(150, 180) // 第 6 句片段，不会出现在 52 字符折叠预览里
+    const f = await mountTui({
+      responses: [{ match: /折叠/, response: '最终回答', reasoning: longReasoning }],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.typeText('折叠测试')
+    pressSubmit(f.setup)
+    // 流式结束（done）后默认折叠：▸ 标题行带摘要预览，正文隐藏（预览只有前 52 字符，不含第 6 句）
+    const folded = await waitFrame(f.setup, (frame) => frame.includes('▸ 💭 推理') && frame.includes('最终回答'))
+    expect(folded).not.toContain(tail)
+    // 点击标题行 → 展开：▾ 标题（流式早已结束，▾ 只可能是展开态）
+    const pos = locateChar(folded, '▸ 💭 推理')
+    expect(pos).not.toBeNull()
+    await f.setup.mockMouse.click(pos!.x, pos!.y)
+    await waitFrame(f.setup, (frame) => frame.includes('▾ 💭 推理') && !frame.includes('▸ 💭 推理') && frame.includes('最终回答'))
+    // 再点击 → 收起回折叠态
+    const expanded = await waitFrame(f.setup, (frame) => frame.includes('▾ 💭 推理') && !frame.includes('▸ 💭 推理') && frame.includes('最终回答'))
+    const pos2 = locateChar(expanded, '▾ 💭 推理')
+    expect(pos2).not.toBeNull()
+    await f.setup.mockMouse.click(pos2!.x, pos2!.y)
+    await waitFrame(f.setup, (frame) => frame.includes('▸ 💭 推理'))
+    await f.cleanup()
+  })
+
+  it('thinking 短推理不折叠，直接显示 ▾ 标题 + 完整正文', async () => {
+    const f = await mountTui({
+      responses: [{ match: /短/, response: '回答', reasoning: '简单想想就回答' }],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.typeText('短推理')
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('▾ 💭 推理') && fr.includes('简单想想就回答'))
+    expect(frame).not.toContain('▸ 💭 推理')
     await f.cleanup()
   })
 })
