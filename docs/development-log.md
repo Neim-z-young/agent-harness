@@ -68,6 +68,31 @@ ACP 的 preModel 把**整段历史**经 `toCores → processTurn → requestMess
 acp-context 52（+4）全绿；bench 300K 自证点与基线逐位相同（纯文本剧本，符合预期）；全仓
 typecheck 0 错误。
 
+**⑦ 诊断会话中断：`[tool]` 占位文本污染历史，模型模仿后停止调用工具（已修）**
+
+用户报告会话 s_1789516184627_g800t「输出到一半就中断」。落盘数据还原的完整链条：
+
+- 会话里两段（间隔 8 小时）各出现 **5~6 条间隔仅几百毫秒的 assistant 消息**（真实推理轮次不可能），
+  每步 tokenUsage.output 只有 25~124 —— 模型在快速输出占位符。
+- 模型的 reasoning 自述："I keep outputting `[tool]` text instead of actual tool invocations"、
+  "I've been stuck in a loop outputting `[tool]` placeholders"。
+- 最后一步输出 `<acp tokens="4" ...>m00160</acp>\n[tool]\n[tool]`（连标签一起复读），**无工具调用**
+  ⇒ finish=stop ⇒ 循环终止 —— 用户看到的「中断」。
+
+根因：`renderText` 的兜底分支把 **tool part 渲染成 `[tool]` 占位**并塞进 text core —— 发给模型的
+历史里，每条工具调用消息都跟着一段 `[tool]` 占位文本（同时还有真正的 tool-call core ⇒ 双重表示）。
+模型（DeepSeek）看到历史里这种格式后**模仿**，开始在正文里输出 `[tool]` 而非发起真正的 function
+call；一旦某步没有工具调用，S2 判据（无工具调用 ⇒ 终止）正确地结束了循环。这也是 agentic loop
+上线后才会显性化的问题 —— 单轮时代模型模仿一次也就停了，多步循环让它连续退化 5~6 步、耗掉整轮。
+
+修复：`renderText` 跳过 reasoning 与 tool（各自有专属 core，不进文本视图）。连带收益：纯工具消息
+不再生成只含占位的空 text core。doom-loop 未拦住属预期：每次工具入参微调、中间夹纯文本步，
+"连续 3 步完全相同"的步签名判据不命中（判据本身工作正常）。
+
+验证：新增用例「text 视图不含 [tool] 占位」；acp-context 57（+1）全绿；bench 300K 自证点与基线
+逐位相同；全仓 typecheck 0 错误。**旧会话已污染的历史不会自动痊愈**（模型模仿源已移除，但存量
+`[tool]` 文本仍在），建议该会话 `/new` 或接受首几轮的质量折扣。
+
 **⑥ 内核契约全面核对（reasoning 修复引发的系统性排查）**
 
 对 acp-kernel 的全部公开契约（34 个 .d.ts）与我们 import 的 API 面逐组核对，新发现 4 处、确认 5 处正确：

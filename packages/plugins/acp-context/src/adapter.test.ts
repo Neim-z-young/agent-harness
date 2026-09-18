@@ -120,4 +120,29 @@ describe('reasoning 往返契约（ACP ↔ 内核）', () => {
     // 且各 part 形态的 id 互不相同（tool 与 text 不碰撞）
     expect(new Set(idsFull).size).toBe(idsFull.length)
   })
+
+  it('text 视图不含 [tool] 占位（模型会模仿它、退化成文本输出而终止循环）', () => {
+    // 回归：renderText 的兜底分支曾把 tool part 渲染成 `[tool]` 占位并塞进 text core ——
+    // 发给模型的历史里每条工具调用消息都跟着一段 `[tool]` 文本，DeepSeek 实测会模仿
+    // 这种格式、在正文里输出 `[tool]` 而不发起真正的 function call，最终无工具调用
+    // 而终止（用户看到「输出到一半就中断」）。真实案例：会话 s_1789516184627_g800t。
+    const msg = mkMsg('a1', 'assistant', [
+      { type: 'tool', toolUseId: 'tu1', toolId: 'read_file', input: { path: 'a' } } as never,
+      { type: 'tool', toolUseId: 'tu2', toolId: 'bash', input: { command: 'ls' } } as never,
+    ])
+    const { cores } = toCores([msg])
+
+    // 工具调用只有 tool-call core，没有任何 text core 夹带占位文本
+    expect(cores.map((c) => c.contentType)).toEqual(['tool-call', 'tool-call'])
+    expect(cores.some((c) => (c.text ?? '').includes('[tool]'))).toBe(false)
+
+    // 混合消息（text + tool）：text core 只含正文
+    const mixed = mkMsg('a2', 'assistant', [
+      { type: 'text', text: '结论' } as never,
+      { type: 'tool', toolUseId: 'tu3', toolId: 'bash', input: {} } as never,
+    ])
+    const { cores: cores2 } = toCores([mixed])
+    const textCore = cores2.find((c) => c.contentType === 'text')
+    expect(textCore?.text).toBe('结论')
+  })
 })

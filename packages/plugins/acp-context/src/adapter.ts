@@ -68,6 +68,12 @@ function safeParse(v: string | undefined): unknown {
  * 且「每个 adapter 都依赖这个往返契约来重建 reasoning_content」）。若并进 text 视图，
  * 往返后 reasoning part 会降级成 text part，thinking 端点（DeepSeek）要求的
  * `reasoning_content` 回传随之缺失。
+ *
+ * **不含 tool** —— 工具调用/结果由 toCores 拆成独立的 tool-call/tool-result core。
+ * 若在这里输出占位（旧实现会输出 `[tool]`），发给模型的历史里每条工具调用消息都会
+ * 跟着一段 `[tool]` 占位文本：模型（DeepSeek 实测）会模仿这种格式、开始在正文里输出
+ * `[tool]` 而不是发起真正的 function call，最终无工具调用而终止 —— 表现为
+ * 「输出到一半就中断」。真实案例见会话 s_1789516184627_g800t。
  */
 function renderText(m: Message): string {
   const parts: string[] = []
@@ -76,7 +82,8 @@ function renderText(m: Message): string {
     else if (p.type === 'file') parts.push(`[file: ${(p as FilePart).path ?? 'inline'}]`)
     else if (p.type === 'image') parts.push(`[image: ${(p as ImagePart).path ?? 'inline'}]`)
     else if (p.type === 'patch') parts.push(`[patch: ${(p as PatchPart).path ?? 'unknown'}]`)
-    else if (p.type !== 'reasoning') parts.push(`[${p.type ?? 'part'}]`)
+    // reasoning / tool：各自有专属 core，不进文本视图
+    else if (p.type !== 'reasoning' && p.type !== 'tool') parts.push(`[${p.type ?? 'part'}]`)
   }
   return parts.join('\n')
 }
