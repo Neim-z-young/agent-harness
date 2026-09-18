@@ -1696,7 +1696,23 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }
 
   return (
-    <box flexDirection="column" style={{ flexGrow: 1 }}>
+    <box
+      flexDirection="column"
+      style={{ flexGrow: 1 }}
+      onMouseDown={(e) => {
+        // 鼠标点击任意处后把焦点还给输入框：OpenTUI 渲染器对 left-down 默认执行
+        // autoFocus（从命中元素向上找第一个 focusable 并 focus），点击消息区等文本
+        // 会把焦点从 textarea 抢走，此后键盘输入失效、需重新点击输入框。
+        // 这里在点击冒泡阶段 preventDefault 掉 autoFocus 并显式 focus 回输入框（幂等）。
+        // 拖选文本（startSelection）发生在 dispatchMouseEvent 之前，不受 preventDefault 影响；
+        // 复制按钮/折叠标题等 onMouseUp 交互照常触发。
+        // 列表模式（Tab 导航）/ 帮助 / 审批模态让出键盘，不抢焦点。
+        if (!listMode && !helpOpen && approvalQ === null) {
+          e.preventDefault()
+          textareaRef.current?.focus()
+        }
+      }}
+    >
       {/* 顶部状态栏 */}
       <box style={{ border: true }}>
         <text attributes={createTextAttributes({ bold: true })}>{statusText}</text>

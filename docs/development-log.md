@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-09-18（续 148）TUI 鼠标点击消息区后键盘失效修复
+
+用户报告：鼠标点到消息框（消息区）后再敲键盘没反应，必须重新点击输入框。
+
+根因（`@opentui/core` 渲染器）：对 left-button down 事件默认执行 **autoFocus** —— 从命中
+元素向上找第一个 `focusable` 的 renderable 并 `focus()`。消息区文本（assistant 回复 /
+thinking / 复制按钮等）都可聚焦，点击后焦点从 textarea 被抢走；React 层 `focused` prop
+不变不会重新 focus，键盘输入就此失效。
+
+修复（`packages/cli/src/tui.tsx`）：在根容器 `onMouseDown` 冒泡阶段统一处理——
+
+- `e.preventDefault()` 阻止渲染器 autoFocus 抢焦点（autoFocus 条件为 `!defaultPrevented`）；
+- 显式 `textareaRef.current?.focus()` 把焦点还给输入框（幂等）；
+- **不影响既有交互**：拖选文本（startSelection）发生在 `dispatchMouseEvent` 之前，
+  不受 preventDefault 影响；复制按钮 / thinking 折叠 / 侧栏 tab 等 onMouseUp 交互照常触发；
+- 列表模式（Tab 导航）/ 帮助面板 / 审批模态期间不干预（让出键盘）。
+
+验证：新增集成用例「鼠标点击消息区后键盘输入仍直接生效」（点击 assistant 文本后
+直接敲字符进入输入框）；cli 338 用例全绿（+1），全仓 typecheck 0 错误。
+
 ## 2026-09-18（续 147）TUI 各块输出视觉区分 + thinking 推理块可折叠
 
 用户需求：前端渲染更人性化地区分各块输出，thinking 块可折叠。改动（`packages/cli/src/tui.tsx`）：

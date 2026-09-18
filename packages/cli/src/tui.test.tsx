@@ -1112,6 +1112,22 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
+  it('鼠标点击消息区后键盘输入仍直接生效（焦点自动回到输入框）', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('消息区点击')
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    // 点击 assistant 消息文本（非输入框区域）：OpenTUI autoFocus 会把焦点从 textarea 抢走
+    const pos = locateChar(frame, '你好，我是 TUI 助手。')
+    expect(pos).not.toBeNull()
+    await f.setup.mockMouse.click(pos!.x, pos!.y)
+    // 点击后无需重新点击输入框，直接敲字符即进入输入框
+    await f.setup.mockInput.typeText('abc')
+    await waitFrame(f.setup, () => inputLine(f.setup).includes('abc'))
+    await f.cleanup()
+  })
+
   it('thinking 长推理默认折叠成标题行，点击展开显示完整正文，再点击收起', async () => {
     const sentence = '我先分析用户意图，再规划工具调用顺序，最后综合结果给出结论。'
     const longReasoning = sentence.repeat(8) // 240 字符 > 160，触发折叠
