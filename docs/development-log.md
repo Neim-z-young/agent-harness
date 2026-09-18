@@ -1,5 +1,45 @@
 # Agent Harness 开发日志
 
+## 2026-09-18（续 145）DeepSeek 官方文档确认回传规则 + 真实 barrier 链路实测通过
+
+### ① DeepSeek 官方文档：`reasoning_content` 的确切规则（回应"为什么不复现 400"）
+
+查官方 Thinking Mode 文档（`api-docs.deepseek.com/guides/thinking_mode`，`deepseek-flash` 正是文档示例模型）：
+
+- **thinking 模式默认启用**（默认 effort=high）；
+- 是否要回传 `reasoning_content` **取决于请求是否带 `tools`**（原文）：
+  > "for requests carrying the `tools` parameter, the reasoning_content must be **fully** passed back
+  > to the API in **all subsequent requests** — even for turns where the model did not perform a tool
+  > call. If your code does not correctly pass back reasoning_content, the API will return a **400** error."
+  - 带 `tools` ⇒ 所有后续请求必须完整回传历史各轮的 reasoning_content；
+  - 不带 `tools` ⇒ 不需要回传，**传了也会被忽略**（不拼进上下文）。
+- 旧版 `deepseek-reasoner`（不支持 function call）规则**相反**：输入消息里带该字段 ⇒ 400。
+
+对本项目的意义：
+1. **自适应设计被双重确认**：新规则要求"必须带"、旧 reasoner 要求"绝不能带" —— 两种端点相反的
+   要求决定了"无条件带/不带都错"，按 400 探测 + 按 modelId 记忆是唯一稳妥解。
+2. **为什么此前实测不复现**：探针构造的历史 assistant 是手工造的，模型从未在那些消息上**真实产生过**
+   reasoning_content，服务端无从校验"曾产生但未回传"。真实报错发生在模型真实产出推理后的下一轮。
+3. 两个已知缺口（暂不修，已记录）：**ACP 折叠可能截断历史 reasoning part**，与"必须**完整**回传"
+   存在张力，重发兜底只补空串救不了"内容不完整"；`thinking` / `reasoning_effort` 参数未透传
+   （默认 high 可用，想调低省 token 暂无入口）。thinking 模式下 `temperature` 静默无效（无害）。
+
+### ② 真实 barrier 链路实测通过（S4 的最后一项未闭环）
+
+新增 `packages/cli/src/barrier-integration.test.ts`（2 例，cli 全包 334）：与既有用例（手工
+enqueue/publish 单环验证）不同，这里走**真实插件链**——subagent 工具真的后台派发、coordinator
+真的计数集齐、事件真的从 `subagent.completed` 链式触发，覆盖三层职责的全部接缝。
+
+**时序实证**（此前只有源码推导）：`bus.publish` 同步调用订阅者（bus:177，async 包装无前置 await），
+而 subagent 的 `bus.publish(completed)`（:834）排在 `enqueueNotification`（:864）**之前** ⇒
+测试断言 CLI 收到 `<continue/>` 的瞬间 `peekNotifications()` 为**空**。若 CLI 同步决策就会把
+真正的后台结果误判为空转、整条吞掉 —— S4 空转识别里"让出宏任务再 peek"不是过度设计，是必要的。
+
+**端到端行为**：后台任务集齐 → 真实注入 `<continue/>` → 续轮真实发生（模型再被调用、通知 drain
+注入上下文、无"跳过"提示）；对照用例：前台（非后台）派发不触发 barrier（无事不扰）。
+
+S0~S4 评审时挂起的"真实 barrier 全链路未验证"至此闭环：双重驱动不会发生，三层协同正常。
+
 ## 2026-09-18（续 144）对 agentic loop 全线的独立代码评审：1 个 P0 + 5 个 P1
 
 对最近 9 个提交（agentic loop S0~S4 + 三处修复）做独立评审。方法沿用上次的结论：**派子代理读代码、
