@@ -508,4 +508,130 @@ describe('S3 真 abort', () => {
   })
 })
 
+// ============================================================================
+// 代码审查修复项（2026-09-18）
+// ============================================================================
+
+/** 一步内并行调用两个 echo（入参不同）—— 用于验证「整步重复」检测 */
+function parallelScript(tag: string): ChatStreamChunk[] {
+  const mk = (n: number): ChatStreamChunk[] => [
+    { type: 'tool_use_start', toolUseId: `tu_${tag}_${n}`, toolId: 'echo' },
+    { type: 'tool_use_delta', inputDelta: JSON.stringify({ msg: `${tag}-${n}` }) },
+    { type: 'tool_use_stop', toolUseId: `tu_${tag}_${n}` },
+  ]
+  return [...mk(1), ...mk(2), { type: 'done', model: 'm', finish: 'tool_calls' }]
+}
+
+describe('审查修复：整步重复（每步多个调用的漏检）', () => {
+  it('每步并行 2 个调用、连续 3 步完全相同 ⇒ 整步被拦', async () => {
+    // 回归：全局序列是 A,B,A,B,A,B…，尾部连续 3 个永不相同，
+    // 只看「同一调用连续 N 次」恒不命中 ⇒ 保护失效、一路跑到 maxSteps。
+    const provider = scriptedProvider([parallelScript('p')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'loop'))
+    const results = events.filter((e) => e.type === 'tool_call_result')
+    const errors = results.filter((r) => r.isError === true)
+
+    // 模型被调用了 3 次（第 3 步请求照发），但第 3 步的**两个工具都没执行**
+    expect(provider.calls).toBe(DOOM_LOOP_THRESHOLD)
+    expect(errors).toHaveLength(2)
+    expect(errors.every((r) => JSON.stringify(r.result).includes('DOOM_LOOP'))).toBe(true)
+    // 只有前两步的 4 次真的执行成功
+    expect(results.filter((r) => r.isError !== true)).toHaveLength(2 * (DOOM_LOOP_THRESHOLD - 1))
+    await h.stop()
+  })
+
+  it('整步重复但用户放行 ⇒ 继续执行，不误伤合法重试', async () => {
+    const provider = scriptedProvider([
+      parallelScript('p'),
+      parallelScript('p'),
+      parallelScript('p'),
+      textScript('收尾'),
+    ])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      permission: new AllowAskEngine({ '*': 'allow' }),
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'retry'))
+    const results = events.filter((e) => e.type === 'tool_call_result')
+    expect(results.every((r) => r.isError !== true)).toBe(true)
+    expect(provider.calls).toBe(4)
+    await h.stop()
+  })
+
+  it('每步入参不同（正常探索）不被整步检测误伤', async () => {
+    const provider = scriptedProvider([parallelScript('a'), parallelScript('b'), textScript('好了')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'explore'))
+    expect(events.filter((e) => e.type === 'tool_call_result').every((r) => r.isError !== true)).toBe(true)
+    expect(provider.calls).toBe(3)
+    await h.stop()
+  })
+})
+
+describe('审查修复：turn_end 在所有退出路径送达', () => {
+  it('某步抛错时 turn_end 仍送达，且异常继续上抛', async () => {
+    // 回归：turn_end 原本写在循环之后，中间任一步抛错都会跳过它，
+    // 以 turn_end 收状态的消费者（TUI 的 busy、swarm tick）会永久卡在"运行中"。
+    let n = 0
+    const provider: ChatProvider = {
+      id: 'boom',
+      async complete() {
+        throw new Error('本用例只走流式路径')
+      },
+      async *stream() {
+        n++
+        if (n === 1) {
+          for (const c of toolCallScript(1)) yield c
+          return
+        }
+        throw new Error('第 2 步炸了')
+      },
+    }
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events: AgentStreamEvent[] = []
+    let caught: unknown
+    try {
+      for await (const ev of h.session.promptStream(sess.id, 'boom')) events.push(ev)
+    } catch (e) {
+      caught = e
+    }
+
+    // 既有终态事件（先收尾），也有真实异常（不把故障伪装成正常结束）
+    expect(events[events.length - 1]?.type).toBe('turn_end')
+    expect(String((caught as Error)?.message)).toContain('第 2 步炸了')
+    await h.stop()
+  })
+
+  it('中断步的 done 与 turn_end 均带 aborted（不再与"正常收尾"无从区分）', async () => {
+    const controller = new AbortController()
+    const provider = scriptedProvider([toolCallScript(1), textScript('不该跑到')])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(makeSignalEchoTool(() => controller.abort()))
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', undefined, controller.signal))
+    const done = events.find((e) => e.type === 'done')
+    const turnEnd = events.find((e) => e.type === 'turn_end')
+
+    // 两者事件序列与正常结束完全一致（done + finish），只能靠 aborted 区分
+    expect(done?.aborted).toBe(true)
+    expect(turnEnd?.aborted).toBe(true)
+    await h.stop()
+  })
+})
+
 

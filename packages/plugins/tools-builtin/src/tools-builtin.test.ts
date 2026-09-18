@@ -292,11 +292,36 @@ describe('@harness/tools-builtin', () => {
       expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
     })
 
-    it('裸设备重定向仍被拦截（删掉 /dev/null 规则不影响真正的破坏性写入）', async () => {
+    it('裸设备写入全部被拦截（重定向的四种形态 + 破坏性命令直写）', async () => {
+      // 回归：修 `echo x > /dev/sda` 漏报时曾把规则写成 `(?:^|\s)>>?`，
+      // 结果 `1>/dev/sda` / `2>/dev/sda` / `hi>/dev/sda` 这三种形态**反而被放行**
+      // —— 它们在旧规则 `\b>` 下是能拦住的，等于净安全性下降。四种形态必须全拦。
       const tool = createBashTool()
-      const res = await tool.call({ command: 'echo x > /dev/sda' }, makeCtx())
-      expect(res.ok).toBe(false)
-      expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+      const dangerous = [
+        'echo x > /dev/sda', // 空格
+        'echo hi>/dev/sda', // 无空格
+        'echo x 1>/dev/sda', // fd 1
+        'cat f 2>/dev/nvme0n1', // fd 2（stderr 重定向同样毁盘）
+        'echo x >> /dev/sdb1', // 追加
+        'dd if=/dev/zero of=/dev/disk0',
+        'shred -n1 /dev/sda', // 无重定向，靠「破坏性命令 + 裸设备」规则
+        'wipefs -a /dev/sda',
+        'mkfs -t ext4 /dev/sda1', // 注意：`mkfs -t` 不匹配 `\bmkfs\.\w+`
+        'parted /dev/sda mklabel gpt',
+        'sgdisk -Z /dev/nvme0n1',
+      ]
+      for (const command of dangerous) {
+        const res = await tool.call({ command }, makeCtx())
+        expect(res.ok).toBe(false)
+        expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+      }
+    })
+
+    it('只读查看裸设备不被误拦（fdisk -l 是常见用法）', async () => {
+      // 与上面成对：裸 `/dev/sda` 字面量不能无差别拦截，否则 `fdisk -l /dev/sda` 会被拒。
+      const tool = createBashTool()
+      const res = await tool.call({ command: 'fdisk -l /dev/sda' }, makeCtx())
+      expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
     })
 
     it('危险命令检测可关闭（dangerousDetection=false）', async () => {

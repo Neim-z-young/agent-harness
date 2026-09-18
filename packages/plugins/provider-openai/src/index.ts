@@ -401,10 +401,20 @@ export class OpenAIChatProvider implements ChatProvider {
    * - thinking 端点（实测 DeepSeek）：**每条** assistant 都必须带（缺就直接 400，
    *   即使这条消息本来没有推理内容 —— 例如旧版本存下的历史消息）
    *
-   * 故采用自适应探测：首次命中相关 400 后置为 true 并重发一次（见 complete / stream），
-   * 之后该 provider 实例的所有请求都补 `reasoning_content`（无内容时用空串）。
+   * 故采用自适应探测：首次命中相关 400 后记住并重发一次（见 complete / stream），
+   * 之后发给**该模型**的请求都补 `reasoning_content`（无内容时用空串）。
+   *
+   * 粒度必须是**模型级**（key = modelId）而非实例级：一个 openai provider 实例可能同时
+   * 服务 thinking 模型与普通模型（如 deepseek-reasoner + gpt-4o）。实例级开关一旦在
+   * thinking 模型上置位，之后发给普通模型的请求也会带上该字段 —— 标准 OpenAI 不认识它 ⇒ 400，
+   * 而开关已开又不会再走重发分支 ⇒ 该实例此后**永久失败**。
    */
-  private requiresReasoningField = false
+  private reasoningFieldRequired = new Set<string>()
+
+  /** 该模型是否已被探测为「要求回传 reasoning_content」 */
+  private needsReasoningField(modelId?: string): boolean {
+    return this.reasoningFieldRequired.has(modelId ?? this.config.defaultModel)
+  }
 
   constructor(
     config: OpenAIProviderConfig = {},
@@ -449,12 +459,12 @@ export class OpenAIChatProvider implements ChatProvider {
     messages: Message[]
     llmParams: Record<string, unknown>
     stream?: boolean
-    /** 覆盖实例级探测结果（一般不用传，见 requiresReasoningField） */
+    /** 覆盖模型级探测结果（一般不用传，见 reasoningFieldRequired） */
     forceReasoningContent?: boolean
   }): OpenAIRequestBody {
     const messages = toOpenAIMessages(
       params.messages,
-      params.forceReasoningContent ?? this.requiresReasoningField,
+      params.forceReasoningContent ?? this.needsReasoningField(params.modelId),
     )
     const model = params.modelId ?? this.config.defaultModel
     const llmParams = params.llmParams ?? {}
@@ -477,6 +487,9 @@ export class OpenAIChatProvider implements ChatProvider {
     else if (typeof llmParams.stop === 'string') body.stop = llmParams.stop
     if (typeof llmParams.tool_choice === 'string') body.tool_choice = llmParams.tool_choice as any
     if (params.stream) body.stream = true
+    // 空历史兜底放在这里（而非各调用点）：重发路径会重新 buildBody，
+    // 若兜底留在调用点，重发时就只剩一个空 messages 数组，请求必然失败且原因难查。
+    if (body.messages.length === 0) body.messages = [{ role: 'user', content: '(no history)' }]
     return body
   }
 
@@ -515,9 +528,6 @@ export class OpenAIChatProvider implements ChatProvider {
       if (!this.config.apiKey) {
         throw new Error('OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量或在 config 中传入 apiKey')
       }
-      if (body.messages.length === 0) {
-        body.messages = [{ role: 'user', content: '(no history)' }]
-      }
 
       const headers = this.buildHeaders(params.headers)
       const url = `${this.config.baseUrl.replace(/\/$/, '')}${this.config.apiPath}`
@@ -530,18 +540,25 @@ export class OpenAIChatProvider implements ChatProvider {
 
       let text = await resp.text()
       // 自适应：thinking 端点要求「每条 assistant 必须带 reasoning_content」，
-      // 首次命中该 400 时打开开关重发（此后该实例的所有请求都会补该字段，无内容时给空串）。
-      if (!resp.ok && !this.requiresReasoningField && /reasoning_content/i.test(text)) {
-        this.requiresReasoningField = true
+      // 首次命中该 400 时记住并重发（此后发给该模型的请求都会补该字段，无内容时给空串）。
+      // 判据限定 status===400：401/429/500 的 error.message 常回显请求体或未知参数，
+      // 文本里可能恰好含该词 —— 用它重发既掩盖真实错误，又会在 429 下加重限流。
+      const reqModel = params.modelId ?? this.config.defaultModel
+      if (resp.status === 400 && !this.reasoningFieldRequired.has(reqModel) && /reasoning_content/i.test(text)) {
+        this.reasoningFieldRequired.add(reqModel)
+        const retryBody = this.buildBody({
+          modelId: params.modelId,
+          messages: params.messages,
+          llmParams: params.params,
+          stream: false,
+        })
+        // 记录真正发出的请求体：否则 calls 里留着未补字段的旧体，
+        // 排障时会照着它得出"明明带上了却没生效"的错误结论。
+        record.body = retryBody
         resp = await fetch(url, {
           method: 'POST',
           headers,
-          body: JSON.stringify(this.buildBody({
-            modelId: params.modelId,
-            messages: params.messages,
-            llmParams: params.params,
-            stream: false,
-          })),
+          body: JSON.stringify(retryBody),
           signal: inner.signal,
         })
         text = await resp.text()
@@ -644,9 +661,6 @@ export class OpenAIChatProvider implements ChatProvider {
     if (!this.config.apiKey) {
       throw new Error('OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量或在 config 中传入 apiKey')
     }
-    if (body.messages.length === 0) {
-      body.messages = [{ role: 'user', content: '(no history)' }]
-    }
 
     const headers = this.buildHeaders({ ...params.headers, Accept: 'text/event-stream' })
 
@@ -695,10 +709,11 @@ export class OpenAIChatProvider implements ChatProvider {
           const j = JSON.parse(text)
           if (j.error?.message) msg = j.error.message
         } catch {}
-        // 自适应：见 requiresReasoningField 的说明。重发时给所有 assistant 补 reasoning_content
-        // （无推理内容的消息给空串），仍失败才向上抛。
-        if (!this.requiresReasoningField && /reasoning_content/i.test(msg)) {
-          this.requiresReasoningField = true
+        // 自适应：见 reasoningFieldRequired 的说明。重发时给所有 assistant 补 reasoning_content
+        // （无推理内容的消息给空串），仍失败才向上抛。判据同样限定 400 且按模型记忆。
+        const reqModel = params.modelId ?? this.config.defaultModel
+        if (resp.status === 400 && !this.reasoningFieldRequired.has(reqModel) && /reasoning_content/i.test(msg)) {
+          this.reasoningFieldRequired.add(reqModel)
           resp = await fetch(url, {
             method: 'POST',
             headers,

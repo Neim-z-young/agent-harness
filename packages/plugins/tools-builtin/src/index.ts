@@ -321,15 +321,22 @@ const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\brm\s+(-[a-z]*f[a-z]*\s*)*~\s/, // rm -rf ~
   /\bmkfs\.\w+/, // mkfs.*
   /\bdd\b.*\bof=\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/, // dd 写裸盘
-  // 重定向裸设备。注意用 `(?:^|\s)` 而非 `\b`：`\b` 要求左侧是单词字符，
-  // 于是 `echo x > /dev/sda`（`>` 前是空格）这种最常见写法反而**漏报**（测试已固定）。
-  /(?:^|\s)>>?\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/,
+  // 重定向裸设备。`>` 左侧允许**行首 / 空白 / fd 数字**三种形态，实测必须全覆盖：
+  //   `echo x > /dev/sda`（空格）· `echo hi>/dev/sda`（无空格）· `echo x 2>/dev/sda`（fd）
+  // 只用 `(?:^|\s)` 会把后两种**漏报**，只用 `\b`（单词边界）会把第一种漏报 —— 两种写法
+  // 都出过事，故这里用 `\d*`（0 个或多个数字）而非限定左侧字符类。
+  /\d*>>?\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/,
+  // 破坏性命令直接以裸设备为参数（无重定向，故上一条覆盖不到）：
+  // shred / wipefs / mkfs -t / parted mklabel / sgdisk -Z …
+  // 刻意不含 fdisk（`-l` 是常见只读查看，误拒会直接卡住正常使用）。
+  /\b(shred|wipefs|sgdisk|sfdisk|mkswap|badblocks|blockdev|mkfs|parted)\b[^|;&\n]*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/,
   /\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b/, // 关机/重启
   /format\s+\/\s*\/s\s*\/f\/q/i, // Windows format /s /f /q（清盘）
   // 注：曾有一条 `>\s*\/dev\/null\b|\/dev\/sda`，已删除 ——
   // - `>/dev/null` / `2>/dev/null` 是最常见的**无害**重定向（丢弃输出），把它判为危险会
   //   大面积误伤正常命令（实测：`git rev-parse --is-inside-work-tree 2>/dev/null` 直接被拒）；
-  // - `/dev/sda` 已由上面「重定向裸设备」那条更完整的规则覆盖（含 sd/hd/nvme/rdisk/disk/vd）。
+  // - 裸 `/dev/sda` 字面量本身**不能**无差别保留：它会连 `fdisk -l /dev/sda`（只读查看）一起拒。
+  //   改为上面两条更精确的规则兜底（重定向写盘 + 破坏性命令写盘），覆盖面不降、误伤更小。
   /\bcurl\b[^|;]*\|\s*(bash|sh)\b|\bwget\b[^|;]*\|\s*(bash|sh)\b/, // curl|bash
   /\bchmod\s+-R\s+777\s+\//, // 递归改根目录权限
   /\bsudo\s+rm\s+-rf\s+(\/|\*)/, // sudo rm -rf /

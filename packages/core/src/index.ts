@@ -551,6 +551,14 @@ export interface AgentStreamEvent {
   finish?: ChatFinishReason
   /** done 时的 Provider 原生 finish 值，仅用于排障 */
   finishRaw?: string
+  /**
+   * done / turn_end 时：本次是否**因外部中断**（`signal`）而提前结束。
+   *
+   * 没有这个字段时，「模型正常收尾」与「用户按了 Ctrl-C」的事件序列完全一致
+   * （都是 done + finish=stop），UI 只能靠自己的侧信道猜。中断时本步已完成的部分
+   * 仍会写回会话，故上层应把它呈现为"已中断（保留已完成部分）"而非失败。
+   */
+  aborted?: boolean
 }
 
 /**
@@ -1434,6 +1442,14 @@ interface StepOutcome {
   toolCallCount: number
   /** 本步工具调用的签名（`toolId|稳定序列化的 input`），跨步累积后用于 doom-loop 检测 */
   toolSigs: string[]
+  /**
+   * 本步的**聚合签名**（所有 toolSigs 排序后拼接），用于检测「整步重复」。
+   *
+   * 只有 toolSigs 不够：模型每步返回 2 个调用时全局序列是 `A,B,A,B,A,B…`，
+   * 尾部连续 3 个永远不相同 ⇒ 「连续 N 次同一调用」的判据恒不命中、保护失效。
+   * 按步聚合后 `A|B,A|B,A|B` 连续 3 步相同即可拦下。
+   */
+  stepSig: string
   /** 本步是否因 doom-loop 被拒而中断（中断后不再续轮） */
   doomLoopTripped?: boolean
   /** 本步是否因外部中断（`signal`）而提前结束（中断后不再续轮） */
@@ -1754,40 +1770,57 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 最近若干次工具调用签名（跨步累积，供 doom-loop 检测）。保持 threshold-1 个即可：
     // 本步自己的签名会在 _runOneStep 内顺序追加，足够凑出连续 threshold 个。
     let recentSigs: string[] = []
+    // 各步的聚合签名（同样只留 threshold-1 个）：供「整步重复」检测 —— 每步多个调用时，
+    // 单看调用签名的判据恒不命中（见 StepOutcome.stepSig 的说明），必须按步再判一次。
+    let stepSigs: string[] = []
 
-    while (true) {
-      // 中断只在**步边界**生效：当前步已在 _runOneStep 内做工具级中断检查。
-      // 这样不会把一步切成两半，已产生的 assistant 消息与工具结果都保持完整。
-      if (signal?.aborted) break
+    try {
+      while (true) {
+        // 中断只在**步边界**生效：当前步已在 _runOneStep 内做工具级中断检查。
+        // 这样不会把一步切成两半，已产生的 assistant 消息与工具结果都保持完整。
+        if (signal?.aborted) break
 
-      step++
-      const outcome = yield* this._runOneStep(prepared, step, recentSigs, signal, !!input.preferComplete)
-      if (outcome.toolSigs.length > 0) {
-        recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
+        step++
+        const outcome = yield* this._runOneStep(
+          prepared,
+          step,
+          recentSigs,
+          signal,
+          !!input.preferComplete,
+          stepSigs,
+        )
+        if (outcome.toolSigs.length > 0) {
+          recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
+          stepSigs = [...stepSigs, outcome.stepSig].slice(-(DOOM_LOOP_THRESHOLD - 1))
+        }
+
+        // doom-loop 被拒 / 被中断 ⇒ 立刻收手，不再续轮
+        if (outcome.doomLoopTripped || outcome.aborted) break
+        if (!shouldContinueStep(outcome)) break
+
+        if (step >= maxSteps) {
+          // 到顶但模型仍想继续：给一次收尾机会（追加提示再跑一步），而非硬截断。
+          // 例外：maxSteps=1 是「显式单轮」语义（子 Agent 只要一次工具结果、旧调用方要单轮行为），
+          // 此时不追加收尾步 —— 否则「1 步」会变成 2 次模型调用。
+          if (wrapUpInjected || maxSteps <= 1) break
+          wrapUpInjected = true
+          await this.deps.session.addMessage(sessionId, {
+            id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+            role: 'user',
+            parts: [{ type: 'text', text: MAX_STEPS_WRAP_UP }],
+            createdAt: Date.now(),
+          })
+        }
       }
-
-      // doom-loop 被拒 / 被中断 ⇒ 立刻收手，不再续轮
-      if (outcome.doomLoopTripped || outcome.aborted) break
-      if (!shouldContinueStep(outcome)) break
-
-      if (step >= maxSteps) {
-        // 到顶但模型仍想继续：给一次收尾机会（追加提示再跑一步），而非硬截断。
-        // 例外：maxSteps=1 是「显式单轮」语义（子 Agent 只要一次工具结果、旧调用方要单轮行为），
-        // 此时不追加收尾步 —— 否则「1 步」会变成 2 次模型调用。
-        if (wrapUpInjected || maxSteps <= 1) break
-        wrapUpInjected = true
-        await this.deps.session.addMessage(sessionId, {
-          id: `m_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
-          role: 'user',
-          parts: [{ type: 'text', text: MAX_STEPS_WRAP_UP }],
-          createdAt: Date.now(),
-        })
-      }
+    } finally {
+      // 整轮结束标记。`done` 每个 step 都会发（A 方案），上层无法据此判断"全部跑完"——
+      // 而 TUI 的 busy 状态、REPL 的收尾都需要这个信息，因此显式收一条终态事件。
+      //
+      // 放在 finally 而非循环之后：中间任一步抛错（网络断连、preModel 插件异常、addMessage 失败…）
+      // 时也要送达，否则以 turn_end 收状态的消费者（TUI 的 busy、swarm tick）会永久卡在"运行中"。
+      // 异常本身不再被吞：finally 执行完仍会继续向上传播。
+      yield { type: 'turn_end', ...(signal?.aborted ? { aborted: true } : {}) }
     }
-
-    // 整轮结束标记。`done` 每个 step 都会发（A 方案），上层无法据此判断"全部跑完"——
-    // 而 TUI 的 busy 状态、REPL 的收尾都需要这个信息，因此显式收一条终态事件。
-    yield { type: 'turn_end' }
   }
 
   /**
@@ -1803,6 +1836,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     priorSigs: readonly string[] = [],
     signal?: AbortSignal,
     preferComplete = false,
+    priorStepSigs: readonly string[] = [],
   ): AsyncGenerator<AgentStreamEvent, StepOutcome, unknown> {
     const { agentId, sessionId, allowedTools, providerId, modelId } = prepared
     const provider = this.deps.chatProvider(providerId)
@@ -1951,11 +1985,38 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 跨步累积（priorSigs）+ 本步顺序追加 ⇒ 尾部连续 threshold 个相同即判定死循环
     const sigs = [...priorSigs]
 
-    for (const tc of toolCalls) {
+    // 预解析本步全部调用：既要算「整步聚合签名」做重复检测，也在执行时复用，
+    // 避免两次解析产生不一致。
+    const planned = toolCalls.map((tc) => {
       const inputJson = tc.inputParts.join('')
       let parsedInput: unknown
       try { parsedInput = inputJson ? JSON.parse(inputJson) : {} }
       catch { parsedInput = inputJson }
+      return { parsedInput, sig: `${tc.toolId}|${JSON.stringify(parsedInput)}` }
+    })
+    // 排序后拼接：模型返回的调用顺序不稳定时也能识别出「同一组动作」
+    const stepSig = planned.map((p) => p.sig).sort().join('\u0001')
+
+    // 整步重复检测 —— 补「每步多个调用」的漏检：
+    // 每步 2 个调用时全局序列是 A,B,A,B,A,B…，尾部连续 3 个永不相同，
+    // 单看「同一调用连续 N 次」恒不命中。按步聚合后 A|B 连续 3 步相同即可拦下。
+    // 只征求一次确认（而非每个工具一次）；用户放行则整步放行。
+    const stepRepeat = planned.length > 0 && isDoomLoop([...priorStepSigs, stepSig])
+    let stepRepeatAllowed = false
+    if (stepRepeat) {
+      const decision = (await this.deps.permission.ask({
+        toolKey: toolCalls[0].toolId,
+        patterns: [stepSig],
+        input: planned[0].parsedInput,
+        from: `doom-loop:${agentId}`,
+      } as ToolPermissionRequest)) as ToolPermissionDecision
+      // 确认期间用户可能已按 Ctrl-C：批准也要让位于中断（否则"已中断却仍执行"）
+      stepRepeatAllowed = !signal?.aborted && decision?.behavior === 'allow'
+    }
+
+    for (let i = 0; i < toolCalls.length; i++) {
+      const tc = toolCalls[i]
+      const { parsedInput, sig } = planned[i]
 
       const tool = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
       const resultPart: any = {
@@ -1965,15 +2026,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         input: parsedInput,
       }
 
-      // doom-loop 检测挡在**执行之前**：第 3 次不再真的跑一遍，而是交给人确认；
-      // 拒绝则中断本步剩余调用并由循环终止（不再续轮）。
-      const sig = `${tc.toolId}|${JSON.stringify(parsedInput)}`
-      sigs.push(sig)
-      toolSigs.push(sig)
-
       // 中断检查：已 abort ⇒ 不再执行剩余工具（含当前这个），逐个标记为 ABORTED。
       // **不丢已完成的部分**：本步此前已 push 的工具结果与已收到的 assistant 文本照常写回会话
       // （对齐 opencode cleanup 的收尾语义）。放在 tool_call_start 之前 —— 没执行就不该报"开始"。
+      // 位置在重复检测之前：中断优先于重复处理（已中断就按 ABORTED 记账，不再询问）。
       if (signal?.aborted) {
         aborted = true
         resultPart.result = { message: '执行已中断，该工具未运行。', code: 'ABORTED' }
@@ -1989,6 +2045,32 @@ export class AgentRuntimeImpl implements AgentRuntime {
         continue
       }
 
+      // 整步重复且用户未放行 ⇒ 本步所有调用都不执行（同样挡在执行之前）
+      if (stepRepeat && !stepRepeatAllowed) {
+        doomLoopTripped = true
+        resultPart.result = {
+          message:
+            `检测到重复调用：连续 ${DOOM_LOOP_THRESHOLD} 步都在发起完全相同的一组工具调用，` +
+            '已中断以避免陷入死循环。请调整策略或提供更多信息后重试。',
+          code: 'DOOM_LOOP',
+        }
+        resultPart.isError = true
+        assistant.parts.push(resultPart)
+        yield {
+          type: 'tool_call_result',
+          toolUseId: tc.toolUseId,
+          toolId: tc.toolId,
+          result: resultPart.result,
+          isError: true,
+        }
+        continue
+      }
+
+      // doom-loop 检测挡在**执行之前**：第 3 次不再真的跑一遍，而是交给人确认；
+      // 拒绝则中断本步剩余调用并由循环终止（不再续轮）。
+      sigs.push(sig)
+      toolSigs.push(sig)
+
       yield { type: 'tool_call_start', toolUseId: tc.toolUseId, toolId: tc.toolId, input: parsedInput }
 
       if (isDoomLoop(sigs)) {
@@ -1998,6 +2080,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
           input: parsedInput,
           from: `doom-loop:${agentId}`,
         } as ToolPermissionRequest)) as ToolPermissionDecision
+        // 确认期间用户可能已按 Ctrl-C：批准也须让位于中断（否则"已中断却仍真的执行第 3 次"）
+        if (signal?.aborted) {
+          aborted = true
+          resultPart.result = { message: '执行已中断，该工具未运行。', code: 'ABORTED' }
+          resultPart.isError = true
+          assistant.parts.push(resultPart)
+          yield {
+            type: 'tool_call_result',
+            toolUseId: tc.toolUseId,
+            toolId: tc.toolId,
+            result: resultPart.result,
+            isError: true,
+          }
+          break
+        }
         if (decision?.behavior !== 'allow') {
           doomLoopTripped = true
           resultPart.result = {
@@ -2061,12 +2158,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
       step,
       ...(finish ? { finish } : {}),
       ...(finishRaw ? { finishRaw } : {}),
+      // 本次查询是否已被中断：上层据此区分「模型正常收尾」与「用户按了 Ctrl-C」——
+      // 否则两者的事件序列完全一样（都是 done + finish），UI 只能猜。
+      //
+      // 判据取 `aborted || signal.aborted` 两者之一，缺一不可：
+      // - `aborted`：中断检查命中、剩余工具被跳过；
+      // - `signal.aborted`：中断发生在**最后一个工具执行期间** —— 此时没有后续迭代，
+      //   `aborted` 永远不会置位，只看它会把这次中断漏报成正常收尾（有测试固定）。
+      ...(aborted || signal?.aborted ? { aborted: true } : {}),
     }
     return {
       assistant,
       finish,
       toolCallCount: toolCalls.length,
       toolSigs,
+      stepSig,
       ...(doomLoopTripped ? { doomLoopTripped } : {}),
       ...(aborted ? { aborted } : {}),
     }

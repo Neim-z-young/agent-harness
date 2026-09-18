@@ -387,6 +387,73 @@ describe('@harness/provider-openai', () => {
       }
     })
 
+    it('探测按模型隔离：同一实例换模型后不受影响（实例级开关会永久毒化）', async () => {
+      // 回归：开关原是实例级。thinking 模型上置位后，之后同一实例发往普通模型的请求
+      // 也会带上该字段 —— 标准 OpenAI 不认识 ⇒ 400，而开关已开又不再重发 ⇒ 永久失败。
+      const bodies: Array<{ model: string; messages: Array<Record<string, unknown>> }> = []
+      const restore = installMock(async ({ init }) => {
+        const body = JSON.parse(String(init?.body ?? '{}')) as {
+          model: string
+          messages: Array<Record<string, unknown>>
+        }
+        bodies.push(body)
+        const seenThinking = bodies.filter((b) => b.model === 'deepseek-flash').length
+        if (body.model === 'deepseek-flash' && seenThinking === 1) {
+          return new Response(
+            JSON.stringify({ error: { message: 'The `reasoning_content` in the thinking mode must be passed back to the API.' } }),
+            { status: 400 },
+          )
+        }
+        return new Response(okResponse('ok', body.model))
+      })
+      try {
+        const p = new OpenAIChatProvider({ apiKey: 'k', defaultModel: 'gpt-4o' })
+        const msgs = [
+          { id: 'u', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+          { id: 'a', role: 'assistant', parts: [{ type: 'text', text: 'ok' }], createdAt: 2 },
+        ]
+        // 先在 thinking 模型上触发探测（首发 400 ⇒ 记住并重发）
+        await p.complete({ providerId: 'openai', modelId: 'deepseek-flash', messages: msgs as never, params: {} })
+        // 同一实例再请求普通模型：不该带该字段
+        await p.complete({ providerId: 'openai', modelId: 'gpt-4o', messages: msgs as never, params: {} })
+
+        const last = bodies[bodies.length - 1]
+        expect(last.model).toBe('gpt-4o')
+        const asst = last.messages.find((m) => m.role === 'assistant')!
+        expect('reasoning_content' in asst).toBe(false)
+      } finally {
+        restore()
+      }
+    })
+
+    it('非 400（如 429 限流）不触发重发，真实错误照抛', async () => {
+      // 回归：判据曾用 `!resp.ok`。429 的 error.message 常回显请求体，文本里可能恰好含
+      // reasoning_content ⇒ 误开开关 + 多打一次请求（限流下更糟），真实错误被第二次响应掩盖。
+      let calls = 0
+      const restore = installMock(async () => {
+        calls++
+        return new Response(
+          JSON.stringify({ error: { message: 'rate limited: unknown param reasoning_content rejected' } }),
+          { status: 429 },
+        )
+      })
+      try {
+        const p = new OpenAIChatProvider({ apiKey: 'k', defaultModel: 'deepseek-flash' })
+        const msgs = [
+          { id: 'u', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+          { id: 'a', role: 'assistant', parts: [{ type: 'text', text: 'ok' }], createdAt: 2 },
+        ]
+        const err = await p
+          .complete({ providerId: 'openai', messages: msgs as never, params: {} })
+          .then(() => null, (e: Error) => e)
+
+        expect(calls).toBe(1) // 不重发
+        expect(err?.message).toContain('rate limited') // 真实错误没被掩盖
+      } finally {
+        restore()
+      }
+    })
+
     it('未配 API Key → 立即抛错', async () => {
       const p = new OpenAIChatProvider()
       const restore = installMock(async () => { throw new Error('不应到达真实 fetch') })
