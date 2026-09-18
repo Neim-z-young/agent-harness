@@ -322,6 +322,31 @@ test('runPreModel：重启后从 meta 水合压缩状态，块仍可定位', asy
   expect(block).toBeDefined()
 })
 
+test('runPreModel：旧版存档水合走二级合并，内核后加的嵌套字段不丢失', async () => {
+  // 回归：水合原是浅展开 `{...createInitialState(), ...saved}`，旧存档的 nudge/stats
+  // **整体替换**新默认 ⇒ 内核升级后加的嵌套字段（如 nudge.lastShownByTier）水合后缺失、
+  // 相关功能静默失效。
+  const freshHarness = makeHarness()
+  const legacyState = {
+    blocks: [],
+    messageRefs: { byRaw: {}, byRef: {} },
+    tokenSnapshot: {},
+    nudge: { lastPerMessageNudgeTokens: 0, lastNudgeShownTokens: 0, baselineTokens: 0, anchors: {} },
+    stats: { tokensCompressed: 0, compressionCount: 0 },
+    nextBlockId: 0,
+    nextRunId: 0,
+  }
+  freshHarness.meta[ACP_META_KEY] = legacyState
+  await freshHarness.run(history(3))
+
+  const st = freshHarness.ctx.state
+  // 新字段来自内核默认（浅展开下它会是 undefined）
+  expect(st.nudge.lastShownByTier).toBeDefined()
+  // 旧存档数据仍保留
+  expect(st.nudge.baselineTokens).toBe(0)
+  expect(st.stats.compressionCount).toBe(0)
+})
+
 // ===== 增量渲染缓存 =====
 
 test('runPreModel：增量路径缓存命中，命中后 needFull 复位、prefixIds 更新为全量', async () => {

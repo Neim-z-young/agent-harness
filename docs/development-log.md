@@ -68,6 +68,37 @@ ACP 的 preModel 把**整段历史**经 `toCores → processTurn → requestMess
 acp-context 52（+4）全绿；bench 300K 自证点与基线逐位相同（纯文本剧本，符合预期）；全仓
 typecheck 0 错误。
 
+**⑥ 内核契约全面核对（reasoning 修复引发的系统性排查）**
+
+对 acp-kernel 的全部公开契约（34 个 .d.ts）与我们 import 的 API 面逐组核对，新发现 4 处、确认 5 处正确：
+
+- **P1 core id 位置漂移（已修）**：`toCores` 的 core id 用跨消息累加计数器（`base#0/#1/…`），
+  同一条消息在全量历史与窗口切片（runCompacting 会重新 toCores）里会得到**不同 id** ⇒
+  块的 `effectiveMessageIds` / `coveredMessageIds` 幂等判定失效（同一窗口重复折叠、ref 重复分配）。
+  修复：id 改为 `base#(r|t|x)partIdx` —— 只依赖消息自身（part 类型 + 消息内序号），跨调用稳定。
+- **P1 状态水合浅展开（已修）**：`{...createInitialState(), ...saved}` 会让旧存档的
+  `nudge`/`stats` 嵌套对象**整体替换**新默认 ⇒ 内核升级后加的字段（如 `nudge.lastShownByTier`）
+  水合后缺失、功能静默失效。改为嵌套键二级合并（`messageRefs`/`tokenSnapshot`/`nudge`/`stats`）。
+- **P1 prompts 绕过 resolvePrompts（已修）**：契约要求任何覆盖必须 `acknowledgeRisk: true`
+  （所有 Prompts 字段 load-bearing，是防呆设计），且只有 string 值生效。我们此前手工合并
+  零门槛生效。已改走 `resolvePrompts`。遗留注意：filePrompts 是内核默认的本地快照，
+  内核升级后若 txt 未同步会以旧规则覆盖新规则。
+- **P0→已知权衡：`read_file` 不在内核 NEVER_PRESERVE_RECENT 名单**：内核按工具名硬编码匹配
+  （`read`/`bash`/`decompress`/`search_context`），本宿主读文件工具叫 `read_file` ⇒ 名单失配，
+  刚读的大文件结果会落入 preserveRecent 软保护区（保护区被撑大、该内容暂不可回收）。
+  内核名单**无配置口**，宿主侧无法修复；且权衡并非单向（刚读的文件本就是活跃工作集，
+  不被立即压掉也有价值）。缓解建议：对 read 频繁的大输出场景开启 `compression.config.truncate`。
+- **确认正确**：`thinkingTokens` 恒 undefined 无实质影响（reasoning text 走 core.text 正常计数，
+  口径一致）；`assignRefs` 的 `nextIndex` 经 `highestUsedIndex` 正确延续；compress/decompress/
+  search_context 工具名与内核 ALWAYS_PROTECTED / NEVER_PRESERVE 名单逐字匹配；
+  `parseCompressInput` 签名与 `compress-tools.d.ts:81` 一致；autoTune 对 tiers/minSummaryLength
+  的覆盖属有意 bench 值而非漏传。
+- **有意取舍已注释**：`renderTags: 'text-only'`（ref 标签不进工具输出，避免污染其内容语义；
+  代价是模型看不到工具结果的 ref，压缩范围只能用相邻文本消息的 ref 近似表达 —— 原先无注释）。
+
+验证：acp-context 56（+2：core id 稳定性 / 水合二级合并）全绿；bench 300K 自证点与基线逐位相同；
+全仓 typecheck 0 错误。
+
 ### ② 真实 barrier 链路实测通过（S4 的最后一项未闭环）
 
 新增 `packages/cli/src/barrier-integration.test.ts`（2 例，cli 全包 334）：与既有用例（手工

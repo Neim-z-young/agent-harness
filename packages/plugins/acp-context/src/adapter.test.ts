@@ -91,4 +91,33 @@ describe('reasoning 往返契约（ACP ↔ 内核）', () => {
     // user 消息不受影响
     expect(msgs.some((m) => m.role === 'user')).toBe(true)
   })
+
+  it('core id 对同一消息稳定：不随输入前缀漂移（covered 幂等判定的前提）', () => {
+    // 回归：core id 原用「跨消息累加计数器」（base#0/#1/#2…），同一条消息出现在
+    // 全量历史与窗口切片（session.compacting 的 runCompacting 会重新 toCores）里
+    // 会得到不同 id ⇒ coveredMessageIds 幂等判定失效（重复折叠 + ref 重复分配）。
+    // 修复后 id = base#(r|t|x)partIdx，只依赖消息自身。
+    const msg = mkMsg('m5', 'assistant', [
+      { type: 'text', text: '内容' } as never,
+      { type: 'tool', toolUseId: 'tu', toolId: 'bash', input: { c: 1 } } as never,
+    ])
+    // 场景 A：全量历史（m5 前面有含 2 个 tool part 的消息）
+    const full = toCores([
+      mkMsg('m1', 'user', [{ type: 'text', text: 'a' } as never]),
+      mkMsg('m2', 'assistant', [
+        { type: 'tool', toolUseId: 'tu_a', toolId: 'x', input: {} } as never,
+        { type: 'tool', toolUseId: 'tu_b', toolId: 'x', result: {} } as never,
+      ]),
+      mkMsg('m3', 'user', [{ type: 'text', text: 'b' } as never]),
+      msg,
+    ])
+    // 场景 B：窗口切片（只有 m5）
+    const slice = toCores([msg])
+
+    const idsFull = full.cores.filter((c) => c.id.startsWith('m5')).map((c) => c.id)
+    const idsSlice = slice.cores.map((c) => c.id)
+    expect(idsFull).toEqual(idsSlice)
+    // 且各 part 形态的 id 互不相同（tool 与 text 不碰撞）
+    expect(new Set(idsFull).size).toBe(idsFull.length)
+  })
 })

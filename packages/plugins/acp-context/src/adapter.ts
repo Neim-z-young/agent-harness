@@ -97,11 +97,18 @@ export function toCores(messages: Message[]): Flat {
   const cores: CoreMessage[] = []
   const byId = new Map<string, Message>()
   const byBase = new Map<string, string[]>()
-  let idx = 0
 
   for (const m of messages) {
     const base = m.id
     const expanded: string[] = []
+
+    // core id 用「消息内 part 的稳定序号」而非跨消息累加计数器：
+    // 同一条消息无论出现在"全量历史"还是"窗口切片"（如 session.compacting 的
+    // runCompacting 会重新 toCores）里，生成的 id 都必须一致 —— 块的
+    // effectiveMessageIds / coveredMessageIds 幂等判定 / archive 去重全靠它。
+    // 若 id 随输入前缀漂移，covered 判定必然失效（同一窗口被重复折叠、ref 重复分配）。
+    let r = 0
+    let t = 0
 
     // 推理内容：独立 core（内核契约）。内核的 reasoning-pairs 保护语义要求 reasoning
     // 是独立的 contentType:'reasoning' 消息、且紧跟它所属的 assistant text/tool-call 之前 ——
@@ -111,7 +118,7 @@ export function toCores(messages: Message[]): Flat {
       if (p.type !== 'reasoning') continue
       const rp = p as ReasoningPart
       if (!rp.text) continue
-      const id = `${baseId(base)}${SEP}${idx++}`
+      const id = `${baseId(base)}${SEP}r${r++}`
       expanded.push(id)
       byId.set(id, m)
       cores.push({
@@ -127,7 +134,7 @@ export function toCores(messages: Message[]): Flat {
       if (p.type !== 'tool') continue
       const tp = p as ToolCallPart
       const isResult = tp.result !== undefined
-      const id = `${baseId(base)}${SEP}${idx++}`
+      const id = `${baseId(base)}${SEP}t${t++}`
       expanded.push(id)
       byId.set(id, m)
       cores.push({
@@ -140,10 +147,10 @@ export function toCores(messages: Message[]): Flat {
       })
     }
 
-    // 文本/推理/附件：一条消息至多一个 text core（含全部文本视图）
+    // 文本/附件：一条消息至多一个 text core（含全部文本视图）
     const text = renderText(m)
     if (text.length > 0 || m.parts.every((p) => p.type !== 'tool')) {
-      const id = `${baseId(base)}${SEP}${idx++}`
+      const id = `${baseId(base)}${SEP}x`
       expanded.push(id)
       byId.set(id, m)
       cores.push({
@@ -152,9 +159,6 @@ export function toCores(messages: Message[]): Flat {
         contentType: 'text',
         text,
       })
-    }
-    if (expanded.length === 0 && byId.size > 0) {
-      // 空消息也保留占位，避免丢消息（极罕见）
     }
 
     byBase.set(baseId(base), expanded)

@@ -33,6 +33,7 @@ import {
   defaultCountTokens,
   parseCompressInput,
   renderNudgeText,
+  resolvePrompts,
   buildCompressSystemPrompt,
   assignRefs,
   highestUsedIndex,
@@ -262,8 +263,16 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   const config = resolveAcpConfig(modelContextLimit, options.config, options.autoTune)
   // 提示词：默认来自插件目录 prompts/*.txt（可本地编辑），config 传入的 prompts 覆盖在其上，
   // systemPrompt 整段覆盖为最高优先级。nudge 渲染与本轮压缩系统提示保持一致。
+  //
+  // 解析走内核 resolvePrompts 契约（prompts.d.ts）：所有 Prompts 字段 load-bearing，
+  // 任何覆盖都必须 acknowledgeRisk:true（内核的防呆设计）；且只有 string 值生效
+  // （malformed partial 被静默丢弃、不污染内核默认）。注意 filePrompts 是内核默认的
+  // 本地快照，内核升级后若 txt 未同步会以旧规则覆盖新规则 —— 升级内核时同步更新 txt。
   const filePrompts = loadPromptFiles()
-  const resolvedPrompts: Prompts = { ...filePrompts, ...(options.prompts ?? {}) }
+  const resolvedPrompts: Prompts = resolvePrompts(
+    { ...filePrompts, ...(options.prompts ?? {}) },
+    { acknowledgeRisk: true },
+  )
   const makeSystemPrompt = (): string =>
     options.systemPrompt ?? buildCompressSystemPrompt(resolvedPrompts)
   // token 折算口径：默认与内核同一份实现（CJK 感知）。'auto' 显式注入等价于内核默认值，
@@ -629,7 +638,19 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     try {
       const saved = (await meta.read())?.[ACP_META_KEY] as CompressionState | undefined
       if (saved && typeof saved === 'object') {
-        ctx.state = { ...createInitialState(), ...saved }
+        // 嵌套键二级合并（而非浅展开）：内核升级会给 NudgeState/CompressionStats 等
+        // 嵌套对象加新字段（如 nudge.lastShownByTier），浅展开会让旧存档**整体替换**新默认
+        // ⇒ 水合后新字段缺失、相关功能静默失效。数组（blocks/absorbed）与标量整体取存档。
+        const fresh = createInitialState()
+        const s = saved as Partial<CompressionState>
+        ctx.state = {
+          ...fresh,
+          ...s,
+          messageRefs: { ...fresh.messageRefs, ...(s.messageRefs ?? {}) },
+          tokenSnapshot: { ...fresh.tokenSnapshot, ...(s.tokenSnapshot ?? {}) },
+          nudge: { ...fresh.nudge, ...(s.nudge ?? {}) },
+          stats: { ...fresh.stats, ...(s.stats ?? {}) },
+        }
         ctx.stateSnapshot = JSON.stringify(ctx.state)
       }
     } catch {
@@ -671,6 +692,12 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     state: ctx.state,
     config,
     tokenCount,
+    // renderTags 取舍（compress.d.ts：'all' 默认 / 'text-only' / 'none'）：
+    // 选 'text-only' —— ref 标签只注入 user/assistant 文本，工具参数与结果保持原样
+    // （工具输出常被粘贴/复制，混入 <acp> 标签会污染其内容语义）。
+    // 代价：模型看不到工具结果的 ref，compress 范围若需精确落在工具结果边界上，
+    // 只能用相邻文本消息的 ref 近似表达。若未来出现"必须精确压缩某段工具输出"的
+    // 场景，再评估切到 'all'（标签只存在于渲染层，不进会话本体与 archive）。
     renderTags: 'text-only',
   })
 
