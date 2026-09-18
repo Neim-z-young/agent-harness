@@ -36,6 +36,38 @@ Agent 级可覆盖：`model.options.reasoningEffort` / `model.options.thinking` 
 （`thinking` 只认 enabled/disabled，其余按未配置处理 —— ProviderConfig 有 index signature，
 这里校验是唯一闸门）。测试 1 例覆盖三种形态（缺省不带 / 配置注入 / params 覆盖）。
 
+**⑤ ACP 的 reasoning 往返修复（"完整回传"张力的真正根源，比预想严重）**
+
+追查"ACP 折叠与完整回传的张力"时发现问题的真实形态不是"折叠截断"，而是**所有消息都丢**：
+
+ACP 的 preModel 把**整段历史**经 `toCores → processTurn → requestMessages` 完全重建（不只折叠区，
+保留区同样如此），而 adapter 此前把 reasoning part 拼进 text 视图（`<reasoning>\n...` 前缀）——
+往返后 reasoning part **降级成 text part**，发给 DeepSeek 时进 `content` 而非 `reasoning_content`
+字段。也就是说开 ACP 的会话里 `reasoning_content` 从来就没回传过，全靠自适应补空串兜底不炸；
+推理文本混在 content 里，模型也拿不到结构化的思维链回传。
+
+而内核 `reasoning-pairs.d.ts` 写明了契约：reasoning 应是独立的 `contentType: 'reasoning'` core、
+紧跟它所属的 assistant text/tool-call 之前；压缩范围会把孤儿半边拉进来**成对**压缩（不拆散）；
+且原文直说"**每个 adapter 都依赖这个往返契约来重建 reasoning_content**"。我们的 adapter 恰恰
+违背了它。
+
+修复（`adapter.ts`）：
+- `toCores`：reasoning part 输出为独立 reasoning core（位于 tool/text core 之前，满足配对依据）；
+  `renderText` 不再拼接 reasoning（避免重复计数）；
+- `requestMessages`：reasoning core 并回**紧随的 assistant 消息** parts 开头 —— `reasoning_content`
+  与 `content`/`tool_calls` 出现在同一条 assistant 消息（DeepSeek 官方样例形态；拆成两条消息
+  是否被端点接受并无契约保证）；孤儿 reasoning 兜底为独立消息不丢内容。
+
+效果：保留区/折叠区的 reasoning 结构化往返；DeepSeek 回传恢复；内核配对保护真正生效
+（reasoning 与它的 tool-call 同进退，不会被拆开折叠）。
+
+**回传张力的最终结论**：此修复后"完整回传"在结构层面成立；剩余的仅有内容层面 —— 被折叠轮次的
+推理已压进摘要（不可恢复），但这与正文折叠同理，是压缩的固有代价而非缺陷。
+
+验证：新增 `adapter.test.ts` 4 例（独立 core 顺序 / 并回 assistant / 往返不丢内容 / 孤儿兜底）；
+acp-context 52（+4）全绿；bench 300K 自证点与基线逐位相同（纯文本剧本，符合预期）；全仓
+typecheck 0 错误。
+
 ### ② 真实 barrier 链路实测通过（S4 的最后一项未闭环）
 
 新增 `packages/cli/src/barrier-integration.test.ts`（2 例，cli 全包 334）：与既有用例（手工

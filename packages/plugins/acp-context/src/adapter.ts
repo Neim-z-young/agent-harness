@@ -60,16 +60,23 @@ function safeParse(v: string | undefined): unknown {
   }
 }
 
-/** 提取一条消息的"文本视图"（text + reasoning + 附件占位） */
+/**
+ * 提取一条消息的"文本视图"（text + 附件占位）。
+ *
+ * **不含 reasoning** —— 推理内容由 toCores 输出为独立的 `contentType: 'reasoning'` core
+ * （内核契约，见 reasoning-pairs.d.ts：reasoning 必须与其 assistant 响应成对压缩，
+ * 且「每个 adapter 都依赖这个往返契约来重建 reasoning_content」）。若并进 text 视图，
+ * 往返后 reasoning part 会降级成 text part，thinking 端点（DeepSeek）要求的
+ * `reasoning_content` 回传随之缺失。
+ */
 function renderText(m: Message): string {
   const parts: string[] = []
   for (const p of m.parts) {
     if (p.type === 'text') parts.push((p as TextPart).text)
-    else if (p.type === 'reasoning') parts.push(`<reasoning>\n${(p as ReasoningPart).text ?? ''}`)
     else if (p.type === 'file') parts.push(`[file: ${(p as FilePart).path ?? 'inline'}]`)
     else if (p.type === 'image') parts.push(`[image: ${(p as ImagePart).path ?? 'inline'}]`)
     else if (p.type === 'patch') parts.push(`[patch: ${(p as PatchPart).path ?? 'unknown'}]`)
-    else parts.push(`[${p.type ?? 'part'}]`)
+    else if (p.type !== 'reasoning') parts.push(`[${p.type ?? 'part'}]`)
   }
   return parts.join('\n')
 }
@@ -95,6 +102,25 @@ export function toCores(messages: Message[]): Flat {
   for (const m of messages) {
     const base = m.id
     const expanded: string[] = []
+
+    // 推理内容：独立 core（内核契约）。内核的 reasoning-pairs 保护语义要求 reasoning
+    // 是独立的 contentType:'reasoning' 消息、且紧跟它所属的 assistant text/tool-call 之前 ——
+    // 折叠范围会把孤儿半边拉进来成对压缩，不拆散。反向映射据此还原 reasoning part，
+    // thinking 端点（DeepSeek）的 reasoning_content 回传才不会缺失。
+    for (const p of m.parts) {
+      if (p.type !== 'reasoning') continue
+      const rp = p as ReasoningPart
+      if (!rp.text) continue
+      const id = `${baseId(base)}${SEP}${idx++}`
+      expanded.push(id)
+      byId.set(id, m)
+      cores.push({
+        id,
+        role: m.role as CoreRole,
+        contentType: 'reasoning' as MessageContentType,
+        text: rp.text,
+      })
+    }
 
     // 工具调用 / 工具结果：每个 tool part 一个 core
     for (const p of m.parts) {
@@ -169,9 +195,45 @@ function makeMessageFromCore(core: CoreMessage): Message {
 
 /**
  * 把 processTurn 输出的 core 列表重建为"本轮发给模型"的 Message[]（忠实重建，保留工具调用结构）。
+ *
+ * reasoning 的往返契约（内核 reasoning-pairs.d.ts）：reasoning core 属于**紧随其后的**
+ * assistant text/tool-call —— 重建时并回同一条消息的 parts 开头，而不是生成独立消息。
+ * 这样 OpenAI 系序列化时 `reasoning_content` 与 `content`/`tool_calls` 出现在同一条
+ * assistant 消息里（DeepSeek Thinking Mode 官方样例的形态）；拆开成两条消息的话，
+ * 单独的 assistant+reasoning_content 是否被各端点接受并无契约保证。
  */
 export function requestMessages(cores: CoreMessage[]): Message[] {
-  return cores.map(makeMessageFromCore)
+  const out: Message[] = []
+  let pendingReasoning: string[] = []
+  const flushOrphan = (id: string): void => {
+    if (pendingReasoning.length === 0) return
+    // 兜底：孤儿 reasoning（内核配对契约下正常不会发生）保留为独立消息，不丢内容
+    out.push({
+      id: `${id}_reasoning`,
+      role: 'assistant',
+      parts: [{ type: 'reasoning', text: pendingReasoning.join('\n') }],
+      createdAt: Date.now(),
+    })
+    pendingReasoning = []
+  }
+  for (const core of cores) {
+    if (core.contentType === 'reasoning') {
+      if (core.text) pendingReasoning.push(core.text)
+      continue
+    }
+    const msg = makeMessageFromCore(core)
+    if (pendingReasoning.length > 0) {
+      if (msg.role === 'assistant') {
+        msg.parts.unshift({ type: 'reasoning', text: pendingReasoning.join('\n') })
+      } else {
+        flushOrphan(core.id)
+      }
+      pendingReasoning = []
+    }
+    out.push(msg)
+  }
+  flushOrphan('tail')
+  return out
 }
 
 export interface CompactResult {
