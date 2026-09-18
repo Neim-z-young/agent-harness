@@ -274,6 +274,13 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 | `apiPath` | OpenAI 类型专用：API 路径（默认 `/v1/chat/completions`；智谱等可改 `/chat/completions`） |
 | `maxTokens` | `max_tokens` 默认值 |
 | `timeoutMs` | 请求超时（ms） |
+| `thinking` | OpenAI 系思考模式开关（DeepSeek / GLM 等）：请求体注入 `thinking: {type}`，取值 `enabled` / `disabled`；缺省不发送（DeepSeek 默认启用，标准 OpenAI 不认识该参数） |
+| `reasoningEffort` | 思考力度：请求体注入 `reasoning_effort`（DeepSeek 接受 `minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`）；缺省不发送 |
+
+`thinking` / `reasoningEffort` 仅 openai 系 Provider（含 `glm` / `qwen`，它们复用同一实现）消费；
+也可按 Agent 覆盖：Agent 定义的 `model.options.reasoningEffort` / `model.options.thinking` 优先于 Provider 配置。
+官方回传规则（DeepSeek Thinking Mode）：**请求带 `tools` 时，后续所有请求必须完整回传历史各轮的
+`reasoning_content`，否则 400**——引擎已自适应处理（缺失时自动补发并按模型记忆）。
 
 `apiKey` 支持三种格式：
 

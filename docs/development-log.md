@@ -20,9 +20,21 @@
    要求决定了"无条件带/不带都错"，按 400 探测 + 按 modelId 记忆是唯一稳妥解。
 2. **为什么此前实测不复现**：探针构造的历史 assistant 是手工造的，模型从未在那些消息上**真实产生过**
    reasoning_content，服务端无从校验"曾产生但未回传"。真实报错发生在模型真实产出推理后的下一轮。
-3. 两个已知缺口（暂不修，已记录）：**ACP 折叠可能截断历史 reasoning part**，与"必须**完整**回传"
-   存在张力，重发兜底只补空串救不了"内容不完整"；`thinking` / `reasoning_effort` 参数未透传
-   （默认 high 可用，想调低省 token 暂无入口）。thinking 模式下 `temperature` 静默无效（无害）。
+3. 两个已知缺口：**ACP 折叠可能截断历史 reasoning part**，与"必须**完整**回传"存在张力，
+   重发兜底只补空串救不了"内容不完整"；thinking 模式下 `temperature` 静默无效（无害）。
+   —— 其中 `thinking` / `reasoning_effort` **透传已在同日补上**（见下）。
+
+**④ `thinking` / `reasoningEffort` 配置透传（同日补上）**
+
+`config.json → providers[]` 新增两个可选字段（仅 openai 系消费，glm/qwen 复用实现自动获得）：
+
+- `thinking: 'enabled' | 'disabled'` → 请求体顶层 `thinking: { type }`
+- `reasoningEffort: string` → 请求体顶层 `reasoning_effort`（DeepSeek：minimal/low/medium/high/xhigh/max/ultra）
+
+Agent 级可覆盖：`model.options.reasoningEffort` / `model.options.thinking` 优先于 Provider 配置。
+**缺省一律不发送**（标准 OpenAI 不认识这两个参数，多传 400）；工厂映射处做取值校验
+（`thinking` 只认 enabled/disabled，其余按未配置处理 —— ProviderConfig 有 index signature，
+这里校验是唯一闸门）。测试 1 例覆盖三种形态（缺省不带 / 配置注入 / params 覆盖）。
 
 ### ② 真实 barrier 链路实测通过（S4 的最后一项未闭环）
 

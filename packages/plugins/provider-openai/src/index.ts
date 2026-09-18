@@ -53,6 +53,18 @@ export interface OpenAIProviderConfig {
   strictEmptyContent?: boolean
   /** Provider ID（默认 'openai'；子类可覆盖如 'qwen' / 'glm'） */
   providerId?: string
+  /**
+   * 思考模式开关（OpenAI 兼容 thinking 端点：DeepSeek / GLM 等）。
+   * 请求体顶层注入 `thinking: { type }`；缺省不发送（DeepSeek 默认启用，标准 OpenAI 不认识该参数）。
+   * 可被单次请求的 `llmParams.thinking` 覆盖（Agent.model.options / llm.params hook）。
+   */
+  thinking?: 'enabled' | 'disabled'
+  /**
+   * 思考力度：请求体顶层注入 `reasoning_effort`。
+   * DeepSeek 接受 minimal/low/medium/high/xhigh/max/ultra；OpenAI o 系接受 low/medium/high。
+   * 缺省不发送。可被单次请求的 `llmParams.reasoningEffort` 覆盖。
+   */
+  reasoningEffort?: string
 }
 
 // ===== OpenAI API 类型（精简子集）=====
@@ -106,6 +118,10 @@ type OpenAIRequestBody = {
   max_tokens?: number
   stop?: string | string[]
   stream?: boolean
+  /** 思考力度（DeepSeek / OpenAI o 系等 thinking 端点；标准端点收到未知参数会 400，故缺省不发送） */
+  reasoning_effort?: string
+  /** 思考模式开关（DeepSeek Thinking Mode 的 OpenAI 格式） */
+  thinking?: { type: 'enabled' | 'disabled' }
 }
 
 type OpenAIUsage = {
@@ -389,7 +405,7 @@ export class OpenAIChatProvider implements ChatProvider {
 
   private readonly config: Required<
     Pick<OpenAIProviderConfig, 'baseUrl' | 'apiPath' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'strictEmptyContent' | 'providerId'>
-  > & { apiKey?: string; organization?: string }
+  > & { apiKey?: string; organization?: string } & Pick<OpenAIProviderConfig, 'thinking' | 'reasoningEffort'>
 
   private toolsGetter: () => Tool[]
 
@@ -433,6 +449,8 @@ export class OpenAIChatProvider implements ChatProvider {
       organization: config.organization,
       strictEmptyContent: config.strictEmptyContent ?? false,
       providerId: config.providerId ?? 'openai',
+      thinking: config.thinking,
+      reasoningEffort: config.reasoningEffort,
     }
     this.id = this.config.providerId
   }
@@ -487,6 +505,17 @@ export class OpenAIChatProvider implements ChatProvider {
     else if (typeof llmParams.stop === 'string') body.stop = llmParams.stop
     if (typeof llmParams.tool_choice === 'string') body.tool_choice = llmParams.tool_choice as any
     if (params.stream) body.stream = true
+    // 思考模式参数（DeepSeek / GLM 等 OpenAI 兼容 thinking 端点）。
+    // params 级（Agent.model.options / llm.params hook）优先于 Provider 配置 —— 允许按 Agent 覆盖。
+    // 标准端点不认识这两个参数（多传 400），所以两者都缺省不发送。
+    const reasoningEffort = typeof llmParams.reasoningEffort === 'string'
+      ? llmParams.reasoningEffort
+      : this.config.reasoningEffort
+    if (reasoningEffort) body.reasoning_effort = reasoningEffort
+    const thinking = llmParams.thinking === 'enabled' || llmParams.thinking === 'disabled'
+      ? llmParams.thinking
+      : this.config.thinking
+    if (thinking) body.thinking = { type: thinking }
     // 空历史兜底放在这里（而非各调用点）：重发路径会重新 buildBody，
     // 若兜底留在调用点，重发时就只剩一个空 messages 数组，请求必然失败且原因难查。
     if (body.messages.length === 0) body.messages = [{ role: 'user', content: '(no history)' }]
@@ -976,5 +1005,9 @@ export const providerTypeFactory: ProviderTypeFactory = {
       timeoutMs: config.timeoutMs,
       apiPath: config.apiPath,
       providerId: config.id,
+      // 思考模式（config.json providers[].thinking / reasoningEffort）。
+      // ProviderConfig 有 index signature，这里的取值校验是唯一闸门：非法值一律按未配置处理。
+      thinking: config.thinking === 'enabled' || config.thinking === 'disabled' ? config.thinking : undefined,
+      reasoningEffort: typeof config.reasoningEffort === 'string' && config.reasoningEffort ? config.reasoningEffort : undefined,
     }),
 }

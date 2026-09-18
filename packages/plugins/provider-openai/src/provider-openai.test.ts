@@ -387,6 +387,43 @@ describe('@harness/provider-openai', () => {
       }
     })
 
+    it('thinking 参数透传：Provider 配置注入请求体，params 级可覆盖，缺省不发送', async () => {
+      // DeepSeek Thinking Mode（官方文档）：body 顶层 `thinking: { type }` + `reasoning_effort`。
+      // 标准端点不认识这两个参数（多传 400）⇒ 三种形态都必须成立：缺省不带 / 配置注入 / params 覆盖。
+      const bodies: Array<Record<string, unknown>> = []
+      const restore = installMock(async ({ init }) => {
+        bodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+        return new Response(okResponse('ok', 'deepseek-flash'))
+      })
+      try {
+        const msgs = [{ id: 'u', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 }]
+        // ① 未配置 ⇒ 请求体不含这两个键
+        const plain = new OpenAIChatProvider({ apiKey: 'k', defaultModel: 'm1' })
+        await plain.complete({ providerId: 'openai', messages: msgs as never, params: {} })
+        expect('reasoning_effort' in bodies[0]).toBe(false)
+        expect('thinking' in bodies[0]).toBe(false)
+
+        // ② Provider 配置（config.json providers[].thinking / reasoningEffort）⇒ 注入请求体顶层
+        const configured = new OpenAIChatProvider({
+          apiKey: 'k', defaultModel: 'm2', reasoningEffort: 'high', thinking: 'disabled',
+        })
+        await configured.complete({ providerId: 'openai', messages: msgs as never, params: {} })
+        expect(bodies[1].reasoning_effort).toBe('high')
+        expect(bodies[1].thinking).toEqual({ type: 'disabled' })
+
+        // ③ params 级覆盖（Agent.model.options / llm.params hook 路径）
+        await configured.complete({
+          providerId: 'openai',
+          messages: msgs as never,
+          params: { reasoningEffort: 'low', thinking: 'enabled' } as never,
+        })
+        expect(bodies[2].reasoning_effort).toBe('low')
+        expect(bodies[2].thinking).toEqual({ type: 'enabled' })
+      } finally {
+        restore()
+      }
+    })
+
     it('探测按模型隔离：同一实例换模型后不受影响（实例级开关会永久毒化）', async () => {
       // 回归：开关原是实例级。thinking 模型上置位后，之后同一实例发往普通模型的请求
       // 也会带上该字段 —— 标准 OpenAI 不认识 ⇒ 400，而开关已开又不再重发 ⇒ 永久失败。

@@ -969,6 +969,17 @@ export interface ProviderConfig {
    * 触发阈值；缺省时各消费者回退自己的默认（默认 200_000）。
    */
   contextWindowTokens?: number
+  /**
+   * 思考模式开关（OpenAI 兼容 thinking 端点：DeepSeek / GLM 等；仅 openai 系 Provider 消费）。
+   * 请求体顶层注入 `thinking: { type }`。缺省不发送（DeepSeek 默认启用；标准 OpenAI 不认识该参数）。
+   */
+  thinking?: 'enabled' | 'disabled'
+  /**
+   * 思考力度：请求体顶层注入 `reasoning_effort`。
+   * DeepSeek 接受 minimal/low/medium/high/xhigh/max/ultra；OpenAI o 系接受 low/medium/high。
+   * 缺省不发送。可被 Agent 定义 `model.options.reasoningEffort` 按覆盖。
+   */
+  reasoningEffort?: string
   /** 额外透传字段（供特定 Provider 自定义配置，如 mock 的 defaultResponse） */
   [key: string]: unknown
 }
