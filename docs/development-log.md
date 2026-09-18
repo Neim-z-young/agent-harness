@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-09-18（续 146）TUI 同一输出多个「⧉ 复制」按钮修复
+
+用户报告：一次 agent 应答的 TUI 输出里出现 4 个复制按钮。根因有二：
+
+1. **`pushConsole` 只合并相邻同类块**，一次应答的多步工具调用（`🔧`/`✅`）被中间的 `💭` thinking /
+   自述行打断，裂成多个 tool 块，每个都带复制按钮；
+2. **`system` 块也带复制按钮**，导致 `⏱️ 耗时` 行、`<acp ...>tool` 这类旧版占位污染文本等
+   状态/元信息各自生成一个按钮。
+
+修复（`tui.tsx`）：
+- `pushConsole`：system/tool 类块改为**向前跳过一个或多个 thinking 块**与上一个同类块合并，
+  一次应答的多步工具输出归为单块，复制按钮只在整段末尾出现一次（thinking 独立保留可视）；
+- `renderBlock`：`copyable` 排除 `system`（耗时行 / 元信息 / 占位文本不再出现按钮）。
+
+验证：新增用例「tool 块跨 thinking 合并」；cli 335 用例全绿（+1），全仓 typecheck 0 错误。
+
 ## 2026-09-18（续 145）DeepSeek 官方文档确认回传规则 + 真实 barrier 链路实测通过
 
 ### ① DeepSeek 官方文档：`reasoning_content` 的确切规则（回应"为什么不复现 400"）

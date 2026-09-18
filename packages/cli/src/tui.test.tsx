@@ -154,6 +154,19 @@ describe('pushConsole 追加控制台文本', () => {
     expect(s.blocks).toHaveLength(2)
     expect(s.blocks[1].kind).toBe('user')
   })
+  it('tool 块跨 thinking 合并：一次应答多步工具调用归为单块，复制按钮只在末尾一次', () => {
+    let s = pushConsole(initialChatState, '🔧  list_dir {...}')
+    s = pushConsole(s, '✅  → entries')
+    s = pushConsole(s, '💭  我 stuck 了，重试')
+    s = pushConsole(s, '🔧  list_dir {}')
+    s = pushConsole(s, '✅  → entries2')
+    s = pushConsole(s, '🔧  bash {}')
+    s = pushConsole(s, '✅  → out')
+    // tool 行跨 thinking 与前一 tool 块合并成一个块；thinking 独立保留
+    expect(s.blocks.filter((b) => b.kind === 'tool')).toHaveLength(1)
+    expect(s.blocks.map((b) => b.kind)).toEqual(['tool', 'thinking'])
+    expect(s.blocks[0].text).toBe('🔧  list_dir {...}\n✅  → entries\n🔧  list_dir {}\n✅  → entries2\n🔧  bash {}\n✅  → out')
+  })
 })
 
 describe('applyStreamEvent 结构化流', () => {

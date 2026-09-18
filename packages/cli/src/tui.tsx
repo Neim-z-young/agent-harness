@@ -183,23 +183,28 @@ export function classifyConsoleLine(line: string): { kind: ChatBlockKind; text: 
 }
 
 /** 追加一段控制台文本（按 \n 拆行归类为新块；空行忽略）。
- *  相邻同类块合并为一个块（命令/工具输出多行 → 单块，复制按钮只在末尾出现一次；
- *  欢迎块 id 0 不参与合并，避免首条输出污染静态欢迎文本）。 */
+ *  system（命令输出）/ tool（工具输出）类块向前**跳过 thinking 块**与上一个同类块合并，
+ *  使一次 agent 应答的多步工具调用（中间夹推理/自述）归并为单块 —— 复制按钮只在整段末尾出现一次；
+ *  user/thinking/assistant 各自独立；欢迎块 id 0 不参与合并，避免首条输出污染静态欢迎文本。 */
 export function pushConsole(state: ChatState, text: string): ChatState {
   let s = state
   for (const raw of text.split('\n')) {
     const line = raw
     if (!line.trim()) continue
     const { kind, text: body } = classifyConsoleLine(line)
-    // 仅合并 system（命令输出）/ tool（工具输出）类相邻块；user/thinking/assistant 各自独立
-    const last = s.blocks[s.blocks.length - 1]
-    if (last && last.id !== 0 && last.kind === kind && (kind === 'system' || kind === 'tool') && !last.streaming) {
-      const blocks = s.blocks.slice()
-      blocks[blocks.length - 1] = { ...last, text: last.text + '\n' + body }
-      s = { ...s, blocks }
-    } else {
-      s = { ...s, blocks: [...s.blocks, { id: s.nextId, kind, text: body }], nextId: s.nextId + 1 }
+    if (kind === 'system' || kind === 'tool') {
+      // 可合并：从末尾向前跳过一个或多个 thinking 块，落到最近的 system/tool 块
+      let i = s.blocks.length - 1
+      while (i >= 0 && s.blocks[i].kind === 'thinking') i--
+      const last = i >= 0 ? s.blocks[i] : undefined
+      if (last && last.id !== 0 && last.kind === kind && !last.streaming) {
+        const blocks = s.blocks.slice()
+        blocks[i] = { ...last, text: last.text + '\n' + body }
+        s = { ...s, blocks }
+        continue
+      }
     }
+    s = { ...s, blocks: [...s.blocks, { id: s.nextId, kind, text: body }], nextId: s.nextId + 1 }
   }
   return s
 }
@@ -1554,9 +1559,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current, usage)
 
   const renderBlock = (b: ChatBlock) => {
-    // 对话消息（用户/助手/工具/命令输出，非空）在正文下加一行鼠标「复制」按钮 —— 工具/报错/命令结果也可复制
+    // 对话消息（用户/助手/工具，非空）在正文下加一行鼠标「复制」按钮 —— 工具输出也可复制。
+    // system 块（耗时行 / 元信息 / `tool` 占位等）不显示复制按钮，避免一次应答裂成多个「⧉ 复制」。
     const copyable =
-      (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool' || b.kind === 'system') &&
+      (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool') &&
       b.text.trim().length > 0
     if (copyable) {
       return (
