@@ -287,7 +287,7 @@ project 级？反之？需实测决定）而不是静默丢弃。
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **M0** ✅ | ~~验证 §3.4 的折叠风险~~（已完成，结论：不会被压缩）；~~`WorkspaceLevel.memory` + `loadDirs.memory`~~（已完成） | 目录字段可用（`ws.user.memory` / `ws.project.memory` / `ws.loadDirs.memory`）；记忆暂不注入。顺手修了 `/workspace` 输出里 agents 行漏路径的既有 bug |
-| **M1** | 加载 L0（`AGENTS.md` 两级）+ L1 索引注入；`/memory` 命令（list/read） | 新会话能读到既有记忆与项目指令；注入量 ≤25KB |
+| **M1** ✅ | ~~补 G1/G2 通道~~ + ~~加载 L0（`AGENTS.md` 两级）~~ + ~~L1 索引注入~~ + ~~`/memory list\|show\|path`~~（已完成） | ✅ 端到端实测：主 Agent 请求的 system 含 `<memory>` 与索引/指令内容；subagent 不含；空索引不注入；注入量 ≤25KB |
 | **M2** | 写入路径 A + `/memory edit|delete`；体积/去重校验 | 模型能写入并下会话读到；超限被明确拒绝（不静默） |
 | **M3** | L2 → L1 候选提示（压缩时提醒沉淀）；子代理记忆隔离策略 | 压缩后不丢失关键纠正 |
 
@@ -427,8 +427,8 @@ M0（目录字段）──► M1（注入 + /memory read）──► F0/F1（技
 
 | # | 缺口 | 为什么插件绕不过去 | 建议 |
 |---|---|---|---|
-| G1 | **`PluginContext` / `PromptInput` 都没有 workspace、cwd** | 注入发生在 **prompt 构建期**，入参只有 `agentId`/`sessionId`（`plugin/src/index.ts:236`）；install 期也拿不到。变通做法是插件自己用 `process.cwd()` + `homedir()` 拼路径 —— 但 CLI 支持 `--cwd`，`process.cwd()` **未必等于** `workspace.cwd` ⇒ 会拼错目录（正是本项目栽过两次的"路径口径分裂"） | `PluginContext` 增 `workspace`（core 一处赋值，约 5 行）；`PromptInput` 增可选 `cwd` |
-| G2 | **判断"当前是否子 Agent"无通道** | 决策 B6 要求不注入 subagent，但注入 hook 拿不到 agent 定义（`mode`）。变通：`agent.stream` 的 `AgentStatusSnapshot.mode` **能拿到 mode**（刚加的字段），但注入发生在事件之前 ⇒ 首轮无从判断 | `PromptInput` 增 `agentMode`（core 一处，约 5 行） |
+| ~~G1~~ ✅ | **`PluginContext` / `PromptInput` 都没有 workspace、cwd**（已补：`PluginContext.workspace` + core 注入 + CLI 传实际 workspace） | 注入发生在 **prompt 构建期**，入参只有 `agentId`/`sessionId`（`plugin/src/index.ts:236`）；install 期也拿不到。变通做法是插件自己用 `process.cwd()` + `homedir()` 拼路径 —— 但 CLI 支持 `--cwd`，`process.cwd()` **未必等于** `workspace.cwd` ⇒ 会拼错目录（正是本项目栽过两次的"路径口径分裂"） | `PluginContext` 增 `workspace`（core 一处赋值，约 5 行）；`PromptInput` 增可选 `cwd` |
+| ~~G2~~ ✅ | **判断"当前是否子 Agent"无通道**（已补：`PromptInput.agentMode`；端到端验证 subagent 请求不含记忆） | 决策 B6 要求不注入 subagent，但注入 hook 拿不到 agent 定义（`mode`）。变通：`agent.stream` 的 `AgentStatusSnapshot.mode` **能拿到 mode**（刚加的字段），但注入发生在事件之前 ⇒ 首轮无从判断 | `PromptInput` 增 `agentMode`（core 一处，约 5 行） |
 | G3 | `CliCommandInput.harness?: unknown` 类型过松 | reload/agent 访问要靠 cast，编译期无保障 | 给 `CliCommandInput` 增明确方法（如 `reloadSkill(id)`），或至少类型化 harness |
 
 ### 9.C 关于"记忆被 ACP 折叠"：无需规避（已实证）

@@ -261,12 +261,28 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   | `coordinator` | 主 Agent 编排：四阶段派工 + barrier 续轮 + `send_message` | `subagent` |
   | `swarm` | 长期在线团队协作：Team / Mailbox / Task List 工具 | — |
   | `herdr` | 把 Agent 状态上报到 [Herdr](https://herdr.dev) 侧栏（working / idle / blocked） | — |
+  | `memory` | 长期记忆：加载两级 `MEMORY.md` 索引 + `AGENTS.md` 项目指令并注入 system prompt（子 Agent 不注入） | — |
 
 - **Herdr 集成**：Herdr 是 agent 感知的终端复用器（tmux 竞品），侧栏能显示每个 pane 在跑/空闲/等你批准。
   本插件在 Herdr pane 内自动生效（靠 `HERDR_ENV=1` + `HERDR_PANE_ID` / `HERDR_BIN_PATH` 判定），
   **不在 Herdr 里跑时全程 no-op**（零进程、零开销），所以 `"plugins": ["herdr"]` 可以常驻声明。
   状态映射：`thinking`/`streaming`/`tool` → `working`，`idle`/`aborted` → `idle`，
   权限审批弹窗（决策为 `ask`）→ `blocked`（带工具名），进程退出时 `release-agent`。
+
+- **长期记忆**：`"plugins": ["memory"]` 后，每轮把下列文件注入 system prompt（**都不存在时不注入、零噪声**）：
+
+  | 层 | 路径 | 上限 |
+  | --- | --- | --- |
+  | 项目指令 | `<cwd>/AGENTS.md`（项目级）+ `<dataDir>/AGENTS.md`（用户级） | 32KB |
+  | 用户长期记忆 | `~/.harness/memory/MEMORY.md` | 前 200 行 / 25KB |
+  | 项目长期记忆 | `<cwd>/.harness/memory/MEMORY.md`（**入 git，团队共享**） | 同上 |
+
+  - 主题文件（`memory/*.md` 除索引外）**不预加载**，由模型按需用 `read` 工具读取 —— 索引里
+    写"一句话 + 相对路径"即可（这是控制注入量的关键）。
+  - **子 Agent 不注入**（隔离语义）；`/memory list|show|path` 可查看现状与路径。
+  - 注入内容只依赖文件内容：文件不变 ⇒ system 逐字不变 ⇒ **不破坏前缀缓存**。
+  - 写入能力（`/memory edit`、自动沉淀、攒到下次压缩注入）见
+    [记忆能力与技能锻造计划](docs/memory-and-skill-forge-plan.md)。
 
 - 依赖**不必显式写出**；外部 MCP server 也可零代码启用：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`。
 - **这些插件一律「登记但不自动装配」**（`optIn`）：不写进 `plugins` 就不会被装上，也不会在 `/tools` 里

@@ -20,6 +20,28 @@ import type { Awaitable, Bus, BusEventRecord } from '@harness/bus'
  * 插件安装上下文
  * 由 PluginManager 在 install() 时注入
  */
+/**
+ * 宿主工作区路径视图（只读）。
+ *
+ * 刻意**不** import `@harness/workspace` 的类型：该包依赖 `@harness/session`，
+ * 而契约层要保持"只依赖 bus"的轻量依赖方向。这里用结构化最小接口，
+ * `Workspace` 对象在结构上可直接赋值（TS 结构化类型），因此不会漏字段 ——
+ * 若 workspace 包改了字段名，赋值处会编译报错。
+ *
+ * 存在意义：插件在 `install(ctx)` 与 `session.preModel` / `prompt.system.transform`
+ * 等**每轮 hook** 里都需要知道"记忆/技能该写到哪、该从哪读"。此前插件只能拿
+ * `process.cwd()` 猜，而 CLI 支持 `--cwd` / `--data-dir` ⇒ 会拼错目录
+ * （本项目已两次栽在"路径口径分裂"上）。
+ */
+export interface PluginWorkspaceView {
+  /** 工作目录（绝对路径） */
+  cwd: string
+  /** 用户级数据根（缺省 ~/.harness） */
+  dataDir: string
+  user: { root: string; plugins: string; skills: string; agents: string; memory: string }
+  project: { root: string; plugins: string; skills: string; agents: string; memory: string }
+}
+
 export interface PluginContext {
   /** Bus 事件总线（发布/订阅事件） */
   bus: Bus
@@ -35,6 +57,13 @@ export interface PluginContext {
     error(msg: string, meta?: unknown): void
     debug(msg: string, meta?: unknown): void
   }
+  /**
+   * 宿主工作区路径（core 注入；缺省时插件须自行回退）。
+   *
+   * 可选是刻意的：`createPluginManager` 可被独立使用（单测、非 CLI 宿主），
+   * 此时没有 workspace —— 插件应把它当作"路径未知"而不是崩溃。
+   */
+  workspace?: PluginWorkspaceView
 }
 
 // ===== Tool Pool =====
@@ -92,6 +121,14 @@ export interface LLMParams {
 export interface PromptInput {
   agentId: string
   sessionId: string
+  /**
+   * 该 Agent 的模式（`primary` / `subagent` / `coordinator` / `teammate`…）。
+   *
+   * 供 prompt 构建类插件按 agent 类型分流 —— 典型用法：主会话的记忆**不注入子 Agent**
+   * （对齐 Claude Code 的 subagent 隔离语义）。此前 hook 只给 agentId，
+   * 插件还得自己查注册表（且拿不到），只能在首轮猜。
+   */
+  agentMode?: string
 }
 
 export interface CompactionContext {
@@ -725,6 +762,11 @@ export interface PluginManagerOptions {
   logger?: PluginContext['log']
   /** 动态 import 实现（用于 loadBuiltin/loadUser；便于单测注入） */
   dynamicImport?: (spec: string) => Promise<{ default?: unknown } | unknown>
+  /**
+   * 宿主工作区路径（可选）：注入到所有插件的 `PluginContext.workspace`。
+   * 由宿主（core）传入；不传则插件的 `ctx.workspace` 为 undefined。
+   */
+  workspace?: PluginWorkspaceView
 }
 
 /**
@@ -773,6 +815,7 @@ export class PluginManagerImpl implements PluginManager {
         },
       },
       log: this.logger,
+      ...(options.workspace ? { workspace: options.workspace } : {}),
     }
   }
 

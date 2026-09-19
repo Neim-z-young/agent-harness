@@ -874,6 +874,17 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       optIn: true,
       load: async () => (await lazyImport<{ createHerdrPlugin: () => AgentPlugin }>('@harness/herdr')).createHerdrPlugin(),
     })
+    // memory：长期记忆（L0 项目指令 AGENTS.md + L1 记忆索引 MEMORY.md）注入 system prompt。
+    // optIn：不声明 `plugins: ["memory"]` 就完全不加载 —— 记忆会占用 system（永不回收的窗口成本），
+    // 必须由用户显式开启。无工作区视图时插件自身也会退化为空 Hooks（宁可不做也不猜路径）。
+    defaultBuiltinRegistry.register({
+      id: 'memory',
+      name: 'Memory',
+      description: '长期记忆：加载两级 MEMORY.md 索引与 AGENTS.md 项目指令并注入 system prompt（子 Agent 不注入）',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createMemoryPlugin: () => AgentPlugin }>('@harness/memory')).createMemoryPlugin(),
+    })
   }
   return defaultBuiltinRegistry
 }
@@ -2403,6 +2414,9 @@ export class HarnessApp {
     // 创建 Harness
     const harness = await createHarness({
       cwd: this.options.cwd,
+      // 工作区路径视图交给插件（记忆/技能目录定位）：CLI 的 dataDir 可能来自 --data-dir，
+      // 让 core 自己 resolve 会算错 ⇒ 传实际 workspace，避免路径口径分裂。
+      workspace: this.workspace,
       defaultAgentId: this.options.agentId,
       internalPlugins: providerPlugins,
       agents: [this.defaultAgent(), ...(this.options.agents ?? [])],

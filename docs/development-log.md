@@ -1,5 +1,51 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 152）记忆能力 M1：补插件路径通道（G1/G2）+ 新建 `@harness/memory` 插件
+
+M1 = 读路径（加载 + 注入 + `/memory` 命令）。计划 §9 指出插件化前必须先补两处"只读视野"通道，
+本次一并落地。
+
+**G1：`PluginContext.workspace`（插件终于能知道路径）**
+此前插件在 `install(ctx)` 与每轮 hook 里都拿不到工作区路径，只能 `process.cwd()` 猜 —— 而 CLI 支持
+`--cwd` / `--data-dir` ⇒ 必然拼错目录（本项目已两次栽在路径口径分裂上）。三处改动：
+- `@harness/plugin`：新增 `PluginWorkspaceView`（**结构化最小接口，刻意不 import `@harness/workspace`**
+  —— 该包依赖 `@harness/session`，契约层要保持"只依赖 bus"的轻量依赖方向）；`PluginContext.workspace?`
+  与 `PluginManagerOptions.workspace?`
+- `core`：`AgentHarnessOptions.workspace?`；`createPluginManager({ workspace: options.workspace ??
+  resolveWorkspace({ cwd: options.cwd }) })`
+  ⚠️ 这里踩到一个**真坑**：初版写的是 `resolveWorkspace({ cwd: this.cwd })`，而 `this.cwd` 在**本行之后**
+  （:2376）才赋值 ⇒ 运行时是 `undefined`、静默退回 `process.cwd()` —— **恰好造成注释里声称要避免的
+  口径分裂**（typecheck 不报错，只有实测才暴露）。改用 `options.cwd` 后实测确认
+  `ctx.workspace.cwd = /tmp/probe-cwd`（等于传入 cwd，而非 process.cwd()）。
+- `cli`：boot 时传 `workspace: this.workspace`（含 `--data-dir` 的实际取值）
+
+**G2：`PromptInput.agentMode`**
+决策 B6 要求"主会话记忆不注入 subagent"，但注入 hook 只给 `agentId` —— 插件无法判断模式（`agent.stream`
+的 `status.mode` 能拿到，但晚于注入）。core 在构造 `promptIn` 时带上 `agent.mode`。
+
+**新包 `@harness/memory`（M1 读路径）**
+- L0 项目指令：`<cwd>/AGENTS.md`（项目）+ `<dataDir>/AGENTS.md`（用户），上限 32KB
+  —— 补上了"仓库根有 AGENTS.md 但从来没被加载过"这个长期缺口。
+- L1 长期记忆：`<scope>/memory/MEMORY.md`，**前 200 行 / 25KB**（对齐 Claude Code auto memory 的
+  实测量级）；主题文件不预载、由模型按需 `read`。
+- 注入走 `prompt.system.transform`，包装成 `<memory>` 段并声明"只在相关时遵循、不要复述"
+  —— 这条路径的 system 消息**没有 `<acp>` ref 标签**，因此 ACP 无从压缩它（实证见计划 §3.4）。
+- **截断是显式的**：超限时在片段里写明"因行数/字节上限被截断，完整内容请读该文件"
+  （Claude Code 的坑：写入成功但下次加载被丢弃，全程无声）。
+- **缓存友好**：`MemoryReader` 按 `mtime + size` 缓存 ⇒ 文件不变则渲染结果逐字相同 ⇒ 前缀缓存不受
+  影响；文件被外部编辑时下次 hook 即失效读到新内容。
+- 硬约束：**全部文件不存在 ⇒ 完全不注入**（零噪声）；**无 workspace 视图 ⇒ 返回空 Hooks**
+  （宁可不做，也不靠猜路径）；`agentMode === 'subagent'` ⇒ 不注入。
+- `/memory list | show <user|project|instruction> | path`（写入能力留到 M2）。
+
+**验证**：memory 包 24 例（21 单测 + **3 条真实链路端到端**：用 `createHarness` + 探针 Provider
+捕获请求体，断言主 Agent 的 system 里真的出现 `<memory>` 与索引/指令内容、**subagent 的请求里不含
+记忆**、空索引时不注入）；全仓 typecheck 0 错误；core 79 / cli 348 全绿；
+`unknownBuiltinPluginIds(["memory"])` 为空 ⇒ 声明式启用路径可用。
+
+**下一步 M2**：写入路径（`/memory edit` 等）+ 体积/去重校验 + §3.7 的分级注入（显式立即 /
+自动攒到下次压缩 flush，flush 双源：`tool.post.execute` compress + `session.compacting`）。
+
 ## 2026-09-19（续 151）记忆能力 M0：workspace 落地 memory 目录字段
 
 [记忆能力与技能锻造计划](memory-and-skill-forge-plan.md) 的 M0。原 M0 有两件事，其中"验证记忆

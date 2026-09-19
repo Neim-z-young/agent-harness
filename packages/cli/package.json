@@ -21,6 +21,7 @@
     "@harness/herdr": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-server-registry": "workspace:*",
+    "@harness/memory": "workspace:*",
     "@harness/permission": "workspace:*",
     "@harness/plugin": "workspace:*",
     "@harness/provider-anthropic": "workspace:*",

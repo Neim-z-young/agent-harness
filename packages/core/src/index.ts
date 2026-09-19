@@ -178,7 +178,14 @@ import type {
 } from '@harness/agent'
 import { agentFromMarkdown } from '@harness/agent'
 import { createSkillManager, formatSkillForPrompt, type SkillManager, type Skill, type SkillSource } from '@harness/skill'
-import { MultiDirLoader, normalizeDirs, type DirEntryInput, type DirSource } from '@harness/workspace'
+import {
+  MultiDirLoader,
+  normalizeDirs,
+  resolveWorkspace,
+  type DirEntryInput,
+  type DirSource,
+  type Workspace,
+} from '@harness/workspace'
 import { readFileSync } from 'node:fs'
 import { basename, extname, resolve } from 'node:path'
 import type {
@@ -1675,7 +1682,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const sysParts: string[] = agent.promptFragments ? [...agent.promptFragments] : []
     if (agent.systemPrompt) { sysParts.length = 0; sysParts.push(agent.systemPrompt) }
     await this.appendCompactionMemory(sessionId, sysParts)
-    const promptIn: PromptInput = { agentId, sessionId }
+    // agentMode 一并交给插件：主会话记忆不应注入子 Agent（隔离语义），而插件此前拿不到 mode
+    const promptIn: PromptInput = {
+      agentId,
+      sessionId,
+      ...(agent.mode ? { agentMode: agent.mode } : {}),
+    }
     await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
 
     // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
@@ -2222,6 +2234,15 @@ export interface Harness {
 export interface AgentHarnessOptions {
   /** 工作目录（注入 ToolContext.cwd，默认 process.cwd()） */
   cwd?: string
+  /**
+   * 宿主工作区布局（由 CLI 传入，含 `--data-dir` 等实际取值）。
+   *
+   * 不传时 core 会按 `resolveWorkspace({ cwd })` 自建一份（缺省 `~/.harness`）——
+   * 独立使用 core 的场景（测试、嵌入式宿主）因此也能给插件一个可用的路径视图。
+   * 传入的意义是**避免路径口径分裂**：CLI 的 dataDir 可能来自 `--data-dir`，
+   * core 自己 resolve 会算错。
+   */
+  workspace?: Workspace
   /** 默认 Agent ID（必填：需要能在 agent.register 后生效） */
   defaultAgentId?: string
   /** 初始 Agent 定义列表（默认注册） */
@@ -2367,6 +2388,11 @@ export class HarnessImpl implements Harness {
       initialConfig: options.config ?? {},
       logger: options.logger,
       dynamicImport: options.pluginOverrides?.dynamicImport,
+      // 工作区路径视图：优先用宿主传入的（CLI 可能带 --data-dir），否则按 cwd 自建。
+      // 插件靠它定位记忆/技能目录 —— 不能靠 process.cwd() 猜（--cwd 时口径不同）。
+      // ⚠️ 这里必须用 `options.cwd` 而不是 `this.cwd`：后者在本行之后（:2376）才赋值，
+      // 此时读到的是 undefined，会静默退回 process.cwd() —— 正好造成要避免的口径分裂。
+      workspace: options.workspace ?? resolveWorkspace({ cwd: options.cwd }),
     })
 
     // ToolPipeline 接入 Plugin hooks（pre/post）
