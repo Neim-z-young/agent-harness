@@ -8,7 +8,7 @@
 
 - **运行时协议优于函数接口**：Tool / Agent / Plugin 是完整的生命周期协议对象，不只是 `call()`
 - **Fail-Closed 安全优先**：所有扩展点默认关闭，需显式声明能力边界（`isReadOnly` / `isDestructive` / `isConcurrencySafe`）
-- **Hooks 管道而非继承**：12+ 个 Hook 点让插件介入生命周期（`harness.start` / `tool.pre.execute` / `prompt.system.transform` / `cli.command` 等）
+- **Hooks 管道而非继承**：12+ 个 Hook 点让插件介入生命周期（`core.harness.start` / `core.tool.pre.execute` / `core.prompt.system.transform` / `cli.command` 等）
 - **三 transport MCP Client**：stdio / Streamable HTTP / 旧版 HTTP+SSE，自动发现 tools / resources / prompts
 - **会话 Compaction**：三级压缩策略（prune / summary / agent）+ 百分比阈值动态触发 + 系统记忆注入
 - **流式输出全链路**：Provider `stream()` → AgentRuntime `queryStream()` → CLI REPL 逐 token 打印
@@ -314,8 +314,8 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   **一次性提示**，邀请模型把值得长期保留的纠正/结论写进记忆（不需要就不写）。
 
   > 一轮 = 一次「用户输入 → Agent 跑完」，**不是**一次模型调用（一轮内多步只算一轮）。
-  > 计数由 core 在整轮结束时广播的 **`agent.turn.end`**（引擎层 hook：任何宿主都有，含内嵌 / ACP）
-  > 驱动，只认主会话、且跳过子 Agent。UI 状态流是另一条 hook（`agent.stream`），两者刻意不混。
+  > 计数由 core 在整轮结束时广播的 **`core.agent.turn.end`**（引擎层 hook：任何宿主都有，含内嵌 / ACP）
+  > 驱动，只认主会话、且跳过子 Agent。UI 状态流是另一条 hook（`cli.agent.stream`），两者刻意不混。
 
   **参数配置**（`config.json`，`memory` 段；启用仍看 `plugins` 里有没有 `"memory"`）：
 
@@ -785,7 +785,7 @@ export function createMyPlugin(): AgentPlugin {
       ctx.log.info('My plugin loaded')
       return {
         // 通过 Hook 注入工具到 ToolRegistry
-        'tool.pool.assemble'(_input, pool) {
+        'core.tool.pool.assemble'(_input, pool) {
           ;(pool as { add: (t: unknown) => void }).add(myTool)
         },
         // 注册 CLI 斜杠命令

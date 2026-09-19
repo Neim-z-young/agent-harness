@@ -70,7 +70,13 @@
 
 - 模型配置来源优先级：**CLI > config.json > 环境变量**
 
-- 权限走「check → ask」两步判定：`resolvePermission` 统一入口，仅 `ask` 时调用引擎 `ask()`；工具执行统一走 `safeExecuteTool` 兜底，把异常归一化为失败 `ToolResult` 反馈给 LLM 而不是中断 agent 流
+- 权限走「check → ask」两步判定：`resolvePermission` 统一入口，仅 `ask` 时调用引擎 `ask()`；工具执行统一走 `safeExecuteTool` 兜底，把异常归一化为失败 `ToolResult` 反馈给 LLM 而不是中断 agent 流；`ask()` 之前会触发 `core.permission.check`（插件可改写决策，也是"等待用户决策"类上报的唯一入口）
+
+- **Hook 命名规范：`层.域.动作`**（如 `core.tool.pre.execute`、`cli.agent.stream`）。首段锁定**触发层**：`core.` = 引擎层（任何宿主都有：CLI / 库内嵌 / ACP 宿主），`cli.` = CLI 宿主层（只有走 CLI 的宿主才有）。判层判据：**"没有 UI 的宿主里这条还会触发吗？"**。新增 hook 必须二选一，不得只写域（历史事故：`agent.stream` 由 CLI 触发，引擎终态曾塞进同一个名字 ⇒ 消费方分不清来源、按轮计数翻倍）。与总线事件（`harness.started` / `tool.enabled`…）是两套命名空间：事件走 `core.bus` 发布订阅，hook 走 `plugin.trigger`；方法名不受约束（`harness.start()` 是方法，hook 是 `core.harness.start`）
+
+- 宿主需要按序取用 hook 回调时用 `PluginManager.listHooks(name)`（公开只读），**不要** `(plugin as any).hooks.listFor(...)` 去摸私有字段
+
+- `permission.check` 之外，`doom-loop` 的重复调用确认是**独立闸门**，不挂 hook：放行后工具仍会走 pipeline 再触发一次权限 hook，挂了会让消费方双报
 
 - 权限拒绝判定用错误名 `err.name === 'ToolPermissionDeniedError'`，避免依赖类绑定
 
@@ -96,9 +102,9 @@
 
 - 工具拆分：内置原语（文件读写 + Shell，`tools-builtin`/`tools-search`）与场景化业务插件分离
 
-- 插件采用统一模式：自包含 helper + `createXxxPlugin` 工厂 + `tool.pool.assemble` Hook 注入；一个插件模块可同时导出 AgentPlugin（`default`/`plugin`/`plugins`）与 Provider 类型工厂（`providerTypeFactory`/`providerType`+`createProviderPlugin`）
+- 插件采用统一模式：自包含 helper + `createXxxPlugin` 工厂 + `core.tool.pool.assemble` Hook 注入；一个插件模块可同时导出 AgentPlugin（`default`/`plugin`/`plugins`）与 Provider 类型工厂（`providerTypeFactory`/`providerType`+`createProviderPlugin`）
 
-- 插件注册技能：在 `harness.init` hook 里用 `harness.skillManager.register(skill)`，`loadedFrom: 'plugin'`
+- 插件注册技能：在 `core.harness.init` hook 里用 `harness.skillManager.register(skill)`，`loadedFrom: 'plugin'`
 
 - TUI 使用 OpenTUI（@opentui/core + @opentui/react），保留会话内核 `createProcessLine`，仅替换渲染层
 

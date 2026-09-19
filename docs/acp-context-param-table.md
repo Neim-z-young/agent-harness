@@ -146,7 +146,7 @@ MC = clamp( 4 × R, 8000, 2 × ( W − R ) )                    // chars；上�
 
 ### 2. 分裂的实际后果（真实插件链路实测）
 
-`createAcpContextPlugin` → `session.preModel` 驱动，300K 窗口、每轮 1 万中文字、`autoTune` 开启，
+`createAcpContextPlugin` → `core.session.preModel` 驱动，300K 窗口、每轮 1 万中文字、`autoTune` 开启，
 读 `acp_status` 上报的占用率与真实占用（真实 = 逐 part 走 `defaultCountTokens`）对比：
 
 | 轮次 | `chars4` 上报 / 真实 | 偏差 | `auto` 上报 / 真实 | 偏差 |

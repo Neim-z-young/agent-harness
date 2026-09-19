@@ -6,7 +6,7 @@
 
 - 关联插件：`@harness/acp-context`
 - 讨论对齐的版本：**V5 定稿**（在标记消息、归档文件、懒加载讨论基础上收敛）
-- 状态：阶段一→三已实施（持久层 / 视图骨架 / session.compacting 接线），阶段二后续走 Route B 彻底改造已落地（开发日志续 109）；**统一块模型整合已落地**：ACP 折叠经 `blocksPatch` 并入 `session.blocks`（`source: 'generic'|'acp'`）、`revert` 经全文回溯只回退最近消息（开发日志续 110、`.trae/documents/上下文压缩-统一块模型.md`）；**阶段四前端按需渲染已落地**：压缩块提示行 + 惰性展开 + 超长分页（开发日志续 111、`.trae/documents/上下文压缩-阶段四-前端按需渲染.md`）
+- 状态：阶段一→三已实施（持久层 / 视图骨架 / core.session.compacting 接线），阶段二后续走 Route B 彻底改造已落地（开发日志续 109）；**统一块模型整合已落地**：ACP 折叠经 `blocksPatch` 并入 `session.blocks`（`source: 'generic'|'acp'`）、`revert` 经全文回溯只回退最近消息（开发日志续 110、`.trae/documents/上下文压缩-统一块模型.md`）；**阶段四前端按需渲染已落地**：压缩块提示行 + 惰性展开 + 超长分页（开发日志续 111、`.trae/documents/上下文压缩-阶段四-前端按需渲染.md`）
 
 ---
 
@@ -16,14 +16,14 @@
 |----|------|------|
 | 内存模型 | `Session.messages: Message[]` 整块驻留内存 | `packages/session/src/index.ts#L161-L188` |
 | 持久化 | `dataDir/sessions/{sessionId}.json` 全量序列化 messages | `packages/workspace/src/storage.ts#L24-L79` |
-| 请求组装 | `query` 直接拼接 `session2.messages` 后触发 `session.preModel` | `packages/core/src/index.ts#L1242-L1294` |
+| 请求组装 | `query` 直接拼接 `session2.messages` 后触发 `core.session.preModel` | `packages/core/src/index.ts#L1242-L1294` |
 | 进入会话 | `resume` 通过 `sessionStore.load(sid)` 全量加载并逐条回填 | `packages/cli/src/index.ts#L1367-L1383` |
-| ACP 投影 | 经 `session.preModel` 读原始消息、`processTurn`、写 `meta.acp.v1` | `packages/plugins/acp-context/src/index.ts#L375-L478` |
+| ACP 投影 | 经 `core.session.preModel` 读原始消息、`processTurn`、写 `meta.acp.v1` | `packages/plugins/acp-context/src/index.ts#L375-L478` |
 
 现有问题：
 1. **内存随会话线性膨胀**：超长会话把全部消息留在内存，即使长期用不到。
 2. **请求全量投影**：`query` 拼 `sess.messages`，历史越长输入 token 越大（依赖 ACP 每轮瘦身，但 ACP 停用时完全裸跑）。
-3. **两管线时序冲突**：进入会话时 `compactIfNeeded` 可能先删旧文，破坏 ACP 保的全文可回溯；且 `compact()` 从未触发已声明的 `session.compacting` hook（核心路径未接线）。
+3. **两管线时序冲突**：进入会话时 `compactIfNeeded` 可能先删旧文，破坏 ACP 保的全文可回溯；且 `compact()` 从未触发已声明的 `core.session.compacting` hook（核心路径未接线）。
 4. **前端一次性渲染**：历史 messages 作为内存数组被 TUI/Web 直接渲染，无按需加载接缝。
 
 ---
@@ -70,7 +70,7 @@
 | D2 | 压缩块是历史里的**稳定节点**（持久、固定 ref），非临时标记 | ACP 增量路径前缀稳定，命中率高 |
 | D3 | 摘要增量写入「会话压缩消息文件」，全文另存原文容器 | 文件固定大小、覆盖式；可追溯由原文容器兜底 |
 | D4 | 断点索引 `(blockId → 原文 id 段)` 复用 ACP 的 `messageRefs/blocks` | 少造新机制，`decompress/search` 只差查盘 |
-| D5 | `session.compacting` hook 接线、扩展 input | 给 ACP"删除前先保全原文"的窗口，解决时序冲突 |
+| D5 | `core.session.compacting` hook 接线、扩展 input | 给 ACP"删除前先保全原文"的窗口，解决时序冲突 |
 | D6 | 前端懒加载经统一 loader，不直接 map 全量 messages | 渲染层与内存结构解耦，支持分页 |
 
 ---
@@ -105,13 +105,13 @@
 - 统计/还原功能（`/compact` info、revert）经 loader 工作正常。
 - **此阶段不依赖 ACP**，禁用 ACP 全量通过。
 
-### 阶段三：session.compacting 接线 + ACP 协同（解决时序冲突）
+### 阶段三：core.session.compacting 接线 + ACP 协同（解决时序冲突）
 **目标**：两管线能在同一会话协同，且删除前 ACP 可先保全原文。
 
 改动：
 - `packages/plugin/src/index.ts`：扩展 `CompactionContext`（加入 `sessionId` 及可读历史窗口引用的入口）。
-- `packages/core/src/index.ts`：`compact()` / `compactIfNeeded()` 触发 `session.compacting` hook；`keepLast/strategy/summary` 允许插件改写。
-- `packages/plugins/acp-context`：注册 `session.compacting` hook——删除前把待压缩窗口**先行折叠进自己的块/摘要文件**，或将 strategy 置为"已由 ACP 处理"以豁免物理删除；幂等（复用 `state` 的 already-compressed 判定）。
+- `packages/core/src/index.ts`：`compact()` / `compactIfNeeded()` 触发 `core.session.compacting` hook；`keepLast/strategy/summary` 允许插件改写。
+- `packages/plugins/acp-context`：注册 `core.session.compacting` hook——删除前把待压缩窗口**先行折叠进自己的块/摘要文件**，或将 strategy 置为"已由 ACP 处理"以豁免物理删除；幂等（复用 `state` 的 already-compressed 判定）。
 - 摘要读取：`decompress` / `search_context` 改走断点索引回读原文容器。✅ 已实施（续 112）：`restoreBlockMessages` 经 `collectCoveredIds` 递归 `directBlockIds` 还原 tier2/3 嵌套原文；折叠窗口原文在 `runPreModel` 折叠轮持久化进 `session.meta[acp.archive.v1]`（跨重启回溯）；工具输出附 `startId/endId` 断点索引，对齐宿主 `resolveAcpBlockOriginals` 容器切片。
 
 验收：

@@ -19,7 +19,7 @@
 | 终止依据 | finish reason 无 tool results | `handle.message.finish` 非 `tool-calls` | —— （跑一轮就停） |
 | 步数上限 | `maxTurns` + `turnCount` | `agent.steps` + `MAX_STEPS_PROMPT` | 无 |
 | 死循环保护 | maxTurns 兜底 | `DOOM_LOOP_THRESHOLD=3` 主动检测 | 无 |
-| 上下文压缩挂载点 | 循环体内 autoCompact | 循环体内 compaction 分支 | 每轮 `session.preModel`（已有） |
+| 上下文压缩挂载点 | 循环体内 autoCompact | 循环体内 compaction 分支 | 每轮 `core.session.preModel`（已有） |
 
 ---
 
@@ -100,7 +100,7 @@ if (
   → AgentRuntimeImpl.queryStream (core)  ← S1/S2 后：引擎内自主多步
        ├─ _prepareQueryOnce              // 一次：agent/工具池/权限/system prompt/model 解析
        └─ while (step <= maxSteps)       // 默认上限 30；maxSteps=1 为显式单轮
-            ├─ _buildStepMessages         // 每轮：重读会话 + getView + llm.params/hooks + preModel 裁剪
+            ├─ _buildStepMessages         // 每轮：重读会话 + getView + core.llm.params/hooks + preModel 裁剪
             ├─ provider.stream / complete // 每步一次模型调用
             ├─ for (tc of toolCalls) 串行执行工具（含 doom-loop 拦截）
             ├─ addMessage(assistant) + yield done(step, finish)
@@ -158,7 +158,7 @@ swarm 的 teammate tick（`plugins/swarm/src/index.ts:1171`）同理，每个 ti
 
 #### OK 详解：ACP 不需要改
 
-`session.preModel` 每轮都跑，循环上线后会变成每 step 都跑。但 ACP 本就按"轮"设计：`bench/compress-params.ts` 的 `--steps=100/140/200` 就是模拟多轮对话，参数表（R / GF / MC）就是在此基础上实测出来的。因此**刚调完的参数不用重调**。
+`core.session.preModel` 每轮都跑，循环上线后会变成每 step 都跑。但 ACP 本就按"轮"设计：`bench/compress-params.ts` 的 `--steps=100/140/200` 就是模拟多轮对话，参数表（R / GF / MC）就是在此基础上实测出来的。因此**刚调完的参数不用重调**。
 
 ---
 
@@ -178,7 +178,7 @@ async *queryStream(input) {
 
   while (true) {
     step++
-    // 每轮需要做的：重建 messages + 跑 session.preModel + snapshot capture
+    // 每轮需要做的：重建 messages + 跑 core.session.preModel + snapshot capture
     const roundMsgs = await this._buildMessagesForStep(prepared, turnMessages, step)
     const { finish, toolCalls, assistant } = await this._runOneStep(prepared, roundMsgs)  //  yields 流式事件
     if (finish === 'stop' || finish === 'length' || finish === 'content_filter') break
@@ -215,7 +215,7 @@ async *queryStream(input) {
 
 - 拆出 `_prepareQueryOnce`（一次：Agent 解析 / 工具池 / 权限 / 用户消息注入 / system prompt /
   provider-model 解析 / paramsBase）与 `_buildStepMessages`（每轮：重读会话 → getView →
-  组装 system+历史 → `llm.params`+`llm.headers` → `session.preModel` → 回写 blocks）
+  组装 system+历史 → `core.llm.params`+`core.llm.headers` → `core.session.preModel` → 回写 blocks）
 - 单步执行体抽成 `_runOneStep(prepared, step)`（async generator，终值经 `yield*` 传出 `StepOutcome`），
   `queryStream` 只剩「准备一次 + for 循环」
 - `AgentQueryInput.maxSteps` 默认 `1`；`session.promptStream(sessionId, text, maxSteps?)` 透传
@@ -229,8 +229,8 @@ async *queryStream(input) {
   ---
   > EVENT done parts=[text] finish=stop step=1
   ```
-  同时对照了 hook 调用次数（`tool.pool.assemble` / `prompt.system.transform` / `llm.params` /
-  `llm.headers` / `session.preModel` 各恰好 1 次 —— 证明拆分既没丢 hook 也没重复执行）、
+  同时对照了 hook 调用次数（`core.tool.pool.assemble` / `core.prompt.system.transform` / `core.llm.params` /
+  `core.llm.headers` / `core.session.preModel` 各恰好 1 次 —— 证明拆分既没丢 hook 也没重复执行）、
   provider 调用次数、会话消息结构
 - 另加 3 例测试锁定骨架本身：缺省 1 步只调一次模型；`maxSteps=2` 时**第二步请求里含第一步的
   assistant 消息与工具结果**（回喂机制的证据，S2 的前提）；两步各自发 done 且 step 递增

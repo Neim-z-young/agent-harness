@@ -170,38 +170,56 @@ interface AgentPlugin {
 }
 
 // ===== Hooks 注册表（介入所有生命周期） =====
+//
+// 命名规范：**层.域.动作**。首段锁定「谁触发这条 hook」（层），不是"功能属于哪个模块"：
+// hook 名是命名空间，两层往同一名字里发会让消费方分不清"这条是谁发的"
+// （历史事故：引擎终态曾被塞进 UI 消费层的 cli.agent.stream，按轮计数的消费方因此翻倍）。
+//
+// 判层判据一句话：**"没有 UI 的宿主里这条还会触发吗？"** 会 → `core.`；只在有 UI 时 → `cli.`。
+//
+// 与总线事件（harness.started / tool.enabled …）是两套机制、两个命名空间：
+// 事件走 `core.bus` 发布/订阅（多订阅者、无入参改写语义）；hook 走 `plugin.trigger`
+// （管道式、可原地改写入参）。方法名不受本规范约束：`harness.start()` 是方法，
+// `core.harness.start` 才是 hook。
+//
+// 权威定义见 packages/plugin/src/index.ts 的 `Hooks`（本清单与它同步；不符时以代码为准）。
 interface Hooks {
-  // === Harness 级 ===
-  'harness.init'?: (input, output) => Awaitable<void>
-  'harness.start'?: (input, output) => Awaitable<void>
-
-  // === Provider 认证（同 OpenCode auth hook） ===
-  'provider.auth'?: (req: AuthRequest) => Awaitable<AuthResult | undefined>
+  // === core.（引擎层：任何宿主都有 —— CLI / 库内嵌 / ACP 宿主） ===
+  'core.harness.init'?: (input, output) => Awaitable<void>
+  'core.harness.start'?: (input, output) => Awaitable<void>
 
   // === 工具池构建 ===
-  'tool.pool.assemble'?: (input: { agentId: string }, pool: ToolPool) => Awaitable<void>
+  'core.tool.pool.assemble'?: (input: { agentId: string }, pool: ToolPool) => Awaitable<void>
 
   // === Tool 执行 Pipeline ===
-  'tool.pre.execute'?: (ctx: ToolContext, next: () => Promise<ToolResult>) => Promise<ToolResult>
-  'tool.post.execute'?: (ctx: ToolContext, result: ToolResult) => Awaitable<ToolResult>
+  'core.tool.pre.execute'?: (ctx: ToolContext, next: () => Promise<ToolResult>) => Promise<ToolResult>
+  'core.tool.post.execute'?: (ctx: ToolContext, result: ToolResult) => Awaitable<ToolResult>
 
   // === LLM 调用链路（同 OpenCode chat params/headers） ===
-  'llm.params'?: (input: LLMInput, params: LLMParams) => Awaitable<void>
-  'llm.headers'?: (input: LLMInput, headers: Record<string, string>) => Awaitable<void>
+  'core.llm.params'?: (input: LLMInput, params: LLMParams) => Awaitable<void>
+  'core.llm.headers'?: (input: LLMInput, headers: Record<string, string>) => Awaitable<void>
 
   // === Prompt 构建链 ===
-  'prompt.system.transform'?: (input: PromptInput, parts: string[]) => Awaitable<void>
-  'prompt.tools.transform'?: (input: PromptInput, toolSchemas: ToolSchema[]) => Awaitable<void>
+  'core.prompt.system.transform'?: (input: PromptInput, parts: string[]) => Awaitable<void>
 
   // === Session 生命周期 ===
-  'session.compacting'?: (input, output: CompactionContext) => Awaitable<void>
-  'session.message.created'?: (msg: Message) => Awaitable<void>
+  'core.session.compacting'?: (input, output: CompactionContext) => Awaitable<void>
+  'core.session.preModel'?: (input: SessionPreModelInput, messages: unknown[]) => Awaitable<void>
 
-  // === Permission 扩展 ===
-  'permission.check'?: (req: PermissionRequest, decision: PermissionDecision) => Awaitable<void>
+  // === Permission 扩展（check 之后、ask 之前触发：此刻 behavior 才可能是 'ask'） ===
+  'core.permission.check'?: (req: PermissionRequestLike, decision: PermissionDecisionLike) => Awaitable<void>
 
-  // === Bus 事件订阅 ===
-  'bus.event'?: (event: BusEvent<any>) => Awaitable<void>
+  // === Agent 生命周期（引擎层事实：含子 Agent 的轮；消费方按 mode/sessionId 自行筛） ===
+  'core.agent.turn.end'?: (input: AgentTurnEndSignal) => Awaitable<void>
+
+  // === Bus 事件订阅（走 subscribeAll 桥接，不经 trigger；卸载时自动退订） ===
+  'core.bus.event'?: (event: BusEventRecord) => Awaitable<void>
+
+  // === cli.（CLI 宿主层：只有走 CLI 的宿主才有） ===
+  'cli.agent.stream'?: (input: AgentStreamSignal) => Awaitable<void>       // UI 状态流（REPL/TUI/run 归约后的快照）
+  'cli.commands'?: (input: CliCommandsInput) => Awaitable<void>           // 注册斜杠命令
+  'cli.command'?: (input: CliCommandInput) => Awaitable<void>             // 处理斜杠命令
+  'cli.mcp.configure'?: (input: McpConfigureInput) => Awaitable<void>     // 注入 MCP 托管列表（配置态）
 }
 
 // ===== Plugin Manager API =====
@@ -215,6 +233,10 @@ interface PluginManager {
   unload(pluginId: string): Promise<void>
   hotReload(pluginId: string): Promise<void>
   list(): LoadedPlugin[]
+
+  // 按名称列出已注册 hook 回调（顺序 = 插件加载顺序，只读）
+  // 供宿主自行组装洋葱管道：core 把 core.tool.pre.execute 包成 next() 链
+  listHooks<N extends keyof Hooks>(name: N): ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks[N]> }>
 
   // 触发 Hook（同 OpenCode trigger，管道式依次调用）
   trigger<N extends keyof Hooks>(name: N, ...args): Promise<HookResult<N>>
@@ -286,10 +308,10 @@ interface Tool<Input = any, Output = any, Progress = any> {
 ```
 1. inputSchema.safeParse() 硬校验
 2. validateInput() 语义校验
-3. Plugin.trigger('tool.pre.execute') 前置 Hook 管道
+3. Plugin.trigger('core.tool.pre.execute') 前置 Hook 管道
 4. PermissionEngine.check() 权限检查（allow/deny/ask + 路径匹配）
 5. tool.call() 真正执行
-6. Plugin.trigger('tool.post.execute') 后置 Hook 管道
+6. Plugin.trigger('core.tool.post.execute') 后置 Hook 管道
 7. outputSchema 校验 + 结果截断
 ```
 
@@ -433,7 +455,7 @@ env:   ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
 // providers 类型工厂约定（注册进 ProviderTypeRegistry）
 export const providerType = 'my-gw'
 export function createProviderPlugin(config) {
-  // 返回 AgentPlugin：install 内通过 harness.init hook 调用 _setChatProvider 注册 ChatProvider
+  // 返回 AgentPlugin：install 内通过 core.harness.init hook 调用 _setChatProvider 注册 ChatProvider
 }
 
 // 通用 Hooks 插件约定（这两者可在同一模块同时导出）
@@ -495,7 +517,7 @@ interface SkillEmbed {
 - `enable(id)`：从禁用缓存恢复；未在缓存中则回落 `reload`（等价启用新增技能）
 - `isDisabled(id)`：查询禁用状态
 - `reload(id)`：从原始来源文件热更新，且保持原启用/禁用状态
-- 插件可在 `harness.init` hook 中通过 `harness.skillManager.register(...)` 注册 `'plugin'` 来源技能
+- 插件可在 `core.harness.init` hook 中通过 `harness.skillManager.register(...)` 注册 `'plugin'` 来源技能
 
 ---
 
@@ -543,7 +565,7 @@ interface PermissionDecision {
 
 ### 3.9 ACP 上下文压缩插件（@harness/acp-context）
 
-**定位**：通过新增的 `session.preModel` Hook 接入 acp-kernel（billion-context 抽取的纯引擎，MIT）做**模型驱动 3 层 LSM 上下文压缩**。对话越长、token 占用越高，代价越低——超长会话不丢失早期上下文，而是折叠成可检索/可还原的摘要块。
+**定位**：通过新增的 `core.session.preModel` Hook 接入 acp-kernel（billion-context 抽取的纯引擎，MIT）做**模型驱动 3 层 LSM 上下文压缩**。对话越长、token 占用越高，代价越低——超长会话不丢失早期上下文，而是折叠成可检索/可还原的摘要块。
 
 **每轮接入点**：core 在 query 与 queryStream 两处构建 `finalMessages` 后、调用模型前，触发 `session.preModel(input, messages)`。插件据此：
 - 调 `processTurn` 指派 refs、按需产出 nudge、执行分层压缩过滤；
@@ -562,7 +584,7 @@ interface SessionPreModelInput {
     patch: (patch: Record<string, unknown>) => Promise<void>  // 浅合并
   }
 }
-// Hooks['session.preModel'] → (input, messages: unknown[]) => Awaitable<void>
+// Hooks['core.session.preModel'] → (input, messages: unknown[]) => Awaitable<void>
 ```
 
 **模型驱动压缩分工**：
@@ -603,7 +625,7 @@ const MCPPlugin: AgentPlugin = {
   async install(ctx) {
     // Hook：组装工具池时，注入 MCP 工具
     return {
-      'tool.pool.assemble'(input, pool) {
+      'core.tool.pool.assemble'(input, pool) {
         // 从 MCP Server 获取工具 → 转换为 Tool Protocol 对象
         for (const mcpTool of getMCPTools()) {
           // 命名前缀 mcp__${server}__${tool}（同 Claude）
@@ -611,7 +633,7 @@ const MCPPlugin: AgentPlugin = {
         }
       },
       // 连接状态变更广播
-      'harness.start'() {
+      'core.harness.start'() {
         startMCPServerHealthCheck(ctx.bus)
       }
     }
@@ -631,7 +653,7 @@ const SwarmPlugin: AgentPlugin = {
   async install(ctx) {
     return {
       // 为 teammate Agent 强制注入协作工具（同 Claude Code）
-      'tool.pool.assemble'({ agentId }, pool) {
+      'core.tool.pool.assemble'({ agentId }, pool) {
         if (getAgentMode(agentId) === 'teammate') {
           pool.addIfMissing([
             'send_message', 'task_create', 'task_list',
@@ -641,7 +663,7 @@ const SwarmPlugin: AgentPlugin = {
       },
 
       // Hook 权限：teammate 请求权限通过 leader 桥接
-      'permission.check'(req, decision) {
+      'core.permission.check'(req, decision) {
         if (req.from === 'teammate' && decision.behavior === 'ask') {
           decision.behavior = bridgeToLeaderPermissionQueue(req)
         }
@@ -666,7 +688,7 @@ const AnthropicProviderPlugin: AgentPlugin = {
           headers: { 'x-api-key': getEnvAPIKey() }
         }
       },
-      'llm.headers'({ providerId }, headers) {
+      'core.llm.headers'({ providerId }, headers) {
         if (providerId === 'anthropic') {
           headers['anthropic-version'] = '2023-06-01'
         }
@@ -678,7 +700,7 @@ const AnthropicProviderPlugin: AgentPlugin = {
 
 ## 四、补充：ACP 上下文压缩插件示例
 
-**官方内置插件，见 3.9 节详述。** 接入方式：把 `createAcpContextPlugin` 加入 `internalPlugins`，通过 `session.preModel` Hook 每轮在进入模型前运行 acp-kernel，并注入 4 个模型驱动压缩工具。
+**官方内置插件，见 3.9 节详述。** 接入方式：把 `createAcpContextPlugin` 加入 `internalPlugins`，通过 `core.session.preModel` Hook 每轮在进入模型前运行 acp-kernel，并注入 4 个模型驱动压缩工具。
 
 ```typescript
 import { createHarness } from '@harness/core'
@@ -751,7 +773,7 @@ const h = await createHarness({
 | **Skill 内嵌 Shell？** | 开启 + MCP 来源强制跳过 | 同 Claude Code 安全切断，防 RCE |
 | **Agent 分层？** | primary/subagent/coordinator/teammate 四模式 | 覆盖 Claude Code 全部场景，且作为插件能力 |
 | **Multi-Agent 优先级？** | P1 只做 Subagent，Swarm 做可选插件 | 平衡复杂度与扩展性，Core 只留 Subagent 基础 |
-| **插件 Hooks 命名？** | 域.动作 格式，如 `tool.pre.execute` | 扩展性好，支持后续新域不冲突 |
+| **插件 Hooks 命名？** | 域.动作 格式，如 `core.tool.pre.execute` | 扩展性好，支持后续新域不冲突 |
 | **Plugin 加载顺序？** | Internal → Builtin → User + dependsOn 拓扑 | 同 OpenCode，保证覆盖关系明确 |
 | **权限匹配优先级？** | 精确路径 → glob → 工具级 → 全局通配 | 同 OpenCode 成熟模式 |
 | **Harness 是否依赖 UI？** | 否，纯逻辑内核 | 同 Claude Code QueryEngine，支持 SDK/CLI/IDE 多入口 |
@@ -967,7 +989,7 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 
 1. **barrier / 自动续轮不能塞进 Subagent 层**：Subagent 是工具层（被调用者），不知道"父 Agent 某次派工期望等几个"；"集齐 N 个 taskId 再汇总"是调用者侧视角，属于 Coordinator/会话层全局状态。
 2. **自动触发 query 是运行时职责**：`agent.query()` 入口由外层（CLI/SDK/IDE）驱动。Coordinator 插件在集齐 barrier 后向外层 command queue 塞一条 `<continue/>` 伪消息，让运行时自然启动下一轮。工具层无权驱动 Runtime。
-3. **身份切换是 Coordinator 专属**：`AgentDefinition.mode: 'coordinator'` + `prompt.system.transform` hook 改写 system prompt 为 orchestrator。Subagent 工具不管。
+3. **身份切换是 Coordinator 专属**：`AgentDefinition.mode: 'coordinator'` + `core.prompt.system.transform` hook 改写 system prompt 为 orchestrator。Subagent 工具不管。
 4. **拓扑约束**：teammate 不能嵌套 spawn teammate（防 agent graph 失控）；Coordinator 模式下 worker 不能自己再派后台任务（防"等 A 时 A 在等 B"死锁）。跨层约束只能在 Mode/插件层统一执行。
 
 ### 9.4 后续开发清单（边界划分后）
@@ -981,11 +1003,11 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] P1-5 进度推送（`subagent.progress` Bus 事件 + 面板进度行）
 
 **划归 `Coordinator Plugin`（✅ 已实现 `@harness/coordinator`）**：
-- [x] `AgentDefinition.mode: 'coordinator'`（AgentMode 已内置）+ `prompt.system.transform` 注入 Coordinator System Prompt（四阶段规则 + orchestrator 身份）
+- [x] `AgentDefinition.mode: 'coordinator'`（AgentMode 已内置）+ `core.prompt.system.transform` 注入 Coordinator System Prompt（四阶段规则 + orchestrator 身份）
 - [x] **Barrier 同步原语**：`CoordinatorBarrierTracker` 跟踪 per-session 后台任务（订阅 subagent.started/completed/failed），全部完成/失败后发布 `coordinator.barrier.completed` 事件；CLI `attachAutoContinue` 订阅后注入 `<continue/>` 自动续轮（直接解决"多调研任务→等待→汇总"场景）
-- [x] forceAsync：插件选项或 `HARNESS_FORCE_ASYNC=true`，`tool.pre.execute` 拦截 subagent 调用强制 runInBackground（原 P2-6）
+- [x] forceAsync：插件选项或 `HARNESS_FORCE_ASYNC=true`，`core.tool.pre.execute` 拦截 subagent 调用强制 runInBackground（原 P2-6）
 - [x] send_message 工具：续跑已有 taskId（延续 worker 会话上下文返回回复），仅注入 mode=coordinator 的 Agent
-- [x] **文件级写锁（设计修正）**：`FileWriteArbiter` 按 canonical 路径跨 session 互斥，锁持有 = 单次写工具调用（write_file/edit_file，从输入 `path` 提取目标）；同一路径被其他 session 的写操作持有时本次写等待，同 session 内天然串行不加锁。`tool.pre.execute` 在写工具执行前 `acquireWrite`、finally `releaseWrite`。
+- [x] **文件级写锁（设计修正）**：`FileWriteArbiter` 按 canonical 路径跨 session 互斥，锁持有 = 单次写工具调用（write_file/edit_file，从输入 `path` 提取目标）；同一路径被其他 session 的写操作持有时本次写等待，同 session 内天然串行不加锁。`core.tool.pre.execute` 在写工具执行前 `acquireWrite`、finally `releaseWrite`。
   - **设计修正说明**：初版为"派工声明级"仲裁（subagent 调用按 `targetFiles`/`AgentDefinition.writesTo` 整组阻塞）——但 agent 实际写哪些文件执行前并不确定，声明级锁会误伤不相关 worker 且锁持有到 worker 生命周期过长。改为文件级后，锁粒度 = 单次写调用，subagent 派工不再阻塞；`SubagentToolInput.targetFiles` / `AgentDefinition.writesTo` 保留为提示性声明（不参与仲裁）。bash 工具无法可靠解析写入路径，不纳入（与 Claude Code 一致，靠 prompt 纪律兜底）。
 
 **划归 `Swarm Plugin`（新包 `@harness/swarm`，✅ 已实现核心）**：
@@ -996,7 +1018,7 @@ P0-2 和 P0-3 可并行开发，P0-1 依赖 P0-3 完成后才能在 prompt 中�
 - [x] in-process teammate 基础：`TeammateRegistry` + `withTeammateIdentity` AsyncLocalStorage 身份隔离 + `formatAgentId`
 - [x] **in-process teammate 完整执行循环**：`spawnInProcessTeammate`（加入/创建团队 + 独立子 session + 注册 + 初始 prompt 立即执行）、`runTeammateTick`（每 tick 处理 mailbox 未读消息——普通消息 query 后回复写回发送者、`shutdown_request` 注入模型决策（不直接关停）；`tryClaimNextTask` 认领 available 任务 → query 执行 → 更新任务状态 + 向 leader 发 task_notification）、`startTeammateLoop`（周期驱动 tick，stop/mailbox shutdown 停止；**含防重叠保护**：内部 query 支持自主多步后单次 tick 可能超过 intervalMs，用 running 标志跳过重叠 tick）
 - [ ] tmux/iTerm2 进程后端（out-of-process teammate）→ 后续增强
-- [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套 / approve_shutdown / reject_shutdown，`tool.pool.assemble` 注入全部 Agent
+- [x] 工具：team_create / team_delete / team_status / send_teammate_message（mailbox 路由，避免与 coordinator 的 send_message 冲突）/ task_* 五件套 / approve_shutdown / reject_shutdown，`core.tool.pool.assemble` 注入全部 Agent
 
 **Swarm 后续待办（对照 Claude Code 源码调研 `04h-multi-agent.md` / teammateMailbox / inProcessRunner / useInboxPoller / tasks.ts）**：
 
@@ -1251,7 +1273,7 @@ TUI 通过 `app.permission.setAskPrompt(cb)` 接管 `ask` 交互，渲染审批�
 ```
 _prepareQueryOnce          一次：Agent 解析 / 工具池 / 权限 / system prompt / provider-model
 while (step <= maxSteps)                    默认 30；maxSteps=1 为显式单轮
-  ├─ _buildStepMessages    每轮：重读会话 + getView + llm.params/headers + session.preModel 裁剪
+  ├─ _buildStepMessages    每轮：重读会话 + getView + core.llm.params/headers + core.session.preModel 裁剪
   ├─ _runOneStep           每步：调模型（流式 / complete）→ 执行工具（含 doom-loop 拦截）→ 写回 assistant
   ├─ yield done(step, finish)               每步各一次
   └─ shouldContinueStep ? 续轮 : 结束
@@ -1275,11 +1297,11 @@ yield turn_end                              整轮只一次
    属被截断/拦截，即便残留 toolCalls 也不续。
 2. **`done` 与 `turn_end` 分离**：前者是「一步结束」（多步时多次，带 `step`），后者是「整轮结束」（一次）。
    UI 状态收尾（busy/spinner）必须挂在 `turn_end` 上。**两条通道名字必须分得开**：
-   - `agent.stream`（**UI 消费层**）：CLI 把事件流归约成"现在在干什么"再广播，只有走 UI 的宿主才会触发，
+   - `cli.agent.stream`（**UI 消费层**）：CLI 把事件流归约成"现在在干什么"再广播，只有走 UI 的宿主才会触发，
      末条 `turn_end` ⇒ `idle` 是 UI 收尾信号。
-   - `agent.turn.end`（**引擎层**）：core 在 `queryStream`/`query()` 的收尾处广播的整轮终态
+   - `core.agent.turn.end`（**引擎层**）：core 在 `queryStream`/`query()` 的收尾处广播的整轮终态
      （`agentId` / `mode` / `sessionId` / `step` / `finish` / `aborted`），任何宿主都有（含以库内嵌、
-     ACP 宿主自己消费事件流）。要"每轮都该发生"的逻辑挂这条；引擎**不往 `agent.stream` 发事件**。
+     ACP 宿主自己消费事件流）。要"每轮都该发生"的逻辑挂这条；引擎**不往 `cli.agent.stream` 发事件**。
 3. **中断**：`AgentQueryInput.signal` 贯穿到 Provider 请求与 `ToolContext.signal`，在步边界与每个工具执行前生效；
    已完成的成果保留，未执行的工具标 `ABORTED`。
 4. **`<continue/>` 空转识别**：续轮前查待处理通知，没有就跳过 —— 避免白跑一整轮（多步后一轮可能是几十步）。
@@ -1292,7 +1314,7 @@ yield turn_end                              整轮只一次
 | 终止依据 | finish reason 无 tool results | `finish` 非 `tool-calls` + `hasToolCalls` 兜底 | 「有无 toolCalls」为主 + finish 排除异常终止 |
 | 步数上限 | `maxTurns` + `turnCount` | `agent.steps` + `MAX_STEPS_PROMPT` | `maxSteps`（默认 30）+ 收尾提示 |
 | 重复调用保护 | maxTurns 兜底 | `DOOM_LOOP_THRESHOLD=3` 主动检测 | 同阈值 + 执行前拦 + 权限确认 |
-| 压缩挂载点 | 循环体内 autoCompact | compaction 作为 continue 分支 | `session.preModel`（每步都跑） |
+| 压缩挂载点 | 循环体内 autoCompact | compaction 作为 continue 分支 | `core.session.preModel`（每步都跑） |
 | 中断 | abort 检查 | cleanup 收尾 | `signal` 贯穿到工具与 Provider |
 
 从参考实现抄到的两条（均已落地）：finish reason 不可单独作判据（opencode `prompt.ts:1123` 的
@@ -1305,6 +1327,6 @@ yield turn_end                              整轮只一次
 **已有基础（零改动）**：
 
 - **工具结果回喂格式就绪**：两个主流 provider 都会把 assistant 消息里带 result 的 tool part 自动拆成合规角色（Anthropic → `tool_result` block；OpenAI → `role:'tool'` 消息带 `tool_call_id`，`provider-openai:227/292`）。session 层保持"assistant 消息内嵌工具结果"的统一模型，序列化时再拆 ⇒ **不需要动消息模型**。
-- **ACP 按轮设计**：`session.preModel` 本就每轮执行，`bench/compress-params.ts` 的 `--steps=100/140/200` 就是模拟多轮，参数表在此基础上实测 ⇒ 循环上线后无需重调参数。
+- **ACP 按轮设计**：`core.session.preModel` 本就每轮执行，`bench/compress-params.ts` 的 `--steps=100/140/200` 就是模拟多轮，参数表在此基础上实测 ⇒ 循环上线后无需重调参数。
 
 **主要风险**在协调层：`coordinator` 的 barrier 续轮已在承担「链式执行」职责，内部循环上线后两者可能双重驱动。计划把 S0~S3 在关闭 coordinator 的前提下验证，S4 再单独协调三层职责（引擎内循环 = 工具结果回喂；barrier = 跨轮推进；`<continue/>` = 仅 barrier 场景）。

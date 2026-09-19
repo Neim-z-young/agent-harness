@@ -1,5 +1,91 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 157）hook 名加层前缀 `core.` / `cli.`，并补上一直"只声明没接线"的 `core.permission.check`
+
+用户要求：「不同层的 hooks 增加对应层前缀，识别当前项目中的 hooks 命名问题并优化」。
+
+续 156 已经按层**拆**过 hook（`agent.stream` / `agent.turn.end`），但两条名字仍共用 `agent.` 这个域 ——
+消费方读名字依然看不出"这条是谁发的"。**拆了却没有留痕**：当时靠契约注释和回归测试去守，
+而注释管不住下一个人。这次把层直接写进名字。
+
+### 新规范：`层.域.动作`
+
+| 层 | 语义 | 触发方 | hook |
+| --- | --- | --- | --- |
+| `core.` | 引擎层：**任何宿主都有**（CLI / 库内嵌 / ACP 宿主） | core | `core.harness.init` / `core.harness.start`、`core.tool.*`、`core.llm.*`、`core.prompt.*`、`core.session.*`、`core.permission.check`、`core.agent.turn.end`、`core.bus.event` |
+| `cli.` | CLI 宿主层：只有走 CLI 的宿主才有 | cli | `cli.agent.stream`（UI 状态流）、`cli.command` / `cli.commands`、`cli.mcp.configure` |
+
+判层判据一句话：**"没有 UI 的宿主里这条还会触发吗？"** 会 → `core.`，只在有 UI 时 → `cli.`。
+（选 `core.`/`cli.` 而非 `engine.`/`ui.`：贴合上一轮"core 层与 cli 层要区分开"的原话，且与发包一一对应、可直接 grep 到 owner。）
+
+### 重命名映射（硬改名，不留旧名别名）
+
+| 旧名 | 新名 | 触发层 |
+| --- | --- | --- |
+| `harness.init` | `core.harness.init` | core |
+| `harness.start` | `core.harness.start` | core |
+| `tool.pool.assemble` | `core.tool.pool.assemble` | core |
+| `tool.pre.execute` | `core.tool.pre.execute` | core |
+| `tool.post.execute` | `core.tool.post.execute` | core |
+| `llm.params` | `core.llm.params` | core |
+| `llm.headers` | `core.llm.headers` | core |
+| `prompt.system.transform` | `core.prompt.system.transform` | core |
+| `session.compacting` | `core.session.compacting` | core |
+| `session.preModel` | `core.session.preModel` | core |
+| `permission.check` | `core.permission.check` | core |
+| `agent.turn.end` | `core.agent.turn.end` | core |
+| `bus.event` | `core.bus.event` | plugin 注册表（见下"取舍 ②"） |
+| `agent.stream` | `cli.agent.stream` | cli |
+| `mcp.configure` | `cli.mcp.configure` | cli |
+| `cli.commands` / `cli.command` | **不变** | cli（本来就是唯一自带层前缀的） |
+
+改名落点：`packages/**/*.ts` 的**带引号字面量**（hook key / `Hooks['x']` 索引 / `trigger('x')`）全部机械替换；
+注释与文档里的**裸词**另跑一遍，并加了"不后随 `(`"的保护 —— `await harness.start()` 是 Harness 的**方法**，
+与 hook `core.harness.start` 是两回事（这条区分也写进了契约注释）。实测只有 2 处会被误伤，都被保护挡住。
+
+### 顺带修掉的三个命名/契约问题（都不止是"名字难看"）
+
+**① `mcp.configure` 从来没被声明过。** 插件（mcp-server-registry）注册它，CLI 用
+`(harness.plugin as any)?.trigger?.('mcp.configure', ...)` 调它 —— **hook 名写错也不会编译报错**，
+`as any` + 可选链把两个保护都关了。现补进 `Hooks` 为 `cli.mcp.configure`，CLI 改强类型调用。
+契约层为它加了 `McpConfigureInput` / `McpServerConfigLike`：字段与 `@harness/mcp-client` 的
+`McpServerConfig` 结构一致但**刻意不 import mcp 包**（契约层只依赖 bus，不能反向依赖插件包），
+新增字段须两处同步，消费方 mcp-server-registry 负责收窄。
+
+**② `permission.check` 只声明、从未触发 —— herdr 的"等待用户决策"上报静默失效。**
+`resolvePermission` 只走 `engine.check()` →（必要时）`engine.ask()`，中间没有 trigger。
+现接线在 **check 之后、ask 之前**：这个位置是刻意的，只有此刻 `decision.behavior` 还可能是 `'ask'`，
+消费方才能分辨"真会弹窗"与"规则已记住、不会弹窗"；放到 ask 之后就永远看不到 ask 了。
+语义：插件可把 behavior 改成 allow/deny（直接采纳、不再询问），也可写 `updatedInput`（补回给 pipeline 重写工具入参）。
+新增 `packages/core/src/permission-hook.test.ts`（**不 import CLI**，5 条）：载荷正确、hook 早于 ask
+（改成 allow 后 ask 一次都不发生）、updatedInput 被采纳、allow/deny 路径同样触发。
+
+**③ core 组装工具洋葱管道时在摸插件管理器的私有字段。** `(this.plugin as any).hooks?.listFor('core.tool.pre.execute')`
+绕过了类型。`PluginManager` 新增公开只读 `listHooks(name)`，core 三处 `as any` 一并去掉；
+顺带把 `(this.plugin as any).trigger(...)` 收口成 `bindTrigger(plugin)` ——
+`trigger` 是类方法，实现里读 `this.hooks`，**直接把方法引用传出去会丢 this**，这是原来必须写 `as any` 的原因。
+
+### 三处刻意的取舍
+
+- **doom-loop 的重复确认不挂权限 hook**：它是独立闸门（同一工具+同一入参连续 N 次），且放行后工具仍会走
+  pipeline 再触发一次 hook ⇒ 挂上去会让消费方**双报**（正是续 156 那个"同一轮计两次"的老坑）。
+  宁可漏一个边界，不造重复计数；这一条已写进 AGENTS.md 与 hook 契约注释。
+- **`bus.event` 归 `core.`**：它既不是内核业务、也不经 `trigger`（由 plugin 管理器桥接 `bus.subscribeAll`，
+  卸载时自动退订）。两前缀词表里取更近的一侧，并在注释里写明它与别的 hook 机制不同 ——
+  宁愿"不完全贴切但只有两个前缀"，也不要为它开第三个。
+- **历史日志不回改**：`development-log.md` 的既有条目（含续 156 那张表）保持原名 —— 那是当时的记录，
+  回改反而抹掉"名字曾经分不清层"这条教训。参考文档（architecture / 各 plan / workspace-management 等）
+  已全部同步到新名；架构文档里顺带删掉了两个从未存在的 hook（`provider.auth`、`prompt.tools.transform`）
+  与一个不存在的 `session.message.created`，并注明"权威定义见 `packages/plugin/src/index.ts`"。
+
+另外记一笔：`docs/agent-harness-architecture.md` 的 `Hooks` 清单此前与实现已经漂移（列的 3 个 hook 根本不存在），
+说明**文档里的接口草图迟早会烂**。这次的做法是让文档注明权威来源，并把清单与实现对齐一次。
+
+**验证**：全仓 36 包 typecheck 0 错误；测试 **1522 pass / 0 fail**（core 87、cli 361、plugin 42、memory 58、
+subagent 114、mcp-server-registry 11、herdr 18 …），其中 core 新增 5 条权限 hook 守卫。
+已知既有问题（本次未动）：`@harness/permission` 没有任何测试文件，`bun test` 在该包报 "No tests found!" 并退 1，
+使根 `bun run test` 退出码为 1 —— 与本次改动无关，按 AGENTS.md"每模块必须有 `src/index.test.ts`"应补。
+
 ## 2026-09-19（续 156）hook 分层：引擎终态独立成 `agent.turn.end`，不再借用 `agent.stream`
 
 用户看上一轮的改动时点出一句：「core 层插件名与 cli 层插件名要区分开」（随后补明确：说的是

@@ -9,7 +9,7 @@
 提供**代码情报**能力：基于结构化 AST 的符号、引用、导航，使 Agent 能做高质量的定位与结构感知编辑。
 
 - 独立插件包 `packages/plugins/code-intel`，命名空间 `@harness/code-intel`。
-- 按"全功能插件化"约束实现，通过 `tool.pool.assemble` 注入工具，不与 core/CLI/workspace 耦合。
+- 按"全功能插件化"约束实现，通过 `core.tool.pool.assemble` 注入工具，不与 core/CLI/workspace 耦合。
 
 ## 2. 职责边界
 
@@ -53,7 +53,7 @@
 
 **反向 import（Java）：** `resolveImporters` 对 Java 按**包名匹配**——`collectJavaModuleInfo` 提取声明方 `package a.b;` 与外部导入方 `import a.b.Symbol;`，凡 import 限定名末段 == 符号且前缀 == 声明方包名，该导入方整文件纳入改名（声明+引用全改）。仅全限定名引用（无 import 绑定）或非本包的开发者不会被误拉入。
 
-## 4. 注入工具（`tool.pool.assemble`）
+## 4. 注入工具（`core.tool.pool.assemble`）
 
 | 工具 id | 作用 | 安全声明 |
 | --- | --- | --- |
@@ -81,8 +81,8 @@
 
 - 导出 `createCodeIntelPlugin(opts)` 工厂（可配 grammar 路径、忽略目录）与默认 `codeIntelPlugin`。
 - Hooks：
-  - `harness.init`：建符号索引上下文（消费 workspace 根路径）。
-  - `tool.pool.assemble`：注入上述工具。
+  - `core.harness.init`：建符号索引上下文（消费 workspace 根路径）。
+  - `core.tool.pool.assemble`：注入上述工具。
   - `cli.commands`（可选）：注册 `/code` 查看符号/来源。
 
 ## 7. 实施步骤

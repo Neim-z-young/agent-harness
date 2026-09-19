@@ -9,14 +9,14 @@
 ## 0. 结论先行
 
 两套能力都**不必从零起步** —— 基建已就绪（两级 workspace 目录、SKILL.md 加载器、会话压缩记忆、
-`prompt.system.transform` 注入链）。真正的缺口只有三处：
+`core.prompt.system.transform` 注入链）。真正的缺口只有三处：
 
 1. **没有跨会话记忆的存储与注入**（现有的 `CompactMemory` 是**会话内**压缩摘要，换会话即失）；
 2. **技能系统只读**（`SkillManager` 有 load/reload/enable/disable，**没有 save/create**）；
 3. **新发现的风险**：注入到 system prompt 的内容**可能被 ACP 折叠** —— 内核与 adapter 都未对
-   `role: 'system'` 做特殊处理（grep 无命中），而 `session.preModel` 会把 system 消息与普通消息
+   `role: 'system'` 做特殊处理（grep 无命中），而 `core.session.preModel` 会把 system 消息与普通消息
    一并交给压缩管道 ⇒ 初稿据此推断"可能被压掉"。**已实证推翻**：core 合成的 system 消息
-   （走 `prompt.system.transform`）**拿不到 `<acp>` ref 标签** ⇒ 模型无从把它圈进压缩范围
+   （走 `core.prompt.system.transform`）**拿不到 `<acp>` ref 标签** ⇒ 模型无从把它圈进压缩范围
    ⇒ ACP 不会压缩它（见 §3.4 的逐条实测）。记忆注入因此是安全的，B1 解除。
 
 建议两条线并行推进，但**记忆先做"读"、技能锻造后做"写"**：读路径零风险且立刻有收益
@@ -39,7 +39,7 @@
 |---|---|---|
 | 两级 workspace 目录 | `workspace/src/index.ts:24-76` | `user`(dataDir) / `project`(<cwd>/.harness)，各有 `plugins`/`skills`/`agents`；`loadDirs` 给出扫描顺序（后者覆盖前者） |
 | SKILL.md 加载器 | `skill/src/index.ts:68-134` | frontmatter（name/description/paths/agentBind/userInvocable）+ Markdown 正文；来源标签 `user`/`project`/`mcp`/`plugin`；支持目录式 `<name>/SKILL.md` 与单文件式 |
-| 技能注入插件（**最佳范式**） | `core/src/index.ts:2506-2524` | `core.skill-injection`：内部插件 + `prompt.system.transform` 注入。记忆注入应照抄此形态 |
+| 技能注入插件（**最佳范式**） | `core/src/index.ts:2506-2524` | `core.skill-injection`：内部插件 + `core.prompt.system.transform` 注入。记忆注入应照抄此形态 |
 | 技能管理命令 | `cli/src/index.ts:2035-2070` | list / enable / disable / reload |
 | 会话压缩记忆 | `session/src/index.ts:146-157`、`core/src/index.ts:911-1004` | `CompactMemory{ round, summaryText, memoryStartAt }`，存 `session.meta`；压缩时累积拼接，经 `appendCompactionMemory` 注入 system prompt |
 | 技能目录装配 | `cli/src/index.ts:2414-2418` | `skillDirs: [user, project]` |
@@ -125,7 +125,7 @@ L2 不属长期记忆，但应作为 **L1 的候选来源**：压缩时若发现
 ### 3.3 注入与预算
 
 - **注入点**：照抄 `core.skill-injection`（`core/src/index.ts:2506`）建 `core.memory-injection` 内部插件，
-  挂 `prompt.system.transform`：注入 `user MEMORY.md` → `project MEMORY.md` → L0 指令片段。
+  挂 `core.prompt.system.transform`：注入 `user MEMORY.md` → `project MEMORY.md` → L0 指令片段。
 - **预算**：MEMORY.md **前 200 行或 25KB**（与 Claude Code 一致，实测过的量级）；主题文件不预载，
   靠既有读文件工具按需读取 —— 索引里的"一句话 + 相对路径"就是检索入口。
 - **去重与优先级**：project 覆盖 user（与 skills/agents 的覆盖规则一致：后者覆盖前者）。
@@ -135,7 +135,7 @@ L2 不属长期记忆，但应作为 **L1 的候选来源**：压缩时若发现
 > 初稿曾推断"可能被折叠"（理由是内核与 adapter 都无 `role === 'system'` 分支）。
 > **该推断已被实证推翻** —— 这是本轮最有价值的结论，因为它直接决定了实现方式。
 
-**实证方法**：走真实插件链路（`@harness/acp-context` 的 `session.preModel` → `compress` 工具 →
+**实证方法**：走真实插件链路（`@harness/acp-context` 的 `core.session.preModel` → `compress` 工具 →
 再 preModel），在 system 提示词里放独占标记 `SYSTEM_MEMORY_MARKER_9f3a`，压缩后检查标记是否存活。
 
 **结果**：
@@ -155,12 +155,12 @@ L2 不属长期记忆，但应作为 **L1 的候选来源**：压缩时若发现
   assistant  m2#x                    ref=m00002
 ```
 
-core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMessages` 的 `sysParts`）
+core 合成的 system 消息（走 `core.prompt.system.transform` ⇒ `_buildStepMessages` 的 `sysParts`）
 **拿不到 ref 标签** ⇒ 模型在 `<acp>` 标签里看不到它 ⇒ **根本无法把它圈进压缩范围**。
 （ACP 自己那条 `acp_system_*` 有标签，说明"system role"并非天然免疫 —— 免疫来自**不打标签**，
 即来自它走的是 core 的 sysParts 通道而非 ACP 的消息列表。这一点要在实现时守住。）
 
-**由此得出的实现约束**：记忆/技能注入**必须**走 `prompt.system.transform`（core 的 sysParts），
+**由此得出的实现约束**：记忆/技能注入**必须**走 `core.prompt.system.transform`（core 的 sysParts），
 不要塞进 messages 数组冒充 system —— 后者会被 ACP 纳入消息列表、打上 ref、进而可被折叠。
 
 **剩余注意（不是正确性问题，是成本问题）**：system 不被压缩 ⇒ 它占的窗口**永远不会被回收**。
@@ -218,11 +218,11 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 
 | 场景 | 压缩机制 | flush 信号 |
 |---|---|---|
-| ACP 开启 | 内核折叠（模型调 `compress` 工具） | `tool.post.execute`（`toolId === 'compress'`） |
-| **ACP 关闭** | **session compaction**（`compactIfNeeded` / `/compact`） | **`session.compacting` hook**（core:952，已实证触发） |
+| ACP 开启 | 内核折叠（模型调 `compress` 工具） | `core.tool.post.execute`（`toolId === 'compress'`） |
+| **ACP 关闭** | **session compaction**（`compactIfNeeded` / `/compact`） | **`core.session.compacting` hook**（core:952，已实证触发） |
 
 ⚠️ 原设计只写了 compress 工具这一源 —— 而 **ACP 关闭时根本没有 compress 工具** ⇒ flush 永不触发
-⇒ 记忆只能靠兜底（N 轮）生效。补上 `session.compacting` 后两种场景都覆盖。
+⇒ 记忆只能靠兜底（N 轮）生效。补上 `core.session.compacting` 后两种场景都覆盖。
 
 **⑤ 两个实现细节（否则会出隐性 bug）**：
 
@@ -234,7 +234,7 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
   这样外部修改会在下次 flush 生效，且 system 内容在两次 flush 之间保持稳定（缓存友好）。
 
 **⑥ `compress` 信号的覆盖面**：无论 nudge 引导的压缩还是模型自主压缩，最终都走同一个 `compress` 工具
-⇒ 一个信号即可全覆盖；次选是比对 ACP state 的 blocks 数量变化。（④ 里写的 `tool.post.execute` 是
+⇒ 一个信号即可全覆盖；次选是比对 ACP state 的 blocks 数量变化。（④ 里写的 `core.tool.post.execute` 是
 当时的设想，实查后不可用 —— 见 ⑦。）
 
 **⑤ 一个反直觉的点**：把易变内容**移到 system 末尾**没有用 —— 前缀缓存从开头分块匹配，
@@ -247,15 +247,15 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 - **兜底轮数取 15**（原建议 10）：它的定位是"防静默失效的兜底"而非节流目标（正常发布由压缩触发，
   那时 system 变更免费），只需"大到平时不抢先、小到长时间不压缩时也能生效"。**单位是"轮"**
   （一次「用户输入 → Agent 跑完」），**不是**模型调用 —— 一轮内多步只算 1。
-- **flush 信号的真实形态**：ACP 那条**不能用** `tool.post.execute`（实查：其 ctx **没有 toolId**），
-  改用 `agent.stream` 的 `status.toolId === 'compress'`；`session.compacting` 那条不变。
+- **flush 信号的真实形态**：ACP 那条**不能用** `core.tool.post.execute`（实查：其 ctx **没有 toolId**），
+  改用 `cli.agent.stream` 的 `status.toolId === 'compress'`；`core.session.compacting` 那条不变。
 - **`turn_end` 必须由 core 广播**（原设计默认"上层会广播"）：实查发现全仓只有 CLI 会 ——
   内嵌 / ACP 宿主自己消费事件流时，靠它驱动的兜底计数**永不推进**。终态是引擎的事实
-  ⇒ 归 core 收口，但**走独立 hook `agent.turn.end`**（不是 `agent.stream`：后者是 UI 消费层的
+  ⇒ 归 core 收口，但**走独立 hook `core.agent.turn.end`**（不是 `cli.agent.stream`：后者是 UI 消费层的
   状态流，引擎往里塞事件会让同一 hook 名由两层分别触发、消费方分不清来源）。
 - **只数主会话的轮**：跳过 `mode === 'subagent'`，并比对主会话 sessionId（teammate / coordinator
   另开 session，不过滤会让攒批提前放行）。
-- **⚠️ 压缩信号仍只有 UI 通道**：`agent.stream` 的 `status.toolId === 'compress'` 在无 UI 宿主里
+- **⚠️ 压缩信号仍只有 UI 通道**：`cli.agent.stream` 的 `status.toolId === 'compress'` 在无 UI 宿主里
   同样收不到，那时只剩"轮数兜底 + 命令写入"。要根治得让引擎层也暴露"工具执行"信号（未做）。
 - **参数出口**：`config.json → memory`（`flushAfterTurns` / `maxLines` / `maxBytes` / `disableInjection`），
   启用仍是 `plugins: ["memory"]`。这段配置**错了不会自己报错**，因此非法值一律丢弃 + 启动告警 + 概览打印。
@@ -286,7 +286,7 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 | 会碰到 system 注入吗 | ❌（无 ref 标签，见 §3.4） | ❌（system 不在 session.messages 里） |
 | 触发频率 | **每轮**（nudge 引导） | **低频**：boot 一次 + `/compact auto` |
 
-**② 连带影响之一：`session.compacting` 已实证触发，但很稀疏**。
+**② 连带影响之一：`core.session.compacting` 已实证触发，但很稀疏**。
 实测中挂探针插件确认它被调用 1 次（window=12）。它可用作 flush 信号（见 §3.7④），
 但**只在 boot 与 `/compact auto` 时触发** ⇒ ACP 关闭时"下次压缩"可能等很久
 ⇒ **兜底（N 轮 / 会话结束）从"保险"升级为主要路径之一**，M2 实现时不能省。
@@ -311,7 +311,7 @@ project 级？反之？需实测决定）而不是静默丢弃。
 | **M0** ✅ | ~~验证 §3.4 的折叠风险~~（已完成，结论：不会被压缩）；~~`WorkspaceLevel.memory` + `loadDirs.memory`~~（已完成） | 目录字段可用（`ws.user.memory` / `ws.project.memory` / `ws.loadDirs.memory`）；记忆暂不注入。顺手修了 `/workspace` 输出里 agents 行漏路径的既有 bug |
 | **M1** ✅ | ~~补 G1/G2 通道~~ + ~~加载 L0（`AGENTS.md` 两级）~~ + ~~L1 索引注入~~ + ~~`/memory list\|show\|path`~~（已完成） | ✅ 端到端实测：主 Agent 请求的 system 含 `<memory>` 与索引/指令内容；subagent 不含；空索引不注入；注入量 ≤25KB |
 | **M2** ✅ | ~~写入路径 A~~ + ~~`/memory add\|rm\|reload`~~ + ~~体积/去重校验~~（已完成）；**§3.7 分级注入刻意留到 M3**（理由见 dev-log 续 153：mtime 缓存已保证"文件不变则 system 不变"，变更本就低频，而分级注入会让"写入后何时生效"不可预期，宜与 flush 双源一起做） | ✅ 实测：超限被拒且文件未变；去重生效；原子写无残留；`/memory add` 写入 → 下一轮注入读到（端到端） |
-| **M3** ✅ | ~~§3.7 分级注入（flush 双源 + 兜底）~~ + ~~L2→L1 沉淀提示（压缩时一次性）~~（已完成）；子代理隔离在 M1 已落地 | ✅ 实测：外部改动默认攒批不立即生效；ACP `compress` / `session.compacting` 均触发 flush；提示一次性；命令写入是例外（立即）；攒够 N 轮兜底放行 |
+| **M3** ✅ | ~~§3.7 分级注入（flush 双源 + 兜底）~~ + ~~L2→L1 沉淀提示（压缩时一次性）~~（已完成）；子代理隔离在 M1 已落地 | ✅ 实测：外部改动默认攒批不立即生效；ACP `compress` / `core.session.compacting` 均触发 flush；提示一次性；命令写入是例外（立即）；攒够 N 轮兜底放行 |
 | **M3.1** ✅ | 复审三处（见 §3.7 ⑦）：~~`turn_end` 广播收口到 core~~（原只有 CLI 会发 ⇒ 内嵌/ACP 宿主下兜底静默失效）+ ~~轮数默认 5→15 且只数主会话~~ + ~~`config.json → memory` 参数出口~~ + ~~快照声明/防重复/截断要求清理~~ | ✅ 实测：core 侧广播 3 例（含 subagent 不发、中断路径）；CLI 侧断言 `turn_end` 只出现一次；`config.json → memory` 端到端（`/memory` 打出的即配置值）；非法值被拒并回落默认 |
 
 ---
@@ -392,7 +392,7 @@ project 级？反之？需实测决定）而不是静默丢弃。
 | # | 阻塞点 | 等级 | 说明 |
 |---|---|---|---|
 | B1 | ~~ACP 可能折叠 system 注入的记忆~~ | **✅ 已解除** | §3.4 实证：core 合成的 system 无 ref 标签 ⇒ 模型选不中它。**新的成本项**：system 不被压缩 ⇒ 其占用**永不回收**，注入预算（200 行/25KB）是硬约束 |
-| B9 | system 变更破坏前缀缓存 | 中 | §3.7：按来源分级注入（显式立即 / 自动攒到下次压缩 / 技能立即）+ 兜底 flush；**flush 必须双源**（ACP 的 compress 工具 + `session.compacting`），否则 ACP 关闭时永久挂起 |
+| B9 | system 变更破坏前缀缓存 | 中 | §3.7：按来源分级注入（显式立即 / 自动攒到下次压缩 / 技能立即）+ 兜底 flush；**flush 必须双源**（ACP 的 compress 工具 + `core.session.compacting`），否则 ACP 关闭时永久挂起 |
 | B10 | system 预算三笔共享、互相挤占 | 中 | §3.8③：技能注入 + 记忆 + CompactMemory 摘要都常驻 system 且永不回收 ⇒ 需按总和设上限 + 超限截断策略（不可静默丢弃） |
 | B11 | pending 集合的持久化与"生效快照" | 小 | §3.7⑤：pending 只放内存会重启即丢；注入必须用"生效快照"而非实时读文件（否则外部编辑会让 system 每轮抖动、缓存全失效） |
 | B2 | `WorkspaceLevel` 需新增 `memory` | 小 | 加字段 + loadDirs；会波及所有 Fake workspace 测试替身 |
@@ -442,25 +442,25 @@ M0（目录字段）──► M1（注入 + /memory read）──► F0/F1（技
 | `/memory`（list/read/edit/delete） | `cli.commands` + `cli.command` hook | **关键**：CLI 注入的 `CliCommandInput` 已含 `workspace`（`app.workspace`，见 `cli/src/index.ts:3474`）与 `harness` ⇒ 路径与运行时操作都能拿到，不必猜目录 |
 | `/skill-forge`（生成 → 确认 → 落盘 → reload） | 同上 + `harness.skillManager.reload(id)` | `SkillManager` 已有 `reload`（`skill/src/index.ts:127`） |
 | 记忆/技能**写入** | 插件内直接 `fs` 写 | **天然不经过工具权限通道** ⇒ 正好满足决策 B4「豁免审批」，无需改权限引擎 |
-| 重复流程检测 | `agent.stream` hook（2026-09-19 新增） | 统计工具序列即可。⚠️ 该 hook 是 **UI 消费层**的（只有走 CLI 的宿主才触发）⇒ 要做 F3 得先有引擎层的"工具执行"信号，否则内嵌宿主下同样静默失效（同 §3.7 ⑦ 的教训） |
-| 注入 system prompt | `prompt.system.transform` hook | 范式照抄 `core.skill-injection`（`core/src/index.ts:2506`）；**已实证不会被 ACP 压缩**（§3.4），注入时机见 §3.7 |
-| 压缩时提示沉淀（L2→L1） | `session.compacting` hook | 已有 |
+| 重复流程检测 | `cli.agent.stream` hook（2026-09-19 新增） | 统计工具序列即可。⚠️ 该 hook 是 **UI 消费层**的（只有走 CLI 的宿主才触发）⇒ 要做 F3 得先有引擎层的"工具执行"信号，否则内嵌宿主下同样静默失效（同 §3.7 ⑦ 的教训） |
+| 注入 system prompt | `core.prompt.system.transform` hook | 范式照抄 `core.skill-injection`（`core/src/index.ts:2506`）；**已实证不会被 ACP 压缩**（§3.4），注入时机见 §3.7 |
+| 压缩时提示沉淀（L2→L1） | `core.session.compacting` hook | 已有 |
 
 ### 9.B 需要补的通道（core 侧小改，**每处都对所有插件有益**）
 
 | # | 缺口 | 为什么插件绕不过去 | 建议 |
 |---|---|---|---|
 | ~~G1~~ ✅ | **`PluginContext` / `PromptInput` 都没有 workspace、cwd**（已补：`PluginContext.workspace` + core 注入 + CLI 传实际 workspace） | 注入发生在 **prompt 构建期**，入参只有 `agentId`/`sessionId`（`plugin/src/index.ts:236`）；install 期也拿不到。变通做法是插件自己用 `process.cwd()` + `homedir()` 拼路径 —— 但 CLI 支持 `--cwd`，`process.cwd()` **未必等于** `workspace.cwd` ⇒ 会拼错目录（正是本项目栽过两次的"路径口径分裂"） | `PluginContext` 增 `workspace`（core 一处赋值，约 5 行）；`PromptInput` 增可选 `cwd` |
-| ~~G2~~ ✅ | **判断"当前是否子 Agent"无通道**（已补：`PromptInput.agentMode`；端到端验证 subagent 请求不含记忆） | 决策 B6 要求不注入 subagent，但注入 hook 拿不到 agent 定义（`mode`）。变通：`agent.stream` 的 `AgentStatusSnapshot.mode` **能拿到 mode**（刚加的字段），但注入发生在事件之前 ⇒ 首轮无从判断 | `PromptInput` 增 `agentMode`（core 一处，约 5 行） |
+| ~~G2~~ ✅ | **判断"当前是否子 Agent"无通道**（已补：`PromptInput.agentMode`；端到端验证 subagent 请求不含记忆） | 决策 B6 要求不注入 subagent，但注入 hook 拿不到 agent 定义（`mode`）。变通：`cli.agent.stream` 的 `AgentStatusSnapshot.mode` **能拿到 mode**（刚加的字段），但注入发生在事件之前 ⇒ 首轮无从判断 | `PromptInput` 增 `agentMode`（core 一处，约 5 行） |
 | G3 | `CliCommandInput.harness?: unknown` 类型过松 | reload/agent 访问要靠 cast，编译期无保障 | 给 `CliCommandInput` 增明确方法（如 `reloadSkill(id)`），或至少类型化 harness |
 
 ### 9.C 关于"记忆被 ACP 折叠"：无需规避（已实证）
 
 初稿曾设计一条"靠 hook 顺序规避"的路径（external 批晚于 internal ⇒ 记忆插件的
-`session.preModel` 排在 `context.acp` 之后 ⇒ 裁剪完再插入）。实证（§3.4）表明**不需要**：
+`core.session.preModel` 排在 `context.acp` 之后 ⇒ 裁剪完再插入）。实证（§3.4）表明**不需要**：
 
 - core 合成的 system 消息**没有 ref 标签** ⇒ 模型选不中它 ⇒ ACP 不压缩它。
-- 因此记忆**就应该**走 `prompt.system.transform`，与技能注入同一条路（`core.skill-injection` 范式）。
+- 因此记忆**就应该**走 `core.prompt.system.transform`，与技能注入同一条路（`core.skill-injection` 范式）。
 - ⚠️ 唯一要守住的边界：**不要把记忆塞进 messages 数组冒充 system** —— 那会进入 ACP 消息列表、
   被打上 ref、变成可折叠对象。这正是"顺序规避法"的隐患所在，所以弃用它反而更安全。
 
@@ -487,5 +487,5 @@ core 侧               PluginContext.workspace、PromptInput.{cwd,agentMode}（�
 （G1~G3），不是架构性障碍。
 
 原先挂着的最大不确定项（B1：记忆会不会被 ACP 压掉）**已实证解除**（§3.4），
-且结论对插件方案更有利：记忆走 `prompt.system.transform` 即可，**不需要**任何顺序技巧。
+且结论对插件方案更有利：记忆走 `core.prompt.system.transform` 即可，**不需要**任何顺序技巧。
 因此现在没有任何"必须先验证才能动工"的前置项 —— 可以直接从 M0 的目录字段开工。
