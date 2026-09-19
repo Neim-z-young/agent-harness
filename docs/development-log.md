@@ -1,5 +1,43 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 154）记忆能力 M3：分级注入（flush 双源）+ 压缩时提示沉淀
+
+M3 做两件在 M2 时特意推迟的事（当时理由是"变更本就低频、而分级注入会让生效时机不可预期，
+宜与 flush 双源一起做"），现在条件齐了：`agent.stream` hook 已在，且 M2 的 mtime 缓存语义已稳定。
+
+**分级发布 `MemoryPublisher`（§3.7 落地）**
+
+```
+内容有变 → 不立即换 system，而是标记 dirty、继续用旧内容
+         → 直到以下任一信号：
+             ① 发生压缩（ACP compress 工具 / session compaction）⇒ flush（搭车，边际缓存成本≈0）
+             ② 攒够 N 轮（默认 5，`turn_end` 计数）⇒ flush（兜底，防"永远等不到压缩"）
+             ③ 显式写入（/memory add|rm）或 /memory reload ⇒ flush（用户有即时预期）
+             ④ flushAfterTurns: 0 ⇒ 关闭攒批（等价 M2 行为，测试用）
+```
+
+- 首次注入必须立即发布（否则永不注入）——**不变的铁律**。
+- 内容**变回**已发布状态时清除 dirty（例如用户撤销了编辑）：否则会带着一个永远不会被发布的
+  状态空转、并在攒够轮数后白发布一次。这条是**测试抓出来的**（我最初只写了 `dirty = true`）。
+
+**flush 双源怎么识别（一个实查出来的约束）**
+`tool.post.execute` 的 ctx **没有 toolId** ⇒ 无法用它识别 `compress`。改用 `agent.stream` 的
+`status.toolId`（M1 之前刚加的字段正好派上用场）：`eventType === 'tool_call_start' &&
+status.toolId === 'compress'` ⇒ ACP 压缩。session compaction 则由 `session.compacting` hook 覆盖。
+两者都触发 flush + 一次性沉淀提示，覆盖"ACP 开 / 关"两种状态（§3.8 的结论在此落地）。
+
+**压缩时提示沉淀（L2 → L1）**：`buildReflectionHint()` 生成一次性提示，指引模型把值得长期保留的
+纠正/决策**用 write 工具追加到记忆索引**，并明确"只在确有值得记的内容时才写"（避免为完成提示
+制造垃圾记忆）。它搭在压缩这一时机上 ⇒ 额外的 system 变更是**免费**的（缓存已失效）。
+
+**顺带**：`/memory` 的 list 现在显示注入时机与"是否有未发布变更（已积 N 轮）"，便于排障。
+
+**验证**：memory 49 例（+12：分级发布器 6 + 提示文本 1 + 插件级 5，覆盖"外部改动攒批不立即生效"、
+"ACP 压缩触发 flush 且提示只出现一次"、"session compaction 触发 flush"、"攒够轮数兜底放行"、
+"命令写入是例外：不参与攒批"）；全仓 typecheck 0 错误；cli 全绿。
+
+至此记忆能力的 M0~M3 全部落地。**未做**：技能锻造（F0~F3，独立一条线）。
+
 ## 2026-09-19（续 153）记忆能力 M2：写入路径 + 三条硬规则
 
 M2 做"写入与校验"。**分级注入（§3.7）本轮刻意未做**，理由见下。

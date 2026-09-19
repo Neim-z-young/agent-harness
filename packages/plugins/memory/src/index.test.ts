@@ -5,8 +5,10 @@ import { join } from 'node:path'
 import type { CliCommandInput, Hooks, PluginContext, PluginWorkspaceView } from '@harness/plugin'
 import {
   MEMORY_INDEX_MAX_LINES,
+  MemoryPublisher,
   MemoryReader,
   MemoryStore,
+  buildReflectionHint,
   createMemoryPlugin,
   readCapped,
   renderMemorySection,
@@ -424,5 +426,140 @@ describe('/memory 写入命令', () => {
     const parts: string[] = []
     await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     expect(parts.join('\n')).toContain('外部改写的内容')
+  })
+})
+
+// ===== M3：分级注入（§3.7）=====
+
+describe('MemoryPublisher（分级发布）', () => {
+  it('首次注入 ⇒ 立即发布（否则永远不注入）', () => {
+    const p = new MemoryPublisher()
+    expect(p.onInject('A')).toBe('A')
+    expect(p.state().published).toBe(true)
+  })
+
+  it('内容有变 ⇒ 攒批：继续注入旧内容，标记 dirty', () => {
+    const p = new MemoryPublisher({ flushAfterTurns: 5 })
+    p.onInject('A')
+    expect(p.onInject('B')).toBe('A') // 仍注入旧内容
+    expect(p.state().dirty).toBe(true)
+    expect(p.state().dirtyTurns).toBe(0)
+  })
+
+  it('flush（压缩发生）⇒ 下次注入发布最新内容', () => {
+    const p = new MemoryPublisher({ flushAfterTurns: 5 })
+    p.onInject('A')
+    p.onInject('B')
+    p.flush()
+    expect(p.onInject('B')).toBe('B')
+    expect(p.state().dirty).toBe(false)
+  })
+
+  it('兜底：攒够轮数仍无压缩 ⇒ 放行（防止永远等不到压缩）', () => {
+    const p = new MemoryPublisher({ flushAfterTurns: 3 })
+    p.onInject('A')
+    p.onInject('B')
+    p.onTurnEnd()
+    p.onTurnEnd()
+    expect(p.onInject('B')).toBe('A') // 还差一轮
+    p.onTurnEnd()
+    expect(p.onInject('B')).toBe('B') // 第 3 轮后放行
+  })
+
+  it('flushAfterTurns=0 ⇒ 关闭攒批（任何变更立即生效，等价 M2 行为）', () => {
+    const p = new MemoryPublisher({ flushAfterTurns: 0 })
+    p.onInject('A')
+    expect(p.onInject('B')).toBe('B')
+  })
+
+  it('内容回退到已发布状态 ⇒ 不再算 dirty（避免无意义攒批）', () => {
+    const p = new MemoryPublisher({ flushAfterTurns: 3 })
+    p.onInject('A')
+    p.onInject('B')
+    expect(p.state().dirty).toBe(true)
+    p.onInject('A') // 又变回来了（例如撤销了编辑）
+    p.onTurnEnd()
+    expect(p.state().dirtyTurns).toBe(0)
+    expect(p.onInject('A')).toBe('A')
+  })
+})
+
+describe('buildReflectionHint', () => {
+  it('含目标文件路径与写入格式，并要求"只在真有内容时写"', () => {
+    const h = buildReflectionHint('/home/u/.harness/memory/MEMORY.md')
+    expect(h).toContain('/home/u/.harness/memory/MEMORY.md')
+    expect(h).toContain('- ')
+    expect(h).toContain('只在确有值得记的内容时写')
+  })
+})
+
+describe('插件级：flush 三源与一次性提示', () => {
+  async function hooksOf(over: Record<string, unknown> = {}) {
+    const w = ws()
+    const { hooks } = await install({ flushAfterTurns: 5, ...over })
+    return { hooks, w }
+  }
+  const sys = { agentId: 'default', sessionId: 's' }
+  const inject = async (hooks: Hooks) => {
+    const parts: string[] = []
+    await hooks['prompt.system.transform']!(sys, parts)
+    return parts.join('\n')
+  }
+
+  it('外部改动（直接改文件）默认攒批：注入仍是旧内容', async () => {
+    const { hooks, w } = await hooksOf()
+    const { hooks: h2 } = await install() // 独立实例，避免互相干扰
+    void h2
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始内容', out: () => {}, sessionId: 's' })
+    expect(await inject(hooks)).toContain('初始内容')
+
+    // 模拟外部编辑（不经命令 ⇒ 不 flush）
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 外部改写\n')
+    expect(await inject(hooks)).toContain('初始内容') // 仍未发布
+    expect(await inject(hooks)).not.toContain('外部改写')
+  })
+
+  it('ACP 压缩（tool_call_start compress）⇒ flush + 一次性沉淀提示', async () => {
+    const { hooks, w } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
+
+    hooks['agent.stream']!({ eventType: 'tool_call_start', status: { agentId: 'd', phase: 'tool', toolId: 'compress' } })
+    const first = await inject(hooks)
+    expect(first).toContain('压缩前的改动')       // 已发布
+    expect(first).toContain('<memory-hint>')       // 提示出现
+    const second = await inject(hooks)
+    expect(second).toContain('压缩前的改动')
+    expect(second).not.toContain('<memory-hint>')  // 一次性
+  })
+
+  it('session compaction（session.compacting）也触发 flush', async () => {
+    const { hooks, w } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- session 压缩时的改动\n')
+
+    hooks['session.compacting']!({ agentId: 'd', sessionId: 's' } as never, {} as never)
+    expect(await inject(hooks)).toContain('session 压缩时的改动')
+  })
+
+  it('兜底：攒够轮数（turn_end）后发布，即使从未压缩', async () => {
+    const { hooks, w } = await hooksOf({ flushAfterTurns: 2 })
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 攒批的改动\n')
+
+    expect(await inject(hooks)).toContain('初始')
+    hooks['agent.stream']!({ eventType: 'turn_end', status: { agentId: 'd', phase: 'idle' } })
+    hooks['agent.stream']!({ eventType: 'turn_end', status: { agentId: 'd', phase: 'idle' } })
+    expect(await inject(hooks)).toContain('攒批的改动')
+  })
+
+  it('命令写入是例外：立即生效，不参与攒批', async () => {
+    const { hooks } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 第一条', out: () => {}, sessionId: 's' })
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 第二条', out: () => {}, sessionId: 's' })
+    expect(await inject(hooks)).toContain('第二条')
   })
 })

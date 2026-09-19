@@ -380,6 +380,101 @@ export class MemoryStore {
   }
 }
 
+// ===== 分级注入（M3，§3.7）=====
+
+export interface PublishOptions {
+  /**
+   * 攒批轮数：连续多少**轮**检测到变更后才发布（默认 5）。
+   * `0` = 关闭攒批（任何变更立即生效，等价 M2 行为）。
+   */
+  flushAfterTurns?: number
+}
+
+/**
+ * 分级发布器：决定**什么时候**把新的记忆文本真正换进 system prompt。
+ *
+ * 为什么需要它（§3.7）：system 在请求最前面，任何变更都让其后所有分块的前缀缓存失效。
+ * 而"压缩"本身已经改写了消息序列 ⇒ 缓存必然失效 ⇒ 把 system 变更**搭车**到那一刻，
+ * 边际成本≈0；反过来，在两次压缩之间插一次变更，等于额外制造一次全量失效。
+ *
+ * 行为：
+ * - 首次（进程内无已发布内容）⇒ 立即发布（否则永远不注入）
+ * - 内容与已发布一致 ⇒ 什么都不做（这正是"文件不变 ⇒ system 逐字不变"的实现）
+ * - 内容有变 ⇒ 标记 dirty，**继续用旧内容**；直到 flush 信号或攒够 `flushAfterTurns` 轮
+ * - `flush()`（压缩发生 / 显式写入 / reload）⇒ 下次注入即发布最新内容
+ */
+export class MemoryPublisher {
+  private published: string | null = null
+  private dirty = false
+  private dirtyTurns = 0
+  private forced = false
+
+  constructor(private readonly opts: PublishOptions = {}) {}
+
+  private get flushAfter(): number {
+    return this.opts.flushAfterTurns ?? 5
+  }
+
+  /** 每轮注入时调用；返回**本次应当注入**的文本 */
+  onInject(candidate: string): string {
+    if (this.forced || this.published === null || this.flushAfter <= 0) {
+      this.publish(candidate)
+      return this.published!
+    }
+    // 双向更新：内容又变回已发布的样子（例如用户撤销了编辑）时也要清掉 dirty，
+    // 否则会带着一个永远不会被发布的"待发布"状态空转、并在攒够轮数后白发布一次
+    this.dirty = candidate !== this.published
+    return this.published
+  }
+
+  /** 轮末推进（`turn_end`）：dirty 状态攒够轮数则安排下一次发布（兜底，防止永远等不到压缩） */
+  onTurnEnd(): void {
+    if (!this.dirty || this.forced) return
+    this.dirtyTurns += 1
+    if (this.dirtyTurns >= this.flushAfter) this.forced = true
+  }
+
+  /** 立即安排发布（压缩发生 / 显式写入 / reload） */
+  flush(): void {
+    this.forced = true
+  }
+
+  private publish(candidate: string): void {
+    this.published = candidate
+    this.dirty = false
+    this.dirtyTurns = 0
+    this.forced = false
+  }
+
+  /** 诊断（`/memory` 用） */
+  state(): { published: boolean; dirty: boolean; dirtyTurns: number; flushAfterTurns: number } {
+    return {
+      published: this.published !== null,
+      dirty: this.dirty,
+      dirtyTurns: this.dirtyTurns,
+      flushAfterTurns: this.flushAfter,
+    }
+  }
+}
+
+/**
+ * 压缩后的一次性"沉淀提示"。
+ *
+ * 触发时机就是缓存已经失效的那一刻（压缩），所以它多出来的 system 变更是**免费**的
+ * —— 与 §3.7 的搭车逻辑同源。刻意写成一次性、并要求"只在真有值得记的内容时写"，
+ * 避免模型为了完成提示而制造垃圾记忆。
+ */
+export function buildReflectionHint(indexPath: string): string {
+  return [
+    '<memory-hint>',
+    '刚刚发生了上下文压缩（部分历史已被折叠成摘要）。',
+    `如果刚才的对话里有值得**长期**保留的纠正、决策或偏好，请用 write 工具把它追加到：${indexPath}`,
+    '格式：一行一条，以 `- ` 开头；只写一句结论，细节请另建主题文件并用 `read` 工具按需读取。',
+    '只在确有值得记的内容时写，不必为了响应本提示而写。',
+    '</memory-hint>',
+  ].join('\n')
+}
+
 // ===== 插件 =====
 
 export interface MemoryPluginOptions {
@@ -390,6 +485,11 @@ export interface MemoryPluginOptions {
   maxBytes?: number
   /** 关闭注入（只保留 /memory 命令）——用于对照实验 */
   disableInjection?: boolean
+  /**
+   * 攒批轮数（§3.7 分级注入）：`0` = 任何变更立即生效（M2 行为，测试常用），
+   * 缺省 5 轮 —— 期间若发生压缩则立即发布（搭车省缓存）。
+   */
+  flushAfterTurns?: number
   id?: string
 }
 
@@ -440,6 +540,11 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
         ]
       }
 
+      const publisher = new MemoryPublisher({
+        ...(options.flushAfterTurns != null ? { flushAfterTurns: options.flushAfterTurns } : {}),
+      })
+      let pendingHint: string | null = null
+
       const hooks: Hooks = {
         async 'prompt.system.transform'(input, parts) {
           if (options.disableInjection) return
@@ -448,8 +553,34 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
             injectedSkips += 1
             return
           }
-          const section = renderMemorySection(load())
-          if (section) parts.push(section)
+          // 分级发布：新内容不一定立刻进 system（攒到压缩那一刻或攒够轮数），见 MemoryPublisher
+          let text = publisher.onInject(renderMemorySection(load()))
+          if (pendingHint) {
+            text = text ? `${text}\n\n${pendingHint}` : pendingHint
+            pendingHint = null // 一次性
+          }
+          if (text) parts.push(text)
+        },
+
+        /**
+         * 压缩信号（flush 双源之一）：ACP 压缩由模型调 `compress` 工具触发，而
+         * `tool.post.execute` 的 ctx 里**没有 toolId** ⇒ 只能从事件流识别。
+         * `agent.stream` 的 `status.toolId` 恰好带这个信息。
+         */
+        'agent.stream'(signal) {
+          if (signal.eventType === 'tool_call_start' && signal.status?.toolId === 'compress') {
+            publisher.flush()
+            pendingHint = buildReflectionHint(p.user.index)
+            return
+          }
+          // 兜底：攒够轮数仍未等到压缩 ⇒ 放行（防止"永远不生效"）
+          if (signal.eventType === 'turn_end') publisher.onTurnEnd()
+        },
+
+        /** 压缩信号（flush 双源之二）：session compaction（ACP 关闭时的那套） */
+        'session.compacting'() {
+          publisher.flush()
+          pendingHint = buildReflectionHint(p.user.index)
         },
 
         'cli.commands'(input) {
@@ -514,6 +645,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
             }
             const res = sub === 'add' ? store.add(payload) : store.remove(payload)
             reader!.clear() // 写入后强制刷新（同毫秒内 mtime 可能不变，不能依赖缓存自动失效）
+            if (res.ok) publisher.flush() // 显式写入 ⇒ 立即注入（用户有即时预期，不参与攒批）
             const label = scope === 'user' ? '用户长期记忆' : '项目长期记忆'
             input.out(
               res.ok
@@ -525,7 +657,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
 
           if (sub === 'reload') {
             reader!.clear()
-            input.out('已清空记忆缓存，下一轮注入将读取最新内容。\n')
+            publisher.flush()
+            input.out('已清空记忆缓存并安排立即发布，下一轮注入将读取最新内容。\n')
             return
           }
 
@@ -550,7 +683,11 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
               budgets.join('\n') +
               `\n  用法：/memory add [user|project] <内容> · /memory rm [user|project] <序号|内容> · ` +
               `/memory show <user|project|instruction> · /memory path · /memory reload\n` +
-              `  说明：默认写入 user 级（项目级会随 git 共享，需显式指定）；主题文件请用 read 工具按需读取\n\n`,
+              `  说明：默认写入 user 级（项目级会随 git 共享，需显式指定）；主题文件请用 read 工具按需读取\n` +
+              `  注入时机（§3.7 分级）：命令写入立即生效；外部改动攒到下次压缩（或 ${publisher.state().flushAfterTurns} 轮）才发布` +
+              (publisher.state().dirty
+                ? `；当前有未发布变更（已积 ${publisher.state().dirtyTurns} 轮）\n\n`
+                : '；当前无未发布变更\n\n'),
           )
         },
       }
