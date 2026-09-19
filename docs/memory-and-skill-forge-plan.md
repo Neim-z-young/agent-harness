@@ -286,7 +286,7 @@ project 级？反之？需实测决定）而不是静默丢弃。
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **M0** | ~~验证 §3.4 的折叠风险~~（**已完成，结论：不会被压缩**）；`WorkspaceLevel.memory` + `loadDirs.memory` | 目录字段可用；记忆暂不注入 |
+| **M0** ✅ | ~~验证 §3.4 的折叠风险~~（已完成，结论：不会被压缩）；~~`WorkspaceLevel.memory` + `loadDirs.memory`~~（已完成） | 目录字段可用（`ws.user.memory` / `ws.project.memory` / `ws.loadDirs.memory`）；记忆暂不注入。顺手修了 `/workspace` 输出里 agents 行漏路径的既有 bug |
 | **M1** | 加载 L0（`AGENTS.md` 两级）+ L1 索引注入；`/memory` 命令（list/read） | 新会话能读到既有记忆与项目指令；注入量 ≤25KB |
 | **M2** | 写入路径 A + `/memory edit|delete`；体积/去重校验 | 模型能写入并下会话读到；超限被明确拒绝（不静默） |
 | **M3** | L2 → L1 候选提示（压缩时提醒沉淀）；子代理记忆隔离策略 | 压缩后不丢失关键纠正 |

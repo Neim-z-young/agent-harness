@@ -30,6 +30,14 @@ export interface WorkspaceLevel {
   skills: string
   /** Agent 目录 */
   agents: string
+  /**
+   * 记忆目录（长期记忆）：`MEMORY.md` 索引 + 主题文件（按需读取）。
+   *
+   * 与 plugins/skills/agents 同属"路径约定"——本包只负责给出路径，不预创建目录、
+   * 不解析内容；写入与加载由消费方（记忆插件）负责。
+   * 详见 docs/memory-and-skill-forge-plan.md §3.2。
+   */
+  memory: string
 }
 
 /** dataDir 下的全局数据文件 / 目录路径（仅用户级存在） */
@@ -72,6 +80,11 @@ export interface Workspace {
     plugins: [string, string]
     skills: [string, string]
     agents: [string, string]
+    /**
+     * 记忆目录对（user → project）。记忆不是"批量加载的资源"，但按同样的
+     * 「后者覆盖前者」顺序给出，供消费方一次取两级路径。
+     */
+    memory: [string, string]
   }
 }
 
@@ -95,6 +108,7 @@ export function level(root: string): WorkspaceLevel {
     plugins: join(root, 'plugins'),
     skills: join(root, 'skills'),
     agents: join(root, 'agents'),
+    memory: join(root, 'memory'),
   }
 }
 
@@ -132,6 +146,7 @@ export function resolveWorkspace(opts: ResolveWorkspaceOptions = {}): Workspace 
       plugins: [user.plugins, project.plugins],
       skills: [user.skills, project.skills],
       agents: [user.agents, project.agents],
+      memory: [user.memory, project.memory],
     },
   }
 }

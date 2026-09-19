@@ -23,13 +23,20 @@
 ├── snapshot/                       # 文件快照（SnapshotService，open 时启用）
 ├── plugins/                        # 用户级插件（user 来源）
 ├── skills/                         # 用户级技能（SKILL.md，user 来源）
-└── agents/                         # 用户级 Agent（Markdown 定义，user 来源）
+├── agents/                         # 用户级 Agent（Markdown 定义，user 来源）
+└── memory/                         # 用户级记忆（MEMORY.md 索引 + 主题文件，按需创建）
 
 <cwd>/.harness/                     # 项目级（cwd 决定）
 ├── plugins/                        # 项目级插件（project 来源，覆盖 user）
 ├── skills/                         # 项目级技能（覆盖 user）
-└── agents/                         # 项目级 Agent（覆盖 user）
+├── agents/                         # 项目级 Agent（覆盖 user）
+└── memory/                         # 项目级记忆（覆盖 user；**入 git 共享**）
 ```
+
+> **memory 目录**：与 plugins/skills/agents 同属"路径约定" —— `@harness/workspace` 只给出路径
+> （`ws.user.memory` / `ws.project.memory` / `ws.loadDirs.memory`），**不预创建目录、不解析内容**；
+> 写入与加载由记忆能力（`@harness/memory` 插件）负责。当前仅落地目录字段，注入尚未启用，
+> 详见 [记忆能力与技能锻造计划](memory-and-skill-forge-plan.md)。
 
 ## 3. 数据存储
 
@@ -67,6 +74,7 @@
 插件：  user (~/.harness/plugins)  →  project (<cwd>/.harness/plugins)   // 后者覆盖
 技能：  user (~/.harness/skills)   →  project (<cwd>/.harness/skills)    // 后者覆盖
 Agent： user (~/.harness/agents)   →  project (<cwd>/.harness/agents)    // 同 ID 后者覆盖
+记忆：  user (~/.harness/memory)   →  project (<cwd>/.harness/memory)    // 索引合并，项目级覆盖同名条目
 Provider：config.json → providers（显式多 Provider） + 默认 Provider 最后注册兜底
 配置：  CLI > config.json > 环境变量
 ```

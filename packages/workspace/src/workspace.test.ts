@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'bun:test'
+import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { resolveWorkspace, level, dataFiles, defaultUserDir } from './index'
 
@@ -43,6 +44,16 @@ describe('resolveWorkspace（工作区定位与解析）', () => {
     expect(ws.loadDirs.plugins).toEqual([ws.user.plugins, ws.project.plugins])
     expect(ws.loadDirs.skills).toEqual([ws.user.skills, ws.project.skills])
     expect(ws.loadDirs.agents).toEqual([ws.user.agents, ws.project.agents])
+    expect(ws.loadDirs.memory).toEqual([ws.user.memory, ws.project.memory])
+  })
+
+  it('记忆目录：两级各一处，且与其它资源目录同级（路径约定，不预创建）', () => {
+    const ws = resolveWorkspace({ cwd: `${TMP}/proj-mem`, dataDir: `${TMP}/store-mem` })
+    expect(ws.user.memory).toBe(join(ws.user.root, 'memory'))
+    expect(ws.project.memory).toBe(join(ws.project.root, 'memory'))
+    // 只给路径，不落地目录（写入方按需创建）——与 plugins/skills/agents 同一约定
+    expect(existsSync(ws.user.memory)).toBe(false)
+    expect(existsSync(ws.project.memory)).toBe(false)
   })
 
   it('dataDir 缺省为 ~/.harness（defaultUserDir）', () => {
@@ -66,6 +77,7 @@ describe('resolveWorkspace（工作区定位与解析）', () => {
       plugins: join(root, 'plugins'),
       skills: join(root, 'skills'),
       agents: join(root, 'agents'),
+      memory: join(root, 'memory'),
     })
     const files = dataFiles(root)
     expect(files.config).toBe(join(root, 'config.json'))

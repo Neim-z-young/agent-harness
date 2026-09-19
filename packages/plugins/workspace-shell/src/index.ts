@@ -85,7 +85,8 @@ function levelLines(l: WorkspaceLevel): string {
   return (
     `  plugins  ${existMark(l.plugins)}${l.plugins}\n` +
     `  skills   ${existMark(l.skills)}${l.skills}\n` +
-    `  agents   ${existMark(l.agents)}\n`
+    `  agents   ${existMark(l.agents)}${l.agents}\n` +
+    `  memory   ${existMark(l.memory)}${l.memory}\n`
   )
 }
 

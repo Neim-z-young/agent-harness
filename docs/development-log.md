@@ -1,5 +1,33 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 151）记忆能力 M0：workspace 落地 memory 目录字段
+
+[记忆能力与技能锻造计划](memory-and-skill-forge-plan.md) 的 M0。原 M0 有两件事，其中"验证记忆
+会不会被 ACP 压缩"已提前完成（续 150 之后单独提交 `a51c683`，结论：**不会**——core 合成的
+system 消息没有 `<acp>` ref 标签，模型选不中它），故本次只做目录字段。
+
+**改动**（`packages/workspace/src/index.ts`）：
+- `WorkspaceLevel` 加 `memory`：`<root>/memory`（user 与 project 各一处）
+- `Workspace.loadDirs` 加 `memory: [user.memory, project.memory]`，与 skills/agents 同序
+  （user 在前、project 覆盖）
+- 定位于"路径约定"：本包**只给路径、不预创建目录、不解析内容** —— 与 plugins/skills/agents
+  完全一致（CLI 里本来就没有 mkdirSync 逻辑）。写入与加载由后续的记忆插件负责。
+
+**一致性改动**（`packages/plugins/workspace-shell/src/index.ts`）：`/workspace` 的目录清单加
+`memory` 行。顺手修掉一个**既有 bug**：`agents` 行只输出了存在标记、**漏了路径本身**
+（`${existMark(l.agents)}` 后面没有 `${l.agents}`），plugins/skills 两行都是全的 —— 属纯展示缺陷。
+
+**验证**：workspace 39（+1：记忆目录两级路径 + 断言目录未被预创建）、workspace-shell 17、
+cli 348 全绿；全仓 typecheck 0 错误。`workspace.test.ts` 的 `level()` 定值断言按新契约更新
+（这正是"契约变更必须同步测试"的正常代价，不是回归）。
+
+**文档**：`docs/workspace-management.md` 的目录布局图 + 覆盖顺序表补 memory 行，并注明
+"不预创建、由记忆插件负责"；计划文档 §3.9 的 M0 标记为完成。
+
+**下一步 M1**：加载 L0（`AGENTS.md` 两级）+ L1（`MEMORY.md` 索引注入）+ `/memory` 命令（list/read）。
+实现形态按 §9 走 `@harness/memory` 插件；需要先补 G1（`PluginContext.workspace` /
+`PromptInput.cwd`）与 G2（`agentMode`，用于"不注入 subagent"）。
+
 ## 2026-09-19（续 150）Herdr 集成做成插件：`agent.stream` hook + `@harness/herdr`
 
 上一轮做了 Agent 状态显示（UI 内），本轮把同一份状态也送到**外部终端复用器**
