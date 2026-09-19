@@ -269,6 +269,36 @@ export interface AgentStreamSignal {
   sessionId?: string
 }
 
+/**
+ * `agent.turn.end` hook 的输入：**引擎层**的整轮终态。
+ *
+ * 与 `agent.stream` 的分工（两者名字必须分得开，否则消费方无法判断"这条是谁发的"）：
+ * - `agent.stream`：**UI 消费层**（CLI 的 REPL / TUI / run）把流式事件归约成"现在在干什么"，
+ *   只在有 UI 的宿主里触发；它是状态流（一条 turn_end 只是"该收 busy 了"）。
+ * - `agent.turn.end`：**引擎**（core.queryStream 的 finally）在整轮结束时发出的事实，
+ *   任何宿主都有（含以库内嵌、ACP 宿主自己消费事件流）。带的是引擎侧事实字段
+ *   （跑了几步、末步 finish、是否被中断），不是 UI 状态。
+ *
+ * 触发范围：每次 `queryStream` / `query()` 整轮结束 —— **包括子 Agent 的轮**
+ * （引擎不做"哪一轮算用户的轮"这种消费侧判断）。消费方按 `mode` / `sessionId` 自行筛。
+ */
+export interface AgentTurnEndSignal {
+  /** 跑完这一轮的 Agent */
+  agentId: string
+  /** Agent 显示名（有则填） */
+  agentName?: string
+  /** Agent 模式（primary / subagent / teammate / coordinator，有则填） */
+  mode?: string
+  /** 会话 ID */
+  sessionId?: string
+  /** 本轮实际跑了几步（从 1 起；未跑起来就结束时为 0） */
+  step: number
+  /** 末步结束原因（stop / tool_calls / length …；中断或未起步时可能缺省） */
+  finish?: string
+  /** 是否因外部中断（`signal`）而提前结束 */
+  aborted?: boolean
+}
+
 // ===== Hooks 接口 =====
 
 /**
@@ -338,8 +368,22 @@ export interface Hooks {
    *
    * 触发点是 **UI 消费层**（REPL / TUI / run），不是引擎 —— 没走 UI 的调用方
    * （如 subagent 的 query()）不触发，集成插件需知悉这一边界。
+   *
+   * ⚠️ 与 `agent.turn.end` 是**两条不同的通道**：本 hook 是 UI 状态流（引擎不会触发它），
+   * `agent.turn.end` 才是引擎的整轮终态。曾把引擎终态也塞进本 hook，结果是同一个 hook 名
+   * 由两层分别触发、消费方无法分辨来源（记忆的按轮计数因此可能被计两次）。
    */
   'agent.stream'?: (input: AgentStreamSignal) => Awaitable<void>
+
+  // === Agent 生命周期（引擎层事实） ===
+  /**
+   * **整轮结束**（引擎层）：core 在 `queryStream` / `query()` 收尾时触发。
+   *
+   * 与 `agent.stream` 的区别是刻意的分层：本 hook 是引擎事实（任何宿主都有：CLI、内嵌库、
+   * ACP 宿主自己消费事件流），`agent.stream` 只在有 UI 消费层时才有。要"每轮都要发生"的
+   * 逻辑（如记忆的攒批放行）挂这里；纯 UI 状态（busy/spinner/侧栏）挂 `agent.stream`。
+   */
+  'agent.turn.end'?: (input: AgentTurnEndSignal) => Awaitable<void>
 
   // === CLI 扩展 ===
   /** 注册 CLI 斜杠命令：插件往 input.commands 追加自己的命令定义 */

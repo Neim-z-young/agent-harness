@@ -588,22 +588,30 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
          * `tool.post.execute` 的 ctx 里**没有 toolId** ⇒ 只能从事件流识别。
          * `agent.stream` 的 `status.toolId` 恰好带这个信息。
          *
-         * 注：`turn_end` 这条由 **core** 广播（不依赖宿主是谁）——CLI 侧原先也发，
-         * 现已在 core 收口后停掉，见 core queryStream 的 finally。
+         * ⚠️ 这是 **UI 消费层**的通道：以库内嵌 / ACP 宿主自己消费事件流时收不到它
+         * （那时只剩下面 `agent.turn.end` 的轮数兜底与命令写入）。要根治得让引擎层也有
+         * "工具执行"信号 —— 属独立的一件事（见 dev-log 续 156）。
          */
         'agent.stream'(signal) {
           if (signal.eventType === 'tool_call_start' && signal.status?.toolId === 'compress') {
             publisher.flush()
             pendingHint = buildReflectionHint(p.user.index)
-            return
           }
-          // 兜底：攒够轮数仍未等到压缩 ⇒ 放行（防止"永远不生效"）。
-          // 只数**主会话**的轮；sessionId 缺失时按"无法归因"处理（照常计数）——
-          // 宁可不精确，也不要因为字段缺失把兜底变成死代码。
-          if (signal.eventType === 'turn_end') {
-            const sid = signal.sessionId
-            if (!sid || !primarySessionId || sid === primarySessionId) publisher.onTurnEnd()
-          }
+        },
+
+        /**
+         * 兜底：攒够轮数仍未等到压缩 ⇒ 放行（防止"永远不生效"）。
+         *
+         * 用**引擎层**的 `agent.turn.end`（core 广播，任何宿主都有），而不是 `agent.stream` 的
+         * turn_end —— 后者只在有 UI 消费层的宿主里才有；靠它计数会"永不推进"，且这种失效
+         * 表现为"记忆改了没生效"，极难排查。
+         * 只数**主会话**的轮，并排除子 Agent（子 Agent 另开 session，且它的轮不是用户的轮）；
+         * 字段缺失时按"无法归因"照常计数 —— 宁可不精确，也不要让兜底变成死代码。
+         */
+        'agent.turn.end'(signal) {
+          if (signal.mode === 'subagent') return
+          const sid = signal.sessionId
+          if (!sid || !primarySessionId || sid === primarySessionId) publisher.onTurnEnd()
         },
 
         /** 压缩信号（flush 双源之二）：session compaction（ACP 关闭时的那套） */

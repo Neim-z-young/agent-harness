@@ -1,5 +1,49 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 156）hook 分层：引擎终态独立成 `agent.turn.end`，不再借用 `agent.stream`
+
+用户看上一轮的改动时点出一句：「core 层插件名与 cli 层插件名要区分开」（随后补明确：说的是
+hook 名 `agent.stream`）。这是对的 —— 我上一轮把引擎终态塞进了 **UI 消费层的通道**，而
+`agent.stream` 的契约注释里早就写着「触发点是 UI 消费层（REPL / TUI / run），不是引擎」。
+一条被自己文档否掉的做法，当天就踩了。
+
+**问题到底出在哪**：hook 名是一个**命名空间**。`agent.stream` 由 CLI 触发时，携带的是
+"归约后的 UI 状态"；我让 core 也往里发一条 turn_end，于是：
+
+1. 同一个 hook 名出现两个来源，消费方**无法分辨"这条是谁发的"**（只能靠猜字段形状）；
+2. 语义被污染：那条 turn_end 是引擎事实还是 UI 状态收尾？两者寿命不同（引擎那条在任何宿主都有）；
+3. 上一轮为此打的补丁（"CLI 停发 turn_end"）本质是用**行为约束**去补**命名缺陷** ——
+   一旦有人忘了这条约束，同一轮就被计两次。
+
+**改法：按层拆成两条 hook，而不是让一条 hook 兼容两层。**
+
+| hook | 层 | 谁触发 | 载荷 | 消费方 |
+| --- | --- | --- | --- | --- |
+| `agent.stream` | **UI 消费层** | CLI（`createProcessLine` / `run`） | 归约后的状态快照（`eventType` + `status` + `sessionId`） | herdr 侧栏、TUI 类外部 UI |
+| `agent.turn.end` | **引擎层** | core（`queryStream` / `query()` 收尾） | 引擎事实：`agentId`/`agentName`/`mode`/`sessionId`/`step`/`finish`/`aborted` | 记忆的按轮计数；任何"每轮必须发生"的逻辑 |
+
+- CLI **恢复**广播 `turn_end`（回滚上一轮的"停发"补丁）：UI 收 busy/idle 本来就靠它，
+  两条通道分开后不存在重复计数。
+- core 改发 `agent.turn.end`，且**不再带 `phase: 'idle'` 这种 UI 词汇** —— 引擎只说事实
+  （跑了几步、末步 finish、是否被中断）。
+- 触发范围改为**包含子 Agent 的轮**：引擎不该做"哪一轮算用户的轮"这种消费侧判断，
+  要不要筛由消费方按 `mode` / `sessionId` 决定（记忆侧两条都筛）。
+- 回归守卫（`packages/core/src/agent-turn-end.test.ts`，**不 import CLI**）：除了断言
+  `agent.turn.end` 恰好一次且字段正确，还断言 **`agent.stream` 一条都没有** —— 把"引擎不碰 UI 通道"
+  钉成测试，而不只是注释。
+
+**记忆插件的两处调整**：按轮计数改挂 `agent.turn.end`（并跳过 `mode === 'subagent'`）；
+ACP 压缩识别仍只能挂在 `agent.stream` 上 —— 于是留下一个**同类的已知缺口**：
+无 UI 宿主里压缩信号也收不到，那时只剩"轮数兜底 + 命令写入"。要根治得让引擎层也有"工具执行"信号，
+已记进计划 §3.7 ⑦（与 F3 的"工具序列统计"是同一件事，将来一起做）。
+
+**教训（值得单独记）**：新增/复用 hook 前先读它的契约注释里写的**触发层**；
+"某条事件由谁发"是契约的一部分，不能因为"能发"就往里发。上一轮的错误正是"能发"——
+core 恰好持有插件管理器，于是顺手就发了。
+
+**验证**：全仓 typecheck 0 错误；core 82、cli 361、memory 58 全绿；
+其中 memory 新增两条专门守分层：UI 通道的 turn_end **不计数**、子 Agent 的轮**不计数**。
+
 ## 2026-09-19（续 155）turn_end 广播收口到 core + memory 参数可配 + 三处"防误判"补丁
 
 起因是两句提问：「配置里的 5 轮是 5 轮对话还是 5 次模型调用？」「记忆没刷新的话，模型会认为
@@ -25,6 +69,10 @@
   其余模式照发，消费方可用 `status.mode` 自筛。
 - CLI 两处**停发** `turn_end`（否则同一轮被计两次，记忆的攒批计数直接翻倍）。归约照做——TUI 要用。
 - 回归守卫：《core 侧广播》（3 例，不 import CLI）+ CLI 侧断言"`turn_end` 只出现一次"。
+
+> ⚠️ **本节 ① 的做法在续 156 被修正**：当时把引擎终态写进了 `agent.stream`（UI 通道），
+> 造成同一个 hook 名由两层分别触发。现已改为独立的 `agent.turn.end`，CLI 恢复在
+> `agent.stream` 上广播 `turn_end`（UI 收 busy 靠它）。下面这段历史记录保留原样。
 
 **② 三处"防误判"补丁（对应提问的第二问）**
 

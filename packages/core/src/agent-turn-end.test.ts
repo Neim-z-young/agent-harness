@@ -1,11 +1,12 @@
 /**
- * `turn_end` 的插件广播归属：由 **core** 负责（不依赖宿主是否走 CLI）。
+ * `turn_end` 的引擎侧广播：hook 名是 **`agent.turn.end`**（core 层），不是 `agent.stream`（UI 层）。
  *
- * 回归背景：原本只有 CLI 侧广播（`createProcessLine` / `harness run`），于是「以库内嵌」
- * 或「宿主（如 ACP）自己消费事件流」时插件永远收不到整轮结束 —— 靠它驱动的兜底逻辑
- * （记忆的攒批放行）会静默失效，且是「什么都没发生」式的失效，极难排查。
+ * 为什么要分成两个 hook：`agent.stream` 的触发点是 UI 消费层（CLI 的 REPL/TUI/run），
+ * 以库内嵌或 ACP 宿主自己消费事件流时**根本不会触发** —— 把引擎终态塞进那个通道，
+ * 会让"每轮都该发生"的逻辑（如记忆的攒批放行）在无 UI 宿主里静默失效；反过来，同一个
+ * hook 名由两层分别触发，消费方也分不清"这条是谁发的"。
  *
- * 因此这里**完全不 import CLI**，只用 createHarness 验证：终态是引擎的事实。
+ * 本文件**故意不 import CLI**：证明引擎终态不依赖宿主。
  */
 import { describe, it, expect } from 'bun:test'
 import {
@@ -17,7 +18,7 @@ import {
   type ChatStreamChunk,
   type Harness,
 } from './index'
-import type { AgentPlugin, AgentStreamSignal } from '@harness/plugin'
+import type { AgentPlugin, AgentStreamSignal, AgentTurnEndSignal } from '@harness/plugin'
 
 const primary: AgentDefinition = {
   id: 'default',
@@ -81,31 +82,35 @@ function scriptedProvider(script: ChatStreamChunk[][]): ChatProvider {
   return p
 }
 
-/** 探针插件：把收到的 agent.stream 信号拷一份留档（跨 await 后仍可比对） */
-function probePlugin(sink: AgentStreamSignal[]): AgentPlugin {
+/** 探针：同时订阅两条通道，用来证明"引擎只走 agent.turn.end" */
+function probePlugin(ends: AgentTurnEndSignal[], streams: AgentStreamSignal[]): AgentPlugin {
   return {
-    id: 'probe.agent-stream',
+    id: 'probe.turn-end',
     version: '0.0.0',
     name: 'probe',
     async install() {
       return {
+        'agent.turn.end': (s) => {
+          ends.push(JSON.parse(JSON.stringify(s)) as AgentTurnEndSignal)
+        },
         'agent.stream': (s) => {
-          sink.push(JSON.parse(JSON.stringify(s)) as AgentStreamSignal)
+          streams.push(JSON.parse(JSON.stringify(s)) as AgentStreamSignal)
         },
       }
     },
   }
 }
 
-async function setup(): Promise<{ h: Harness; sink: AgentStreamSignal[] }> {
-  const sink: AgentStreamSignal[] = []
+async function setup(): Promise<{ h: Harness; ends: AgentTurnEndSignal[]; streams: AgentStreamSignal[] }> {
+  const ends: AgentTurnEndSignal[] = []
+  const streams: AgentStreamSignal[] = []
   const h = await createHarness({
     agents: [primary, sub],
     chatProvider: scriptedProvider([toolCallChunks, finalChunks]),
   })
   h.tools.register(echoTool)
-  await h.plugin.loadInternal([probePlugin(sink)])
-  return { h, sink }
+  await h.plugin.loadInternal([probePlugin(ends, streams)])
+  return { h, ends, streams }
 }
 
 async function run(
@@ -117,45 +122,49 @@ async function run(
   return events
 }
 
-describe('core 侧广播 turn_end（插件不依赖宿主）', () => {
-  it('整轮结束广播一次，带 sessionId / idle / finish / step / mode', async () => {
-    const { h, sink } = await setup()
+describe('core 广播整轮终态：agent.turn.end（引擎层）', () => {
+  it('整轮结束发一次，带引擎事实字段（sessionId / step / finish / mode），且不碰 agent.stream', async () => {
+    const { h, ends, streams } = await setup()
     const sess = await h.session.create()
     await run(h, { sessionId: sess.id, agentId: 'default', message: '干活' })
 
-    const ends = sink.filter((s) => s.eventType === 'turn_end')
     expect(ends).toHaveLength(1) // 整轮只发一次（done 才是每步一次）
-    const s0 = ends[0]!
-    expect(s0.sessionId).toBe(sess.id)
-    expect(s0.status.phase).toBe('idle')
-    expect(s0.status.agentId).toBe('default')
-    expect(s0.status.mode).toBe('primary')
-    expect(s0.status.step).toBe(2)
-    expect(s0.status.finish).toBe('stop')
+    const e = ends[0]!
+    expect(e.agentId).toBe('default')
+    expect(e.mode).toBe('primary')
+    expect(e.sessionId).toBe(sess.id)
+    expect(e.step).toBe(2)
+    expect(e.finish).toBe('stop')
+    expect(e.aborted).toBeUndefined()
+
+    // 分层的关键断言：引擎**不往 UI 通道**（agent.stream）发任何东西
+    expect(streams).toEqual([])
     await h.stop()
   })
 
-  it('子 Agent（mode=subagent）不广播：它的「轮」不是用户的轮', async () => {
-    const { h, sink } = await setup()
+  it('子 Agent 的轮也发（引擎不做"哪一轮算用户的轮"的判断），带 mode 供消费方筛', async () => {
+    const { h, ends } = await setup()
     const sess = await h.session.create()
     await run(h, { sessionId: sess.id, agentId: 'worker', message: '干活' })
 
-    expect(sink.filter((s) => s.eventType === 'turn_end')).toHaveLength(0)
+    expect(ends).toHaveLength(1)
+    expect(ends[0]!.mode).toBe('subagent')
+    expect(ends[0]!.agentId).toBe('worker')
     await h.stop()
   })
 
-  it('中断路径也广播（phase=aborted），消费方不会永远停在「运行中」', async () => {
-    const { h, sink } = await setup()
+  it('中断路径也发（step=0 + aborted），消费方不会永远停在「运行中」', async () => {
+    const { h, ends } = await setup()
     const sess = await h.session.create()
     const ctl = new AbortController()
     ctl.abort()
     const events = await run(h, { sessionId: sess.id, agentId: 'default', message: '干活', signal: ctl.signal })
 
     expect(events[events.length - 1]?.type).toBe('turn_end')
-    const ends = sink.filter((s) => s.eventType === 'turn_end')
     expect(ends).toHaveLength(1)
-    expect(ends[0]!.status.phase).toBe('aborted')
-    expect(ends[0]!.status.aborted).toBe(true)
+    expect(ends[0]!.step).toBe(0) // 一步都没跑
+    expect(ends[0]!.aborted).toBe(true)
+    expect(ends[0]!.finish).toBeUndefined()
     await h.stop()
   })
 })

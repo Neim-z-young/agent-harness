@@ -544,15 +544,16 @@ describe('插件级：flush 三源与一次性提示', () => {
     expect(await inject(hooks)).toContain('session 压缩时的改动')
   })
 
-  it('兜底：攒够轮数（turn_end）后发布，即使从未压缩', async () => {
+  it('兜底：攒够轮数（agent.turn.end）后发布，即使从未压缩', async () => {
     const { hooks, w } = await hooksOf({ flushAfterTurns: 2 })
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 攒批的改动\n')
 
     expect(await inject(hooks)).toContain('初始')
-    hooks['agent.stream']!({ eventType: 'turn_end', status: { agentId: 'd', phase: 'idle' } })
-    hooks['agent.stream']!({ eventType: 'turn_end', status: { agentId: 'd', phase: 'idle' } })
+    // 引擎层的整轮终态（不是 agent.stream —— 那条只在有 UI 消费层的宿主里才有）
+    hooks['agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: 's', step: 1 })
+    hooks['agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: 's', step: 1 })
     expect(await inject(hooks)).toContain('攒批的改动')
   })
 
@@ -606,11 +607,13 @@ describe('turn_end 计数只认主会话', () => {
     await hooks['prompt.system.transform']!(sys, parts)
     return parts.join('\n')
   }
-  const endTurn = (hooks: Hooks, sessionId?: string) => {
-    hooks['agent.stream']!({
-      eventType: 'turn_end',
+  const endTurn = (hooks: Hooks, sessionId?: string, mode = 'primary') => {
+    // 引擎层通道：agent.turn.end（不是 agent.stream 的 turn_end —— 那条只存在于有 UI 的宿主）
+    hooks['agent.turn.end']!({
+      agentId: 'default',
+      mode,
+      step: 1,
       ...(sessionId ? { sessionId } : {}),
-      status: { agentId: 'default', phase: 'idle' },
     })
   }
 
@@ -653,5 +656,52 @@ describe('turn_end 计数只认主会话', () => {
       writeFileSync(f, `${v}\n`) // 与上一版**等长**：只看 size 分辨不出来
       expect(r.read(f).text).toBe(`${v}\n`)
     }
+  })
+})
+
+describe('轮次计数的来源必须是引擎层（agent.turn.end）', () => {
+  const sys = { agentId: 'default', sessionId: 's' }
+  const inject = async (hooks: Hooks) => {
+    const parts: string[] = []
+    await hooks['prompt.system.transform']!(sys, parts)
+    return parts.join('\n')
+  }
+  const endTurn = (hooks: Hooks, mode = 'primary', sessionId: string | undefined = 's') => {
+    hooks['agent.turn.end']!({ agentId: 'default', mode, step: 1, ...(sessionId ? { sessionId } : {}) })
+  }
+
+  it('UI 通道（agent.stream）的 turn_end 不计数 —— 否则两层都发时会翻倍', async () => {
+    const w = ws()
+    const { hooks } = await install({ flushAfterTurns: 2 })
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    expect(await inject(hooks)).toContain('初始') // 先被"发现"（dirty）
+
+    for (let i = 0; i < 3; i++) {
+      hooks['agent.stream']!({ eventType: 'turn_end', sessionId: 's', status: { agentId: 'default', phase: 'idle' } })
+    }
+    expect(await inject(hooks)).toContain('初始') // 三次都没推进轮数
+
+    endTurn(hooks)
+    endTurn(hooks)
+    expect(await inject(hooks)).toContain('改动') // 引擎层两次即放行
+  })
+
+  it('子 Agent 的轮不计入（mode=subagent 直接跳过）', async () => {
+    const w = ws()
+    const { hooks } = await install({ flushAfterTurns: 2 })
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    expect(await inject(hooks)).toContain('初始')
+
+    endTurn(hooks, 'subagent')
+    endTurn(hooks, 'subagent')
+    expect(await inject(hooks)).toContain('初始') // 子 Agent 的轮不算用户的轮
+
+    endTurn(hooks)
+    endTurn(hooks)
+    expect(await inject(hooks)).toContain('改动')
   })
 })

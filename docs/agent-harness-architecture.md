@@ -1274,10 +1274,12 @@ yield turn_end                              整轮只一次
    `finishReason` 仍是 `STOP`，只看它会在该续轮时退出、退化成单轮；反向地 `length`/`content_filter`/`error`
    属被截断/拦截，即便残留 toolCalls 也不续。
 2. **`done` 与 `turn_end` 分离**：前者是「一步结束」（多步时多次，带 `step`），后者是「整轮结束」（一次）。
-   UI 状态收尾（busy/spinner）必须挂在 `turn_end` 上。**`turn_end` 的 `agent.stream` 广播由 core 发出**
-   （带 `sessionId` 与 `status.agentId/mode/phase/step/finish/aborted`；子 Agent 模式不发）——
-   终态是引擎的事实，不能依赖"宿主会不会替我们广播"：CLI 只是其中一个宿主，以库内嵌或 ACP 宿主自己
-   消费事件流时，插件侧收不到整轮结束（靠它驱动的兜底会静默失效）。其余事件仍由 CLI 侧广播（归约后状态）。
+   UI 状态收尾（busy/spinner）必须挂在 `turn_end` 上。**两条通道名字必须分得开**：
+   - `agent.stream`（**UI 消费层**）：CLI 把事件流归约成"现在在干什么"再广播，只有走 UI 的宿主才会触发，
+     末条 `turn_end` ⇒ `idle` 是 UI 收尾信号。
+   - `agent.turn.end`（**引擎层**）：core 在 `queryStream`/`query()` 的收尾处广播的整轮终态
+     （`agentId` / `mode` / `sessionId` / `step` / `finish` / `aborted`），任何宿主都有（含以库内嵌、
+     ACP 宿主自己消费事件流）。要"每轮都该发生"的逻辑挂这条；引擎**不往 `agent.stream` 发事件**。
 3. **中断**：`AgentQueryInput.signal` 贯穿到 Provider 请求与 `ToolContext.signal`，在步边界与每个工具执行前生效；
    已完成的成果保留，未执行的工具标 `ABORTED`。
 4. **`<continue/>` 空转识别**：续轮前查待处理通知，没有就跳过 —— 避免白跑一整轮（多步后一轮可能是几十步）。

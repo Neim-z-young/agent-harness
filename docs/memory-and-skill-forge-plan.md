@@ -250,10 +250,13 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 - **flush 信号的真实形态**：ACP 那条**不能用** `tool.post.execute`（实查：其 ctx **没有 toolId**），
   改用 `agent.stream` 的 `status.toolId === 'compress'`；`session.compacting` 那条不变。
 - **`turn_end` 必须由 core 广播**（原设计默认"上层会广播"）：实查发现全仓只有 CLI 会 ——
-  内嵌 / ACP 宿主自己消费事件流时，靠它驱动的兜底计数**永不推进**。终态是引擎的事实 ⇒ 收口到 core
-  （CLI 同步停发以免重复计数）。
-- **只数主会话的轮**：teammate / 子 Agent 另开 session（且子 Agent 的轮不是用户的轮），
-  不过滤会让攒批提前放行。
+  内嵌 / ACP 宿主自己消费事件流时，靠它驱动的兜底计数**永不推进**。终态是引擎的事实
+  ⇒ 归 core 收口，但**走独立 hook `agent.turn.end`**（不是 `agent.stream`：后者是 UI 消费层的
+  状态流，引擎往里塞事件会让同一 hook 名由两层分别触发、消费方分不清来源）。
+- **只数主会话的轮**：跳过 `mode === 'subagent'`，并比对主会话 sessionId（teammate / coordinator
+  另开 session，不过滤会让攒批提前放行）。
+- **⚠️ 压缩信号仍只有 UI 通道**：`agent.stream` 的 `status.toolId === 'compress'` 在无 UI 宿主里
+  同样收不到，那时只剩"轮数兜底 + 命令写入"。要根治得让引擎层也暴露"工具执行"信号（未做）。
 - **参数出口**：`config.json → memory`（`flushAfterTurns` / `maxLines` / `maxBytes` / `disableInjection`），
   启用仍是 `plugins: ["memory"]`。这段配置**错了不会自己报错**，因此非法值一律丢弃 + 启动告警 + 概览打印。
 - **⑤ 的"pending 必须落盘"未做**（pending 目前只活在进程内）：重启会丢掉"待发布"状态，但**不丢内容**
@@ -439,7 +442,7 @@ M0（目录字段）──► M1（注入 + /memory read）──► F0/F1（技
 | `/memory`（list/read/edit/delete） | `cli.commands` + `cli.command` hook | **关键**：CLI 注入的 `CliCommandInput` 已含 `workspace`（`app.workspace`，见 `cli/src/index.ts:3474`）与 `harness` ⇒ 路径与运行时操作都能拿到，不必猜目录 |
 | `/skill-forge`（生成 → 确认 → 落盘 → reload） | 同上 + `harness.skillManager.reload(id)` | `SkillManager` 已有 `reload`（`skill/src/index.ts:127`） |
 | 记忆/技能**写入** | 插件内直接 `fs` 写 | **天然不经过工具权限通道** ⇒ 正好满足决策 B4「豁免审批」，无需改权限引擎 |
-| 重复流程检测 | `agent.stream` hook（2026-09-19 新增） | 统计工具序列即可 |
+| 重复流程检测 | `agent.stream` hook（2026-09-19 新增） | 统计工具序列即可。⚠️ 该 hook 是 **UI 消费层**的（只有走 CLI 的宿主才触发）⇒ 要做 F3 得先有引擎层的"工具执行"信号，否则内嵌宿主下同样静默失效（同 §3.7 ⑦ 的教训） |
 | 注入 system prompt | `prompt.system.transform` hook | 范式照抄 `core.skill-injection`（`core/src/index.ts:2506`）；**已实证不会被 ACP 压缩**（§3.4），注入时机见 §3.7 |
 | 压缩时提示沉淀（L2→L1） | `session.compacting` hook | 已有 |
 
