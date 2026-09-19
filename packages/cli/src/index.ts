@@ -862,6 +862,18 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       optIn: true,
       load: async () => (await lazyImport<{ createSwarmPlugin: () => AgentPlugin }>('@harness/swarm')).createSwarmPlugin(),
     })
+    // ── 外部集成类插件 ──
+    // herdr：把 Agent 状态（working / idle / blocked）上报到 Herdr 侧栏。
+    // optIn + 环境内自查双保险：未声明 ⇒ 不加载；已声明但不在 Herdr pane 内 ⇒ install 时
+    // 检测不到 HERDR_ENV=1 就返回空 Hooks（零进程、零副作用）。所以**常驻声明也安全**。
+    defaultBuiltinRegistry.register({
+      id: 'herdr',
+      name: 'Herdr Agent State',
+      description: '把 Agent 状态上报到 Herdr 终端复用器侧栏（仅在 Herdr pane 内生效，环境外为 no-op）',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createHerdrPlugin: () => AgentPlugin }>('@harness/herdr')).createHerdrPlugin(),
+    })
   }
   return defaultBuiltinRegistry
 }
@@ -3527,6 +3539,16 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       let lastDoneStep: number | null = null
       for await (const ev of gen) {
         agentStatus = reduceAgentStatus(agentStatus, ev)
+        // 外部集成（Herdr 等）：把**归约后**的状态广播给插件。刻意不 await ——
+        // 每个 text_delta 都等一次插件链会把流式渲染拖成串行；代价是上报可能乱序，
+        // 这正是 herdr 插件必须带严格递增 --seq 的原因（Herdr 会丢弃同源旧序号）。
+        void harness.plugin
+          .trigger('agent.stream', {
+            eventType: ev.type,
+            status: agentStatus,
+            sessionId: curSessionId,
+          })
+          .catch(() => undefined)
         // turn_end 是「整轮结束」标记，不是「下一步开始了」⇒ 不能触发续轮分隔
         if (ev.type !== 'done' && ev.type !== 'turn_end' && lastDoneStep != null) {
           if (!onEvent) out(`\n🔄  第 ${lastDoneStep + 1} 步（自主续轮）\n`)
@@ -4011,7 +4033,17 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       if (!prompt) { write('用法: harness run "<prompt>"\n'); return 1 }
       // 流式输出（逐 token 打印到 stdout，脚本友好）
       const gen = app.sendStream(session.id, prompt)
+      // 一次性执行也要上报状态（在 Herdr 里跑 `harness run` 同样需要侧栏反馈）
+      let runStatus = initialAgentStatus({ agentId: session.agentId ?? 'default' })
       for await (const ev of gen) {
+        runStatus = reduceAgentStatus(runStatus, ev)
+        void harness.plugin
+          .trigger('agent.stream', {
+            eventType: ev.type,
+            status: runStatus,
+            sessionId: session.id,
+          })
+          .catch(() => undefined)
         if (ev.type === 'text_delta') write(ev.text ?? '')
         else if (ev.type === 'tool_call_start') {
           // 引擎自主多步时把工具活动写到 stderr —— stdout 保持「纯结果」，脚本可安全消费

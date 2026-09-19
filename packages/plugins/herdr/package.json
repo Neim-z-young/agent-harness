@@ -1,0 +1,21 @@
+{
+  "name": "@harness/herdr",
+  "version": "0.1.0",
+  "description": "Herdr 终端复用器集成插件：把 Agent 状态（working / idle / blocked）上报到 Herdr 侧栏",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/plugin": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

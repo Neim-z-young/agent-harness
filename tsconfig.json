@@ -42,6 +42,7 @@
       "@harness/code-intel/meta": ["./packages/plugins/code-intel/src/meta.ts"],
       "@harness/acp-context": ["./packages/plugins/acp-context/src"],
       "@harness/workspace-shell": ["./packages/plugins/workspace-shell/src"],
+      "@harness/herdr": ["./packages/plugins/herdr/src"],
       "@harness/provider-anthropic": ["./packages/plugins/provider-anthropic/src"],
       "@harness/mcp-client": ["./packages/plugins/mcp-client/src"],
       "@harness/mcp-server-registry": ["./packages/plugins/mcp-server-registry/src"],

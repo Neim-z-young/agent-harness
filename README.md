@@ -260,6 +260,13 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   | `subagent` | 子 Agent 派工：`subagent` 工具 + `/subagents` 命令 | — |
   | `coordinator` | 主 Agent 编排：四阶段派工 + barrier 续轮 + `send_message` | `subagent` |
   | `swarm` | 长期在线团队协作：Team / Mailbox / Task List 工具 | — |
+  | `herdr` | 把 Agent 状态上报到 [Herdr](https://herdr.dev) 侧栏（working / idle / blocked） | — |
+
+- **Herdr 集成**：Herdr 是 agent 感知的终端复用器（tmux 竞品），侧栏能显示每个 pane 在跑/空闲/等你批准。
+  本插件在 Herdr pane 内自动生效（靠 `HERDR_ENV=1` + `HERDR_PANE_ID` / `HERDR_BIN_PATH` 判定），
+  **不在 Herdr 里跑时全程 no-op**（零进程、零开销），所以 `"plugins": ["herdr"]` 可以常驻声明。
+  状态映射：`thinking`/`streaming`/`tool` → `working`，`idle`/`aborted` → `idle`，
+  权限审批弹窗（决策为 `ask`）→ `blocked`（带工具名），进程退出时 `release-agent`。
 
 - 依赖**不必显式写出**；外部 MCP server 也可零代码启用：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`。
 - **这些插件一律「登记但不自动装配」**（`optIn`）：不写进 `plugins` 就不会被装上，也不会在 `/tools` 里

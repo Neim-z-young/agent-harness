@@ -190,6 +190,48 @@ export interface PermissionDecisionLike {
   remember?: boolean
 }
 
+// ===== Agent 流式事件（外部集成用） =====
+
+/**
+ * Agent 运行时状态快照。由消费层把流式事件归约而成，供集成类插件（状态上报、
+ * 遥测、外部 UI 桥接）直接消费，无需各自解释原始事件。
+ */
+export interface AgentStatusSnapshot {
+  /** Agent ID（未知时可缺省 —— 集成类插件不应假定它必然存在） */
+  agentId?: string
+  /** Agent 显示名（有则填） */
+  agentName?: string
+  /** Agent 模式（primary / subagent / teammate …，有则填） */
+  mode?: string
+  /**
+   * 当前阶段：
+   * - `idle` 等待输入（未开始或整轮已结束）
+   * - `thinking` 模型推理中（含工具返回后的继续推理）
+   * - `streaming` 正在收到文本增量
+   * - `tool` 工具执行中（失败时也留在此态，便于显示「卡在哪个工具上」）
+   * - `aborted` 被中断（Ctrl-C / 超限被拦）
+   */
+  phase: 'idle' | 'thinking' | 'streaming' | 'tool' | 'aborted'
+  /** 当前步序号（多步循环下从 1 开始；已知时填） */
+  step?: number
+  /** 正在执行的工具 ID（phase=tool 时） */
+  toolId?: string
+  /** 结束原因（stop / tool_calls / length / content_filter / error，已知时填） */
+  finish?: string
+  /** 是否因外部中断而结束（区别于模型正常收尾） */
+  aborted?: boolean
+}
+
+/** `agent.stream` hook 的输入 */
+export interface AgentStreamSignal {
+  /** 原始事件类型名（text_delta / tool_call_start / done / turn_end …），仅供排查 */
+  eventType: string
+  /** 归约后的当前状态 */
+  status: AgentStatusSnapshot
+  /** 会话 ID（外部集成可用它做会话关联/恢复） */
+  sessionId?: string
+}
+
 // ===== Hooks 接口 =====
 
 /**
@@ -248,6 +290,19 @@ export interface Hooks {
   // === Bus 事件订阅 ===
   /** 订阅所有 Bus 事件（用于日志、遥测、桥接） */
   'bus.event'?: (event: BusEventRecord) => Awaitable<void>
+
+  // === Agent 流式事件（外部集成用） ===
+  /**
+   * Agent 执行过程中的每个流式事件，携带**归约后**的状态快照。
+   *
+   * 为什么带的是归约结果而不是原始事件：原始 AgentStreamEvent 是引擎内部结构
+   * （text_delta / tool_call_start / done.step / turn_end 等十来种），让每个集成插件
+   * 各自解释一遍既重复又容易分歧；归约器（CLI 侧）已把「现在在干什么」算清楚。
+   *
+   * 触发点是 **UI 消费层**（REPL / TUI / run），不是引擎 —— 没走 UI 的调用方
+   * （如 subagent 的 query()）不触发，集成插件需知悉这一边界。
+   */
+  'agent.stream'?: (input: AgentStreamSignal) => Awaitable<void>
 
   // === CLI 扩展 ===
   /** 注册 CLI 斜杠命令：插件往 input.commands 追加自己的命令定义 */

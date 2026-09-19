@@ -1,5 +1,48 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 150）Herdr 集成做成插件：`agent.stream` hook + `@harness/herdr`
+
+上一轮做了 Agent 状态显示（UI 内），本轮把同一份状态也送到**外部终端复用器**
+[Herdr](https://herdr.dev)（agent 感知的 tmux 竞品：侧栏显示每个 pane 在跑/空闲/等你批准）。
+用户要求**做成插件**而非内嵌 CLI —— 状态上报属环境集成，与 CLI 主流程无耦合，插件化后
+`plugins: ["herdr"]` 按需启用，不在 Herdr 里跑的用户零开销、零代码路径。
+
+**唯一的引擎侧缺口：`agent.stream` hook。** 现有 Hooks 覆盖工具池/LLM 参数/prompt/会话/权限
+/CLI 命令，但**没有任何流式事件入口** —— 而「现在在干什么」只存在于事件流里。新增：
+
+- `@harness/plugin` 的 `Hooks['agent.stream']`，入参是**归约后**的状态快照（不是原始事件）。
+  理由：原始 AgentStreamEvent 有十来种类型（text_delta / tool_call_start / done.step / turn_end…），
+  让每个集成插件各自解释一遍既重复又容易分歧；归约器（CLI 侧 `agent-status.ts`，上一轮产物）
+  已把语义算清楚，直接复用。
+- 触发点在 **UI 消费层**（REPL / TUI / run 三处），不是在引擎内 —— 没走 UI 的调用方
+  （如 subagent 的 `query()`）不触发，已在 hook 注释里写明这一边界。
+- 刻意 **不 await**：每个 text_delta 都等一次插件链会把流式渲染拖成串行；代价是上报可能乱序，
+  这正是插件必须带严格递增 `--seq` 的原因（Herdr 会丢弃同源旧序号）。
+
+**插件 `@harness/herdr`（新包 packages/plugins/herdr）**，协议逐条对齐官方文档
+（herdr.dev/docs/integrations「Integrate your own agent」）：
+
+- 只在 `HERDR_ENV=1` 且 `HERDR_PANE_ID`/`HERDR_BIN_PATH` 齐备时生效，否则 install 返回**空 Hooks**
+  （官方硬要求："keeps the integration a no-op outside Herdr"）。双保险：`optIn` 不声明不加载、
+  声明了但不在 Herdr 内也不产生任何进程。
+- 三态映射：thinking/streaming/tool → working；idle/aborted → idle（中断是回到等待输入，
+  不是「等你决策」，故不是 blocked）；权限审批 → blocked。
+- **blocked 只在决策确实是 `ask` 时才报** —— 规则已记住（allow/deny）时根本不会弹窗，报 blocked
+  会制造假阳性（侧栏高亮但没人真的在等你）。
+- 节流是**必需**而非优化：text_delta 每帧都触发 hook，一轮成百上千次，不节流既打满 CPU
+  也让侧栏抖动；判定键 = state + sessionId + message。
+- 退出要 `release-agent`（协议**没有 done** 态）交还生命周期权威，否则 Herdr 会一直认为该 pane
+  归本 source 管。`release` 走**同步** spawn —— 进程 `exit` 钩子里事件循环已不再调度，异步等不到。
+
+核实了一处上一轮的口述结论：官方文档确认 `--seq` **真实存在**且用于乱序防护（"If reports can
+arrive out of order, include a strictly increasing `--seq`"），故实现里带上；同时确认
+`--agent-session-id` / `--message` / `release-agent` 均属实。本机未安装 Herdr ⇒ 无端到端真机验证。
+
+验证：herdr 包 18 例（环境探测 4 / 映射 2 / 命令构造 3 / reporter 5 / 装配 4，含「环境外零调用」
+与「release 同步且幂等」两条不变量）；cli +1 端到端（真实 processLine 跑多步，断言广播确实发生、
+末事件 idle+finish=stop、存在 step=2）；cli 348 全绿；全仓 typecheck 0 错误；
+`unknownBuiltinPluginIds(["herdr"])` 为空且拼错仍报错 ⇒ 声明式启用路径正常。
+
 ## 2026-09-19（续 149）Agent 状态显示：把事件流归约成「现在在干什么」
 
 自主多步上线后，用户最想知道的变成「跑到第几步、在跑哪个工具、是否被中断」——此前 UI 只有
