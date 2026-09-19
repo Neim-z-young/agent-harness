@@ -411,7 +411,7 @@ describe('@harness/provider-openai', () => {
         expect(bodies[1].reasoning_effort).toBe('high')
         expect(bodies[1].thinking).toEqual({ type: 'disabled' })
 
-        // ③ params 级覆盖（Agent.model.options / llm.params hook 路径）
+        // ③ params 级覆盖（Agent.model.options / core.llm.params hook 路径）
         await configured.complete({
           providerId: 'openai',
           messages: msgs as never,

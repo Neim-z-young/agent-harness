@@ -6,7 +6,7 @@
  *
  * 支持格式：PNG / JPEG / GIF / WebP / BMP（通过魔数识别，不依赖额外图像库）
  *
- * 通过 tool.pool.assemble Hook 注入到 Harness 工具池。
+ * 通过 core.tool.pool.assemble Hook 注入到 Harness 工具池。
  */
 
 import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
@@ -231,7 +231,7 @@ export function createToolsMediaPlugin(options?: {
     async install(ctx) {
       ctx.log.info('媒体工具插件已加载', { tools: tools.map((t) => t.id) })
       return {
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const tool of tools) {
             ;(pool as { add: (t: unknown) => void }).add(tool)
           }

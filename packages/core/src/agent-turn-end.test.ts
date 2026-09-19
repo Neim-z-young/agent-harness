@@ -1,7 +1,7 @@
 /**
- * `turn_end` 的引擎侧广播：hook 名是 **`agent.turn.end`**（core 层），不是 `agent.stream`（UI 层）。
+ * `turn_end` 的引擎侧广播：hook 名是 **`core.agent.turn.end`**（core 层），不是 `cli.agent.stream`（UI 层）。
  *
- * 为什么要分成两个 hook：`agent.stream` 的触发点是 UI 消费层（CLI 的 REPL/TUI/run），
+ * 为什么要分成两个 hook：`cli.agent.stream` 的触发点是 UI 消费层（CLI 的 REPL/TUI/run），
  * 以库内嵌或 ACP 宿主自己消费事件流时**根本不会触发** —— 把引擎终态塞进那个通道，
  * 会让"每轮都该发生"的逻辑（如记忆的攒批放行）在无 UI 宿主里静默失效；反过来，同一个
  * hook 名由两层分别触发，消费方也分不清"这条是谁发的"。
@@ -82,7 +82,7 @@ function scriptedProvider(script: ChatStreamChunk[][]): ChatProvider {
   return p
 }
 
-/** 探针：同时订阅两条通道，用来证明"引擎只走 agent.turn.end" */
+/** 探针：同时订阅两条通道，用来证明"引擎只走 core.agent.turn.end" */
 function probePlugin(ends: AgentTurnEndSignal[], streams: AgentStreamSignal[]): AgentPlugin {
   return {
     id: 'probe.turn-end',
@@ -90,10 +90,10 @@ function probePlugin(ends: AgentTurnEndSignal[], streams: AgentStreamSignal[]): 
     name: 'probe',
     async install() {
       return {
-        'agent.turn.end': (s) => {
+        'core.agent.turn.end': (s) => {
           ends.push(JSON.parse(JSON.stringify(s)) as AgentTurnEndSignal)
         },
-        'agent.stream': (s) => {
+        'cli.agent.stream': (s) => {
           streams.push(JSON.parse(JSON.stringify(s)) as AgentStreamSignal)
         },
       }
@@ -122,8 +122,8 @@ async function run(
   return events
 }
 
-describe('core 广播整轮终态：agent.turn.end（引擎层）', () => {
-  it('整轮结束发一次，带引擎事实字段（sessionId / step / finish / mode），且不碰 agent.stream', async () => {
+describe('core 广播整轮终态：core.agent.turn.end（引擎层）', () => {
+  it('整轮结束发一次，带引擎事实字段（sessionId / step / finish / mode），且不碰 cli.agent.stream', async () => {
     const { h, ends, streams } = await setup()
     const sess = await h.session.create()
     await run(h, { sessionId: sess.id, agentId: 'default', message: '干活' })
@@ -137,7 +137,7 @@ describe('core 广播整轮终态：agent.turn.end（引擎层）', () => {
     expect(e.finish).toBe('stop')
     expect(e.aborted).toBeUndefined()
 
-    // 分层的关键断言：引擎**不往 UI 通道**（agent.stream）发任何东西
+    // 分层的关键断言：引擎**不往 UI 通道**（cli.agent.stream）发任何东西
     expect(streams).toEqual([])
     await h.stop()
   })

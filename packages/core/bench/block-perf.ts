@@ -1,7 +1,7 @@
 /**
  * @harness/core 压缩块性能压测（可复用，手动运行）
  *
- * 针对「上下文压缩·统一块模型」风险项4：session.compacting / setBlocks /
+ * 针对「上下文压缩·统一块模型」风险项4：core.session.compacting / setBlocks /
  * blocksPatch 等写块路径的合并去重与持久化频率是否最优。用 mock 模型 + 合成
  * 数据量化，后续可切换真实 ChatProvider 复跑。
  *
@@ -82,7 +82,7 @@ async function scenarioQueryPath(args: Record<string, string>): Promise<void> {
     id: 'bench-acp-premodel',
     async install() {
       return {
-        'session.preModel': async (input: any) => {
+        'core.session.preModel': async (input: any) => {
           // 模拟 ACP 每轮内部折叠出 1 个新块（seq 全局递增 → 每轮一个唯一 id）
           seq++
           input.blocksPatch?.push({

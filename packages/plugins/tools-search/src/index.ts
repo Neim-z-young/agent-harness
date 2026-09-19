@@ -5,7 +5,7 @@
  * - list_dir：列出目录内容（支持递归、隐藏文件）
  * - grep_file：在文件/目录中搜索文本（正则、glob 过滤）
  *
- * 通过 tool.pool.assemble Hook 注入到 Harness 工具池。
+ * 通过 core.tool.pool.assemble Hook 注入到 Harness 工具池。
  *
  * @example
  * import { createHarness } from '@harness/core'
@@ -334,7 +334,7 @@ export const searchTools: Tool[] = [listDirTool, grepFileTool]
 /**
  * 搜索工具插件
  *
- * 通过 tool.pool.assemble Hook 注入 list_dir / grep_file。
+ * 通过 core.tool.pool.assemble Hook 注入 list_dir / grep_file。
  *
  * @param options.toolIds 可选：只注入指定 ID 的工具（默认全部）
  */
@@ -354,7 +354,7 @@ export function createToolsSearchPlugin(options?: {
     async install(ctx) {
       ctx.log.info('搜索工具插件已加载', { tools: tools.map((t) => t.id) })
       return {
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const tool of tools) {
             ;(pool as { add: (t: unknown) => void }).add(tool)
           }

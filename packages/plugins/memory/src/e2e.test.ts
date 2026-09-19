@@ -2,7 +2,7 @@
  * 端到端：文件 → 插件注入 → **模型请求**（而不是只验证 hook 被调用）。
  *
  * 用真实 core 装配（`createHarness`）+ 探针 Provider 捕获请求体，覆盖整条链路：
- *   ctx.workspace（core 注入） → 读 AGENTS.md / MEMORY.md → prompt.system.transform
+ *   ctx.workspace（core 注入） → 读 AGENTS.md / MEMORY.md → core.prompt.system.transform
  *   → system 消息 → provider.stream 收到的 messages
  *
  * 同时验证决策 B6：subagent 跑同一链路时**不带**记忆。

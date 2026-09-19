@@ -6,13 +6,13 @@
  * - 其他插件通过 `registerMcpServer()` 注册两条路径之一：
  *   1. `config`：stdio / http / sse 的 McpServerConfig（缺省用 @harness/mcp-client 的 defaultTransportFactory 拉起）
  *   2. `createTransport`：进程内 / 自定义启动器，返回一个 @harness/mcp-client 的 McpTransport
- * - 本插件在 harness.start 时连接所有已注册 server，复用 @harness/mcp-client 的
- *   McpClient 管理连接 + convertMcpToolToHarnessTool 转成 Harness 工具，经 tool.pool.assemble 暴露
+ * - 本插件在 core.harness.start 时连接所有已注册 server，复用 @harness/mcp-client 的
+ *   McpClient 管理连接 + convertMcpToolToHarnessTool 转成 Harness 工具，经 core.tool.pool.assemble 暴露
  *
  * 依赖约定：mcpserver 相关插件应 `dependsOn: ['mcp.server-registry']`，确保本插件先安装、先连接。
  */
 
-import type { AgentPlugin, Hooks } from '@harness/plugin'
+import type { AgentPlugin, Hooks, McpConfigureInput } from '@harness/plugin'
 import { globalMcpToolIndex, type Tool } from '@harness/tool'
 import type { Unsubscribe } from '@harness/bus'
 import { LifecycleEvents } from '@harness/core'
@@ -131,9 +131,9 @@ export interface McpCliStore {
 
 /**
  * 创建 MCP Server 注册表插件。
- * 负责：harness.start 时连接所有已注册（代码 + config.json）server → tool.pool.assemble 暴露工具
+ * 负责：core.harness.start 时连接所有已注册（代码 + config.json）server → core.tool.pool.assemble 暴露工具
  *       → /mcp 命令管理（服务器/工具两级启停）→ unload 时断开。
- * 配置源：config.json `mcpServers` 经 `mcp.configure` Hook 注入（boot 时由 CLI 调用），
+ * 配置源：config.json `mcpServers` 经 `cli.mcp.configure` Hook 注入（boot 时由 CLI 调用），
  *        后续 CLI/TUI/Web 界面经注入的 McpCliStore.save 持久化回 config.json。
  */
 export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOptions = {}): AgentPlugin {
@@ -320,11 +320,16 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
       return {
         /**
          * 注入 config.json 的 mcpServers（替换托管列表）。仅建立配置态，不连接；
-         * 由 harness.start 按 enabled 开关连接。CLI 在 createHarness 后、start 前调用。
+         * 由 core.harness.start 按 enabled 开关连接。CLI 在 createHarness 后、start 前调用。
+         *
+         * 入参用契约层的 `McpConfigureInput`（`McpServerConfigLike` 与 mcp-client 的
+         * `McpServerConfig` 结构一致但刻意不 import —— 避免契约包反向依赖 MCP 插件包）。
+         * 这里按本插件自己的 `McpServerEntry` 收窄：字段口径由 mcp-client 定义，双方约定同步。
          */
-        'mcp.configure'(input: { mcpServers?: McpServerEntry[] }, _output?: unknown) {
+        'cli.mcp.configure'(input: McpConfigureInput) {
+          const entries = (input.mcpServers ?? []) as unknown as McpServerEntry[]
           managed.clear()
-          for (const e of input.mcpServers ?? []) {
+          for (const e of entries) {
             managed.set(e.name, {
               entry: e,
               enabled: e.enabled ?? true,
@@ -333,13 +338,13 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
           }
         },
 
-        async 'harness.start'() {
+        async 'core.harness.start'() {
           // 懒加载：启动不预连 MCP server，避免阻塞应用启动。
-          // 首次 tool.pool.assemble（首条消息 / /tools / /mcp 等真正需要工具时）才连接；
+          // 首次 core.tool.pool.assemble（首条消息 / /tools / /mcp 等真正需要工具时）才连接；
           // 单个 server 连接失败仅被跳过，不影响启动与其他 server。
         },
 
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           const p = pool as { add: (t: unknown) => void; remove?: (id: string) => void }
           // 懒加载：装配工具前确保「启用」server 已连接（in-flight 去重，失败仅跳过）
           await ensureConnected()
@@ -434,7 +439,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
               out(ok ? (m ? `已启用并连接 ${name}\n` : `已启用并重新连接 ${name}（本次进程生效）\n`) : `启用失败（未能连接 ${name}）\n`)
               await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
             } else {
-              // 记录待移除的工具 id（先从运行态取，再断开连接），供 tool.pool.assemble 收敛注册表
+              // 记录待移除的工具 id（先从运行态取，再断开连接），供 core.tool.pool.assemble 收敛注册表
               const rt = runtimes.find((r) => r.name === name)
               downTools.set(name, rt ? rt.tools.map((t) => t.id) : [])
               if (m) { m.enabled = false; persist() }

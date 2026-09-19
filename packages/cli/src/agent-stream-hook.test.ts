@@ -1,11 +1,11 @@
 /**
- * `agent.stream` hook 的端到端验证：CLI 真的把**归约后**的状态广播给了插件。
+ * `cli.agent.stream` hook 的端到端验证：CLI 真的把**归约后**的状态广播给了插件。
  *
  * 这是「Herdr 集成做成插件」能成立的前提 —— 该 hook 是插件化唯一需要新增的引擎侧入口，
  * 若它没被触发，插件就只是个空壳。故这里不 mock hook 调用，而是走真实 processLine 链路。
  *
- * 注意分层：`agent.stream` 是 **UI 消费层**的通道（本文件验证的就是它，UI 收 busy/idle 靠它）；
- * 引擎层的整轮终态走另一条 hook **`agent.turn.end`**（core 广播，任何宿主都有，
+ * 注意分层：`cli.agent.stream` 是 **UI 消费层**的通道（本文件验证的就是它，UI 收 busy/idle 靠它）；
+ * 引擎层的整轮终态走另一条 hook **`core.agent.turn.end`**（core 广播，任何宿主都有，
  * 见 core/src/agent-turn-end.test.ts）。两条通道刻意不混 —— 终态若两层都发，
  * 消费方分不清来源，按轮计数的逻辑会被计两次。
  */
@@ -17,7 +17,7 @@ import { HarnessApp, createProcessLine } from './index'
 import { defineTool } from '@harness/core'
 import type { AgentPlugin, AgentStreamSignal } from '@harness/plugin'
 
-describe('agent.stream hook（外部集成入口）', () => {
+describe('cli.agent.stream hook（外部集成入口）', () => {
   it('多步链路中按事件广播归约后的状态，末事件为 idle+finish', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'agent-stream-'))
     try {
@@ -28,7 +28,7 @@ describe('agent.stream hook（外部集成入口）', () => {
         name: 'probe',
         async install() {
           return {
-            'agent.stream': (s) => {
+            'cli.agent.stream': (s) => {
               seen.push(JSON.parse(JSON.stringify(s)) as AgentStreamSignal)
             },
           }
@@ -80,7 +80,7 @@ describe('agent.stream hook（外部集成入口）', () => {
       // 每个信号都带会话 ID（外部集成长按它做会话关联/恢复）
       expect(seen.every((s) => s.sessionId === sess.id)).toBe(true)
       // turn_end（UI 状态流：整轮结束 ⇒ idle）**恰好一次**：这条通道只由 CLI 触发，
-      // 引擎终态在另一条 hook（agent.turn.end），两边都发会让按轮计数的消费方翻倍
+      // 引擎终态在另一条 hook（core.agent.turn.end），两边都发会让按轮计数的消费方翻倍
       expect(seen.filter((s) => s.eventType === 'turn_end')).toHaveLength(1)
       // 归约结果里有「工具执行中」这一态（外部 UI 最关心的状态之一）
       expect(seen.some((s) => s.status.phase === 'tool')).toBe(true)

@@ -135,10 +135,10 @@ describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', ()
     expect(plugin.dependsOn).toContain('mcp.server-registry')
     const hooks = await plugin.install({ log: { info() {}, warn() {}, error() {}, debug() {} } } as any)
 
-    // 纯 MCP 装配：不产生 tool.pool.assemble 直装工具
-    expect((hooks as any)['tool.pool.assemble']).toBeUndefined()
+    // 纯 MCP 装配：不产生 core.tool.pool.assemble 直装工具
+    expect((hooks as any)['core.tool.pool.assemble']).toBeUndefined()
 
-    // registry 中可见 code-intel server（伴随 harness.start 由 mcp-server-registry 连接）
+    // registry 中可见 code-intel server（伴随 core.harness.start 由 mcp-server-registry 连接）
     const entry = listRegisteredMcpServers().find((r) => r.name === CODE_INTEL_SERVER_NAME)
     expect(entry).toBeDefined()
     expect(entry && 'createTransport' in entry ? (entry as { createTransport: unknown }).createTransport : null).toBeTypeOf('function')
@@ -161,7 +161,7 @@ describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', ()
     client.close()
   })
 
-  it('端到端：code-intel + registry 装配后 harness.start 连接，tool.pool.assemble 暴露 mcp__code-intel__*', async () => {
+  it('端到端：code-intel + registry 装配后 core.harness.start 连接，core.tool.pool.assemble 暴露 mcp__code-intel__*', async () => {
     const log = { info() {}, warn() {}, error() {}, debug() {} }
     const bus = { publish: async () => undefined, subscribe: () => () => undefined, subscribeAll: () => () => undefined }
     const codeIntel = createCodeIntelPlugin()
@@ -169,10 +169,10 @@ describe('createCodeIntelPlugin 装配（可插拔，对齐 computer-use）', ()
     const registry = createMcpServerRegistryPlugin()
     const regHooks = await registry.install({ log, bus } as any)
 
-    // 模拟 harness.start：连接所有已注册进程内 server（含 code-intel）
-    await (regHooks as any)['harness.start']()
+    // 模拟 core.harness.start：连接所有已注册进程内 server（含 code-intel）
+    await (regHooks as any)['core.harness.start']()
     const pool = { added: [] as unknown[] }
-    await (regHooks as any)['tool.pool.assemble']({} as any, { add: (t: unknown) => (pool.added as unknown[]).push(t) })
+    await (regHooks as any)['core.tool.pool.assemble']({} as any, { add: (t: unknown) => (pool.added as unknown[]).push(t) })
 
     const ids = pool.added.map((t) => (t as { id: string }).id).sort()
     expect(ids).toEqual([

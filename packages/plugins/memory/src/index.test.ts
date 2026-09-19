@@ -179,7 +179,7 @@ describe('插件装配与注入', () => {
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '用户偏好：始终用中文回答')
     const { hooks } = await install()
     const parts: string[] = []
-    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    await hooks['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     expect(parts.join('\n')).toContain('<memory>')
     expect(parts.join('\n')).toContain('始终用中文回答')
   })
@@ -190,7 +190,7 @@ describe('插件装配与注入', () => {
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '不该出现在子 Agent 里')
     const { hooks } = await install()
     const parts: string[] = []
-    await hooks['prompt.system.transform']!(
+    await hooks['core.prompt.system.transform']!(
       { agentId: 'sub', sessionId: 's', agentMode: 'subagent' },
       parts,
     )
@@ -200,7 +200,7 @@ describe('插件装配与注入', () => {
   it('四个文件都不存在 → 完全不注入（零噪声）', async () => {
     const { hooks } = await install()
     const parts: string[] = []
-    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    await hooks['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     expect(parts).toEqual([])
   })
 
@@ -216,7 +216,7 @@ describe('插件装配与注入', () => {
     writeFileSync(join(w.user.memory, 'MEMORY.md'), 'x')
     const { hooks } = await install({ disableInjection: true })
     const parts: string[] = []
-    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    await hooks['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     expect(parts).toEqual([])
   })
 })
@@ -407,7 +407,7 @@ describe('/memory 写入命令', () => {
     hooks['cli.command']!(cmdInput('rm 会被删掉的'))
 
     const parts: string[] = []
-    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    await hooks['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     const injected = parts.join('\n')
     expect(injected).toContain('保留的')
     expect(injected).not.toContain('会被删掉的')
@@ -424,7 +424,7 @@ describe('/memory 写入命令', () => {
     hooks['cli.command']!(input)
     expect(input.lines.join('')).toContain('已清空记忆缓存')
     const parts: string[] = []
-    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    await hooks['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     expect(parts.join('\n')).toContain('外部改写的内容')
   })
 })
@@ -502,7 +502,7 @@ describe('插件级：flush 三源与一次性提示', () => {
   const sys = { agentId: 'default', sessionId: 's' }
   const inject = async (hooks: Hooks) => {
     const parts: string[] = []
-    await hooks['prompt.system.transform']!(sys, parts)
+    await hooks['core.prompt.system.transform']!(sys, parts)
     return parts.join('\n')
   }
 
@@ -525,7 +525,7 @@ describe('插件级：flush 三源与一次性提示', () => {
     await inject(hooks)
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
 
-    hooks['agent.stream']!({ eventType: 'tool_call_start', status: { agentId: 'd', phase: 'tool', toolId: 'compress' } })
+    hooks['cli.agent.stream']!({ eventType: 'tool_call_start', status: { agentId: 'd', phase: 'tool', toolId: 'compress' } })
     const first = await inject(hooks)
     expect(first).toContain('压缩前的改动')       // 已发布
     expect(first).toContain('<memory-hint>')       // 提示出现
@@ -534,26 +534,26 @@ describe('插件级：flush 三源与一次性提示', () => {
     expect(second).not.toContain('<memory-hint>')  // 一次性
   })
 
-  it('session compaction（session.compacting）也触发 flush', async () => {
+  it('session compaction（core.session.compacting）也触发 flush', async () => {
     const { hooks, w } = await hooksOf()
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '- session 压缩时的改动\n')
 
-    hooks['session.compacting']!({ agentId: 'd', sessionId: 's' } as never, {} as never)
+    hooks['core.session.compacting']!({ agentId: 'd', sessionId: 's' } as never, {} as never)
     expect(await inject(hooks)).toContain('session 压缩时的改动')
   })
 
-  it('兜底：攒够轮数（agent.turn.end）后发布，即使从未压缩', async () => {
+  it('兜底：攒够轮数（core.agent.turn.end）后发布，即使从未压缩', async () => {
     const { hooks, w } = await hooksOf({ flushAfterTurns: 2 })
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 攒批的改动\n')
 
     expect(await inject(hooks)).toContain('初始')
-    // 引擎层的整轮终态（不是 agent.stream —— 那条只在有 UI 消费层的宿主里才有）
-    hooks['agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: 's', step: 1 })
-    hooks['agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: 's', step: 1 })
+    // 引擎层的整轮终态（不是 cli.agent.stream —— 那条只在有 UI 消费层的宿主里才有）
+    hooks['core.agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: 's', step: 1 })
+    hooks['core.agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: 's', step: 1 })
     expect(await inject(hooks)).toContain('攒批的改动')
   })
 
@@ -604,12 +604,12 @@ describe('turn_end 计数只认主会话', () => {
   }
   const inject = async (hooks: Hooks) => {
     const parts: string[] = []
-    await hooks['prompt.system.transform']!(sys, parts)
+    await hooks['core.prompt.system.transform']!(sys, parts)
     return parts.join('\n')
   }
   const endTurn = (hooks: Hooks, sessionId?: string, mode = 'primary') => {
-    // 引擎层通道：agent.turn.end（不是 agent.stream 的 turn_end —— 那条只存在于有 UI 的宿主）
-    hooks['agent.turn.end']!({
+    // 引擎层通道：core.agent.turn.end（不是 cli.agent.stream 的 turn_end —— 那条只存在于有 UI 的宿主）
+    hooks['core.agent.turn.end']!({
       agentId: 'default',
       mode,
       step: 1,
@@ -659,18 +659,18 @@ describe('turn_end 计数只认主会话', () => {
   })
 })
 
-describe('轮次计数的来源必须是引擎层（agent.turn.end）', () => {
+describe('轮次计数的来源必须是引擎层（core.agent.turn.end）', () => {
   const sys = { agentId: 'default', sessionId: 's' }
   const inject = async (hooks: Hooks) => {
     const parts: string[] = []
-    await hooks['prompt.system.transform']!(sys, parts)
+    await hooks['core.prompt.system.transform']!(sys, parts)
     return parts.join('\n')
   }
   const endTurn = (hooks: Hooks, mode = 'primary', sessionId: string | undefined = 's') => {
-    hooks['agent.turn.end']!({ agentId: 'default', mode, step: 1, ...(sessionId ? { sessionId } : {}) })
+    hooks['core.agent.turn.end']!({ agentId: 'default', mode, step: 1, ...(sessionId ? { sessionId } : {}) })
   }
 
-  it('UI 通道（agent.stream）的 turn_end 不计数 —— 否则两层都发时会翻倍', async () => {
+  it('UI 通道（cli.agent.stream）的 turn_end 不计数 —— 否则两层都发时会翻倍', async () => {
     const w = ws()
     const { hooks } = await install({ flushAfterTurns: 2 })
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
@@ -679,7 +679,7 @@ describe('轮次计数的来源必须是引擎层（agent.turn.end）', () => {
     expect(await inject(hooks)).toContain('初始') // 先被"发现"（dirty）
 
     for (let i = 0; i < 3; i++) {
-      hooks['agent.stream']!({ eventType: 'turn_end', sessionId: 's', status: { agentId: 'default', phase: 'idle' } })
+      hooks['cli.agent.stream']!({ eventType: 'turn_end', sessionId: 's', status: { agentId: 'default', phase: 'idle' } })
     }
     expect(await inject(hooks)).toContain('初始') // 三次都没推进轮数
 

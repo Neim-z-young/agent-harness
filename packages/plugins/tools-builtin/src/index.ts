@@ -9,7 +9,7 @@
  *
  * 搜索/导航类工具（list_dir / grep_file）见 @harness/tools-search。
  *
- * 通过 tool.pool.assemble Hook 自动注入到 Harness 工具池。
+ * 通过 core.tool.pool.assemble Hook 自动注入到 Harness 工具池。
  *
  * @example
  * import { createHarness } from '@harness/core'
@@ -868,7 +868,7 @@ export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, edit
 /**
  * 内置 Tool 插件
  *
- * 通过 tool.pool.assemble Hook 把工具注入到工具池。
+ * 通过 core.tool.pool.assemble Hook 把工具注入到工具池。
  * 可通过配置选择只注入部分工具，并配置 bash 沙箱。
  *
  * @param options.toolIds 可选：只注入指定 ID 的工具（默认全部）
@@ -891,7 +891,7 @@ export function createToolsBuiltinPlugin(options?: {
     async install(ctx) {
       ctx.log.info('内置工具插件已加载', { tools: tools.map((t) => t.id) })
       return {
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const tool of tools) {
             ;(pool as { add: (t: unknown) => void }).add(tool)
           }

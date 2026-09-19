@@ -514,7 +514,7 @@ function summarizeResult(
 /**
  * 创建 SubagentTool
  *
- * @param getHarness 获取 Harness 引用的函数（插件在 harness.start 时缓存）
+ * @param getHarness 获取 Harness 引用的函数（插件在 core.harness.start 时缓存）
  * @param timeoutMs 执行超时
  * @param cleanupSession 完成后是否删除子 session
  * @param maxResultLength 返回给父 Agent 的最大结果长度（字符），超过则生成摘要。缺省 2000
@@ -522,7 +522,7 @@ function summarizeResult(
  * @param directive 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），
  *                  要求子 Agent 简洁结构化回复；不传则不注入
  */
-/** createSubagentTool 可选的 worktree 隔离依赖（由插件在 harness.start 时注入） */
+/** createSubagentTool 可选的 worktree 隔离依赖（由插件在 core.harness.start 时注入） */
 export interface WorktreeHooks {
   /** 解析/创建子 Agent 隔离 worktree 目录（未启用返回 undefined） */
   resolve: (existingCwd?: string) => Promise<string | undefined>
@@ -596,10 +596,10 @@ export function createSubagentTool(
       }
 
       if (!harness || !harness.agent || !harness.session) {
-        publishFailed('HARNESS_NOT_READY', 'Harness 未就绪（harness.start 未触发或 agent/session 缺失）')
+        publishFailed('HARNESS_NOT_READY', 'Harness 未就绪（core.harness.start 未触发或 agent/session 缺失）')
         return {
           ok: false,
-          error: { message: 'Harness 未就绪（harness.start 未触发）', code: 'HARNESS_NOT_READY' },
+          error: { message: 'Harness 未就绪（core.harness.start 未触发）', code: 'HARNESS_NOT_READY' },
         }
       }
 
@@ -1114,7 +1114,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
    * 口径必须与 subagent 工具一致 —— 工具是用 `agent.get(agentId)` + `mode` 校验
    * 解析目标的（见 createSubagentTool），同样只认注册表、不认插件数组。
    *
-   * @returns 注册表里的子 Agent；harness 尚未就绪（如单测未触发 harness.start）时
+   * @returns 注册表里的子 Agent；harness 尚未就绪（如单测未触发 core.harness.start）时
    *          返回 undefined，由调用方回退到插件配置数组。
    */
   const registrySubagents = (): AgentDefinition[] | undefined => {
@@ -1184,7 +1184,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         subagents: subagents.map((a) => ({ id: a.id, name: a.name, mode: a.mode })),
       })
 
-      // 延迟创建 SubagentTool（需要 harness 引用，在 harness.start 时才有）
+      // 延迟创建 SubagentTool（需要 harness 引用，在 core.harness.start 时才有）
       subagentTool = createSubagentTool(
         () => harness,
         timeoutMs,
@@ -1199,10 +1199,10 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
 
 
       return {
-        async 'harness.start'(input) {
+        async 'core.harness.start'(input) {
           const h = (input as { harness: HarnessLike }).harness
           if (!h?.agent || !h?.session) {
-            ctx.log.error('Subagent 插件：harness.start 未提供 agent/session 引用')
+            ctx.log.error('Subagent 插件：core.harness.start 未提供 agent/session 引用')
             return
           }
           harness = h
@@ -1234,7 +1234,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
           }
         },
 
-        'tool.pool.assemble'(_input, pool) {
+        'core.tool.pool.assemble'(_input, pool) {
           if (subagentTool) {
             ;(pool as { add: (t: unknown) => void }).add(subagentTool)
           }
@@ -1890,7 +1890,7 @@ export function createBackgroundTaskMonitor(options: BackgroundTaskMonitorOption
 
 // ===== 便捷导出 =====
 
-/** 默认导出（无子 Agent 配置，需要通过 harness.start 后外部注册） */
+/** 默认导出（无子 Agent 配置，需要通过 core.harness.start 后外部注册） */
 export const subagentPlugin = createSubagentPlugin()
 
 // ===== 运行时能力（抽象层契约）=====

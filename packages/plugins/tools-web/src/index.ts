@@ -4,7 +4,7 @@
  * 提供：
  * - web_fetch：HTTP(S) 抓取 URL 内容（text / json / base64），支持方法、请求头、超时、请求体
  *
- * 通过 tool.pool.assemble Hook 注入到 Harness 工具池。
+ * 通过 core.tool.pool.assemble Hook 注入到 Harness 工具池。
  *
  * 安全策略：
  * - 允许抓取任意 URL；但拒绝非 http(s) 协议、拒绝 SSRF 目标（私有 IP、localhost 可选拒绝）
@@ -272,7 +272,7 @@ export function createToolsWebPlugin(options?: {
     async install(ctx) {
       ctx.log.info('网页工具插件已加载', { tools: tools.map((t) => t.id) })
       return {
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const tool of tools) {
             ;(pool as { add: (t: unknown) => void }).add(tool)
           }

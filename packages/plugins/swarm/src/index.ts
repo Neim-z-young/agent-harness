@@ -2025,7 +2025,7 @@ export function createSwarmPlugin(options: SwarmPluginOptions = {}): AgentPlugin
       ]
 
       return {
-        'tool.pool.assemble'(input, pool) {
+        'core.tool.pool.assemble'(input, pool) {
           const reg = pool as { add: (t: unknown) => void }
           for (const tool of tools) reg.add(tool)
         },

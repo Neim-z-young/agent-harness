@@ -5,7 +5,7 @@
  * - 生命周期（init→start→stop）串联 Bus 事件 + Plugin Hooks
  * - 能力模块访问器（session/agent/plugin/bus/tool/permission/skill/context）
  * - Tool Pipeline 接入 Plugin hooks（pre/post 管道桥接）
- * - LLM 调用链路（ChatProvider → llm.params 钩子）
+ * - LLM 调用链路（ChatProvider → core.llm.params 钩子）
  *
  * 同一套内核可嵌入 SDK/CLI/IDE/Worker/Server 多形态。
  */
@@ -157,6 +157,8 @@ import {
   LLMInput,
   LLMParams,
   PromptInput,
+  PermissionRequestLike,
+  PermissionDecisionLike,
 } from '@harness/plugin'
 import type { CompactionContext } from '@harness/plugin'
 import {
@@ -281,13 +283,57 @@ function defaultGlob(pattern: string, path: string): boolean {
 }
 
 /**
+ * 触发插件 hook 的通用签名（与 PluginManager.trigger 同形）。
+ * 供 `resolvePermission` 这类自由函数按需注入，避免把 PluginsRegistry 类型漏进工具链。
+ */
+type PluginTrigger = <N extends keyof Hooks>(
+  name: N,
+  ...args: Parameters<NonNullable<Hooks[N]>>
+) => Promise<void>
+
+/**
+ * 把 `PluginManager.trigger` 包成可安全传递的触发函数。
+ *
+ * 为什么要包一层：`trigger` 是**类方法**，实现里读 `this.hooks` —— 直接把
+ * `pm.trigger` 当值传出去会丢 this（运行时炸）。此前各处只能用
+ * `(n, ...args) => (pm as any).trigger(n, ...args)` 绕类型，这里收口成一处，
+ * 顺带把泛型签名保住（调用方 `trigger('core.llm.params', ...)` 仍有完整类型检查）。
+ */
+function bindTrigger(pm: PluginManager): PluginTrigger {
+  return (name, ...args) => pm.trigger(name, ...args)
+}
+
+/**
  * 权限判定两步走：先 check（不询问），若需询问则调用 ask()（交上层交互，
  * 无交互器时引擎 ask() 默认 deny，保证安全）。工具执行统一经此入口拿到最终 allow/deny。
+ *
+ * 在 check 之后、ask() 之前插入 `core.permission.check` hook：插件可原地改写决策
+ * （如 teammate 桥接 leader、herdr 上报「等待用户决策」）。触发点刻意放在 **ask 之前**：
+ * 只有此刻 `decision.behavior` 还可能是 `'ask'`，消费方才能分辨「真会弹窗」与
+ * 「规则已记住、不会弹窗」；放到 ask 之后就永远看不到 ask 了（那是 hook 契约失效，
+ * 不是消费方的判断错）。
+ *
+ * 触发后行为：
+ * - 插件把 behavior 改成 allow/deny ⇒ 直接采纳，不再询问用户；
+ * - 插件改写了 updatedInput 而引擎侧决策没带回 ⇒ 补回，避免改写丢失
+ *   （ToolPipeline 从返回的 decision.updatedInput 重写工具入参）。
  */
-async function resolvePermission(engine: PermissionEngine, req: ToolPermissionRequest): Promise<ToolPermissionDecision> {
+async function resolvePermission(
+  engine: PermissionEngine,
+  req: ToolPermissionRequest,
+  triggerPlugin?: PluginTrigger,
+): Promise<ToolPermissionDecision> {
   const d = await engine.check(req)
-  if (d.behavior !== 'ask') return d
-  return engine.ask(req)
+  const decision = { ...d } as PermissionDecisionLike
+  if (triggerPlugin) {
+    await triggerPlugin('core.permission.check', req as PermissionRequestLike, decision)
+  }
+  if (decision.behavior !== 'ask') return decision as ToolPermissionDecision
+  const asked = await engine.ask(req)
+  if (asked.updatedInput === undefined && decision.updatedInput !== undefined) {
+    return { ...asked, updatedInput: decision.updatedInput }
+  }
+  return asked
 }
 
 /**
@@ -374,7 +420,7 @@ export class DefaultPermissionEngine implements PermissionEngine {
 }
 
 // ========================================================================
-// 3. ChatProvider（LLM 抽象）+ llm.params Hook 桥
+// 3. ChatProvider（LLM 抽象）+ core.llm.params Hook 桥
 // ========================================================================
 
 /** LLM token 用量统计（含缓存命中/未命中明细） */
@@ -650,7 +696,7 @@ class DefaultToolPool implements PluginToolPool {
 interface SessionServices {
   readonly agent: AgentRuntime
   readonly currentAgentId: () => string
-  /** 触发插件 hook（供 session.compacting 等生命周期接入） */
+  /** 触发插件 hook（供 core.session.compacting 等生命周期接入） */
   readonly triggerPlugin: <N extends keyof Hooks>(
     name: N,
     ...args: Parameters<NonNullable<Hooks[N]>>
@@ -942,7 +988,7 @@ export class DefaultSessionManager implements SessionManager {
     let windowToPrune = msgs.slice(0, cutIndex)
     let kept = msgs.slice(cutIndex)
 
-    // 触发 session.compacting hook：给插件（如 ACP）在删除前保全原文的窗口，
+    // 触发 core.session.compacting hook：给插件（如 ACP）在删除前保全原文的窗口，
     // 并可改写 keepLast/strategy/summary。核心路径此前从未触发该 hook。
     const compactCtx: CompactionContext = {
       keepLast: keepRecent,
@@ -957,7 +1003,7 @@ export class DefaultSessionManager implements SessionManager {
       },
     }
     await this.services?.()?.triggerPlugin(
-      'session.compacting',
+      'core.session.compacting',
       { agentId: sess.agentId ?? '', sessionId },
       compactCtx,
     )
@@ -1424,18 +1470,18 @@ export interface AgentRuntime {
 
 /**
  * 一次查询内**不变**的准备产物（`_prepareQueryOnce` 的返回）。
- * 随轮次变化的部分（消息历史、llm.params/headers、preModel 裁剪）不在这里，
+ * 随轮次变化的部分（消息历史、core.llm.params/headers、preModel 裁剪）不在这里，
  * 由 `_buildStepMessages` 每轮重建。
  */
 interface PreparedQuery {
   agentId: string
   sessionId: string
-  /** system prompt 片段（已过 `prompt.system.transform` 与压缩记忆注入） */
+  /** system prompt 片段（已过 `core.prompt.system.transform` 与压缩记忆注入） */
   sysParts: string[]
   allowedTools: Tool[]
   providerId: string
   modelId?: string
-  /** 基础 LLM 参数（temperature / agent.model.options），每轮浅拷贝后交给 `llm.params` hook */
+  /** 基础 LLM 参数（temperature / agent.model.options），每轮浅拷贝后交给 `core.llm.params` hook */
   paramsBase: LLMParams
 }
 
@@ -1643,7 +1689,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
     if (!agent) throw new Error(`Agent "${agentId}" not registered`)
 
     const pool = new DefaultToolPool(this.deps.toolRegistry)
-    await this.deps.triggerPlugin('tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
+    await this.deps.triggerPlugin('core.tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
     const allowedTools = filterMcpTools(
       this.deps.toolRegistry.filterByWhitelist(agent.tools),
       agent.mcpServers,
@@ -1688,12 +1734,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
       sessionId,
       ...(agent.mode ? { agentMode: agent.mode } : {}),
     }
-    await this.deps.triggerPlugin('prompt.system.transform', promptIn, sysParts)
+    await this.deps.triggerPlugin('core.prompt.system.transform', promptIn, sysParts)
 
     // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
     const providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'
     const modelId = input.model?.modelId ?? agent.model?.modelId
-    // 基础参数一次算好（浅拷贝给每轮的 params）；`llm.params` hook 仍每轮跑 ——
+    // 基础参数一次算好（浅拷贝给每轮的 params）；`core.llm.params` hook 仍每轮跑 ——
     // 它的入参含本轮 messages，提前到一次阶段会让 hook 看到过期的历史。
     const paramsBase: LLMParams = {
       temperature: input.model?.temperature ?? agent.model?.temperature ?? 0.7,
@@ -1739,13 +1785,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const llmIn: LLMInput = { providerId: p.providerId, modelId: p.modelId, messages }
     const params: LLMParams = { ...p.paramsBase }
     const headers: Record<string, string> = {}
-    await this.deps.triggerPlugin('llm.params', llmIn, params)
-    await this.deps.triggerPlugin('llm.headers', llmIn, headers)
+    await this.deps.triggerPlugin('core.llm.params', llmIn, params)
+    await this.deps.triggerPlugin('core.llm.headers', llmIn, headers)
 
     // 每轮进入模型前：交给上下文压缩插件裁剪/改写 messages（原地生效），并回写精简后的会话
     const preModelBlocks: NonNullable<import('@harness/plugin').SessionPreModelInput['blocksPatch']> = []
     await this.deps.triggerPlugin(
-      'session.preModel',
+      'core.session.preModel',
       {
         sessionId,
         agentId: p.agentId,
@@ -1835,7 +1881,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       // 时也要送达，否则以 turn_end 收状态的消费者（TUI 的 busy、swarm tick）会永久卡在"运行中"。
       // 异常本身不再被吞：finally 执行完仍会继续向上传播。
       //
-      // 顺带**广播整轮结束**给插件：走 `agent.turn.end`（引擎层事实），不走 `agent.stream`
+      // 顺带**广播整轮结束**给插件：走 `core.agent.turn.end`（引擎层事实），不走 `cli.agent.stream`
       // —— 后者是 UI 消费层（CLI 的 REPL/TUI/run）的"现在在干什么"状态流，引擎不该往里塞事件，
       // 否则同一个 hook 名由两层分别触发，消费方无法分辨来源。
       //
@@ -1846,7 +1892,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       // 要不要筛由消费方按 mode / sessionId 决定。
       const def = this.agents.get(prepared.agentId)
       void this.deps
-        .triggerPlugin('agent.turn.end', {
+        .triggerPlugin('core.agent.turn.end', {
           agentId: prepared.agentId,
           ...(def?.name ? { agentName: def.name } : {}),
           ...(def?.mode ? { mode: def.mode } : {}),
@@ -2171,7 +2217,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
         signal: signal ?? new AbortController().signal,
         variables: {},
         cwd: tctxCwd,
-        requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
+        requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest, this.deps.triggerPlugin) as Promise<ToolPermissionDecision>,
       }
       const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, parsedInput, tctx)
       resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
@@ -2223,7 +2269,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
 /** 工作中的 Harness 接口（与模板文档略有差异，这里提供具体可用 API） */
 export interface Harness {
   // === 生命周期 ===
-  /** 启动（触发 harness.start hook + harness.started event） */
+  /** 启动（触发 core.harness.start hook + harness.started event） */
   start(): Promise<void>
   /** 停止（unload 所有插件 + bus publish） */
   stop(): Promise<void>
@@ -2232,7 +2278,7 @@ export interface Harness {
   /** 恢复（MVP：占位） */
   resume(): Promise<void>
   /**
-   * 组装工具池：对每个已注册 Agent 触发 `tool.pool.assemble` Hook，把插件工具注册进全局
+   * 组装工具池：对每个已注册 Agent 触发 `core.tool.pool.assemble` Hook，把插件工具注册进全局
    * ToolRegistry。幂等（ToolPool.add 仅注册尚未注册的工具）。供 boot 后台预加载插件后主动
    * 预热，使 /tools 无需等待首条消息即可呈现「已加载」状态（query 内部仍会再触发一次）。
    */
@@ -2247,7 +2293,7 @@ export interface Harness {
   readonly tools: ToolRegistry
   readonly toolPipeline: ToolPipeline
   readonly permission: PermissionEngine
-  /** Skill 管理器（加载/查询/禁用/重载技能；插件可在 harness.init 中通过此注册 plugin 来源技能） */
+  /** Skill 管理器（加载/查询/禁用/重载技能；插件可在 core.harness.init 中通过此注册 plugin 来源技能） */
   readonly skillManager?: SkillManager
 
   // === 工作目录 ===
@@ -2387,7 +2433,7 @@ export class HarnessImpl implements Harness {
   public readonly plugin: PluginManager
   public readonly session: SessionManager
   public readonly agent: AgentRuntime
-  /** Skill 管理器（从 skillDirs 加载，通过 prompt.system.transform 注入） */
+  /** Skill 管理器（从 skillDirs 加载，通过 core.prompt.system.transform 注入） */
   public skillManager?: SkillManager
   /** 全局工具工作目录（= options.cwd ?? process.cwd()） */
   public readonly cwd: string
@@ -2421,16 +2467,15 @@ export class HarnessImpl implements Harness {
     })
 
     // ToolPipeline 接入 Plugin hooks（pre/post）
-    // - preHook 洋葱：按插件序，把 tool.pre.execute 包装成 next() 链
-    // - postHook 顺序：把 tool.post.execute 插入
+    // - preHook 洋葱：按插件序，把 core.tool.pre.execute 包装成 next() 链
+    // - postHook 顺序：把 core.tool.post.execute 插入
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     let _self: unknown = null
     _self = this as any
     const preHook: ToolPreHook = async (preCtx, next) => {
-      let idx = 0
-      const entries = (this.plugin as any).hooks?.listFor
-        ? (this.plugin as any).hooks.listFor('tool.pre.execute') as ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks['tool.pre.execute']> }>
-        : []
+      const idx = 0
+      // 每次执行时重新取（插件可热插拔），顺序 = 插件加载顺序
+      const entries = this.plugin.listHooks('core.tool.pre.execute')
       const callNth = async (i: number, inp: unknown): Promise<ToolResult> => {
         if (i >= entries.length) return next(inp)
         const entry = entries[i]
@@ -2445,10 +2490,7 @@ export class HarnessImpl implements Harness {
     }
     const postHook: ToolPostHook = async (postCtx, result) => {
       let r: ToolResult = result
-      const entries: ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks['tool.post.execute']> }> =
-        (this.plugin as any).hooks?.listFor
-          ? (this.plugin as any).hooks.listFor('tool.post.execute')
-          : []
+      const entries = this.plugin.listHooks('core.tool.post.execute')
       for (const e of entries) {
         const fn = e.fn as (ctx: unknown, res: unknown) => Awaitable<unknown>
         const next = await fn({ ...postCtx, pluginId: e.pluginId }, r)
@@ -2457,7 +2499,8 @@ export class HarnessImpl implements Harness {
       return r
     }
     this.toolPipeline = new ToolPipeline({
-      checkPermission: (req) => resolvePermission(this.permission, req as ToolPermissionRequest) as Promise<ToolPermissionDecision>,
+      checkPermission: (req) =>
+        resolvePermission(this.permission, req as ToolPermissionRequest, bindTrigger(this.plugin)) as Promise<ToolPermissionDecision>,
       preHooks: [preHook],
       postHooks: [postHook],
     })
@@ -2469,7 +2512,7 @@ export class HarnessImpl implements Harness {
       return {
         agent: agentRuntime,
         currentAgentId: () => options.defaultAgentId ?? 'default',
-        triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
+        triggerPlugin: bindTrigger(this.plugin),
         originalStore: options.originalStore,
       }
     })
@@ -2522,7 +2565,7 @@ export class HarnessImpl implements Harness {
     void _self
   }
 
-  /** 初始化：加载 Internal/Builtin/User 插件 + harness.init Hook */
+  /** 初始化：加载 Internal/Builtin/User 插件 + core.harness.init Hook */
   private async init(): Promise<void> {
     const startedAt = Date.now()
     await this.bus.publish(HarnessEvents.initializing, { startedAt }, { source: 'harness' })
@@ -2531,7 +2574,7 @@ export class HarnessImpl implements Harness {
       if (this.options.builtinPlugins?.length) await this.plugin.loadBuiltin(this.options.builtinPlugins)
       if (this.options.userPlugins?.length) await this.plugin.loadUser(this.options.userPlugins)
 
-      // Skill 注入插件：在 prompt.system.transform Hook 中注入匹配的 Skill 内容
+      // Skill 注入插件：在 core.prompt.system.transform Hook 中注入匹配的 Skill 内容
       // 参考 Claude Code 的 Skill 注入机制：agent.skills 白名单中的 Skill 自动注入到 system prompt
       if (this.skillManager) {
         // 1. 从 skillDirs 异步加载 SKILL.md（构造函数中不能 await，故延迟到 init）
@@ -2561,10 +2604,10 @@ export class HarnessImpl implements Harness {
             id: 'core.skill-injection',
             version: '0.1.0',
             name: 'Skill 注入',
-            description: '将 agent.skills 白名单中的 Skill 通过 prompt.system.transform 注入到 system prompt',
+            description: '将 agent.skills 白名单中的 Skill 通过 core.prompt.system.transform 注入到 system prompt',
             async install() {
               return {
-                async 'prompt.system.transform'(
+                async 'core.prompt.system.transform'(
                   input: { agentId: string; sessionId: string },
                   parts: string[],
                 ) {
@@ -2584,10 +2627,10 @@ export class HarnessImpl implements Harness {
         }
       }
 
-      // harness.init Hook（给插件最后一次修改 context/tool 机会）
+      // core.harness.init Hook（给插件最后一次修改 context/tool 机会）
       const initIn: PluginHarnessInitInput = { harnessOptions: this.options }
       const initOut: PluginHarnessInitOutput = { harness: this }
-      await (this.plugin as any).trigger('harness.init', initIn, initOut)
+      await (this.plugin as any).trigger('core.harness.init', initIn, initOut)
     } catch (err) {
       await this.bus.publish(HarnessEvents.error, { stage: 'init', error: err }, { source: 'harness' })
       throw err
@@ -2605,7 +2648,7 @@ export class HarnessImpl implements Harness {
     try {
       const startIn: PluginHarnessStartInput = { harness: this }
       const startOut: PluginHarnessStartOutput = { started: true }
-      await (this.plugin as any).trigger('harness.start', startIn, startOut)
+      await (this.plugin as any).trigger('core.harness.start', startIn, startOut)
     } catch (err) {
       await this.bus.publish(HarnessEvents.error, { stage: 'start', error: err }, { source: 'harness' })
       throw err
@@ -2616,12 +2659,12 @@ export class HarnessImpl implements Harness {
 
   /**
    * 组装工具池（见 Harness.assembleTools 注释）。与 query 内联逻辑一致：新建
-   * DefaultToolPool 绑定全局 ToolRegistry，逐 Agent 触发 tool.pool.assemble Hook。
+   * DefaultToolPool 绑定全局 ToolRegistry，逐 Agent 触发 core.tool.pool.assemble Hook。
    */
   async assembleTools(): Promise<void> {
     const pool = new DefaultToolPool(this.tools)
     for (const def of this.agent.list()) {
-      await (this.plugin as any).trigger('tool.pool.assemble', { agentId: def.id } as ToolPoolAssembleInput, pool)
+      await (this.plugin as any).trigger('core.tool.pool.assemble', { agentId: def.id } as ToolPoolAssembleInput, pool)
     }
   }
 
@@ -2679,7 +2722,7 @@ export class HarnessImpl implements Harness {
  *
  * 流程：
  * 1. 构造 HarnessImpl（bus/context/permission/tools/plugin/session/agent）
- * 2. init（加载 Internal/Builtin/User 插件 + 触发 harness.init Hook）
+ * 2. init（加载 Internal/Builtin/User 插件 + 触发 core.harness.init Hook）
  * 3. 返回实例（未 start，由调用方按需 await harness.start()）
  */
 export async function createHarness(options: AgentHarnessOptions = {}): Promise<Harness> {

@@ -721,7 +721,7 @@ export function createProviderGeminiPlugin(
       })
 
       return {
-        async 'harness.init'(_input, output) {
+        async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | {
                 _setChatProvider?: (p: ChatProvider) => void

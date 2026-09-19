@@ -4,7 +4,7 @@
  * 提供：
  * - glob：按模式（可多个）递归搜索匹配文件，支持排除/大小/时间过滤
  *
- * 通过 tool.pool.assemble Hook 注入到 Harness 工具池。
+ * 通过 core.tool.pool.assemble Hook 注入到 Harness 工具池。
  *
  * @example
  * import { createHarness } from '@harness/core'
@@ -262,7 +262,7 @@ export function createToolsGlobPlugin(options?: {
     async install(ctx) {
       ctx.log.info('Glob 工具插件已加载', { tools: tools.map((t) => t.id) })
       return {
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const tool of tools) {
             ;(pool as { add: (t: unknown) => void }).add(tool)
           }

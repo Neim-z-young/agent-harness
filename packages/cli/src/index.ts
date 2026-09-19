@@ -260,7 +260,7 @@ export interface HarnessConfig {
   /**
    * MCP Server 装配列表：从 config.json 以 JSON 形式新增外部 MCP server（stdio/sse/http）。
    * 元素复用 McpServerConfig 字段 + enabled（服务器级）、tools（工具级）开关。
-   * 启动时经 mcp.configure Hook 注入 mcp-server-registry 插件；/mcp 命令可即时启用/禁用并写回。
+   * 启动时经 cli.mcp.configure Hook 注入 mcp-server-registry 插件；/mcp 命令可即时启用/禁用并写回。
    */
   mcpServers?: McpServerEntry[]
   /**
@@ -841,7 +841,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
     })
     // mcp.server-registry：computer-use / code-intel 这类「进程内 MCP server 插件」的宿主
     // （自身不提供工具，故无 metaSource）。optIn=true → 默认不自动装配：不给用不到的能力拉起
-    // MCP 通道；**必须在 harness.start 之前**装好，否则 applyMcpServers 的 mcp.configure
+    // MCP 通道；**必须在 core.harness.start 之前**装好，否则 applyMcpServers 的 cli.mcp.configure
     // 注入与 start 时的连接都会落空（这正是它不能靠「后台预加载」补装的原因）。
     // 由 config.json → plugins 声明式启用（依赖闭包也会自动补上），或外部插件目录显式装配。
     defaultBuiltinRegistry.register({
@@ -2034,7 +2034,7 @@ export class HarnessApp {
 
   /**
    * 持久化 mcpServers 列表到 config.json（upsert 顶层 mcpServers）。供 mcp-server-registry 的
-   * /mcp 命令在启用/禁用/增删后写回；重启后由 boot 阶段经 mcp.configure 重新注入生效。
+   * /mcp 命令在启用/禁用/增删后写回；重启后由 boot 阶段经 cli.mcp.configure 重新注入生效。
    */
   async setMcpServers(list: McpServerEntry[]): Promise<void> {
     const cfg = await this.configStore.load()
@@ -2042,13 +2042,17 @@ export class HarnessApp {
   }
 
   /**
-   * 把 config.json 的 mcpServers 应用到运行时：createHarness 后、harness.start 前触发
-   * mcp.configure Hook，注入 mcp-server-registry 插件（按 enabled 开关在 start 时连接）。
+   * 把 config.json 的 mcpServers 应用到运行时：createHarness 后、core.harness.start 前触发
+   * cli.mcp.configure Hook，注入 mcp-server-registry 插件（按 enabled 开关在 start 时连接）。
+   *
+   * 该 hook 已在 @harness/plugin 的 `Hooks` 里声明 ⇒ 不再需要 `as any` 绕过类型
+   * （此前调用点用 `(harness.plugin as any)?.trigger?.(...)`，hook 名写错也不会报错）。
+   * `harness.plugin` 由 createHarness 建好，可空断言仅为防手写 Harness 桩。
    */
   async applyMcpServers(harness: Harness): Promise<void> {
     const cfg = await this.configStore.load()
     const list = [...(cfg.mcpServers ?? [])]
-    await (harness.plugin as any)?.trigger?.('mcp.configure', { mcpServers: list })
+    await harness.plugin?.trigger('cli.mcp.configure', { mcpServers: list })
   }
 
   /**
@@ -2587,7 +2591,7 @@ export class HarnessApp {
     // 回读 config.json 的 agents[] 覆盖（tools 白名单 + mcpServers/excludeMcpServers）到已注册 Agent（createHarness 全部组装完成后、query 前）
     await this.applyConfigAgentOverrides(harness)
     // 把 config.json 的 mcpServers 注入 mcp-server-registry 插件（在 start 前建立配置态，
-    // 由 harness.start 按 enabled 开关连接外部 MCP server）。
+    // 由 core.harness.start 按 enabled 开关连接外部 MCP server）。
     await this.applyMcpServers(harness)
     await harness.start()
     this.harness = harness
@@ -2857,7 +2861,7 @@ export class HarnessApp {
    * 1) 预热已登记的内置插件（tools-builtin / tools-manager 等，动态 import 已被运行时缓存，重复调用开销极低）；
    * 2) 将预加载出的插件模块安装进 Harness（跳过 boot 阶段已同步安装的），并触发
    *    harness.assembleTools() 主动组装工具池——否则工具只在用户首条消息后（query 内
-   *    的 tool.pool.assemble）才注册，/tools 会一直停留在「仅元信息」，list_dir 等场景
+   *    的 core.tool.pool.assemble）才注册，/tools 会一直停留在「仅元信息」，list_dir 等场景
    *    工具也无法开箱即用。
    */
   private scheduleBuiltinPreload(): void {
@@ -2954,7 +2958,7 @@ export interface BackgroundTaskPanelOptions {
 /**
  * 订阅 MCP server 生命周期事件，触发工具池重组（assembleTools）。
  *
- * 禁用/启用/新增/移除 server 后，mcp-server-registry 的 tool.pool.assemble 会
+ * 禁用/启用/新增/移除 server 后，mcp-server-registry 的 core.tool.pool.assemble 会
  * 移除 / 装配对应 server 的工具；若不主动重组，运行时 ToolRegistry 里旧工具会一直
  * 「残留下线」，导致 /tools 仍把禁用 server 的工具显示为启用/可调用。本函数把事件
  * 桥接到 harness.assembleTools()，让禁用即时生效。
@@ -3696,10 +3700,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         // 这正是 herdr 插件必须带严格递增 --seq 的原因（Herdr 会丢弃同源旧序号）。
         //
         // 这是**UI 消费层**的通道（含末条 turn_end ⇒ idle，UI 收 busy 靠它）。
-        // 引擎层的整轮终态走另一条 hook `agent.turn.end`（core 广播，任何宿主都有）；
+        // 引擎层的整轮终态走另一条 hook `core.agent.turn.end`（core 广播，任何宿主都有）；
         // 两条通道刻意不混：同一条终态若两个来源都发，消费方就分不清"这条是谁发的"。
         void harness.plugin
-          .trigger('agent.stream', {
+          .trigger('cli.agent.stream', {
             eventType: ev.type,
             status: agentStatus,
             sessionId: curSessionId,
@@ -4193,9 +4197,9 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       let runStatus = initialAgentStatus({ agentId: session.agentId ?? 'default' })
       for await (const ev of gen) {
         runStatus = reduceAgentStatus(runStatus, ev)
-        // UI 状态流（含末条 turn_end ⇒ idle）。引擎层终态在 `agent.turn.end`，两条通道不混。
+        // UI 状态流（含末条 turn_end ⇒ idle）。引擎层终态在 `core.agent.turn.end`，两条通道不混。
         void harness.plugin
-          .trigger('agent.stream', {
+          .trigger('cli.agent.stream', {
             eventType: ev.type,
             status: runStatus,
             sessionId: session.id,

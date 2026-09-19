@@ -6,7 +6,7 @@
  *
  * 核心能力：
  * 1. **Coordinator 身份**：`AgentDefinition.mode === 'coordinator'` 的 Agent
- *    通过 prompt.system.transform 注入 Coordinator System Prompt（四阶段规则）。
+ *    通过 core.prompt.system.transform 注入 Coordinator System Prompt（四阶段规则）。
  * 2. **Barrier 自动集齐**：跟踪该 session 派出的后台任务（subagent.started
  *    background=true），全部完成/失败后发布 `coordinator.barrier.completed`
  *    事件。外层（CLI REPL）订阅后注入 `<continue/>` 自动续轮，父 Agent 无需
@@ -375,7 +375,7 @@ export function createSendMessageTool(
       }
       const harness = getHarness()
       if (!harness?.agent || !harness.session) {
-        return { ok: false, error: { message: 'Harness 未就绪（harness.start 未触发）', code: 'HARNESS_NOT_READY' } }
+        return { ok: false, error: { message: 'Harness 未就绪（core.harness.start 未触发）', code: 'HARNESS_NOT_READY' } }
       }
       const worker = getTracker().getWorker(input.taskId)
       if (!worker) {
@@ -480,10 +480,10 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
       })
 
       return {
-        async 'harness.start'(input) {
+        async 'core.harness.start'(input) {
           const h = (input as { harness: HarnessLike }).harness
           if (!h?.agent || !h?.session) {
-            ctx.log.error('Coordinator 插件：harness.start 未提供 agent/session 引用')
+            ctx.log.error('Coordinator 插件：core.harness.start 未提供 agent/session 引用')
             return
           }
           harness = h
@@ -527,7 +527,7 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
         },
 
         // Coordinator 身份：注入 orchestrator System Prompt
-        'prompt.system.transform'(input, parts) {
+        'core.prompt.system.transform'(input, parts) {
           const def = harness?.agent.get(input.agentId)
           if (def?.mode === 'coordinator') {
             parts.push(COORDINATOR_SYSTEM_PROMPT)
@@ -537,7 +537,7 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
         // forceAsync + 文件级写锁：拦截工具调用
         // 注：core 的 preHook next 实际签名是 (modifiedInput?: unknown) => Promise<ToolResult>，
         // 但 Hooks 接口类型声明为 () => Promise<unknown>，此处用 any 兼容传参改写
-        async 'tool.pre.execute'(ctx: any, next: any) {
+        async 'core.tool.pre.execute'(ctx: any, next: any) {
           // 文件级写锁：写类工具按目标路径跨 session 互斥（锁持有 = 本次写调用）
           if (serializeWrites && ctx?.input && typeof ctx.input === 'object') {
             const writePath = extractWritePath(ctx?.tool?.id, ctx.input)
@@ -559,7 +559,7 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
         },
 
         // 给 coordinator Agent 注入 send_message 工具
-        'tool.pool.assemble'({ agentId }, pool) {
+        'core.tool.pool.assemble'({ agentId }, pool) {
           const def = harness?.agent.get(agentId)
           if (def?.mode === 'coordinator' && sendMessageTool) {
             ;(pool as { add: (t: unknown) => void }).add(sendMessageTool)

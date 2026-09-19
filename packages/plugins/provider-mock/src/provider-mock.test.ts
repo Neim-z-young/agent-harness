@@ -185,7 +185,7 @@ describe('@harness/provider-mock', () => {
   })
 
   describe('providerMockPlugin 插件集成', () => {
-    it('通过 internalPlugins 注入 → harness.init Hook 替换 ChatProvider', async () => {
+    it('通过 internalPlugins 注入 → core.harness.init Hook 替换 ChatProvider', async () => {
       const plugin = createProviderMockPlugin({
         defaultResponse: '插件注入成功',
         model: 'mock-plugin-v1',
@@ -246,13 +246,13 @@ describe('@harness/provider-mock', () => {
       await h.stop()
     })
 
-    it('端到端：mock provider + tool call + tool.pool.assemble 注入工具', async () => {
-      // 用一个 ToolPlugin 通过 tool.pool.assemble 注册 echo 工具
+    it('端到端：mock provider + tool call + core.tool.pool.assemble 注入工具', async () => {
+      // 用一个 ToolPlugin 通过 core.tool.pool.assemble 注册 echo 工具
       const ToolPlugin: AgentPlugin = {
         id: 'tools', version: '1', name: 'Tools',
         async install() {
           return {
-            async 'tool.pool.assemble'(_i, pool: any) {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
               pool.add(createEchoTool())
             },
           } as Hooks

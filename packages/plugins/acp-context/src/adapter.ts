@@ -110,7 +110,7 @@ export function toCores(messages: Message[]): Flat {
     const expanded: string[] = []
 
     // core id 用「消息内 part 的稳定序号」而非跨消息累加计数器：
-    // 同一条消息无论出现在"全量历史"还是"窗口切片"（如 session.compacting 的
+    // 同一条消息无论出现在"全量历史"还是"窗口切片"（如 core.session.compacting 的
     // runCompacting 会重新 toCores）里，生成的 id 都必须一致 —— 块的
     // effectiveMessageIds / coveredMessageIds 幂等判定 / archive 去重全靠它。
     // 若 id 随输入前缀漂移，covered 判定必然失效（同一窗口被重复折叠、ref 重复分配）。

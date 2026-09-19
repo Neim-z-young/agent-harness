@@ -183,7 +183,7 @@ describe('convertMcpToolToHarnessTool', () => {
 })
 
 describe('createMcpClientPlugin', () => {
-  it('插件 connect + tool.pool.assemble 注入工具', async () => {
+  it('插件 connect + core.tool.pool.assemble 注入工具', async () => {
     const transport = new MockTransport()
     transport.register('initialize', () => ({ protocolVersion: '2024-11-05', capabilities: { tools: {} } }))
     transport.register('tools/list', () => ({
@@ -211,13 +211,13 @@ describe('createMcpClientPlugin', () => {
     }
     const hooks = await plugin.install(ctx as any)
 
-    // 模拟 harness.start
-    await (hooks as any)['harness.start']?.()
+    // 模拟 core.harness.start
+    await (hooks as any)['core.harness.start']?.()
 
-    // 模拟 tool.pool.assemble
+    // 模拟 core.tool.pool.assemble
     const addedTools: any[] = []
     const pool = { add: (t: unknown) => { addedTools.push(t) } }
-    await (hooks as any)['tool.pool.assemble']?.({}, pool)
+    await (hooks as any)['core.tool.pool.assemble']?.({}, pool)
 
     expect(addedTools.length).toBe(2)
     expect(addedTools[0].id).toBe('mcp__web-tools__search')
@@ -257,7 +257,7 @@ describe('createMcpClientPlugin', () => {
       config: { get: () => undefined, set: () => {} },
     }
     const hooks = await plugin.install(ctx as any)
-    await (hooks as any)['harness.start']?.()
+    await (hooks as any)['core.harness.start']?.()
 
     const cmdInput = { commands: [] as any[] }
     await (hooks as any)['cli.commands']?.(cmdInput)
@@ -762,7 +762,7 @@ describe('createMcpClientPlugin resources/prompts', () => {
       config: { get: () => undefined, set: () => {} },
     }
     const hooks = await plugin.install(ctx as any)
-    await (hooks as any)['harness.start']?.()
+    await (hooks as any)['core.harness.start']?.()
     return { plugin, hooks }
   }
 
@@ -827,7 +827,7 @@ describe('createMcpClientPlugin resources/prompts', () => {
 // ===== autoInjectResources 测试 =====
 
 describe('createMcpClientPlugin autoInjectResources', () => {
-  it("policy='all' 把资源 text 注入到 prompt.system.transform", async () => {
+  it("policy='all' 把资源 text 注入到 core.prompt.system.transform", async () => {
     const transport = new MockTransport()
     transport.register('initialize', () => ({
       protocolVersion: '2024-11-05',
@@ -853,10 +853,10 @@ describe('createMcpClientPlugin autoInjectResources', () => {
       config: { get: () => undefined, set: () => {} },
     }
     const hooks = await plugin.install(ctx as any)
-    await (hooks as any)['harness.start']?.()
+    await (hooks as any)['core.harness.start']?.()
 
     const parts: string[] = ['base system prompt']
-    await (hooks as any)['prompt.system.transform']?.({}, parts)
+    await (hooks as any)['core.prompt.system.transform']?.({}, parts)
     const combined = parts.join('\n')
     expect(combined).toInclude('MCP Resources')
     expect(combined).toInclude('app: demo')
@@ -894,10 +894,10 @@ describe('createMcpClientPlugin autoInjectResources', () => {
       config: { get: () => undefined, set: () => {} },
     }
     const hooks = await plugin.install(ctx as any)
-    await (hooks as any)['harness.start']?.()
+    await (hooks as any)['core.harness.start']?.()
 
     const parts: string[] = []
-    await (hooks as any)['prompt.system.transform']?.({}, parts)
+    await (hooks as any)['core.prompt.system.transform']?.({}, parts)
     const combined = parts.join('\n')
     expect(combined).toInclude('body-file://a.txt')
     expect(combined).not.toInclude('body-file://b.txt')

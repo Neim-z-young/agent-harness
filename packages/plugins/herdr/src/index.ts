@@ -198,7 +198,7 @@ export interface HerdrReporterOptions {
 /**
  * 状态上报器：节流 + 序号递增 + 退出释放。
  *
- * **节流是必需的，不是优化**：`agent.stream` 每收到一个 `text_delta` 就触发一次，
+ * **节流是必需的，不是优化**：`cli.agent.stream` 每收到一个 `text_delta` 就触发一次，
  * 一轮流式输出成百上千个增量 —— 每个都 spawn 一次进程既打满 CPU 也会让 Herdr 侧栏抖动。
  * 故只在「状态实质变化」时上报（state / sessionId / message 三者构成判定键）。
  */
@@ -245,7 +245,7 @@ export class HerdrReporter {
     return true
   }
 
-  /** 处理 agent.stream 事件（映射 + 上报） */
+  /** 处理 cli.agent.stream 事件（映射 + 上报） */
   handleStream(signal: AgentStreamSignal): boolean {
     return this.report(mapStatusToHerdrState(signal.status), signal.sessionId)
   }
@@ -253,7 +253,7 @@ export class HerdrReporter {
   /**
    * 报「等待用户决策」。
    *
-   * 由 `permission.check` 触发，但**仅在决策确实是 ask 时**才报 —— 若规则已记住
+   * 由 `core.permission.check` 触发，但**仅在决策确实是 ask 时**才报 —— 若规则已记住
    * （behavior=allow/deny），这次检查根本不会弹窗，报 blocked 会制造假阳性
    * （侧栏高亮但没人真的在等你）。
    */
@@ -311,10 +311,10 @@ export function createHerdrPlugin(options: HerdrPluginOptions = {}): AgentPlugin
       process.once('exit', onExit)
 
       return {
-        'agent.stream': (signal) => {
+        'cli.agent.stream': (signal) => {
           reporter?.handleStream(signal)
         },
-        'permission.check': (req: PermissionRequestLike, decision: PermissionDecisionLike) => {
+        'core.permission.check': (req: PermissionRequestLike, decision: PermissionDecisionLike) => {
           // 只有真的会弹窗（ask）才报 blocked；已记住的规则不产生等待。
           if (decision?.behavior !== 'ask') return
           const label = req?.toolKey ?? 'permission'

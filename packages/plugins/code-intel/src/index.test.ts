@@ -1046,8 +1046,8 @@ describe('createCodeIntelPlugin', () => {
     expect(plugin.dependsOn).toContain('mcp.server-registry')
 
     const hooks = await plugin.install({ log: { info() {}, warn() {}, error() {}, debug() {} } } as any)
-    // 纯 MCP 装配：不产生 tool.pool.assemble 直装工具，能力只在 mcp-server-registry 连接后以 mcp__code-intel__* 暴露
-    expect((hooks as any)['tool.pool.assemble']).toBeUndefined()
+    // 纯 MCP 装配：不产生 core.tool.pool.assemble 直装工具，能力只在 mcp-server-registry 连接后以 mcp__code-intel__* 暴露
+    expect((hooks as any)['core.tool.pool.assemble']).toBeUndefined()
   })
 
   it('支持忽略目录/文件数上限配置透传', () => {

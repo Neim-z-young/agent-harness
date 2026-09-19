@@ -10,7 +10,7 @@
  * **L2 会话压缩记忆**（`CompactMemory`）由 core 负责，不在这里。
  *
  * 三个已实证/已决策的前提（不要凭直觉改）：
- * 1. **注入走 `prompt.system.transform`** —— 这样合成出的 system 消息不带 `<acp>` ref 标签，
+ * 1. **注入走 `core.prompt.system.transform`** —— 这样合成出的 system 消息不带 `<acp>` ref 标签，
  *    ACP 无从把它圈进压缩范围（实证见计划 §3.4）。若改成塞进 messages 数组，会被打上 ref、
  *    变成可折叠对象。
  * 2. **system 占用永不回收** ⇒ 索引必须有硬上限（`maxLines` / `maxBytes`），且超限要显式
@@ -565,7 +565,7 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
       let primarySessionId: string | null = null
 
       const hooks: Hooks = {
-        async 'prompt.system.transform'(input, parts) {
+        async 'core.prompt.system.transform'(input, parts) {
           // 先记 id 再判分支：disableInjection（对照实验）下也要能计数，否则兜底会静默失效
           if (input.agentMode !== 'subagent') primarySessionId = input.sessionId
           if (options.disableInjection) return
@@ -585,14 +585,14 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
 
         /**
          * 压缩信号（flush 双源之一）：ACP 压缩由模型调 `compress` 工具触发，而
-         * `tool.post.execute` 的 ctx 里**没有 toolId** ⇒ 只能从事件流识别。
-         * `agent.stream` 的 `status.toolId` 恰好带这个信息。
+         * `core.tool.post.execute` 的 ctx 里**没有 toolId** ⇒ 只能从事件流识别。
+         * `cli.agent.stream` 的 `status.toolId` 恰好带这个信息。
          *
          * ⚠️ 这是 **UI 消费层**的通道：以库内嵌 / ACP 宿主自己消费事件流时收不到它
-         * （那时只剩下面 `agent.turn.end` 的轮数兜底与命令写入）。要根治得让引擎层也有
+         * （那时只剩下面 `core.agent.turn.end` 的轮数兜底与命令写入）。要根治得让引擎层也有
          * "工具执行"信号 —— 属独立的一件事（见 dev-log 续 156）。
          */
-        'agent.stream'(signal) {
+        'cli.agent.stream'(signal) {
           if (signal.eventType === 'tool_call_start' && signal.status?.toolId === 'compress') {
             publisher.flush()
             pendingHint = buildReflectionHint(p.user.index)
@@ -602,20 +602,20 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
         /**
          * 兜底：攒够轮数仍未等到压缩 ⇒ 放行（防止"永远不生效"）。
          *
-         * 用**引擎层**的 `agent.turn.end`（core 广播，任何宿主都有），而不是 `agent.stream` 的
+         * 用**引擎层**的 `core.agent.turn.end`（core 广播，任何宿主都有），而不是 `cli.agent.stream` 的
          * turn_end —— 后者只在有 UI 消费层的宿主里才有；靠它计数会"永不推进"，且这种失效
          * 表现为"记忆改了没生效"，极难排查。
          * 只数**主会话**的轮，并排除子 Agent（子 Agent 另开 session，且它的轮不是用户的轮）；
          * 字段缺失时按"无法归因"照常计数 —— 宁可不精确，也不要让兜底变成死代码。
          */
-        'agent.turn.end'(signal) {
+        'core.agent.turn.end'(signal) {
           if (signal.mode === 'subagent') return
           const sid = signal.sessionId
           if (!sid || !primarySessionId || sid === primarySessionId) publisher.onTurnEnd()
         },
 
         /** 压缩信号（flush 双源之二）：session compaction（ACP 关闭时的那套） */
-        'session.compacting'() {
+        'core.session.compacting'() {
           publisher.flush()
           pendingHint = buildReflectionHint(p.user.index)
         },

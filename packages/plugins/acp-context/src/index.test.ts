@@ -212,11 +212,11 @@ test('runPreModel：ACP 哲学 system 每轮注入一次', async () => {
 
 // ===== 提示词可配置（prompts / systemPrompt）=====
 
-/** 安装插件并取回 session.preModel hook 处理器，供端到端验证工厂的提示词解析 */
+/** 安装插件并取回 core.session.preModel hook 处理器，供端到端验证工厂的提示词解析 */
 async function preModelFromPlugin(options: Parameters<typeof createAcpContextPlugin>[0]) {
   const plugin = createAcpContextPlugin(options)
   const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
-  const handler = hooks['session.preModel']!
+  const handler = hooks['core.session.preModel']!
   return (rawMessages: Message[]) =>
     handler(
       {
@@ -422,7 +422,7 @@ test('adapter：baseId 导出可复用（核心链路依赖）', () => {
   expect(baseId('a b!c')).toBe('a_b_c')
 })
 
-// ===== session.compacting 协同（方案三：先保全原文再物理删除） =====
+// ===== core.session.compacting 协同（方案三：先保全原文再物理删除） =====
 
 function compactCtxFor(window: Message[]): CompactionContext {
   return {
@@ -828,9 +828,9 @@ test('端到端：tokenCalibration 决定 acp_status 上报的 tokenCount（中�
     const plugin = createAcpContextPlugin({ modelContextLimit: 1_000_000, tokenCalibration })
     const tools = new Map<string, any>()
     const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
-    await hooks['tool.pool.assemble']!({} as any, { add: (t: any) => tools.set(t.id, t) } as any)
+    await hooks['core.tool.pool.assemble']!({} as any, { add: (t: any) => tools.set(t.id, t) } as any)
     const messages = [msg('user', zhText, 0), msg('assistant', zhText, 1)]
-    await hooks['session.preModel']!(
+    await hooks['core.session.preModel']!(
       {
         sessionId: 's',
         meta: { read: async () => undefined, patch: async () => {} },

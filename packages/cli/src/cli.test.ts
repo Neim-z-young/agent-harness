@@ -1756,7 +1756,7 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
             },
           }
           return {
-            async 'harness.init'(_i: unknown, output: any) {
+            async 'core.harness.init'(_i: unknown, output: any) {
               output?.harness?._setChatProvider?.(provider as any)
             },
           } as any

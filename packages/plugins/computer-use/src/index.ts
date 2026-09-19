@@ -2,7 +2,7 @@
  * @harness/computer-use - 电脑控制 MCP server 插件
  *
  * 依赖 @harness/mcp-server-registry：通过 registerMcpServer() 注册一个进程内
- * MCP server，registry 在 harness.start 时用 @harness/mcp-client 自动连接，
+ * MCP server，registry 在 core.harness.start 时用 @harness/mcp-client 自动连接，
  * 并把 tools 暴露到 Harness 工具池。后端用 macOS 自动化（osascript）实现。
  *
  * 同时注册一个 plugin 来源的 Skill「Computer Use」作为操作指南。
@@ -52,7 +52,7 @@ export function createComputerUsePlugin(options: ComputerUsePluginOptions = {}):
       backendRef = backend
       const server = new ComputerUseMcpServer(backend)
 
-      // 注册进程内 MCP server：registry 在 harness.start 连接
+      // 注册进程内 MCP server：registry 在 core.harness.start 连接
       registerMcpServer({
         name: COMPUTER_USE_SERVER_NAME,
         createTransport: () => createComputerUseServerTransport(server),
@@ -60,7 +60,7 @@ export function createComputerUsePlugin(options: ComputerUsePluginOptions = {}):
       ctx.log.info(`computer-use 已注册进程内 MCP server（由 mcp-server-registry 启动连接）`)
 
       return {
-        async 'harness.init'(_input, output) {
+        async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | { skillManager?: { register: (s: Skill) => void } }
             | undefined

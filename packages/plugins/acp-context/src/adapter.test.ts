@@ -94,7 +94,7 @@ describe('reasoning 往返契约（ACP ↔ 内核）', () => {
 
   it('core id 对同一消息稳定：不随输入前缀漂移（covered 幂等判定的前提）', () => {
     // 回归：core id 原用「跨消息累加计数器」（base#0/#1/#2…），同一条消息出现在
-    // 全量历史与窗口切片（session.compacting 的 runCompacting 会重新 toCores）里
+    // 全量历史与窗口切片（core.session.compacting 的 runCompacting 会重新 toCores）里
     // 会得到不同 id ⇒ coveredMessageIds 幂等判定失效（重复折叠 + ref 重复分配）。
     // 修复后 id = base#(r|t|x)partIdx，只依赖消息自身。
     const msg = mkMsg('m5', 'assistant', [

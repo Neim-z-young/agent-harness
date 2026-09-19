@@ -2,7 +2,7 @@
  * @harness/core bench helpers —— 可复用的压缩块性能压测辅助
  *
  * 供 packages/core/bench/*.ts 复用。构造低成本 mock 环境，便于手动压测
- * session.compacting / setBlocks / blocksPatch 等热点路径。
+ * core.session.compacting / setBlocks / blocksPatch 等热点路径。
  *
  * 后续切换到真实模型：createHarness 传入真实 ChatProvider（或加载 provider
  * 插件），复用其余装配逻辑即可，本次以 mock ChatProvider + 合成数据为准。

@@ -350,10 +350,10 @@ describe('createCoordinatorPlugin', () => {
     return { bus, harness, plugin, agent }
   }
 
-  it('harness.start 后订阅 subagent 事件，barrier 集齐发布 coordinator.barrier.completed', async () => {
+  it('core.harness.start 后订阅 subagent 事件，barrier 集齐发布 coordinator.barrier.completed', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     const barrierEvents: any[] = []
     const off = bus.subscribe(CoordinatorEvents.barrierCompleted, ({ payload }) => { barrierEvents.push(payload) })
@@ -389,58 +389,58 @@ describe('createCoordinatorPlugin', () => {
     off()
   })
 
-  it('prompt.system.transform：coordinator 身份注入 orchestrator prompt', async () => {
+  it('core.prompt.system.transform：coordinator 身份注入 orchestrator prompt', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     const parts: string[] = []
-    await hooks['prompt.system.transform']({ agentId: 'coordinator', sessionId: 's_parent' }, parts)
+    await hooks['core.prompt.system.transform']({ agentId: 'coordinator', sessionId: 's_parent' }, parts)
     expect(parts.join('')).toInclude('You are Harness Coordinator')
 
     const parts2: string[] = []
-    await hooks['prompt.system.transform']({ agentId: 'researcher', sessionId: 's_parent' }, parts2)
+    await hooks['core.prompt.system.transform']({ agentId: 'researcher', sessionId: 's_parent' }, parts2)
     expect(parts2.join('')).not.toInclude('Harness Coordinator')
   })
 
-  it('tool.pool.assemble：只给 coordinator 注入 send_message', async () => {
+  it('core.tool.pool.assemble：只给 coordinator 注入 send_message', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     const pool: any = { add: (t: any) => { pool.added = [...(pool.added ?? []), t.id] } }
-    await hooks['tool.pool.assemble']({ agentId: 'coordinator' }, pool)
+    await hooks['core.tool.pool.assemble']({ agentId: 'coordinator' }, pool)
     expect(pool.added).toContain('send_message')
 
     const pool2: any = { add: (t: any) => { pool2.added = [...(pool2.added ?? []), t.id] } }
-    await hooks['tool.pool.assemble']({ agentId: 'researcher' }, pool2)
+    await hooks['core.tool.pool.assemble']({ agentId: 'researcher' }, pool2)
     expect(pool2.added ?? []).not.toContain('send_message')
   })
 
   it('forceAsync=true：拦截 subagent 工具调用强制 runInBackground', async () => {
     const { bus, harness, plugin } = setup({ forceAsync: true })
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     const preCtx = { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'hi' }, ctx: {}, toolUseId: 't1' }
     let nextInput: any
-    await hooks['tool.pre.execute'](preCtx, (modified: any) => { nextInput = modified; return { ok: true } })
+    await hooks['core.tool.pre.execute'](preCtx, (modified: any) => { nextInput = modified; return { ok: true } })
     expect(nextInput).toEqual({ agentId: 'researcher', prompt: 'hi', runInBackground: true })
 
     // 非 subagent 工具不改写（next() 无参 → core 语义保留原 input）
     const preCtx2 = { tool: { id: 'read_file' }, input: { path: '/x' }, ctx: {}, toolUseId: 't2' }
-    await hooks['tool.pre.execute'](preCtx2, (modified: any) => { nextInput = modified ?? preCtx2.input; return { ok: true } })
+    await hooks['core.tool.pre.execute'](preCtx2, (modified: any) => { nextInput = modified ?? preCtx2.input; return { ok: true } })
     expect(nextInput).toEqual({ path: '/x' })
   })
 
   it('forceAsync=false（默认）：不改写 subagent 输入', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     const preCtx = { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'hi' }, ctx: {}, toolUseId: 't1' }
     let nextInput: any
-    await hooks['tool.pre.execute'](preCtx, (modified: any) => { nextInput = modified ?? preCtx.input; return { ok: true } })
+    await hooks['core.tool.pre.execute'](preCtx, (modified: any) => { nextInput = modified ?? preCtx.input; return { ok: true } })
     expect(nextInput).toEqual({ agentId: 'researcher', prompt: 'hi' })
   })
 
@@ -457,16 +457,16 @@ describe('createCoordinatorPlugin', () => {
   it('文件级写锁：write_file 被其他 session 持有 → 阻塞到该写完成', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     // session sA 写 src/a.ts，next 挂起模拟写操作进行中（锁持有 = 本次写调用）
-    const pA = hooks['tool.pre.execute'](
+    const pA = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts', content: 'x' }, toolUseId: 'tA', sessionId: 'sA' },
       () => new Promise((r) => setTimeout(r, 100)),
     )
     // session sB 写同一路径 → 阻塞
     let bDone = false
-    const pB = hooks['tool.pre.execute'](
+    const pB = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts', content: 'y' }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )
@@ -481,14 +481,14 @@ describe('createCoordinatorPlugin', () => {
   it('文件级写锁：不同路径的写操作并行不阻塞', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
-    const pA = hooks['tool.pre.execute'](
+    const pA = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tA', sessionId: 'sA' },
       () => new Promise((r) => setTimeout(r, 100)),
     )
     let bDone = false
-    const pB = hooks['tool.pre.execute'](
+    const pB = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'docs/b.md' }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )
@@ -500,15 +500,15 @@ describe('createCoordinatorPlugin', () => {
   it('写工具完成后 finally 释放锁：顺序写同一路径不阻塞', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
-    await hooks['tool.pre.execute'](
+    await hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tA', sessionId: 'sA' },
       () => { return { ok: true } },
     )
     // sA 已完成（await 返回时锁已释放）→ sB 同路径直接放行
     let bDone = false
-    const pB = hooks['tool.pre.execute'](
+    const pB = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )
@@ -519,17 +519,17 @@ describe('createCoordinatorPlugin', () => {
   it('非写工具不被拦截（subagent 派工不再做声明级仲裁）', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     // 两个 subagent 调用即使带相同 targetFiles 也直接放行（不再派工级阻塞）
     const calls: string[] = []
     const next = () => { calls.push('called'); return { ok: true } }
-    await hooks['tool.pre.execute'](
+    await hooks['core.tool.pre.execute'](
       { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'A', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tA', sessionId: 'sA' },
       next,
     )
     let bDone = false
-    const pB = hooks['tool.pre.execute'](
+    const pB = hooks['core.tool.pre.execute'](
       { tool: { id: 'subagent' }, input: { agentId: 'researcher', prompt: 'B', targetFiles: ['src/a.ts'], runInBackground: true }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )
@@ -539,7 +539,7 @@ describe('createCoordinatorPlugin', () => {
 
     // read_file（有 path 但非写工具）不被拦截
     let readDone = false
-    await hooks['tool.pre.execute'](
+    await hooks['core.tool.pre.execute'](
       { tool: { id: 'read_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tR', sessionId: 'sC' },
       () => { readDone = true; return { ok: true } },
     )
@@ -549,15 +549,15 @@ describe('createCoordinatorPlugin', () => {
   it('serializeWrites=false：写工具不做文件级互斥', async () => {
     const { bus, harness, plugin } = setup({ serializeWrites: false })
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
-    await hooks['harness.start']({ harness })
+    await hooks['core.harness.start']({ harness })
 
     // sA 挂起写 src/a.ts，sB 同路径 → 直接放行（不等待）
-    const pA = hooks['tool.pre.execute'](
+    const pA = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tA', sessionId: 'sA' },
       () => new Promise((r) => setTimeout(r, 100)),
     )
     let bDone = false
-    const pB = hooks['tool.pre.execute'](
+    const pB = hooks['core.tool.pre.execute'](
       { tool: { id: 'write_file' }, input: { path: 'src/a.ts' }, toolUseId: 'tB', sessionId: 'sB' },
       () => { bDone = true; return { ok: true } },
     )

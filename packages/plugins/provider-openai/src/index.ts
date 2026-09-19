@@ -56,7 +56,7 @@ export interface OpenAIProviderConfig {
   /**
    * 思考模式开关（OpenAI 兼容 thinking 端点：DeepSeek / GLM 等）。
    * 请求体顶层注入 `thinking: { type }`；缺省不发送（DeepSeek 默认启用，标准 OpenAI 不认识该参数）。
-   * 可被单次请求的 `llmParams.thinking` 覆盖（Agent.model.options / llm.params hook）。
+   * 可被单次请求的 `llmParams.thinking` 覆盖（Agent.model.options / core.llm.params hook）。
    */
   thinking?: 'enabled' | 'disabled'
   /**
@@ -506,7 +506,7 @@ export class OpenAIChatProvider implements ChatProvider {
     if (typeof llmParams.tool_choice === 'string') body.tool_choice = llmParams.tool_choice as any
     if (params.stream) body.stream = true
     // 思考模式参数（DeepSeek / GLM 等 OpenAI 兼容 thinking 端点）。
-    // params 级（Agent.model.options / llm.params hook）优先于 Provider 配置 —— 允许按 Agent 覆盖。
+    // params 级（Agent.model.options / core.llm.params hook）优先于 Provider 配置 —— 允许按 Agent 覆盖。
     // 标准端点不认识这两个参数（多传 400），所以两者都缺省不发送。
     const reasoningEffort = typeof llmParams.reasoningEffort === 'string'
       ? llmParams.reasoningEffort
@@ -951,7 +951,7 @@ export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): Agent
       })
 
       return {
-        async 'harness.init'(_input, output) {
+        async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | {
                 _setChatProvider?: (p: ChatProvider) => void

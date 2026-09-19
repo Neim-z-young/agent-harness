@@ -7,7 +7,7 @@
  * - 可配置默认文本响应 / reasoning / model / tokenUsage
  * - 按用户消息关键词匹配不同响应（含 tool call 模拟）
  * - 记录所有调用历史（calls 数组，供测试断言）
- * - 通过 harness.init Hook 注入到 Harness 的 ChatProvider 槽位
+ * - 通过 core.harness.init Hook 注入到 Harness 的 ChatProvider 槽位
  *
  * 配置（通过 PluginContext.config 传入）：
  *   config key: "provider.mock"
@@ -308,7 +308,7 @@ export class MockChatProvider implements ChatProvider {
  *
  * 流程：
  * 1. install：从 ctx.config.get('provider.mock') 读取配置 → 创建 MockChatProvider 实例
- * 2. harness.init Hook：从 output.harness 拿到 HarnessImpl → 调用 _setChatProvider 注入
+ * 2. core.harness.init Hook：从 output.harness 拿到 HarnessImpl → 调用 _setChatProvider 注入
  *
  * @param config 可选：直接传入配置（覆盖 config store 中的值）
  * @returns AgentPlugin 实例
@@ -333,8 +333,8 @@ export function createProviderMockPlugin(config?: MockProviderConfig): AgentPlug
       ctx.log.info('Mock Provider installed', { model: provider.id })
 
       return {
-        async 'harness.init'(_input, output) {
-          // 从 harness.init 的 output 拿到 harness 实例，注入 provider
+        async 'core.harness.init'(_input, output) {
+          // 从 core.harness.init 的 output 拿到 harness 实例，注入 provider
           const harness = (output as { harness?: unknown }).harness as
             | { _setChatProvider?: (p: ChatProvider) => void }
             | undefined

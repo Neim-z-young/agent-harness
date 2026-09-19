@@ -2,7 +2,7 @@
  * @harness/computer-use 测试
  * - 进程内 MCP server：initialize / tools/list / tools/call（经后端 stub）
  * - transport 对接 McpClient（连通性）
- * - 插件：注册 mcp server + harness.init 注册 plugin 来源 Skill
+ * - 插件：注册 mcp server + core.harness.init 注册 plugin 来源 Skill
  */
 import { describe, expect, test, afterEach } from 'bun:test'
 import { ComputerUseBackend } from './mac'
@@ -132,16 +132,16 @@ describe('createComputerUsePlugin', () => {
     await plugin.uninstall?.()
     expect(listRegisteredMcpServers().find((r) => r.name === COMPUTER_USE_SERVER_NAME)).toBeUndefined()
     expect(hooks).toBeDefined()
-    expect(typeof (hooks as any)['harness.init']).toBe('function')
+    expect(typeof (hooks as any)['core.harness.init']).toBe('function')
   })
 
-  test('harness.init 注册 plugin 来源 Skill', async () => {
+  test('core.harness.init 注册 plugin 来源 Skill', async () => {
     const plugin = createComputerUsePlugin({ backend: new StubBackend() })
     const hooks = await plugin.install({ log: { info(){}, warn(){}, error(){}, debug(){} } } as any) as any
 
     const registered: any[] = []
     const fakeHarness = { skillManager: { register: (s: any) => registered.push(s) } }
-    await hooks!['harness.init']!({ harnessOptions: {} }, { harness: fakeHarness })
+    await hooks!['core.harness.init']!({ harnessOptions: {} }, { harness: fakeHarness })
 
     expect(registered).toHaveLength(1)
     expect(registered[0].id).toBe('computer-use')

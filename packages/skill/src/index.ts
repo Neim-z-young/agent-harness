@@ -25,7 +25,7 @@ export type Awaitable<T> = T | Promise<T>
  * - user：用户全局配置（~/.harness/skills）
  * - project：项目级（.harness/skills）
  * - mcp：MCP Server 提供（安全限制：禁用 shell embed）
- * - plugin：由插件（.harness/plugins）在其 install/harness.init 时注册
+ * - plugin：由插件（.harness/plugins）在其 install/core.harness.init 时注册
  */
 export type SkillSource = 'bundled' | 'user' | 'project' | 'mcp' | 'plugin'
 

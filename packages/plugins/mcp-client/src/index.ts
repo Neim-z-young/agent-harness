@@ -725,7 +725,7 @@ export function createMcpClientPlugin(options: {
     async install(ctx) {
       ctx.log.info('MCP Client 插件已加载', { servers: servers.map((s) => s.name) })
       return {
-        async 'harness.start'() {
+        async 'core.harness.start'() {
           if (connected) return
           for (const config of servers) {
             try {
@@ -782,7 +782,7 @@ export function createMcpClientPlugin(options: {
           connected = true
         },
 
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const rt of runtimes) {
             for (const tool of rt.tools) {
               ;(pool as { add: (t: unknown) => void }).add(tool)
@@ -790,7 +790,7 @@ export function createMcpClientPlugin(options: {
           }
         },
 
-        'prompt.system.transform'(_input, parts) {
+        'core.prompt.system.transform'(_input, parts) {
           // 注入自动拉取的资源文本（模板含 `# MCP Resources` 标题 + `{uri}`/`{text}` 占位符）
           if (injectedResourceCache.size > 0) {
             const rendered = Array.from(injectedResourceCache.entries())

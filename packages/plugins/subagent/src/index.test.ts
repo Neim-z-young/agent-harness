@@ -450,7 +450,7 @@ describe('createSubagentPlugin', () => {
     }
   }
 
-  it('harness.start 注册子 Agent + 缓存 harness 引用', async () => {
+  it('core.harness.start 注册子 Agent + 缓存 harness 引用', async () => {
     const coderAgent: AgentDefinition = {
       id: 'coder',
       name: 'Coder',
@@ -477,13 +477,13 @@ describe('createSubagentPlugin', () => {
       session: createMockSessionManager(new Map()),
     }
 
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
     expect(registered.length).toBe(1)
     expect(registered[0].id).toBe('coder')
     expect(logs.some(([_, m]) => m.includes('已注册'))).toBe(true)
   })
 
-  it('harness.start 跳过 mode 非 subagent 的定义', async () => {
+  it('core.harness.start 跳过 mode 非 subagent 的定义', async () => {
     const primaryAgent: AgentDefinition = {
       id: 'primary',
       name: 'Primary',
@@ -509,26 +509,26 @@ describe('createSubagentPlugin', () => {
       session: createMockSessionManager(new Map()),
     }
 
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
     expect(registered.length).toBe(0)
     expect(logs.some(([level, _]) => level === 'warn')).toBe(true)
   })
 
-  it('tool.pool.assemble 注入 SubagentTool', async () => {
+  it('core.tool.pool.assemble 注入 SubagentTool', async () => {
     const plugin = createSubagentPlugin({ subagents: [] })
     const { ctx } = makeCtx()
     const hooks = await plugin.install(ctx)
 
-    // 先触发 harness.start（缓存 harness 引用）
+    // 先触发 core.harness.start（缓存 harness 引用）
     const mockHarness = {
       agent: { register: () => {}, get: () => undefined, list: () => [], query: async () => makeMessage('assistant', 'ok'), queryStream: async function* () {} } as any,
       session: createMockSessionManager(new Map()),
     }
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
 
     const added: unknown[] = []
     const pool = { add: (t: unknown) => { added.push(t) } }
-    await (hooks as any)['tool.pool.assemble']?.({}, pool)
+    await (hooks as any)['core.tool.pool.assemble']?.({}, pool)
     expect(added.length).toBe(1)
     expect((added[0] as { id: string }).id).toBe('subagent')
   })
@@ -581,7 +581,7 @@ describe('createSubagentPlugin', () => {
     expect(cmdInput.commands[0].command).toBe('tasks')
   })
 
-  it('harness.start 后 /subagents 以注册表为准：md 定义的子 Agent（未配在插件里）也会列出并标注来源', async () => {
+  it('core.harness.start 后 /subagents 以注册表为准：md 定义的子 Agent（未配在插件里）也会列出并标注来源', async () => {
     const coderAgent: AgentDefinition = {
       id: 'coder',
       name: 'Coder',
@@ -625,7 +625,7 @@ describe('createSubagentPlugin', () => {
       } as any,
       session: createMockSessionManager(new Map()),
     }
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
 
     const out: string[] = []
     const cliInput = {
@@ -679,7 +679,7 @@ describe('createSubagentPlugin', () => {
         filterByWhitelist: (w: string[]) => (w.includes(READONLY_TOOLS_SENTINEL) ? [{ id: 'read_file' }, { id: 'list_dir' }] : []),
       },
     }
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
 
     const out: string[] = []
     await (hooks as any)['cli.command']?.({
@@ -718,7 +718,7 @@ describe('createSubagentPlugin', () => {
       } as any,
       session: createMockSessionManager(new Map()),
     }
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
 
     const cmdInput = { commands: [] as any[] }
     ;(hooks as any)['cli.commands']?.(cmdInput)
@@ -734,12 +734,12 @@ describe('createSubagentPlugin', () => {
       agent: { register: () => {}, get: () => undefined, list: () => [], query: async () => makeMessage('assistant', 'ok'), queryStream: async function* () {} } as any,
       session: createMockSessionManager(new Map()),
     }
-    await (hooks as any)['harness.start']?.({ harness: mockHarness })
+    await (hooks as any)['core.harness.start']?.({ harness: mockHarness })
 
     // 工具应该能工作
     const added: unknown[] = []
     const pool = { add: (t: unknown) => { added.push(t) } }
-    await (hooks as any)['tool.pool.assemble']?.({}, pool)
+    await (hooks as any)['core.tool.pool.assemble']?.({}, pool)
     expect(added.length).toBe(1)
 
     await plugin.uninstall?.()
@@ -789,13 +789,13 @@ describe('Subagent 端到端', () => {
     }
     const hooks = await plugin.install(ctx as any)
 
-    // 1. harness.start
-    await (hooks as any)['harness.start']?.({ harness: { agent: mockAgent, session: mockSession } })
+    // 1. core.harness.start
+    await (hooks as any)['core.harness.start']?.({ harness: { agent: mockAgent, session: mockSession } })
 
-    // 2. tool.pool.assemble
+    // 2. core.tool.pool.assemble
     const added: unknown[] = []
     const pool = { add: (t: unknown) => { added.push(t) } }
-    await (hooks as any)['tool.pool.assemble']?.({}, pool)
+    await (hooks as any)['core.tool.pool.assemble']?.({}, pool)
     const tool = added[0] as { call: (i: SubagentToolInput, c: ToolContext) => Promise<ToolResult<SubagentToolOutput>> }
 
     // 3. 主 Agent 调用 SubagentTool
@@ -977,7 +977,7 @@ describe('SubagentTool Bus 事件', () => {
 
   it('Harness 部分可用（有 bus 无 agent）时发布 failed 事件', async () => {
     const { bus, events } = createMockBus()
-    // 模拟部分 harness：有 bus 但无 agent/session（harness.start 未完成）
+    // 模拟部分 harness：有 bus 但无 agent/session（core.harness.start 未完成）
     const tool = createSubagentTool(() => ({ bus } as any), 5000, false)
     const res = await tool.call(
       { agentId: 'coder', prompt: 'test' },
@@ -2495,7 +2495,7 @@ describe('Subagent git worktree 隔离', () => {
     return realpathSync(dir)
   }
 
-  /** 组装插件并触发 harness.start，返回可调用的 subagentTool */
+  /** 组装插件并触发 core.harness.start，返回可调用的 subagentTool */
   async function setupPlugin(cwd: string) {
     const sessions = new Map<string, Session>()
     const session = createMockSessionManager(sessions)
@@ -2516,10 +2516,10 @@ describe('Subagent git worktree 隔离', () => {
       config: { get: () => undefined, set: () => {} },
     }
     const hooks = await plugin.install(ctx as any)
-    await (hooks as any)['harness.start']?.({ harness: { agent, session, cwd } })
+    await (hooks as any)['core.harness.start']?.({ harness: { agent, session, cwd } })
     const added: unknown[] = []
     const pool = { add: (t: unknown) => { added.push(t) } }
-    await (hooks as any)['tool.pool.assemble']?.({}, pool)
+    await (hooks as any)['core.tool.pool.assemble']?.({}, pool)
     return {
       hooks,
       session,

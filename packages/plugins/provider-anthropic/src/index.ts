@@ -301,7 +301,7 @@ export class AnthropicChatProvider implements ChatProvider {
     }
   }
 
-  /** 动态更新工具池 getter（由 harness.init Hook 在注册完成后调用） */
+  /** 动态更新工具池 getter（由 core.harness.init Hook 在注册完成后调用） */
   setToolsGetter(getter: () => Tool[]): void {
     this.toolsGetter = getter
   }
@@ -687,7 +687,7 @@ export function createProviderAnthropicPlugin(config?: AnthropicProviderConfig):
       })
 
       return {
-        async 'harness.init'(_input, output) {
+        async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | {
                 _setChatProvider?: (p: ChatProvider) => void

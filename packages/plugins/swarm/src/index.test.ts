@@ -1075,7 +1075,7 @@ describe('Swarm 工具', () => {
     const plugin = createSwarmPlugin({ teamsDir: dir })
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
     const pool: any = { added: [], add: (t: any) => { pool.added.push(t) } }
-    await hooks['tool.pool.assemble']({ agentId: 'coordinator' }, pool)
+    await hooks['core.tool.pool.assemble']({ agentId: 'coordinator' }, pool)
     const approve = pool.added.find((t: any) => t.id === 'approve_shutdown')
 
     // 在全局 teammateRegistry 注册一个 teammate（identity.team 为 sanitize 后团队名）
@@ -1094,11 +1094,11 @@ describe('Swarm 工具', () => {
 // ===== 插件 =====
 
 describe('createSwarmPlugin', () => {
-  it('tool.pool.assemble 注入全部 swarm 工具', async () => {
+  it('core.tool.pool.assemble 注入全部 swarm 工具', async () => {
     const plugin = createSwarmPlugin({ teamsDir: await makeDir('swarm-plugin-') })
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
     const pool: any = { added: [], add: (t: any) => { pool.added.push(t.id) } }
-    await hooks['tool.pool.assemble']({ agentId: 'any' }, pool)
+    await hooks['core.tool.pool.assemble']({ agentId: 'any' }, pool)
     const ids = (pool.added as string[]).sort()
     expect(ids).toEqual([
       'approve_shutdown',

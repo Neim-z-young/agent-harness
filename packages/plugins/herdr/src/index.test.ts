@@ -163,14 +163,14 @@ describe('HerdrReporter', () => {
 })
 
 describe('插件装配', () => {
-  it('Herdr 内：返回 agent.stream / permission.check 两个 Hook', async () => {
+  it('Herdr 内：返回 cli.agent.stream / core.permission.check 两个 Hook', async () => {
     const plugin = createHerdrPlugin({
       env: { HERDR_ENV: '1', HERDR_PANE_ID: 'pane-1', HERDR_BIN_PATH: '/bin/herdr' },
       runner: fakeRunner().runner,
     })
     const hooks = (await plugin.install(fakeCtx())) as Record<string, unknown>
-    expect(typeof hooks['agent.stream']).toBe('function')
-    expect(typeof hooks['permission.check']).toBe('function')
+    expect(typeof hooks['cli.agent.stream']).toBe('function')
+    expect(typeof hooks['core.permission.check']).toBe('function')
     await plugin.uninstall?.()
   })
 
@@ -183,18 +183,18 @@ describe('插件装配', () => {
     await plugin.uninstall?.()
   })
 
-  it('permission.check：只有 decision=ask 才报 blocked（已记住的规则没人真的在等）', async () => {
+  it('core.permission.check：只有 decision=ask 才报 blocked（已记住的规则没人真的在等）', async () => {
     const { calls, runner } = fakeRunner()
     const plugin = createHerdrPlugin({
       env: { HERDR_ENV: '1', HERDR_PANE_ID: 'pane-1', HERDR_BIN_PATH: '/bin/herdr' },
       runner,
     })
     const hooks = (await plugin.install(fakeCtx())) as {
-      'permission.check': (r: unknown, d: unknown) => void
+      'core.permission.check': (r: unknown, d: unknown) => void
     }
-    hooks['permission.check']({ toolKey: 'bash' }, { behavior: 'allow' })
+    hooks['core.permission.check']({ toolKey: 'bash' }, { behavior: 'allow' })
     expect(calls).toHaveLength(0)
-    hooks['permission.check']({ toolKey: 'bash' }, { behavior: 'ask' })
+    hooks['core.permission.check']({ toolKey: 'bash' }, { behavior: 'ask' })
     expect(calls).toHaveLength(1)
     expect(calls[0]!.args).toContain('blocked')
     await plugin.uninstall?.()

@@ -9,7 +9,8 @@
  * 3. User 用户插件（配置文件指定，支持 file:///）
  * 每一级内部按 dependsOn 拓扑排序
  *
- * Hooks 命名规范：域.动作 格式（如 tool.pre.execute、session.compacting）
+ * Hooks 命名规范：**层.域.动作** 格式（如 core.tool.pre.execute、cli.agent.stream）。
+ * 首段锁定「谁触发这条 hook」的层，避免同一域下出现两个来源、消费方分不清。
  */
 
 import type { Awaitable, Bus, BusEventRecord } from '@harness/bus'
@@ -28,7 +29,7 @@ import type { Awaitable, Bus, BusEventRecord } from '@harness/bus'
  * `Workspace` 对象在结构上可直接赋值（TS 结构化类型），因此不会漏字段 ——
  * 若 workspace 包改了字段名，赋值处会编译报错。
  *
- * 存在意义：插件在 `install(ctx)` 与 `session.preModel` / `prompt.system.transform`
+ * 存在意义：插件在 `install(ctx)` 与 `core.session.preModel` / `core.prompt.system.transform`
  * 等**每轮 hook** 里都需要知道"记忆/技能该写到哪、该从哪读"。此前插件只能拿
  * `process.cwd()` 猜，而 CLI 支持 `--cwd` / `--data-dir` ⇒ 会拼错目录
  * （本项目已两次栽在"路径口径分裂"上）。
@@ -140,7 +141,7 @@ export interface CompactionContext {
   summary?: string
   /**
    * 待压缩窗口（将要被删除的消息，只读参考）。core 会在真正删除前的
-   * `session.compacting` hook 里传入，供 ACP 等插件在删除前保全原文。
+   * `core.session.compacting` hook 里传入，供 ACP 等插件在删除前保全原文。
    * 语义为只读：插件不应修改该数组（core 之后会按 keepLast 重算并存取）。
    */
   window?: readonly unknown[]
@@ -164,7 +165,7 @@ export interface CompactionContext {
     archiveRef?: string
   }[]
   /**
-   * 会话 meta 访问器：与 `session.preModel` 的 meta 同义，供插件在物理删除前
+   * 会话 meta 访问器：与 `core.session.preModel` 的 meta 同义，供插件在物理删除前
    * 把窗口原文/状态持久化到 session.meta，跨重启后可回溯。只读/浅合并读写。
    */
   meta?: {
@@ -173,7 +174,7 @@ export interface CompactionContext {
   }
 }
 
-/** session.preModel hook 的输入（每轮进入模型前） */
+/** core.session.preModel hook 的输入（每轮进入模型前） */
 export interface SessionPreModelInput {
   /** 会话 ID */
   sessionId: string
@@ -259,7 +260,7 @@ export interface AgentStatusSnapshot {
   aborted?: boolean
 }
 
-/** `agent.stream` hook 的输入 */
+/** `cli.agent.stream` hook 的输入 */
 export interface AgentStreamSignal {
   /** 原始事件类型名（text_delta / tool_call_start / done / turn_end …），仅供排查 */
   eventType: string
@@ -270,12 +271,12 @@ export interface AgentStreamSignal {
 }
 
 /**
- * `agent.turn.end` hook 的输入：**引擎层**的整轮终态。
+ * `core.agent.turn.end` hook 的输入：**引擎层**的整轮终态。
  *
- * 与 `agent.stream` 的分工（两者名字必须分得开，否则消费方无法判断"这条是谁发的"）：
- * - `agent.stream`：**UI 消费层**（CLI 的 REPL / TUI / run）把流式事件归约成"现在在干什么"，
+ * 与 `cli.agent.stream` 的分工（两者名字必须分得开，否则消费方无法判断"这条是谁发的"）：
+ * - `cli.agent.stream`：**UI 消费层**（CLI 的 REPL / TUI / run）把流式事件归约成"现在在干什么"，
  *   只在有 UI 的宿主里触发；它是状态流（一条 turn_end 只是"该收 busy 了"）。
- * - `agent.turn.end`：**引擎**（core.queryStream 的 finally）在整轮结束时发出的事实，
+ * - `core.agent.turn.end`：**引擎**（core.queryStream 的 finally）在整轮结束时发出的事实，
  *   任何宿主都有（含以库内嵌、ACP 宿主自己消费事件流）。带的是引擎侧事实字段
  *   （跑了几步、末步 finish、是否被中断），不是 UI 状态。
  *
@@ -305,58 +306,76 @@ export interface AgentTurnEndSignal {
  * Hooks 注册表
  * 插件通过 install() 返回此对象，介入 Harness 各生命周期
  *
- * 命名规范：域.动作 格式，支持后续新域不冲突
+ * ## 命名规范：`层.域.动作`
+ *
+ * 首段是**触发层**（谁 emit 这条 hook），不是"功能属于哪个模块"。这一条是刻意的：
+ * hook 名是一个命名空间，若两层往同一个名字里发，消费方只能靠猜字段形状判断
+ * "这条是谁发的" —— 本项目踩过（引擎终态曾被塞进 UI 消费层的 `cli.agent.stream`，
+ * 同一个 hook 名出现两个来源，按轮计数的消费方因此翻倍）。
+ *
+ * | 层 | 语义 | 触发方 | hook |
+ * | --- | --- | --- | --- |
+ * | `core.` | 引擎层：**任何宿主都有**（CLI / 库内嵌 / ACP 宿主） | core | `core.harness.init` / `core.harness.start`、`core.tool.*`、`core.llm.*`、`core.prompt.*`、`core.session.*`、`core.permission.check`、`core.agent.turn.end`、`core.bus.event` |
+ * | `cli.` | CLI 宿主层：只有走 CLI 的宿主才有 | cli | `cli.agent.stream`（UI 状态流）、`cli.command` / `cli.commands`（斜杠命令）、`cli.mcp.configure` |
+ *
+ * 约定：
+ * - 新增 hook 前先定层，判据一句话：**"没有 UI 的宿主里这条还会触发吗？"** 会 → `core.`；只在有 UI 时 → `cli.`。
+ * - 动作置于末段（`core.tool.pre.execute`、`core.agent.turn.end`），便于按 `core.agent.*` 前缀聚合。
+ * - 触发时机是契约的一部分：声明为 `core.` 就必须在任何宿主里触发；只在 CLI 触发却写成 `core.` 是缺陷。
+ * - 与**总线事件**（`harness.started`、`tool.enabled`…）是两套机制、两个命名空间：事件走 `core.bus`
+ *   发布/订阅（多订阅者、无入参改写语义），hook 走 `plugin.trigger`（管道式、可原地改写入参）。
+ * - 方法名不受本规范约束：`harness.start()` 是 Harness 的方法，hook 名是 `core.harness.start`。
  */
 export interface Hooks {
   // === Harness 级 ===
   /** Harness 初始化阶段（create 时） */
-  'harness.init'?: (input: HarnessInitInput, output: HarnessInitOutput) => Awaitable<void>
+  'core.harness.init'?: (input: HarnessInitInput, output: HarnessInitOutput) => Awaitable<void>
   /** Harness 启动阶段（start 时） */
-  'harness.start'?: (input: HarnessStartInput, output: HarnessStartOutput) => Awaitable<void>
+  'core.harness.start'?: (input: HarnessStartInput, output: HarnessStartOutput) => Awaitable<void>
 
   // === 工具池构建 ===
   /** 组装 Agent 工具池（可注入/移除工具） */
-  'tool.pool.assemble'?: (input: ToolPoolAssembleInput, pool: ToolPool) => Awaitable<void>
+  'core.tool.pool.assemble'?: (input: ToolPoolAssembleInput, pool: ToolPool) => Awaitable<void>
 
   // === Tool 执行 Pipeline ===
   /** 前置 Hook：可拦截、修改输入、提前返回（中间件模式） */
-  'tool.pre.execute'?: (ctx: unknown, next: () => Promise<unknown>) => Promise<unknown>
+  'core.tool.pre.execute'?: (ctx: unknown, next: () => Promise<unknown>) => Promise<unknown>
   /** 后置 Hook：可修改结果 */
-  'tool.post.execute'?: (ctx: unknown, result: unknown) => Awaitable<unknown>
+  'core.tool.post.execute'?: (ctx: unknown, result: unknown) => Awaitable<unknown>
 
   // === LLM 调用链路 ===
   /** 修改 LLM 调用参数（temperature/maxTokens 等） */
-  'llm.params'?: (input: LLMInput, params: LLMParams) => Awaitable<void>
+  'core.llm.params'?: (input: LLMInput, params: LLMParams) => Awaitable<void>
   /** 修改 LLM 请求头（如注入 API key、版本号） */
-  'llm.headers'?: (input: LLMInput, headers: Record<string, string>) => Awaitable<void>
+  'core.llm.headers'?: (input: LLMInput, headers: Record<string, string>) => Awaitable<void>
 
   // === Prompt 构建链 ===
   /** 修改 System Prompt 片段数组 */
-  'prompt.system.transform'?: (input: PromptInput, parts: string[]) => Awaitable<void>
+  'core.prompt.system.transform'?: (input: PromptInput, parts: string[]) => Awaitable<void>
 
   // === Session 生命周期 ===
   /** 会话压缩阶段 */
-  'session.compacting'?: (input: PromptInput, output: CompactionContext) => Awaitable<void>
+  'core.session.compacting'?: (input: PromptInput, output: CompactionContext) => Awaitable<void>
   /**
    * 每轮进入模型前 Hook：把本轮待发消息（含 system）交给插件，插件可裁剪/改写 messages 原地生效，
    * 并通过 save(messages) 把精简后的会话消息回写持久层（上下文压缩插件使用）。
    * messages 为待发消息数组，可原地 splice/push（会反映到本轮的模型请求）。
    */
-  'session.preModel'?: (
+  'core.session.preModel'?: (
     input: SessionPreModelInput,
     messages: unknown[]
   ) => Awaitable<void>
 
   // === Permission 扩展 ===
   /** 权限检查 Hook：可修改决策（如 teammate 桥接到 leader） */
-  'permission.check'?: (
+  'core.permission.check'?: (
     req: PermissionRequestLike,
     decision: PermissionDecisionLike
   ) => Awaitable<void>
 
   // === Bus 事件订阅 ===
   /** 订阅所有 Bus 事件（用于日志、遥测、桥接） */
-  'bus.event'?: (event: BusEventRecord) => Awaitable<void>
+  'core.bus.event'?: (event: BusEventRecord) => Awaitable<void>
 
   // === Agent 流式事件（外部集成用） ===
   /**
@@ -369,27 +388,35 @@ export interface Hooks {
    * 触发点是 **UI 消费层**（REPL / TUI / run），不是引擎 —— 没走 UI 的调用方
    * （如 subagent 的 query()）不触发，集成插件需知悉这一边界。
    *
-   * ⚠️ 与 `agent.turn.end` 是**两条不同的通道**：本 hook 是 UI 状态流（引擎不会触发它），
-   * `agent.turn.end` 才是引擎的整轮终态。曾把引擎终态也塞进本 hook，结果是同一个 hook 名
+   * ⚠️ 与 `core.agent.turn.end` 是**两条不同的通道**：本 hook 是 UI 状态流（引擎不会触发它），
+   * `core.agent.turn.end` 才是引擎的整轮终态。曾把引擎终态也塞进本 hook，结果是同一个 hook 名
    * 由两层分别触发、消费方无法分辨来源（记忆的按轮计数因此可能被计两次）。
    */
-  'agent.stream'?: (input: AgentStreamSignal) => Awaitable<void>
+  'cli.agent.stream'?: (input: AgentStreamSignal) => Awaitable<void>
 
   // === Agent 生命周期（引擎层事实） ===
   /**
    * **整轮结束**（引擎层）：core 在 `queryStream` / `query()` 收尾时触发。
    *
-   * 与 `agent.stream` 的区别是刻意的分层：本 hook 是引擎事实（任何宿主都有：CLI、内嵌库、
-   * ACP 宿主自己消费事件流），`agent.stream` 只在有 UI 消费层时才有。要"每轮都要发生"的
-   * 逻辑（如记忆的攒批放行）挂这里；纯 UI 状态（busy/spinner/侧栏）挂 `agent.stream`。
+   * 与 `cli.agent.stream` 的区别是刻意的分层：本 hook 是引擎事实（任何宿主都有：CLI、内嵌库、
+   * ACP 宿主自己消费事件流），`cli.agent.stream` 只在有 UI 消费层时才有。要"每轮都要发生"的
+   * 逻辑（如记忆的攒批放行）挂这里；纯 UI 状态（busy/spinner/侧栏）挂 `cli.agent.stream`。
    */
-  'agent.turn.end'?: (input: AgentTurnEndSignal) => Awaitable<void>
+  'core.agent.turn.end'?: (input: AgentTurnEndSignal) => Awaitable<void>
 
   // === CLI 扩展 ===
   /** 注册 CLI 斜杠命令：插件往 input.commands 追加自己的命令定义 */
   'cli.commands'?: (input: CliCommandsInput) => Awaitable<void>
   /** 处理 CLI 斜杠命令：当 REPL 收到非内置 /xxx 时触发，插件设 input.result 表示已处理 */
   'cli.command'?: (input: CliCommandInput) => Awaitable<void>
+  /**
+   * 注入 MCP 托管列表（配置态，替换语义）：CLI 在 `createHarness` 之后、`core.harness.start`
+   * 之前触发，把 config.json 的 `mcpServers` 交给 mcp-server-registry；后者只在 start 时按
+   * `enabled` 连接，不在本 hook 里做 I/O。
+   *
+   * 由 CLI 触发 ⇒ 层前缀 `cli.`（见接口头的分层表）。
+   */
+  'cli.mcp.configure'?: (input: McpConfigureInput) => Awaitable<void>
 }
 
 /** CLI 命令定义（供 /help 展示） */
@@ -406,6 +433,45 @@ export interface CliCommandDef {
 export interface CliCommandsInput {
   /** 插件往此数组追加命令定义 */
   commands: CliCommandDef[]
+}
+
+/**
+ * MCP server 配置条目（`cli.mcp.configure` 的载荷元素）。
+ *
+ * 与 `@harness/mcp-client` 的 `McpServerConfig` **结构保持一致**，但刻意不 import 它：
+ * 契约层要保持"只依赖 bus"的轻量方向，不能反向依赖某个 MCP 插件包。字段口径由
+ * `McpServerConfig` 定义，**新增字段须两处同步**（消费方 mcp-server-registry 负责收窄）。
+ */
+export interface McpServerConfigLike {
+  /** 服务器名（工具命名 mcp__${name}__${tool}） */
+  name: string
+  /** 服务器级开关（缺省 true） */
+  enabled?: boolean
+  /** 工具级开关：key=工具名（不带 mcp__<server>__ 前缀），value=false 停用单个工具（缺省全开） */
+  tools?: Record<string, boolean>
+  /** 传输类型；缺省按字段推断（有 command → stdio，有 url → http） */
+  transport?: 'stdio' | 'sse' | 'http'
+  /** stdio：启动命令 */
+  command?: string
+  /** stdio：命令参数 */
+  args?: string[]
+  /** stdio：环境变量 */
+  env?: Record<string, string>
+  /** sse/http：服务器 URL */
+  url?: string
+  /** MCP 协议版本号（缺省 '2024-11-05'） */
+  protocolVersion?: string
+  /** 单次请求超时（毫秒） */
+  requestTimeoutMs?: number
+  /** 是否自动发现 resources / prompts */
+  discoverResources?: boolean
+  discoverPrompts?: boolean
+}
+
+/** cli.mcp.configure hook 的输入 */
+export interface McpConfigureInput {
+  /** 托管的 MCP server 列表（替换语义：整表覆盖上一份） */
+  mcpServers?: McpServerConfigLike[]
 }
 
 /**
@@ -569,6 +635,12 @@ export interface PluginManager {
   hotReload(pluginId: string): Promise<void>
   /** 列出已加载插件 */
   list(): LoadedPlugin[]
+
+  /**
+   * 按名称列出已注册的 hook 回调（顺序 = 插件加载顺序，只读）。
+   * 供宿主组装洋葱管道（如 core 的 tool pre/post hook 链）时按序取用。
+   */
+  listHooks<N extends keyof Hooks>(name: N): ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks[N]> }>
 
   /**
    * 触发 Hook（管道式依次调用所有已注册插件）
@@ -753,7 +825,7 @@ export function topologicalSortPlugins(plugins: AgentPlugin[]): AgentPlugin[] {
  * HooksRegistry：Hook name → （pluginId, callback）有序列表
  *
  * trigger(name, args) 按注册顺序依次调用所有回调；
- * - 对 `tool.pre.execute` / `tool.post.execute` 特殊处理 Promise 链返回值给调用方（见 PluginManager）
+ * - 对 `core.tool.pre.execute` / `core.tool.post.execute` 特殊处理 Promise 链返回值给调用方（见 PluginManager）
  * - 其他 hooks 管道式 mutate 参数（返回值忽略）
  */
 export class HooksRegistry {
@@ -819,10 +891,10 @@ export interface PluginManagerOptions {
  * 流程：
  * 1. 构造时注入 PluginContext（bus + 内存 config + logger + dynamicImport）
  * 2. loadInternal/loadBuiltin/loadUser 三级加载
- *    - 每级：拓扑排序 → 去重检查 → install → hooks 聚合 + bus.event 订阅桥接
+ *    - 每级：拓扑排序 → 去重检查 → install → hooks 聚合 + core.bus.event 订阅桥接
  *    - loadBuiltin/loadUser 调用 dynamicImport 或 Bun 的自动 npm install
  * 3. trigger(name, ...args) 按插件加载顺序依次回调，出错聚合抛错
- * 4. unload：bus.event 退订 → hooks unregister → uninstall
+ * 4. unload：core.bus.event 退订 → hooks unregister → uninstall
  * 5. hotReload：卸载后再安装
  */
 export class PluginManagerImpl implements PluginManager {
@@ -836,7 +908,7 @@ export class PluginManagerImpl implements PluginManager {
   private readonly loaded = new Map<string, LoadedPlugin>()
   /** Hooks 注册表 */
   private readonly hooks = new HooksRegistry()
-  /** bus.event Hook → Bus unsubscribe 句柄映射 */
+  /** core.bus.event Hook → Bus unsubscribe 句柄映射 */
   private readonly busEventUnsubs = new Map<string, () => void>()
   /** loadBuiltin / loadUser 动态 import 后保存 spec 对应 pluginId 以支持 hotReload */
   private readonly specById = new Map<string, { source: 'builtin' | 'user'; spec: string }>()
@@ -892,7 +964,7 @@ export class PluginManagerImpl implements PluginManager {
     const lp = this.loaded.get(pluginId)
     if (!lp) throw new PluginNotFoundError(pluginId)
 
-    // 1. bus.event 退订
+    // 1. core.bus.event 退订
     const unsub = this.busEventUnsubs.get(pluginId)
     if (unsub) {
       unsub()
@@ -955,6 +1027,18 @@ export class PluginManagerImpl implements PluginManager {
 
   // ---- trigger Hook 管道 ----
 
+  /**
+   * 按名称列出已注册的 hook 回调（顺序 = 插件加载顺序）。
+   *
+   * 供宿主自行组装**洋葱管道**的场景使用（core 把 `core.tool.pre.execute` 包成
+   * `next()` 链、`core.tool.post.execute` 顺序插入）。此前 core 只能
+   * `(plugin as any).hooks.listFor(...)` 去摸私有字段 —— 类型检查因此失效，
+   * 这里把它收成公开只读 API。
+   */
+  listHooks<N extends keyof Hooks>(name: N): ReadonlyArray<{ pluginId: string; fn: NonNullable<Hooks[N]> }> {
+    return this.hooks.listFor(name)
+  }
+
   async trigger<N extends keyof Hooks>(
     name: N,
     ...args: Parameters<NonNullable<Hooks[N]>>
@@ -1002,12 +1086,12 @@ export class PluginManagerImpl implements PluginManager {
     // 聚合到 HooksRegistry
     this.hooks.register(plugin.id, hooksResult)
 
-    // bus.event 桥接：如果插件声明了 bus.event Hook，则用 bus.subscribeAll 订阅
-    const busEventFn = hooksResult?.['bus.event']
+    // core.bus.event 桥接：如果插件声明了 core.bus.event Hook，则用 bus.subscribeAll 订阅
+    const busEventFn = hooksResult?.['core.bus.event']
     if (busEventFn) {
       const unsub = this.bus.subscribeAll((record) => {
         return Promise.resolve(busEventFn(record as BusEventRecord)).catch((err) => {
-          this.logger.error(`[plugin:${plugin.id}] bus.event handler failed`, err)
+          this.logger.error(`[plugin:${plugin.id}] core.bus.event handler failed`, err)
         })
       })
       this.busEventUnsubs.set(plugin.id, unsub)

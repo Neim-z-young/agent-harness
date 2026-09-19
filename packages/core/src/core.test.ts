@@ -120,7 +120,7 @@ describe('@harness/core', () => {
       await h.stop()
     })
 
-    it('harness.init / harness.start hooks 被触发', async () => {
+    it('core.harness.init / core.harness.start hooks 被触发', async () => {
       const steps: string[] = []
       const P: AgentPlugin = {
         id: 'p1',
@@ -128,11 +128,11 @@ describe('@harness/core', () => {
         name: 'P1',
         async install() {
           return {
-            async 'harness.init'(_i, o) {
+            async 'core.harness.init'(_i, o) {
               steps.push('init')
               expect((o as any).harness).toBeDefined()
             },
-            async 'harness.start'(_i, _o) {
+            async 'core.harness.start'(_i, _o) {
               steps.push('start')
             },
           } as Hooks
@@ -182,7 +182,7 @@ describe('@harness/core', () => {
   })
 
   describe('AgentRuntime + query 单轮（纯文本响应）', () => {
-    it('创建会话 → prompt → 输出 assistant 消息，插件修改 llm.params temperature', async () => {
+    it('创建会话 → prompt → 输出 assistant 消息，插件修改 core.llm.params temperature', async () => {
       const cp = mockChatProvider('text')
       const TempPlugin: AgentPlugin = {
         id: 'temp',
@@ -190,11 +190,11 @@ describe('@harness/core', () => {
         name: 'Temp',
         async install() {
           return {
-            async 'llm.params'(_i, params) {
+            async 'core.llm.params'(_i, params) {
               params.temperature = 0.2
               params.maxTokens = 2048
             },
-            async 'prompt.system.transform'(_i, parts) {
+            async 'core.prompt.system.transform'(_i, parts) {
               parts.push('【测试注入】回答要简洁')
             },
           } as Hooks
@@ -226,7 +226,7 @@ describe('@harness/core', () => {
   })
 
   describe('AgentRuntime + ToolPipeline 联动（tool call）', () => {
-    it('模型返回 toolCall → 执行 echo 工具 → tool.pre.execute / tool.post.execute Hook 生效', async () => {
+    it('模型返回 toolCall → 执行 echo 工具 → core.tool.pre.execute / core.tool.post.execute Hook 生效', async () => {
       const cp = mockChatProvider('tool')
       const register: string[] = []
       const HooksPlugin: AgentPlugin = {
@@ -236,13 +236,13 @@ describe('@harness/core', () => {
         async install(ctx) {
           ctx.bus  // 验证 ctx 注入
           return {
-            async 'tool.pre.execute'(ctx: any, next: any) {
+            async 'core.tool.pre.execute'(ctx: any, next: any) {
               register.push(`pre:${ctx.tool.id}`)
               // 修改输入
               const modified = { ...(ctx.input as any), msg: (ctx.input as any).msg + '+pre' }
               return next(modified)
             },
-            async 'tool.post.execute'(ctx: any, result: ToolResult) {
+            async 'core.tool.post.execute'(ctx: any, result: ToolResult) {
               register.push(`post:${ctx.tool.id}`)
               return { ...result, output: { reply: (result.output as any).reply + '+post' } }
             },
@@ -255,7 +255,7 @@ describe('@harness/core', () => {
         name: 'Tools',
         async install() {
           return {
-            async 'tool.pool.assemble'(_i, pool: any) {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
               pool.add(createEchoTool())
               register.push('pool.assemble')
             },
@@ -332,7 +332,7 @@ describe('@harness/core', () => {
         id: 'bad', version: '1', name: 'bad',
         async install() {
           return {
-            async 'harness.start'() { throw new Error('start-boom') },
+            async 'core.harness.start'() { throw new Error('start-boom') },
           } as Hooks
         },
       }
@@ -345,14 +345,14 @@ describe('@harness/core', () => {
     })
   })
 
-  describe('tool.pool.assemble Hook 按 Agent 白名单限制工具', () => {
+  describe('core.tool.pool.assemble Hook 按 Agent 白名单限制工具', () => {
     it('agent.tools whitelist 限制为 ["echo"] 未注册的工具不被执行', async () => {
       const cp = mockChatProvider('tool')
       const ToolPlugin: AgentPlugin = {
         id: 'tools', version: '1', name: 'Tools',
         async install() {
           return {
-            async 'tool.pool.assemble'(_i, pool: any) {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
               pool.add(createEchoTool())
               // 第二个工具模型不会选到，同时也不在 agent.tools 里
               const other = defineTool({
@@ -391,7 +391,7 @@ describe('@harness/core', () => {
         id: 'mcp-tools', version: '1', name: 'McpTools',
         async install() {
           return {
-            async 'tool.pool.assemble'(_i, pool: any) {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
               for (const [server, tool] of [['gh', 'create_issue'], ['fs', 'read']] as const) {
                 pool.add(defineTool({
                   id: `mcp__${server}__${tool}`,
@@ -437,8 +437,8 @@ describe('@harness/core', () => {
     })
   })
 
-  describe('bus.event 桥（Plugin hooks → Bus publish）', () => {
-    it('插件声明 bus.event Hook 能订阅 Harness lifecycle 事件', async () => {
+  describe('core.bus.event 桥（Plugin hooks → Bus publish）', () => {
+    it('插件声明 core.bus.event Hook 能订阅 Harness lifecycle 事件', async () => {
       const bus = new InMemoryBus()
       const received: string[] = []
       // 在 bus 侧额外订阅，用于接收插件卸载后发出的 stopped 事件
@@ -448,7 +448,7 @@ describe('@harness/core', () => {
         id: 'spy', version: '1', name: 'Spy',
         async install() {
           return {
-            async 'bus.event'(rec: any) { received.push(rec.name) },
+            async 'core.bus.event'(rec: any) { received.push(rec.name) },
           } as Hooks
         },
       }
@@ -724,7 +724,7 @@ describe('@harness/core', () => {
         name: 'acp-like',
         async install(ctx) {
           return {
-            'session.compacting': async (_input, output) => {
+            'core.session.compacting': async (_input, output) => {
               output.windowHandled = true
               output.blocksPatch = [
                 { id: 'b_acp_1', summary: 'ACP折叠摘要', startId: 'u_0', endId: 'a_3', source: 'acp', archiveRef: 'acp:1' },
@@ -761,14 +761,14 @@ describe('@harness/core', () => {
       await h.stop()
     })
 
-    it('session.preModel 回传 blocksPatch：每轮内部折叠的 acp 块合并进 session.blocks（幂等去重）', async () => {
+    it('core.session.preModel 回传 blocksPatch：每轮内部折叠的 acp 块合并进 session.blocks（幂等去重）', async () => {
       const acpLike: AgentPlugin = {
         id: 'acp-premodel',
         version: '1',
         name: 'acp-premodel',
         async install(ctx) {
           return {
-            'session.preModel': async (input, _msgs) => {
+            'core.session.preModel': async (input, _msgs) => {
               // 每轮内部折叠产出一个 source:'acp' 块（模拟 runPreModel 折叠）
               input.blocksPatch?.push({
                 id: 'acp_b_c1',

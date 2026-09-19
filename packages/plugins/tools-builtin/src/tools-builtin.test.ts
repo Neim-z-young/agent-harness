@@ -521,7 +521,7 @@ describe('@harness/tools-builtin', () => {
   // ===== 插件集成 =====
 
   describe('toolsBuiltinPlugin 集成', () => {
-    it('通过 tool.pool.assemble 注入三个工具', async () => {
+    it('通过 core.tool.pool.assemble 注入三个工具', async () => {
       const h = await createHarness({
         cwd: TMP_DIR,
         internalPlugins: [toolsBuiltinPlugin],

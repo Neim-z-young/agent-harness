@@ -1,7 +1,7 @@
 /**
  * @harness/mcp-server-registry 测试
  * - 注册表的 register/unregister/has/list/clear
- * - createMcpServerRegistryPlugin：harness.start 连接 → tool.pool.assemble 暴露工具 → /mcp 命令
+ * - createMcpServerRegistryPlugin：core.harness.start 连接 → core.tool.pool.assemble 暴露工具 → /mcp 命令
  */
 import { describe, expect, test, beforeEach } from 'bun:test'
 import {
@@ -104,7 +104,7 @@ describe('McpServerRegistry', () => {
 })
 
 describe('createMcpServerRegistryPlugin', () => {
-  test('harness.start 连接服务器并用 tool.pool.assemble 暴露工具', async () => {
+  test('core.harness.start 连接服务器并用 core.tool.pool.assemble 暴露工具', async () => {
     const reg = createMcpServerRegistry()
     const { transport, calls } = createFakeTransport([
       { name: 'list_apps', description: 'list apps' },
@@ -115,9 +115,9 @@ describe('createMcpServerRegistryPlugin', () => {
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
 
-    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+    await hooks!['core.harness.start']!({ harness: {} } as any, { started: true })
     const pool = fakePool()
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().length).toBe(2)
     const ids = pool.list().map((t: any) => t.id).sort()
     expect(ids).toEqual(['mcp__fake__click', 'mcp__fake__list_apps'])
@@ -139,9 +139,9 @@ describe('createMcpServerRegistryPlugin', () => {
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
-    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
-    // 懒加载：经过一次 tool.pool.assemble 后才真正连接 server（启动不预连）
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, fakePool())
+    await hooks!['core.harness.start']!({ harness: {} } as any, { started: true })
+    // 懒加载：经过一次 core.tool.pool.assemble 后才真正连接 server（启动不预连）
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, fakePool())
 
     // 无服务器注册时可不出现在命令列表
     const cmdInput1: any = { commands: [] }
@@ -175,10 +175,10 @@ describe('createMcpServerRegistryPlugin', () => {
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
-    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+    await hooks!['core.harness.start']!({ harness: {} } as any, { started: true })
 
     const pool = fakePool()
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     const ids = pool.list().map((t: any) => t.id)
     expect(ids).toContain('mcp__ok__t')
     expect(ids).not.toContain('mcp__bad__')
@@ -192,11 +192,11 @@ describe('createMcpServerRegistryPlugin', () => {
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
-    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+    await hooks!['core.harness.start']!({ harness: {} } as any, { started: true })
 
     // 复用同一个 pool：验证禁用时工具被真正移除、启用时恢复（而非只是不再 add）
     const pool = fakePool()
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
 
     // 代码注册 server 禁用（嵌套写法 servers disable）：会话内断开连接，工具从池中移除
@@ -208,7 +208,7 @@ describe('createMcpServerRegistryPlugin', () => {
     expect(out.join('')).toContain('已禁用')
     expect(reg.has('code-intel')).toBe(true) // 注册项仍在，仅本次进程禁用
 
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list()).toHaveLength(0) // 已在池中的工具也被移除
 
     // 重新启用（嵌套写法 servers enable）：重新连接，工具恢复
@@ -219,7 +219,7 @@ describe('createMcpServerRegistryPlugin', () => {
     } as any)
     expect(out2.join('')).toContain('重新连接')
 
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__list_apps')
     await plugin.uninstall?.()
   })
@@ -232,22 +232,22 @@ describe('createMcpServerRegistryPlugin', () => {
 
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await plugin.install({ log: mockLog, bus } as unknown as PluginContext)
-    await hooks!['harness.start']!({ harness: {} } as any, { started: true })
+    await hooks!['core.harness.start']!({ harness: {} } as any, { started: true })
 
     const pool = fakePool()
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__code_symbols')
 
     // 插件卸载 → server 断开 + 工具从工具池收敛
     await bus.publish(LifecycleEvents.pluginUnloaded, { id: 'code-intel' })
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list()).toHaveLength(0)
 
     // 插件重载 → 重新注册并重连，工具恢复
     reg.register({ name: 'code-intel', createTransport: () => transport, source: 'code-intel' })
     await bus.publish(LifecycleEvents.pluginLoaded, { id: 'code-intel' })
     await new Promise((r) => setTimeout(r, 10)) // 等待异步重连完成
-    await hooks!['tool.pool.assemble']!({ agentId: 'a' }, pool)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__code_symbols')
     await plugin.uninstall?.()
   })
@@ -259,21 +259,25 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     mcpServers: [], setMcpServers: () => undefined,
     ...over,
   })
-  /** mcp.configure 是自定义 Hook，Hooks 类型未声明，转 any 便于测试直接调用 */
+  /**
+   * 安装插件并取回 Hooks。
+   *
+   * `cli.mcp.configure` 已声明进 `Hooks`（此前是"契约外自定义 hook"，只能用 any 调用），
+   * 这里仍转 any 仅为免去 `!` 非空断言的噪音 —— 调用形态与生产一致（单个 input 参数）。
+   */
   const installAny = async (plugin: ReturnType<typeof createMcpServerRegistryPlugin>) =>
     (await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)) as any
 
-  test('mcp.configure 注入配置态：/mcp servers 展示启停状态', async () => {
+  test('cli.mcp.configure 注入配置态：/mcp servers 展示启停状态', async () => {
     const reg = createMcpServerRegistry()
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await installAny(plugin)
 
-    await hooks['mcp.configure'](
+    await hooks['cli.mcp.configure'](
       { mcpServers: [
         { name: 'alpha', transport: 'http', url: 'http://x/a', enabled: true },
         { name: 'beta', transport: 'http', url: 'http://x/b', enabled: false },
       ] },
-      {},
     )
     const out: string[] = []
     await hooks!['cli.command']!(mkInput({ arg: '', out: (s: string) => out.push(s) }))
@@ -288,8 +292,8 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     const reg = createMcpServerRegistry()
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await installAny(plugin)
-    await hooks['mcp.configure'](
-      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
+    await hooks['cli.mcp.configure'](
+      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] },
     )
 
     const out: string[] = []
@@ -307,8 +311,8 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const bus = makeBus()
     const hooks = (await plugin.install({ log: mockLog, bus } as unknown as PluginContext)) as any
-    await hooks['mcp.configure'](
-      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
+    await hooks['cli.mcp.configure'](
+      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] },
     )
 
     const saved: any[][] = []
@@ -339,8 +343,8 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     const reg = createMcpServerRegistry()
     const plugin = createMcpServerRegistryPlugin({ registry: reg })
     const hooks = await installAny(plugin)
-    await hooks['mcp.configure'](
-      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] }, {},
+    await hooks['cli.mcp.configure'](
+      { mcpServers: [{ name: 'alpha', transport: 'http', url: 'http://x/a' }] },
     )
 
     const saved: any[] = []

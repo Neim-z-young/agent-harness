@@ -309,7 +309,7 @@ describe('@harness/plugin', () => {
       let got: unknown
       const P = makePlugin('cfg', {
         hooks: {
-          async 'harness.init'(_i, _o) {},
+          async 'core.harness.init'(_i, _o) {},
         },
       })
       const pm = createPluginManager({
@@ -357,12 +357,12 @@ describe('@harness/plugin', () => {
   })
 
   describe('Hook trigger 管道', () => {
-    it('trigger("harness.init") 顺序调用所有注册的 hook，mutate input/output', async () => {
+    it('trigger("core.harness.init") 顺序调用所有注册的 hook，mutate input/output', async () => {
       const pm = createPluginManager({ bus })
       const traces: string[] = []
       const P1 = makePlugin('p1', {
         hooks: {
-          async 'harness.init'(input, output) {
+          async 'core.harness.init'(input, output) {
             traces.push('p1:' + (input.harnessOptions as any).id)
             output.harness = 'from-p1'
           },
@@ -371,7 +371,7 @@ describe('@harness/plugin', () => {
       const P2 = makePlugin('p2', {
         dependsOn: ['p1'],
         hooks: {
-          async 'harness.init'(input, output) {
+          async 'core.harness.init'(input, output) {
             traces.push('p2')
             expect(output.harness).toBe('from-p1')
           },
@@ -380,14 +380,14 @@ describe('@harness/plugin', () => {
       await pm.loadInternal([P2, P1]) // 故意乱序，依赖排序让 p1 先
       const input: any = { harnessOptions: { id: 'test' } }
       const output: any = { harness: undefined }
-      await pm.trigger('harness.init', input, output)
+      await pm.trigger('core.harness.init', input, output)
       expect(traces).toEqual(['p1:test', 'p2'])
       expect(output.harness).toBe('from-p1')
     })
 
     it('未注册 hook 的 trigger 不报错', async () => {
       const pm = createPluginManager({ bus })
-      await pm.trigger('harness.start', { harness: {} as any }, { started: false })
+      await pm.trigger('core.harness.start', { harness: {} as any }, { started: false })
       // 通过
     })
 
@@ -395,37 +395,37 @@ describe('@harness/plugin', () => {
       const pm = createPluginManager({ bus })
       const Bad = makePlugin('bad', {
         hooks: {
-          async 'llm.params'() {
+          async 'core.llm.params'() {
             throw new Error('bad-hook')
           },
         },
       })
       const Good = makePlugin('good', {
         hooks: {
-          async 'llm.params'(i, params) {
+          async 'core.llm.params'(i, params) {
             params.touched = true
           },
         },
       })
       await pm.loadInternal([Bad, Good])
       const params: any = {}
-      const err = await pm.trigger('llm.params', { providerId: 'x', messages: [] }, params)
+      const err = await pm.trigger('core.llm.params', { providerId: 'x', messages: [] }, params)
         .then(() => null, (e) => e)
       expect(err).toBeInstanceOf(PluginHookError)
       expect((err as PluginHookError).pluginId).toBe('bad')
-      expect((err as PluginHookError).hookName).toBe('llm.params')
+      expect((err as PluginHookError).hookName).toBe('core.llm.params')
     })
 
     it('多个 hook 都失败 → AggregateError', async () => {
       const pm = createPluginManager({ bus })
       const A = makePlugin('A', {
-        hooks: { async 'session.compacting'() { throw new Error('A-err') } },
+        hooks: { async 'core.session.compacting'() { throw new Error('A-err') } },
       })
       const B = makePlugin('B', {
-        hooks: { async 'session.compacting'() { throw new Error('B-err') } },
+        hooks: { async 'core.session.compacting'() { throw new Error('B-err') } },
       })
       await pm.loadInternal([A, B])
-      const err = await pm.trigger('session.compacting', { agentId: '', sessionId: '' }, {}).then(() => null, (e) => e)
+      const err = await pm.trigger('core.session.compacting', { agentId: '', sessionId: '' }, {}).then(() => null, (e) => e)
       expect(err).toBeInstanceOf(AggregateError)
       expect((err as AggregateError).errors.map((e: any) => e.message).join(',')).toContain('A-err')
       expect((err as AggregateError).errors.map((e: any) => e.message).join(',')).toContain('B-err')
@@ -436,7 +436,7 @@ describe('@harness/plugin', () => {
       let called = 0
       const P = makePlugin('P', {
         hooks: {
-          async 'permission.check'(req, dec) {
+          async 'core.permission.check'(req, dec) {
             called++
             req.from = 'touched'
           },
@@ -444,22 +444,22 @@ describe('@harness/plugin', () => {
       })
       await pm.loadInternal([P])
       const req: any = { toolKey: 'w', patterns: [], input: null }
-      await pm.trigger('permission.check', req, { behavior: 'allow' })
+      await pm.trigger('core.permission.check', req, { behavior: 'allow' })
       expect(called).toBe(1)
 
       await pm.unload('P')
-      await pm.trigger('permission.check', req, { behavior: 'allow' })
+      await pm.trigger('core.permission.check', req, { behavior: 'allow' })
       expect(called).toBe(1) // 不再调用
     })
   })
 
-  describe('bus.event Hook 桥接', () => {
-    it('插件声明 bus.event Hook → 自动订阅所有 Bus 事件', async () => {
+  describe('core.bus.event Hook 桥接', () => {
+    it('插件声明 core.bus.event Hook → 自动订阅所有 Bus 事件', async () => {
       const pm = createPluginManager({ bus })
       const events: { name: string; payload: any }[] = []
       const P = makePlugin('logger', {
         hooks: {
-          async 'bus.event'(rec) {
+          async 'core.bus.event'(rec) {
             events.push({ name: rec.name, payload: rec.payload })
           },
         },
@@ -476,7 +476,7 @@ describe('@harness/plugin', () => {
       expect(events[1]!.payload).toBe(7)
     })
 
-    it('bus.event Hook 抛错时不中断 Bus 发布（日志记录）', async () => {
+    it('core.bus.event Hook 抛错时不中断 Bus 发布（日志记录）', async () => {
       const logs: { msg: string; meta?: unknown }[] = []
       const logger = {
         info() {},
@@ -489,7 +489,7 @@ describe('@harness/plugin', () => {
       const pm = createPluginManager({ bus, logger })
       const Bad = makePlugin('bad-logger', {
         hooks: {
-          async 'bus.event'() {
+          async 'core.bus.event'() {
             throw new Error('bus-handler-crash')
           },
         },
@@ -499,16 +499,16 @@ describe('@harness/plugin', () => {
       const E = BusEvent.define<{ ok: boolean }>('e.test')
       // 发布不应抛错（因为 bus subscribeAll 内已经 try/catch）
       await bus.publish(E, { ok: true })
-      // 错误被 logger.error 记录（日志里包含 "bus.event handler failed"）
-      const err = logs.find((l) => l.msg.includes('bus.event handler failed'))
+      // 错误被 logger.error 记录（日志里包含 "core.bus.event handler failed"）
+      const err = logs.find((l) => l.msg.includes('core.bus.event handler failed'))
       expect(err).toBeDefined()
     })
 
-    it('卸载插件后 bus.event 不再被调用', async () => {
+    it('卸载插件后 core.bus.event 不再被调用', async () => {
       let n = 0
       const pm = createPluginManager({ bus })
       const P = makePlugin('c', {
-        hooks: { async 'bus.event'() { n++ } },
+        hooks: { async 'core.bus.event'() { n++ } },
       })
       await pm.loadInternal([P])
       const E = BusEvent.define<{ v: number }>('e.v')
@@ -527,23 +527,23 @@ describe('@harness/plugin', () => {
     it('register / unregister / listFor / has 工作', () => {
       const reg = new HooksRegistry()
       const hooksP: Hooks = {
-        async 'harness.init'() {},
-        async 'harness.start'() {},
+        async 'core.harness.init'() {},
+        async 'core.harness.start'() {},
       }
       const hooksQ: Hooks = {
-        async 'harness.init'() {},
+        async 'core.harness.init'() {},
       }
       reg.register('p', hooksP)
       reg.register('q', hooksQ)
 
-      expect(reg.has('harness.init')).toBe(true)
-      expect(reg.has('session.compacting')).toBe(false)
-      expect(reg.listFor('harness.init').map((r: any) => r.pluginId)).toEqual(['p', 'q'])
-      expect(reg.listFor('harness.start').map((r: any) => r.pluginId)).toEqual(['p'])
+      expect(reg.has('core.harness.init')).toBe(true)
+      expect(reg.has('core.session.compacting')).toBe(false)
+      expect(reg.listFor('core.harness.init').map((r: any) => r.pluginId)).toEqual(['p', 'q'])
+      expect(reg.listFor('core.harness.start').map((r: any) => r.pluginId)).toEqual(['p'])
 
       reg.unregister('p')
-      expect(reg.has('harness.start')).toBe(false)
-      expect(reg.listFor('harness.init').map((r: any) => r.pluginId)).toEqual(['q'])
+      expect(reg.has('core.harness.start')).toBe(false)
+      expect(reg.listFor('core.harness.init').map((r: any) => r.pluginId)).toEqual(['q'])
     })
   })
 

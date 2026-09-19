@@ -4,7 +4,7 @@
  * 基于 [acp-kernel](https://github.com/ranxianglei/acp-kernel) 的模型驱动 3 层 LSM
  * 上下文压缩引擎，直接引用它的功能包做宿主适配：
  *
- * - **每轮接入**：通过 core 新增的 `session.preModel` hook，在每轮进入模型前
+ * - **每轮接入**：通过 core 新增的 `core.session.preModel` hook，在每轮进入模型前
  *   `processTurn` 指派 refs、执行分层压缩过滤、产出 nudge 决策，并把精简后的
  *   会话历史回写持久层（`save`）。
  * - **模型驱动工具**：注入 `compress` / `decompress` / `search_context` / `acp_status`
@@ -256,7 +256,7 @@ export function resolveAcpConfig(
 
 /**
  * 创建 ACP 上下文压缩插件。
- * 每轮通过 session.preModel 运行 acp-kernel 的 processTurn，并注入 4 个模型驱动工具。
+ * 每轮通过 core.session.preModel 运行 acp-kernel 的 processTurn，并注入 4 个模型驱动工具。
  */
 export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): AgentPlugin {
   const modelContextLimit = options.modelContextLimit ?? 200_000
@@ -519,11 +519,11 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
       })
 
       return {
-        async 'tool.pool.assemble'(_input, pool) {
+        async 'core.tool.pool.assemble'(_input, pool) {
           for (const t of tools) (pool as { add: (t: unknown) => void }).add(t)
         },
 
-        async 'session.preModel'(input, rawMessages) {
+        async 'core.session.preModel'(input, rawMessages) {
           const messages = rawMessages as Message[]
           try {
             await runPreModel({
@@ -549,7 +549,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           }
         },
 
-        async 'session.compacting'(input, compactCtx) {
+        async 'core.session.compacting'(input, compactCtx) {
           try {
             await runCompacting({
               sessionId: input.sessionId,
@@ -564,7 +564,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             })
           } catch (err) {
             // 折叠失败不阻断 core 的默认 session 压缩
-            plgCtx.log.warn?.('ACP session.compacting 处理失败，走默认压缩', { err: String(err) })
+            plgCtx.log.warn?.('ACP core.session.compacting 处理失败，走默认压缩', { err: String(err) })
           }
         },
       } as Hooks
@@ -786,7 +786,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
   // ---- 同步内部折叠块到 session.blocks（统一块模型） ----
   // ACP 每轮内部折叠（tier1/2/3）的块经 recordBlocks 回传给 host 合并进 session.blocks，
-  // 使全历史重建/revert 也覆盖 ACP 内部折叠（不再只覆盖 session.compacting 折叠窗口）。
+  // 使全历史重建/revert 也覆盖 ACP 内部折叠（不再只覆盖 core.session.compacting 折叠窗口）。
   // 幂等：以 recordedBlockIds 记录已回传的块，避免每轮重复写；跨重启后该集合为空，
   // 首轮会把既有块重新回传（session.blocks 按 id 去重覆盖，安全幂等）。
   if (deps.recordBlocks) {
@@ -881,7 +881,7 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 export const acpContextPlugin: AgentPlugin = createAcpContextPlugin()
 
 /**
- * session.compacting hook 的处理核心（可单测纯函数）。
+ * core.session.compacting hook 的处理核心（可单测纯函数）。
  *
  * 目标：在 core 物理删除历史窗口前，让 ACP 先把这个窗口折叠进自己的压缩块，
  * 从而即使原文被 session 压缩从会话历史删掉，ACP 的块/摘要仍保留该段的梗概，
