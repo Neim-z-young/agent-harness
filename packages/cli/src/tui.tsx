@@ -21,6 +21,14 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  formatAgentPhase,
+  initialAgentStatus,
+  isAgentBusy,
+  reduceAgentStatus,
+  type AgentIdentity,
+  type AgentStatus,
+} from './agent-status'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { readdirSync, statSync } from 'node:fs'
@@ -1036,6 +1044,19 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
    * 中断句柄：`createProcessLine` 在执行查询期间写入当前 `AbortController`，结束后清空。
    * Ctrl-C 据此区分「执行中 ⇒ 中断本次查询」与「空闲 ⇒ 退出」。
    */
+  // ---- Agent 状态显示 ----
+  // 静态身份（id/name/mode）来自 AgentDefinition；运行态（phase/step/tool）由事件流归约。
+  const agentIdentity = useMemo<AgentIdentity>(() => {
+    const id = options.session.agentId ?? 'default'
+    const def = options.harness.agent?.get?.(id)
+    return {
+      agentId: id,
+      ...(def?.name ? { agentName: def.name } : {}),
+      ...(def?.mode ? { mode: def.mode } : {}),
+    }
+  }, [options.session.agentId, options.harness])
+  const [agentStatus, setAgentStatus] = useState<AgentStatus>(() => initialAgentStatus(agentIdentity))
+
   const abortCtlRef = useRef<{ current: AbortController | null }>({ current: null })
   const exitRef = useRef(false)
   const pendingEvsRef = useRef<AgentStreamEvent[]>([])
@@ -1099,6 +1120,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           // 整轮结束（所有 step 跑完）—— 这里才是真正该收 busy 的时机
           setBusy(false)
         }
+        // 状态归约（纯函数）：供状态栏显示「第几步 / 在跑哪个工具 / 是否被中断」
+        setAgentStatus((prev) => reduceAgentStatus(prev, ev))
         // 渲染状态：缓冲批量提交
         pendingEvsRef.current.push(ev)
         if (flushScheduledRef.current) return
@@ -1559,9 +1582,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const provider = options.provider ?? 'auto'
   const hint = options.openFile && fileRefs.length > 0 ? ' ·[Tab]引用' : ''
   // 状态栏行需在 ≤80 列内（测试 renderer 固定 80 宽）；session 已在侧栏展示，故不在此重复。
+  //
+  // 宽度预算靠「忙时让位」解决：**忙时隐藏快捷键提示**（此时也用不上），把这几列让给
+  // 状态文本；闲时再显示快捷键。于是任何时候总长都不超过原来的最长形态。
+  const busyNow = isAgentBusy(agentStatus) || busy
+  const statusLabel = busyNow
+    ? formatAgentPhase(agentStatus) + (agentStatus.step ? `·${agentStatus.step}步` : '')
+    : ''
+  const tail = busyNow ? statusLabel : `[^B]面板·[^/]帮助·[^Y]复制·[^C]退出${hint}`
   const statusText =
-    `${busy ? '●' : '○'} ${provider} | agent=${options.session.agentId ?? 'default'}` +
-    ` | model=${model ?? '-'} | [^B]面板·[^/]帮助·[^Y]复制·[^C]退出${hint}`
+    `${busyNow ? '●' : '○'} ${provider} | agent=${agentStatus.agentId ?? 'default'}` +
+    ` | model=${model ?? '-'}` +
+    (tail ? ` | ${tail}` : '')
   // 后台任务分组（模块 A）：进行中置顶、已结束收尾，各自限量
   const { running: bgRunning, finished: bgFinished } = splitBgTasks(bgTasks)
   // 模块 D：统计面板 —— 由对话块 + 后台任务实时归并（elapsed 用挂载起点）

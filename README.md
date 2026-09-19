@@ -195,6 +195,19 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 - **流式事件**：`done` 是「**一步**结束」（带 `step`，多步时会出现多次），
   `turn_end` 才是「**整轮**结束」（只出现一次）。UI 收尾应挂在 `turn_end` 上。
 
+#### Agent 状态显示
+
+多步执行后「现在跑到哪一步、在跑哪个工具」成了最想知道的信息，故把事件流归约成状态并显示：
+
+| 位置 | 形态 |
+|---|---|
+| TUI 状态栏 | `● openai | agent=coordinator(编排) | model=… | 工具·bash·3步`（忙时显示状态，**并隐藏快捷键提示**让出宽度——状态栏整行需 ≤80 列） |
+| REPL 统计行 | `⏱️ 812ms | agent=default · 第2步 · 结束=stop | model=…`（每轮结束打印） |
+
+状态取值：`空闲` / `推理`（reasoning）/ `输出`（text）/ `工具·<名>` / `已中断`。
+推导逻辑在 `packages/cli/src/agent-status.ts`（纯函数，可单测），UI 只负责渲染；
+中断态不会被 `turn_end` 冲掉，异常路径也能收到 `turn_end` 从而回到空闲（不会一直显示忙）。
+
 改动过程与阶段记录见 [Agentic Loop 改造计划](docs/agentic-loop-plan.md)（S0~S4 已完成）。
 
 ### compaction 对象（会话压缩，与 ACP 是两套机制）

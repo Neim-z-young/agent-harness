@@ -82,6 +82,7 @@ import {
   todayUsageLine,
   type UsageStats,
 } from './usage-stats'
+import { formatAgentStatus, initialAgentStatus, reduceAgentStatus } from './agent-status'
 import type { CompactOptions } from '@harness/session'
 import { collectTodayUsage } from './usage-today'
 import { reconstructHistory, buildResolveBlock, getSessionModelOverride, sessionModelMetaPatch, type Message, type Session, type SessionModelOverride, type HistoryLoadRange, type SessionOriginalStore, type CompactionBlock } from '@harness/session'
@@ -3501,6 +3502,15 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     }
     const started = Date.now()
     let assistant: Message | undefined
+    // Agent 状态：由事件流归约（纯函数），供末尾统计行显示「第几步 / 在跑哪个工具 / 是否被中断」。
+    // 声明在 try 之外 —— 统计行在 try/catch 之后，异常路径也要能显示已归约到的状态。
+    const statusAgentId = current.agentId ?? 'default'
+    const statusDef = harness.agent?.get?.(statusAgentId)
+    let agentStatus = initialAgentStatus({
+      agentId: statusAgentId,
+      ...(statusDef?.name ? { agentName: statusDef.name } : {}),
+      ...(statusDef?.mode ? { mode: statusDef.mode } : {}),
+    })
     // 中断句柄：执行期间暴露给上层（REPL 的 SIGINT / TUI 的 Ctrl-C），
     // 让「执行中按键 = 中断当前查询」而不是直接退出进程。
     const ctl = new AbortController()
@@ -3516,6 +3526,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       // 打一行分隔让人看得出它自己在往下走，而不是长时间无反馈。
       let lastDoneStep: number | null = null
       for await (const ev of gen) {
+        agentStatus = reduceAgentStatus(agentStatus, ev)
         // turn_end 是「整轮结束」标记，不是「下一步开始了」⇒ 不能触发续轮分隔
         if (ev.type !== 'done' && ev.type !== 'turn_end' && lastDoneStep != null) {
           if (!onEvent) out(`\n🔄  第 ${lastDoneStep + 1} 步（自主续轮）\n`)
@@ -3589,7 +3600,12 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     // 用「本会话实际会用的模型」而非 Agent 绑定值：会话级覆盖（/model）后若还读 Agent 定义，
     // 统计行会一直显示旧模型，看起来像切换没生效
     const modelLabel = app.resolveSessionModel(current)
-    out(`⏱️  ${duration}ms | agent=${assistant?.agentId ?? current.agentId ?? '?'}` +
+    // agent 部分用状态机输出（含步数 / 工具 / 中断），比单纯的 agent=<id> 信息量大得多
+    const agentLabel = formatAgentStatus({
+      ...agentStatus,
+      ...(assistant?.agentId ? { agentId: assistant.agentId } : {}),
+    })
+    out(`⏱️  ${duration}ms | ${agentLabel}` +
       (modelLabel ? ` | model=${modelLabel}` : '') + '\n\n')
     return 'continue'
   }

@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-09-19（续 149）Agent 状态显示：把事件流归约成「现在在干什么」
+
+自主多步上线后，用户最想知道的变成「跑到第几步、在跑哪个工具、是否被中断」——此前 UI 只有
+"忙/不忙"两种状态（`●/○`）。新增 `packages/cli/src/agent-status.ts`：
+
+- **纯函数状态机**：`reduceAgentStatus(prev, ev)` 把 AgentStreamEvent 归约成
+  `{agentId/name/mode, phase, step, toolId, finish}`。抽成纯函数是为了能在无 UI 环境下完整单测，
+  UI（TUI 状态栏 / REPL 统计行）只负责渲染。
+- **phase 回落规则值得记**：工具执行完（`tool_call_result`）回到 `thinking` 而不是 `idle` ——
+  此时模型仍在同一 Turn 内；只有 `turn_end` 才代表整轮结束。工具**失败**则留在 `tool` 态，
+  便于显示"卡在哪个工具上"。
+- **中断态不被冲掉**：`done.aborted` / `turn_end.aborted` 记为 `aborted`，后续 `turn_end`
+  不会把它改成 `idle`（否则"已中断"会一闪而过）。中断后 `isAgentBusy=false`，UI 收起 spinner。
+- **TUI 状态栏宽度约束**：整行需 ≤80 列（测试 renderer 固定 80 宽），靠**忙时让位**解决 ——
+  忙时隐藏快捷键提示（此时也用不上），把这几列让给状态文本；闲时恢复。总长不超过原最长形态。
+- **REPL 统计行**：`⏱️ xxms | agent=default · 第2步 · 结束=stop | model=…`。
+
+验证：新增 9 例（8 条状态机纯单测 + 1 条端到端：真实 processLine 跑多步工具链，断言统计行含
+"第2步/结束=stop"）；cli 347 全绿（TUI 状态栏改动无回归）；全仓 typecheck 0 错误。
+
 ## 2026-09-18（续 148）TUI 鼠标点击消息区后键盘失效修复
 
 用户报告：鼠标点到消息框（消息区）后再敲键盘没反应，必须重新点击输入框。
