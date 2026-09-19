@@ -1785,6 +1785,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 各步的聚合签名（同样只留 threshold-1 个）：供「整步重复」检测 —— 每步多个调用时，
     // 单看调用签名的判据恒不命中（见 StepOutcome.stepSig 的说明），必须按步再判一次。
     let stepSigs: string[] = []
+    // 末步结果：turn_end 的插件广播要用（finish 在循环外本来拿不到）
+    let lastOutcome: StepOutcome | undefined
 
     try {
       while (true) {
@@ -1801,6 +1803,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
           !!input.preferComplete,
           stepSigs,
         )
+        lastOutcome = outcome
         if (outcome.toolSigs.length > 0) {
           recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
           stepSigs = [...stepSigs, outcome.stepSig].slice(-(DOOM_LOOP_THRESHOLD - 1))
@@ -1831,6 +1834,35 @@ export class AgentRuntimeImpl implements AgentRuntime {
       // 放在 finally 而非循环之后：中间任一步抛错（网络断连、preModel 插件异常、addMessage 失败…）
       // 时也要送达，否则以 turn_end 收状态的消费者（TUI 的 busy、swarm tick）会永久卡在"运行中"。
       // 异常本身不再被吞：finally 执行完仍会继续向上传播。
+      //
+      // 顺带**广播给插件**（`agent.stream`）：终态由 core 发出，而不是由哪个宿主代劳 ——
+      // 原先只有 CLI 侧广播（createProcessLine / harness run），于是「以库内嵌 / ACP 宿主自己
+      // 消费事件流」时插件永远收不到整轮结束，靠它驱动的兜底逻辑（如记忆攒批放行）会静默失效。
+      // 终态是引擎的事实 ⇒ 归 core 收口；CLI 侧已相应不再广播 turn_end（否则同一条会被计两次）。
+      //
+      // 子 Agent 不发：它的「轮」不是用户的轮（与注入侧 `agentMode==='subagent'` 的隔离同源），
+      // 且子 Agent 另开 session ⇒ 会污染按会话计数的消费方。其余模式照发（含 mode 字段，
+      // 消费方可自行筛 teammate/coordinator）。
+      const def = this.agents.get(prepared.agentId)
+      if (def?.mode !== 'subagent') {
+        const aborted = !!signal?.aborted
+        // 与 CLI 侧同策略：插件链失败不该打断收尾（trigger 内部已聚合错误，这里只兜住 Promise）
+        void this.deps
+          .triggerPlugin('agent.stream', {
+            eventType: 'turn_end',
+            status: {
+              agentId: prepared.agentId,
+              ...(def?.name ? { agentName: def.name } : {}),
+              ...(def?.mode ? { mode: def.mode } : {}),
+              phase: aborted ? 'aborted' : 'idle',
+              ...(step > 0 ? { step } : {}),
+              ...(lastOutcome?.finish ? { finish: lastOutcome.finish } : {}),
+              ...(aborted ? { aborted: true } : {}),
+            },
+            sessionId,
+          })
+          .catch(() => undefined)
+      }
       yield { type: 'turn_end', ...(signal?.aborted ? { aborted: true } : {}) }
     }
   }

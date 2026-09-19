@@ -126,13 +126,18 @@ export function renderMemorySection(layers: MemoryLayer[]): string {
     '<memory>',
     '以下是跨会话保留的记忆与项目指令，供你参考。它们不是本轮任务的逐字要求：',
     '只在相关时遵循，不要向用户复述或引用本节本身。',
+    // 快照语义要说清楚：分级注入（§3.7）下刚写进去的内容不一定已经出现在本节里，
+    // 否则模型会以为"我写了却没生效"（文件其实早已写入）。给出自证手段即可，不必解释机制。
+    '本节是**快照**（上面各节标题里就是文件路径）：若你刚写入过记忆、或怀疑内容已过期，',
+    '直接用 read 工具读那些文件 —— 文件永远是最新的，本节只是它的一个副本。',
   ]
   for (const l of present) {
     blocks.push('', `## ${l.label}（${l.read.path}）`)
     if (l.read.truncated) {
       const why = l.read.truncatedBy === 'bytes' ? '字节上限' : '行数上限'
       blocks.push(
-        `（注意：内容因${why}被截断，完整内容请用 read 工具读取该文件；` +
+        `（注意：内容因${why}被截断，超出部分**不会被加载** —— 继续追加只会排在读不到的区间里。` +
+          `请先用 read 读取该文件全文，把冗长条目合并或删除后再写；` +
           `当前仅加载了前 ${l.read.text.split('\n').length} 行 / 原 ${l.read.totalLines} 行）`,
       )
     }
@@ -170,10 +175,14 @@ export function resolveMemoryPaths(ws: PluginWorkspaceView): MemoryPaths {
 /**
  * 带缓存的文件读取器。
  *
- * 缓存键是路径，校验用 `mtimeMs + size`：文件没变则复用上次的 `CappedRead`。
+ * 缓存键是路径，校验用 `mtimeNs + size`：文件没变则复用上次的 `CappedRead`。
  * 这保证**同一内容 ⇒ 同一渲染结果 ⇒ 前缀缓存不受影响**（§3.7），也省掉每轮的重复读盘。
  * 文件被外部编辑时会自动失效（下一次 hook 调用即读到新内容）——M1 直接生效；
  * "攒到下次压缩再刷新"的分级策略是 M2 的事。
+ *
+ * ⚠️ 精度必须到纳秒：原先用 `mtimeMs`，而「同毫秒内写入 + 内容字节数相同」会被判成"没变"，
+ * 缓存便返回旧内容 —— 表现为"明明改了却没生效"。模型用 write 工具重写索引、或写入与旧内容
+ * 等长的条目时正是这个组合（本插件自己的测试就先被它咬了一口）。
  */
 export class MemoryReader {
   private cache = new Map<string, { stamp: string; view: CappedRead }>()
@@ -183,8 +192,8 @@ export class MemoryReader {
   read(path: string): CappedRead {
     let stamp = 'missing'
     try {
-      const st = statSync(path)
-      stamp = `${st.mtimeMs}:${st.size}`
+      const st = statSync(path, { bigint: true })
+      stamp = `${st.mtimeNs}:${st.size}`
     } catch {
       stamp = 'missing'
     }
@@ -384,8 +393,12 @@ export class MemoryStore {
 
 export interface PublishOptions {
   /**
-   * 攒批轮数：连续多少**轮**检测到变更后才发布（默认 5）。
+   * 攒批轮数：连续多少**轮**检测到变更后才发布（默认 15）。
    * `0` = 关闭攒批（任何变更立即生效，等价 M2 行为）。
+   *
+   * 为什么是 15：这个数字是「防静默失效的兜底」而非节流目标 —— 正常情况下发布由**压缩**触发
+   * （那种时机下 system 变更免费）。所以它只要"足够大到平时不抢先、又足够小到长时间不压缩时
+   * 也能生效"。按一轮 1~3 次模型调用估，15 轮 ≈ 几十次调用内必定生效。
    */
   flushAfterTurns?: number
 }
@@ -412,7 +425,7 @@ export class MemoryPublisher {
   constructor(private readonly opts: PublishOptions = {}) {}
 
   private get flushAfter(): number {
-    return this.opts.flushAfterTurns ?? 5
+    return this.opts.flushAfterTurns ?? 15
   }
 
   /** 每轮注入时调用；返回**本次应当注入**的文本 */
@@ -470,6 +483,8 @@ export function buildReflectionHint(indexPath: string): string {
     '刚刚发生了上下文压缩（部分历史已被折叠成摘要）。',
     `如果刚才的对话里有值得**长期**保留的纠正、决策或偏好，请用 write 工具把它追加到：${indexPath}`,
     '格式：一行一条，以 `- ` 开头；只写一句结论，细节请另建主题文件并用 `read` 工具按需读取。',
+    // 防重复：system 里那份是快照，可能还没包含你刚写过的条目 ⇒ 先读文件再决定写什么。
+    '写之前先用 read 看一眼该文件，确认这条还没有 —— 避免重复追加（等价条目会被拒，但白跑一趟）。',
     '只在确有值得记的内容时写，不必为了响应本提示而写。',
     '</memory-hint>',
   ].join('\n')
@@ -487,7 +502,8 @@ export interface MemoryPluginOptions {
   disableInjection?: boolean
   /**
    * 攒批轮数（§3.7 分级注入）：`0` = 任何变更立即生效（M2 行为，测试常用），
-   * 缺省 5 轮 —— 期间若发生压缩则立即发布（搭车省缓存）。
+   * 缺省 **15** 轮 —— 一轮 = 一次「用户输入 → Agent 跑完」（不是一次模型调用）；
+   * 期间若发生压缩则立即发布（搭车省缓存）。
    */
   flushAfterTurns?: number
   id?: string
@@ -544,9 +560,14 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
         ...(options.flushAfterTurns != null ? { flushAfterTurns: options.flushAfterTurns } : {}),
       })
       let pendingHint: string | null = null
+      // 主会话 id：turn_end 计数只认它 —— teammate/coordinator 会另开 session，
+      // 那些"轮"不是用户的轮，混进来会让攒批提前放行
+      let primarySessionId: string | null = null
 
       const hooks: Hooks = {
         async 'prompt.system.transform'(input, parts) {
+          // 先记 id 再判分支：disableInjection（对照实验）下也要能计数，否则兜底会静默失效
+          if (input.agentMode !== 'subagent') primarySessionId = input.sessionId
           if (options.disableInjection) return
           // 决策 B6：主会话的记忆不注入子 Agent（对齐 Claude Code 的 subagent 隔离）
           if (input.agentMode === 'subagent') {
@@ -566,6 +587,9 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
          * 压缩信号（flush 双源之一）：ACP 压缩由模型调 `compress` 工具触发，而
          * `tool.post.execute` 的 ctx 里**没有 toolId** ⇒ 只能从事件流识别。
          * `agent.stream` 的 `status.toolId` 恰好带这个信息。
+         *
+         * 注：`turn_end` 这条由 **core** 广播（不依赖宿主是谁）——CLI 侧原先也发，
+         * 现已在 core 收口后停掉，见 core queryStream 的 finally。
          */
         'agent.stream'(signal) {
           if (signal.eventType === 'tool_call_start' && signal.status?.toolId === 'compress') {
@@ -573,8 +597,13 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
             pendingHint = buildReflectionHint(p.user.index)
             return
           }
-          // 兜底：攒够轮数仍未等到压缩 ⇒ 放行（防止"永远不生效"）
-          if (signal.eventType === 'turn_end') publisher.onTurnEnd()
+          // 兜底：攒够轮数仍未等到压缩 ⇒ 放行（防止"永远不生效"）。
+          // 只数**主会话**的轮；sessionId 缺失时按"无法归因"处理（照常计数）——
+          // 宁可不精确，也不要因为字段缺失把兜底变成死代码。
+          if (signal.eventType === 'turn_end') {
+            const sid = signal.sessionId
+            if (!sid || !primarySessionId || sid === primarySessionId) publisher.onTurnEnd()
+          }
         },
 
         /** 压缩信号（flush 双源之二）：session compaction（ACP 关闭时的那套） */
@@ -686,7 +715,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
               `  说明：默认写入 user 级（项目级会随 git 共享，需显式指定）；主题文件请用 read 工具按需读取\n` +
               `  注入时机（§3.7 分级）：命令写入立即生效；外部改动攒到下次压缩（或 ${publisher.state().flushAfterTurns} 轮）才发布` +
               (publisher.state().dirty
-                ? `；当前有未发布变更（已积 ${publisher.state().dirtyTurns} 轮）\n\n`
+                ? `；当前有未发布变更（已积 ${publisher.state().dirtyTurns} 轮）\n` +
+                  `  （轮 = 一次「用户输入 → Agent 跑完」；一轮内多步只算一轮）\n\n`
                 : '；当前无未发布变更\n\n'),
           )
         },

@@ -563,3 +563,95 @@ describe('插件级：flush 三源与一次性提示', () => {
     expect(await inject(hooks)).toContain('第二条')
   })
 })
+
+// ===== M3 补充：默认轮数 / 快照语义 / 主会话过滤 =====
+
+describe('默认攒批轮数与快照语义', () => {
+  it('flushAfterTurns 默认 15（单位是「轮」= 一次用户输入跑完，不是一次模型调用）', () => {
+    expect(new MemoryPublisher().state().flushAfterTurns).toBe(15)
+  })
+
+  it('注入段声明"这是快照"，并指向文件供 read 自证（治"我写了却没生效"的误判）', () => {
+    const f = join(dir, 'MEMORY.md')
+    writeFileSync(f, '- 一条事实\n')
+    const section = renderMemorySection([{ label: '用户长期记忆', read: readCapped(f) }])
+    expect(section).toContain('快照')
+    expect(section).toContain('read')
+    expect(section).toContain(f)
+  })
+
+  it('截断时要求先合并/删除，而不只是"去读全文"（治"只追加不清理"）', () => {
+    const f = join(dir, 'MEMORY.md')
+    writeFileSync(f, Array.from({ length: 10 }, (_, i) => `- L${i}`).join('\n'))
+    const section = renderMemorySection([{ label: '用户长期记忆', read: readCapped(f, { maxLines: 3 }) }])
+    expect(section).toContain('不会被加载')
+    expect(section).toContain('合并或删除')
+    expect(section).toContain('原 10 行')
+  })
+
+  it('沉淀提示要求先 read 防重复（system 里那份是快照，可能还没包含刚写的内容）', () => {
+    const h = buildReflectionHint('/x/MEMORY.md')
+    expect(h).toContain('先用 read 看一眼该文件')
+    expect(h).toContain('避免重复追加')
+  })
+})
+
+describe('turn_end 计数只认主会话', () => {
+  const sys = { agentId: 'default', sessionId: 's' }
+  async function installAt(over: Record<string, unknown> = {}) {
+    return await install({ flushAfterTurns: 2, ...over })
+  }
+  const inject = async (hooks: Hooks) => {
+    const parts: string[] = []
+    await hooks['prompt.system.transform']!(sys, parts)
+    return parts.join('\n')
+  }
+  const endTurn = (hooks: Hooks, sessionId?: string) => {
+    hooks['agent.stream']!({
+      eventType: 'turn_end',
+      ...(sessionId ? { sessionId } : {}),
+      status: { agentId: 'default', phase: 'idle' },
+    })
+  }
+
+  it('别的会话（teammate / 子 Agent）的轮不计入，主会话的轮才计入', async () => {
+    const w = ws()
+    const { hooks } = await installAt()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    expect(await inject(hooks)).toContain('初始')
+
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    endTurn(hooks, 'teammate-1') // 两次都不该计数
+    endTurn(hooks, 'teammate-1')
+    expect(await inject(hooks)).toContain('初始') // 仍是旧快照
+
+    endTurn(hooks, 's')
+    endTurn(hooks, 's') // 主会话满 2 轮 ⇒ 兜底放行
+    expect(await inject(hooks)).toContain('改动')
+  })
+
+  it('信号缺 sessionId 时按"无法归因"照常计数（不把兜底变成死代码）', async () => {
+    const w = ws()
+    const { hooks } = await installAt()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    // 变更要先被某次注入"发现"（dirty 只在注入时算出）——真实链路里就是下一轮开头那一次
+    expect(await inject(hooks)).toContain('初始')
+
+    endTurn(hooks) // 不带 sessionId
+    endTurn(hooks)
+    expect(await inject(hooks)).toContain('改动')
+  })
+
+  it('等长改写也能读到新内容：缓存戳必须到纳秒（毫秒级会把同尺寸的改写误判成"没变"）', () => {
+    const f = join(dir, 'stamp.md')
+    const r = new MemoryReader()
+    writeFileSync(f, 'aaaa\n')
+    expect(r.read(f).text).toBe('aaaa\n')
+    for (const v of ['bbbb', 'cccc', 'dddd']) {
+      writeFileSync(f, `${v}\n`) // 与上一版**等长**：只看 size 分辨不出来
+      expect(r.read(f).text).toBe(`${v}\n`)
+    }
+  })
+})

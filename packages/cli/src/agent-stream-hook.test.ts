@@ -3,6 +3,9 @@
  *
  * 这是「Herdr 集成做成插件」能成立的前提 —— 该 hook 是插件化唯一需要新增的引擎侧入口，
  * 若它没被触发，插件就只是个空壳。故这里不 mock hook 调用，而是走真实 processLine 链路。
+ *
+ * 注意 `turn_end` 是唯一例外：它由 **core** 广播（见 core/src/agent-stream-broadcast.test.ts），
+ * CLI 侧只广播其余事件 —— 两条来源若都发，同一轮会被消费方计两次。这里顺带守住"只发一次"。
  */
 import { describe, expect, it } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -74,6 +77,9 @@ describe('agent.stream hook（外部集成入口）', () => {
       expect(seen.length).toBeGreaterThan(2)
       // 每个信号都带会话 ID（外部集成长按它做会话关联/恢复）
       expect(seen.every((s) => s.sessionId === sess.id)).toBe(true)
+      // turn_end **只出现一次**：终态由 core 广播，CLI 侧已不再重复（否则同一轮会被计两次，
+      // 记忆这类"按轮计数"的消费方会翻倍推进）
+      expect(seen.filter((s) => s.eventType === 'turn_end')).toHaveLength(1)
       // 归约结果里有「工具执行中」这一态（外部 UI 最关心的状态之一）
       expect(seen.some((s) => s.status.phase === 'tool')).toBe(true)
       // 事件类型透传（供排障；插件一般不用，但要有）

@@ -233,16 +233,35 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
   解法：每轮照读文件、但与**当前生效快照**比对哈希，**只在 flush 点更新生效快照**。
   这样外部修改会在下次 flush 生效，且 system 内容在两次 flush 之间保持稳定（缓存友好）。
 
-**⑥ 一个反直觉的点**：把易变内容**移到 system 末尾**没有用 —— 前缀缓存从开头分块匹配，
-`tool.post.execute`（`toolId === 'compress'`）—— 无论 nudge 引导还是模型自主压缩，
-最终都走这个工具，一个信号全覆盖。次选是比对 ACP state 的 blocks 数量变化。
+**⑥ `compress` 信号的覆盖面**：无论 nudge 引导的压缩还是模型自主压缩，最终都走同一个 `compress` 工具
+⇒ 一个信号即可全覆盖；次选是比对 ACP state 的 blocks 数量变化。（④ 里写的 `tool.post.execute` 是
+当时的设想，实查后不可用 —— 见 ⑦。）
 
 **⑤ 一个反直觉的点**：把易变内容**移到 system 末尾**没有用 —— 前缀缓存从开头分块匹配，
 变化点之后的所有分块（含后续历史消息）依旧全部失配。关键变量是**变更频率**，不是位置。
 把易变内容移出 system 塞进 messages 更糟：那会进入 ACP 的视野，**打上 ref、变成可折叠对象**
 （§3.4），既丢了"指令"语义又可能被压掉。
 
+**⑦ 落地后的校正（2026-09-19 续 155，M3 做完再回看）**：
+
+- **兜底轮数取 15**（原建议 10）：它的定位是"防静默失效的兜底"而非节流目标（正常发布由压缩触发，
+  那时 system 变更免费），只需"大到平时不抢先、小到长时间不压缩时也能生效"。**单位是"轮"**
+  （一次「用户输入 → Agent 跑完」），**不是**模型调用 —— 一轮内多步只算 1。
+- **flush 信号的真实形态**：ACP 那条**不能用** `tool.post.execute`（实查：其 ctx **没有 toolId**），
+  改用 `agent.stream` 的 `status.toolId === 'compress'`；`session.compacting` 那条不变。
+- **`turn_end` 必须由 core 广播**（原设计默认"上层会广播"）：实查发现全仓只有 CLI 会 ——
+  内嵌 / ACP 宿主自己消费事件流时，靠它驱动的兜底计数**永不推进**。终态是引擎的事实 ⇒ 收口到 core
+  （CLI 同步停发以免重复计数）。
+- **只数主会话的轮**：teammate / 子 Agent 另开 session（且子 Agent 的轮不是用户的轮），
+  不过滤会让攒批提前放行。
+- **参数出口**：`config.json → memory`（`flushAfterTurns` / `maxLines` / `maxBytes` / `disableInjection`），
+  启用仍是 `plugins: ["memory"]`。这段配置**错了不会自己报错**，因此非法值一律丢弃 + 启动告警 + 概览打印。
+- **⑤ 的"pending 必须落盘"未做**（pending 目前只活在进程内）：重启会丢掉"待发布"状态，但**不丢内容**
+  —— 新进程首次注入必定发布最新内容（时机从"等压缩"变成"立即"）。影响面小，等自动沉淀上线再补。
+
 ### 3.8 ACP 关闭时的 session compaction 场景（实证）
+
+
 
 用户提示"ACP 关闭时的 session compact 也要考虑"。查证 + 实测结论：**记忆注入在两种场景都安全**，
 但有两个连带影响必须设计进去。
@@ -289,7 +308,8 @@ project 级？反之？需实测决定）而不是静默丢弃。
 | **M0** ✅ | ~~验证 §3.4 的折叠风险~~（已完成，结论：不会被压缩）；~~`WorkspaceLevel.memory` + `loadDirs.memory`~~（已完成） | 目录字段可用（`ws.user.memory` / `ws.project.memory` / `ws.loadDirs.memory`）；记忆暂不注入。顺手修了 `/workspace` 输出里 agents 行漏路径的既有 bug |
 | **M1** ✅ | ~~补 G1/G2 通道~~ + ~~加载 L0（`AGENTS.md` 两级）~~ + ~~L1 索引注入~~ + ~~`/memory list\|show\|path`~~（已完成） | ✅ 端到端实测：主 Agent 请求的 system 含 `<memory>` 与索引/指令内容；subagent 不含；空索引不注入；注入量 ≤25KB |
 | **M2** ✅ | ~~写入路径 A~~ + ~~`/memory add\|rm\|reload`~~ + ~~体积/去重校验~~（已完成）；**§3.7 分级注入刻意留到 M3**（理由见 dev-log 续 153：mtime 缓存已保证"文件不变则 system 不变"，变更本就低频，而分级注入会让"写入后何时生效"不可预期，宜与 flush 双源一起做） | ✅ 实测：超限被拒且文件未变；去重生效；原子写无残留；`/memory add` 写入 → 下一轮注入读到（端到端） |
-| **M3** ✅ | ~~§3.7 分级注入（flush 双源 + 兜底）~~ + ~~L2→L1 沉淀提示（压缩时一次性）~~（已完成）；子代理隔离在 M1 已落地 | ✅ 实测：外部改动默认攒批不立即生效；ACP `compress` / `session.compacting` 均触发 flush；提示一次性；命令写入是例外（立即）；攒够 5 轮兜底放行 |
+| **M3** ✅ | ~~§3.7 分级注入（flush 双源 + 兜底）~~ + ~~L2→L1 沉淀提示（压缩时一次性）~~（已完成）；子代理隔离在 M1 已落地 | ✅ 实测：外部改动默认攒批不立即生效；ACP `compress` / `session.compacting` 均触发 flush；提示一次性；命令写入是例外（立即）；攒够 N 轮兜底放行 |
+| **M3.1** ✅ | 复审三处（见 §3.7 ⑦）：~~`turn_end` 广播收口到 core~~（原只有 CLI 会发 ⇒ 内嵌/ACP 宿主下兜底静默失效）+ ~~轮数默认 5→15 且只数主会话~~ + ~~`config.json → memory` 参数出口~~ + ~~快照声明/防重复/截断要求清理~~ | ✅ 实测：core 侧广播 3 例（含 subagent 不发、中断路径）；CLI 侧断言 `turn_end` 只出现一次；`config.json → memory` 端到端（`/memory` 打出的即配置值）；非法值被拒并回落默认 |
 
 ---
 

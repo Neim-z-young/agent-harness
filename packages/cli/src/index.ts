@@ -277,6 +277,29 @@ export interface HarnessConfig {
    */
   plugins?: string[]
   /**
+   * 长期记忆（`@harness/memory`）的参数覆盖，**与 `plugins: ["memory"]` 配合**。
+   *
+   * 只覆盖参数、不负责启用：启用仍看 `plugins` 里有没有 `"memory"`（写了本段却未启用会告警）。
+   * 这是目前唯一"带参装配"的内置插件 —— `plugins` 数组只表达「启用」，而记忆的攒批轮数、
+   * 注入上限这类参数需要按人/按项目调，且不宜写死在组合根。
+   */
+  memory?: {
+    /**
+     * 攒批轮数：记忆**文件**变更后，最多再等几轮才把新内容换进 system prompt。
+     *
+     * 一轮 = 一次「用户输入 → Agent 跑完」（**不是**一次模型调用；一轮内多步只算一轮）。
+     * `0` = 立即生效；缺省 **15**。期间若发生上下文压缩则提前发布（那时缓存本就失效，
+     * system 变更搭车不额外花钱）。它的定位是「防静默失效的兜底」，不是节流目标。
+     */
+    flushAfterTurns?: number
+    /** 记忆索引注入上限（行，缺省 200）；超出部分不会被加载 */
+    maxLines?: number
+    /** 记忆索引注入上限（字节，缺省 25600） */
+    maxBytes?: number
+    /** 只保留 `/memory` 命令、完全不做注入（对照实验用） */
+    disableInjection?: boolean
+  }
+  /**
    * 是否允许加载**外部插件目录里的代码**（`.harness/plugins/*.ts|js|mjs`，默认 **false**）。
    *
    * 为什么默认关：那些文件是可执行代码。若无条件 `import()`，克隆一个带 `.harness/plugins`
@@ -1499,6 +1522,80 @@ export function checkCompactionReachability(cfg: HarnessConfig, defaultProviderI
   )
 }
 
+/** memory 段合法键（与 HarnessConfig.memory 一一对应） */
+const MEMORY_KEYS: Record<keyof NonNullable<HarnessConfig['memory']>, true> = {
+  flushAfterTurns: true,
+  maxLines: true,
+  maxBytes: true,
+  disableInjection: true,
+}
+
+/**
+ * 概览里显示的默认上限。刻意抄一份常量而不是静态 import `@harness/memory`：
+ * CLI 对插件一律懒加载（`lazyImport`），为两个数字在启动路径上加载整个插件模块不划算。
+ * 改动时需与 memory 包的 `MEMORY_INDEX_MAX_LINES` / `MEMORY_INDEX_MAX_BYTES` 保持一致。
+ */
+const MEMORY_INDEX_LINES_HINT = 200
+const MEMORY_INDEX_BYTES_HINT = 25 * 1024
+
+/**
+ * 校验 `config.json → memory`：未知键 + 类型/取值。纯函数（无 IO），便于单测。
+ *
+ * 为什么必须校验：这段配置**没有任何一处会主动报错** —— 键拼错会被静默忽略（记忆照旧工作、
+ * 看起来一切正常），而 `flushAfterTurns` 若写成字符串（JSON 没有类型保护），
+ * `dirtyTurns >= flushAfter` 恒为 false ⇒ 兜底永不触发，表现是"改了记忆好几轮都不生效"。
+ * 偏偏记忆是「开了就不再盯着」的能力，只能靠这里的白名单比对暴露出来。
+ */
+export function checkMemoryConfig(c: unknown): string[] {
+  if (!isPlainObject(c)) return []
+  const out: string[] = []
+  for (const k of collectUnknown(c, Object.keys(MEMORY_KEYS), 'memory')) {
+    out.push(`${k} 未被识别，该配置不会生效`)
+  }
+  const numeric: Array<[string, unknown]> = [
+    ['memory.flushAfterTurns', c.flushAfterTurns],
+    ['memory.maxLines', c.maxLines],
+    ['memory.maxBytes', c.maxBytes],
+  ]
+  for (const [path, v] of numeric) {
+    if (v === undefined) continue
+    if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
+      out.push(`${path} 应为非负整数，收到 ${JSON.stringify(v)} ⇒ 已忽略该项`)
+    }
+  }
+  if (typeof c.disableInjection === 'boolean' || c.disableInjection === undefined) {
+    // ok
+  } else {
+    out.push(`memory.disableInjection 应为布尔值，收到 ${JSON.stringify(c.disableInjection)} ⇒ 已忽略该项`)
+  }
+  if (c.maxLines === 0 || c.maxBytes === 0) {
+    out.push('memory.maxLines / maxBytes 为 0 会让索引完全不注入（等于只留 /memory 命令），请确认是否有意如此')
+  }
+  return out
+}
+
+/**
+ * `config.json → memory` → memory 插件的构造参数。
+ *
+ * **逐项显式映射**（而不是整段 spread）：JSON 里的值不受类型系统保护，非法值若直接透传，
+ * 插件侧只会"按默认以外的怪值工作"（如 `flushAfterTurns: "15"` ⇒ 兜底永不触发）。
+ * 这里只放行校验过的值，非法项一律丢弃（并在 checkMemoryConfig 里给出提示）。
+ */
+export function memoryPluginOptions(c: HarnessConfig['memory']): Record<string, unknown> {
+  if (!c) return {}
+  const out: Record<string, unknown> = {}
+  const int = (v: unknown): number | undefined =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : undefined
+  const flush = int(c.flushAfterTurns)
+  if (flush !== undefined) out.flushAfterTurns = flush
+  const lines = int(c.maxLines)
+  if (lines !== undefined) out.maxLines = lines
+  const bytes = int(c.maxBytes)
+  if (bytes !== undefined) out.maxBytes = bytes
+  if (typeof c.disableInjection === 'boolean') out.disableInjection = c.disableInjection
+  return out
+}
+
 /** 配置概览（--check-config / /config 共用），apiKey 默认脱敏展示 */
 export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string): string {
   const lines: string[] = []
@@ -1545,6 +1642,24 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
     for (const m of compactionIssues) lines.push(`  - ${m}`)
     const unreachable = checkCompactionReachability(cfg, defaultProviderId)
     if (unreachable) lines.push(`  - ${unreachable}`)
+  }
+  {
+    // 长期记忆：既报「有没有开」，也报「参数最终会怎么用」—— 攒批轮数这类值一旦写错
+    // （拼错键名 / 传成字符串）全都不会报错、只是行为不同，只能在概览里对照。
+    const m = cfg.memory
+    const declared = (cfg.plugins ?? []).some((id) => String(id).trim() === 'memory')
+    const opt = memoryPluginOptions(m)
+    lines.push(
+      declared
+        ? `长期记忆（memory）：已启用 · 索引上限 ${opt.maxLines ?? MEMORY_INDEX_LINES_HINT} 行 / ` +
+            `${opt.maxBytes ?? MEMORY_INDEX_BYTES_HINT} 字节 · 文件变更攒批 ${
+              opt.flushAfterTurns === undefined ? '15（默认）' : `${opt.flushAfterTurns} 轮`
+            }` +
+            (opt.disableInjection ? ' · 已关闭注入（只留 /memory 命令）' : '')
+        : '长期记忆（memory）：未启用（config.json → plugins 加 "memory" 开启；可选 memory 段调参）',
+    )
+    for (const issue of checkMemoryConfig(m)) lines.push(`  - ${issue}`)
+    if (m && !declared) lines.push('  - memory 段已写但未启用 ⇒ 该段不会生效（需 plugins 里加 "memory"）')
   }
   const rawProviders = cfg.providers ?? []
   if (!rawProviders.length) {
@@ -2395,6 +2510,29 @@ export class HarnessApp {
     // 其余能力一律通过外部插件目录（~/.harness/plugins、.harness/plugins）可插拔加载，
     // CLI 不做硬编码依赖（避免依赖倒置）：此处 externalPlugins 来自 loadPluginDirs（user → project）。
     if (externalPlugins.plugins.length) providerPlugins.push(...externalPlugins.plugins)
+    // 长期记忆：`plugins: ["memory"]` 启用，`memory` 段覆盖参数 —— 目前唯一"带参装配"的内置插件。
+    //
+    // 位置刻意是「外部插件目录之后、declaredPlugins 之前」：外部插件已入列 ⇒ 下面的按 id 去重会
+    // 跳过注册表那份（保持"外部插件目录优先"的既有语义，便于临时替换实现）；参数则来自 config.json，
+    // 不在组合根写死 —— 与 compression → acp-context 同一模式，不违背"无参工厂"的初衷。
+    const memoryCfg = cfg.memory
+    const memoryDeclared = (cfg.plugins ?? []).some((id) => String(id).trim() === 'memory')
+    if (memoryDeclared && !providerPlugins.some((p) => p.id === 'memory')) {
+      const memoryMod = await lazyImport<{ createMemoryPlugin: (o?: Record<string, unknown>) => AgentPlugin }>(
+        '@harness/memory',
+      )
+      providerPlugins.push(memoryMod.createMemoryPlugin(memoryPluginOptions(memoryCfg)))
+    } else if (memoryCfg && !memoryDeclared) {
+      this.options.stdout?.write?.(
+        '[WARN] config.json 写了 memory 段，但没有启用记忆（plugins 里加 "memory"）⇒ 该段不会生效\n',
+      )
+    }
+    const memoryIssues = checkMemoryConfig(memoryCfg)
+    if (memoryIssues.length) {
+      this.options.stdout?.write?.(
+        `[WARN] config.json → memory 有以下问题：\n` + memoryIssues.map((m) => `       - ${m}`).join('\n') + '\n',
+      )
+    }
     // config.json → plugins 声明的内置插件：与外部插件目录按 id 去重（外部插件目录优先，便于临时替换实现）
     if (declaredPlugins.plugins.length) {
       const present = new Set(providerPlugins.map((p) => p.id))
@@ -3556,13 +3694,18 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         // 外部集成（Herdr 等）：把**归约后**的状态广播给插件。刻意不 await ——
         // 每个 text_delta 都等一次插件链会把流式渲染拖成串行；代价是上报可能乱序，
         // 这正是 herdr 插件必须带严格递增 --seq 的原因（Herdr 会丢弃同源旧序号）。
-        void harness.plugin
-          .trigger('agent.stream', {
-            eventType: ev.type,
-            status: agentStatus,
-            sessionId: curSessionId,
-          })
-          .catch(() => undefined)
+        //
+        // turn_end 例外：终态已由 **core** 广播（见 core queryStream 的 finally），这里不再重复，
+        // 否则同一整轮会被插件收到两次（记忆的攒批计数会翻倍）。归约仍照做 —— TUI/统计行要用。
+        if (ev.type !== 'turn_end') {
+          void harness.plugin
+            .trigger('agent.stream', {
+              eventType: ev.type,
+              status: agentStatus,
+              sessionId: curSessionId,
+            })
+            .catch(() => undefined)
+        }
         // turn_end 是「整轮结束」标记，不是「下一步开始了」⇒ 不能触发续轮分隔
         if (ev.type !== 'done' && ev.type !== 'turn_end' && lastDoneStep != null) {
           if (!onEvent) out(`\n🔄  第 ${lastDoneStep + 1} 步（自主续轮）\n`)
@@ -4051,13 +4194,16 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       let runStatus = initialAgentStatus({ agentId: session.agentId ?? 'default' })
       for await (const ev of gen) {
         runStatus = reduceAgentStatus(runStatus, ev)
-        void harness.plugin
-          .trigger('agent.stream', {
-            eventType: ev.type,
-            status: runStatus,
-            sessionId: session.id,
-          })
-          .catch(() => undefined)
+        // turn_end 由 core 广播（见 core queryStream 的 finally）—— 此处不重复，避免同一轮计两次
+        if (ev.type !== 'turn_end') {
+          void harness.plugin
+            .trigger('agent.stream', {
+              eventType: ev.type,
+              status: runStatus,
+              sessionId: session.id,
+            })
+            .catch(() => undefined)
+        }
         if (ev.type === 'text_delta') write(ev.text ?? '')
         else if (ev.type === 'tool_call_start') {
           // 引擎自主多步时把工具活动写到 stderr —— stdout 保持「纯结果」，脚本可安全消费
