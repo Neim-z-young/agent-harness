@@ -15,7 +15,9 @@
 2. **技能系统只读**（`SkillManager` 有 load/reload/enable/disable，**没有 save/create**）；
 3. **新发现的风险**：注入到 system prompt 的内容**可能被 ACP 折叠** —— 内核与 adapter 都未对
    `role: 'system'` 做特殊处理（grep 无命中），而 `session.preModel` 会把 system 消息与普通消息
-   一并交给压缩管道 ⇒ 记忆/指令有被压掉的可能。**这是第一阶段必须先验证的事**。
+   一并交给压缩管道 ⇒ 初稿据此推断"可能被压掉"。**已实证推翻**：core 合成的 system 消息
+   （走 `prompt.system.transform`）**拿不到 `<acp>` ref 标签** ⇒ 模型无从把它圈进压缩范围
+   ⇒ ACP 不会压缩它（见 §3.4 的逐条实测）。记忆注入因此是安全的，B1 解除。
 
 建议两条线并行推进，但**记忆先做"读"、技能锻造后做"写"**：读路径零风险且立刻有收益
 （项目指令不再被压缩吞掉、偏好不再重复交代），写路径涉及权限、治理与安全，需更谨慎。
@@ -128,20 +130,41 @@ L2 不属长期记忆，但应作为 **L1 的候选来源**：压缩时若发现
   靠既有读文件工具按需读取 —— 索引里的"一句话 + 相对路径"就是检索入口。
 - **去重与优先级**：project 覆盖 user（与 skills/agents 的覆盖规则一致：后者覆盖前者）。
 
-### 3.4 ⚠️ 风险：注入内容可能被 ACP 折叠（先验证，再谈其余）
+### 3.4 ✅ 已实证：ACP **不会**压缩我们注入的 system 提示词（原 B1 风险解除）
+
+> 初稿曾推断"可能被折叠"（理由是内核与 adapter 都无 `role === 'system'` 分支）。
+> **该推断已被实证推翻** —— 这是本轮最有价值的结论，因为它直接决定了实现方式。
+
+**实证方法**：走真实插件链路（`@harness/acp-context` 的 `session.preModel` → `compress` 工具 →
+再 preModel），在 system 提示词里放独占标记 `SYSTEM_MEMORY_MARKER_9f3a`，压缩后检查标记是否存活。
+
+**结果**：
+
+| 场景 | system 存活 | 标记存活 |
+|---|---|---|
+| 正常范围压缩（首尾 ref 之间） | ✅ | ✅ |
+| 压缩发生后新一轮 preModel | ✅ | ✅ |
+
+**为什么安全（机制层面，比结论更重要）**：
 
 ```
-_buildStepMessages → finalMessages = [system 片段, ...历史]
-                  → session.preModel（ACP）→ toCores(全部消息) → 内核折叠
+逐条消息的 role → ref：
+  system     m0                      ref=（无标签）   ← 我们注入的（core 合成）
+  system     acp_system_s_xxx        ref=m00175       ← ACP 自己注入的指令
+  user       m1#x                    ref=m00001
+  assistant  m2#x                    ref=m00002
 ```
 
-内核与 adapter **都没有**对 `role: 'system'` 的特殊分支（grep `role === 'system'` 在
-`node_modules/acp-kernel/dist/index.js` 与 `adapter.ts` 均无命中）⇒ system 片段很可能被当作
-普通消息参与保护/折叠判定。若为真，则"注入了记忆但很快被压掉"——又是一次静默失效。
+core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMessages` 的 `sysParts`）
+**拿不到 ref 标签** ⇒ 模型在 `<acp>` 标签里看不到它 ⇒ **根本无法把它圈进压缩范围**。
+（ACP 自己那条 `acp_system_*` 有标签，说明"system role"并非天然免疫 —— 免疫来自**不打标签**，
+即来自它走的是 core 的 sysParts 通道而非 ACP 的消息列表。这一点要在实现时守住。）
 
-**M0 必须先做的验证**：造一个超长记忆 + 触发压缩的会话，断言若干轮后 system 片段是否仍在。
-对策（按验证结果选一）：① 记忆走保护区/protected ref；② 在 `session.preModel` **之后**重新追加
-记忆片段（即 ACP 裁剪完再挂上，不参与压缩）；③ 由插件在 preModel 里把记忆标记为不可折叠。
+**由此得出的实现约束**：记忆/技能注入**必须**走 `prompt.system.transform`（core 的 sysParts），
+不要塞进 messages 数组冒充 system —— 后者会被 ACP 纳入消息列表、打上 ref、进而可被折叠。
+
+**剩余注意（不是正确性问题，是成本问题）**：system 不被压缩 ⇒ 它占的窗口**永远不会被回收**。
+所以 §3.3 的注入预算（前 200 行 / 25KB）不只是"加载限制"，更是**永久性占用**，必须严格控制。
 
 ### 3.5 写入路径
 
@@ -161,11 +184,45 @@ _buildStepMessages → finalMessages = [system 片段, ...历史]
   不重复 L0 已有的指令。
 - **隐私**：user 级记忆在本机；project 级可能入 git ⇒ 写入前提示作用域（见 §3.2 待决策）。
 
-### 3.7 分阶段
+### 3.7 注入时机与缓存：**攒到下次压缩时再注入**
+
+**用户提出的问题**：记忆/技能生成后若立即改写 system 提示词，会破坏 provider 的前缀缓存
+（提示词在最前，任何变化都让其后所有分块失配）—— 能否等下次压缩时再一起注入？
+
+**结论：这个思路成立，而且比"立即注入"更优。** 理由与代价如下。
+
+**① 为什么成立**：压缩本身就会改写消息序列 ⇒ **缓存必然整体失效**。把 system 的变更
+"搭车"到那一刻，边际失效成本 ≈ 0；反之，在两次压缩之间插入一次 system 变更，等于
+**额外制造一次全量失效**。我们 bench 一直以 `--cacheDiscount=0.04` 作为命中折扣假定
+（见 `docs/acp-context-param-table.md`），system 每轮失配的成本按这个折扣的倒数放大，
+而 system 通常又占几千~几万 token —— 值得省。
+
+**② 代价（必须配套兜底）**：压缩不是每轮都发生（由 nudge 提示模型自主触发），
+所以"等下次压缩"可能等好几轮、甚至整个会话都不发生 ⇒ **记忆迟迟不生效**。
+
+**③ 因此按"写入来源"分级**（这是本节的核心设计）：
+
+| 来源 | 时机 | 理由 |
+|---|---|---|
+| **显式写入**（`/memory` 命令、用户说"记住 X"） | **立即注入** | 用户有明确预期，正确性优先于缓存成本 |
+| **自动沉淀**（模型自发判断值得记） | **pending，攒到下次压缩时 flush** | 无人在等，成本优先 |
+| **技能（新建/修改）** | **立即注入** | 技能一旦写成很少变（变更天然低频），且它的作用是"下次用到就注入"，延迟无收益 |
+| 兜底 | N 轮未压缩（建议 10 轮）或会话结束前 flush | 防"永远不生效" |
+
+**④ 技术落地**：pending 队列 + flush 信号。判定"刚发生压缩"最干净的钩子是
+`tool.post.execute`（`toolId === 'compress'`）—— 无论 nudge 引导还是模型自主压缩，
+最终都走这个工具，一个信号全覆盖。次选是比对 ACP state 的 blocks 数量变化。
+
+**⑤ 一个反直觉的点**：把易变内容**移到 system 末尾**没有用 —— 前缀缓存从开头分块匹配，
+变化点之后的所有分块（含后续历史消息）依旧全部失配。关键变量是**变更频率**，不是位置。
+把易变内容移出 system 塞进 messages 更糟：那会进入 ACP 的视野，**打上 ref、变成可折叠对象**
+（§3.4），既丢了"指令"语义又可能被压掉。
+
+### 3.8 分阶段
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **M0** | 验证 §3.4 的折叠风险；`WorkspaceLevel.memory` + `loadDirs.memory` | 实测结论 + 目录字段可用；记忆暂不注入 |
+| **M0** | ~~验证 §3.4 的折叠风险~~（**已完成，结论：不会被压缩**）；`WorkspaceLevel.memory` + `loadDirs.memory` | 目录字段可用；记忆暂不注入 |
 | **M1** | 加载 L0（`AGENTS.md` 两级）+ L1 索引注入；`/memory` 命令（list/read） | 新会话能读到既有记忆与项目指令；注入量 ≤25KB |
 | **M2** | 写入路径 A + `/memory edit|delete`；体积/去重校验 | 模型能写入并下会话读到；超限被明确拒绝（不静默） |
 | **M3** | L2 → L1 候选提示（压缩时提醒沉淀）；子代理记忆隔离策略 | 压缩后不丢失关键纠正 |
@@ -247,7 +304,8 @@ _buildStepMessages → finalMessages = [system 片段, ...历史]
 
 | # | 阻塞点 | 等级 | 说明 |
 |---|---|---|---|
-| B1 | **ACP 可能折叠 system 注入的记忆** | **P0（先验证）** | §3.4；不解决则整个记忆能力形同虚设 |
+| B1 | ~~ACP 可能折叠 system 注入的记忆~~ | **✅ 已解除** | §3.4 实证：core 合成的 system 无 ref 标签 ⇒ 模型选不中它。**新的成本项**：system 不被压缩 ⇒ 其占用**永不回收**，注入预算（200 行/25KB）是硬约束 |
+| B9 | system 变更破坏前缀缓存 | 中 | §3.7：按来源分级注入（显式立即 / 自动攒到下次压缩 / 技能立即）+ 兜底 flush |
 | B2 | `WorkspaceLevel` 需新增 `memory` | 小 | 加字段 + loadDirs；会波及所有 Fake workspace 测试替身 |
 | B3 | `SkillManager` 需 `save()` | 小 | 加载器只读，需新增写入 + 路径校验 |
 | B4 | 写入的权限通道 | 中 | ask 模式下每次写记忆都弹窗；需决定记忆写入是否豁免 |
@@ -257,17 +315,19 @@ _buildStepMessages → finalMessages = [system 片段, ...历史]
 | B8 | 生成技能的质量/过时 | 长期 | 靠人工确认 + 治理缓解，无银弹 |
 
 **难度评估**：单看代码量都不大（记忆 M0~M2 约 200~300 行 + 测试；技能锻造 F0~F1 约 150~250 行），
-真正的成本在 **B1 的验证** 与 **B4/B6/B7 三个决策**。
+真正的成本在 **B4/B6/B7 三个决策（已拍板）** 与 **B9 注入时机（§3.7 的分级设计）**。
+原最大的不确定项 B1 **已实证解除**，无前置阻塞。
 
 ## 7. 里程碑建议
 
 ```
-M0（验证 + 目录字段）──► M1（注入 + /memory read）──► F0/F1（技能写入与锻造）
-        │                                                      │
-        └──► M2（写入与治理）                          M3（压缩→记忆；F2/F3 治理与隐式检测）
+M0（目录字段）──► M1（注入 + /memory read）──► F0/F1（技能写入与锻造）
+      │                                                 │
+      └──► M2（写入与治理 + §3.7 分级注入）      M3（压缩→记忆；F2/F3 治理与隐式检测）
 ```
 
-先 M0 拿到 B1 的结论 —— 它决定记忆注入的实现方式，也可能反过来要求改 ACP。
+下一步就是 M0 的目录字段（`WorkspaceLevel.memory` + `loadDirs.memory`）—— 它没有依赖，
+可以立刻开工；B1 的实测结论已经给出，不需要再等验证。
 
 ## 8. 决策（2026-09-19 已拍板）
 
@@ -276,7 +336,8 @@ M0（验证 + 目录字段）──► M1（注入 + /memory read）──► F0
 | B6 | 子代理记忆隔离 | **不注入 subagent**（对齐 Claude Code） | 注入时需能判断"当前是不是子 Agent" ⇒ 见 §9-B2（需 `agentMode` 通道） |
 | B7 | project 记忆是否入 git | **入 git（团队共享）** | `.harness` 本就未被忽略（其内只忽略 `last-session.json`）；需在写入时**显式确认作用域**，避免个人偏好被提交 |
 | B4 | 写入是否豁免权限审批 | **豁免** | 记忆/技能写入走插件内 fs，**不经工具权限通道**；但限定目录 + 禁写密钥 |
-| — | 首期范围 | 记忆 + 技能锻造一起（分阶段、分提交） | 见 §7；先 M0 拿到 B1 结论 |
+| — | 首期范围 | 记忆 + 技能锻造一起（分阶段、分提交） | 见 §7；M0 已无前置依赖（B1 实测解除） |
+| — | 记忆注入时机 | **显式立即 / 自动攒到下次压缩 / 技能立即**（+ 兜底 flush） | §3.7；省前缀缓存成本，前提是 B1 为假（已实证） |
 
 ---
 
@@ -293,32 +354,30 @@ M0（验证 + 目录字段）──► M1（注入 + /memory read）──► F0
 | `/skill-forge`（生成 → 确认 → 落盘 → reload） | 同上 + `harness.skillManager.reload(id)` | `SkillManager` 已有 `reload`（`skill/src/index.ts:127`） |
 | 记忆/技能**写入** | 插件内直接 `fs` 写 | **天然不经过工具权限通道** ⇒ 正好满足决策 B4「豁免审批」，无需改权限引擎 |
 | 重复流程检测 | `agent.stream` hook（2026-09-19 新增） | 统计工具序列即可 |
-| 注入 system prompt | `prompt.system.transform` hook | 范式照抄 `core.skill-injection`（`core/src/index.ts:2506`） |
+| 注入 system prompt | `prompt.system.transform` hook | 范式照抄 `core.skill-injection`（`core/src/index.ts:2506`）；**已实证不会被 ACP 压缩**（§3.4），注入时机见 §3.7 |
 | 压缩时提示沉淀（L2→L1） | `session.compacting` hook | 已有 |
 
 ### 9.B 需要补的通道（core 侧小改，**每处都对所有插件有益**）
 
 | # | 缺口 | 为什么插件绕不过去 | 建议 |
 |---|---|---|---|
-| B1 | **`PluginContext` / `PromptInput` 都没有 workspace、cwd** | 注入发生在 **prompt 构建期**，入参只有 `agentId`/`sessionId`（`plugin/src/index.ts:236`）；install 期也拿不到。变通做法是插件自己用 `process.cwd()` + `homedir()` 拼路径 —— 但 CLI 支持 `--cwd`，`process.cwd()` **未必等于** `workspace.cwd` ⇒ 会拼错目录（正是本项目栽过两次的"路径口径分裂"） | `PluginContext` 增 `workspace`（core 一处赋值，约 5 行）；`PromptInput` 增可选 `cwd` |
-| B2 | **判断"当前是否子 Agent"无通道** | 决策 B6 要求不注入 subagent，但注入 hook 拿不到 agent 定义（`mode`）。变通：`agent.stream` 的 `AgentStatusSnapshot.mode` **能拿到 mode**（刚加的字段），但注入发生在事件之前 ⇒ 首轮无从判断 | `PromptInput` 增 `agentMode`（core 一处，约 5 行） |
-| B3 | `CliCommandInput.harness?: unknown` 类型过松 | reload/agent 访问要靠 cast，编译期无保障 | 给 `CliCommandInput` 增明确方法（如 `reloadSkill(id)`），或至少类型化 harness |
+| G1 | **`PluginContext` / `PromptInput` 都没有 workspace、cwd** | 注入发生在 **prompt 构建期**，入参只有 `agentId`/`sessionId`（`plugin/src/index.ts:236`）；install 期也拿不到。变通做法是插件自己用 `process.cwd()` + `homedir()` 拼路径 —— 但 CLI 支持 `--cwd`，`process.cwd()` **未必等于** `workspace.cwd` ⇒ 会拼错目录（正是本项目栽过两次的"路径口径分裂"） | `PluginContext` 增 `workspace`（core 一处赋值，约 5 行）；`PromptInput` 增可选 `cwd` |
+| G2 | **判断"当前是否子 Agent"无通道** | 决策 B6 要求不注入 subagent，但注入 hook 拿不到 agent 定义（`mode`）。变通：`agent.stream` 的 `AgentStatusSnapshot.mode` **能拿到 mode**（刚加的字段），但注入发生在事件之前 ⇒ 首轮无从判断 | `PromptInput` 增 `agentMode`（core 一处，约 5 行） |
+| G3 | `CliCommandInput.harness?: unknown` 类型过松 | reload/agent 访问要靠 cast，编译期无保障 | 给 `CliCommandInput` 增明确方法（如 `reloadSkill(id)`），或至少类型化 harness |
 
-### 9.C B1（记忆被 ACP 折叠）在插件方案下如何处置
+### 9.C 关于"记忆被 ACP 折叠"：无需规避（已实证）
 
-**插件有一条天然的解法**：hook 按注册顺序执行（`plugin/src/index.ts:875`），而
-**external 批（声明式 `plugins: ["memory"]`）晚于 internal 批安装** ⇒ 记忆插件的
-`session.preModel` 排在 ACP（`id: 'context.acp'`，`acp-context/src/index.ts:504`）**之后**
-⇒ 可以在 ACP 裁剪完之后再插入记忆片段，**当轮不会再被裁剪**；下一轮虽会进入 ACP 视野，
-但每轮都重新插入 ⇒ 记忆恒在最新一轮（且落在 `preserveRecent` 尾部保护区内）。
+初稿曾设计一条"靠 hook 顺序规避"的路径（external 批晚于 internal ⇒ 记忆插件的
+`session.preModel` 排在 `context.acp` 之后 ⇒ 裁剪完再插入）。实证（§3.4）表明**不需要**：
 
-两个必须注意的点：
+- core 合成的 system 消息**没有 ref 标签** ⇒ 模型选不中它 ⇒ ACP 不压缩它。
+- 因此记忆**就应该**走 `prompt.system.transform`，与技能注入同一条路（`core.skill-injection` 范式）。
+- ⚠️ 唯一要守住的边界：**不要把记忆塞进 messages 数组冒充 system** —— 那会进入 ACP 消息列表、
+  被打上 ref、变成可折叠对象。这正是"顺序规避法"的隐患所在，所以弃用它反而更安全。
 
-- ⚠️ **不要写 `dependsOn: ['context.acp']`**：拓扑排序只对**同批**依赖建边
-  （`plugin/src/index.ts:603-607`，跨批跳过），且 ACP 是**可选**插件（`compression.enabled` 才装配），
-  写成硬依赖会在 ACP 关闭时出问题。跨批顺序本身就是"external 晚于 internal"，不必声明。
-- 这是**顺序依赖**，换装配方式（如把记忆插件放进 internal 批）就可能失效。
-  彻底解法仍在 core：提供显式的"裁剪后注入点"。建议 M0 验证后决定是否需要它。
+（保留一条备查事实：拓扑排序只对**同批**依赖建边（`plugin/src/index.ts:603-607`，跨批跳过），
+且 ACP 是可选插件（`compression.enabled` 才装配）。若将来确有插件间顺序需求，别写
+`dependsOn: ['context.acp']` 这种可选依赖。）
 
 ### 9.D 建议的切分
 
@@ -335,6 +394,9 @@ core 侧               PluginContext.workspace、PromptInput.{cwd,agentMode}（�
 ### 9.E 结论
 
 **可行，且推荐走插件**：写入免审批这个决策本身就与插件路径天然契合（不经工具通道），
-命令侧通道已经齐备（workspace + harness 都注入了），剩下 3 处是"给插件补只读视野"的小改，
-不是架构性障碍。真正需要提前验证的仍是 §3.4 的 B1 —— 它决定记忆注入走"hook 追加"还是
-"core 注入点"，但它**不决定插件化是否成立**。
+命令侧通道已经齐备（workspace + harness 都注入了），剩下 3 处是"给插件补只读视野"的小改
+（G1~G3），不是架构性障碍。
+
+原先挂着的最大不确定项（B1：记忆会不会被 ACP 压掉）**已实证解除**（§3.4），
+且结论对插件方案更有利：记忆走 `prompt.system.transform` 即可，**不需要**任何顺序技巧。
+因此现在没有任何"必须先验证才能动工"的前置项 —— 可以直接从 M0 的目录字段开工。
