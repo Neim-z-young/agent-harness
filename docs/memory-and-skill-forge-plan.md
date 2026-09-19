@@ -164,7 +164,12 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 不要塞进 messages 数组冒充 system —— 后者会被 ACP 纳入消息列表、打上 ref、进而可被折叠。
 
 **剩余注意（不是正确性问题，是成本问题）**：system 不被压缩 ⇒ 它占的窗口**永远不会被回收**。
-所以 §3.3 的注入预算（前 200 行 / 25KB）不只是"加载限制"，更是**永久性占用**，必须严格控制。
+所以 §3.3 的注入预算（前 200 行 / 25KB）不只是"加载限制"，更是**永久性占用**，必须严格控制；
+且它与技能注入、CompactMemory 摘要是**共享** system 空间的（详见 §3.8③）。
+
+**ACP 关闭时同样安全**：此时另有 session compaction（按条数裁剪 `session.messages`），
+但 system 消息本就不在 `session.messages` 里（每轮在 AgentRuntime 内动态构建）⇒ 实测确认
+压缩前后会话里都没有 system（§3.8）。
 
 ### 3.5 写入路径
 
@@ -209,7 +214,26 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 | **技能（新建/修改）** | **立即注入** | 技能一旦写成很少变（变更天然低频），且它的作用是"下次用到就注入"，延迟无收益 |
 | 兜底 | N 轮未压缩（建议 10 轮）或会话结束前 flush | 防"永远不生效" |
 
-**④ 技术落地**：pending 队列 + flush 信号。判定"刚发生压缩"最干净的钩子是
+**④ 技术落地（flush 信号必须是双源 —— 单源在 ACP 关闭时会永久挂起）**：
+
+| 场景 | 压缩机制 | flush 信号 |
+|---|---|---|
+| ACP 开启 | 内核折叠（模型调 `compress` 工具） | `tool.post.execute`（`toolId === 'compress'`） |
+| **ACP 关闭** | **session compaction**（`compactIfNeeded` / `/compact`） | **`session.compacting` hook**（core:952，已实证触发） |
+
+⚠️ 原设计只写了 compress 工具这一源 —— 而 **ACP 关闭时根本没有 compress 工具** ⇒ flush 永不触发
+⇒ 记忆只能靠兜底（N 轮）生效。补上 `session.compacting` 后两种场景都覆盖。
+
+**⑤ 两个实现细节（否则会出隐性 bug）**：
+
+- **pending 必须落盘**：只放内存的话，重启即丢（用户刚说"记住"的东西静默消失）。建议存
+  `<scope>/memory/.pending.json` 或 `session.meta`。
+- **注入内容必须是"生效快照"，不是实时读文件**。原因是一个两难：插件每轮读 `MEMORY.md`
+  才能感知**外部修改**（人直接编辑了文件），但"读到就注入"会让 system 随时变化 ⇒ 缓存失效。
+  解法：每轮照读文件、但与**当前生效快照**比对哈希，**只在 flush 点更新生效快照**。
+  这样外部修改会在下次 flush 生效，且 system 内容在两次 flush 之间保持稳定（缓存友好）。
+
+**⑥ 一个反直觉的点**：把易变内容**移到 system 末尾**没有用 —— 前缀缓存从开头分块匹配，
 `tool.post.execute`（`toolId === 'compress'`）—— 无论 nudge 引导还是模型自主压缩，
 最终都走这个工具，一个信号全覆盖。次选是比对 ACP state 的 blocks 数量变化。
 
@@ -218,7 +242,47 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 把易变内容移出 system 塞进 messages 更糟：那会进入 ACP 的视野，**打上 ref、变成可折叠对象**
 （§3.4），既丢了"指令"语义又可能被压掉。
 
-### 3.8 分阶段
+### 3.8 ACP 关闭时的 session compaction 场景（实证）
+
+用户提示"ACP 关闭时的 session compact 也要考虑"。查证 + 实测结论：**记忆注入在两种场景都安全**，
+但有两个连带影响必须设计进去。
+
+**① 为什么安全**：`core/src/index.ts:930` 明写"不包含 `role===system` 的消息（它们在 AgentRuntime
+内动态构建，不在 `session.messages` 里）"，实测确认：
+
+| 阶段 | session.messages 的 role 种类 | 含 system 吗 |
+|---|---|---|
+| 压缩前（16 条） | `assistant, user` | ❌ |
+| 压缩后（4 条） | `assistant, user` | ❌ |
+
+⇒ session compaction 裁的只是 user/assistant/tool，**碰不到 system**（我们注入的记忆在 system 通道）。
+两套压缩机制的对照：
+
+| | ACP（内核折叠） | session compaction |
+|---|---|---|
+| 作用对象 | 待发消息（含 ACP 自己注入的消息） | `session.messages`（持久化会话） |
+| 会碰到 system 注入吗 | ❌（无 ref 标签，见 §3.4） | ❌（system 不在 session.messages 里） |
+| 触发频率 | **每轮**（nudge 引导） | **低频**：boot 一次 + `/compact auto` |
+
+**② 连带影响之一：`session.compacting` 已实证触发，但很稀疏**。
+实测中挂探针插件确认它被调用 1 次（window=12）。它可用作 flush 信号（见 §3.7④），
+但**只在 boot 与 `/compact auto` 时触发** ⇒ ACP 关闭时"下次压缩"可能等很久
+⇒ **兜底（N 轮 / 会话结束）从"保险"升级为主要路径之一**，M2 实现时不能省。
+
+**③ 连带影响之二：system 预算是三笔共享的**（新约束）。
+ACP 关闭时，`appendCompactionMemory` 会把 `CompactMemory.summaryText` 也注入 system
+（定义 `core/src/index.ts:1548`，调用点 `:1677`，在 `_buildStepMessages` 里）；ACP 开启时它同样存在。
+所以 system 里的常驻内容至少三笔：
+
+```
+技能注入（core.skill-injection） + 记忆（本方案，≤200 行/25KB） + CompactMemory 摘要（≤ session.summaryMaxChars）
+```
+
+它们**都不参与压缩、占用永不回收**（§3.4）。因此预算要按"总和"设上限，而不是各自为政 ——
+建议给 `core.memory-injection` 一个可配的 `maxBytes`，并在超限时**截断低优先级条目**（user 级优先于
+project 级？反之？需实测决定）而不是静默丢弃。
+
+### 3.9 分阶段
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
@@ -305,7 +369,9 @@ core 合成的 system 消息（走 `prompt.system.transform` ⇒ `_buildStepMess
 | # | 阻塞点 | 等级 | 说明 |
 |---|---|---|---|
 | B1 | ~~ACP 可能折叠 system 注入的记忆~~ | **✅ 已解除** | §3.4 实证：core 合成的 system 无 ref 标签 ⇒ 模型选不中它。**新的成本项**：system 不被压缩 ⇒ 其占用**永不回收**，注入预算（200 行/25KB）是硬约束 |
-| B9 | system 变更破坏前缀缓存 | 中 | §3.7：按来源分级注入（显式立即 / 自动攒到下次压缩 / 技能立即）+ 兜底 flush |
+| B9 | system 变更破坏前缀缓存 | 中 | §3.7：按来源分级注入（显式立即 / 自动攒到下次压缩 / 技能立即）+ 兜底 flush；**flush 必须双源**（ACP 的 compress 工具 + `session.compacting`），否则 ACP 关闭时永久挂起 |
+| B10 | system 预算三笔共享、互相挤占 | 中 | §3.8③：技能注入 + 记忆 + CompactMemory 摘要都常驻 system 且永不回收 ⇒ 需按总和设上限 + 超限截断策略（不可静默丢弃） |
+| B11 | pending 集合的持久化与"生效快照" | 小 | §3.7⑤：pending 只放内存会重启即丢；注入必须用"生效快照"而非实时读文件（否则外部编辑会让 system 每轮抖动、缓存全失效） |
 | B2 | `WorkspaceLevel` 需新增 `memory` | 小 | 加字段 + loadDirs；会波及所有 Fake workspace 测试替身 |
 | B3 | `SkillManager` 需 `save()` | 小 | 加载器只读，需新增写入 + 路径校验 |
 | B4 | 写入的权限通道 | 中 | ask 模式下每次写记忆都弹窗；需决定记忆写入是否豁免 |
