@@ -774,6 +774,7 @@ const mcpPlugin = createMcpClientPlugin({
 Agent 执行链路：
 
 - [Agentic Loop 改造计划](docs/agentic-loop-plan.md) — 三方（Claude Code / Opencode / 本项目）循环机制对比、阻塞点清单、S0~S4 分阶段实施方案
+- [记忆能力与技能锻造计划](docs/memory-and-skill-forge-plan.md) — 跨会话记忆三层模型（项目指令 / 长期记忆 / 会话压缩记忆）、自动把重复流程固化为 SKILL.md，含阻塞点与待决策
 
 ## Tech Stack
 
