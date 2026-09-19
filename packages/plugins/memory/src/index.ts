@@ -22,8 +22,8 @@
  * （"把变更攒到下次压缩再注入"的分级策略属 M2，见计划 §3.7。）
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
 import type { AgentPlugin, CliCommandInput, Hooks, PluginContext, PluginWorkspaceView } from '@harness/plugin'
 
 // ===== 常量 =====
@@ -201,6 +201,185 @@ export class MemoryReader {
   }
 }
 
+// ===== 写入（M2）=====
+
+export type MemoryScope = 'user' | 'project'
+
+export interface EntryView {
+  /** 1-based 序号（与 `/memory list` 展示一致） */
+  index: number
+  text: string
+  /** 该条目在文件里的物理行号（0-based） */
+  line: number
+}
+
+export interface WriteResult {
+  ok: boolean
+  reason?: 'duplicate' | 'over-limit' | 'not-found' | 'io-error' | 'empty'
+  /** 人类可读说明（失败时必填，成功时可省） */
+  message?: string
+  lines?: number
+  bytes?: number
+  index?: number
+}
+
+/** 条目前缀：统一 `- ` 便于按行增删与去重 */
+export const ENTRY_PREFIX = '- '
+
+/**
+ * 解析索引文件的条目（`- ` 开头的行；标题/空行/其它 Markdown 结构保留但不计入条目）。
+ */
+export function parseEntries(text: string): EntryView[] {
+  const out: EntryView[] = []
+  const lines = text.split('\n')
+  let n = 0
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i] ?? ''
+    if (l.startsWith(ENTRY_PREFIX)) {
+      out.push({ index: ++n, text: l.slice(ENTRY_PREFIX.length).trim(), line: i })
+    }
+  }
+  return out
+}
+
+function normalizeEntry(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * 索引写入器（M2）。
+ *
+ * 三条硬规则：
+ * 1. **超限即拒绝，且不落盘** —— 先预演新内容再校验，避免 Claude Code 那个
+ *    "写入成功但下次加载被丢弃"的静默失效。
+ * 2. **去重**：同一条（空白归一化后完全相同）不重复追加 —— 反复"记住同一件事"
+ *    不该把索引撑爆。
+ * 3. **原子写**：临时文件 + rename，避免写到一半崩溃留下半截索引。
+ */
+export class MemoryStore {
+  constructor(
+    private readonly path: string,
+    private readonly opts: CapOptions = {},
+  ) {}
+
+  private get maxLines(): number {
+    return this.opts.maxLines ?? MEMORY_INDEX_MAX_LINES
+  }
+
+  private get maxBytes(): number {
+    return this.opts.maxBytes ?? MEMORY_INDEX_MAX_BYTES
+  }
+
+  /** 全量读取（**不截断**）——条目增删必须基于完整内容，`MemoryReader.read` 的截断视图不能用于写 */
+  private readFull(): string {
+    if (!existsSync(this.path)) return ''
+    try {
+      return readFileSync(this.path, 'utf-8')
+    } catch {
+      return ''
+    }
+  }
+
+  entries(): EntryView[] {
+    return parseEntries(this.readFull())
+  }
+
+  /** 预演校验：返回超限说明（不超限则 undefined） */
+  private checkLimit(next: string): WriteResult | undefined {
+    const lines = next.split('\n').length
+    const bytes = Buffer.byteLength(next, 'utf-8')
+    if (lines > this.maxLines) {
+      return {
+        ok: false,
+        reason: 'over-limit',
+        message: `索引将达 ${lines} 行，超过上限 ${this.maxLines} 行 —— 已拒绝写入（请先精简或把细节移到主题文件）`,
+        lines,
+        bytes,
+      }
+    }
+    if (bytes > this.maxBytes) {
+      return {
+        ok: false,
+        reason: 'over-limit',
+        message: `索引将达 ${bytes} 字节，超过上限 ${this.maxBytes} 字节 —— 已拒绝写入（请先精简或把细节移到主题文件）`,
+        lines,
+        bytes,
+      }
+    }
+    return undefined
+  }
+
+  private writeAtomic(text: string): void {
+    mkdirSync(dirname(this.path), { recursive: true })
+    const tmp = `${this.path}.tmp-${process.pid}-${Date.now()}`
+    writeFileSync(tmp, text, 'utf-8')
+    renameSync(tmp, this.path)
+  }
+
+  /** 追加一条；重复（归一化后相同）返回 duplicate；超限返回 over-limit 且不落盘 */
+  add(rawText: string): WriteResult {
+    const text = normalizeEntry(rawText)
+    if (!text) return { ok: false, reason: 'empty', message: '条目为空' }
+
+    const cur = this.readFull()
+    const existing = parseEntries(cur).map((e) => normalizeEntry(e.text))
+    if (existing.includes(text)) {
+      return { ok: false, reason: 'duplicate', message: '该条目已存在，未重复写入' }
+    }
+
+    const base = cur.length === 0 || cur.endsWith('\n') ? cur : `${cur}\n`
+    const next = `${base}${ENTRY_PREFIX}${text}\n`
+    const over = this.checkLimit(next)
+    if (over) return over
+
+    try {
+      this.writeAtomic(next)
+    } catch (e) {
+      return { ok: false, reason: 'io-error', message: String((e as Error)?.message ?? e) }
+    }
+    const lines = next.split('\n').length
+    return { ok: true, lines, bytes: Buffer.byteLength(next, 'utf-8'), index: existing.length + 1 }
+  }
+
+  /** 按 1-based 序号或文本（归一化精确匹配）删除一条 */
+  remove(target: string): WriteResult {
+    const cur = this.readFull()
+    const entries = parseEntries(cur)
+    if (entries.length === 0) return { ok: false, reason: 'not-found', message: '索引为空，无可删除条目' }
+
+    const asNum = Number(target)
+    let hit: EntryView | undefined
+    if (Number.isInteger(asNum) && asNum >= 1 && asNum <= entries.length) {
+      hit = entries[asNum - 1]
+    } else {
+      const want = normalizeEntry(target)
+      hit = entries.find((e) => normalizeEntry(e.text) === want)
+    }
+    if (!hit) return { ok: false, reason: 'not-found', message: `未找到条目：${target}` }
+
+    const lines = cur.split('\n')
+    lines.splice(hit.line, 1)
+    const next = lines.join('\n')
+    try {
+      this.writeAtomic(next)
+    } catch (e) {
+      return { ok: false, reason: 'io-error', message: String((e as Error)?.message ?? e) }
+    }
+    return { ok: true, lines: next.split('\n').length, bytes: Buffer.byteLength(next, 'utf-8') }
+  }
+
+  /** 供诊断：剩余额度（写入前自查） */
+  budget(): { lines: number; maxLines: number; bytes: number; maxBytes: number } {
+    const cur = this.readFull()
+    return {
+      lines: cur.split('\n').length,
+      maxLines: this.maxLines,
+      bytes: Buffer.byteLength(cur, 'utf-8'),
+      maxBytes: this.maxBytes,
+    }
+  }
+}
+
 // ===== 插件 =====
 
 export interface MemoryPluginOptions {
@@ -214,13 +393,14 @@ export interface MemoryPluginOptions {
   id?: string
 }
 
-function describeLayer(label: string, r: CappedRead): string {
-  if (!r.exists) return `${label}：不存在（${r.path}）`
+/** 把「项目指令」文件状态渲染成一行（不存在也给出路径，便于排障） */
+function instructionLine(r: CappedRead): string {
+  if (!r.exists) return `不存在（${r.path}）`
   const lines = r.text.split('\n').length
   return (
-    `${label}：${lines} 行 / ${Buffer.byteLength(r.text, 'utf-8')} 字节` +
+    `${lines} 行 · ${Buffer.byteLength(r.text, 'utf-8')} 字节` +
     (r.truncated ? `（已截断，原 ${r.totalLines} 行）` : '') +
-    `\n    ${r.path}`
+    ` — ${r.path}`
   )
 }
 
@@ -275,8 +455,8 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
         'cli.commands'(input) {
           input.commands.push({
             command: 'memory',
-            description: '查看长期记忆与项目指令（list / show <user|project|instruction> / path）',
-            usage: '/memory [list|show <user|project|instruction>|path]',
+            description: '长期记忆：查看 / 追加 / 删除条目（add · rm · show · path · reload）',
+            usage: '/memory [add|rm] [user|project] <内容|序号>',
           })
         },
 
@@ -317,14 +497,60 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
             return
           }
 
+          // ── 写入：add / rm（M2）──
+          if (sub === 'add' || sub === 'rm' || sub === 'remove') {
+            const rest = arg.slice(sub.length).trim()
+            const scopeArg = (rest.split(/\s+/)[0] ?? '').toLowerCase()
+            const isScope = scopeArg === 'user' || scopeArg === 'project'
+            const scope: MemoryScope = isScope ? (scopeArg as MemoryScope) : 'user'
+            const payload = isScope ? rest.slice(scopeArg.length).trim() : rest
+            const store = new MemoryStore(scope === 'user' ? p.user.index : p.project.index, {
+              maxLines: options.maxLines,
+              maxBytes: options.maxBytes,
+            })
+            if (!payload) {
+              input.out(`用法：/memory ${sub === 'add' ? 'add' : 'rm'} [user|project] <内容或序号>\n`)
+              return
+            }
+            const res = sub === 'add' ? store.add(payload) : store.remove(payload)
+            reader!.clear() // 写入后强制刷新（同毫秒内 mtime 可能不变，不能依赖缓存自动失效）
+            const label = scope === 'user' ? '用户长期记忆' : '项目长期记忆'
+            input.out(
+              res.ok
+                ? `✅ ${label}${sub === 'add' ? `已追加第 ${res.index} 条` : '已删除 1 条'}（现 ${res.lines} 行 / ${res.bytes} 字节）\n`
+                : `⚠️  未写入：${res.message}\n`,
+            )
+            return
+          }
+
+          if (sub === 'reload') {
+            reader!.clear()
+            input.out('已清空记忆缓存，下一轮注入将读取最新内容。\n')
+            return
+          }
+
           // 默认 list
           const layers = load()
           const total = layers.reduce((n, l) => n + (l.read.exists ? 1 : 0), 0)
+          const budgets: string[] = []
+          for (const [scope, idx] of [['user', p.user.index], ['project', p.project.index]] as const) {
+            const st = new MemoryStore(idx, { maxLines: options.maxLines, maxBytes: options.maxBytes })
+            const b = st.budget()
+            const entries = st.entries()
+            budgets.push(
+              `\n  ${scope === 'user' ? '用户长期记忆' : '项目长期记忆'}：${entries.length} 条 / ${b.lines} 行 · ${b.bytes} 字节` +
+                (entries.length ? `（上限 ${b.maxLines} 行 / ${b.maxBytes} 字节）` : ''),
+            )
+            for (const e of entries.slice(0, 20)) budgets.push(`      ${String(e.index).padStart(3)}. ${e.text}`)
+            if (entries.length > 20) budgets.push(`      …（其余 ${entries.length - 20} 条见 /memory show）`)
+          }
           input.out(
-            `\n长期记忆（${total}/${layers.length} 个文件存在；上限 ${options.maxLines ?? MEMORY_INDEX_MAX_LINES} 行 / ${options.maxBytes ?? MEMORY_INDEX_MAX_BYTES} 字节）\n` +
-              layers.map((l) => `  ${describeLayer(l.label, l.read)}`).join('\n') +
-              `\n  写法：/memory show <user|project|instruction> 查看内容 · /memory path 看路径\n` +
-              `  说明：写入能力在 M2 落地；当前仅加载索引，主题文件请用 read 工具按需读取\n\n`,
+            `\n长期记忆（${total}/${layers.length} 个文件存在；注入上限 ${options.maxLines ?? MEMORY_INDEX_MAX_LINES} 行 / ${options.maxBytes ?? MEMORY_INDEX_MAX_BYTES} 字节）\n` +
+              `  项目指令  ${instructionLine(layers[0]!.read)}\n` +
+              budgets.join('\n') +
+              `\n  用法：/memory add [user|project] <内容> · /memory rm [user|project] <序号|内容> · ` +
+              `/memory show <user|project|instruction> · /memory path · /memory reload\n` +
+              `  说明：默认写入 user 级（项目级会随 git 共享，需显式指定）；主题文件请用 read 工具按需读取\n\n`,
           )
         },
       }

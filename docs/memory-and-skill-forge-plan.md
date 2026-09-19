@@ -288,7 +288,7 @@ project 级？反之？需实测决定）而不是静默丢弃。
 |---|---|---|
 | **M0** ✅ | ~~验证 §3.4 的折叠风险~~（已完成，结论：不会被压缩）；~~`WorkspaceLevel.memory` + `loadDirs.memory`~~（已完成） | 目录字段可用（`ws.user.memory` / `ws.project.memory` / `ws.loadDirs.memory`）；记忆暂不注入。顺手修了 `/workspace` 输出里 agents 行漏路径的既有 bug |
 | **M1** ✅ | ~~补 G1/G2 通道~~ + ~~加载 L0（`AGENTS.md` 两级）~~ + ~~L1 索引注入~~ + ~~`/memory list\|show\|path`~~（已完成） | ✅ 端到端实测：主 Agent 请求的 system 含 `<memory>` 与索引/指令内容；subagent 不含；空索引不注入；注入量 ≤25KB |
-| **M2** | 写入路径 A + `/memory edit|delete`；体积/去重校验 | 模型能写入并下会话读到；超限被明确拒绝（不静默） |
+| **M2** ✅ | ~~写入路径 A~~ + ~~`/memory add\|rm\|reload`~~ + ~~体积/去重校验~~（已完成）；**§3.7 分级注入刻意留到 M3**（理由见 dev-log 续 153：mtime 缓存已保证"文件不变则 system 不变"，变更本就低频，而分级注入会让"写入后何时生效"不可预期，宜与 flush 双源一起做） | ✅ 实测：超限被拒且文件未变；去重生效；原子写无残留；`/memory add` 写入 → 下一轮注入读到（端到端） |
 | **M3** | L2 → L1 候选提示（压缩时提醒沉淀）；子代理记忆隔离策略 | 压缩后不丢失关键纠正 |
 
 ---

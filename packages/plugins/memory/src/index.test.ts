@@ -1,11 +1,12 @@
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliCommandInput, Hooks, PluginContext, PluginWorkspaceView } from '@harness/plugin'
 import {
   MEMORY_INDEX_MAX_LINES,
   MemoryReader,
+  MemoryStore,
   createMemoryPlugin,
   readCapped,
   renderMemorySection,
@@ -238,18 +239,22 @@ describe('/memory 命令', () => {
     expect(commands.map((c) => c.command)).toContain('memory')
   })
 
-  it('list：列出各文件存在情况与路径', async () => {
+  it('list：列出条目（带序号）与文件状态', async () => {
     const w = ws()
     mkdirSync(w.project.memory, { recursive: true })
-    writeFileSync(join(w.project.memory, 'MEMORY.md'), '项目事实')
+    writeFileSync(join(w.project.memory, 'MEMORY.md'), '- 项目事实A\n- 项目事实B\n')
     const { hooks } = await install()
     const input = cmdInput('')
     hooks['cli.command']!(input)
     const text = input.lines.join('')
     expect(input.result).toBe('continue')
     expect(text).toContain('项目长期记忆')
-    expect(text).toContain('项目事实'.length > 0 ? join(w.project.memory, 'MEMORY.md') : '')
-    expect(text).not.toContain('项目事实') // list 只给概要，不复述内容
+    expect(text).toContain('项目事实A')
+    expect(text).toMatch(/1\.\s*项目事实A/)
+    expect(text).toMatch(/2\.\s*项目事实B/)
+    // 条目数与预算一起给出（写入前自查手上有多少额度）
+    expect(text).toContain('2 条')
+    expect(text).toContain('上限')
   })
 
   it('show user：输出内容；不存在时明确提示', async () => {
@@ -281,5 +286,143 @@ describe('/memory 命令', () => {
     const input: CliCommandInput = { ...cmdInput('x'), command: 'other' }
     hooks['cli.command']!(input)
     expect(input.result).toBeUndefined()
+  })
+})
+
+// ===== M2：写入内核（校验 / 去重 / 原子写）=====
+
+describe('MemoryStore', () => {
+  const storePath = () => join(dir, 'memory', 'MEMORY.md')
+
+  it('add：追加并返回序号；文件不存在时按需创建目录', () => {
+    const st = new MemoryStore(storePath())
+    const r = st.add('偏好：中文回答')
+    expect(r.ok).toBe(true)
+    expect(r.index).toBe(1)
+    expect(existsSync(storePath())).toBe(true)
+    expect(st.entries().map((e) => e.text)).toEqual(['偏好：中文回答'])
+  })
+
+  it('add：空白归一化后重复 ⇒ duplicate，不重复写入', () => {
+    const st = new MemoryStore(storePath())
+    st.add('偏好：中文回答')
+    const again = st.add('  偏好：中文回答  ')
+    expect(again.ok).toBe(false)
+    expect(again.reason).toBe('duplicate')
+    expect(st.entries()).toHaveLength(1)
+  })
+
+  it('add：超限 ⇒ 拒绝且**不落盘**（避免"写了却读不到"的静默失效）', () => {
+    const st = new MemoryStore(storePath(), { maxLines: 3, maxBytes: 10_000 })
+    expect(st.add('a').ok).toBe(true)
+    expect(st.add('b').ok).toBe(true)
+    const before = readFileSync(storePath(), 'utf-8')
+    const over = st.add('c')
+    expect(over.ok).toBe(false)
+    expect(over.reason).toBe('over-limit')
+    expect(over.message).toContain('超过上限')
+    expect(readFileSync(storePath(), 'utf-8')).toBe(before) // 文件未被触碰
+  })
+
+  it('remove：按 1-based 序号删除', () => {
+    const st = new MemoryStore(storePath())
+    st.add('第一条')
+    st.add('第二条')
+    st.add('第三条')
+    const r = st.remove('2')
+    expect(r.ok).toBe(true)
+    expect(st.entries().map((e) => e.text)).toEqual(['第一条', '第三条'])
+  })
+
+  it('remove：按文本删除；找不到时明确报错', () => {
+    const st = new MemoryStore(storePath())
+    st.add('要删掉的')
+    st.add('保留的')
+    expect(st.remove('要删掉的').ok).toBe(true)
+    expect(st.entries().map((e) => e.text)).toEqual(['保留的'])
+    const miss = st.remove('不存在的')
+    expect(miss.ok).toBe(false)
+    expect(miss.reason).toBe('not-found')
+  })
+
+  it('写入是原子的：不留下临时文件', () => {
+    const st = new MemoryStore(storePath())
+    st.add('x')
+    st.remove('1')
+    const files = readdirSync(join(dir, 'memory'))
+    expect(files.filter((f) => f.includes('.tmp-'))).toEqual([])
+  })
+
+  it('budget：给出当前用量与上限（供写入前自查）', () => {
+    const st = new MemoryStore(storePath(), { maxLines: 50, maxBytes: 999 })
+    st.add('一条')
+    const b = st.budget()
+    expect(b.maxLines).toBe(50)
+    expect(b.maxBytes).toBe(999)
+    expect(b.lines).toBeGreaterThan(0)
+  })
+})
+
+describe('/memory 写入命令', () => {
+  function cmdInput(arg: string): CliCommandInput & { lines: string[] } {
+    const lines: string[] = []
+    return { raw: `memory ${arg}`, command: 'memory', arg, out: (s) => lines.push(s), sessionId: 's', lines }
+  }
+
+  it('add 默认写 user 级（项目级会随 git 共享，须显式指定）', async () => {
+    const w = ws()
+    const { hooks } = await install()
+    const input = cmdInput('add 偏好：用中文')
+    hooks['cli.command']!(input)
+    expect(input.lines.join('')).toContain('用户长期记忆')
+    expect(existsSync(join(w.user.memory, 'MEMORY.md'))).toBe(true)
+    expect(existsSync(join(w.project.memory, 'MEMORY.md'))).toBe(false)
+  })
+
+  it('add project：写入项目级', async () => {
+    const w = ws()
+    const { hooks } = await install()
+    hooks['cli.command']!(cmdInput('add project 项目事实：ACP 参数见 docs'))
+    expect(readFileSync(join(w.project.memory, 'MEMORY.md'), 'utf-8')).toContain('ACP 参数见 docs')
+  })
+
+  it('add 超限时提示"未写入"，且不产生半截文件', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), Array.from({ length: 3 }, (_, i) => `- L${i}`).join('\n'))
+    const { hooks } = await install({ maxLines: 3 })
+    const input = cmdInput('add 再来一条')
+    hooks['cli.command']!(input)
+    expect(input.lines.join('')).toContain('未写入')
+    expect(readFileSync(join(w.user.memory, 'MEMORY.md'), 'utf-8')).not.toContain('再来一条')
+  })
+
+  it('rm 删除后立即可被下一轮注入读到（写入必须清缓存）', async () => {
+    const w = ws()
+    const { hooks } = await install()
+    hooks['cli.command']!(cmdInput('add 会被删掉的'))
+    hooks['cli.command']!(cmdInput('add 保留的'))
+    hooks['cli.command']!(cmdInput('rm 会被删掉的'))
+
+    const parts: string[] = []
+    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    const injected = parts.join('\n')
+    expect(injected).toContain('保留的')
+    expect(injected).not.toContain('会被删掉的')
+    void w
+  })
+
+  it('reload：清缓存后读到外部修改（防"改了没生效"的困惑）', async () => {
+    const w = ws()
+    const { hooks } = await install()
+    hooks['cli.command']!(cmdInput('add 原始内容'))
+    // 模拟外部编辑（人直接改文件）
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 外部改写的内容\n')
+    const input = cmdInput('reload')
+    hooks['cli.command']!(input)
+    expect(input.lines.join('')).toContain('已清空记忆缓存')
+    const parts: string[] = []
+    await hooks['prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
+    expect(parts.join('\n')).toContain('外部改写的内容')
   })
 })

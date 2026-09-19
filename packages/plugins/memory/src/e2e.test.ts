@@ -105,3 +105,41 @@ describe('端到端：记忆真的到达模型请求', () => {
     await h.stop()
   })
 })
+
+describe('端到端：写入后下一轮注入能读到（M2 验收）', () => {
+  it('经 /memory add 写入 → 下一轮 queryStream 的 system 里出现该条目', async () => {
+    const dir2 = mkdtempSync(join(tmpdir(), 'mem-e2e2-'))
+    dirs.push(dir2)
+    const cwd = join(dir2, 'proj')
+    const dataDir = join(dir2, 'store')
+    mkdirSync(cwd, { recursive: true })
+    const workspace = resolveWorkspace({ cwd, dataDir })
+    const sink2: Message[][] = []
+    const h2 = await createHarness({
+      cwd,
+      workspace,
+      agents: [{ id: 'default', name: 'd', description: 'd', mode: 'primary', tools: [], permission: { '*': 'allow' } }],
+      chatProvider: probeProvider(sink2),
+    })
+    const plugin = createMemoryPlugin()
+    await h2.plugin.loadInternal([plugin])
+    const hooks2 = (await plugin.install({ workspace } as never)) as never as {
+      'cli.command': (i: unknown) => void
+    }
+    const lines: string[] = []
+    hooks2['cli.command']({
+      raw: 'memory add 记住：这个项目用 bun 而不是 npm',
+      command: 'memory',
+      arg: 'add 记住：这个项目用 bun 而不是 npm',
+      out: (s: string) => lines.push(s),
+      sessionId: 's',
+    })
+    expect(lines.join('')).toContain('已追加')
+
+    const sess = await h2.session.create()
+    for await (const _ of h2.agent.queryStream({ sessionId: sess.id, agentId: 'default', message: 'hi' })) void _
+    const sys = systemTextOf(sink2[0]!)
+    expect(sys).toContain('这个项目用 bun 而不是 npm')
+    await h2.stop()
+  })
+})
