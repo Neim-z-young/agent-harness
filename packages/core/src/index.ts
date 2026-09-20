@@ -632,6 +632,11 @@ export interface ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /**
+     * 本 agent 实际可用的工具（已按 agent 白名单过滤）。
+     * Provider 据此生成 tools 载荷；缺省时退回全局注册表 —— 那会让模型看到它无权执行的工具。
+     */
+    tools?: Tool[]
   }): Promise<ChatCompletionOutput>
   /**
    * 执行一次流式 chat completion，逐 chunk yield。
@@ -646,6 +651,8 @@ export interface ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 同 complete：本 agent 实际可用的工具（按 agent 白名单过滤） */
+    tools?: Tool[]
   }): AsyncGenerator<ChatStreamChunk, void, unknown>
 }
 
@@ -1953,6 +1960,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
         headers,
         sessionId,
         agentId,
+        // 本 agent 实际可用的工具：provider 据此生成 tools 载荷。
+        // 不传的话 provider 只能拿全局注册表 —— 模型会看到它无权执行的工具（提示词/执行两侧不一致）。
+        tools: allowedTools,
         ...(signal ? { signal } : {}),
       })
       // 中断时 Provider 会抛 AbortError：这里吞掉并保留**已收到的部分**（partial assistant），
@@ -2001,16 +2011,17 @@ export class AgentRuntimeImpl implements AgentRuntime {
       // Fallback：非流式 complete()，模拟单次 yield
       let completion
       try {
-        completion = await provider.complete({
-          providerId: providerId,
-          modelId: modelId,
-          messages: finalMessages,
-          params,
-          headers,
-          sessionId,
-          agentId,
-          ...(signal ? { signal } : {}),
-        })
+      completion = await provider.complete({
+        providerId: providerId,
+        modelId: modelId,
+        messages: finalMessages,
+        params,
+        headers,
+        sessionId,
+        agentId,
+        tools: allowedTools,
+        ...(signal ? { signal } : {}),
+      })
       } catch (e) {
         if (isAbortError(e) || signal?.aborted) {
           completion = undefined

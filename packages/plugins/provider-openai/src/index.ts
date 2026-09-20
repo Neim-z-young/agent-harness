@@ -479,6 +479,8 @@ export class OpenAIChatProvider implements ChatProvider {
     stream?: boolean
     /** 覆盖模型级探测结果（一般不用传，见 reasoningFieldRequired） */
     forceReasoningContent?: boolean
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入）；缺省退回全局注册表 */
+    tools?: Tool[]
   }): OpenAIRequestBody {
     const messages = toOpenAIMessages(
       params.messages,
@@ -486,7 +488,7 @@ export class OpenAIChatProvider implements ChatProvider {
     )
     const model = params.modelId ?? this.config.defaultModel
     const llmParams = params.llmParams ?? {}
-    const toolsDefs = this.toolsGetter().map(toolToOpenAIDef)
+    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToOpenAIDef)
 
     const body: OpenAIRequestBody = {
       model,
@@ -533,12 +535,15 @@ export class OpenAIChatProvider implements ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): Promise<ChatCompletionOutput> {
     const body = this.buildBody({
       modelId: params.modelId,
       messages: params.messages,
       llmParams: params.params,
       stream: false,
+      tools: params.tools,
     })
 
     const record = { body, response: undefined as OpenAIResponseBody | undefined, error: undefined as unknown }
@@ -679,12 +684,15 @@ export class OpenAIChatProvider implements ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): AsyncGenerator<ChatStreamChunk, void, unknown> {
     const body = this.buildBody({
       modelId: params.modelId,
       messages: params.messages,
       llmParams: params.params,
       stream: true,
+      tools: params.tools,
     })
 
     if (!this.config.apiKey) {

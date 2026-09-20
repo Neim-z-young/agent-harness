@@ -223,6 +223,30 @@ describe('@harness/provider-openai', () => {
       }
     })
 
+    it('params.tools（本 agent 白名单）优先于全局 toolsGetter', async () => {
+      // 回归：此前 toolsGetter 是全局注册表，模型会看到它无权执行的工具
+      const globalTool = makeTool('global_tool', '全局注册表里的工具')
+      const agentTool = makeTool('agent_tool', '本 agent 白名单里的工具')
+      const p = new OpenAIChatProvider({ apiKey: 'k' }, () => [globalTool])
+      let captured: any
+      const restore = installMock(async ({ init }) => {
+        captured = JSON.parse(init.body as string)
+        return new Response(okResponse('ok'))
+      })
+      try {
+        await p.complete({
+          providerId: 'o',
+          messages: [{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'x' }], createdAt: 1 }],
+          params: {},
+          tools: [agentTool],
+        })
+        expect(captured.tools).toHaveLength(1)
+        expect(captured.tools[0].function.name).toBe('agent_tool')
+      } finally {
+        restore()
+      }
+    })
+
     it('不带 __jsonSchema 的工具回落到宽松 schema', async () => {
       const loose = defineTool({
         id: 'loose',

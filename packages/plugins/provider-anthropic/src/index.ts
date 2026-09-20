@@ -321,13 +321,15 @@ export class AnthropicChatProvider implements ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): Promise<ChatCompletionOutput> {
     const { system, rest } = extractSystemPrompt(params.messages)
     const messages = toAnthropicMessages(rest)
 
     const model = params.modelId ?? this.config.defaultModel
     const llmParams = params.params ?? {}
-    const toolsDefs = this.toolsGetter().map(toolToAnthropicDef)
+    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToAnthropicDef)
 
     const body: AnthropicRequestBody = {
       model,
@@ -447,13 +449,15 @@ export class AnthropicChatProvider implements ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): AsyncGenerator<ChatStreamChunk, void, unknown> {
     const { system, rest } = extractSystemPrompt(params.messages)
     const messages = toAnthropicMessages(rest)
 
     const model = params.modelId ?? this.config.defaultModel
     const llmParams = params.params ?? {}
-    const toolsDefs = this.toolsGetter().map(toolToAnthropicDef)
+    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToAnthropicDef)
 
     const body: AnthropicRequestBody = {
       model,

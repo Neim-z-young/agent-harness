@@ -315,11 +315,13 @@ export class GeminiChatProvider implements ChatProvider {
   private buildBody(params: {
     messages: Message[]
     llmParams: Record<string, unknown>
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): GeminiRequestBody {
     const { system, rest } = extractSystem(params.messages)
     const contents = toGeminiContents(rest)
     const llmParams = params.llmParams ?? {}
-    const toolsDefs = this.toolsGetter().map(toolToGeminiDecl)
+    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToGeminiDecl)
 
     const body: GeminiRequestBody = {
       contents,
@@ -369,9 +371,11 @@ export class GeminiChatProvider implements ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): Promise<ChatCompletionOutput> {
     const model = params.modelId ?? this.config.defaultModel
-    const body = this.buildBody({ messages: params.messages, llmParams: params.params })
+    const body = this.buildBody({ messages: params.messages, llmParams: params.params, tools: params.tools })
 
     const record = {
       body,
@@ -494,9 +498,11 @@ export class GeminiChatProvider implements ChatProvider {
     signal?: AbortSignal
     sessionId?: string
     agentId?: string
+    /** 本 agent 实际可用的工具（core 按 agent 白名单传入） */
+    tools?: Tool[]
   }): AsyncGenerator<ChatStreamChunk, void, unknown> {
     const model = params.modelId ?? this.config.defaultModel
-    const body = this.buildBody({ messages: params.messages, llmParams: params.params })
+    const body = this.buildBody({ messages: params.messages, llmParams: params.params, tools: params.tools })
 
     if (!this.config.apiKey) {
       throw new Error(
