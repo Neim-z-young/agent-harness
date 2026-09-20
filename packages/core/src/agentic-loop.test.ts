@@ -179,8 +179,17 @@ function textScript(text: string): ChatStreamChunk[] {
 }
 
 /** ask 一律放行的权限引擎（用于验证「用户允许时不误伤」） */
+/**
+ * 权限替身：任何 `ask()` 都放行 —— 等价于 CLI 的 `--permission allow-all`。
+ *
+ * `asks` 计数用于断言「死循环守卫**不再**依赖权限引擎」：守卫曾被 `permission.ask()` 架空
+ * （实测会话 s_1789862291973_b0c2s：整步重复判据命中 5 步，allow-all 下全部放行，
+ * 25 步空转 21 秒无拦截）。
+ */
 class AllowAskEngine extends DefaultPermissionEngine {
+  asks = 0
   override async ask() {
+    this.asks += 1
     return { behavior: 'allow' as const }
   }
 }
@@ -240,28 +249,29 @@ describe('S2 续轮判据与保护', () => {
     await h.stop()
   })
 
-  it('doom-loop 且用户允许 ⇒ 继续执行，不误伤合法重试', async () => {
+  it('doom-loop：即使权限引擎一律放行（allow-all）也必须硬中断', async () => {
     const provider = scriptedProvider([
       toolCallScript('same'),
       toolCallScript('same'),
       toolCallScript('same'),
       textScript('收尾'),
     ])
-    const h = await createHarness({
-      agents: [agent],
-      chatProvider: provider,
-      permission: new AllowAskEngine({ '*': 'allow' }),
-    })
+    const engine = new AllowAskEngine({ '*': 'allow' })
+    const h = await createHarness({ agents: [agent], chatProvider: provider, permission: engine })
     h.tools.register(echoTool)
     const sess = await h.session.create()
 
     const events = await collect(h.session.promptStream(sess.id, 'retry'))
     const results = events.filter((e) => e.type === 'tool_call_result')
 
-    // 三次都真的执行了（用户放行），之后模型给出文本收尾
+    // 第 3 次调用被硬拦：只有前两次真的执行，第 3 次记 DOOM_LOOP
     expect(results).toHaveLength(DOOM_LOOP_THRESHOLD)
-    expect(results.every((r) => r.isError !== true)).toBe(true)
-    expect(provider.calls).toBe(4)
+    expect(results.filter((r) => r.isError !== true)).toHaveLength(DOOM_LOOP_THRESHOLD - 1)
+    expect(JSON.stringify(results[results.length - 1]?.result)).toContain('DOOM_LOOP')
+    // 关键：守卫不再咨询权限引擎（否则 allow-all 会把它变成"放行"）
+    expect(engine.asks).toBe(0)
+    // 拦下即收手：模型只被调用 3 次，第 4 步的「收尾」剧本不会被用到
+    expect(provider.calls).toBe(DOOM_LOOP_THRESHOLD)
     await h.stop()
   })
 
@@ -544,25 +554,29 @@ describe('审查修复：整步重复（每步多个调用的漏检）', () => {
     await h.stop()
   })
 
-  it('整步重复但用户放行 ⇒ 继续执行，不误伤合法重试', async () => {
+  it('整步重复：即使权限引擎一律放行（allow-all）也必须硬中断', async () => {
     const provider = scriptedProvider([
       parallelScript('p'),
       parallelScript('p'),
       parallelScript('p'),
       textScript('收尾'),
     ])
-    const h = await createHarness({
-      agents: [agent],
-      chatProvider: provider,
-      permission: new AllowAskEngine({ '*': 'allow' }),
-    })
+    const engine = new AllowAskEngine({ '*': 'allow' })
+    const h = await createHarness({ agents: [agent], chatProvider: provider, permission: engine })
     h.tools.register(echoTool)
     const sess = await h.session.create()
 
     const events = await collect(h.session.promptStream(sess.id, 'retry'))
     const results = events.filter((e) => e.type === 'tool_call_result')
-    expect(results.every((r) => r.isError !== true)).toBe(true)
-    expect(provider.calls).toBe(4)
+
+    // 前两步的 4 次正常执行；第 3 步整步被拦（两个调用都记 DOOM_LOOP）
+    expect(results.filter((r) => r.isError !== true)).toHaveLength(2 * (DOOM_LOOP_THRESHOLD - 1))
+    const errors = results.filter((r) => r.isError === true)
+    expect(errors).toHaveLength(2)
+    expect(errors.every((r) => JSON.stringify(r.result).includes('DOOM_LOOP'))).toBe(true)
+    // 关键：整步守卫同样不再咨询权限引擎
+    expect(engine.asks).toBe(0)
+    expect(provider.calls).toBe(DOOM_LOOP_THRESHOLD)
     await h.stop()
   })
 

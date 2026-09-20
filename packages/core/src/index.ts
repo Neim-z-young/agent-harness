@@ -2083,19 +2083,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 整步重复检测 —— 补「每步多个调用」的漏检：
     // 每步 2 个调用时全局序列是 A,B,A,B,A,B…，尾部连续 3 个永不相同，
     // 单看「同一调用连续 N 次」恒不命中。按步聚合后 A|B 连续 3 步相同即可拦下。
-    // 只征求一次确认（而非每个工具一次）；用户放行则整步放行。
+    //
+    // ⚠️ 判据命中即**硬中断**，不征求权限（见下方两处 DOOM_LOOP）：这不是「能不能执行」的权限问题，
+    // 而是「已经在空转」的资源保护。交给权限引擎裁决会被 `--permission allow-all`（或已记住的
+    // allow 规则）架空 —— 实测会话 s_1789862291973_b0c2s：判据命中 5 步，allow-all 下全部放行，
+    // 25 步空转 21 秒无任何拦截，最后靠模型自己吐了个空步才收尾。
     const stepRepeat = planned.length > 0 && isDoomLoop([...priorStepSigs, stepSig])
-    let stepRepeatAllowed = false
-    if (stepRepeat) {
-      const decision = (await this.deps.permission.ask({
-        toolKey: toolCalls[0].toolId,
-        patterns: [stepSig],
-        input: planned[0].parsedInput,
-        from: `doom-loop:${agentId}`,
-      } as ToolPermissionRequest)) as ToolPermissionDecision
-      // 确认期间用户可能已按 Ctrl-C：批准也要让位于中断（否则"已中断却仍执行"）
-      stepRepeatAllowed = !signal?.aborted && decision?.behavior === 'allow'
-    }
 
     for (let i = 0; i < toolCalls.length; i++) {
       const tc = toolCalls[i]
@@ -2128,13 +2121,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
         continue
       }
 
-      // 整步重复且用户未放行 ⇒ 本步所有调用都不执行（同样挡在执行之前）
-      if (stepRepeat && !stepRepeatAllowed) {
+      // 整步重复 ⇒ 本步所有调用都不执行（同样挡在执行之前）
+      if (stepRepeat) {
         doomLoopTripped = true
         resultPart.result = {
           message:
             `检测到重复调用：连续 ${DOOM_LOOP_THRESHOLD} 步都在发起完全相同的一组工具调用，` +
-            '已中断以避免陷入死循环。请调整策略或提供更多信息后重试。',
+            '已自动中断本轮以避免死循环。若确有需要，请换一种入参或策略后重试。',
           code: 'DOOM_LOOP',
         }
         resultPart.isError = true
@@ -2149,54 +2142,31 @@ export class AgentRuntimeImpl implements AgentRuntime {
         continue
       }
 
-      // doom-loop 检测挡在**执行之前**：第 3 次不再真的跑一遍，而是交给人确认；
-      // 拒绝则中断本步剩余调用并由循环终止（不再续轮）。
+      // doom-loop 检测挡在**执行之前**：第 threshold 次不再真的跑一遍，直接中断（硬保护，
+      // 不问权限 —— 见 stepRepeat 处的说明）。命中后由循环终止，不再续轮。
       sigs.push(sig)
       toolSigs.push(sig)
 
       yield { type: 'tool_call_start', toolUseId: tc.toolUseId, toolId: tc.toolId, input: parsedInput }
 
       if (isDoomLoop(sigs)) {
-        const decision = (await this.deps.permission.ask({
-          toolKey: tc.toolId,
-          patterns: [sig],
-          input: parsedInput,
-          from: `doom-loop:${agentId}`,
-        } as ToolPermissionRequest)) as ToolPermissionDecision
-        // 确认期间用户可能已按 Ctrl-C：批准也须让位于中断（否则"已中断却仍真的执行第 3 次"）
-        if (signal?.aborted) {
-          aborted = true
-          resultPart.result = { message: '执行已中断，该工具未运行。', code: 'ABORTED' }
-          resultPart.isError = true
-          assistant.parts.push(resultPart)
-          yield {
-            type: 'tool_call_result',
-            toolUseId: tc.toolUseId,
-            toolId: tc.toolId,
-            result: resultPart.result,
-            isError: true,
-          }
-          break
+        doomLoopTripped = true
+        resultPart.result = {
+          message:
+            `检测到重复调用：同一工具（${tc.toolId}）与完全相同的入参已连续 ${DOOM_LOOP_THRESHOLD} 次，` +
+            '已自动中断本轮以避免死循环。若确有需要，请换一种入参或策略后重试。',
+          code: 'DOOM_LOOP',
         }
-        if (decision?.behavior !== 'allow') {
-          doomLoopTripped = true
-          resultPart.result = {
-            message:
-              `检测到重复调用：同一工具（${tc.toolId}）与完全相同的入参已连续 ${DOOM_LOOP_THRESHOLD} 次，` +
-              '已中断以避免陷入死循环。请调整策略或提供更多信息后重试。',
-            code: 'DOOM_LOOP',
-          }
-          resultPart.isError = true
-          assistant.parts.push(resultPart)
-          yield {
-            type: 'tool_call_result',
-            toolUseId: tc.toolUseId,
-            toolId: tc.toolId,
-            result: resultPart.result,
-            isError: true,
-          }
-          break
+        resultPart.isError = true
+        assistant.parts.push(resultPart)
+        yield {
+          type: 'tool_call_result',
+          toolUseId: tc.toolUseId,
+          toolId: tc.toolId,
+          result: resultPart.result,
+          isError: true,
         }
+        break
       }
 
       if (!tool) {
