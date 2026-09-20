@@ -2577,8 +2577,14 @@ export class HarnessImpl implements Harness {
           }
         }
 
-        // 2. 仅当有 Skill 加载成功时才注册注入插件（避免空 Hook）
-        if (this.skillManager.all().length > 0) {
+        // 2. 注册注入插件。
+        //
+        // 判据是「**宿主编配了技能目录**」（= 技能系统启用），**不是**「当前有没有技能」：
+        // 技能可能在会话中途被锻造/新增（`@harness/skill-forge` 落盘后 reload 进 manager），
+        // 若 init 时为空就不注册，之后新增的技能**永远进不了提示词** —— 真机实测过：空 skills
+        // 目录启动 → 锻造并绑定白名单 → 后续每轮 system 指纹完全不变（技能从未注入）。
+        // 未配技能目录的宿主（多为单测/内嵌最小用法）不注册，避免污染插件列表。
+        if ((this.options.skillDirs?.length ?? 0) > 0) {
           const skillManager = this.skillManager
           const agentAccessor = this.agent
           await this.plugin.loadInternal([{
