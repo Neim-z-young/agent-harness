@@ -340,6 +340,15 @@ export interface HarnessConfig {
     crash?: boolean
     /** 跨会话匿名 user id（缺省从 `.config-key` 派生，仅供聚合，非明文） */
     userId?: string
+    /** 可选 OTLP 上报：endpoint 非空才启用（collector 根地址，如 `https://collector:4318`） */
+    otlp?: {
+      /** 总开关（默认 true，endpoint 非空即启用） */
+      enabled?: boolean
+      /** collector 端点；为空则完全不上报 */
+      endpoint?: string
+      /** 附加请求头（如 API key） */
+      headers?: Record<string, string>
+    }
   }
   /**
    * ACP 上下文压缩配置（`compression.enabled: true` 开启才装配 @harness/acp-context 插件）。
@@ -1639,8 +1648,21 @@ export function telemetryPluginOptions(c: HarnessConfig['telemetry']): Record<st
   if (typeof c.debounceMs === 'number' && Number.isInteger(c.debounceMs) && c.debounceMs >= 0) out.debounceMs = c.debounceMs
   if (typeof c.crash === 'boolean') out.crash = c.crash
   if (typeof c.userId === 'string' && c.userId.length > 0) out.userID = c.userId
+  if (c.otlp && typeof c.otlp === 'object') {
+    const o: Record<string, unknown> = {}
+    if (typeof c.otlp.enabled === 'boolean') o.enabled = c.otlp.enabled
+    if (typeof c.otlp.endpoint === 'string' && c.otlp.endpoint.length > 0) o.endpoint = c.otlp.endpoint
+    if (c.otlp.headers && typeof c.otlp.headers === 'object' && !Array.isArray(c.otlp.headers)) {
+      const headers: Record<string, string> = {}
+      for (const [k, v] of Object.entries(c.otlp.headers)) if (typeof v === 'string') headers[k] = v
+      if (Object.keys(headers).length) o.headers = headers
+    }
+    out.otlp = o as import('@harness/telemetry').OtlpOptions
+  }
   return out
 }
+
+const TELEMETRY_OTLP_KEYS: Record<string, true> = { enabled: true, endpoint: true, headers: true }
 
 const TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['telemetry']>, true> = {
   enabled: true,
@@ -1648,6 +1670,7 @@ const TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['telemetry']>, true
   debounceMs: true,
   crash: true,
   userId: true,
+  otlp: true,
 }
 
 /**
@@ -1670,6 +1693,21 @@ export function checkTelemetryConfig(c: unknown): string[] {
   }
   if (c.crash !== undefined && typeof c.crash !== 'boolean') {
     out.push(`telemetry.crash 应为布尔值，已忽略该项`)
+  }
+  // otlp 子段（白名单里的 otlp 是被 type 保护的；这里只查子键）
+  if (isPlainObject(c.otlp)) {
+    for (const k of collectUnknown(c.otlp, Object.keys(TELEMETRY_OTLP_KEYS), 'telemetry.otlp')) {
+      out.push(`${k} 未被识别，该配置不会生效`)
+    }
+    if (c.otlp.enabled !== undefined && typeof c.otlp.enabled !== 'boolean') {
+      out.push(`telemetry.otlp.enabled 应为布尔值，已忽略该项`)
+    }
+    if (c.otlp.endpoint !== undefined && (typeof c.otlp.endpoint !== 'string' || c.otlp.endpoint.length === 0)) {
+      out.push(`telemetry.otlp.endpoint 应为非空字符串，已忽略该项`)
+    }
+    if (c.otlp.headers !== undefined && !isPlainObject(c.otlp.headers)) {
+      out.push(`telemetry.otlp.headers 应为对象，已忽略该项`)
+    }
   }
   return out
 }
@@ -1739,14 +1777,14 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
     for (const issue of checkMemoryConfig(m)) lines.push(`  - ${issue}`)
     if (m && !declared) lines.push('  - memory 段已写但未启用 ⇒ 该段不会生效（需 plugins 里加 "memory"）')
   }
-  // 通用遥测：报「装没装」「开没开」「崩溃兜底挂没挂」。
+  // 通用遥测：报「装没装」「开没开」「崩溃兜底挂没挂」「OTLP 上不上报」。
   {
     const t = cfg.telemetry
     const opt = telemetryPluginOptions(t)
     const on = opt && opt.enabled !== false
     lines.push(
       t
-        ? `遥测（telemetry）：${on ? '已启用 · ' + (opt?.pathBuilder ? '自定义路径' : '会话级 dataDir/sessions/*.telemetry.jsonl') : '已装配但关闭（telemetry.enabled: false）'}${opt?.crash === false ? ' · 崩溃兜底已关' : ' · 崩溃兜底开启'}`
+        ? `遥测（telemetry）：${on ? '已启用 · ' + (opt?.pathBuilder ? '自定义路径' : '会话级 dataDir/sessions/*.telemetry.jsonl') : '已装配但关闭（telemetry.enabled: false）'}${opt?.crash === false ? ' · 崩溃兜底已关' : ' · 崩溃兜底开启'}${opt?.otlp ? ' · OTLP 上报开启（' + String((opt.otlp as { endpoint?: string })?.endpoint ?? '?') + '）' : ''}`
         : '遥测（telemetry）：未启用（config.json 写 telemetry 段开启；默认不生成遥测文件）',
     )
     for (const issue of checkTelemetryConfig(t)) lines.push(`  - ${issue}`)

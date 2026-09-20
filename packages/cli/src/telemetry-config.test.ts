@@ -26,6 +26,13 @@ describe('checkTelemetryConfig', () => {
     expect(checkTelemetryConfig({ path: '' }).join()).toContain('telemetry.path 应为非空字符串')
     expect(checkTelemetryConfig({ crash: 'x' }).join()).toContain('telemetry.crash 应为布尔值')
   })
+
+  it('otlp 未知键与非法类型提示', () => {
+    expect(checkTelemetryConfig({ otlp: { unknow: 1 } }).join()).toContain('telemetry.otlp.unknow 未被识别')
+    expect(checkTelemetryConfig({ otlp: { enabled: 'x' } }).join()).toContain('telemetry.otlp.enabled 应为布尔值')
+    expect(checkTelemetryConfig({ otlp: { endpoint: 42 } }).join()).toContain('telemetry.otlp.endpoint 应为非空字符串')
+    expect(checkTelemetryConfig({ otlp: { headers: 'x' } }).join()).toContain('telemetry.otlp.headers 应为对象')
+  })
 })
 
 describe('telemetryPluginOptions', () => {
@@ -46,6 +53,14 @@ describe('telemetryPluginOptions', () => {
   it('非法值丢弃', () => {
     expect(telemetryPluginOptions({ debounceMs: '3' as never, enabled: 'x' as never })).toEqual({})
   })
+
+  it('otlp 合法值映射', () => {
+    const o = telemetryPluginOptions({ otlp: { endpoint: 'https://c:4318', enabled: true, headers: { a: 'b' } } })
+    const otlp = o!.otlp as { endpoint: string; enabled: boolean; headers: Record<string, string> }
+    expect(otlp.endpoint).toBe('https://c:4318')
+    expect(otlp.enabled).toBe(true)
+    expect(otlp.headers).toEqual({ a: 'b' })
+  })
 })
 
 describe('buildConfigOverview：telemetry 段', () => {
@@ -64,6 +79,12 @@ describe('buildConfigOverview：telemetry 段', () => {
     const off = buildConfigOverview({ model: 'm', telemetry: { enabled: false, crash: false } }, 'mock')
     expect(off).toContain('已装配但关闭')
     expect(off).toContain('崩溃兜底已关')
+  })
+
+  it('OTLP 开启时展示端点', () => {
+    const on = buildConfigOverview({ model: 'm', telemetry: { otlp: { endpoint: 'https://c:4318' } } }, 'mock')
+    expect(on).toContain('OTLP 上报开启')
+    expect(on).toContain('https://c:4318')
   })
 })
 

@@ -1,6 +1,6 @@
 # Agent Harness 遥测（Telemetry）方案
 
-> 状态：方案稿（v0.1）· 第 1 步已落地（`@harness/telemetry` 建包 + bus→envelope→本地 writer + cli 装配，见 `docs/development-log.md` 续 167）
+> 状态：方案稿（v0.1）· 第 1 步已落地（`@harness/telemetry` 建包 + bus→envelope→本地 writer + cli 装配，见 `docs/development-log.md` 续 167）；OTLP 最小直连已落地（续 168）
 > 适用范围：本仓库（XiaoZhi-new / agent-harness）的 CLI 与 core 宿主
 > 设计原则：**本地采集为主 + 可选 OTLP 上报**；插件化实现，不侵入 core/CLI 主逻辑；默认零隐私负担，用户可控。
 

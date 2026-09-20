@@ -28,11 +28,13 @@ import { createJsonlWriter, type JsonlWriter } from './writer.js'
 import { makeEnvelope, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
 import { mapBusEvent } from './map.js'
 import { createCrashGuard, type CrashState } from './crash.js'
+import { createOtlpExporter, type OtlpOptions } from './otlp.js'
 
 export * from './envelope.js'
 export * from './writer.js'
 export * from './map.js'
 export * from './crash.js'
+export * from './otlp.js'
 
 export interface TelemetryOptions {
   /** 总开关；false 时完全 no-op（不写盘、不订阅） */
@@ -47,6 +49,8 @@ export interface TelemetryOptions {
   crash?: boolean
   /** 跨会话匿名 user id（缺省从 `.config-key` 派生） */
   userID?: string
+  /** 可选 OTLP 上报：endpoint 非空才启用（对齐 OpenCode，冷路径零成本） */
+  otlp?: OtlpOptions
 }
 
 export interface TelemetryController {
@@ -89,6 +93,9 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
   // 崩溃兜底用：内存里最后已知的会话状态
   let lastKnown: CrashState = {}
 
+  // 可选 OTLP 上报（endpoint 非空才启用；关闭时 no-op）
+  const otlpExporter = createOtlpExporter(opts.otlp ?? { enabled: false })
+
   // 单活跃 writer（跟随会话边界切换；会话分摊 writer 不保留，边界处切换）
   const UNSET = '\u0000uninitialized'
   let activeSessionId: string = UNSET
@@ -108,13 +115,18 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
     if (typeof ev.attrs.round === 'number') lastKnown.round = ev.attrs.round
     lastKnown.lastKind = ev.kind
     writer.write(ev)
+    // OTLP 上报与本地同步写：本地始终落盘，OTLP 仅添加上报（可单独关闭）
+    otlpExporter.push(ev)
   }
 
   const record = (kind: string, attrs?: TelemetryAttrs, metrics?: Record<string, number>) => {
     persist(makeEnvelope(kind, { userID, ...attrs }, metrics))
   }
 
-  const flush = () => writer.flush()
+  const flush = () => {
+    writer.flush()
+    void otlpExporter.flush()
+  }
 
   const onBusEvent = (ev: BusEventRecord) => {
     if (!enabled) return
@@ -157,6 +169,7 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
       unsubscribe?.()
       crashGuard?.detach()
       flush()
+      otlpExporter.close()
     },
   }
 

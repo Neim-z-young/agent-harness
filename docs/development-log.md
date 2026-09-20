@@ -1,5 +1,23 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 168）遥测 OTLP 最小直连导出
+
+在 `@harness/telemetry` 上加可选 OTLP 出口（对齐 `reference/opencode-dev/.../otlp.ts` 思路），用户已定「最小直连 batch log exporter、不引整套 SDK」。
+
+**`src/otlp.ts`**：只发 `v1/logs`（不做 traces）；endpoint 为空 → 整体 no-op（冷路径零成本）。序列化走 OTLP/HTTP `application/json` 的 `ExportLogsServiceRequest`，不引入 protobuf 依赖：
+- `toOtlpLogRecord`：envelope → LogRecord（`timeUnixNano`、`severity`、`body`、`attributes`），异常类 kind（`error|fail|crash|doomloop|deny`）自动标 ERROR 级便于远端告警；
+- `toExportRequest`：批量包 resourceLogs 结构（纯函数，可单测）；
+- `createOtlpExporter`：batch + debounce 合并请求、`AbortController` 超时、失败静默丢弃本批。
+
+**接线**：`createTelemetryService` 增加 `otlp` 选项，`persist` 双写（本地始终落盘 + OTLP 上报），`flush()` 联动发送、`uninstall` close。**本地行为零变化**，OTLP 仅作添加上报。
+
+**cli**：`telemetry.otlp {enabled, endpoint, headers}` 逐项显式映射 + 白名单校验（未知键/非法类型在 `--check-config`/概览、boot WARN 双处暴露），概览加 `OTLP 上报开启（endpoint）`。
+
+**测试**：telemetry 包 +8 例（otlp 序列化/severity/close）共 23 例；cli +3 例（otlp 校验/映射/概览）共 375 例，全过；全量 typecheck 绿。
+真机联调：OTLP/HTTP 收 JSON 还是 protobuf 取决于 collector 配置，本地无法联调；已留「真机为准」校验点（见规划 §6 注释）。
+
+残留待办：ACP 遥测迁移到本包（`telemetry.acp.*`）、异常遥测的权限/doomloop 专项埋点（当前由通用 `telemetry.bus.*` 覆盖，未细分 kind）。
+
 ## 2026-09-20（续 167）通用遥测插件 `@harness/telemetry`（本地采集 + 可选 OTLP）
 
 按 `docs/telemetry-plan.md` 落地第一步：通用遥测设施 + cli 装配。用户已定三项决策：**会话级**存储、
