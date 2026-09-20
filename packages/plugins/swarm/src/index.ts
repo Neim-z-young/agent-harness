@@ -38,7 +38,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { AgentPlugin, SwarmCapability } from '@harness/plugin'
 import type { AgentRuntime, SessionManager } from '@harness/core'
-import { defineTool, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
+import { defineTool, withJsonSchema, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
 
 // ===== 基础类型与错误 =====
 
@@ -1581,7 +1581,16 @@ export function createTeamCreateTool(getTeamManager: () => TeamManager): Tool<Te
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TeamCreateInput>(),
+    inputSchema: withJsonSchema(makeSchema<TeamCreateInput>(), {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: '团队名（唯一，作为目录名会做 sanitize）' },
+        description: { type: 'string', description: '团队目标/职责描述（可选）' },
+        agentType: { type: 'string', description: 'lead 的 Agent 类型（默认当前 agentId）' },
+      },
+      required: ['name'],
+      additionalProperties: false,
+    }),
     permission: { key: 'team_create', extractPatterns: (input) => [input.name] },
     async call(input, ctx) {
       try {
@@ -1628,7 +1637,12 @@ export function createTeamDeleteTool(getTeamManager: () => TeamManager): Tool<Te
     isConcurrencySafe: () => false,
     isDestructive: () => true,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TeamDeleteInput>(),
+    inputSchema: withJsonSchema(makeSchema<TeamDeleteInput>(), {
+      type: 'object',
+      properties: { name: { type: 'string', description: '要删除的团队名' } },
+      required: ['name'],
+      additionalProperties: false,
+    }),
     permission: { key: 'team_delete', extractPatterns: (input) => [input.name] },
     async call(input) {
       try {
@@ -1668,7 +1682,12 @@ export function createTeamStatusTool(
     isConcurrencySafe: () => true,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TeamStatusInput>(),
+    inputSchema: withJsonSchema(makeSchema<TeamStatusInput>(), {
+      type: 'object',
+      properties: { name: { type: 'string', description: '团队名' } },
+      required: ['name'],
+      additionalProperties: false,
+    }),
     permission: { key: 'team_status', extractPatterns: (input) => [input.name] },
     async call(input) {
       const team = await getTeamManager().get(input.name)
@@ -1722,7 +1741,18 @@ export function createSendTeammateMessageTool(getMailbox: () => TeammateMailbox)
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<SendTeammateMessageInput>(),
+    inputSchema: withJsonSchema(makeSchema<SendTeammateMessageInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        to: { type: 'string', description: '收件人成员名；"lead" 表示队长' },
+        message: { type: 'string', description: '消息内容' },
+        summary: { type: 'string', description: '一句话摘要（用于收件箱列表，可选）' },
+        type: { type: 'string', enum: ['message', 'task_notification', 'permission_response', 'shutdown_request', 'shutdown_approved', 'shutdown_rejected', 'idle_notification'], description: '消息类型（默认 message）' },
+      },
+      required: ['team', 'to', 'message'],
+      additionalProperties: false,
+    }),
     permission: { key: 'send_teammate_message', extractPatterns: (input) => [input.team, input.to] },
     async call(input, ctx) {
       try {
@@ -1786,7 +1816,17 @@ export function createShutdownDecisionTool(
     isConcurrencySafe: () => false,
     isDestructive: () => decision === 'approved',
     requiresUserInteraction: false,
-    inputSchema: makeSchema<ShutdownDecisionInput>(),
+    inputSchema: withJsonSchema(makeSchema<ShutdownDecisionInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        memberName: { type: 'string', description: '团队成员名（默认当前 agentId；关停目标按此查找 registry）' },
+        requestId: { type: 'string', description: '关联的 shutdown_request 的 requestId' },
+        reason: { type: 'string', description: '批准/拒绝的理由（可选）' },
+      },
+      required: ['team'],
+      additionalProperties: false,
+    }),
     permission: { key: id, extractPatterns: (input) => [input.team] },
     async call(input, ctx) {
       try {
@@ -1827,7 +1867,17 @@ export function createTaskCreateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TaskCreateInput>(),
+    inputSchema: withJsonSchema(makeSchema<TaskCreateInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        title: { type: 'string', description: '任务标题' },
+        description: { type: 'string', description: '任务详细说明（做什么、验收标准，可选）' },
+        blockedBy: { type: 'array', items: { type: 'string' }, description: '依赖任务 id 列表（全部完成后才可认领，可选）' },
+      },
+      required: ['team', 'title'],
+      additionalProperties: false,
+    }),
     permission: { key: 'task_create', extractPatterns: (input) => [input.team] },
     async call(input) {
       try {
@@ -1857,7 +1907,15 @@ export function createTaskListTool(getTaskPlane: () => TaskListPlane): Tool<Task
     isConcurrencySafe: () => true,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TaskListInput>(),
+    inputSchema: withJsonSchema(makeSchema<TaskListInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        status: { type: 'string', enum: ['available', 'in_progress', 'completed', 'failed', 'cancelled'], description: '按状态过滤（可选，不传返回全部）' },
+      },
+      required: ['team'],
+      additionalProperties: false,
+    }),
     permission: { key: 'task_list', extractPatterns: (input) => [input.team] },
     async call(input) {
       try {
@@ -1890,7 +1948,16 @@ export function createTaskClaimTool(getTaskPlane: () => TaskListPlane): Tool<Tas
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TaskClaimInput>(),
+    inputSchema: withJsonSchema(makeSchema<TaskClaimInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        taskId: { type: 'string', description: '要认领的任务 id' },
+        agentName: { type: 'string', description: '认领成员名（默认当前 agentId）' },
+      },
+      required: ['team', 'taskId'],
+      additionalProperties: false,
+    }),
     permission: { key: 'task_claim', extractPatterns: (input) => [input.team, input.taskId] },
     async call(input, ctx) {
       try {
@@ -1923,7 +1990,17 @@ export function createTaskUpdateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TaskUpdateInput>(),
+    inputSchema: withJsonSchema(makeSchema<TaskUpdateInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        taskId: { type: 'string', description: '任务 id' },
+        status: { type: 'string', enum: ['available', 'in_progress', 'completed', 'failed', 'cancelled'], description: '目标状态（带生命周期校验）' },
+        result: { type: 'string', description: '执行结果/结论（写入任务记录）' },
+      },
+      required: ['team', 'taskId'],
+      additionalProperties: false,
+    }),
     permission: { key: 'task_update', extractPatterns: (input) => [input.team, input.taskId] },
     async call(input) {
       try {
@@ -1959,7 +2036,15 @@ export function createTaskStopTool(getTaskPlane: () => TaskListPlane): Tool<Task
     isConcurrencySafe: () => false,
     isDestructive: () => true,
     requiresUserInteraction: false,
-    inputSchema: makeSchema<TaskStopInput>(),
+    inputSchema: withJsonSchema(makeSchema<TaskStopInput>(), {
+      type: 'object',
+      properties: {
+        team: { type: 'string', description: '团队名' },
+        taskId: { type: 'string', description: '要停止的任务 id' },
+      },
+      required: ['team', 'taskId'],
+      additionalProperties: false,
+    }),
     permission: { key: 'task_stop', extractPatterns: (input) => [input.team, input.taskId] },
     async call(input) {
       try {

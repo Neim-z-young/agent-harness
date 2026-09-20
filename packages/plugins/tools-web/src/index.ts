@@ -12,7 +12,7 @@
  * - isReadOnly：逻辑上不写本地，但涉及网络，声明为非只读但非破坏性
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, withJsonSchema, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import { isIP } from 'node:net'
 
@@ -101,7 +101,19 @@ const DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 export const webFetchTool = defineTool<WebFetchInput, WebFetchOutput>({
   id: 'web_fetch',
   description: '通过 HTTP(S) 抓取 URL 内容。支持自定义方法/头/体，返回 text / json / base64。默认禁止访问私有网络（SSRF 防护）。',
-  inputSchema: makeSchema<WebFetchInput>(),
+  inputSchema: withJsonSchema(makeSchema<WebFetchInput>(), {
+    type: 'object',
+    properties: {
+      url: { type: 'string', description: '要抓取的 URL（仅 http/https；私有网络被 SSRF 防护拒绝）' },
+      method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'PATCH', 'OPTIONS'], description: 'HTTP 方法（默认 GET）' },
+      headers: { type: 'object', description: '请求头', additionalProperties: { type: 'string' } },
+      body: { description: '请求体（POST/PUT/PATCH 等）：对象会 JSON 序列化，字符串直接传' },
+      format: { type: 'string', enum: ['text', 'json', 'base64'], description: '返回格式：text 文本 / json 解析对象 / base64 原始字节' },
+      timeoutMs: { type: 'number', description: '超时毫秒（默认 15000）' },
+    },
+    required: ['url'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => false,
   isDestructive: () => false,
   isConcurrencySafe: () => true,

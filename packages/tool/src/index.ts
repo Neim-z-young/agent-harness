@@ -25,7 +25,8 @@ export type Awaitable<T> = T | Promise<T>
  */
 export interface JsonSchemaObject {
   type: 'object'
-  properties: Record<string, unknown>
+  /** 常规单模式必填；用 oneOf 表达多模式（联合入参，如 code_semantic_edit）时可省略 */
+  properties?: Record<string, unknown>
   required?: string[]
   additionalProperties?: boolean
   [k: string]: unknown

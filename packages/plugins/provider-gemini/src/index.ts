@@ -235,12 +235,8 @@ function toolToGeminiDecl(tool: Tool): GeminiFunctionDeclaration {
     return {
       name: tool.id,
       description,
-      parameters: {
-        type: schema.type ?? 'object',
-        properties: schema.properties ?? {},
-        required: Array.isArray(schema.required) ? schema.required : undefined,
-        additionalProperties: schema.additionalProperties ?? true,
-      },
+      // 整体转发：保留 oneOf 等关键字（同 openai，勿逐字段挑选）
+      parameters: { ...schema, type: schema.type ?? 'object' },
     }
   }
   // 兜底：宽松对象 schema

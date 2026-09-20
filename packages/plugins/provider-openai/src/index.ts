@@ -371,12 +371,9 @@ function toolToOpenAIDef(tool: Tool): OpenAIToolDef {
       function: {
         name: tool.id,
         description: fullDescription(tool),
-        parameters: {
-          type: 'object',
-          properties: schema.properties ?? {},
-          required: Array.isArray(schema.required) ? schema.required : undefined,
-          additionalProperties: schema.additionalProperties ?? true,
-        },
+        // 整体转发（不逐字段挑选）：保留 oneOf/anyOf/items 等 JSON Schema 关键字，
+        // 否则联合入参（如 code_semantic_edit 的三种编辑模式）会被静默剥掉
+        parameters: { ...schema, type: schema.type ?? 'object' },
       },
     }
   }

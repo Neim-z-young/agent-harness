@@ -7,7 +7,7 @@
  */
 
 import { resolve, isAbsolute } from 'node:path'
-import { defineTool, Schema, Tool, ToolResult, ToolContext } from '@harness/tool'
+import { defineTool, withJsonSchema, Schema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import {
   CodeIntelIndex,
   execSemanticEdit,
@@ -58,7 +58,13 @@ export const codeSymbolsTool = (index: CodeIntelIndex): Tool<CodeSymbolsInput, C
   defineTool<CodeSymbolsInput, CodeSymbolsOutput>({
     id: 'code_symbols',
     description: codeSymbolsPrompt.trim(),
-    inputSchema: makeSchema<CodeSymbolsInput>(),
+    inputSchema: withJsonSchema(makeSchema<CodeSymbolsInput>(), {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: '要扫描的文件或目录（相对 cwd 或绝对路径，默认 cwd）' },
+      },
+      additionalProperties: false,
+    }),
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
     permission: {
@@ -107,7 +113,15 @@ export const codeReferenceTool = (index: CodeIntelIndex): Tool<CodeReferenceInpu
   defineTool<CodeReferenceInput, CodeReferenceOutput>({
     id: 'code_reference',
     description: codeReferencePrompt.trim(),
-    inputSchema: makeSchema<CodeReferenceInput>(),
+    inputSchema: withJsonSchema(makeSchema<CodeReferenceInput>(), {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: '要查找引用的符号名' },
+        path: { type: 'string', description: '搜索范围（文件/目录，默认 cwd）' },
+      },
+      required: ['symbol'],
+      additionalProperties: false,
+    }),
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
     permission: {
@@ -157,7 +171,15 @@ export const codeDefinitionTool = (index: CodeIntelIndex): Tool<CodeDefinitionIn
   defineTool<CodeDefinitionInput, CodeDefinitionOutput>({
     id: 'code_definition',
     description: codeDefinitionPrompt.trim(),
-    inputSchema: makeSchema<CodeDefinitionInput>(),
+    inputSchema: withJsonSchema(makeSchema<CodeDefinitionInput>(), {
+      type: 'object',
+      properties: {
+        symbol: { type: 'string', description: '要查找定义的符号名' },
+        path: { type: 'string', description: '搜索范围（文件/目录，默认 cwd）' },
+      },
+      required: ['symbol'],
+      additionalProperties: false,
+    }),
     isReadOnly: () => true,
     isConcurrencySafe: () => true,
     permission: {
@@ -196,7 +218,51 @@ export const codeSemanticEditTool = (
   defineTool<CodeSemanticEditInput, CodeSemanticEditOutput>({
     id: 'code_semantic_edit',
     description: codeSemanticEditPrompt.trim(),
-    inputSchema: makeSchema<CodeSemanticEditInput>(),
+    inputSchema: withJsonSchema(makeSchema<CodeSemanticEditInput>(), {
+      type: 'object',
+      description: '三选一模式：rename / replace_node / replace_subtree，按 mode 字段区分',
+      oneOf: [
+        {
+          type: 'object',
+          properties: {
+            mode: { type: 'string', enum: ['rename'], description: '符号重命名' },
+            symbol: { type: 'string', description: '要重命名的符号名' },
+            to: { type: 'string', description: '新符号名（须为合法标识符）' },
+            path: { type: 'string', description: '扫描根目录/文件（默认 cwd）' },
+            scope: { type: 'string', description: '仅编辑该子目录/文件内的命中（相对 path）' },
+            resolveImporters: { type: 'boolean', description: '是否反向查找并同步修改 import { symbol } 的外部导入方' },
+            importRoot: { type: 'string', description: '反向 import 查找的扫描根（默认 cwd）' },
+            dryRun: { type: 'boolean', description: '仅预览不落盘（默认 false）' },
+          },
+          required: ['mode', 'symbol', 'to'],
+        },
+        {
+          type: 'object',
+          properties: {
+            mode: { type: 'string', enum: ['replace_node'], description: '按 AST 节点行列范围替换' },
+            path: { type: 'string', description: '目标文件' },
+            startLine: { type: 'number', description: '起始行（1-based）' },
+            startColumn: { type: 'number', description: '起始列' },
+            endLine: { type: 'number', description: '结束行' },
+            endColumn: { type: 'number', description: '结束列（可选）' },
+            replacement: { type: 'string', description: '替换文本' },
+            dryRun: { type: 'boolean', description: '仅预览不落盘（默认 false）' },
+          },
+          required: ['mode', 'path', 'startLine', 'startColumn', 'endLine', 'replacement'],
+        },
+        {
+          type: 'object',
+          properties: {
+            mode: { type: 'string', enum: ['replace_subtree'], description: '按成员链路径定位子表达式并替换' },
+            path: { type: 'string', description: '目标文件' },
+            selector: { type: 'string', description: '成员链路径（如 obj.method.arg）' },
+            replacement: { type: 'string', description: '替换文本' },
+            dryRun: { type: 'boolean', description: '仅预览不落盘（默认 false）' },
+          },
+          required: ['mode', 'path', 'selector', 'replacement'],
+        },
+      ],
+    }),
     isReadOnly: () => false,
     isConcurrencySafe: () => false,
     permission: {

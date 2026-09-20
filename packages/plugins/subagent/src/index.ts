@@ -32,7 +32,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext, formatToolWhitelist, READONLY_TOOLS_SENTINEL } from '@harness/tool'
+import { defineTool, withJsonSchema, Tool, ToolResult, Schema, ToolContext, formatToolWhitelist, READONLY_TOOLS_SENTINEL } from '@harness/tool'
 import type { AgentPlugin, Hooks, CliCommandInput, SubagentCapability } from '@harness/plugin'
 import type { AgentDefinition, AgentPermissionConfig } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
@@ -569,7 +569,28 @@ export function createSubagentTool(
     isDestructive: () => false,       // 工具本身不破坏，但子 Agent 内部可能
     requiresUserInteraction: false,
 
-    inputSchema: makeSchema<SubagentToolInput>(),
+    inputSchema: withJsonSchema(makeSchema<SubagentToolInput>(), {
+      type: 'object',
+      properties: {
+        agentId: { type: 'string', description: '子 Agent ID（必须已注册且 mode === subagent）' },
+        prompt: { type: 'string', description: '派给子 Agent 的任务描述（要自包含：目标、上下文、验收标准）' },
+        description: { type: 'string', description: '3-5 词简短描述（用于 UI 展示与调用日志，可选）' },
+        model: {
+          type: 'object',
+          description: '模型覆盖（优先级高于子 Agent 定义，可选）',
+          properties: {
+            providerId: { type: 'string' },
+            modelId: { type: 'string' },
+            temperature: { type: 'number' },
+          },
+        },
+        sessionId: { type: 'string', description: '续接已有子 session（多轮子 Agent 对话）；不传则新建' },
+        runInBackground: { type: 'boolean', description: 'true = 后台运行，立即返回 taskId，结果经 task-notification 推送；默认同步等待完成' },
+        targetFiles: { type: 'array', items: { type: 'string' }, description: '该 worker 预计写入的文件/目录（项目相对路径）。调度元数据：写操作按文件集串行化' },
+      },
+      required: ['agentId', 'prompt'],
+      additionalProperties: false,
+    }),
 
     permission: {
       key: 'agent',

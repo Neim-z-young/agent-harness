@@ -9,7 +9,7 @@
  * 通过 core.tool.pool.assemble Hook 注入到 Harness 工具池。
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, withJsonSchema, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative } from 'node:path'
@@ -130,7 +130,16 @@ const DEFAULT_MAX_IMG_BYTES = 8 * 1024 * 1024
 export const viewImageTool = defineTool<ViewImageInput, ViewImageOutput>({
   id: 'view_image',
   description: '读取本地图像文件，返回 base64 data URI 与尺寸/格式信息，供多模态 LLM 识别。支持 PNG/JPEG/GIF/WebP/BMP 自动识别。',
-  inputSchema: makeSchema<ViewImageInput>(),
+  inputSchema: withJsonSchema(makeSchema<ViewImageInput>(), {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '图像路径（相对 cwd 或绝对路径）' },
+      maxBytes: { type: 'number', description: '最大字节数（默认 8MB，超出则只返回元数据不含 base64）' },
+      strictSize: { type: 'boolean', description: 'true = 超出 maxBytes 直接报错；false = 降级为仅元数据（默认）' },
+    },
+    required: ['path'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => true,
   isDestructive: () => false,
   isConcurrencySafe: () => true,

@@ -35,7 +35,7 @@
  * })
  */
 
-import { defineTool, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
+import { defineTool, withJsonSchema, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
 import type { AgentPlugin } from '@harness/plugin'
 import type { AgentDefinition } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
@@ -328,7 +328,18 @@ export function createSendMessageTool(
     isDestructive: () => false,
     requiresUserInteraction: false,
 
-    inputSchema: makeSchema<SendMessageInput>(),
+    inputSchema: withJsonSchema(makeSchema<SendMessageInput>(), {
+      type: 'object',
+      properties: {
+        taskId: { type: 'string', description: '本地续跑路由：已派出的后台任务 ID（subagent runInBackground 返回），延续其会话执行' },
+        message: { type: 'string', description: '要发送的指令 / 消息内容' },
+        description: { type: 'string', description: '简短描述（可选，用于日志展示）' },
+        to: { type: 'string', description: 'mailbox 路由：目标团队成员名；"*" 表示广播给团队全部成员' },
+        team: { type: 'string', description: 'mailbox 路由：团队名（提供 to 时必填）' },
+      },
+      required: ['message'],
+      additionalProperties: false,
+    }),
     permission: { key: 'send_message', extractPatterns: (input) => [input.taskId ?? input.to ?? ''] },
 
     async call(input: SendMessageInput, ctx: ToolContext): Promise<ToolResult<SendMessageOutput>> {
