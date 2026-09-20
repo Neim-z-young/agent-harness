@@ -19,8 +19,8 @@
  */
 
 import type { AgentPlugin, Hooks, PluginContext, CliCommandInput } from '@harness/plugin'
-import type { Skill, SkillSource, SkillManager } from '@harness/skill'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { isValidSkillId, type Skill, type SkillSource, type SkillManager } from '@harness/skill'
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { basename, dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
@@ -362,11 +362,14 @@ export class SkillInjectScheduler {
     return this.opts.flushAfterTurns ?? 15
   }
 
-  /** 排入待注入队列（不立即改白名单） */
+  /** 排入待注入队列（不立即改白名单）。
+   *
+   * 评审修复：此前这里无条件 `forced=false; dirtyTurns=0` —— 若 compress/压缩刚 flush 过、
+   * 还没被下一次 prompt 构建消费，又锻造了一个技能，会把整个队列的「立即发布」冲掉，
+   * 白白再等 15 轮。schedule 只入队，不碰发布状态。
+   */
   schedule(skillId: string, agentId?: string): void {
     this.pending.set(skillId, agentId)
-    this.dirtyTurns = 0
-    this.forced = false
   }
 
   /** 轮末推进：攒够轮数则安排放行（兜底） */
@@ -447,6 +450,10 @@ export function writeFeedbackMemory(
   const text = normalizeEntry(line)
   if (!text) return { ok: false, message: '空条目' }
   try {
+    // 目标已是符号链接时拒绝（评审建议）：否则会写到链接指向的任意文件
+    if (existsSync(file) && lstatSync(file).isSymbolicLink()) {
+      return { ok: false, message: `目标是符号链接，拒绝写入：${file}` }
+    }
     mkdirSync(dirname(file), { recursive: true })
     const cur = existsSync(file) ? readFileSync(file, 'utf-8') : ''
     const existing = cur
@@ -626,7 +633,10 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
         return true
       }
       if (verb === 'add') {
-        const payload = (input.arg ?? '').split(/\s+/).slice(3).join(' ').trim() || desc || ''
+        // 评审修复：此前用 split(/\s+/).slice(3) 按空白切，内容里的词会被当成分隔符丢掉
+        // （真机实测"这个项目用 bun 跑测试"只写入"bun 跑测试"）。parseArgs 的 positional
+        // 已按引号分组并剔掉 flag，从第 3 个位置参数起就是完整内容。
+        const payload = positional.slice(2).join(' ').trim() || desc || ''
         if (!payload) { out('用法：/forge memory add <内容> [--project]\n'); return true }
         const res = appendMemory(file, payload)
         out(res.ok ? `✅ 已写入${scope === 'project' ? '项目' : '用户'}记忆：${payload}\n` : `⚠️  未写入：${res.message}\n`)
@@ -763,7 +773,12 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
       // 下一轮真正发生注入前，把到期的技能绑进白名单
       hooks['core.prompt.system.transform'] = () => {
         const due = scheduler.takeDue()
-        for (const d of due) bindToAgent(d.skillId, d.agentId)
+        for (const d of due) {
+          // 评审修复：bindToAgent 失败（找不到目标 Agent）此前被静默吞掉 —— 队列已清空、
+          // 技能永远不注入，用户却以为在延迟队列里。失败必须留痕。
+          const msg = bindToAgent(d.skillId, d.agentId)
+          if (msg.startsWith('⚠️')) ctxLog?.warn?.(`延迟注入绑定失败：${msg}`)
+        }
         if (due.length && ctxLog) {
           ctxLog.info?.(`延迟注入已发布：${due.map((d) => d.skillId).join('、')}`)
         }
@@ -852,8 +867,22 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
         }
         if (!manager) { out('未获得 skillManager（技能系统未装配）\n'); return }
 
+        // id 形态在**出草稿前**就校验（评审修复）：否则用户看完草稿、走到 --confirm 才
+        // 被 validateDraft 拒绝，白跑一轮。id 同时是目录名，规则与 SkillManager.save 一致。
+        if (!isValidSkillId(name)) {
+          out(`⚠️  技能名非法：${name}（只允许小写字母/数字/连字符/下划线，1~64 字符，如 acp-param-tuning）\n`)
+          return
+        }
+
         const scope = scopeOf(flags)
         const key = `${scope}:${name}`
+        // 待确认草稿有界（评审修复）：上限 20，FIFO 淘汰最旧的 —— 防止反复生成草稿
+        // 把 Map 撑大（每份草稿含完整正文）。
+        while (pending.size >= 20) {
+          const oldest = pending.keys().next().value
+          if (oldest === undefined) break
+          pending.delete(oldest)
+        }
 
         // ---- 确认落盘 ----
         if (flags.has('--confirm') || flags.has('-y')) {

@@ -23,11 +23,16 @@ import {
 
 // ===== 测试替身 =====
 
-function fakeCtx(over: Record<string, unknown> = {}): any {
+function fakeCtx(over: Record<string, unknown> = {}, logWarns: string[] = []): any {
   return {
     bus: { publish: () => {}, subscribe: () => () => {}, subscribeAll: () => () => {} },
     config: { get: () => undefined, set: () => {} },
-    log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    log: {
+      info: () => {},
+      warn: (m: string) => logWarns.push(m),
+      error: () => {},
+      debug: () => {},
+    },
     ...over,
   }
 }
@@ -42,6 +47,7 @@ async function setup(opts: { maxSkills?: number } = {}) {
     project: { root: base, plugins: '', skills: join(base, 'project-skills'), agents: '', memory: join(base, 'project-memory') },
   }
   const manager = createSkillManager()
+  const logWarns: string[] = []
   const plugin = createSkillForgePlugin({ workspace: ws, skillManager: manager, ...opts })
 
   // 最小 agent 注册表（core 的注入只认 agent.skills 白名单 ⇒ 绑定测试需要它）
@@ -55,7 +61,7 @@ async function setup(opts: { maxSkills?: number } = {}) {
   }
 
   // install 时注入 workspace；再模拟 core.harness.init 注入 harness（含 skillManager / agent）
-  const hooks = (await plugin.install(fakeCtx({ workspace: ws }))) as Record<string, any>
+  const hooks = (await plugin.install(fakeCtx({ workspace: ws }, logWarns))) as Record<string, any>
   hooks['core.harness.init']({}, { harness: { skillManager: manager, agent: agentRegistry } })
   await new Promise((r) => setTimeout(r, 0)) // 等 ensureDirs 的 microtask
 
@@ -71,7 +77,7 @@ async function setup(opts: { maxSkills?: number } = {}) {
       ok ? { ok: true } : { ok: false, error: { message: error ?? '失败' } },
     )
   }
-  return { base, ws, manager, hooks, lines, run, record, agents }
+  return { base, ws, manager, hooks, lines, run, record, agents, logWarns }
 }
 
 // ===== 轨迹与草稿 =====
@@ -572,5 +578,66 @@ describe('ACP 压缩触发延迟注入（引擎层 compress 工具信号）', ()
     )
     hooks['core.prompt.system.transform']({}, [])
     expect(agents.default.skills).not.toContain('other-tool')
+  })
+})
+
+// ===== 评审修复的回归守卫 =====
+
+describe('评审修复', () => {
+  it('/forge memory add 保留完整内容（此前 split.slice(3) 会丢词）', async () => {
+    const { hooks, ws } = await setup()
+    const out: string[] = []
+    hooks['cli.command']({ command: 'forge', arg: 'memory add 这个项目用 bun 跑测试', out: (t: string) => out.push(t), sessionId: 's1' } as any)
+    expect(out.join('')).toContain('这个项目用 bun 跑测试')
+    expect(readFileSync(join(ws.user.memory, 'MEMORY.md'), 'utf-8')).toContain('这个项目用 bun 跑测试')
+  })
+
+  it('延迟绑定失败（目标 Agent 不存在）必须留 warn 日志，不得静默吞掉', async () => {
+    const { hooks, run, record, logWarns, agents } = await setup()
+    record('bash', { command: 'ls' })
+    run('ghost-bind')
+    run('--confirm ghost-bind --bind missing-agent')
+    await new Promise((r) => setTimeout(r, 10))
+    // 发布时 Agent 不存在 ⇒ bindToAgent 返回 ⚠️ ⇒ 必须出现在 warn 日志里（评审修复前被吞掉）
+    hooks['core.session.compacting']() // 触发发布（否则队列未到期）
+    hooks['core.prompt.system.transform']({}, [])
+    expect(logWarns.join('\n')).toContain('延迟注入绑定失败')
+    // 且技能不得凭空进入白名单
+    expect(agents.default.skills).not.toContain('ghost-bind')
+  })
+})
+
+
+describe('评审修复（续）', () => {
+  it('schedule 不得冲掉已到期的发布状态（compress flush 后又锻造 ⇒ 照常立即发布）', () => {
+    const s = new SkillInjectScheduler()
+    s.schedule('first')
+    s.flush() // 压缩触发 ⇒ 立即到期
+    s.schedule('second') // 此刻又锻造了一个 —— 不得重置 forced
+    expect(s.due).toBe(true)
+    const ids = s.takeDue().map((x) => x.skillId).sort()
+    expect(ids).toEqual(['first', 'second'])
+  })
+
+  it('非法技能名在出草稿前就被拒绝（不用等 --confirm 才报错）', async () => {
+    const { run, lines } = await setup()
+    run('Bad Name')
+    expect(lines.join('')).toContain('技能名非法')
+    expect(lines.join('')).not.toContain('技能草稿')
+  })
+
+  it('待确认草稿有界（超过 20 份 FIFO 淘汰最旧）', async () => {
+    const { run, lines } = await setup()
+    for (let i = 1; i <= 21; i += 1) {
+      run('draft-' + String(i).padStart(2, '0'))
+    }
+    // draft-01 最旧 ⇒ 已被 FIFO 淘汰 ⇒ confirm 报"没有待确认的草稿"
+    lines.length = 0
+    run('--confirm draft-01')
+    expect(lines.join('')).toContain('没有待确认的草稿')
+    // 最新的一份仍在
+    lines.length = 0
+    run('--confirm draft-21')
+    expect(lines.join('')).not.toContain('没有待确认的草稿')
   })
 })

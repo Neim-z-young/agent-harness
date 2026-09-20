@@ -654,8 +654,18 @@ export class SkillManagerImpl implements SkillManager {
     // ⑤ 原子写：同目录临时文件 → rename（不会留下半截文件，也不会被读到写了一半的内容）
     const content = skillToMarkdown(skill)
     try {
-      mkdirSync(resolve(target, '..'), { recursive: true })
-      const tmp = join(resolve(target, '..'), `.${basename(target)}.${randomBytes(6).toString('hex')}.tmp`)
+      const parent = resolve(target, '..')
+      mkdirSync(parent, { recursive: true })
+      // 中间目录逃逸校验（评审修复）：root/<id> 本身可能是符号链接（攻击者在已登记目录里
+      // 预置、指向外部目录），此时 target 尚不存在 ⇒ ④ 的检查全部被绕过，tmp 与最终文件
+      // 都会经符号链接写到根目录**外**。父目录 realpath 必须仍在根内（根自身也取 realpath，
+      // 兼容 macOS /var → /private/var 这类合法链接）。
+      const rootReal = realpathSync(root)
+      const parentReal = realpathSync(parent)
+      if (parentReal !== rootReal && !parentReal.startsWith(rootReal + sep)) {
+        return { ok: false, message: `目标父目录真实路径越出技能目录（疑似符号链接）：${parentReal}` }
+      }
+      const tmp = join(parent, `.${basename(target)}.${randomBytes(6).toString('hex')}.tmp`)
       writeFileSync(tmp, content, { encoding: 'utf-8', flag: 'wx', mode: 0o600 })
       try {
         renameSync(tmp, target)

@@ -22,7 +22,7 @@
  * （"把变更攒到下次压缩再注入"的分级策略属 M2，见计划 §3.7。）
  */
 
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import type { AgentPlugin, CliCommandInput, Hooks, PluginContext, PluginWorkspaceView } from '@harness/plugin'
 
@@ -319,6 +319,11 @@ export class MemoryStore {
   }
 
   private writeAtomic(text: string): void {
+    // 目标已是符号链接时拒绝写入（评审建议）：MEMORY.md 被换成符号链接时，
+    // 原子写会经链接写到任意文件。正常路径下它不该是链接。
+    if (existsSync(this.path) && lstatSync(this.path).isSymbolicLink()) {
+      throw new Error(`目标是符号链接，拒绝写入：${this.path}`)
+    }
     mkdirSync(dirname(this.path), { recursive: true })
     const tmp = `${this.path}.tmp-${process.pid}-${Date.now()}`
     writeFileSync(tmp, text, 'utf-8')

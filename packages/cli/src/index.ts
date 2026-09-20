@@ -4226,11 +4226,10 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
           const detail =
             typeof ev.result === 'string'
               ? ev.result
-              : ((ev.result as any)?.message ?? JSON.stringify(ev.result))
-          const oneLine = String(detail ?? '').split('\n')[0]!.slice(0, 300)
+              : ((ev.result as any)?.message ?? JSON.stringify(ev.result) ?? '(无详情)')
+          const oneLine = String(detail ?? '(无详情)').split('\n')[0]!.slice(0, 300)
           const tag = ev.isError ? '失败' : '结果'
-          process.stderr.write(`[工具${tag}] ${ev.toolId}: ${oneLine}${String(detail).length > oneLine.length ? '…' : ''}\n`)
-        } else if (ev.type === 'done') {
+          process.stderr.write(`[工具${tag}] ${ev.toolId}: ${oneLine}${String(detail).length > oneLine.length ? '…' : ''}\n`)        } else if (ev.type === 'done') {
           if (ev.message) {
             // 换行收尾
             const textParts = ev.message.parts.filter((p: any) => p.type === 'text')

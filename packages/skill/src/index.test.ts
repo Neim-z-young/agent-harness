@@ -626,3 +626,22 @@ describe('skillToMarkdown', () => {
     expect(text).toContain('allowEmbedShell: false')
   })
 })
+
+  it('评审修复：中间目录（root/<id>）是符号链接时拒绝写入（否则可逃逸出根目录）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'skill-symdir-'))
+    const dir = join(base, 'skills')
+    const outside = join(base, 'outside')
+    mkdirSync(outside, { recursive: true })
+    mkdirSync(dir, { recursive: true })
+    symlinkSync(outside, join(dir, 'evil')) // 预置符号链接目录，外部无 SKILL.md ⇒ existsSync(target)=false
+    const m = createSkillManager()
+    await m.load(dir, 'user')
+    const res = await m.save(
+      { id: 'evil', name: 'evil', description: 'd', loadedFrom: 'user', content: 'body' },
+      { scope: 'user' },
+    )
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain('越出技能目录')
+    // 外部目录必须没有被写入
+    expect(existsSync(join(outside, 'SKILL.md'))).toBe(false)
+  })
