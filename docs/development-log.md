@@ -1,5 +1,22 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 165）ACP 压缩信号统一到引擎层（回答"和 memory 保持一致还是都改引擎层"）
+
+用户追问两条路的区别。结论：**照抄 memory 旧方式（cli.agent.stream）保持的"一致"是与缺陷一致**
+—— UI 消费层通道在内嵌/ACP 宿主收不到，正是本项目三次静默失效事故（herdr 上报、turn_end 广播、
+memory flush）的同源模式；且 memory 旧注释的技术前提（"post.execute 的 ctx 没有 toolId"）早已
+不成立，`ToolPostHookContext` 一直带 `tool.id`。
+
+统一后的触发源三件套（两插件一致）：post.execute 识别 compress（ACP 模型驱动压缩，
+**不触发 compacting**）+ compacting（session compaction）+ turn.end 攒轮兜底。
+附带的语义改进：旧 UI 方式在 tool_call_start（压缩前）就 flush，压缩失败也发布；现在
+`ok:false` 不发布（软失败——返回 errors 但 ok 仍真——照常发布，真机就撞上了 anchor 失败
+折叠 0 块的 case）。
+
+真机（ACP 开、小窗口逼模型调 compress）：锻造+绑定后连续 9 轮 system 恒定；compress 后下一轮
+技能进入（变化一次），随后恒定。memory 60 例（改 1 补 2）、skill-forge 46 例（+3）；
+全量 1589 pass / 0 fail。提交 `f71c1d7` + 计划文档 §5.1。
+
 ## 2026-09-20（续 164）锻造的技能改延迟注入 + `/forge` 统一入口把两条线串起来
 
 **延迟注入**（用户拍板：技能也跟记忆一样延迟）：技能进 `agent.skills` 白名单 ⇒ 下一轮 system
