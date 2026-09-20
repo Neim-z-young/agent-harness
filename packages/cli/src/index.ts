@@ -4209,6 +4209,16 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
         else if (ev.type === 'tool_call_start') {
           // 引擎自主多步时把工具活动写到 stderr —— stdout 保持「纯结果」，脚本可安全消费
           process.stderr.write(`\n[工具] ${ev.toolId}\n`)
+        } else if (ev.type === 'tool_call_result' && (ev.isError || args.verbose)) {
+          // 失败结果必须可见（DOOM_LOOP / 权限拒绝 / 执行异常此前在 headless 下完全无声，
+          // 只有 TUI 能看到）；成功结果仅在 --verbose 时给一行摘要。同样走 stderr。
+          const detail =
+            typeof ev.result === 'string'
+              ? ev.result
+              : ((ev.result as any)?.message ?? JSON.stringify(ev.result))
+          const oneLine = String(detail ?? '').split('\n')[0]!.slice(0, 300)
+          const tag = ev.isError ? '失败' : '结果'
+          process.stderr.write(`[工具${tag}] ${ev.toolId}: ${oneLine}${String(detail).length > oneLine.length ? '…' : ''}\n`)
         } else if (ev.type === 'done') {
           if (ev.message) {
             // 换行收尾
