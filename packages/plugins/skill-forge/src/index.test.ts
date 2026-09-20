@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test'
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSkillManager } from '@harness/skill'
@@ -8,8 +8,10 @@ import {
   collapseCycle,
   createSkillForgePlugin,
   draftFromTrace,
+  detectRepeatable,
   draftToSkill,
   findSimilarSkill,
+  writeFeedbackMemory,
   parseArgs,
   renderDraft,
   summarizeInput,
@@ -40,9 +42,19 @@ async function setup(opts: { maxSkills?: number } = {}) {
   const manager = createSkillManager()
   const plugin = createSkillForgePlugin({ workspace: ws, skillManager: manager, ...opts })
 
-  // install 时注入 workspace；再模拟 core.harness.init 注入 harness（含 skillManager）
+  // 最小 agent 注册表（core 的注入只认 agent.skills 白名单 ⇒ 绑定测试需要它）
+  const agents: Record<string, any> = {
+    default: { id: 'default', name: 'Default', mode: 'primary', skills: [] as string[] },
+  }
+  const agentRegistry = {
+    get: (id: string) => agents[id],
+    register: (def: any) => { agents[def.id] = def },
+    list: () => Object.values(agents),
+  }
+
+  // install 时注入 workspace；再模拟 core.harness.init 注入 harness（含 skillManager / agent）
   const hooks = (await plugin.install(fakeCtx({ workspace: ws }))) as Record<string, any>
-  hooks['core.harness.init']({}, { harness: { skillManager: manager } })
+  hooks['core.harness.init']({}, { harness: { skillManager: manager, agent: agentRegistry } })
   await new Promise((r) => setTimeout(r, 0)) // 等 ensureDirs 的 microtask
 
   const lines: string[] = []
@@ -57,7 +69,7 @@ async function setup(opts: { maxSkills?: number } = {}) {
       ok ? { ok: true } : { ok: false, error: { message: error ?? '失败' } },
     )
   }
-  return { base, ws, manager, hooks, lines, run, record }
+  return { base, ws, manager, hooks, lines, run, record, agents }
 }
 
 // ===== 轨迹与草稿 =====
@@ -295,5 +307,100 @@ describe('步骤去重（真机观察）', () => {
     const d = draftFromTrace('x', trace)
     expect(d.steps).toHaveLength(3)
     expect(d.steps[2]).toContain('showLineNumbers')
+  })
+})
+
+// ===== F3：隐式重复检测（只提示不自动写）=====
+
+describe('detectRepeatable', () => {
+  const mk = (toolId: string, inputSummary = ''): any => ({ toolId, inputSummary, ok: true })
+
+  it('同一工具+同一入参重复 ≥3 次 ⇒ 提示', () => {
+    const r = detectRepeatable([mk('bash', 'cmd=ls'), mk('bash', 'cmd=ls'), mk('bash', 'cmd=ls')])
+    expect(r).toHaveLength(1)
+    expect(r[0]!.kind).toBe('single')
+    expect(r[0]!.count).toBe(3)
+  })
+
+  it('入参不同不算重复（避免把"多次用 bash"当流程）', () => {
+    const r = detectRepeatable([mk('bash', 'cmd=ls'), mk('bash', 'cmd=cat'), mk('bash', 'cmd=grep')])
+    expect(r).toHaveLength(0)
+  })
+
+  it('2~6 步序列完整重复 ⇒ 报序列（信息量大于单步，单步结果被吸收）', () => {
+    const seq = [mk('a'), mk('b'), mk('a'), mk('b')]
+    const r = detectRepeatable(seq)
+    expect(r.some((x) => x.kind === 'sequence' && x.toolIds.join('>') === 'a>b')).toBe(true)
+    expect(r.every((x) => x.kind !== 'single')).toBe(true)
+  })
+
+  it('不足阈值不提示（避免噪音劝退）', () => {
+    expect(detectRepeatable([mk('a'), mk('a')])).toHaveLength(0)
+  })
+})
+
+describe('writeFeedbackMemory', () => {
+  it('写入 - 前缀条目，去重，且超限拒绝', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'fb-'))
+    const file = join(dir, 'MEMORY.md')
+    expect(writeFeedbackMemory(file, '[feedback] bash 反复失败').ok).toBe(true)
+    expect(readFileSync(file, 'utf-8')).toContain('- [feedback] bash 反复失败')
+    // 精确去重（含空白归一化）
+    expect(writeFeedbackMemory(file, '[feedback]  bash   反复失败').ok).toBe(false)
+    // 上限 200 条
+    const many = Array.from({ length: 201 }, (_, i) => `条目 ${i}`).join('\n')
+    writeFileSync(join(dir, 'big.md'), many, 'utf-8')
+    expect(writeFeedbackMemory(join(dir, 'big.md'), '新条目').ok).toBe(false)
+  })
+})
+
+describe('F3 命令侧', () => {
+  it('suggest 只打印提示，**不创建任何技能**', async () => {
+    const { manager, run, record, lines } = await setup()
+    for (let i = 0; i < 3; i += 1) record('bash', { command: 'ls' })
+    run('suggest')
+    expect(lines.join('')).toContain('可固化')
+    expect(lines.join('')).toContain('不会自动创建')
+    expect(manager.all()).toHaveLength(0)
+  })
+
+  it('无重复时明确说明判据（不静默）', async () => {
+    const { run, record, lines } = await setup()
+    record('bash', { command: 'ls' })
+    run('suggest')
+    expect(lines.join('')).toContain('未检测到')
+  })
+
+  it('反复失败 ⇒ 回写一条 feedback 到记忆（同一工具+入参只写一次）', async () => {
+    const { ws, record } = await setup()
+    for (let i = 0; i < 3; i += 1) record('read_file', { path: 'x' }, false, 'ENOENT')
+    await new Promise((r) => setTimeout(r, 5))
+    const file = join(ws.user.memory, 'MEMORY.md')
+    expect(existsSync(file)).toBe(true)
+    const text = readFileSync(file, 'utf-8')
+    expect(text).toContain('[feedback]')
+    expect(text.split('\n').filter((l) => l.includes('[feedback]')).length).toBe(1)
+  })
+
+  it('--bind 把技能加入 agent 的 skills 白名单（注入只认白名单）', async () => {
+    const { run, record, lines, agents } = await setup()
+    record('bash', { command: 'ls' })
+    run('bindme')
+    lines.length = 0
+    run('--confirm bindme --bind')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(agents.default.skills).toContain('bindme')
+    expect(lines.join('')).toContain('持久化') // 运行时绑定 + 提示如何落盘
+  })
+
+  it('不带 --bind 时明确告知"不会自动注入"（否则用户以为锻造完就能用）', async () => {
+    const { run, record, lines, agents } = await setup()
+    record('bash', { command: 'ls' })
+    run('nobind')
+    lines.length = 0
+    run('--confirm nobind')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(agents.default.skills).not.toContain('nobind')
+    expect(lines.join('')).toContain('--bind')
   })
 })

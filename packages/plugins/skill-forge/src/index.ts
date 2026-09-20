@@ -20,6 +20,9 @@
 
 import type { AgentPlugin, Hooks, PluginContext, CliCommandInput } from '@harness/plugin'
 import type { Skill, SkillSource, SkillManager } from '@harness/skill'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { basename, dirname, join } from 'node:path'
+import { randomBytes } from 'node:crypto'
 
 // ===== 轨迹记录 =====
 
@@ -197,6 +200,47 @@ export function draftFromTrace(
   }
 }
 
+/**
+ * 从轨迹里找「可固化的重复流程」（F3 的**只提示**部分）。
+ *
+ * 判据（都要求**同一工具+同一入参**，避免把"多次用 bash"这类噪音当成流程）：
+ * 1. 单步重复 ≥ minRepeats 次；
+ * 2. 长度 2~6 的**连续序列**完整重复 ≥ 2 轮。
+ *
+ * ⚠️ 刻意**不注入 system**：提示走命令输出（`/skill-forge suggest`），
+ * 每轮改 system 会让前缀缓存持续失效（B9），而"提示"根本不需要进模型上下文。
+ */
+export function detectRepeatable(
+  trace: TraceEntry[],
+  opts: { minRepeats?: number } = {},
+): Array<{ kind: 'single' | 'sequence'; toolIds: string[]; count: number }> {
+  const min = opts.minRepeats ?? 3
+  const out: Array<{ kind: 'single' | 'sequence'; toolIds: string[]; count: number }> = []
+  const key = (e: TraceEntry) => `${e.toolId}|${e.inputSummary}`
+
+  // 1) 单步重复
+  const byKey = new Map<string, number>()
+  for (const e of trace) byKey.set(key(e), (byKey.get(key(e)) ?? 0) + 1)
+  for (const [k, n] of byKey) {
+    if (n >= min) out.push({ kind: 'single', toolIds: [k.split('|')[0]!], count: n })
+  }
+
+  // 2) 连续序列重复（滑窗找重复出现的 n-gram，且必须连续出现两次才算"跑了一轮以上"）
+  const keys = trace.map(key)
+  for (let len = 2; len <= 6 && len * 2 <= keys.length; len += 1) {
+    const seen = new Map<string, number>()
+    for (let i = 0; i + len <= keys.length; i += 1) {
+      const gram = keys.slice(i, i + len).join('>')
+      seen.set(gram, (seen.get(gram) ?? 0) + 1)
+    }
+    for (const [gram, n] of seen) {
+      if (n >= 2) out.push({ kind: 'sequence', toolIds: gram.split('>').map((k) => k.split('|')[0]!), count: n })
+    }
+  }
+  // 序列命中时，单步命中通常是它的子集 ⇒ 只保留信息量更大的序列结果
+  return out.filter((r) => !(r.kind === 'single' && out.some((o) => o.kind === 'sequence')))
+}
+
 /** 草稿 → 展示文本（人工确认时打印给用户的就是这份） */
 export function renderDraft(draft: SkillDraft): string {
   const lines: string[] = []
@@ -295,6 +339,64 @@ export function findSimilarSkill(
   return best
 }
 
+// ===== 失败回写记忆（F3 闭环的一半）=====
+
+/** 回写记忆的一条候选（节流后才会真的落盘） */
+export interface FeedbackCandidate {
+  toolId: string
+  inputSummary: string
+  error: string
+  failures: number
+}
+
+const MEMORY_INDEX_FILE = 'MEMORY.md'
+const ENTRY_PREFIX = '- '
+
+/** 归一化（与 memory 插件一致：去空白，便于精确去重） */
+function normalizeEntry(text: string): string {
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * 把「反复失败」写回长期记忆（feedback 类）。
+ *
+ * 直接按 memory 插件的文件约定写（`MEMORY.md`，`- ` 前缀条目），**不依赖** @harness/memory
+ * —— 用户可能没启用记忆插件，而这里只是"顺手留一条事实"，不该反过来要求启用它。
+ * 原子写 + 精确去重 + 行数上限，与 MemoryStore 的约束对齐。
+ */
+export function writeFeedbackMemory(
+  file: string,
+  line: string,
+): { ok: boolean; message: string } {
+  const text = normalizeEntry(line)
+  if (!text) return { ok: false, message: '空条目' }
+  try {
+    mkdirSync(dirname(file), { recursive: true })
+    const cur = existsSync(file) ? readFileSync(file, 'utf-8') : ''
+    const existing = cur
+      .split('\n')
+      .map((l) => (l.startsWith(ENTRY_PREFIX) ? l.slice(ENTRY_PREFIX.length) : l))
+      .map(normalizeEntry)
+    if (existing.includes(text)) return { ok: false, message: '该条目已存在，未重复写入' }
+    if (existing.filter((l) => l.length > 0).length >= 200) {
+      return { ok: false, message: '记忆索引已达 200 条上限' }
+    }
+    const base = cur.length === 0 || cur.endsWith('\n') ? cur : `${cur}\n`
+    const next = `${base}${ENTRY_PREFIX}${text}\n`
+    const tmp = join(dirname(file), `.${basename(file)}.${randomBytes(6).toString('hex')}.tmp`)
+    writeFileSync(tmp, next, { encoding: 'utf-8', flag: 'wx', mode: 0o600 })
+    try {
+      renameSync(tmp, file)
+    } catch (err) {
+      rmSync(tmp, { force: true })
+      throw err
+    }
+    return { ok: true, message: `已写入 ${file}` }
+  } catch (err) {
+    return { ok: false, message: `写入失败：${(err as Error)?.message ?? err}` }
+  }
+}
+
 // ===== 插件 =====
 
 export interface SkillForgePluginOptions {
@@ -304,8 +406,17 @@ export interface SkillForgePluginOptions {
   maxSkills?: number
   /** 草稿步骤上限（默认 12） */
   maxSteps?: number
+  /** F3：工具反复失败时回写一条 feedback 到长期记忆（默认 true） */
+  writeBackOnFailure?: boolean
+  /** 回写阈值：同一工具+入参失败几次才写（默认 2） */
+  minFailures?: number
+  /** 回写到哪级记忆（默认 user；project 会随 git 共享） */
+  feedbackScope?: 'user' | 'project'
   /** 注入 workspace（测试用；运行时走 ctx.workspace） */
-  workspace?: { user: { skills: string }; project: { skills: string } }
+  workspace?: {
+    user: { skills: string; memory: string }
+    project: { skills: string; memory: string }
+  }
   /** 注入 skillManager（测试用） */
   skillManager?: SkillManager
 }
@@ -344,9 +455,38 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
   const pending = new Map<string, { draft: SkillDraft; at: number }>()
   let manager: SkillManager | undefined = options.skillManager
   let ws = options.workspace
+  let harnessRef: any
+  /** 已回写过记忆的失败（节流：同一工具+入参一次会话只写一条） */
+  const writtenFeedback = new Set<string>()
+  let ctxLog: PluginContext['log'] | undefined
 
   const scopeOf = (flags: Set<string>): 'user' | 'project' =>
     flags.has('--project') ? 'project' : (options.scope ?? 'user')
+
+  /**
+   * 把技能 id 加进 agent 的 skills 白名单（**运行时**）。
+   *
+   * 为什么必须做这步：`core.skill-injection` 只注入 `agent.skills` 白名单里的技能
+   * （`core/src/index.ts`），锻造出来的技能**不在白名单里就不会被注入**；
+   * 而 `paths` 条件触发在仓库里是死代码（matchByPath 无人调用）。
+   * 持久化只能改 agent 的 md frontmatter —— 插件不该替用户改配置文件，所以这里只改运行时
+   * 并**打印该加的那一行**，由用户决定是否落盘。
+   */
+  const bindToAgent = (skillId: string, agentId?: string): string => {
+    const reg = harnessRef?.agent
+    const target = agentId ?? 'default'
+    const def = reg?.get?.(target)
+    if (!reg?.register || !def) {
+      return `⚠️  未能绑定：找不到 Agent "${target}"（可在命令里指定 --bind <agentId>）`
+    }
+    const cur = Array.isArray(def.skills) ? def.skills : []
+    if (cur.includes(skillId)) return `已在 Agent "${target}" 的技能白名单中`
+    reg.register({ ...def, skills: [...cur, skillId] })
+    return (
+      `✅ 已加入 Agent "${target}" 的技能白名单（运行时；重启后需持久化）\n` +
+      `   持久化：在该 Agent 的 .md frontmatter 里写  skills: [${[...cur, skillId].join(', ')}]`
+    )
+  }
 
   const ensureDirs = async (): Promise<void> => {
     if (!manager || !ws) return
@@ -367,12 +507,38 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
     'core.tool.post.execute'(hctx: unknown, result: unknown) {
       const h = hctx as { tool?: { id?: string }; input?: unknown; ctx?: { sessionId?: string } } | undefined
       const r = result as { ok?: boolean; error?: { message?: string } } | undefined
-      recorder.record(h?.ctx?.sessionId ?? '', {
-        toolId: h?.tool?.id ?? 'unknown',
-        inputSummary: summarizeInput(h?.input),
+      const sessionId = h?.ctx?.sessionId ?? ''
+      const toolId = h?.tool?.id ?? 'unknown'
+      const inputSummary = summarizeInput(h?.input)
+      recorder.record(sessionId, {
+        toolId,
+        inputSummary,
         ok: r?.ok !== false,
         ...(r?.ok === false ? { error: r?.error?.message } : {}),
       })
+
+      // F3 闭环的一半：同一工具+入参反复失败 ⇒ 回写一条 feedback 到长期记忆。
+      // 节流到"一次会话一条"，否则一次连环失败会把记忆刷满。
+      if (options.writeBackOnFailure !== false && r?.ok === false && ws && sessionId) {
+        const key = `${sessionId}:${toolId}|${inputSummary}`
+        if (!writtenFeedback.has(key)) {
+          const failures = recorder.list(sessionId).filter(
+            (e) => e.toolId === toolId && e.inputSummary === inputSummary && !e.ok,
+          ).length
+          if (failures >= (options.minFailures ?? 2)) {
+            writtenFeedback.add(key)
+            const file = join(
+              (options.feedbackScope ?? 'user') === 'project' ? ws.project.memory : ws.user.memory,
+              MEMORY_INDEX_FILE,
+            )
+            const res = writeFeedbackMemory(
+              file,
+              `[feedback] ${toolId} 反复失败（${failures} 次）：${(r.error?.message ?? '未知原因').slice(0, 120)}`,
+            )
+            ctxLog?.debug?.(`失败回写记忆：${res.message}`)
+          }
+        }
+      }
     },
   }
 
@@ -385,11 +551,13 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
       ws = options.workspace ?? ctx.workspace
+      ctxLog = ctx.log
 
       const hooks: Record<string, unknown> = { ...insert }
 
       hooks['core.harness.init'] = (_input: unknown, output: unknown) => {
         const h = (output as { harness?: { skillManager?: SkillManager } } | undefined)?.harness
+        if (h) harnessRef = h
         if (h?.skillManager) manager = h.skillManager
         void ensureDirs()
       }
@@ -444,13 +612,41 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
           return
         }
 
+        // ---- suggest：隐式重复检测（F3）—— **只提示，不自动写，也不进 system** ----
+        if (positional[0] === 'suggest' || positional.length === 0) {
+          const trace = recorder.list(input.sessionId ?? '')
+          const found = detectRepeatable(trace)
+          out(
+            found.length
+              ? `\n检测到 ${found.length} 段可固化的重复流程（只提示，不会自动创建）：\n` +
+                  found
+                    .map(
+                      (f) =>
+                        `  · ${f.kind === 'sequence' ? '序列' : '单步'} ${f.toolIds.join(' → ')}（重复 ${f.count} 次）` +
+                        `\n    可执行：/skill-forge <name> --desc "何时用"`,
+                    )
+                    .join('\n') +
+                  '\n'
+              : `\n未检测到重复流程（当前会话 ${trace.length} 条工具记录；判据：同一工具+同一入参重复 ≥3 次，或 2~6 步序列完整重复 ≥2 轮）\n`,
+          )
+          if (positional.length === 0) {
+            out(
+              '用法：\n' +
+                '  /skill-forge <name> [--project] [--desc "何时用"]   生成草稿（仅展示，不落盘）\n' +
+                '  /skill-forge --confirm <name> [--project] [--overwrite] [--bind]   确认落盘并当轮生效\n' +
+                '  /skill-forge suggest | list | path | disable <id>\n',
+            )
+          }
+          return
+        }
+
         const name = positional[0]
         if (!name) {
           out(
             '用法：\n' +
               '  /skill-forge <name> [--project] [--desc "何时用"]   生成草稿（仅展示，不落盘）\n' +
-              '  /skill-forge --confirm <name> [--project] [--overwrite]   确认落盘并当轮生效\n' +
-              '  /skill-forge list | path | disable <id>\n',
+              '  /skill-forge --confirm <name> [--project] [--overwrite] [--bind]   确认落盘并当轮生效\n' +
+              '  /skill-forge suggest | list | path | disable <id>\n',
           )
           return
         }
@@ -478,7 +674,15 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
             })
             if (res.ok) {
               pending.delete(key)
-              out(`✅ ${res.message}\n   调用方式：/${name}（或命中 paths 时自动注入）\n`)
+              out(`✅ ${res.message}\n`)
+              // 注入只在 agent.skills 白名单里发生（paths 触发在仓库里是死代码），
+              // 所以默认提示用户绑定；--bind 直接做运行时绑定。
+              if (flags.has('--bind')) out(`${bindToAgent(name, positional[1] ?? input.agentId)}\n`)
+              else
+                out(
+                  `   说明：技能注入只认 Agent 的 skills 白名单 —— 加 --bind 可把 ${name} 加入当前 Agent\n` +
+                    `   （否则它只在 /skill-forge list 里可见，不会自动注入）\n`,
+                )
             } else {
               out(`⚠️  ${res.message}\n`)
             }
