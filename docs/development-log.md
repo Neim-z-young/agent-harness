@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 161）schema 补齐至 42/42 + headless 失败结果可见
+
+**① 剩余工具 schema 全部补齐（17 个）**：swarm 9（task 系 status 用五态 enum；shutdown 决策
+两工具）、coordinator send_message（mailbox/续跑两套路由分别说明）、subagent（runInBackground/
+targetFiles 语义进参数描述）、code-intel 4（code_semantic_edit 联合入参用 oneOf 三模式）、
+view_image、web_fetch。加上续 160 的 10 个与 MCP 透传的 computer-use 10 个，全仓 42 工具全覆盖；
+脚本终检「未包 withJsonSchema 的 makeSchema」= 0。
+
+**顺带修掉一个会让 oneOf 白写的转发缺陷**：三个 provider 此前只挑 properties/required/
+additionalProperties 三个字段转发 —— oneOf/anyOf/items 会被静默剥掉，code_semantic_edit 发到
+模型侧就退化成空对象。改为整体转发（`{ ...schema, type: schema.type ?? 'object' }`）；
+JsonSchemaObject.properties 相应改为可选。
+
+**② headless run 失败可见**：run 模式此前只渲染 tool_call_start，tool_call_result 整个忽略 ⇒
+DOOM_LOOP/权限拒绝/执行异常在脚本里完全无声。现在 isError 结果**始终**打 stderr
+（`[工具失败] <toolId>: <message 单行 300 字>`），成功结果仅 --verbose 给一行摘要，
+stdout 保持纯结果。真机复验：coordinator 空转被守卫切断时 stderr 明确打印中断原因。
+
+提交 `d169025`（schema，10 文件）+ `d5c8e1f`（cli）。typecheck 0 错误、全量 1532 pass / 0 fail。
+
+遗留观察：本次真机 run 中模型仍高频调 acp_status（27 次里 11 次）——参数/schema 都对，
+纯粹是它「每步开工前看一眼状态」的习惯；守卫会在同参连续 3 次时切断，暂不进一步干预。
+
 ## 2026-09-20（续 160）提示词取证：42 个工具的参数 schema 全是空的 —— 补上后同一句 prompt 从空转变成正常完成
 
 顺着续 159 的空转追"构造出的提示词"，用临时 dataDir + 用户插件（`core.session.preModel`）把每轮
