@@ -1694,6 +1694,9 @@ export function checkTelemetryConfig(c: unknown): string[] {
   if (c.crash !== undefined && typeof c.crash !== 'boolean') {
     out.push(`telemetry.crash 应为布尔值，已忽略该项`)
   }
+  if (c.userId !== undefined && (typeof c.userId !== 'string' || c.userId.length === 0)) {
+    out.push(`telemetry.userId 应为非空字符串，已忽略该项`)
+  }
   // otlp 子段（白名单里的 otlp 是被 type 保护的；这里只查子键）
   if (isPlainObject(c.otlp)) {
     for (const k of collectUnknown(c.otlp, Object.keys(TELEMETRY_OTLP_KEYS), 'telemetry.otlp')) {
@@ -1782,9 +1785,18 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
     const t = cfg.telemetry
     const opt = telemetryPluginOptions(t)
     const on = opt && opt.enabled !== false
+    // OTLP 真开 = 有 otlp 段、endpoint 非空、且 otlp.enabled !== false
+    const otlp = opt?.otlp as { endpoint?: string; enabled?: boolean } | undefined
+    const otlpOn = !!otlp && otlp.enabled !== false && !!otlp.endpoint
+    let otlpTag = ''
+    if (otlp && otlp.enabled !== false) {
+      otlpTag = otlpOn
+        ? ` · OTLP 上报开启（${otlp.endpoint}）`
+        : ' · OTLP 已配置但无有效 endpoint（不会上报）'
+    }
     lines.push(
       t
-        ? `遥测（telemetry）：${on ? '已启用 · ' + (opt?.pathBuilder ? '自定义路径' : '会话级 dataDir/sessions/*.telemetry.jsonl') : '已装配但关闭（telemetry.enabled: false）'}${opt?.crash === false ? ' · 崩溃兜底已关' : ' · 崩溃兜底开启'}${opt?.otlp ? ' · OTLP 上报开启（' + String((opt.otlp as { endpoint?: string })?.endpoint ?? '?') + '）' : ''}`
+        ? `遥测（telemetry）：${on ? '已启用 · ' + (opt?.pathBuilder ? '自定义路径' : '会话级 dataDir/sessions/*.telemetry.jsonl') : '已装配但关闭（telemetry.enabled: false）'}${opt?.crash === false ? ' · 崩溃兜底已关' : ' · 崩溃兜底开启'}${otlpTag}`
         : '遥测（telemetry）：未启用（config.json 写 telemetry 段开启；默认不生成遥测文件）',
     )
     for (const issue of checkTelemetryConfig(t)) lines.push(`  - ${issue}`)

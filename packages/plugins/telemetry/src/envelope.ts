@@ -67,16 +67,15 @@ export function pickAttrs(payload: unknown): TelemetryAttrs {
     if (typeof v === 'string' && v.length > 0) attrs[k] = v
     else if (typeof v === 'number' && Number.isFinite(v)) attrs[k] = v
   }
-  // 别名归一：把常见的 id/sessionId 归到标准 attrs 键
-  if (attrs['sessionId'] == null && attrs['id'] != null) {
-    attrs['sessionId'] = attrs['id'] as string
-    delete attrs['id']
-  }
   return attrs
 }
 
-/** 常见 id 主键 → 标准 attrs 键的映射，用于从 bus 载荷提取会话/agent/provider 维度 */
-const SESSION_KEY_HINTS = ['sessionId', 'session_id', 'id']
+/**
+ * 常见 id 主键 → 标准 attrs 键的映射，用于从 bus 载荷提取会话/agent/provider 维度。
+ * ⚠️ **不把任意顶层 `id` 当 sessionId**：`tool.enabled {id}` / `plugin.loaded {id}` 等事件的
+ * id 是工具/插件 id，顶掉 sessionId 会让会话遥测被切散到错误文件。只认明确的会话键。
+ */
+const SESSION_KEY_HINTS = ['sessionId', 'session_id']
 const AGENT_KEY_HINTS = ['agentId', 'agent_id']
 
 export function extractIdentity(payload: unknown): { sessionId?: string; agentId?: string } {

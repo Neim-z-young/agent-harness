@@ -25,6 +25,7 @@ describe('checkTelemetryConfig', () => {
     expect(checkTelemetryConfig({ debounceMs: 1.5 }).join()).toContain('telemetry.debounceMs 应为非负整数')
     expect(checkTelemetryConfig({ path: '' }).join()).toContain('telemetry.path 应为非空字符串')
     expect(checkTelemetryConfig({ crash: 'x' }).join()).toContain('telemetry.crash 应为布尔值')
+    expect(checkTelemetryConfig({ userId: 123 }).join()).toContain('telemetry.userId 应为非空字符串')
   })
 
   it('otlp 未知键与非法类型提示', () => {
@@ -85,6 +86,12 @@ describe('buildConfigOverview：telemetry 段', () => {
     const on = buildConfigOverview({ model: 'm', telemetry: { otlp: { endpoint: 'https://c:4318' } } }, 'mock')
     expect(on).toContain('OTLP 上报开启')
     expect(on).toContain('https://c:4318')
+  })
+
+  it('OTLP 无有效 endpoint 时提示不会上报', () => {
+    const none = buildConfigOverview({ model: 'm', telemetry: { otlp: {} } }, 'mock')
+    expect(none).toContain('OTLP 已配置但无有效 endpoint')
+    expect(none).not.toContain('OTLP 上报开启')
   })
 })
 

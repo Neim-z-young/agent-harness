@@ -55,6 +55,9 @@ export function createCrashGuard(opts: CrashGuardOpts): CrashGuard {
       stackHash: stackHashStack((reason as Error)?.stack).hash,
     })
     opts.flush()
+    // 交还 Node 默认语义：未被处理的 rejection 会让进程退出（Node 15+ 默认 throw→exit）。
+    // 挂监听后 Node 不再按默认处理，故 记录后必须主动退出，否则会静默吞掉、进程带病运行。
+    process.exit(1)
   }
 
   return {

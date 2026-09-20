@@ -1,5 +1,24 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 171）遥测四提交后独立评审：2 个 P1 + 3 个 P2 修复
+
+按续 136/166 方法论，对 7927498/c905afb/9b3b8c5/c62bc89 做提交后独立审查（自查 + 独立子代理交叉）。
+
+**P1 —— 任意 `id` 被误当 sessionId（真实运行期 bug）**：`extractIdentity` 的 `SESSION_KEY_HINTS` 含 `'id'`，
+于是 `tool.enabled {id:'bash'}` / `plugin.loaded {id:'code-intel'}` 等事件的 tool/plugin id 会被顶成 sessionId，
+`switchWriter` 把会话遥测切散到 `{toolId}.telemetry.jsonl` 之类错误文件，并污染 `lastKnown.sessionId`
+（崩溃事件归属错 session）。修复：只认明确会话键 `sessionId/session_id`，`pickAttrs` 里 `id→sessionId`
+别名归一一并移除。教训：**订阅 subscribeAll 的遥测会收到任意 payload，把通用 `id` 当主键极其危险**。
+
+**P1 —— `unhandledRejection` 被静默吞掉**：挂监听后 Node 不再按默认（未处理 rejection → 退出）处理，
+`rejectionHandler` 只 record+flush 不退出 ⇒ 进程带病运行，违背"交还原行为"契约。修复：记录后
+`process.exit(1)`（对照 exceptionHandler rethrow、signal re-emit）。
+
+**P2×3**：`checkTelemetryConfig` 漏校验 `userId`（非字符串被静默丢）；概览对 `otlp:{}` 误显示"上报开启"→
+改为"已配置但无有效 endpoint（不会上报）"；`telemetry.path` 固定单文件与会话分隔语义冲突（有意为之，记录知悉）。
+
+测试：telemetry 29 例、cli 376 例（+1 userId 校验、+1 otlp 空 endpoint 概览、map 断言改防污染）全过；全量 typecheck 绿。
+
 ## 2026-09-20（续 170）ACP 遥测迁移到通用设施（复用 @harness/telemetry writer）
 
 `acp-context` 撤掉自研 JSONL writer，复用 `@harness/telemetry` 的通用 `createJsonlWriter`。

@@ -29,7 +29,8 @@ describe('envelope', () => {
 
   test('extractIdentity 从载荷挑 sessionId/agentId', () => {
     expect(extractIdentity({ session_id: 'a', agent_id: 'ag' })).toEqual({ sessionId: 'a', agentId: 'ag' })
-    expect(extractIdentity({ id: 'x' })).toEqual({ sessionId: 'x' })
+    expect(extractIdentity({ sessionId: 's' })).toEqual({ sessionId: 's' })
+    expect(extractIdentity({ id: 'x' })).toEqual({}) // 任意 id 不当 sessionId（防 tool/plugin id 污染）
     expect(extractIdentity('nope')).toEqual({})
   })
 })
@@ -69,13 +70,20 @@ describe('writer', () => {
 })
 
 describe('mapBusEvent', () => {
-  test('普通事件 → telemetry.bus.<name>，提取 session/metrics', () => {
+  test('普通事件 → telemetry.bus.<name>，tool.enabled 的 id 不顶 sessionId', () => {
     const rec = { name: 'tool.enabled', payload: { id: 'bash', agentId: 'd' }, timestamp: 7, source: 'tools' }
     const ev = mapBusEvent(rec)
     expect(ev.kind).toBe('telemetry.bus.tool.enabled')
     expect(ev.ts).toBe(7)
-    expect(ev.attrs.sessionId).toBe('bash')
+    expect(ev.attrs.sessionId).toBeUndefined() // tool id 不再被当成 sessionId（防会话文件错乱）
     expect(ev.attrs.source).toBe('tools')
+  })
+
+  test('带真实 sessionId 的事件会提取到 sessionId', () => {
+    const rec = { name: 'core.agent.turn.end', payload: { sessionId: 's_1', step: 3 }, timestamp: 9 }
+    const ev = mapBusEvent(rec)
+    expect(ev.attrs.sessionId).toBe('s_1')
+    expect(ev.metrics.step).toBe(3)
   })
 
   test('harness.error → telemetry.error', () => {
