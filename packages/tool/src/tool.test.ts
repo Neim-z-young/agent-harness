@@ -14,6 +14,7 @@ import {
   ToolUse,
   ToolValidationError,
   defineTool,
+  withJsonSchema,
   partitionToolCalls,
   parseMcpToolId,
   filterMcpTools,
@@ -802,5 +803,26 @@ describe('@harness/tool', () => {
     it('server 名匹配前 trim', () => {
       expect(ids(filterMcpTools(set, [' github ']))).toEqual(['bash', 'mcp__github__a', 'mcp__github__b'])
     })
+  })
+})
+
+describe('withJsonSchema', () => {
+  it('只追加 __jsonSchema，不改变 parse/safeParse 行为', () => {
+    const base: Schema<{ a: string }> = {
+      parse: (v) => v as { a: string },
+      safeParse: (v) => ({ success: true as const, data: v as { a: string } }),
+    }
+    const json = {
+      type: 'object' as const,
+      properties: { a: { type: 'string', description: '参数 a' } },
+      required: ['a'],
+      additionalProperties: false,
+    }
+    const s = withJsonSchema(base, json)
+    // 模型可读的入参描述已挂上
+    expect(s.__jsonSchema).toEqual(json)
+    // 运行时校验行为不变（仍委托原 schema）
+    expect(s.parse({ a: 'x' })).toEqual({ a: 'x' })
+    expect(s.safeParse({ a: 'x' })).toEqual({ success: true, data: { a: 'x' } })
   })
 })

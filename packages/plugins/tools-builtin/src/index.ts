@@ -22,7 +22,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext, PermissionRequest } from '@harness/tool'
+import { defineTool, Tool, ToolResult, Schema, ToolContext, PermissionRequest, withJsonSchema } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
@@ -110,7 +110,17 @@ export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
   id: 'read_file',
   description: '读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。',
   documentation: readFileDoc.trim(),
-  inputSchema: makeSchema<ReadFileInput>(),
+  inputSchema: withJsonSchema(makeSchema<ReadFileInput>(), {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
+      offset: { type: 'number', description: '起始行号（1-based，默认 1）' },
+      limit: { type: 'number', description: '读取行数（默认全部）' },
+      showLineNumbers: { type: 'boolean', description: '是否添加行号前缀（默认 false）' },
+    },
+    required: ['path'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
   permission: {
@@ -229,7 +239,17 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
   id: 'write_file',
   description: '写入本地文件。支持覆盖、追加和仅新建模式。只能在工目录内写入。',
   documentation: writeFileDoc.trim(),
-  inputSchema: makeSchema<WriteFileInput>(),
+  inputSchema: withJsonSchema(makeSchema<WriteFileInput>(), {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
+      content: { type: 'string', description: '写入内容' },
+      mode: { type: 'string', enum: ['overwrite', 'append', 'create'], description: 'overwrite=覆盖/创建，append=追加，create=仅新建' },
+      createDirs: { type: 'boolean', description: '是否自动创建父目录（默认 true）' },
+    },
+    required: ['path', 'content'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => false,
   isDestructive: (input) => input?.mode === 'overwrite',
   isConcurrencySafe: () => false,
@@ -445,7 +465,17 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     id: 'bash',
     description: '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
     documentation: bashDoc.trim(),
-    inputSchema: makeSchema<BashInput>(),
+    inputSchema: withJsonSchema(makeSchema<BashInput>(), {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '要执行的 shell 命令' },
+        cwd: { type: 'string', description: '工作目录（默认使用当前会话 cwd）' },
+        timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 30000）' },
+        env: { type: 'object', description: '附加环境变量', additionalProperties: { type: 'string' } },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    }),
     isReadOnly: () => false,
     isDestructive: () => true,
     isConcurrencySafe: () => false,
@@ -740,7 +770,17 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
   id: 'edit_file',
   description: '编辑文件：精确查找并替换文本片段。默认只替换第一个匹配，支持 replaceAll。需要 oldString 在文件中唯一匹配。',
   documentation: editFileDoc.trim(),
-  inputSchema: makeSchema<EditFileInput>(),
+  inputSchema: withJsonSchema(makeSchema<EditFileInput>(), {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
+      oldString: { type: 'string', description: '要替换的旧文本（必须精确匹配，含缩进/换行）' },
+      newString: { type: 'string', description: '替换为的新文本' },
+      replaceAll: { type: 'boolean', description: '是否替换所有匹配（默认 false，仅替换第一个）' },
+    },
+    required: ['path', 'oldString', 'newString'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => false,
   isDestructive: () => false,
   isConcurrencySafe: () => false,

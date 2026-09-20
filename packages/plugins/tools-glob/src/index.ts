@@ -16,7 +16,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, Tool, ToolResult, Schema, ToolContext, withJsonSchema } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative, join } from 'node:path'
@@ -124,7 +124,17 @@ const MAX_GLOB_RESULTS = 5000
 export const globTool = defineTool<GlobInput, GlobOutput>({
   id: 'glob',
   description: '按模式（glob，支持 **/*/? 通配符，! 取反）递归搜索文件，支持排除、大小过滤、深度限制。',
-  inputSchema: makeSchema<GlobInput>(),
+  inputSchema: withJsonSchema(makeSchema<GlobInput>(), {
+    type: 'object',
+    properties: {
+      pattern: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }], description: '匹配模式（如 "*.ts"、["src/**/*.ts","!src/dist/**"]，"!" 开头表示排除）' },
+      path: { type: 'string', description: '搜索根目录（相对 cwd 或绝对路径，默认 "."）' },
+      maxResults: { type: 'number', description: '最大结果数量（默认 500）' },
+      includeHidden: { type: 'boolean', description: '是否包含隐藏文件（默认 false）' },
+    },
+    required: ['pattern'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
   permission: {

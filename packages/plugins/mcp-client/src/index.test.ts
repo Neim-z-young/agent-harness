@@ -125,7 +125,11 @@ describe('convertMcpToolToHarnessTool', () => {
     const client = new McpClient('myserver', transport)
     await client.connect()
 
-    const mcpTool: McpToolDef = { name: 'greet', description: 'Greet someone' }
+    const mcpTool: McpToolDef = {
+      name: 'greet',
+      description: 'Greet someone',
+      inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+    }
     const tool = convertMcpToolToHarnessTool(mcpTool, 'myserver', client)
 
     expect(tool.id).toBe('mcp__myserver__greet')
@@ -137,6 +141,12 @@ describe('convertMcpToolToHarnessTool', () => {
     // schema 校验
     const parsed = tool.inputSchema.safeParse({ name: 'Alice' })
     expect(parsed.success).toBe(true)
+    // 服务端声明的 inputSchema 必须透传成 __jsonSchema（否则模型看不到任何参数）
+    expect((tool.inputSchema as any).__jsonSchema).toEqual({
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+    })
 
     // 执行
     const ctx = {} as ToolContext

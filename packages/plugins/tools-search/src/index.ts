@@ -17,7 +17,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, Tool, ToolResult, Schema, ToolContext, withJsonSchema } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative, join } from 'node:path'
@@ -84,7 +84,16 @@ const MAX_DIR_ENTRIES = 500
 export const listDirTool = defineTool<ListDirInput, ListDirOutput>({
   id: 'list_dir',
   description: '列出目录内容。支持递归、隐藏文件显示。返回文件名、类型和大小。',
-  inputSchema: makeSchema<ListDirInput>(),
+  inputSchema: withJsonSchema(makeSchema<ListDirInput>(), {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '要列出的目录（相对 cwd 或绝对路径，默认 "."）' },
+      recursive: { type: 'boolean', description: '是否递归列出子目录' },
+      showHidden: { type: 'boolean', description: '是否包含隐藏文件（默认 false）' },
+      maxDepth: { type: 'number', description: '递归时的最大深度' },
+    },
+    additionalProperties: false,
+  }),
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
   permission: {
@@ -216,7 +225,19 @@ const MAX_GREP_FILES = 200
 export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
   id: 'grep_file',
   description: '在文件或目录中搜索文本模式（正则表达式）。支持 glob 文件过滤、大小写敏感、递归搜索。',
-  inputSchema: makeSchema<GrepFileInput>(),
+  inputSchema: withJsonSchema(makeSchema<GrepFileInput>(), {
+    type: 'object',
+    properties: {
+      pattern: { type: 'string', description: '要搜索的文本（字面量）' },
+      path: { type: 'string', description: '搜索根目录或文件（默认 "."）' },
+      recursive: { type: 'boolean', description: '是否递归子目录（默认 true）' },
+      caseSensitive: { type: 'boolean', description: '是否区分大小写（默认 false）' },
+      include: { type: 'string', description: '文件名过滤 glob（如 "*.ts"）' },
+      maxResults: { type: 'number', description: '最大匹配数' },
+    },
+    required: ['pattern'],
+    additionalProperties: false,
+  }),
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
   permission: {

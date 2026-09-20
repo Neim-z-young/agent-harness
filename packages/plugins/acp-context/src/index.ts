@@ -23,7 +23,7 @@
  * })
  */
 
-import { defineTool, Schema, ToolResult, ToolContext } from '@harness/tool'
+import { defineTool, Schema, ToolResult, ToolContext, withJsonSchema } from '@harness/tool'
 import type { AgentPlugin, Hooks, CompactionContext } from '@harness/plugin'
 import type { Message } from '@harness/session'
 import {
@@ -80,6 +80,22 @@ function makeSchema<T>(): Schema<T> {
       return { success: true, data: value as T }
     },
   }
+}
+
+/**
+ * 脱敏内核压缩系统提示里的**字面示例标签**。
+ *
+ * 内核默认提示（buildCompressSystemPrompt 输出）里带一个完整的可复制模板：
+ * `<acp tokens="2.1K" type="tool:bash">m00175</acp>`，同一页又要求 "NEVER echo these tags"。
+ * 实测（会话 s_1789516184627_g800t）DeepSeek 会照抄模板把标签输出进正文，与工具调用协议混淆。
+ * 这里把示例改成不完整形态：保住「每条消息都带 ref 标签」的语义，但不再提供可直接复制的模板。
+ * （消息上由内核注入的**真实** ref 标签不受影响 —— 那是 compress 选段的机制本身。）
+ */
+export function sanitizeExampleTags(text: string): string {
+  return text.replace(
+    /<acp tokens="[^"]*" type="[^"]*">m\d+<\/acp>/g,
+    '<acp tokens=… type=…>mNNNNN</acp>',
+  )
 }
 
 // ===== 工具输入类型 =====
@@ -274,7 +290,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     { acknowledgeRisk: true },
   )
   const makeSystemPrompt = (): string =>
-    options.systemPrompt ?? buildCompressSystemPrompt(resolvedPrompts)
+    options.systemPrompt ?? sanitizeExampleTags(buildCompressSystemPrompt(resolvedPrompts))
   // token 折算口径：默认与内核同一份实现（CJK 感知）。'auto' 显式注入等价于内核默认值，
   // 目的是把口径**钉死在一处**——插件上报的 tokenCount 与内核内部计数永远是同一把尺子。
   const countTokens = options.tokenCalibration === 'chars4' ? chars4CountTokens : cjkAwareCountTokens
@@ -322,7 +338,29 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         id: 'compress',
         description:
           '压缩历史消息：把指定 ref 范围内的旧消息折叠成一段摘要，换回上下文空间。模型写摘要、内核做编排。',
-        inputSchema: makeSchema<CompressInput>(),
+        inputSchema: withJsonSchema(makeSchema<CompressInput>(), {
+          type: 'object',
+          properties: {
+            topic: { type: 'string', description: '本次压缩的主题（可选，便于日后检索）' },
+            content: {
+              type: 'array',
+              description: '要折叠的范围列表；每段的 summary 是这段历史被替换后的唯一记录，必须自洽完整',
+              items: {
+                type: 'object',
+                properties: {
+                  topic: { type: 'string', description: '该段的主题（可选）' },
+                  startId: { type: 'string', description: '起始消息 ref（如 m00012）' },
+                  endId: { type: 'string', description: '结束消息 ref' },
+                  summary: { type: 'string', description: '自包含的摘要：任务状态、结论、关键路径/签名/报错原文、决策及理由' },
+                  summaryMaxChars: { type: 'number', description: '摘要长度上限（可选）' },
+                },
+                required: ['startId', 'endId', 'summary'],
+              },
+            },
+          },
+          required: ['content'],
+          additionalProperties: false,
+        }),
         isConcurrencySafe: () => false,
         isReadOnly: () => false,
         async call(input, ctx) {
@@ -387,7 +425,16 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     ? defineTool<DecompressInput, DecompressOutput>({
         id: 'decompress',
         description: '按 blockId 查看某个已压缩上下文块的摘要，可了解被压缩掉的内容梗概。',
-        inputSchema: makeSchema<DecompressInput>(),
+        inputSchema: withJsonSchema(makeSchema<DecompressInput>(), {
+          type: 'object',
+          properties: {
+            blockId: { type: 'string', description: '要展开的压缩块 id' },
+            toFile: { type: 'boolean', description: '是否落盘为文件（大块时避免撑爆上下文）' },
+            full: { type: 'boolean', description: '是否展开全部原文（默认折叠视图）' },
+          },
+          required: ['blockId'],
+          additionalProperties: false,
+        }),
         isConcurrencySafe: () => false,
         isReadOnly: () => true,
         async call(input, ctx): Promise<ToolResult<DecompressOutput>> {
@@ -429,7 +476,15 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     ? defineTool<SearchInput, SearchOutput>({
         id: 'search_context',
         description: '按 query 对已压缩的历史上下文块做相关性检索，找到对话主题对应的摘要。',
-        inputSchema: makeSchema<SearchInput>(),
+        inputSchema: withJsonSchema(makeSchema<SearchInput>(), {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: '检索关键词（在已压缩块中查找）' },
+            limit: { type: 'number', description: '最大返回条数' },
+          },
+          required: ['query'],
+          additionalProperties: false,
+        }),
         isConcurrencySafe: () => false,
         isReadOnly: () => true,
         async call(input, ctx): Promise<ToolResult<SearchOutput>> {
@@ -459,7 +514,11 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     ? defineTool<AcpStatusInput, AcpStatusOutput>({
         id: 'acp_status',
         description: '查看当前上下文压缩状态：上下文占用、已压缩块数、已回收 token 数。',
-        inputSchema: makeSchema<AcpStatusInput>(),
+        inputSchema: withJsonSchema(makeSchema<AcpStatusInput>(), {
+          type: 'object',
+          properties: {},
+          additionalProperties: false,
+        }),
         isConcurrencySafe: () => false,
         isReadOnly: () => true,
         async call(_input, ctx): Promise<ToolResult<AcpStatusOutput>> {

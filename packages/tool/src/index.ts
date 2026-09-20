@@ -19,6 +19,19 @@
 export type Awaitable<T> = T | Promise<T>
 
 /**
+ * 工具入参的 JSON Schema（对象形态）。
+ * 供 Provider 生成 `tools` 载荷 —— 这是模型认识工具参数的**唯一**渠道：
+ * 缺了它，模型只能看到工具名 + 一句散文描述，参数全靠猜（实测会退化成空参调用与原地空转）。
+ */
+export interface JsonSchemaObject {
+  type: 'object'
+  properties: Record<string, unknown>
+  required?: string[]
+  additionalProperties?: boolean
+  [k: string]: unknown
+}
+
+/**
  * 通用 Schema 接口（抽象层，兼容 zod / valibot / 自定义校验）
  * 用于 Tool 的 inputSchema / outputSchema 硬校验
  */
@@ -27,6 +40,32 @@ export interface Schema<T> {
   parse(value: unknown): T
   /** 安全解析，返回结果对象 */
   safeParse(value: unknown): { success: true; data: T } | { success: false; error: unknown }
+  /**
+   * 可选：入参的 JSON Schema（声明式描述，给模型阅读；运行时校验仍走 parse/safeParse）。
+   *
+   * ⚠️ 这是 provider 生成 tools 载荷时的**唯一**参数来源（openai / anthropic / gemini 三个适配器
+   * 都读它），缺失时工具会以空对象 schema 发出 —— 模型看不到任何参数名/类型/必填项。
+   * 新工具请务必通过 {@link withJsonSchema}（或 zod 适配）提供。
+   */
+  __jsonSchema?: JsonSchemaObject
+}
+
+/**
+ * 给已有 schema 补 JSON Schema（不改变运行时校验行为，只追加模型可读的入参描述）。
+ *
+ * @example
+ * inputSchema: withJsonSchema(makeSchema<BashInput>(), {
+ *   type: 'object',
+ *   properties: { command: { type: 'string', description: '要执行的 shell 命令' } },
+ *   required: ['command'],
+ *   additionalProperties: false,
+ * }),
+ */
+export function withJsonSchema<T>(
+  schema: Schema<T>,
+  jsonSchema: JsonSchemaObject,
+): Schema<T> & { __jsonSchema: JsonSchemaObject } {
+  return Object.assign(schema, { __jsonSchema: jsonSchema })
 }
 
 // ===== ToolContext =====

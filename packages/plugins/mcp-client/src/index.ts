@@ -19,6 +19,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import type { Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { withJsonSchema } from '@harness/tool'
 import { defaultUserDir } from '@harness/workspace'
 import { OAuthFlow, type McpOauthConfig } from './oauth'
 import { OAuthTokenStore, oauthServerKey } from './token-store'
@@ -658,7 +659,13 @@ export function convertMcpToolToHarnessTool(
     isReadOnly: () => false,
     isDestructive: () => false,
     isConcurrencySafe: () => false,
-    inputSchema: new PassthroughSchema(),
+    // MCP 服务端声明的 inputSchema 原样透传给模型（此前用裸 PassthroughSchema，
+    // 服务端声明的参数名/类型/必填项全部丢失 ⇒ 模型只能空参调用或瞎猜）。
+    inputSchema: withJsonSchema(new PassthroughSchema(), (mcpTool.inputSchema ?? {
+      type: 'object',
+      properties: {},
+      additionalProperties: true,
+    }) as never),
     async call(input: Record<string, unknown>, _ctx: ToolContext): Promise<ToolResult<unknown>> {
       try {
         const result = await client.callTool(mcpTool.name, input)
