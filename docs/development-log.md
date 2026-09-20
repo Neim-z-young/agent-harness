@@ -1,5 +1,30 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 166）提交后评审：59e296e..HEAD（63 提交，续 157~165）—— 1 安全 + 4 缺陷
+
+按续 136 固化的方法论（**提交后再跑一次独立审查**）：我自查 + 独立子代理复审，交叉确认。
+
+**P0 安全 —— save() 中间目录符号链接逃逸**：`root/<id>` 被预置为指向外部的 symlink、且外部
+无 SKILL.md 时，`existsSync(target)=false` 绕过全部既有检查，tmp 与最终文件都经链接写到根
+目录**外**（本地探针实锤）。修复：mkdir 后对父目录 realpath 校验（根自身也取 realpath，
+兼容 macOS /var→/private/var）。教训：**只校验最终路径挡不住中间目录链接**，每一级写入点
+都要验。
+
+**P1 —— /forge memory add 丢内容**：`split(/\s+/).slice(3)` 把内容里的词当分隔符丢掉
+（"这个项目用 bun 跑测试"只写入"bun 跑测试"）——**就藏在自己的真机 e2e 输出里**，当时
+只看了"已写入"没核对内容。改用 parseArgs 的 positional。
+
+**P2×3**（独立评审抓出 2 个、自查 1 个）：schedule() 重置 forced（冲掉 compress 触发的
+立即发布）、pending 草稿 Map 无界、非法 id 拖到 confirm 才报错。另修 cli run 空 detail。
+
+**P3**：writeAtomic / writeFeedbackMemory 对已是符号链接的目标拒绝写入。
+
+独立评审同时确认了四个"不是缺陷"（post.execute 契约、/forge skill 切片、__jsonSchema
+转发、doom-loop 硬中断），避免追假阳性。结论：可合入，P2 已全部修复后再提交。
+
+提交 `8528601`（修复，+10 例守卫）。全量 1595 pass / 0 fail。
+经验：真机 e2e 断言"写入了"不够，要**断言写入的内容**；安全检查要覆盖中间路径组件。
+
 ## 2026-09-20（续 165）ACP 压缩信号统一到引擎层（回答"和 memory 保持一致还是都改引擎层"）
 
 用户追问两条路的区别。结论：**照抄 memory 旧方式（cli.agent.stream）保持的"一致"是与缺陷一致**
