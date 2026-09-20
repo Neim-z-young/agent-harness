@@ -1,5 +1,34 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 162）技能锻造 F0/F1/F2 落地（记忆线 M0~M3.1 之后的能力二）
+
+按 docs/memory-and-skill-forge-plan.md §4 推进：记忆线已收口，接着做「把跑通的流程固化成技能」。
+
+**F0（@harness/skill）**：新增 `SkillManager.save()` + `skillToMarkdown()`。安全边界四道：
+目标目录必须已登记（不给任意路径）、id 只允许 `a-z0-9-_`（id 即目录名）、目标为符号链接
+或 realpath 越界一律拒绝、同目录临时文件 → rename 的原子写；写后 reload（未命中源时 register
+兜底）⇒ 落盘即当轮可用。配套：`load()` 在目录不存在时也登记 sourceDirs（首次锻造时 skills
+目录往往还没建）；realpath 越界校验的基准也要取 realpath（macOS 的 /var → /private/var
+符号链接会误判，单测当场抓出）。
+
+**F1/F2（新包 @harness/skill-forge，optIn）**：`/skill-forge <name> [--project] [--desc "何时用"]`
+出草稿（**不落盘**）→ `/skill-forge --confirm <name>` 才写文件并当轮生效；另有 list / path /
+disable。要点：
+- 轨迹采集走引擎层 `core.tool.post.execute`（不用 UI 层的 `cli.agent.stream`，内嵌宿主下会静默失效）；
+- 命令两段式：`CliCommandInput` 只有 out 没有 stdin，这是唯一不阻塞 REPL 的确认方式；
+- 生成**不接 LLM**（照实记录跑通的路径，避免幻觉步骤）；默认 user 级（项目级会随 git 共享）；
+- 步骤去噪三级（真机观察驱动）：折叠相邻重复 → 折叠完整周期 → 按「工具+入参」全局去重。
+  实测把 list_dir/read_file 反复跑出的 12 步压成 3 步，且不丢不同入参的步骤。
+- F2：描述相似度（Jaccard 0.5）提示"更新已有技能"、数量上限 50、禁用而非删除。
+- 生成技能 `allowEmbedShell: false` 写死（防模型给自己生成 !`cmd` 可执行技能）。
+
+**真机端到端**（临时 dataDir + 真实 DeepSeek，REPL 用管道喂命令并留足等待时间）：
+工具调用 → 草稿 → --confirm → SKILL.md 落盘 → `/skill-forge list` 当轮可见。
+（坑：管道喂命令太快会在模型跑完前就 `/exit`，轨迹为空 —— 需 sleep 等待。）
+
+提交 `2a06a5d`（F0，+9 例）+ `2c098cf`（F1/F2，+23 例）+ `4d0e3a1`（计划文档）。
+typecheck 0 错误；全量 1564 pass / 0 fail。**F3（隐式重复检测 + 失败回写记忆）未做**。
+
 ## 2026-09-20（续 161）schema 补齐至 42/42 + headless 失败结果可见
 
 **① 剩余工具 schema 全部补齐（17 个）**：swarm 9（task 系 status 用五态 enum；shutdown 决策
