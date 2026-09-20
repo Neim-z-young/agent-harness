@@ -1,5 +1,110 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 158）herdr 上报「启动不显示已启动 / 退出不显示已退出」—— 三条根因，全部真机证实
+
+用户报：「herdr 插件的状态上报似乎有问题，启动时没有立即显示已启动，退出后也没有显示已退出」。
+两条症状看起来像两件事，查下来是**三条**根因，而且每条都不是"代码写错了"，而是**按官方文档字面实现、
+却没在真机上对过账**。本机恰好装着 `/opt/homebrew/bin/herdr`（0.9.0，server 在跑），于是全程用真机验证，
+而不是靠读代码推断。
+
+### 真机手段
+
+- `herdr --help` / `pane report-agent --help` / `release-agent --help`：确认 `--state` 合法值
+  （`idle|working|blocked|unknown`）与 **`release-agent` 也有 `--seq`**（官方文档示例里没有！）。
+- `herdr pane get <id>` / `herdr api snapshot`：读 pane 上真实的 `agent` / `agent_status` / `state_change_seq`。
+- 对 `w2:p3` 用**独立 source**（`custom:harness-probe`）做上报实验，每次实验后 `release-agent` 收尾，
+  不触碰用户正在运行会话的 `w2:p1`；实验结束已核对无残留。
+
+### 根因 ①：`--seq` 的水位线跨进程不重置，新进程从 1 起算 ⇒ 前 N 条上报全被丢弃
+
+| 步骤 | 命令 | pane 实际状态 |
+| --- | --- | --- |
+| 埋高水位 | `report --state idle --seq 100` | `idle` ✅ |
+| 模拟新进程 | `report --state working --seq 1` | **仍是 `idle`**（seq=1 被丢弃） |
+| 超过水位线 | `report --state working --seq 101` | `working` ✅ |
+
+⇒ 官方原文只写了 "Herdr ignores stale sequence numbers from the same source"，没说水位线的生命周期；
+实测它**按 (pane, source) 存、与上报方进程无关**。旧实现 `seq` 每个进程都从 0 自增，于是只要上一次运行
+没来得及 release，新进程的前 N 条上报全被当 stale 丢掉 —— 这就是「启动后侧边栏半天不动」。
+（更糟的是它**静默**丢弃，没有任何返回码或日志。）
+
+### 根因 ②：`release-agent` 不带 `--seq` 会被同一个水位线丢掉 ⇒ 退出后标签一直在
+
+A/B 实测（同一 pane、两个独立 source）：
+
+| 实验 | 上报 | release | 结果 |
+| --- | --- | --- | --- |
+| A | `--seq 50` | `release-agent`（不带 seq，**照官方示例写的**） | ❌ 标签仍在、状态停在 `working` |
+| B | `--seq 50` | `release-agent --seq 51` | ✅ 标签清掉、状态回到 `unknown` |
+
+⇒ 旧 `buildReleaseArgs` 恰好就是 A 的写法：**释放命令发出去了，但被 herdr 丢了**。
+这条解释了「退出后不显示已退出」，而且与进程怎么退出的无关 —— 哪怕优雅退出也不会释放。
+
+### 根因 ③：`process.once('exit')` 覆盖不到信号退出
+
+Bun 1.3.14 实测（`process.on('exit')` 里 `spawnSync` 落一个 marker 文件）：
+
+| 退出方式 | 'exit' 处理器 | release 是否发出 |
+| --- | --- | --- |
+| `process.exit(0)`（`/exit`、Ctrl-D、TUI 关闭） | ✅ 运行 | ✅ |
+| SIGTERM | ❌ 不运行 | ❌ |
+| SIGHUP（**关掉 pane 就是它**） | ❌ 不运行 | ❌ |
+| SIGINT | ——（Bun 未按默认处置终止；CLI 自己注册了处理） | —— |
+
+⇒ 「关 pane」这个最常见的退出方式，旧实现**永远不会 release**（正好把根因 ② 的水位线留给了下一次运行，
+于是下一次连"启动"都不显示 —— 三条根因是这样串起来的）。刻意**没挂 SIGINT**：CLI 的 REPL/TUI 用它
+表示「中断当前查询」，插件抢这个信号会把用户的 Ctrl-C 语义改坏；正常 Ctrl-C 退出会经 `process.exit()`
+⇒ 仍由 'exit' 兜住。
+
+### 改法（`@harness/herdr` 0.1.0 → 0.2.0）
+
+1. **启动即上报**：新增 `core.harness.start` hook → 报一次 `idle`（= 已启动、等待输入）。
+   只挂 `cli.agent.stream` 的话，侧栏要等用户按下第一个回车才有状态。
+2. **序号基线改为微秒级墙上时钟**（`nextSeqBase()`，≈1.8e15，真机确认该量级被接受）：
+   恒大于任何一次历史运行的末序号，跨进程也不会撞上水位线。
+3. **退出序列 `shutdown()`**：先报 `unknown`（离开 working/idle 语义态），再 `release-agent **带序号**`；
+   两步都走同步执行器（退出时事件循环已不再调度），幂等。
+4. **退出覆盖信号**：`process.on('SIGTERM'|'SIGHUP')` → 同步 shutdown → 卸掉自己的监听 →
+   `process.kill(pid, sig)` 按默认处置重发（保住退出码/信号语义，也让进程真的能退出）。`EXIT_SIGNALS` 导出供测试。
+5. 顺手把「已启用」日志从恒为 `pane=ok` 改成真实 `pane=w2:p1` 这类实际 pane id（排查时才有用）。
+
+### 写测试时又抓出一个自己的洞
+
+第一版基线用 `Date.now()`（毫秒），回归测试立刻红：
+
+```
+Expected: > 1789862553376      // 上一次运行的末序号 = 基线 + 2
+Received:   1789862553375      // 新进程的首序号 = 同一毫秒的基线 + 1
+```
+
+即**同一毫秒内重启仍会撞车**（我先写了"放大 1000 倍"的版本，测试证明那并不能解决——同一个毫秒的基线
+是同一个值，槽位号才是撞车的原因）。最终改用**微秒级**时钟（`performance.timeOrigin + performance.now()`），
+并把这条不变量做成确定性可测的形式：`nextSeqBase(固定输入)` 断言量级、`seqBase` 注入两个"不同启动时刻"
+的 reporter 断言跨运行严格递增。**这个洞不是推演出来的，是测试逼出来的** —— 值得记一笔。
+
+### 端到端验证（真实插件 + 真实 herdr 服务）
+
+用真实 `createHerdrPlugin()`（真 runner = spawn/spawnSync）打到真实 `herdr`：
+
+| 场景 | 结果 |
+| --- | --- |
+| 先埋「上次残留水位线 `seq=500` 的 working」 | pane 停在 `working`（复现用户症状） |
+| 启动插件（`core.harness.start`） | 0.6s 内状态被改写（`done`）、1.9s 流式后 `working` ✅ |
+| 发 SIGTERM | 进程按信号语义退出 + pane 变 `agent=(无) status=unknown` ✅ |
+| 走 `process.exit(0)`（/exit 路径） | pane 干净（`agent=(无) status=unknown`）✅ |
+
+**顺带实测**：herdr 侧栏把 `working → idle` 的转换显示为 **`done`**（"做完待查看"，你看过才消失），
+`done` 不在 `report-agent --state` 的合法值里 —— 它是 herdr 自己的 rollup 状态。所以「上次残留 working」的
+pane 启动时会显示 `done` 而不是 `idle`，这是 herdr 的状态机，不是本插件的 bug（已在插件注释里写明）。
+
+**验证**：herdr 包 26 个用例全绿（新增 8 条：序号基线量级/跨运行单调、release 必须带更高序号、
+shutdown 顺序与同步性、启动上报、信号注册与卸载、信号重发）；全仓 typecheck 0 错误；全量测试 1530 pass / 0 fail。
+
+**教训**：外部集成的契约**以真机为准**。这次三处都是"官方原文没写 / 例子与实现不一致"的地方：
+release 要带 `--seq`（文档示例不带）、水位线跨进程存在（文档只说"同 source 旧序号被忽略"）、
+信号退出不触发 'exit'（Node/Bun 通病但容易被忘）。三处都是**静默失效**，读代码看不出来 ——
+能真机验就别只读文档。
+
 ## 2026-09-19（续 157）hook 名加层前缀 `core.` / `cli.`，并补上一直"只声明没接线"的 `core.permission.check`
 
 用户要求：「不同层的 hooks 增加对应层前缀，识别当前项目中的 hooks 命名问题并优化」。
