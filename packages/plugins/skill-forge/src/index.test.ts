@@ -36,8 +36,8 @@ async function setup(opts: { maxSkills?: number } = {}) {
   const ws = {
     cwd: base,
     dataDir: base,
-    user: { root: base, plugins: '', skills: join(base, 'user-skills'), agents: '', memory: '' },
-    project: { root: base, plugins: '', skills: join(base, 'project-skills'), agents: '', memory: '' },
+    user: { root: base, plugins: '', skills: join(base, 'user-skills'), agents: '', memory: join(base, 'user-memory') },
+    project: { root: base, plugins: '', skills: join(base, 'project-skills'), agents: '', memory: join(base, 'project-memory') },
   }
   const manager = createSkillManager()
   const plugin = createSkillForgePlugin({ workspace: ws, skillManager: manager, ...opts })

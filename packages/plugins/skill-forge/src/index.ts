@@ -527,10 +527,11 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
           ).length
           if (failures >= (options.minFailures ?? 2)) {
             writtenFeedback.add(key)
-            const file = join(
-              (options.feedbackScope ?? 'user') === 'project' ? ws.project.memory : ws.user.memory,
-              MEMORY_INDEX_FILE,
-            )
+            const memoryDir =
+              (options.feedbackScope ?? 'user') === 'project' ? ws.project.memory : ws.user.memory
+            // 路径为空时绝不落笔：join('', 'MEMORY.md') 会解析成相对路径 ⇒ 写到进程 cwd
+            if (!memoryDir) return
+            const file = join(memoryDir, MEMORY_INDEX_FILE)
             const res = writeFeedbackMemory(
               file,
               `[feedback] ${toolId} 反复失败（${failures} 次）：${(r.error?.message ?? '未知原因').slice(0, 120)}`,
