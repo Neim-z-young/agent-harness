@@ -1,5 +1,37 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 167）通用遥测插件 `@harness/telemetry`（本地采集 + 可选 OTLP）
+
+按 `docs/telemetry-plan.md` 落地第一步：通用遥测设施 + cli 装配。用户已定三项决策：**会话级**存储、
+**最小直连** OTLP（未实现，留二期）、需要**跨会话匿名 user id**。
+
+**现状复盘**：此前只有 ACP 压缩的定制遥测（`acp-context/src/telemetry.ts`），写 `{sessionId}.telemetry.jsonl`，
+且事件名/维度自造、无统一模型。本包把它提升为通用模块：
+
+- `envelope.ts`：统一 `TelemetryEnvelope {schema, kind, ts, attrs, metrics}`，隐私红线 = 只记标量/低基数标签，
+  从 bus 载荷通用提取 `pickMetrics/pickAttrs/extractIdentity`。
+- `writer.ts`：`createJsonlWriter`（提升自 ACP `createWriter`，泛型化、debounce、失败静默、无 path=no-op）。
+- `map.ts`：任意 bus 事件 → `telemetry.bus.<name>`，`harness.error` → `telemetry.error`；初版即可覆盖现有
+  `HarnessEvents`/`LifecycleEvents`，免逐条枚举。
+- `crash.ts`：崩溃兜底——SIGTERM/SIGHUP（**不抢 SIGINT**）、`uncaughtException`/`unhandledRejection` →
+  `telemetry.crash` + flush 后交还原信号/异常默认行为；堆栈哈希去重、截断防泄露。
+- `index.ts`：`createTelemetryService`（返回 `{plugin, telemetry}`）与 `createTelemetryPlugin`（仅插件）；
+  `install` 订阅 `ctx.bus.subscribeAll`，会话边界切换活跃 writer；`deriveUserID` 从 `.config-key` 派生匿名 id。
+
+**cli 装配**（零影响默认）：config.json 写 `telemetry` 段才装配，逐项显式映射 + 白名单校验
+（`telemetryPluginOptions`/`checkTelemetryConfig`，未知键/非法类型在 `--check-config`/概览、boot WARN 双处暴露），
+概览加 `遥测（telemetry）：…` 行。dataDir 用 CLI 实际 workspace，避免路径口径分裂。
+
+**踩坑（很关键）**：`switchWriter` 的 `activeSessionId === undefined` 守卫在首条**无 sessionId** 的 bus 事件上
+恒真 → 永远不建 writer、不发文件。修复：用唯一哨兵 `UNSET` 代替 `undefined` 当"未初始化"态。教训：
+**「比较未初始化态防重复」在首个值为 undefined/null 时会直接吞掉首写**，这类守卫应选一个业务值永远
+不会命中的哨兵。
+
+测试：telemetry 包 15 例 + cli telemetry-config 11 例全过；cli 全量 372 pass（含新 11 例）；全量 typecheck 绿。
+root `bun test` 的 607 处 `document is not defined` 为既有 TUI/dom 环境性失败，与本次改动无关。
+
+提交待续。OTLP 最小直连 + ACP 遥测迁移到本包（`telemetry.acp.*`）留二期。
+
 ## 2026-09-20（续 166）提交后评审：59e296e..HEAD（63 提交，续 157~165）—— 1 安全 + 4 缺陷
 
 按续 136 固化的方法论（**提交后再跑一次独立审查**）：我自查 + 独立子代理复审，交叉确认。

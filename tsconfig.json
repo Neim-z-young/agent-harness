@@ -49,6 +49,7 @@
       "@harness/mcp-server-registry": ["./packages/plugins/mcp-server-registry/src"],
       "@harness/computer-use": ["./packages/plugins/computer-use/src"],
       "@harness/computer-use/meta": ["./packages/plugins/computer-use/src/meta.ts"],
+      "@harness/telemetry": ["./packages/plugins/telemetry/src"],
       "@harness/cli": ["./packages/cli/src"]
     }
   },

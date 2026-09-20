@@ -29,6 +29,7 @@
         "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
         "@harness/swarm": "workspace:*",
+        "@harness/telemetry": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
         "@harness/tools-glob": "workspace:*",
@@ -324,6 +325,14 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/telemetry": {
+      "name": "@harness/telemetry",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/bus": "workspace:*",
+        "@harness/plugin": "workspace:*",
+      },
+    },
     "packages/plugins/tools-builtin": {
       "name": "@harness/tools-builtin",
       "version": "0.1.0",
@@ -503,6 +512,8 @@
     "@harness/subagent": ["@harness/subagent@workspace:packages/plugins/subagent"],
 
     "@harness/swarm": ["@harness/swarm@workspace:packages/plugins/swarm"],
+
+    "@harness/telemetry": ["@harness/telemetry@workspace:packages/plugins/telemetry"],
 
     "@harness/tool": ["@harness/tool@workspace:packages/tool"],
 

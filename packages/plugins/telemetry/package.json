@@ -1,0 +1,22 @@
+{
+  "name": "@harness/telemetry",
+  "version": "0.1.0",
+  "description": "通用遥测插件：会话级本地 JSONL 采集（bus 事件→统一 envelope）+ 异常场景监控 + 崩溃兜底，可选 OTLP 最小直连上报",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/bus": "workspace:*",
+    "@harness/plugin": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

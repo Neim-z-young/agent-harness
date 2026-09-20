@@ -324,6 +324,24 @@ export interface HarnessConfig {
    */
   harness?: { snapshot?: boolean }
   /**
+   * 通用遥测（本地采集为主 + 可选 OTLP）。**写出 `telemetry` 段才装配** `@harness/telemetry`
+   * 插件（默认不启用，避免生成遥测文件）；开启后按会话写
+   * `dataDir/sessions/{sessionId}.telemetry.jsonl`（bus 事件 → 统一 envelope），
+   * 附带崩溃兜底（SIGTERM/SIGHUP / uncaughtException → telemetry.crash）。
+   */
+  telemetry?: {
+    /** 总开关（默认 true，仅在该段存在时生效） */
+    enabled?: boolean
+    /** 会话文件路径生成（缺省 `{dataDir}/sessions/{sessionId}.telemetry.jsonl`） */
+    path?: string
+    /** 批量 flush 间隔 ms（缺省 500） */
+    debounceMs?: number
+    /** 是否挂崩溃兜底（缺省 true） */
+    crash?: boolean
+    /** 跨会话匿名 user id（缺省从 `.config-key` 派生，仅供聚合，非明文） */
+    userId?: string
+  }
+  /**
    * ACP 上下文压缩配置（`compression.enabled: true` 开启才装配 @harness/acp-context 插件）。
    * 装配后运行 @harness/acp-context 的 runPreModel：保留历次折叠的 source:'acp' 压缩块到统一块模型。
    */
@@ -1607,6 +1625,55 @@ export function memoryPluginOptions(c: HarnessConfig['memory']): Record<string, 
   return out
 }
 
+/**
+ * `config.json → telemetry` → telemetry 插件的构造参数（含秘设备注入前的显式映射）。
+ *
+ * 与 memory 同模式：逐项显式映射，非法值丢弃并在 checkTelemetryConfig 里提示。
+ * 返回 `null` 表示「未装配」（config 没写 telemetry 段）——保持默认零影响。
+ */
+export function telemetryPluginOptions(c: HarnessConfig['telemetry']): Record<string, unknown> | null {
+  if (!c) return null
+  const out: Record<string, unknown> = {}
+  if (typeof c.enabled === 'boolean') out.enabled = c.enabled
+  if (typeof c.path === 'string' && c.path.length > 0) out.pathBuilder = (_sid?: string) => c.path as string
+  if (typeof c.debounceMs === 'number' && Number.isInteger(c.debounceMs) && c.debounceMs >= 0) out.debounceMs = c.debounceMs
+  if (typeof c.crash === 'boolean') out.crash = c.crash
+  if (typeof c.userId === 'string' && c.userId.length > 0) out.userID = c.userId
+  return out
+}
+
+const TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['telemetry']>, true> = {
+  enabled: true,
+  path: true,
+  debounceMs: true,
+  crash: true,
+  userId: true,
+}
+
+/**
+ * 校验 `config.json → telemetry`：未知键。纯函数（无 IO），便于单测。
+ */
+export function checkTelemetryConfig(c: unknown): string[] {
+  if (!isPlainObject(c)) return []
+  const out: string[] = []
+  for (const k of collectUnknown(c, Object.keys(TELEMETRY_KEYS), 'telemetry')) {
+    out.push(`${k} 未被识别，该配置不会生效`)
+  }
+  if (c.enabled !== undefined && typeof c.enabled !== 'boolean') {
+    out.push(`telemetry.enabled 应为布尔值，收到 ${JSON.stringify(c.enabled)} ⇒ 已忽略该项`)
+  }
+  if (c.path !== undefined && (typeof c.path !== 'string' || c.path.length === 0)) {
+    out.push(`telemetry.path 应为非空字符串，已忽略该项`)
+  }
+  if (c.debounceMs !== undefined && (typeof c.debounceMs !== 'number' || !Number.isInteger(c.debounceMs) || c.debounceMs < 0)) {
+    out.push(`telemetry.debounceMs 应为非负整数，收到 ${JSON.stringify(c.debounceMs)} ⇒ 已忽略该项`)
+  }
+  if (c.crash !== undefined && typeof c.crash !== 'boolean') {
+    out.push(`telemetry.crash 应为布尔值，已忽略该项`)
+  }
+  return out
+}
+
 /** 配置概览（--check-config / /config 共用），apiKey 默认脱敏展示 */
 export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: string): string {
   const lines: string[] = []
@@ -1671,6 +1738,18 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
     )
     for (const issue of checkMemoryConfig(m)) lines.push(`  - ${issue}`)
     if (m && !declared) lines.push('  - memory 段已写但未启用 ⇒ 该段不会生效（需 plugins 里加 "memory"）')
+  }
+  // 通用遥测：报「装没装」「开没开」「崩溃兜底挂没挂」。
+  {
+    const t = cfg.telemetry
+    const opt = telemetryPluginOptions(t)
+    const on = opt && opt.enabled !== false
+    lines.push(
+      t
+        ? `遥测（telemetry）：${on ? '已启用 · ' + (opt?.pathBuilder ? '自定义路径' : '会话级 dataDir/sessions/*.telemetry.jsonl') : '已装配但关闭（telemetry.enabled: false）'}${opt?.crash === false ? ' · 崩溃兜底已关' : ' · 崩溃兜底开启'}`
+        : '遥测（telemetry）：未启用（config.json 写 telemetry 段开启；默认不生成遥测文件）',
+    )
+    for (const issue of checkTelemetryConfig(t)) lines.push(`  - ${issue}`)
   }
   const rawProviders = cfg.providers ?? []
   if (!rawProviders.length) {
@@ -2546,6 +2625,24 @@ export class HarnessApp {
     if (memoryIssues.length) {
       this.options.stdout?.write?.(
         `[WARN] config.json → memory 有以下问题：\n` + memoryIssues.map((m) => `       - ${m}`).join('\n') + '\n',
+      )
+    }
+    // 通用遥测：config.json → telemetry 段存在才装配 @harness/telemetry（默认零影响）。
+    // 会话级 JSONL 采集（bus 事件 → 统一 envelope）+ 崩溃兜底。dataDir 用 CLI 实际 workspace，
+    // 避免路径口径分裂（--data-dir 时 core 自推导会拼错目录）。
+    const telemetryOpts = telemetryPluginOptions(cfg.telemetry)
+    if (telemetryOpts) {
+      const telMod = await lazyImport<{
+        createTelemetryService: (o?: Record<string, unknown>) => { plugin: AgentPlugin }
+      }>('@harness/telemetry')
+      providerPlugins.push(
+        telMod.createTelemetryService({ dataDir: this.workspace.dataDir, ...telemetryOpts }).plugin,
+      )
+    }
+    const telemetryIssues = checkTelemetryConfig(cfg.telemetry)
+    if (telemetryIssues.length) {
+      this.options.stdout?.write?.(
+        `[WARN] config.json → telemetry 有以下问题：\n` + telemetryIssues.map((m) => `       - ${m}`).join('\n') + '\n',
       )
     }
     // config.json → plugins 声明的内置插件：与外部插件目录按 id 去重（外部插件目录优先，便于临时替换实现）
