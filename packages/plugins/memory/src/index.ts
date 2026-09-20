@@ -584,16 +584,16 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
         },
 
         /**
-         * 压缩信号（flush 双源之一）：ACP 压缩由模型调 `compress` 工具触发，而
-         * `core.tool.post.execute` 的 ctx 里**没有 toolId** ⇒ 只能从事件流识别。
-         * `cli.agent.stream` 的 `status.toolId` 恰好带这个信息。
+         * 压缩信号（flush 双源之一）：ACP 压缩由模型调 `compress` 工具触发。
          *
-         * ⚠️ 这是 **UI 消费层**的通道：以库内嵌 / ACP 宿主自己消费事件流时收不到它
-         * （那时只剩下面 `core.agent.turn.end` 的轮数兜底与命令写入）。要根治得让引擎层也有
-         * "工具执行"信号 —— 属独立的一件事（见 dev-log 续 156）。
+         * 走**引擎层** `core.tool.post.execute`（ctx 带 `tool.id`，任何宿主都有）：
+         * 早先用的 `cli.agent.stream` 是 UI 消费层通道 —— 以库内嵌 / ACP 宿主自己消费
+         * 事件流时收不到（那时只剩轮数兜底与命令写入）。压缩执行完再 flush 语义也更准：
+         * 下一次注入（无论同轮续跑还是下一轮）读到的一定是压缩后的干净窗口。
          */
-        'cli.agent.stream'(signal) {
-          if (signal.eventType === 'tool_call_start' && signal.status?.toolId === 'compress') {
+        'core.tool.post.execute'(hctx: unknown, result: unknown) {
+          const toolId = (hctx as { tool?: { id?: string } } | undefined)?.tool?.id
+          if (toolId === 'compress' && (result as { ok?: boolean } | undefined)?.ok !== false) {
             publisher.flush()
             pendingHint = buildReflectionHint(p.user.index)
           }

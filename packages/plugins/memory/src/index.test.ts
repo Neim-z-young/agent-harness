@@ -519,19 +519,40 @@ describe('插件级：flush 三源与一次性提示', () => {
     expect(await inject(hooks)).not.toContain('外部改写')
   })
 
-  it('ACP 压缩（tool_call_start compress）⇒ flush + 一次性沉淀提示', async () => {
+  it('ACP 压缩（引擎层 core.tool.post.execute compress）⇒ flush + 一次性沉淀提示', async () => {
     const { hooks, w } = await hooksOf()
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
 
-    hooks['cli.agent.stream']!({ eventType: 'tool_call_start', status: { agentId: 'd', phase: 'tool', toolId: 'compress' } })
+    // 引擎层信号（任何宿主都有）：compress 工具执行成功。不再依赖 UI 层的 cli.agent.stream。
+    hooks['core.tool.post.execute']!({ tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's' } }, { ok: true })
     const first = await inject(hooks)
     expect(first).toContain('压缩前的改动')       // 已发布
     expect(first).toContain('<memory-hint>')       // 提示出现
     const second = await inject(hooks)
     expect(second).toContain('压缩前的改动')
     expect(second).not.toContain('<memory-hint>')  // 一次性
+  })
+
+  it('ACP 压缩失败不 flush（压缩没成，窗口还没腾出来）', async () => {
+    const { hooks, w } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
+
+    hooks['core.tool.post.execute']!({ tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's' } }, { ok: false, error: { message: 'x' } })
+    expect(await inject(hooks)).not.toContain('压缩前的改动') // 未发布
+  })
+
+  it('非 compress 工具不触发 flush', async () => {
+    const { hooks, w } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
+
+    hooks['core.tool.post.execute']!({ tool: { id: 'bash' }, input: {}, ctx: { sessionId: 's' } }, { ok: true })
+    expect(await inject(hooks)).not.toContain('压缩前的改动')
   })
 
   it('session compaction（core.session.compacting）也触发 flush', async () => {
@@ -670,18 +691,17 @@ describe('轮次计数的来源必须是引擎层（core.agent.turn.end）', () 
     hooks['core.agent.turn.end']!({ agentId: 'default', mode, step: 1, ...(sessionId ? { sessionId } : {}) })
   }
 
-  it('UI 通道（cli.agent.stream）的 turn_end 不计数 —— 否则两层都发时会翻倍', async () => {
+  it('不再订阅 UI 通道（cli.agent.stream）—— 信号全部来自引擎层，内嵌宿主下不失效', async () => {
     const w = ws()
     const { hooks } = await install({ flushAfterTurns: 2 })
+    // 早先 ACP 压缩走 cli.agent.stream（UI 层），内嵌宿主收不到 ⇒ 已全部改引擎层
+    expect(hooks['cli.agent.stream']).toBeUndefined()
+    expect(typeof hooks['core.tool.post.execute']).toBe('function')
+
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
     writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
     expect(await inject(hooks)).toContain('初始') // 先被"发现"（dirty）
-
-    for (let i = 0; i < 3; i++) {
-      hooks['cli.agent.stream']!({ eventType: 'turn_end', sessionId: 's', status: { agentId: 'default', phase: 'idle' } })
-    }
-    expect(await inject(hooks)).toContain('初始') // 三次都没推进轮数
 
     endTurn(hooks)
     endTurn(hooks)

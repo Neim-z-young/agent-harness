@@ -527,3 +527,50 @@ describe('/forge 统一入口', () => {
     expect(out.join('')).toContain('技能草稿：via-forge')
   })
 })
+
+describe('ACP 压缩触发延迟注入（引擎层 compress 工具信号）', () => {
+  it('模型调 compress 成功 ⇒ 队列到期，下一轮 prompt 构建时进白名单', async () => {
+    const { run, record, agents, hooks } = await setup()
+    record('bash', { command: 'ls' })
+    run('acp-defer')
+    run('--confirm acp-defer --bind')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(agents.default.skills).not.toContain('acp-defer')
+
+    // ACP 主路径：模型调 compress 工具（不触发 core.session.compacting！）
+    hooks['core.tool.post.execute'](
+      { tool: { id: 'compress' }, input: { content: [] }, ctx: { sessionId: 's1' } },
+      { ok: true },
+    )
+    hooks['core.prompt.system.transform']({}, [])
+    expect(agents.default.skills).toContain('acp-defer')
+  })
+
+  it('compress 失败不发布（窗口没腾出来，发布了也不划算）', async () => {
+    const { run, record, agents, hooks } = await setup()
+    record('bash', { command: 'ls' })
+    run('fail-comp')
+    run('--confirm fail-comp --bind')
+    await new Promise((r) => setTimeout(r, 10))
+    hooks['core.tool.post.execute'](
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's1' } },
+      { ok: false, error: { message: 'x' } },
+    )
+    hooks['core.prompt.system.transform']({}, [])
+    expect(agents.default.skills).not.toContain('fail-comp')
+  })
+
+  it('其他工具执行不误触发', async () => {
+    const { run, record, agents, hooks } = await setup()
+    record('bash', { command: 'ls' })
+    run('other-tool')
+    run('--confirm other-tool --bind')
+    await new Promise((r) => setTimeout(r, 10))
+    hooks['core.tool.post.execute'](
+      { tool: { id: 'list_dir' }, input: {}, ctx: { sessionId: 's1' } },
+      { ok: true },
+    )
+    hooks['core.prompt.system.transform']({}, [])
+    expect(agents.default.skills).not.toContain('other-tool')
+  })
+})

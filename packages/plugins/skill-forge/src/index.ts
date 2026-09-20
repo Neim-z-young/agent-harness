@@ -684,6 +684,13 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
         ...(r?.ok === false ? { error: r?.error?.message } : {}),
       })
 
+      // ACP 压缩信号（延迟注入的第三个触发源，引擎层）：
+      // ACP 的模型驱动压缩走「模型调 compress 工具」，**不触发** `core.session.compacting`
+      // （那只由 session compaction / /compact 触发）—— 之前只挂 compacting 时，
+      // ACP 主路径上延迟队列永远等不到发布。compress 与普通工具一样过
+      // core.tool.post.execute 且 ctx 带 tool.id ⇒ 在引擎层就能识别，任何宿主都有。
+      if (toolId === 'compress' && r?.ok !== false) scheduler.flush()
+
       // F3 闭环的一半：同一工具+入参反复失败 ⇒ 回写一条 feedback 到长期记忆。
       // 节流到"一次会话一条"，否则一次连环失败会把记忆刷满。
       if (options.writeBackOnFailure !== false && r?.ok === false && ws && sessionId) {
