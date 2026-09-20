@@ -1,9 +1,14 @@
 import { describe, it, expect } from 'bun:test'
+import { mkdtempSync, existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   skillFromMarkdown,
+  skillToMarkdown,
   createSkillManager,
   formatSkillForPrompt,
   formatSkillSource,
+  isValidSkillId,
   type Skill,
   type SkillSource,
 } from './index'
@@ -501,5 +506,123 @@ describe('formatSkillForPrompt', () => {
     expect(formatted).toInclude('# Skill: Test')
     expect(formatted).not.toInclude('>')
     expect(formatted).toInclude('正文')
+  })
+})
+
+// ===== SkillManager.save（技能锻造 F0）=====
+
+describe('SkillManager.save', () => {
+  const mkSkill = (id: string, over: Partial<Skill> = {}): Skill => ({
+    id,
+    name: id,
+    description: '何时用：做这件事的时候',
+    loadedFrom: 'user',
+    content: '## 步骤\n\n1. 调用 `bash`',
+    ...over,
+  })
+
+  const withTmp = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'skill-save-'))
+    const m = createSkillManager()
+    return { dir, m }
+  }
+
+  it('落盘为 <id>/SKILL.md 并当轮可见（reload 生效）', async () => {
+    const { dir, m } = withTmp()
+    await m.load(dir, 'user')
+    const res = await m.save(mkSkill('forge-demo'), { scope: 'user' })
+    expect(res.ok).toBe(true)
+    expect(res.path).toBe(join(dir, 'forge-demo', 'SKILL.md'))
+    expect(existsSync(res.path!)).toBe(true)
+    const loaded = m.get('forge-demo')
+    expect(loaded?.description).toBe('何时用：做这件事的时候')
+  })
+
+  it('round-trip：写出的 markdown 能被 skillFromMarkdown 原样读回', async () => {
+    const { dir, m } = withTmp()
+    await m.load(dir, 'user')
+    const src = mkSkill('rt', { name: 'rt', description: 'd', paths: ['src/**/*.ts'] })
+    await m.save(src, { scope: 'user' })
+    const text = readFileSync(join(dir, 'rt', 'SKILL.md'), 'utf-8')
+    const back = skillFromMarkdown(text, 'rt', 'user')
+    expect(back.description).toBe('d')
+    expect(back.paths).toEqual(['src/**/*.ts'])
+    // 安全硬约束：锻造出来的技能不得带 shell embed
+    expect(back.allowEmbedShell).toBe(false)
+  })
+
+  it('id 非法直接拒绝（id 同时是目录名，不能含 / 或 ..）', async () => {
+    const { dir, m } = withTmp()
+    await m.load(dir, 'user')
+    for (const bad of ['../escape', 'a/b', 'Up Case', '', 'a'.repeat(65)]) {
+      const res = await m.save(mkSkill(bad), { scope: 'user' })
+      expect(res.ok).toBe(false)
+    }
+  })
+
+  it('目标是符号链接时拒绝写入（否则会写到目录外的真实文件）', async () => {
+    const { dir, m } = withTmp()
+    await m.load(dir, 'user')
+    const outside = mkdtempSync(join(tmpdir(), 'skill-outside-'))
+    const victim = join(outside, 'victim.md')
+    writeFileSync(victim, 'original', 'utf-8')
+    mkdirSync(join(dir, 'evil'), { recursive: true })
+    symlinkSync(victim, join(dir, 'evil', 'SKILL.md'))
+
+    const res = await m.save(mkSkill('evil'), { scope: 'user', overwrite: true })
+    expect(res.ok).toBe(false)
+    expect(readFileSync(victim, 'utf-8')).toBe('original')
+  })
+
+  it('已存在且未声明覆盖 ⇒ 拒绝；--overwrite 才写', async () => {
+    const { dir, m } = withTmp()
+    await m.load(dir, 'user')
+    await m.save(mkSkill('dup'), { scope: 'user' })
+    const again = await m.save(mkSkill('dup', { description: 'v2' }), { scope: 'user' })
+    expect(again.ok).toBe(false)
+    const forced = await m.save(mkSkill('dup', { description: 'v2' }), { scope: 'user', overwrite: true })
+    expect(forced.ok).toBe(true)
+    expect(m.get('dup')?.description).toBe('v2')
+  })
+
+  it('未登记的目录一律拒绝（不能把技能写到任意路径）', async () => {
+    const { m } = withTmp()
+    const res = await m.save(mkSkill('x'), { dir: '/tmp/not-a-skill-dir' })
+    expect(res.ok).toBe(false)
+    expect(res.message).toContain('未登记')
+  })
+
+  it('单文件布局（layout=file）写 <id>.md', async () => {
+    const { dir, m } = withTmp()
+    await m.load(dir, 'project')
+    const res = await m.save(mkSkill('flat'), { scope: 'project', layout: 'file' })
+    expect(res.ok).toBe(true)
+    expect(res.path).toBe(join(dir, 'flat.md'))
+  })
+
+  it('目录尚不存在时也能写（首次锻造：skills 目录还没建）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'skill-empty-'))
+    const dir = join(base, 'skills')
+    const m = createSkillManager()
+    await m.load(dir, 'user') // 目录不存在 ⇒ 登记但不报错
+    const res = await m.save(mkSkill('first'), { scope: 'user' })
+    expect(res.ok).toBe(true)
+    expect(existsSync(join(dir, 'first', 'SKILL.md'))).toBe(true)
+  })
+})
+
+describe('skillToMarkdown', () => {
+  it('只输出有值的字段（空字段会让默认值判定失真）', () => {
+    const text = skillToMarkdown({
+      id: 'x',
+      name: 'x',
+      description: 'd',
+      loadedFrom: 'user',
+      content: 'body',
+    })
+    expect(text.startsWith('---\nname: x\ndescription: d\n')).toBe(true)
+    expect(text).not.toContain('paths:')
+    expect(text).not.toContain('userInvocable')
+    expect(text).toContain('allowEmbedShell: false')
   })
 })

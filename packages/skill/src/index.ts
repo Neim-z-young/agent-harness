@@ -11,8 +11,20 @@
  */
 
 import { matchGlob } from '@harness/permission'
-import { readdirSync, readFileSync, existsSync, statSync } from 'node:fs'
-import { join, basename, extname } from 'node:path'
+import {
+  readdirSync,
+  readFileSync,
+  existsSync,
+  statSync,
+  lstatSync,
+  mkdirSync,
+  writeFileSync,
+  renameSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs'
+import { join, basename, extname, resolve, sep } from 'node:path'
+import { randomBytes } from 'node:crypto'
 
 /** 支持 Promise 或同步值的类型 */
 export type Awaitable<T> = T | Promise<T>
@@ -131,6 +143,71 @@ export interface SkillManager {
   enable(id: string): Promise<Skill | undefined>
   /** 是否已禁用 */
   isDisabled(id: string): boolean
+  /**
+   * 落盘一个技能并当轮生效（技能锻造 F0）。
+   *
+   * 安全边界（缺一不可）：
+   * - 目标目录必须是**已 load 过的来源目录**（或显式传入的 dir），不允许写到任意路径；
+   * - id 只接受 `a-z0-9-_`，且解析后的最终路径必须仍在目标目录内（防 `../` 穿越）；
+   * - 目标已存在且是**符号链接**时拒绝（否则会写到目录外的真实文件）；
+   * - 先写同目录临时文件再 rename（原子写，不会留下半截文件）。
+   */
+  save(skill: Skill, opts?: SkillSaveOptions): Promise<SkillSaveResult>
+}
+
+/** 技能落盘选项 */
+export interface SkillSaveOptions {
+  /** 目标目录；缺省时按 scope 从已加载的来源目录里挑 */
+  dir?: string
+  /** 目标作用域（dir 未给时按它挑已加载目录） */
+  scope?: 'user' | 'project'
+  /** 覆盖同名（默认 false） */
+  overwrite?: boolean
+  /** 目录形式 `<id>/SKILL.md`（默认）或单文件 `<id>.md` */
+  layout?: 'dir' | 'file'
+}
+
+/** 技能落盘结果 */
+export interface SkillSaveResult {
+  ok: boolean
+  /** 落盘路径（成功时） */
+  path?: string
+  /** 失败原因 / 成功说明 */
+  message: string
+  /** 落盘并 reload 后的技能（成功时） */
+  skill?: Skill
+}
+
+/** 技能 id 的合法形态：小写字母数字 + 连字符/下划线（同时保证它是安全的文件名） */
+const SKILL_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
+
+/** 校验技能 id 是否为安全的文件名（路径穿越与大小写混乱都靠这一道挡） */
+export function isValidSkillId(id: string): boolean {
+  return SKILL_ID_RE.test(id)
+}
+
+/**
+ * 把 Skill 序列化为 SKILL.md 文本（frontmatter + 正文），与 `skillFromMarkdown` 互逆。
+ *
+ * 只写有值的字段 —— 空字段塞进 frontmatter 会让 `!== false` 这类默认值判定失真。
+ */
+export function skillToMarkdown(skill: Skill): string {
+  const lines: string[] = ['---']
+  lines.push(`name: ${skill.name}`)
+  lines.push(`description: ${skill.description}`)
+  if (skill.paths?.length) lines.push(`paths: [${skill.paths.map((p) => JSON.stringify(p)).join(', ')}]`)
+  if (skill.agentBind?.length) lines.push(`agentBind: [${skill.agentBind.map((a) => JSON.stringify(a)).join(', ')}]`)
+  if (skill.allowedTools?.length) lines.push(`allowedTools: [${skill.allowedTools.map((t) => JSON.stringify(t)).join(', ')}]`)
+  if (skill.userInvocable === false) lines.push('userInvocable: false')
+  // 生成/落盘的技能默认**不允许**内嵌 shell：这是防止"模型给自己写可执行技能"的硬约束
+  lines.push(`allowEmbedShell: ${skill.allowEmbedShell === true ? 'true' : 'false'}`)
+  if (skill.model) lines.push(`model: ${skill.model}`)
+  if (skill.effort) lines.push(`effort: ${skill.effort}`)
+  lines.push('---')
+  lines.push('')
+  lines.push(skill.content.trim())
+  lines.push('')
+  return lines.join('\n')
 }
 
 // ===== Frontmatter 解析（简化 YAML，自包含无依赖）=====
@@ -391,9 +468,10 @@ export class SkillManagerImpl implements SkillManager {
     // source 为目录路径
     const dir = source
     const tag = sourceTag
-    if (!existsSync(dir)) return []
-
+    // 即使目录还不存在也登记：技能锻造（save）需要按 scope 找到"该往哪写"，
+    // 而首次锻造时 skills 目录往往还没建 —— 那时 reload 找不到文件是正常语义。
     this.sourceDirs.set(dir, { dir, source: tag })
+    if (!existsSync(dir)) return []
     const loaded: Skill[] = []
     const entries = readdirSync(dir, { withFileTypes: true })
 
@@ -516,6 +594,103 @@ export class SkillManagerImpl implements SkillManager {
 
   isDisabled(id: string): boolean {
     return this.disabled.has(id)
+  }
+
+  /** 已登记的来源目录（供 save 选目标与宿主展示） */
+  sourceDirectories(): Array<{ dir: string; source: SkillSource }> {
+    return Array.from(this.sourceDirs.values())
+  }
+
+  async save(skill: Skill, opts: SkillSaveOptions = {}): Promise<SkillSaveResult> {
+    // ① 目标目录：只允许已 load 过的来源目录（或显式传入且已登记的 dir）
+    const dir = this.resolveTargetDir(opts)
+    if (!dir) {
+      return {
+        ok: false,
+        message:
+          opts.dir
+            ? `目录 ${opts.dir} 未登记为技能来源（只能写入已加载的技能目录）`
+            : `没有可写入的 ${opts.scope ?? 'user/project'} 级技能目录（需先由宿主 load 过）`,
+      }
+    }
+    const { dir: base, source } = dir
+
+    // ② id 校验：既是唯一性也是文件名安全
+    if (!isValidSkillId(skill.id)) {
+      return { ok: false, message: `技能 id 非法（只允许 a-z0-9-_，1~64 字符）：${skill.id}` }
+    }
+
+    // ③ 路径解析 + 穿越校验
+    const root = resolve(base)
+    const rel = opts.layout === 'file' ? `${skill.id}.md` : join(skill.id, 'SKILL.md')
+    const target = resolve(root, rel)
+    if (target !== root && !target.startsWith(root + sep)) {
+      return { ok: false, message: `目标路径越出技能目录：${target}` }
+    }
+
+    // ④ 已存在：符号链接拒绝（防止写到目录外），非覆盖也拒绝
+    if (existsSync(target)) {
+      const st = lstatSync(target)
+      if (st.isSymbolicLink()) {
+        return { ok: false, message: `目标是符号链接，拒绝写入（防穿越）：${target}` }
+      }
+      // 已存在文件若真实位置已在目录外（父目录被换过），同样拒绝。
+      // ⚠️ 基准必须也取 realpath：macOS 上 /var 是 /private/var 的符号链接，
+      //    拿未解析的 root 去比对会把「目录本身在链接下」误判成越界。
+      try {
+        const rootReal = realpathSync(root)
+        const real = realpathSync(target)
+        if (real !== rootReal && !real.startsWith(rootReal + sep)) {
+          return { ok: false, message: `目标真实路径越出技能目录：${real}` }
+        }
+      } catch {
+        /* 读不到 realpath 就按上面已通过的 startWith 判定放行 */
+      }
+      if (!opts.overwrite) {
+        return { ok: false, message: `技能已存在（加 --overwrite 覆盖）：${target}` }
+      }
+    }
+
+    // ⑤ 原子写：同目录临时文件 → rename（不会留下半截文件，也不会被读到写了一半的内容）
+    const content = skillToMarkdown(skill)
+    try {
+      mkdirSync(resolve(target, '..'), { recursive: true })
+      const tmp = join(resolve(target, '..'), `.${basename(target)}.${randomBytes(6).toString('hex')}.tmp`)
+      writeFileSync(tmp, content, { encoding: 'utf-8', flag: 'wx', mode: 0o600 })
+      try {
+        renameSync(tmp, target)
+      } catch (err) {
+        rmSync(tmp, { force: true })
+        throw err
+      }
+    } catch (err) {
+      return { ok: false, message: `写入失败：${(err as Error)?.message ?? err}` }
+    }
+
+    // ⑥ 写后立即生效：register 兜底（目录首次出现时 reload 找不到源）+ reload 走正规加载
+    const loaded = await this.reload(skill.id)
+    if (!loaded) this.register({ ...skill, loadedFrom: source })
+    return {
+      ok: true,
+      path: target,
+      message: `已写入 ${target}（来源=${source}）并当轮生效`,
+      skill: this.skills.get(skill.id) ?? this.disabled.get(skill.id),
+    }
+  }
+
+  /** 按 opts 挑一个可写目录：显式 dir 必须已登记；否则按 scope 在来源目录里找 */
+  private resolveTargetDir(opts: SkillSaveOptions): { dir: string; source: SkillSource } | undefined {
+    if (opts.dir) {
+      const hit = this.sourceDirs.get(opts.dir) ?? this.sourceDirs.get(resolve(opts.dir))
+      if (!hit) return undefined
+      return hit
+    }
+    const want = opts.scope ?? 'user'
+    // 优先精确匹配 scope；用户级目录不存在时退回 project（宿主可能只加载了一级）
+    const exact = Array.from(this.sourceDirs.values()).find((d) => d.source === want)
+    if (exact) return exact
+    const fallback = Array.from(this.sourceDirs.values()).find((d) => d.source === 'user' || d.source === 'project')
+    return fallback
   }
 }
 
