@@ -133,6 +133,7 @@
       "dependencies": {
         "@harness/plugin": "workspace:*",
         "@harness/session": "workspace:*",
+        "@harness/telemetry": "workspace:*",
         "@harness/tool": "workspace:*",
         "acp-kernel": "^0.0.63",
       },

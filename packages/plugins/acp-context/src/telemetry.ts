@@ -14,9 +14,8 @@
  * 遥测的 `rawTok` / `requestTok` / `occupancy` 因此与内核决策口径一致。
  */
 
-import { writeFileSync, mkdirSync, existsSync } from 'node:fs'
-import { dirname } from 'node:path'
 import { defaultCountTokens, type Config, type CoreMessage, type CompressionState, type TokenCountFn } from 'acp-kernel'
+import { createJsonlWriter, type JsonlWriter } from '@harness/telemetry'
 import { estimateTokens } from './adapter.js'
 
 // ===== 配置快照：每轮 preModel 都记，便于事后还原"参数 × 指标"关系 =====
@@ -124,47 +123,13 @@ export function commonPrefixHit(prev: CoreMessage[] | undefined, curr: CoreMessa
 
 // ===== Writer =====
 
-export interface TelemetryWriter {
-  /** 追加一条事件；写盘在 flush 中 debounce 执行 */
-  write(ev: TelemetryEvent): void
-  /** 立即 flush pending 行（正常退出 / session 结束时调用） */
-  flush(): void
-}
-
 /**
- * 纯 JSONL 追加写入器。debounce 500ms 内多次 write 只写一次盘，
- * 避免每轮 preModel 都 IO。异常吞掉（遥测不影响主流程）。
+ * 复用 `@harness/telemetry` 的通用 JSONL writer（原自研 createWriter 已上移为通用模块）。
+ * debounce 批量 flush、失败静默、无 path=no-op；**保持事件 JSON 结构与现有 bench 脚本兼容**
+ * （每行仍是 {kind:'preModel'|'compress'|'providerCache', ...}，不套用统一 envelope）。
  */
-export function createWriter(path: string | undefined): TelemetryWriter {
-  if (!path) return { write: () => {}, flush: () => {} }
-
-  let pending: TelemetryEvent[] = []
-  let timer: ReturnType<typeof setTimeout> | null = null
-
-  const doFlush = () => {
-    if (pending.length === 0) return
-    try {
-      if (!existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true })
-      const lines = pending.map((ev) => JSON.stringify(ev)).join('\n') + '\n'
-      writeFileSync(path, lines, { flag: 'a' })
-    } catch {
-      // 遥测失败不致命
-    }
-    pending = []
-    timer = null
-  }
-
-  return {
-    write(ev: TelemetryEvent) {
-      pending.push(ev)
-      if (timer === null) timer = setTimeout(doFlush, 500)
-    },
-    flush() {
-      if (timer !== null) { clearTimeout(timer); timer = null }
-      doFlush()
-    },
-  }
-}
+export type TelemetryWriter = JsonlWriter<TelemetryEvent>
+export const createWriter = createJsonlWriter as (path?: string) => TelemetryWriter
 
 // ===== 事件构造（主流程调用） =====
 

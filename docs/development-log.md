@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 170）ACP 遥测迁移到通用设施（复用 @harness/telemetry writer）
+
+`acp-context` 撤掉自研 JSONL writer，复用 `@harness/telemetry` 的通用 `createJsonlWriter`。
+
+- `telemetry.ts`：删除本地 `writeFileSync/mkdirSync/existsSync` 实现的 `createWriter`（该实现正是
+  通用 writer 的来源），改为 `export const createWriter = createJsonlWriter as (path?)=>JsonlWriter<TelemetryEvent>`；
+  `TelemetryWriter` type 保留为 `JsonlWriter<TelemetryEvent>`。
+- **关键约束**：复用 writer 但**不套用统一 envelope**——ACP 事件每行仍是
+  `{kind:'preModel'|'compress'|'providerCache', ...}`，保住现有 bench 脚本（`bench/*.ts`）兼容。
+- 依赖：`acp-context` 新加 `@harness/telemetry`。
+
+至此通用遥测设施闭环：bus→envelope→本地写 + OTLP + 崩溃兜底 + 异常专项埋点（续 167~169），
+ACP 压缩遥测也统一到通用 writer（去重后仅事件模型仍独立）。
+
+测试：acp-context 55 例 + telemetry 28 例，cli 375 例，全量 typecheck 绿。
+
 ## 2026-09-20（续 169）遥测异常场景专项埋点（权限拒绝 / DOOM_LOOP / 工具失败细分 kind）
 
 遥测插件把三类工具失败单独细分 kind，而非全落在通用的 `telemetry.bus.*`，便于异常检索/告警。
