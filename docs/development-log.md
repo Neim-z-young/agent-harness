@@ -1,5 +1,27 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 169）遥测异常场景专项埋点（权限拒绝 / DOOM_LOOP / 工具失败细分 kind）
+
+遥测插件把三类工具失败单独细分 kind，而非全落在通用的 `telemetry.bus.*`，便于异常检索/告警。
+
+先摸清 core：目前**只有**生命周期 + 生命周期解耦事件（harness.* / plugin.* / mcp.* / tool.enabled），
+没有运行期的权限拒绝 / DOOM_LOOP / tool.call 结果事件。故**不改 core**，利用既有的
+`core.tool.post.execute` hook（核心实测始终带 `ctx.tool.id`）：
+
+- `map.ts` 新增纯函数 `toolFailureEnvelope(ctx, result)`：`result.ok===false` 时按 `error.code` 细分——
+  `PERMISSION_DENIED` → `telemetry.permission.deny`（errName=ToolPermissionDeniedError）、
+  `DOOM_LOOP` → `telemetry.doomloop`、其它 → `telemetry.tool.fail`；成功/null 返回 null。
+- `index.ts` 的 `install` 现在返回 `Hooks`：注册 `core.tool.post.execute`，失败即 `persist` 该 envelope，
+  原样返回 result 保持 pipeline 语义（遥测只读不改写）。
+
+说明：DOOM_LOOP 的 fail 结果可能不总经过 post.execute（agent 循环内直接产出），这条线属「尽力而为」；
+`harness.error`/crash 兜底已覆盖其主线。权限拒绝必经过工具 pipeline ⇒ 必命中。
+
+测试：telemetry 包 +5 例（permission.deny / doomloop / tool.fail / 成功 null / 空 result）共 28 例全过；
+全量 typecheck 绿。
+
+残留待办：ACP 遥测迁移到本包（`telemetry.acp.*`）。
+
 ## 2026-09-20（续 168）遥测 OTLP 最小直连导出
 
 在 `@harness/telemetry` 上加可选 OTLP 出口（对齐 `reference/opencode-dev/.../otlp.ts` 思路），用户已定「最小直连 batch log exporter、不引整套 SDK」。

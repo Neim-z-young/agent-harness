@@ -22,11 +22,11 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { readFileSync, existsSync } from 'node:fs'
 import { createHash } from 'node:crypto'
-import type { AgentPlugin, PluginContext } from '@harness/plugin'
+import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
 import type { BusEventRecord, Unsubscribe } from '@harness/bus'
 import { createJsonlWriter, type JsonlWriter } from './writer.js'
 import { makeEnvelope, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
-import { mapBusEvent } from './map.js'
+import { mapBusEvent, toolFailureEnvelope } from './map.js'
 import { createCrashGuard, type CrashState } from './crash.js'
 import { createOtlpExporter, type OtlpOptions } from './otlp.js'
 
@@ -135,6 +135,17 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
 
   const controller: TelemetryController = { record, recordRaw: persist, flush, enabled }
 
+  // 异常场景专项埋点 hooks（工具执行失败 → 细分 kind）。不改 core，只注册已有 hook。
+  const hooks: Hooks = {
+    async 'core.tool.post.execute'(ctx: unknown, result: unknown): Promise<unknown> {
+      if (!enabled) return result
+      const ev = toolFailureEnvelope(ctx, result)
+      if (ev) persist(ev)
+      // 遥测只读不改结果，原样返回以保持 pipeline 语义
+      return result
+    },
+  }
+
   // bus 事件订阅 + 崩溃兜底（在 install(ctx) 里接线，chhug 需要 bus）
   let unsubscribe: Unsubscribe | undefined
   let crashGuard: ReturnType<typeof createCrashGuard> | undefined
@@ -164,6 +175,9 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
         })
         crashGuard.attach()
       }
+      // 异常场景专项埋点：tools pipeline 的 post.execute 里细分权限拒绝 / DOOM_LOOP / 工具失败。
+      // 不改 core，只注册已有 hook（core. 层任何宿主都触发）。
+      return hooks
     },
     async uninstall() {
       unsubscribe?.()

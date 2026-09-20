@@ -42,3 +42,31 @@ function pickRound(payload: unknown): number | undefined {
 export function isBoundaryEvent(name: string): boolean {
   return LIFECYCLE_NAMES.has(name)
 }
+
+/**
+ * 工具执行失败 → 细分遥测事件（异常场景专项埋点）。
+ *
+ * `core.tool.post.execute` hook 的 (ctx, result) 里：
+ *  - `ctx.tool.id`：工具 id；
+ *  - `result.ok === false` 且 `result.error.code`：`PERMISSION_DENIED` / `DOOM_LOOP` / 其它。
+ * 据此把三类失败细分到独立 kind（而非全落在通用的 telemetry.bus.*），便于异常检索/告警。
+ * 纯函数（无 IO），便于单测。成功（ok !== false）返回 null。
+ */
+export function toolFailureEnvelope(ctx: unknown, result: unknown): TelemetryEnvelope | null {
+  const r = result as { ok?: boolean; error?: { code?: string }; meta?: { durationMs?: number } } | undefined
+  if (!r || r.ok !== false) return null
+  const toolId = (ctx as { tool?: { id?: string } } | undefined)?.tool?.id
+  const code = r.error?.code
+  let kind = 'telemetry.tool.fail'
+  let errName: string | undefined = code
+  if (code === 'PERMISSION_DENIED') {
+    kind = 'telemetry.permission.deny'
+    errName = 'ToolPermissionDeniedError'
+  } else if (code === 'DOOM_LOOP') {
+    kind = 'telemetry.doomloop'
+    errName = 'DOOM_LOOP'
+  }
+  const metrics: Record<string, number> = {}
+  if (typeof r.meta?.durationMs === 'number') metrics.durationMs = r.meta.durationMs
+  return makeEnvelope(kind, { toolId, errName }, metrics)
+}

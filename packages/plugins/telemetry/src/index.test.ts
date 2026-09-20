@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { InMemoryBus, BusEvent } from '@harness/bus'
 import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity } from './envelope.js'
 import { createJsonlWriter } from './writer.js'
-import { mapBusEvent } from './map.js'
+import { mapBusEvent, toolFailureEnvelope } from './map.js'
 import { createTelemetryService, deriveUserID, stackHashStack } from './index.js'
 
 describe('envelope', () => {
@@ -142,5 +142,37 @@ describe('misc helpers', () => {
     const ev = makeEnvelope('k', { sessionId: undefined, provider: 'p' }, { n: undefined as unknown as number })
     expect(Object.values(ev.attrs).join('')).toContain('p')
     expect(JSON.stringify(ev).includes('undefined')).toBe(false)
+  })
+})
+
+describe('toolFailureEnvelope（异常场景专项埋点）', () => {
+  const ctx = { tool: { id: 'bash' } }
+
+  test('成功 ok=true ⇒ null（不埋点）', () => {
+    expect(toolFailureEnvelope(ctx, { ok: true })).toBeNull()
+  })
+
+  test('普通失败 ⇒ telemetry.tool.fail', () => {
+    const ev = toolFailureEnvelope(ctx, { ok: false, error: { code: 'TOOL_ERROR' }, meta: { durationMs: 12 } })
+    expect(ev!.kind).toBe('telemetry.tool.fail')
+    expect(ev!.attrs.toolId).toBe('bash')
+    expect(ev!.attrs.errName).toBe('TOOL_ERROR')
+    expect(ev!.metrics.durationMs).toBe(12)
+  })
+
+  test('权限拒绝 ⇒ telemetry.permission.deny', () => {
+    const ev = toolFailureEnvelope(ctx, { ok: false, error: { code: 'PERMISSION_DENIED' } })!
+    expect(ev.kind).toBe('telemetry.permission.deny')
+    expect(ev.attrs.errName).toBe('ToolPermissionDeniedError')
+  })
+
+  test('DOOM_LOOP ⇒ telemetry.doomloop', () => {
+    const ev = toolFailureEnvelope(ctx, { ok: false, error: { code: 'DOOM_LOOP' } })!
+    expect(ev.kind).toBe('telemetry.doomloop')
+    expect(ev.attrs.toolId).toBe('bash')
+  })
+
+  test('result 为空 ⇒ null', () => {
+    expect(toolFailureEnvelope(ctx, undefined)).toBeNull()
   })
 })
