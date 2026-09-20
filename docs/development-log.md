@@ -1,5 +1,73 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 160）提示词取证：42 个工具的参数 schema 全是空的 —— 补上后同一句 prompt 从空转变成正常完成
+
+顺着续 159 的空转追"构造出的提示词"，用临时 dataDir + 用户插件（`core.session.preModel`）把每轮
+**真正发给模型**的 messages 落了盘，provider 层的 tools 载荷用真实工具定义直接调 `buildBody` 打印。
+
+### 首轮请求构成（coordinator + 「分析当前会话」，实测）
+
+| 部分 | 长度 | 内容 |
+| --- | --- | --- |
+| system[0] | 738 字符 | Agent 提示（身份 + 派工规则，本身写得干净） |
+| system[1] | 8380 字符 | **ACP 压缩手册**（第二条 system，插在 system 与 user 之间，每轮全量重发） |
+| user | 47 字符 | 其中 31 字符是内核注入的 `<acp tokens="6" type="text">m00001</acp>` 前缀 |
+
+**任务本身只占首轮内容的 0.7%**。
+
+### P0-1　42 个工具的参数 schema 全部为空（本次最重要的发现）
+
+三个 provider 适配器都读 `inputSchema.__jsonSchema` 生成 tools 载荷，但**全仓没有任何写入方**；
+工具全是裸 `{parse, safeParse}`（acp-context 的 `makeSchema`、MCP 的 `PassthroughSchema` 连服务端
+声明好的 inputSchema 都丢掉）。实测所有工具发出都是：
+
+```json
+{"type":"object","properties":{},"additionalProperties":true}
+```
+
+⇒ 模型认识工具参数的**唯一**渠道断了：`list_dir` 描述仅 31 字符 ⇒ 只能 `list_dir {}` ⇒ 每轮同一个
+默认目录列表 ⇒ 原地打转；`acp_status` 无参数可填 ⇒ 变成"万能安慰工具"；`compress`（模型驱动压缩的
+核心工具）参数完全不可见。b0c2s 里模型那句 "the tools require parameters even if empty" 就是在描述
+这个感知。**这不是模型"变笨"，是我们没给参数。**
+
+修复：
+- `@harness/tool`：`Schema` 增加可选 `__jsonSchema`；新增 `withJsonSchema(schema, json)`（只追加描述，
+  不改运行时校验行为）。
+- mcp-client：`convertMcpToolToHarnessTool` 把服务端声明的 inputSchema **透传**成 `__jsonSchema`。
+- 补齐 10 个高频工具：bash/read_file/write_file/edit_file、list_dir/grep_file、glob、
+  compress/decompress/search_context/acp_status。其余（swarm/computer-use/web 等）待补。
+
+### P0-2　工具清单未按 agent 过滤
+
+provider 的 toolsGetter 是 `harness.tools.list()`（全局注册表）⇒ coordinator 一轮收到 **42 个工具**
+（含 computer-use 的 click/drag/type_text、OCR、文件编辑、code-intel、swarm 的 team/task 工具），
+而提示写着「你负责调度，不亲自执行」。改法：`ChatProvider.complete/stream` 增加可选 `tools?: Tool[]`，
+core 传入本 agent 的 `allowedTools`；三个适配器载荷优先用 `params.tools`，缺省才退回全局注册表
+（toolsGetter 保留，兼容旧调用方与单测）。
+
+### P1　ACP 手册的示例标签脱敏
+
+内核压缩系统提示里带一个**字面示例** `<acp tokens="2.1K" type="tool:bash">m00175</acp>`，同一页又要求
+"NEVER echo these tags" —— 一边给可复制模板一边禁模仿，g800t 实测模型照抄（连 `[tool]` 一起）。
+宿主侧能做的：`sanitizeExampleTags()` 在 `makeSystemPrompt` 处把示例脱敏成不完整形态
+（`<acp tokens=… type=…>mNNNNN</acp>`），保住"每条消息都带 ref 标签"的语义、不再提供可复制模板；
+消息上的**真实** ref 标签不受影响（那是 compress 选段的机制）。load-bearing 的四段规则文本未动。
+
+### 真机前后对比（同一句 prompt、同模型同环境）
+
+| | 修前（b0c2s） | 修后（实测） |
+| --- | --- | --- |
+| 工具载荷 | 42 个工具、全部空 schema | 白名单内、常用工具带完整参数 schema |
+| 行为 | 24 次空参 `acp_status`/`list_dir {}`，原地打转 | `list_dir {"path":".","maxDepth":2}` 等真实参数探索 |
+| 收尾 | 第 25 步无文本无工具 ⇒ 静默结束（用户看到"中断"） | 正常给出带表格的最终答复（13 步，exit 0） |
+
+**验证**：typecheck 0 错误；全量 1532 pass / 0 fail（新增 withJsonSchema、MCP 透传、params.tools
+优先级 3 条防回归）。AGENTS.md 新增硬约定：**新工具不写参数 schema 视为缺陷**。
+
+**遗留**：① swarm/computer-use/web 等其余工具的 schema 待补；② `harness run` 模式不打印工具结果
+（DOOM_LOOP 在 headless 不可见）；③ ACP 手册 8.4k 字符的固定成本与「两条 system 消息」的排布
+属内核设计，宿主侧只能整段覆盖（`systemPrompt` 选项），整段接管会引入内核升级漂移，暂不做。
+
 ## 2026-09-20（续 159）doom-loop 守卫改为硬中断（不再受权限模式影响）+ ACP 对照实验
 
 用户问：会话 `s_1789862291973_b0c2s`「跑到一半中断了，还是之前遇到的问题吗」。

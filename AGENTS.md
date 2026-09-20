@@ -110,6 +110,8 @@
 
 - 会话压缩阈值基于模型上下文窗口百分比动态计算（默认保留 30000 token 后窗口的 80%）
 
+- **工具必须带参数 JSON schema**：`withJsonSchema(schema, {...})`（或 MCP 服务端 inputSchema 透传）——这是 provider 生成 tools 载荷时模型认识参数的**唯一**渠道（openai/anthropic/gemini 都读 `inputSchema.__jsonSchema`），缺失即退化为空对象 schema，模型只能空参瞎猜并原地空转（实测 25 步）。新工具不写 schema 视为缺陷
+
 - 与外部工具/服务对接协议时（herdr 这类终端/服务集成）**以真机为准**：官方文档没写清的边界必须实测确认后再实现。已知的三个坑都在文档之外且**静默失效**（读代码看不出来）：① 上报用过 `--seq` 后，`release-agent` 也必须带一个更高的 `--seq`，否则被 Herdr 当旧序号丢弃；② 序号水位线按 (pane, source) 存、**跨进程不重置**，新进程从 1 起算的前 N 条上报会被静默丢弃（故序号基线取微秒级时钟）；③ `process.once('exit')` **覆盖不到信号退出**（SIGTERM/SIGHUP 直接终止进程，而"关 pane"就是 SIGHUP），信号类退出必须单独挂监听，且不能抢 SIGINT（REPL/TUI 用它表示"中断当前查询"）。详见 `docs/development-log.md` 续 158
 
 ## 6. 安全与协作
