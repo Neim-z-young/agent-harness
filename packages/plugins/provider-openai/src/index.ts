@@ -185,6 +185,10 @@ function toOpenAIMessages(messages: Message[], forceReasoningContent = false): O
       const reasoningParts: string[] = []
       const toolCalls: NonNullable<OpenAIChatMessage['tool_calls']> = []
       const imageParts: Array<{ url: string }> = []
+      // 内嵌在 assistant 消息里的工具执行结果（core 把一步的调用与结果合并存于同一
+      // tool part）。OpenAI 协议要求 tool_calls 之后必须紧跟 role:'tool' 结果消息，
+      // 因此在同一条 assistant 消息序列化后补发这些 tool 结果，并保持 part 顺序。
+      const embeddedResults: Array<{ toolUseId: string; result: unknown }> = []
 
       for (const p of msg.parts) {
         const part = p as Part
@@ -194,16 +198,19 @@ function toOpenAIMessages(messages: Message[], forceReasoningContent = false): O
             break
           case 'tool': {
             const tp = part as any
-            // assistant 内的 tool part → tool_calls（无 result 时）
-            if (tp.result === undefined) {
-              toolCalls.push({
-                id: tp.toolUseId ?? `call_${Math.random().toString(36).slice(2, 10)}`,
-                type: 'function',
-                function: {
-                  name: tp.toolId,
-                  arguments: JSON.stringify(tp.input ?? {}),
-                },
-              })
+            // assistant 内的 tool part：无论是否带 result，都作为 tool_calls 输出；
+            // 带 result 的再额外收集为后续 role:'tool' 结果消息（此前被静默丢弃，
+            // 导致模型在无 ACP 会话里看不到工具结果而反复重试同一调用 → DOOM_LOOP）。
+            toolCalls.push({
+              id: tp.toolUseId ?? `call_${Math.random().toString(36).slice(2, 10)}`,
+              type: 'function',
+              function: {
+                name: tp.toolId,
+                arguments: JSON.stringify(tp.input ?? {}),
+              },
+            })
+            if (tp.result !== undefined) {
+              embeddedResults.push({ toolUseId: tp.toolUseId, result: tp.result })
             }
             break
           }
@@ -253,6 +260,14 @@ function toOpenAIMessages(messages: Message[], forceReasoningContent = false): O
       else if (forceReasoningContent) assistantMsg.reasoning_content = ''
       // 注意：OpenAI assistant 消息即使有 tool_calls 也可以有 content（可空）
       out.push(assistantMsg)
+      // 紧随 assistant 之后补发其内嵌的工具结果（role:'tool'），与 tool_calls 成对。
+      for (const er of embeddedResults) {
+        out.push({
+          role: 'tool',
+          content: typeof er.result === 'string' ? er.result : JSON.stringify(er.result),
+          tool_call_id: er.toolUseId,
+        })
+      }
       continue
     }
 

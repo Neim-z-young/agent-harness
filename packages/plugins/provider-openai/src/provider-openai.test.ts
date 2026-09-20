@@ -145,6 +145,44 @@ describe('@harness/provider-openai', () => {
       }
     })
 
+    it('assistant 内 ToolCallPart 带 result：同时输出 tool_calls 与该结果的独立 role:tool 消息（回归：DOOM_LOOP）', async () => {
+      // core 把一步的调用与结果合并存于同一条 assistant 的 tool part（result 内嵌）。
+      // 此前序列化在「无 result → tool_calls」分支把带 result 的部分静默丢弃，
+      // 模型看不到工具结果而反复重试同一调用直至 DOOM_LOOP。现要求：既输出 tool_calls，
+      // 又在 assistant 后补发 role:'tool' 结果消息，且顺序与 part 一致。
+      const p = new OpenAIChatProvider({ apiKey: 'k' })
+      let captured: any
+      const restore = installMock(async ({ init }) => {
+        captured = JSON.parse(init.body as string)
+        return new Response(okResponse('done'))
+      })
+      try {
+        const msgs: Message[] = [
+          { id: 'a1', role: 'assistant', agentId: 'a', createdAt: 1, parts: [
+            { type: 'reasoning', text: '想一下' },
+            { type: 'tool', toolUseId: 'tu1', toolId: 'list_dir', input: { path: '.' }, result: { entries: ['a', 'b'] } },
+            { type: 'tool', toolUseId: 'tu2', toolId: 'bash', input: { command: 'pwd' }, result: '{"stdout":"/tmp"}' },
+          ]},
+        ]
+        await p.complete({ providerId: 'o', messages: msgs, params: {} })
+        // assistant 含全部 tool_calls（含带 result 的），reasoning 走独立字段不进正文
+        const asst = captured.messages.find((m: any) => m.role === 'assistant')
+        expect(asst.reasoning_content).toBe('想一下')
+        expect(asst.content).toBe('')
+        expect(asst.tool_calls).toHaveLength(2)
+        expect(asst.tool_calls[0].id).toBe('tu1')
+        expect(asst.tool_calls[0].function.name).toBe('list_dir')
+        expect(asst.tool_calls[1].id).toBe('tu2')
+        // 两个独立 role:tool 结果消息紧随 assistant 之后，顺序与 part 一致，内容完整
+        const toolMsgs = captured.messages.filter((m: any) => m.role === 'tool')
+        expect(toolMsgs).toHaveLength(2)
+        expect(toolMsgs[0]).toEqual({ role: 'tool', tool_call_id: 'tu1', content: '{"entries":["a","b"]}' })
+        expect(toolMsgs[1]).toEqual({ role: 'tool', tool_call_id: 'tu2', content: '{"stdout":"/tmp"}' })
+      } finally {
+        restore()
+      }
+    })
+
     it('ImagePart → image_url content', async () => {
       const p = new OpenAIChatProvider({ apiKey: 'k' })
       let captured: any

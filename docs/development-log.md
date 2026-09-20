@@ -1,5 +1,26 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 172）修复 provider-openai 序列化丢弃内嵌工具结果 → DOOM_LOOP 中断
+
+**根因（provider 层）**：某真实会话（如 `s_1789916436883_ra6w1`）"输出到一半就中断"，模型推理区出现
+*"I keep failing to make tool calls"*。core 把工具执行结果**内嵌**进同一条 assistant 消息的 tool part
+（`{type:'tool', toolUseId, toolId, input, result}`，见 core `_buildStepMessages`），会话里不单独生成
+`role:'tool'` 消息。而 OpenAI Chat Completions 要求 `assistant(tool_calls)` + 紧随的 `role:'tool'`
+（带 `tool_call_id`）结果消息严格成对。
+
+`toOpenAIMessages` 的原实现只在 `tp.result === undefined` 时把 tool part 转成 `tool_calls`；**带 result
+的 tool part 被静默丢弃**——既不入 tool_calls，也不落入 `role:'tool'` 分支。结果模型看不到工具结果、
+反复重试同一调用直至触发 DOOM_LOOP 硬中断。**该 bug 只在未启用 ACP 压缩时触发**（ACP 的 adapter 会把
+tool part 先拆成独立 `role:'tool'` 消息，绕开了这条序列化路径）。
+
+**修复**：`toOpenAIMessages` 的 assistant 分支里，tool part 无论是否带 result 都输出为 `tool_calls`；
+带 result 的额外收集进 `embeddedResults`，在同一条 assistant 消息序列化后紧随其后补发 `role:'tool'`
+结果消息，顺序与 part 一致。
+
+**验证**：provider-openai 新增回归用例"assistant 内 ToolCallPart 带 result：同时输出 tool_calls 与独立
+role:tool 消息"（断言 tool_calls 2 条 + 2 条独立 tool 结果顺序/内容完整）→ 29 例全过；core agentic-loop
+24 例全过；全量 typecheck 绿。
+
 ## 2026-09-20（续 171）遥测四提交后独立评审：2 个 P1 + 3 个 P2 修复
 
 按续 136/166 方法论，对 7927498/c905afb/9b3b8c5/c62bc89 做提交后独立审查（自查 + 独立子代理交叉）。
