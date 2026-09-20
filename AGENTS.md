@@ -76,7 +76,7 @@
 
 - 宿主需要按序取用 hook 回调时用 `PluginManager.listHooks(name)`（公开只读），**不要** `(plugin as any).hooks.listFor(...)` 去摸私有字段
 
-- `permission.check` 之外，`doom-loop` 的重复调用确认是**独立闸门**，不挂 hook：放行后工具仍会走 pipeline 再触发一次权限 hook，挂了会让消费方双报
+- `doom-loop` 重复调用守卫是**硬中断，不经权限引擎**（同一工具+同一入参连续 3 次，或连续 3 步整步签名相同）：它是"已经在空转"的资源保护，不是"能不能执行"的权限问题。曾走 `permission.ask()` ⇒ 被 `--permission allow-all`（或已记住的 allow 规则）完全架空（实测 25 步空转 21 秒零拦截）。命中即记 `code: 'DOOM_LOOP'` 的失败 ToolResult 并终止本轮，不再续轮。另：该守卫**不挂 `core.permission.check` hook**——它不走权限路径了，且放行后工具仍会走 pipeline，挂 hook 会让消费方双报
 
 - 权限拒绝判定用错误名 `err.name === 'ToolPermissionDeniedError'`，避免依赖类绑定
 

@@ -1,5 +1,69 @@
 # Agent Harness 开发日志
 
+## 2026-09-20（续 159）doom-loop 守卫改为硬中断（不再受权限模式影响）+ ACP 对照实验
+
+用户问：会话 `s_1789862291973_b0c2s`「跑到一半中断了，还是之前遇到的问题吗」。
+
+**先答：不是。** 之前那条根因（`renderText` 把 tool part 渲染成 `[tool]` 占位 → 模型模仿 → 不再调工具，
+续 ⑦）本会话 **0 次复现**（`[tool]` 计数 0）。本次是**另一个**问题，而且拆开是两层。
+
+### 会话落盘还原（`~/.harness/sessions/`）
+
+- title「分析当前会话」，agentId=coordinator，model=`online/deepseek-flash`，cwd=claude-code-analysis-main
+  （= TUI 的 `-c` 参数），**21 秒内 25 次 LLM 调用**：24 次 `acp_status`（多为空参 `{}`）+ 若干 `list_dir`；
+  每步 output 仅 53~60 token。
+- 模型 reasoning 反复自述"我没能发出工具调用"，并乱试三种协议（`antml:invoke` / `function_calls` /
+  JSON `{"name":..}`）—— 全仓 grep 确认这些格式**不来自我们的提示词**，是模型自身先验；实际调用是发出去了的。
+- 最后一步只有 53 token 推理、**既无文本也无工具调用** ⇒ 引擎按「无工具调用 ⇒ 收尾」正常结束本轮
+  ⇒ 用户看到的「中断」、没有最终答复。**收尾方式与上次相同，但成因不同。**
+
+### 修的第一层：守卫被权限模式架空（本次的实锤缺陷）
+
+用落盘数据复算「整步重复」判据（阈值 3）：**[15][16][17][18][24] 共 5 步命中** —— 判据工作正常，
+但守卫的实现是 `permission.ask()`，而该 TUI 用 `--permission allow-all` 启动 ⇒ `CliPermissionEngine.ask`
+直接返回 allow ⇒ **5 次命中全部被放行，25 步空转零拦截**。续 ⑦ 里"doom-loop 未拦住属预期（步签名不命中）"
+的解释在本次不成立。
+
+改法（`core`）：**守卫与权限解耦，命中即硬中断**。
+- 两处（每步聚合签名 / 每次调用签名）删掉 `permission.ask()` 与"用户放行则继续"的分支；命中即记
+  `code: 'DOOM_LOOP'` 的失败 ToolResult 并 `break`/`doomLoopTripped`，不再续轮。
+- 文案改为「已自动中断本轮以避免死循环。若确有需要，请换一种入参或策略后重试。」
+- 理由写进注释：这是「已经在空转」的**资源保护**，不是「能不能执行」的**权限问题**；用权限引擎裁决
+  必然被 allow-all / 已记住的 allow 规则架空。
+- 顺带删掉每调用分支里那段"确认期间可能 Ctrl-C"的中断兜底 —— 不再有阻塞式询问，而循环顶部已有
+  abort 检查（`signal?.aborted` ⇒ ABORTED）。
+
+**防回归测试**（`agentic-loop.test.ts`）：两条旧用例原本断言"用户放行 ⇒ 继续执行"，现改为
+「**即使权限引擎一律放行（allow-all）也必须硬中断**」，并断言 `engine.asks === 0`（守卫不得再咨询权限引擎）
+与 `provider.calls === DOOM_LOOP_THRESHOLD`（拦下即收手）。`AllowAskEngine` 顺势加了 `asks` 计数。
+
+### 修的第二层：ACP 是不是诱因？—— 对照实验（结论：不是）
+
+怀疑点：ACP 内核每轮给每条消息注入 `<acp tokens=… type=…>mNNNNN</acp>` ref 标签（内核 system prompt 明写
+"NEVER echo these tags"），b0c2s 的模型 reasoning 里出现过 "the acp tag"。于是做了一次受控 A/B。
+
+**实验设计**（不碰用户 `~/.harness`）：
+- 两个临时 dataDir（`/tmp/acp-ab/{on,off}`），配置**唯一差别**是 `compression.enabled`（acp-context 的装配开关），
+  其余（provider/model/plugins）逐字复制；`apiKey` 用 `${AB_DEEPSEEK_KEY}` 环境变量引用 ⇒ **密钥不落盘**。
+- 同一 prompt（`分析当前会话`）、同 cwd、同 agent（coordinator）、同 `--permission allow-all`，`harness run` 单跑。
+
+| 臂 | ACP | 实际步序列 | 结果 |
+| --- | --- | --- | --- |
+| A | 开 | `acp_status`(空参) ×3，签名完全相同 | 第 3 步被新守卫切断（DOOM_LOOP×1），**2 秒**结束 |
+| B | 关 | bash/list_dir/glob 交替 13 步（入参多变），第 11~13 步出现完全相同的 `bash+list_dir` | 第 13 步切断（DOOM_LOOP×2），**15 秒**结束 |
+
+**结论**：关掉 ACP 照样空转 ⇒ **空转与 ACP（含 ref 标签）无关**，病根在「模型 + coordinator 提示词 +
+这个 prompt」这一侧；ACP 只改变了它挑来空转的工具（开 ACP 时盯上 `acp_status`，关掉后改盯 bash/list_dir）。
+两臂 `[tool]` / `<acp>` 计数都是 0，也再次确认续 ⑦ 的修复有效。**A 臂同时是本次守卫修复的真机验收**：
+同样的空转，修前 25 步（21 秒）无拦截，修后第 3 步就断。
+
+**顺带记录（未改）**：`harness run` 模式只把 `[工具] <name>` 写 stderr，**不打印工具结果** ⇒ DOOM_LOOP
+在 run 模式下对用户不可见；TUI/REPL 走 `createProcessLine` 会渲染 `❌ → {"message":"检测到重复调用…"}`，
+所以 TUI 用户能看到中断原因。若要让 headless 也可见，得给 run 的渲染加一条失败结果输出（另议）。
+
+**验证**：core 87 全绿（2 例改写为 allow-all 硬中断 + 引擎不被咨询）；全仓 typecheck 0 错误；
+全量测试 1530 pass / 0 fail。真机：A 臂（ACP 开）与 B 臂（ACP 关）都在守卫处被切断，未再出现"静默中断"。
+
 ## 2026-09-20（续 158）herdr 上报「启动不显示已启动 / 退出不显示已退出」—— 三条根因，全部真机证实
 
 用户报：「herdr 插件的状态上报似乎有问题，启动时没有立即显示已启动，退出后也没有显示已退出」。
