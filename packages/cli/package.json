@@ -30,6 +30,7 @@
     "@harness/provider-mock": "workspace:*",
     "@harness/provider-openai": "workspace:*",
     "@harness/provider-qwen": "workspace:*",
+    "@harness/skill-forge": "workspace:*",
     "@harness/revert": "workspace:*",
     "@harness/session": "workspace:*",
     "@harness/skill": "workspace:*",

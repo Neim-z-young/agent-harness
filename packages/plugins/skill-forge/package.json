@@ -1,0 +1,22 @@
+{
+  "name": "@harness/skill-forge",
+  "version": "0.1.0",
+  "description": "技能锻造插件：从会话工具轨迹生成技能草稿（人工确认后落盘并当轮生效），含去重提示与治理上限",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/plugin": "workspace:*",
+    "@harness/skill": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

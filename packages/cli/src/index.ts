@@ -908,6 +908,17 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       optIn: true,
       load: async () => (await lazyImport<{ createMemoryPlugin: () => AgentPlugin }>('@harness/memory')).createMemoryPlugin(),
     })
+    // skill-forge：技能锻造（F1/F2）。optIn：会往 skills 目录写文件，必须显式声明才启用。
+    // 与 memory 互补：单条事实进记忆，多步流程进技能（见 docs/memory-and-skill-forge-plan.md §0）。
+    defaultBuiltinRegistry.register({
+      id: 'skill-forge',
+      name: 'Skill Forge',
+      description: '技能锻造：从会话工具轨迹生成技能草稿，人工确认后落盘为 SKILL.md 并当轮生效（/skill-forge）',
+      source: 'builtin',
+      optIn: true,
+      load: async () =>
+        (await lazyImport<{ createSkillForgePlugin: () => AgentPlugin }>('@harness/skill-forge')).createSkillForgePlugin(),
+    })
   }
   return defaultBuiltinRegistry
 }

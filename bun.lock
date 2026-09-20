@@ -65,8 +65,10 @@
         "@harness/bus": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/herdr": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
+        "@harness/memory": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/provider-anthropic": "workspace:*",
@@ -78,6 +80,7 @@
         "@harness/revert": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/skill": "workspace:*",
+        "@harness/skill-forge": "workspace:*",
         "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
         "@harness/swarm": "workspace:*",
@@ -173,6 +176,13 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/herdr": {
+      "name": "@harness/herdr",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
+      },
+    },
     "packages/plugins/manage-plugin": {
       "name": "@harness/manage-plugin",
       "version": "0.1.0",
@@ -201,6 +211,17 @@
         "@harness/mcp-client": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/memory": {
+      "name": "@harness/memory",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
+      },
+      "devDependencies": {
+        "@harness/core": "workspace:*",
+        "@harness/workspace": "workspace:*",
       },
     },
     "packages/plugins/provider-anthropic": {
@@ -268,6 +289,14 @@
         "@harness/provider-openai": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/tool": "workspace:*",
+      },
+    },
+    "packages/plugins/skill-forge": {
+      "name": "@harness/skill-forge",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
+        "@harness/skill": "workspace:*",
       },
     },
     "packages/plugins/subagent": {
@@ -435,11 +464,15 @@
 
     "@harness/core": ["@harness/core@workspace:packages/core"],
 
+    "@harness/herdr": ["@harness/herdr@workspace:packages/plugins/herdr"],
+
     "@harness/manage-plugin": ["@harness/manage-plugin@workspace:packages/plugins/manage-plugin"],
 
     "@harness/mcp-client": ["@harness/mcp-client@workspace:packages/plugins/mcp-client"],
 
     "@harness/mcp-server-registry": ["@harness/mcp-server-registry@workspace:packages/plugins/mcp-server-registry"],
+
+    "@harness/memory": ["@harness/memory@workspace:packages/plugins/memory"],
 
     "@harness/permission": ["@harness/permission@workspace:packages/permission"],
 
@@ -462,6 +495,8 @@
     "@harness/session": ["@harness/session@workspace:packages/session"],
 
     "@harness/skill": ["@harness/skill@workspace:packages/skill"],
+
+    "@harness/skill-forge": ["@harness/skill-forge@workspace:packages/plugins/skill-forge"],
 
     "@harness/snapshot": ["@harness/snapshot@workspace:packages/snapshot"],
 
