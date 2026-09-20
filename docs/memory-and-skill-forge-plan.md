@@ -364,7 +364,22 @@ project 级？反之？需实测决定）而不是静默丢弃。
 - 技能执行失败或被用户纠正 ⇒ 回写 L1 记忆（feedback 类），形成闭环；
 - 与记忆的分工：单条事实进记忆，多步流程进技能（§0 原则）。
 
-### 5.1 串联落地（2026-09-20）：统一入口 `/forge`
+### 5.1 信号通道：三个触发源全部收口到引擎层（2026-09-20 修订）
+
+延迟注入/flush 的触发源最终形态（两个插件完全一致）：
+
+| 触发源 | 层 | 覆盖的路径 |
+|---|---|---|
+| `core.tool.post.execute`（`tool.id === 'compress'` 且成功） | 引擎 | **ACP 模型驱动压缩**（模型调 compress 工具）——这条不触发 compacting！ |
+| `core.session.compacting` | 引擎 | session compaction（`/compact`、自动压缩） |
+| `core.agent.turn.end`（攒够 N 轮，只数主会话） | 引擎 | 兜底，防"永远等不到压缩" |
+
+修订记录：memory 原本感知 ACP 压缩走 `cli.agent.stream`（**UI 消费层**），内嵌/ACP 宿主收不到
+—— 其注释自称"post.execute 的 ctx 没有 toolId"，实际 `ToolPostHookContext` 一直带 `tool.id`，
+前提不成立。且 UI 方式在 `tool_call_start`（压缩开始**前**）就 flush，压缩失败也照发布；
+引擎层 post 能看结果，`ok:false` 不发布，语义更准。改后两插件信号源完全一致。
+
+### 5.2 串联落地（2026-09-20）：统一入口 `/forge`
 
 两条线各自跑通后按 §5 用一个入口串起来（路由规则即 §0 的分工）：
 
