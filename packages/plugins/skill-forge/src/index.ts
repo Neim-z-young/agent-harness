@@ -339,6 +339,77 @@ export function findSimilarSkill(
   return best
 }
 
+// ===== 延迟注入调度（与记忆同一套分级策略）=====
+
+/**
+ * 锻造技能的**延迟注入**调度器。
+ *
+ * 为什么延迟：技能一进 `agent.skills` 白名单，下一轮的 system 就变了 ⇒ 前缀缓存失效一次。
+ * 锻造常常是连着做几件的（跑通一段就存一个），逐个立即绑定会让 system 连续变好几轮。
+ * 与记忆（§3.7）同一套判据：**攒到下次压缩**再统一发布，攒够 N 轮兜底放行，`--now` 例外。
+ *
+ * ⚠️ 触发源必须双份：`core.session.compacting`（ACP/压缩路径）+ `core.agent.turn.end`
+ * （引擎层轮末兜底）—— 只认前者在关闭压缩时永远等不到，只认后者则要白等十几轮。
+ */
+export class SkillInjectScheduler {
+  private pending = new Map<string, string | undefined>() // skillId → 绑定目标 agentId
+  private dirtyTurns = 0
+  private forced = false
+
+  constructor(private readonly opts: { flushAfterTurns?: number } = {}) {}
+
+  private get flushAfter(): number {
+    return this.opts.flushAfterTurns ?? 15
+  }
+
+  /** 排入待注入队列（不立即改白名单） */
+  schedule(skillId: string, agentId?: string): void {
+    this.pending.set(skillId, agentId)
+    this.dirtyTurns = 0
+    this.forced = false
+  }
+
+  /** 轮末推进：攒够轮数则安排放行（兜底） */
+  onTurnEnd(): void {
+    if (this.pending.size === 0 || this.forced) return
+    this.dirtyTurns += 1
+    if (this.dirtyTurns >= this.flushAfter) this.forced = true
+  }
+
+  /** 立即安排发布（压缩发生 / 显式 flush） */
+  flush(): void {
+    if (this.pending.size > 0) this.forced = true
+  }
+
+  /** 是否此刻应当发布 */
+  get due(): boolean {
+    return this.forced || this.flushAfter <= 0
+  }
+
+  /** 取出待发布队列并清空调度状态 */
+  takeDue(): Array<{ skillId: string; agentId?: string }> {
+    if (!this.due) return []
+    const out = Array.from(this.pending.entries()).map(([skillId, agentId]) => ({
+      skillId,
+      ...(agentId ? { agentId } : {}),
+    }))
+    this.pending.clear()
+    this.dirtyTurns = 0
+    this.forced = false
+    return out
+  }
+
+  /** 诊断（`/forge` 面板用） */
+  state(): { pending: string[]; dirtyTurns: number; flushAfterTurns: number; due: boolean } {
+    return {
+      pending: Array.from(this.pending.keys()),
+      dirtyTurns: this.dirtyTurns,
+      flushAfterTurns: this.flushAfter,
+      due: this.due,
+    }
+  }
+}
+
 // ===== 失败回写记忆（F3 闭环的一半）=====
 
 /** 回写记忆的一条候选（节流后才会真的落盘） */
@@ -355,6 +426,11 @@ const ENTRY_PREFIX = '- '
 /** 归一化（与 memory 插件一致：去空白，便于精确去重） */
 function normalizeEntry(text: string): string {
   return text.replace(/\s+/g, ' ').trim()
+}
+
+/** 往记忆索引追加一条（`- ` 前缀、精确去重、上限校验、原子写） */
+export function appendMemory(file: string, line: string): { ok: boolean; message: string } {
+  return writeFeedbackMemory(file, line)
 }
 
 /**
@@ -412,6 +488,8 @@ export interface SkillForgePluginOptions {
   minFailures?: number
   /** 回写到哪级记忆（默认 user；project 会随 git 共享） */
   feedbackScope?: 'user' | 'project'
+  /** 延迟注入兜底轮数（默认 15，与记忆一致；0 = 立即） */
+  flushAfterTurns?: number
   /** 注入 workspace（测试用；运行时走 ctx.workspace） */
   workspace?: {
     user: { skills: string; memory: string }
@@ -459,6 +537,11 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
   /** 已回写过记忆的失败（节流：同一工具+入参一次会话只写一条） */
   const writtenFeedback = new Set<string>()
   let ctxLog: PluginContext['log'] | undefined
+  /** install 里赋值：/forge 转发子命令时要复用技能侧的命令处理器 */
+  let commandHandler: ((input: any) => void) | undefined
+  const scheduler = new SkillInjectScheduler({
+    ...(options.flushAfterTurns != null ? { flushAfterTurns: options.flushAfterTurns } : {}),
+  })
 
   const scopeOf = (flags: Set<string>): 'user' | 'project' =>
     flags.has('--project') ? 'project' : (options.scope ?? 'user')
@@ -486,6 +569,90 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
       `✅ 已加入 Agent "${target}" 的技能白名单（运行时；重启后需持久化）\n` +
       `   持久化：在该 Agent 的 .md frontmatter 里写  skills: [${[...cur, skillId].join(', ')}]`
     )
+  }
+
+  /**
+   * 统一沉淀入口 `/forge`（§5：两条线一个入口）。
+   *
+   * 路由规则：**单条事实 → 记忆，多步流程 → 技能**。
+   * - `/forge` 面板：一眼看到「可固化流程 / 待注入技能 / 记忆条目」；
+   * - `/forge memory add <内容> [--project]` 写记忆（不依赖 @harness/memory）；
+   * - `/forge skill <name> …` 转发到技能锻造；
+   * - `/forge flush` 立即发布延迟注入队列。
+   *
+   * @returns 是否已处理（false 表示不是本插件的命令）
+   */
+  const handleForge = (input: CliCommandInput): boolean => {
+    if (input.command !== 'forge') return false
+    input.result = 'continue'
+    const out = input.out
+    const { flags, positional, desc } = parseArgs(input.arg ?? '')
+    const sub = positional[0]
+
+    // 转发：/forge skill <name> … → 与 /skill-forge <name> … 完全等价
+    if (sub === 'skill') {
+      const rest = (input.arg ?? '').slice('skill'.length).trim()
+      commandHandler?.({ ...input, command: 'skill-forge', arg: rest })
+      return true
+    }
+
+    if (sub === 'flush') {
+      scheduler.flush() // 先标记到期，再取 —— 否则 takeDue 只会返回空（面板显示待注入、flush 却说没有）
+      const due = scheduler.takeDue()
+      for (const d of due) bindToAgent(d.skillId, d.agentId)
+      out(
+        due.length
+          ? `✅ 已发布延迟注入：${due.map((d) => d.skillId).join('、')}（下一轮起生效）\n`
+          : '当前没有待注入的技能。\n',
+      )
+      return true
+    }
+
+    if (sub === 'memory') {
+      const verb = positional[1] ?? 'list'
+      const scope = flags.has('--project') ? 'project' : (options.feedbackScope ?? 'user')
+      const dir = scope === 'project' ? ws?.project.memory : ws?.user.memory
+      if (!dir) { out('未获得 workspace 的 memory 路径。\n'); return true }
+      const file = join(dir, MEMORY_INDEX_FILE)
+      if (verb === 'list' || verb === undefined) {
+        const text = existsSync(file) ? readFileSync(file, 'utf-8') : ''
+        const entries = text.split('\n').filter((l) => l.trim().length > 0)
+        out(
+          `\n长期记忆（${scope} 级 · ${file}）：${entries.length} 条\n` +
+            entries.slice(0, 20).map((l) => `   ${l}`).join('\n') +
+            (entries.length ? '\n' : '  （空）\n') +
+            `  写入：/forge memory add <内容>${scope === 'user' ? '（--project 写项目级，会随 git 共享）' : ''}\n`,
+        )
+        return true
+      }
+      if (verb === 'add') {
+        const payload = (input.arg ?? '').split(/\s+/).slice(3).join(' ').trim() || desc || ''
+        if (!payload) { out('用法：/forge memory add <内容> [--project]\n'); return true }
+        const res = appendMemory(file, payload)
+        out(res.ok ? `✅ 已写入${scope === 'project' ? '项目' : '用户'}记忆：${payload}\n` : `⚠️  未写入：${res.message}\n`)
+        return true
+      }
+      out('用法：/forge memory add <内容> [--project] · /forge memory list\n')
+      return true
+    }
+
+    // 默认：沉淀面板
+    const trace = recorder.list(input.sessionId ?? '')
+    const found = detectRepeatable(trace)
+    const st = scheduler.state()
+    const memFile = ws?.user.memory ? join(ws.user.memory, MEMORY_INDEX_FILE) : undefined
+    const memCount = memFile && existsSync(memFile)
+      ? readFileSync(memFile, 'utf-8').split('\n').filter((l) => l.trim().length > 0).length
+      : 0
+    out(
+      `\n沉淀面板（单条事实 → 记忆；多步流程 → 技能）\n` +
+        `  可固化流程  ${found.length} 段${found.length ? `（${found.slice(0, 3).map((f) => f.toolIds.join('→')).join('、')}）` : ''}\n` +
+        `  待注入技能  ${st.pending.length ? `${st.pending.join('、')}（${st.dirtyTurns}/${st.flushAfterTurns} 轮）` : '无'}\n` +
+        `  用户记忆    ${memCount} 条\n` +
+        `  已装技能    ${manager ? manager.all().length : 0} 个\n` +
+        `  下一步：/forge skill <name> 固化流程 · /forge memory add <事实> · /forge flush 立即发布\n`,
+    )
+    return true
   }
 
   const ensureDirs = async (): Promise<void> => {
@@ -566,12 +733,37 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
       hooks['cli.commands'] = (input: { commands: Array<{ command: string; description: string; usage: string }> }) => {
         input.commands.push({
           command: 'skill-forge',
-          description: '技能锻造：把本次跑通的流程固化为技能（草稿 → 确认 → 落盘）',
-          usage: '/skill-forge <name> [--project] [--desc "何时用"] · --confirm <name> · list · path · disable <id>',
+          description: '技能锻造：把本次跑通的流程固化为技能（草稿 → 确认 → 延迟注入）',
+          usage: '/skill-forge <name> [--project] [--desc "何时用"] · --confirm <name> [--now] · list · path · disable <id>',
+        })
+        // 统一沉淀入口（§5：单条事实 → 记忆，多步流程 → 技能）
+        input.commands.push({
+          command: 'forge',
+          description: '沉淀总入口：查看面板 / 记忆 add·list / 技能 skill·flush（两条线同一入口）',
+          usage: '/forge · /forge memory add <内容> [--project] · /forge memory list · /forge skill <name> · /forge flush',
         })
       }
 
-      hooks['cli.command'] = (input: CliCommandInput) => {
+      // 延迟注入的两个触发源（缺一不可，见 SkillInjectScheduler 的注释）
+      hooks['core.session.compacting'] = () => {
+        scheduler.flush()
+      }
+      hooks['core.agent.turn.end'] = (signal: { mode?: string; sessionId?: string }) => {
+        if (signal?.mode === 'subagent') return
+        scheduler.onTurnEnd()
+      }
+
+      // 下一轮真正发生注入前，把到期的技能绑进白名单
+      hooks['core.prompt.system.transform'] = () => {
+        const due = scheduler.takeDue()
+        for (const d of due) bindToAgent(d.skillId, d.agentId)
+        if (due.length && ctxLog) {
+          ctxLog.info?.(`延迟注入已发布：${due.map((d) => d.skillId).join('、')}`)
+        }
+      }
+
+      const cliCommandHandler = (input: CliCommandInput) => {
+        if (input.command === 'forge' && handleForge(input)) return
         if (input.command !== 'skill-forge') return
         input.result = 'continue'
         const out = input.out
@@ -676,14 +868,24 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
             if (res.ok) {
               pending.delete(key)
               out(`✅ ${res.message}\n`)
-              // 注入只在 agent.skills 白名单里发生（paths 触发在仓库里是死代码），
-              // 所以默认提示用户绑定；--bind 直接做运行时绑定。
-              if (flags.has('--bind')) out(`${bindToAgent(name, positional[1] ?? input.agentId)}\n`)
-              else
+              const target = positional[1] ?? input.agentId
+              // 注入只认 agent.skills 白名单（paths 触发是死代码）。
+              // 默认**延迟**：改白名单就会改下一轮 system ⇒ 前缀缓存失效一次，攒到一起发布更划算。
+              if (flags.has('--now')) {
+                out(`${bindToAgent(name, target)}\n`)
+              } else if (flags.has('--bind') || flags.has('--defer')) {
+                scheduler.schedule(name, target)
+                const st = scheduler.state()
                 out(
-                  `   说明：技能注入只认 Agent 的 skills 白名单 —— 加 --bind 可把 ${name} 加入当前 Agent\n` +
-                    `   （否则它只在 /skill-forge list 里可见，不会自动注入）\n`,
+                  `   已排入延迟注入队列（${st.pending.join('、')}）—— 下次压缩、或 ${st.flushAfterTurns} 轮后发布；\n` +
+                    `   立即发布：/forge flush（也可在 --confirm 时加 --now）\n`,
                 )
+              } else {
+                out(
+                  `   说明：技能注入只认 Agent 的 skills 白名单 —— 加 --bind 排入延迟注入，或 --now 立即生效\n` +
+                    `   （不加则只在 /skill-forge list 里可见，不会注入）\n`,
+                )
+              }
             } else {
               out(`⚠️  ${res.message}\n`)
             }
@@ -711,6 +913,8 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
         )
       }
 
+      hooks['cli.command'] = cliCommandHandler
+      commandHandler = cliCommandHandler
       return hooks as Hooks
     },
   }

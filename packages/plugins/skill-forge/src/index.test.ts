@@ -5,8 +5,10 @@ import { tmpdir } from 'node:os'
 import { createSkillManager } from '@harness/skill'
 import {
   TraceRecorder,
+  appendMemory,
   collapseCycle,
   createSkillForgePlugin,
+  SkillInjectScheduler,
   draftFromTrace,
   detectRepeatable,
   draftToSkill,
@@ -382,15 +384,21 @@ describe('F3 命令侧', () => {
     expect(text.split('\n').filter((l) => l.includes('[feedback]')).length).toBe(1)
   })
 
-  it('--bind 把技能加入 agent 的 skills 白名单（注入只认白名单）', async () => {
-    const { run, record, lines, agents } = await setup()
+  it('--bind 排入延迟队列：压缩触发后才真正进白名单（注入只认白名单）', async () => {
+    const { run, record, lines, agents, hooks } = await setup()
     record('bash', { command: 'ls' })
     run('bindme')
     lines.length = 0
     run('--confirm bindme --bind')
     await new Promise((r) => setTimeout(r, 10))
+    // 关键：此刻还**没**进白名单（否则下一轮 system 就变，前缀缓存白失效一次）
+    expect(agents.default.skills).not.toContain('bindme')
+    expect(lines.join('')).toContain('延迟注入队列')
+
+    // 压缩（ACP 路径）触发发布 ⇒ 下一轮 prompt 构建时进白名单
+    hooks['core.session.compacting']()
+    hooks['core.prompt.system.transform']({}, [])
     expect(agents.default.skills).toContain('bindme')
-    expect(lines.join('')).toContain('持久化') // 运行时绑定 + 提示如何落盘
   })
 
   it('不带 --bind 时明确告知"不会自动注入"（否则用户以为锻造完就能用）', async () => {
@@ -402,5 +410,120 @@ describe('F3 命令侧', () => {
     await new Promise((r) => setTimeout(r, 10))
     expect(agents.default.skills).not.toContain('nobind')
     expect(lines.join('')).toContain('--bind')
+  })
+})
+
+// ===== 延迟注入（与记忆同一套分级策略）=====
+
+describe('SkillInjectScheduler', () => {
+  it('排入队列后不立即发布；攒够轮数才 due', () => {
+    const s = new SkillInjectScheduler({ flushAfterTurns: 3 })
+    s.schedule('a')
+    expect(s.due).toBe(false)
+    expect(s.takeDue()).toHaveLength(0)
+    s.onTurnEnd(); s.onTurnEnd()
+    expect(s.takeDue()).toHaveLength(0)
+    s.onTurnEnd()
+    expect(s.takeDue().map((x) => x.skillId)).toEqual(['a'])
+  })
+  it('压缩触发 flush（ACP 路径）与显式 flush 都立即到期', () => {
+    const a = new SkillInjectScheduler()
+    a.schedule('x'); a.flush()
+    expect(a.takeDue().map((x) => x.skillId)).toEqual(['x'])
+    const b = new SkillInjectScheduler()
+    b.schedule('y'); b.flush()
+    expect(b.due).toBe(true)
+  })
+  it('队列为空时 flush 不产生空发布（避免白改一次 system）', () => {
+    const s = new SkillInjectScheduler()
+    s.flush()
+    expect(s.due).toBe(false)
+    expect(s.takeDue()).toHaveLength(0)
+  })
+  it('flushAfterTurns=0 ⇒ 立即（关闭延迟）', () => {
+    const s = new SkillInjectScheduler({ flushAfterTurns: 0 })
+    s.schedule('z')
+    expect(s.takeDue()).toHaveLength(1)
+  })
+})
+
+describe('延迟注入命令侧', () => {
+  it('--bind 后**不**立即进白名单；/forge flush 才发布', async () => {
+    const { run, record, lines, agents } = await setup()
+    record('bash', { command: 'ls' })
+    run('defer-me')
+    run('--confirm defer-me --bind')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(agents.default.skills).not.toContain('defer-me')
+    expect(lines.join('')).toContain('延迟注入队列')
+
+    lines.length = 0
+    run('/x') // 占位，避免空
+    // 统一入口发布
+    const forge = { command: 'forge', arg: 'flush', out: (t: string) => lines.push(t), sessionId: 's1' } as any
+    ;(await import('./index')).createSkillForgePlugin // 保持引用
+    // 直接走同一个 handler：用 setup 暴露的 hooks 转发
+    // （setup 的 run 只支持 skill-forge，这里借 /forge skill 转发路径）
+    lines.length = 0
+    run('flush') === 'continue' // skill-forge 无 flush 子命令 ⇒ 落到用法提示
+    // 用 /forge 面板的 flush：通过 hooks 直接调用
+    const { hooks } = await setup()
+    const out2: string[] = []
+    hooks['cli.command']({ command: 'forge', arg: 'flush', out: (t: string) => out2.push(t), sessionId: 's1' } as any)
+    expect(out2.join('')).toContain('没有待注入')
+  })
+
+  it('/forge flush 能真正发布待注入队列（先 flush 再取，否则恒为空）', async () => {
+    const { hooks, run, record, agents } = await setup()
+    record('bash', { command: 'ls' })
+    run('flush-me')
+    run('--confirm flush-me --bind')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(agents.default.skills).not.toContain('flush-me')
+    const out: string[] = []
+    hooks['cli.command']({ command: 'forge', arg: 'flush', out: (t: string) => out.push(t), sessionId: 's1' } as any)
+    expect(out.join('')).toContain('已发布延迟注入')
+    expect(agents.default.skills).toContain('flush-me')
+  })
+
+  it('--now 立即注入（用户有即时预期时的例外）', async () => {
+    const { run, record, agents } = await setup()
+    record('bash', { command: 'ls' })
+    run('nower')
+    run('--confirm nower --now')
+    await new Promise((r) => setTimeout(r, 10))
+    expect(agents.default.skills).toContain('nower')
+  })
+})
+
+// ===== 两条线串联（/forge 统一入口）=====
+
+describe('/forge 统一入口', () => {
+  it('面板同时给出两条线的状态（可固化流程 / 待注入 / 记忆 / 技能数）', async () => {
+    const { hooks, record } = await setup()
+    for (let i = 0; i < 3; i += 1) record('bash', { command: 'ls' })
+    const out: string[] = []
+    hooks['cli.command']({ command: 'forge', arg: '', out: (t: string) => out.push(t), sessionId: 's1' } as any)
+    const text = out.join('')
+    expect(text).toContain('可固化流程')
+    expect(text).toContain('待注入技能')
+    expect(text).toContain('用户记忆')
+    expect(text).toContain('已装技能')
+  })
+
+  it('/forge memory add 写记忆（单条事实走这条线）', async () => {
+    const { hooks, ws } = await setup()
+    const out: string[] = []
+    hooks['cli.command']({ command: 'forge', arg: 'memory add 这个项目用 bun 跑测试', out: (t: string) => out.push(t), sessionId: 's1' } as any)
+    expect(out.join('')).toContain('已写入')
+    expect(readFileSync(join(ws.user.memory, 'MEMORY.md'), 'utf-8')).toContain('bun 跑测试')
+  })
+
+  it('/forge skill <name> 转发到技能锻造（多步流程走这条线）', async () => {
+    const { hooks, record } = await setup()
+    record('bash', { command: 'ls' })
+    const out: string[] = []
+    hooks['cli.command']({ command: 'forge', arg: 'skill via-forge --desc "经统一入口"', out: (t: string) => out.push(t), sessionId: 's1' } as any)
+    expect(out.join('')).toContain('技能草稿：via-forge')
   })
 })
