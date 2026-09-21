@@ -106,7 +106,7 @@ TUI 退化为**渲染器**。核心难点不是"算"，而是**幂等**——必
 3. **自愈**：若 checkpoint 的 id 在消息列表里**找不到**（被 `/compact`、`deleteMessage`、手工编辑
    破坏），放弃增量、用 `usageFromMessages(messages)` **全量重建**并重写 checkpoint。
    —— 这条是必需的：`usageFromMessages` 已存在且经过测试，重建比"猜测漏算了什么"更可靠；
-4. **写入时机**：复用刚上线（续 167）的脏会话机制——`updateMeta` 会标脏，CLI 在轮末
+4. **写入时机**：复用刚上线（续 173）的脏会话机制——`updateMeta` 会标脏，CLI 在轮末
    `flushDirtySessions()` 落盘。**不要**在引擎里直接 `sessionStore.save`（会与宿主写盘打架）。
 5. **子会话**：无特殊处理，`_runOneStep` 自动覆盖；父会话只做**展示层聚合**（见 §5 待拍板）。
 

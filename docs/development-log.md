@@ -1,6 +1,6 @@
 # Agent Harness 开发日志
 
-## 2026-09-21（续 169）Anthropic 显式 prompt 缓存（未验收，默认关）+ matchGlob 的 `**/` 语义修正 + permission 补测试
+## 2026-09-21（续 175）Anthropic 显式 prompt 缓存（未验收，默认关）+ matchGlob 的 `**/` 语义修正 + permission 补测试
 
 用户说「继续实施」⇒ 接着落方案文档 §7.6 的未做项。**先撞上硬阻塞：本机只有 DeepSeek 的 key，
 没有 Anthropic key** ⇒ 按 AGENTS.md「与外部服务对接以真机为准」，把 Anthropic 缓存做成
@@ -49,7 +49,7 @@ typecheck 0 错误；全量 **1700 pass / 0 fail**；**根 `bun run test` 退出
 ① 第二次同前缀请求 `usage.cache_read_input_tokens > 0`；② `cache_creation_input_tokens` 只在首次/
 前缀变化时出现。通过后再把默认值翻成 true。
 
-## 2026-09-21（续 168）用量纳管搬到引擎层 + ACP 手册改尾部注入（修前缀缓存失效）
+## 2026-09-21（续 174）用量纳管搬到引擎层 + ACP 手册改尾部注入（修前缀缓存失效）
 
 实施 `docs/usage-accounting-and-prompt-cache-plan.md`（该文件为本轮方案稿，同批落地）。
 用户拍板：**手册尾部注入**；`@harness/usage` 独立成包；`meta.usageStats` 保持本会话口径 + 展示层给聚合行。
@@ -106,7 +106,7 @@ acp-context 订阅后落 `providerCache` 遥测行。此前 `buildProviderCacheE
 +2 providerCache、+3 聚合行）。AGENTS.md 新增四条硬约定（前缀只放恒定文本 / 尾部注入必须用
 user role / 累积必须 checkpoint+自愈 / 用量口径引擎层唯一）。
 
-## 2026-09-21（续 167）会话分析暴露的 8 个问题：全部修复（含 2 个 worker 因限流中断后的接手）
+## 2026-09-21（续 173）会话分析暴露的 8 个问题：全部修复（含 2 个 worker 因限流中断后的接手）
 
 来源：对会话 `s_1789916436883_ra6w1` 的取证分析 + token 归因（两份报告在 `reference/workbuddy/`）。
 按文件集分 4 组并行修复（worker-swarm / worker-session / worker-subagent / worker-acp），
