@@ -63,6 +63,25 @@ export function sanitizeName(name: string): string {
   return cleaned || 'unnamed'
 }
 
+/**
+ * 校验 team 字段：缺失 / 非字符串 / 空串 → 返回结构化错误，供工具层直接返回
+ * （不抛错，避免落到 sanitizeName 抛 TypeError 或静默空数组）。
+ */
+function requireTeam(input: { team?: unknown }): { ok: false; error: { message: string; code: string } } | undefined {
+  const team = input.team
+  if (typeof team !== 'string' || team.trim() === '') {
+    return { ok: false, error: { message: '缺少 team：请在入参里给出团队名', code: 'TEAM_REQUIRED' } }
+  }
+  return undefined
+}
+
+/** 校验 team 字段（面向内部 TaskListPlane）：非法时抛 SwarmError，避免静默空数组 */
+function assertTeamName(team: unknown): void {
+  if (typeof team !== 'string' || team.trim() === '') {
+    throw new SwarmError('task', '缺少 team：请在入参里给出团队名')
+  }
+}
+
 /** 生成短唯一 ID（task 等用） */
 function genId(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
@@ -627,17 +646,20 @@ export class TaskListPlane {
 
   /** 列出任务（可选按状态过滤） */
   async list(team: string, status?: SwarmTaskStatus): Promise<SwarmTask[]> {
+    assertTeamName(team)
     const tasks = await this.read(team)
     return status ? tasks.filter((t) => t.status === status) : tasks
   }
 
   /** 查询任务 */
   async get(team: string, id: string): Promise<SwarmTask | undefined> {
+    assertTeamName(team)
     return (await this.read(team)).find((t) => t.id === id)
   }
 
   /** 认领任务：available → in_progress（已被认领/非 available/依赖未解决抛错；锁内 busy-check 防 TOCTOU） */
   async claim(team: string, id: string, agentName: string): Promise<SwarmTask> {
+    assertTeamName(team)
     let claimed: SwarmTask | undefined
     await withLock(this.lockPath(team), async () => {
       const tasks = await this.read(team)
@@ -670,6 +692,7 @@ export class TaskListPlane {
     id: string,
     patch: { status?: SwarmTaskStatus; result?: string },
   ): Promise<SwarmTask> {
+    assertTeamName(team)
     let updated: SwarmTask | undefined
     await withLock(this.lockPath(team), async () => {
       const tasks = await this.read(team)
@@ -691,6 +714,7 @@ export class TaskListPlane {
 
   /** 停止任务：in_progress → cancelled（统一 kill switch） */
   async stop(team: string, id: string): Promise<SwarmTask> {
+    assertTeamName(team)
     return this.update(team, id, { status: 'cancelled' })
   }
 }
@@ -1559,8 +1583,10 @@ function ctxIdentity(ctx: ToolContext): { agentId: string; sessionId: string } {
 
 /** team_create 输入/输出 */
 export interface TeamCreateInput {
-  /** 团队名（目录名将 sanitize） */
-  name: string
+  /** 团队名（目录名将 sanitize）；与 team 等价，二选一 */
+  name?: string
+  /** 团队名（与 name 等价，二选一） */
+  team?: string
   description?: string
   /** lead Agent 类型（默认当前 agentId） */
   agentType?: string
@@ -1584,19 +1610,24 @@ export function createTeamCreateTool(getTeamManager: () => TeamManager): Tool<Te
     inputSchema: withJsonSchema(makeSchema<TeamCreateInput>(), {
       type: 'object',
       properties: {
-        name: { type: 'string', description: '团队名（唯一，作为目录名会做 sanitize）' },
+        name: { type: 'string', description: '团队名（唯一，作为目录名会做 sanitize）；与 team 等价，二选一' },
+        team: { type: 'string', description: '团队名（与 name 等价，二选一）' },
         description: { type: 'string', description: '团队目标/职责描述（可选）' },
         agentType: { type: 'string', description: 'lead 的 Agent 类型（默认当前 agentId）' },
       },
-      required: ['name'],
+      required: [],
       additionalProperties: false,
     }),
-    permission: { key: 'team_create', extractPatterns: (input) => [input.name] },
+    permission: { key: 'team_create', extractPatterns: (input) => [(input.name ?? input.team) as string] },
     async call(input, ctx) {
+      const teamName = input.name ?? input.team
+      if (!teamName) {
+        return { ok: false, error: { message: '缺少团队名：请传 name（或 team）', code: 'TEAM_NAME_REQUIRED' } }
+      }
       try {
         const { agentId, sessionId } = ctxIdentity(ctx)
         const team = await getTeamManager().create({
-          name: input.name,
+          name: teamName,
           description: input.description,
           leadAgentId: agentId,
           leadSessionId: sessionId,
@@ -1615,14 +1646,17 @@ export function createTeamCreateTool(getTeamManager: () => TeamManager): Tool<Te
         return { ok: false, error: { message: (err as Error).message, code: 'TEAM_CREATE_FAILED' } }
       }
     },
-    renderUse: (input) => ({ name: input.name, description: input.description }),
+    renderUse: (input) => ({ name: input.name ?? input.team, description: input.description }),
     renderResult: (result) => (result.ok && result.output ? { name: result.output.name, lead: result.output.leadAgentId } : undefined),
   })
 }
 
 /** team_delete 输入/输出 */
 export interface TeamDeleteInput {
-  name: string
+  /** 团队名（与 team 等价，二选一） */
+  name?: string
+  /** 团队名（与 name 等价，二选一） */
+  team?: string
 }
 export interface TeamDeleteOutput {
   name: string
@@ -1639,27 +1673,37 @@ export function createTeamDeleteTool(getTeamManager: () => TeamManager): Tool<Te
     requiresUserInteraction: false,
     inputSchema: withJsonSchema(makeSchema<TeamDeleteInput>(), {
       type: 'object',
-      properties: { name: { type: 'string', description: '要删除的团队名' } },
-      required: ['name'],
+      properties: {
+        name: { type: 'string', description: '要删除的团队名；与 team 等价，二选一' },
+        team: { type: 'string', description: '团队名（与 name 等价，二选一）' },
+      },
+      required: [],
       additionalProperties: false,
     }),
-    permission: { key: 'team_delete', extractPatterns: (input) => [input.name] },
+    permission: { key: 'team_delete', extractPatterns: (input) => [(input.name ?? input.team) as string] },
     async call(input) {
+      const teamName = input.name ?? input.team
+      if (!teamName) {
+        return { ok: false, error: { message: '缺少团队名：请传 name（或 team）', code: 'TEAM_NAME_REQUIRED' } }
+      }
       try {
-        await getTeamManager().delete(input.name)
-        return { ok: true, output: { name: sanitizeName(input.name) } }
+        await getTeamManager().delete(teamName)
+        return { ok: true, output: { name: sanitizeName(teamName) } }
       } catch (err) {
         return { ok: false, error: { message: (err as Error).message, code: 'TEAM_DELETE_FAILED' } }
       }
     },
-    renderUse: (input) => ({ name: input.name }),
+    renderUse: (input) => ({ name: input.name ?? input.team }),
     renderResult: (result) => (result.ok && result.output ? { name: result.output.name } : undefined),
   })
 }
 
 /** team_status 输入/输出 */
 export interface TeamStatusInput {
-  name: string
+  /** 团队名（与 team 等价，二选一） */
+  name?: string
+  /** 团队名（与 name 等价，二选一） */
+  team?: string
 }
 export interface TeamStatusOutput {
   name: string
@@ -1684,15 +1728,22 @@ export function createTeamStatusTool(
     requiresUserInteraction: false,
     inputSchema: withJsonSchema(makeSchema<TeamStatusInput>(), {
       type: 'object',
-      properties: { name: { type: 'string', description: '团队名' } },
-      required: ['name'],
+      properties: {
+        name: { type: 'string', description: '团队名；与 team 等价，二选一' },
+        team: { type: 'string', description: '团队名（与 name 等价，二选一）' },
+      },
+      required: [],
       additionalProperties: false,
     }),
-    permission: { key: 'team_status', extractPatterns: (input) => [input.name] },
+    permission: { key: 'team_status', extractPatterns: (input) => [(input.name ?? input.team) as string] },
     async call(input) {
-      const team = await getTeamManager().get(input.name)
-      if (!team) return { ok: false, error: { message: `Team not found: ${input.name}`, code: 'TEAM_NOT_FOUND' } }
-      const tasks = await getTaskPlane().list(input.name)
+      const teamName = input.name ?? input.team
+      if (!teamName) {
+        return { ok: false, error: { message: '缺少团队名：请传 name（或 team）', code: 'TEAM_NAME_REQUIRED' } }
+      }
+      const team = await getTeamManager().get(teamName)
+      if (!team) return { ok: false, error: { message: `Team not found: ${teamName}`, code: 'TEAM_NOT_FOUND' } }
+      const tasks = await getTaskPlane().list(teamName)
       return {
         ok: true,
         output: {
@@ -1705,7 +1756,7 @@ export function createTeamStatusTool(
         },
       }
     },
-    renderUse: (input) => ({ name: input.name }),
+    renderUse: (input) => ({ name: input.name ?? input.team }),
     renderResult: (result) =>
       result.ok && result.output
         ? { name: result.output.name, members: result.output.members.length, tasks: result.output.tasks.length }
@@ -1880,6 +1931,8 @@ export function createTaskCreateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     }),
     permission: { key: 'task_create', extractPatterns: (input) => [input.team] },
     async call(input) {
+      const teamErr = requireTeam(input)
+      if (teamErr) return teamErr
       try {
         return { ok: true, output: await getTaskPlane().create(input.team, { title: input.title, description: input.description, blockedBy: input.blockedBy }) }
       } catch (err) {
@@ -1918,6 +1971,8 @@ export function createTaskListTool(getTaskPlane: () => TaskListPlane): Tool<Task
     }),
     permission: { key: 'task_list', extractPatterns: (input) => [input.team] },
     async call(input) {
+      const teamErr = requireTeam(input)
+      if (teamErr) return teamErr
       try {
         return { ok: true, output: await getTaskPlane().list(input.team, input.status) }
       } catch (err) {
@@ -1960,6 +2015,8 @@ export function createTaskClaimTool(getTaskPlane: () => TaskListPlane): Tool<Tas
     }),
     permission: { key: 'task_claim', extractPatterns: (input) => [input.team, input.taskId] },
     async call(input, ctx) {
+      const teamErr = requireTeam(input)
+      if (teamErr) return teamErr
       try {
         const agentName = input.agentName ?? ctx.agentId
         return { ok: true, output: await getTaskPlane().claim(input.team, input.taskId, agentName) }
@@ -2003,6 +2060,8 @@ export function createTaskUpdateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     }),
     permission: { key: 'task_update', extractPatterns: (input) => [input.team, input.taskId] },
     async call(input) {
+      const teamErr = requireTeam(input)
+      if (teamErr) return teamErr
       try {
         return {
           ok: true,
@@ -2047,6 +2106,8 @@ export function createTaskStopTool(getTaskPlane: () => TaskListPlane): Tool<Task
     }),
     permission: { key: 'task_stop', extractPatterns: (input) => [input.team, input.taskId] },
     async call(input) {
+      const teamErr = requireTeam(input)
+      if (teamErr) return teamErr
       try {
         return { ok: true, output: await getTaskPlane().stop(input.team, input.taskId) }
       } catch (err) {

@@ -27,6 +27,7 @@ import {
   createTaskCreateTool,
   createTaskListTool,
   createTaskStopTool,
+  createTaskUpdateTool,
   createTeamCreateTool,
   createTeamDeleteTool,
   createTeamStatusTool,
@@ -1088,6 +1089,83 @@ describe('Swarm 工具', () => {
     expect(state.abortController.signal.aborted).toBe(true)
     // 清理全局 registry，避免污染后续测试
     teammateRegistry['tasks'].clear()
+  })
+
+  // ===== 字段名兼容 + 必填校验回归 =====
+
+  it('team_status 传 {team} 能查到已存在的团队（兼容多数派写法）', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const mgr = new TeamManager(dir)
+    const plane = new TaskListPlane(dir)
+    await mgr.create({ name: 'project-recon', leadAgentId: 'c', leadSessionId: 's' })
+    const statusTool = createTeamStatusTool(() => mgr, () => plane)
+    // 此前会读 input.name（undefined）→ get(undefined) → Team not found: undefined
+    const res = await statusTool.call({ team: 'project-recon' }, makeCtx())
+    expect(res.ok).toBe(true)
+    expect(res.output!.name).toBe('project-recon')
+  })
+
+  it('team_status 传 {name} 仍可用（向后兼容）', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const mgr = new TeamManager(dir)
+    const plane = new TaskListPlane(dir)
+    await mgr.create({ name: 'Alpha', leadAgentId: 'c', leadSessionId: 's' })
+    const statusTool = createTeamStatusTool(() => mgr, () => plane)
+    const res = await statusTool.call({ name: 'Alpha' }, makeCtx())
+    expect(res.ok).toBe(true)
+    expect(res.output!.name).toBe('alpha')
+  })
+
+  it('team_status / team_delete / team_create 都不传 name 与 team ⇒ TEAM_NAME_REQUIRED', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const mgr = new TeamManager(dir)
+    const plane = new TaskListPlane(dir)
+    const statusTool = createTeamStatusTool(() => mgr, () => plane)
+    const deleteTool = createTeamDeleteTool(() => mgr)
+    const createTool = createTeamCreateTool(() => mgr)
+
+    const s = await statusTool.call({} as any, makeCtx())
+    expect(s.ok).toBe(false)
+    expect(s.error!.code).toBe('TEAM_NAME_REQUIRED')
+    expect(s.error!.message).not.toContain('undefined')
+
+    const d = await deleteTool.call({} as any, makeCtx())
+    expect(d.ok).toBe(false)
+    expect(d.error!.code).toBe('TEAM_NAME_REQUIRED')
+
+    const c = await createTool.call({} as any, makeCtx())
+    expect(c.ok).toBe(false)
+    expect(c.error!.code).toBe('TEAM_NAME_REQUIRED')
+  })
+
+  it('task_create {} ⇒ TEAM_REQUIRED（不抛 TypeError、消息不含 name.trim）', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const plane = new TaskListPlane(dir)
+    const create = createTaskCreateTool(() => plane)
+    const res = await create.call({} as any, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('TEAM_REQUIRED')
+    expect(res.error!.message).not.toContain('name.trim')
+  })
+
+  it('task_list {} ⇒ TEAM_REQUIRED（不再静默返回 []）', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const plane = new TaskListPlane(dir)
+    const list = createTaskListTool(() => plane)
+    const res = await list.call({} as any, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('TEAM_REQUIRED')
+  })
+
+  it('task_claim / task_update / task_stop {} ⇒ TEAM_REQUIRED', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const plane = new TaskListPlane(dir)
+    const claim = createTaskClaimTool(() => plane)
+    const update = createTaskUpdateTool(() => plane)
+    const stop = createTaskStopTool(() => plane)
+    expect((await claim.call({} as any, makeCtx())).error!.code).toBe('TEAM_REQUIRED')
+    expect((await update.call({} as any, makeCtx())).error!.code).toBe('TEAM_REQUIRED')
+    expect((await stop.call({} as any, makeCtx())).error!.code).toBe('TEAM_REQUIRED')
   })
 })
 
