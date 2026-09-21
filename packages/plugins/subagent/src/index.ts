@@ -39,7 +39,8 @@ import type { AgentRuntime, SessionManager } from '@harness/core'
 import type { Message } from '@harness/session'
 import { BusEvent, type Bus } from '@harness/bus'
 import { matchGlob } from '@harness/permission'
-import { writeFileSync } from 'node:fs'
+import { writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+import { mkdir, writeFile, appendFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWorktree } from './worktree'
@@ -124,6 +125,20 @@ export const SubagentEvents = {
     /** 是否为后台执行 */
     background?: boolean
   }>('subagent.failed'),
+
+  /**
+   * 子 Agent 结果已被本地续跑通道取回（coordinator send_message 命中该 taskId）。
+   * subagent 插件订阅后把对应后台任务标记为 `resultFetched=true`，使其完成通知降级为简短提示，
+   * 不再把结果全文重复注入父会话（去重：另一条通道已先取回结果）。
+   */
+  resultFetched: BusEvent.define<{
+    /** 后台任务 ID */
+    taskId: string
+    /** 父 session ID（发送续跑消息的协调者会话） */
+    parentSessionId: string
+    /** 取回时间戳 */
+    fetchedAt: number
+  }>('subagent.result.fetched'),
 
   /**
    * 子 Agent 工具调用进度事件（P1-5）。
@@ -228,7 +243,7 @@ export interface SubagentPluginOptions {
   /** 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），要求子 Agent 简洁结构化回复 */
   directive?: string
   /**
-   * 子 Agent 的引擎内自主多步步数上限（缺省 {@link DEFAULT_SUBAGENT_MAX_STEPS} = 10）。
+   * 子 Agent 的引擎内自主多步步数上限（缺省 {@link DEFAULT_SUBAGENT_MAX_STEPS} = 20）。
    *
    * 为什么比主 Agent 的默认 30 小：子 Agent 的职责是**聚焦执行**（分析一个文件、改一处、
    * 跑一条命令），不是长链探索；步数越多越容易撞上 `timeoutMs`（缺省 120s）而被判超时。
@@ -240,11 +255,15 @@ export interface SubagentPluginOptions {
 /**
  * 子 Agent 默认步数上限。
  *
- * 取 10 的理由：多步上线后子 Agent 单次执行的耗时随步数线性增长，而 subagent 的超时是
- * 固定 120s —— 30 步（主 Agent 默认）在多数模型下会超时。10 步足够覆盖「读→查→改→验」，
- * 需要更长的子 Agent 应在自己的 AgentDefinition 里显式写 `maxSteps`。
+ * 取 20 的依据（真机实测）：会话 `s_1789916436883_ra6w1` 中 R2 任务（测绘 1902 个文件 /
+ * 512K 行源码）跑在旧上限 10 被截断，子 Agent 自述「已到达步数上限，未逐一细读」。该量级
+ * 的深度遍历任务典型需要 15~20 步，故提升到 20。
+ *
+ * 为什么仍比主 Agent 默认 30 小：子 Agent 职责是聚焦执行（分析一个文件、改一处、跑一条
+ * 命令），不是长链探索；步数越多越容易撞上 `timeoutMs`（缺省 120s）被判超时。需要更长的
+ * 子 Agent 应在自己的 AgentDefinition 里显式写 `maxSteps`，或直接用插件 `maxSteps` 选项覆盖。
  */
-export const DEFAULT_SUBAGENT_MAX_STEPS = 10
+export const DEFAULT_SUBAGENT_MAX_STEPS = 20
 
 /** Harness 引用的最小接口（避免 import core 导致循环依赖） */
 interface HarnessLike {
@@ -544,6 +563,8 @@ export function createSubagentTool(
   getRegistry?: () => BackgroundTaskRegistry | undefined,
   worktree?: WorktreeHooks,
   subagentMaxSteps: number = DEFAULT_SUBAGENT_MAX_STEPS,
+  /** 后台任务结果落盘目录（{dataDir}/tasks）；取不到时退化为不落盘（记 warn，不抛错） */
+  getTasksDir?: () => string | undefined,
 ): Tool<SubagentToolInput, SubagentToolOutput> {
   /**
    * 本次子 Agent 执行的步数上限：**子 Agent 自己的定义优先**（md 里写了 `maxSteps` 就用它），
@@ -851,6 +872,9 @@ export function createSubagentTool(
               durationMs: Date.now() - startTime,
             })
 
+            // 落盘（无论通知是否可达，结果都持久化到可回看位置，防止父会话已结束时结果丢失）
+            await persistTaskRecord(getTasksDir?.(), registry.get(taskId))
+
             // publish completed 事件（带 taskId）
             if (bus) {
               bus.publish(SubagentEvents.completed, {
@@ -867,22 +891,29 @@ export function createSubagentTool(
             }
 
             // 自动向父 session 注入 task-notification 通知（去重）
+            // 若结果已通过本地续跑通道（send_message）取回，则降级为简短提示，避免重复注入全文
             const task = registry.get(taskId)
             if (task && !task.notified) {
               task.notified = true
-              const notification = formatTaskNotification({
-                taskId,
-                status: 'completed',
-                agentName: input.agentId,
-                description: input.description,
-                result: resultTextBg,
-                outputPath,
-                diffPath,
-                durationMs: Date.now() - startTime,
-                messageCount: messages.length,
-                toolCallCount,
-              })
-              session.enqueueNotification(ctx.sessionId, notification)
+              const notification = task.resultFetched
+                ? formatTaskNotificationBrief({ taskId, status: 'completed', agentName: input.agentId, description: input.description })
+                : formatTaskNotification({
+                    taskId,
+                    status: 'completed',
+                    agentName: input.agentId,
+                    description: input.description,
+                    result: resultTextBg,
+                    outputPath,
+                    diffPath,
+                    durationMs: Date.now() - startTime,
+                    messageCount: messages.length,
+                    toolCallCount,
+                  })
+              try {
+                session.enqueueNotification(ctx.sessionId, notification)
+              } catch {
+                // 父会话不可用/不可写：结果已落盘，忽略投递异常，不向上抛
+              }
             }
           } catch (err) {
             const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}`
@@ -893,6 +924,10 @@ export function createSubagentTool(
               message: errMsg,
               durationMs: failDurationMs,
             })
+
+            // 落盘（失败结果同样持久化，防止父会话已结束时错误上下文丢失）
+            await persistTaskRecord(getTasksDir?.(), registry.get(taskId))
+
             // publish failed 事件（带 taskId）
             if (bus) {
               bus.publish(SubagentEvents.failed, {
@@ -909,18 +944,25 @@ export function createSubagentTool(
             }
 
             // 自动向父 session 注入 task-notification 通知（去重）
+            // 若结果已通过本地续跑通道（send_message）取回，则降级为简短提示，避免重复注入全文
             const task = registry.get(taskId)
             if (task && !task.notified) {
               task.notified = true
-              const notification = formatTaskNotification({
-                taskId,
-                status: 'failed',
-                agentName: input.agentId,
-                description: input.description,
-                error: errMsg,
-                durationMs: failDurationMs,
-              })
-              session.enqueueNotification(ctx.sessionId, notification)
+              const notification = task.resultFetched
+                ? formatTaskNotificationBrief({ taskId, status: 'failed', agentName: input.agentId, description: input.description })
+                : formatTaskNotification({
+                    taskId,
+                    status: 'failed',
+                    agentName: input.agentId,
+                    description: input.description,
+                    error: errMsg,
+                    durationMs: failDurationMs,
+                  })
+              try {
+                session.enqueueNotification(ctx.sessionId, notification)
+              } catch {
+                // 父会话不可用/不可写：结果已落盘，忽略投递异常，不向上抛
+              }
             }
           } finally {
             clearTimeout(timerBg)
@@ -1124,6 +1166,10 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
   let baseCwd: string | null = null
   /** worktree 隔离是否启用（harness.cwd 是 git 仓库时） */
   let worktreeEnabled = false
+  /** 用户级 dataDir（来自插件上下文 workspace.dataDir），任务落盘目录 = join(dataDir, 'tasks') */
+  let dataDir: string | undefined
+  /** 后台任务结果落盘目录（{dataDir}/tasks）；dataDir 不可用时为 undefined → 跳过落盘 */
+  let tasksDir: string | undefined
 
   /**
    * 权威来源：AgentRuntime 注册表里所有 `mode === 'subagent'` 的 Agent。
@@ -1201,6 +1247,11 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     description: `Subagent 插件：派出子 Agent 执行独立任务（${subagents.length} 个子 Agent 已注册，支持 runInBackground）`,
 
     async install(ctx) {
+      // 捕获用户级 dataDir（来自插件上下文 workspace.dataDir）与插件 logger。
+      // 任务落盘统一写到 {dataDir}/tasks，避免污染用户仓库 cwd（.harness 未被 gitignore）。
+      dataDir = (ctx as { workspace?: { dataDir?: string } }).workspace?.dataDir
+      pluginLogger = ctx.log
+
       ctx.log.info('Subagent 插件已加载', {
         subagents: subagents.map((a) => ({ id: a.id, name: a.name, mode: a.mode })),
       })
@@ -1216,6 +1267,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         () => registry,
         { resolve: resolveWorktree, attachDiff: attachWorktreeDiff },
         subagentMaxSteps,
+        () => tasksDir,
       )
 
 
@@ -1227,6 +1279,24 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
             return
           }
           harness = h
+
+          // 后台任务结果落盘目录：用户级 {dataDir}/tasks（与会话落盘同层，绝不落到仓库 cwd）。
+          // dataDir 不可用则退化为 tasksDir=undefined（跳过落盘 + 记 warn），不回退到 cwd。
+          if (dataDir) {
+            tasksDir = join(dataDir, 'tasks')
+          } else {
+            tasksDir = undefined
+            pluginLogger?.warn('[subagent] workspace.dataDir 不可用，后台任务结果将不落盘（仅内存注册表可见，防止污染用户仓库）')
+          }
+
+          // 订阅"结果已通过本地续跑通道取回"事件：标记对应后台任务，使其完成通知降级为简短提示
+          // （bus 解耦：coordinator send_message 取回结果后广播，subagent 不反向依赖 coordinator）
+          if (h.bus) {
+            h.bus.subscribe(SubagentEvents.resultFetched, ({ payload }) => {
+              const t = registry.get(payload.taskId)
+              if (t) t.resultFetched = true
+            })
+          }
 
           // 检测 git worktree 隔离启用条件：harness 工作目录是 git 仓库
           try {
@@ -1479,6 +1549,97 @@ export function formatTaskNotification(input: {
 </task-notification>`
 }
 
+/**
+ * 格式化「结果已此前取回」的简短 task-notification 提示。
+ * 当后台任务结果已通过本地续跑通道（coordinator send_message）取回时，完成通知降级为此提示，
+ * 不再携带结果全文（避免重复注入浪费 token）。
+ */
+export function formatTaskNotificationBrief(input: {
+  taskId: string
+  status: 'completed' | 'failed'
+  agentName: string
+  description?: string
+}): string {
+  const label = input.description || input.agentName
+  const outcome = input.status === 'completed' ? '已完成' : '已失败'
+  return `<task-notification>
+<task-id>${input.taskId}</task-id>
+<status>${input.status}</status>
+<summary>后台任务 "${label}" ${outcome}（结果已在此前通过 send_message 返回，不再重复注入）</summary>
+</task-notification>`
+}
+
+// ===== 后台任务结果落盘（可回看，防止父会话已结束时结果丢失）=====
+
+/** 落盘的后台任务记录（{dataDir}/tasks/<taskId>.json，含 index.jsonl 便于枚举） */
+export interface PersistedTaskRecord {
+  taskId: string
+  status: BackgroundTaskStatus
+  agentId: string
+  description?: string
+  result?: string
+  errorCode?: string
+  errorMessage?: string
+  durationMs?: number
+  messageCount?: number
+  toolCallCount?: number
+  createdAt: number
+  finishedAt?: number
+}
+
+/** 插件 logger（install 时从插件上下文捕获）；落盘失败时回退用，未就绪则为 undefined */
+let pluginLogger: { warn: (msg: string, ...args: unknown[]) => void } | undefined
+
+/**
+ * 将后台任务结果落盘到 {tasksDir}/<taskId>.json，并追加一行到 index.jsonl（便于将来 /tasks 枚举）。
+ * 全程 best-effort：目录不可用（tasksDir=undefined）或写入失败只记 warn 日志，绝不向上抛异常。
+ */
+async function persistTaskRecord(tasksDir: string | undefined, task: BackgroundTask | undefined): Promise<void> {
+  if (!task) return
+  if (tasksDir === undefined) return // 目录不可用：跳过（缺 dataDir 的 warn 已在 core.harness.start 记录）
+  const record: PersistedTaskRecord = {
+    taskId: task.taskId,
+    status: task.status,
+    agentId: task.agentId,
+    description: task.description,
+    result: task.result,
+    errorCode: task.errorCode,
+    errorMessage: task.errorMessage,
+    durationMs: task.durationMs,
+    messageCount: task.messageCount,
+    toolCallCount: task.toolCallCount,
+    createdAt: task.createdAt,
+    finishedAt: task.completedAt,
+  }
+  try {
+    await mkdir(tasksDir, { recursive: true })
+    await writeFile(join(tasksDir, `${task.taskId}.json`), JSON.stringify(record, null, 2), 'utf-8')
+    await appendFile(join(tasksDir, 'index.jsonl'), JSON.stringify(record) + '\n', 'utf-8')
+  } catch (err) {
+    pluginLogger?.warn('[subagent] 落盘后台任务结果失败', { taskId: task.taskId, error: err instanceof Error ? err.message : String(err) })
+  }
+}
+
+/**
+ * 枚举已落盘的后台任务记录（供 /tasks 命令在父会话已不可用时回看结果）。
+ * 读取 {tasksDir}/*.json；任何文件解析失败都跳过，不影响其余。
+ */
+export async function listPersistedTasks(tasksDir: string): Promise<PersistedTaskRecord[]> {
+  try {
+    if (!existsSync(tasksDir)) return []
+    const out: PersistedTaskRecord[] = []
+    for (const f of readdirSync(tasksDir)) {
+      if (!f.endsWith('.json')) continue
+      try {
+        out.push(JSON.parse(readFileSync(join(tasksDir, f), 'utf-8')) as PersistedTaskRecord)
+      } catch { /* 跳过损坏文件 */ }
+    }
+    return out
+  } catch {
+    return []
+  }
+}
+
 
 /**
  * 后台任务状态
@@ -1539,6 +1700,8 @@ export interface BackgroundTask {
   controller?: AbortController
   /** 完成通知是否已注入父 session（去重，防止重复注入） */
   notified?: boolean
+  /** 结果是否已被本地续跑通道（coordinator send_message）取回：取回后完成通知降级为简短提示 */
+  resultFetched?: boolean
 }
 
 /**

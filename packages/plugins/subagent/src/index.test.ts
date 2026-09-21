@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll } from 'bun:test'
 import { tmpdir } from 'node:os'
-import { mkdtempSync, rmSync, writeFileSync, realpathSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, realpathSync, existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { runGit, gitTopLevel } from './worktree'
 import {
@@ -12,6 +12,8 @@ import {
   subagentCapability,
   SubagentEvents,
   formatTaskNotification,
+  formatTaskNotificationBrief,
+  listPersistedTasks,
   isAgentDenied,
   filterAccessibleAgents,
   type SubagentToolInput,
@@ -2276,6 +2278,258 @@ describe('SubagentTool runInBackground', () => {
     const bash = progressEvents.find((e) => e.toolName === 'bash' && e.toolStatus === 'running')
     expect(bash).toBeDefined()
     expect(bash.summary).toInclude('ls')
+  })
+})
+
+// ===== 完成通知去重降级（缺陷1）=====
+
+describe('runInBackground 完成通知去重降级（缺陷1）', () => {
+  const coderAgent: AgentDefinition = {
+    id: 'coder',
+    name: 'Coder',
+    description: '负责写代码的子 Agent',
+    mode: 'subagent',
+    tools: ['read_file', 'write_file', 'bash'],
+    permission: { '*': 'allow' },
+    promptFragments: ['你是写代码的子 Agent'],
+  }
+  const RESULT_FULL = '这是完整结果：测绘 1902 个文件 / 512K 行源码'
+
+  it('① 结果已被本地续跑通道取回：完成通知降级为简短提示且不含结果全文', async () => {
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      await new Promise((r) => setTimeout(r, 20))
+      const msg = makeMessage('assistant', RESULT_FULL)
+      const s = sessionsRef.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('user', input.message)); s.messages.push(msg) }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(() => harness, 5000, false, 2000, 500, undefined, () => registry)
+
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+    const res = await tool.call({ agentId: 'coder', prompt: 'do something', runInBackground: true }, ctx)
+    const taskId = res.output!.taskId!
+
+    // 模拟"结果已通过 send_message 本地续跑通道取回"
+    registry.get(taskId)!.resultFetched = true
+
+    await registry.wait(taskId, 1000)
+    const notifications = session.drainNotifications(parentSession.id)
+    expect(notifications).toHaveLength(1)
+    const notif = notifications[0]
+    expect(notif).toInclude('<task-notification>')
+    expect(notif).toInclude(`<task-id>${taskId}</task-id>`)
+    // 降级为简短提示
+    expect(notif).toInclude('不再重复注入')
+    // 关键：不含结果全文
+    expect(notif).not.toInclude(RESULT_FULL)
+    expect(notif).not.toInclude('<result>')
+  })
+
+  it('② 结果未被取回：完成通知仍注入结果全文', async () => {
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      await new Promise((r) => setTimeout(r, 20))
+      const msg = makeMessage('assistant', RESULT_FULL)
+      const s = sessionsRef.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('user', input.message)); s.messages.push(msg) }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(() => harness, 5000, false, 2000, 500, undefined, () => registry)
+
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+    const res = await tool.call({ agentId: 'coder', prompt: 'do something', runInBackground: true }, ctx)
+    const taskId = res.output!.taskId!
+
+    await registry.wait(taskId, 1000)
+    const notifications = session.drainNotifications(parentSession.id)
+    expect(notifications).toHaveLength(1)
+    const notif = notifications[0]
+    // 未被取回：注入结果全文
+    expect(notif).toInclude('<result>')
+    expect(notif).toInclude(RESULT_FULL)
+  })
+
+  it('formatTaskNotificationBrief 生成不含结果全文的简短提示', () => {
+    const brief = formatTaskNotificationBrief({ taskId: 'task-abc-1', status: 'completed', agentName: 'coder', description: '测绘' })
+    expect(brief).toInclude('<task-notification>')
+    expect(brief).toInclude('<task-id>task-abc-1</task-id>')
+    expect(brief).toInclude('不再重复注入')
+    expect(brief).not.toInclude('<result>')
+  })
+})
+
+// ===== 后台任务结果落盘（缺陷2）=====
+
+describe('runInBackground 结果落盘可回看（缺陷2）', () => {
+  const coderAgent: AgentDefinition = {
+    id: 'coder',
+    name: 'Coder',
+    description: '负责写代码的子 Agent',
+    mode: 'subagent',
+    tools: ['read_file', 'write_file', 'bash'],
+    permission: { '*': 'allow' },
+    promptFragments: ['你是写代码的子 Agent'],
+  }
+
+  it('③ 父会话不可用（enqueueNotification 抛错）时结果落盘到 {dataDir}/tasks 且不抛异常', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-data-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      await new Promise((r) => setTimeout(r, 20))
+      const msg = makeMessage('assistant', '落盘内容：完成重构')
+      const s = sessionsRef.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('user', input.message)); s.messages.push(msg) }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    // 模拟父会话不可用：enqueueNotification 直接抛错
+    ;(session as any).enqueueNotification = () => { throw new Error('session gone') }
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir,
+    )
+
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+    const res = await tool.call({ agentId: 'coder', prompt: 'do', runInBackground: true }, ctx)
+    const taskId = res.output!.taskId!
+
+    // 等待完成：不应因 enqueue 抛错而异常或被判失败
+    const task = await registry.wait(taskId, 1000)
+    expect(task!.status).toBe('completed')
+
+    // 等待落盘 IIFE 中 await persistTaskRecord 完成（registry.wait 在 complete 时即 resolve，先于落盘写文件）
+    await new Promise((r) => setTimeout(r, 50))
+
+    // 结果已落盘
+    const file = join(tasksDir, `${taskId}.json`)
+    expect(existsSync(file)).toBe(true)
+    const rec = JSON.parse(readFileSync(file, 'utf-8'))
+    expect(rec.taskId).toBe(taskId)
+    expect(rec.status).toBe('completed')
+    expect(rec.result).toInclude('落盘内容')
+    expect(rec.agentId).toBe('coder')
+    expect(typeof rec.createdAt).toBe('number')
+    expect(typeof rec.finishedAt).toBe('number')
+
+    // index.jsonl 可枚举
+    const indexFile = join(tasksDir, 'index.jsonl')
+    expect(existsSync(indexFile)).toBe(true)
+    const lines = readFileSync(indexFile, 'utf-8').trim().split('\n')
+    expect(lines.length).toBe(1)
+    expect(JSON.parse(lines[0]).taskId).toBe(taskId)
+
+    // listPersistedTasks 可读回
+    const listed = await listPersistedTasks(tasksDir)
+    expect(listed).toHaveLength(1)
+    expect(listed[0].taskId).toBe(taskId)
+
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  it('失败的后台任务同样落盘错误信息到 {dataDir}/tasks', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-data-fail-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async () => { throw new Error('query error') })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+    const res = await tool.call({ agentId: 'coder', prompt: 'fail', runInBackground: true }, ctx)
+    const taskId = res.output!.taskId!
+    const task = await registry.wait(taskId, 1000)
+    expect(task!.status).toBe('failed')
+
+    // 等待落盘完成（registry.wait 在 fail 时即 resolve，先于 await persistTaskRecord 写文件）
+    await new Promise((r) => setTimeout(r, 50))
+
+    const rec = JSON.parse(readFileSync(join(tasksDir, `${taskId}.json`), 'utf-8'))
+    expect(rec.status).toBe('failed')
+    expect(rec.errorCode).toBe('SUBAGENT_FAILED')
+    expect(rec.errorMessage).toInclude('query error')
+    rmSync(tasksDir, { recursive: true, force: true })
+  })
+
+  it('tasksDir 不可用时退化为不落盘且不抛异常', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async () => makeMessage('assistant', 'ok'))
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => undefined,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+    const res = await tool.call({ agentId: 'coder', prompt: 'do', runInBackground: true }, ctx)
+    const task = await registry.wait(res.output!.taskId!, 1000)
+    expect(task!.status).toBe('completed')
+  })
+})
+
+// ===== 子 Agent 默认步数上限（缺陷3）=====
+
+describe('子 Agent 默认步数上限（缺陷3）', () => {
+  const coderAgent: AgentDefinition = {
+    id: 'coder',
+    name: 'Coder',
+    description: '负责写代码的子 Agent',
+    mode: 'subagent',
+    tools: ['read_file', 'write_file', 'bash'],
+    permission: { '*': 'allow' },
+    promptFragments: ['你是写代码的子 Agent'],
+  }
+
+  it('④ 默认步数上限为 20', () => {
+    expect(DEFAULT_SUBAGENT_MAX_STEPS).toBe(20)
+  })
+
+  it('④ 插件 maxSteps 选项可覆盖默认值', async () => {
+    const sessions = new Map<string, Session>()
+    const session = createMockSessionManager(sessions)
+    const seen: Array<number | undefined> = []
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      seen.push((input as { maxSteps?: number }).maxSteps)
+      return makeMessage('assistant', 'done')
+    })
+    const tool = createSubagentTool(() => ({ agent, session }), 5000, false, 2000, 500, undefined, undefined, undefined, 15)
+    await tool.call({ agentId: 'coder', prompt: 'x' }, makeToolContext())
+    expect(seen[0]).toBe(15)
+  })
+
+  it('④ 子 Agent 定义 maxSteps 优先于选项默认值', async () => {
+    const sessions = new Map<string, Session>()
+    const session = createMockSessionManager(sessions)
+    const seen: Array<number | undefined> = []
+    const agent = createMockAgentRuntime(
+      [{ ...coderAgent, maxSteps: 25 }],
+      async (input) => {
+        seen.push((input as { maxSteps?: number }).maxSteps)
+        return makeMessage('assistant', 'done')
+      },
+    )
+    const tool = createSubagentTool(() => ({ agent, session }), 5000, false, 2000, 500, undefined, undefined, undefined, 15)
+    await tool.call({ agentId: 'coder', prompt: 'x' }, makeToolContext())
+    expect(seen[0]).toBe(25)
   })
 })
 

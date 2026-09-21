@@ -335,6 +335,31 @@ describe('send_message 工具', () => {
     expect(res.ok).toBe(false)
     expect(res.error!.code).toBe('INVALID_TARGET')
   })
+
+  it('本地续跑取回结果后广播 subagent.result.fetched 事件（供 subagent 降级完成通知）', async () => {
+    const bus = createBus()
+    const tracker = new CoordinatorBarrierTracker()
+    tracker.onWorkerStarted({ taskId: 'task-1', agentId: 'researcher', subSessionId: 's_sub', parentSessionId: 's_parent' })
+    tracker.onWorkerFinished({ taskId: 'task-1', parentSessionId: 's_parent', status: 'completed' })
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([workerAgent], async () => makeMessage('assistant', '补充调研结果'))
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session, bus }
+    const tool = createSendMessageTool(() => harness, () => tracker, 5000)
+
+    const events: Array<{ taskId: string; parentSessionId: string }> = []
+    const off = bus.subscribe(SubagentEvents.resultFetched, ({ payload }) => {
+      events.push({ taskId: payload.taskId, parentSessionId: payload.parentSessionId })
+    })
+
+    const res = await tool.call({ taskId: 'task-1', message: '再补充竞品 Z 的定价' }, makeToolContext())
+    expect(res.ok).toBe(true)
+    off()
+
+    expect(events).toHaveLength(1)
+    expect(events[0].taskId).toBe('task-1')
+    expect(events[0].parentSessionId).toBeDefined()
+  })
 })
 
 // ===== 插件集成测试 =====

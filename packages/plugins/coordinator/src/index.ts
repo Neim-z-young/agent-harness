@@ -405,6 +405,15 @@ export function createSendMessageTool(
           message: input.message,
         })
         const msg = await Promise.race([msgPromise, timeout])
+        // 结果已通过本地续跑通道取回：广播事件，subagent 侧将把该后台任务标记为
+        // resultFetched，使其稍后的完成通知降级为简短提示，避免重复注入结果全文（去重）
+        if (harness.bus && input.taskId) {
+          harness.bus.publish(SubagentEvents.resultFetched, {
+            taskId: input.taskId,
+            parentSessionId: ctx.sessionId,
+            fetchedAt: Date.now(),
+          }).catch(() => { /* Bus 发布失败不影响主流程 */ })
+        }
         return {
           ok: true,
           output: {
