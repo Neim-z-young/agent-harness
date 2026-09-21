@@ -16,6 +16,7 @@ import {
   listPersistedTasks,
   isAgentDenied,
   filterAccessibleAgents,
+  renderRoster,
   type SubagentToolInput,
   type SubagentToolOutput,
   type SubagentPluginOptions,
@@ -2878,5 +2879,130 @@ describe('Subagent git worktree 隔离', () => {
     const rmInput = { command: 'worktrees', arg: `remove ${worktreeDir}`, out: (s: string) => { out2.push(s) }, sessionId: 's1', raw: 'worktrees remove', result: undefined as any }
     await (hooks as any)['cli.command']?.(rmInput)
     expect(existsSync(worktreeDir)).toBe(false)
+  })
+})
+
+// ===== 派工 roster 注入 =====
+//
+// 背景：agent 的 `description` **不进模型上下文**（只有 /subagents 展示用），subagent 工具的
+// description 又是静态 txt ⇒ 派工方看不见有哪些子 Agent，只能靠用户点名或靠猜。roster 就是
+// 把「id + 一句话触发条件」摆到它面前。
+
+describe('派工 roster 注入', () => {
+  // 本文件里的 makeCtx 定义在另一个 describe 内部（作用域不外露），这里自带一份最小 ctx
+  const mkCtx = () =>
+    ({
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    }) as any
+
+  const worker: AgentDefinition = {
+    id: 'reader',
+    name: '速读员',
+    description:
+      '并行读取多个文件/目录并回报事实（只读、不改文件、不做实现）。适合"把这几处的现状汇报给我"。',
+    mode: 'subagent',
+    tools: ['read_file'],
+    permission: { '*': 'allow' },
+    promptFragments: [],
+  }
+
+  it('renderRoster：每行 id + 一句话，长描述只取第一句并截断（不把省下的载荷吃回去）', () => {
+    const text = renderRoster([worker])
+    expect(text).toContain('## 可派工的子 Agent')
+    const line = text.split('\n').find((l) => l.startsWith('- reader'))!
+    expect(line).toContain('reader')
+    // 只到第一个句号，且 ≤60 字符 ⇒ 不可能把整段 description（含 example）塞进来
+    expect(line.length).toBeLessThan(90)
+    expect(line).not.toContain('适合')
+  })
+
+  it('只给"自己有 subagent 工具"的 Agent 注入；派不了工的不注入（拿到是噪音）', async () => {
+    const plugin = createSubagentPlugin({ subagents: [worker] })
+    const ctx = mkCtx()
+    const hooks = (await plugin.install(ctx)) as any
+    const defs: Record<string, AgentDefinition> = {
+      coordinator: {
+        id: 'coordinator', name: 'Coordinator', mode: 'coordinator',
+        tools: ['subagent', 'read_file'], promptFragments: [],
+      },
+      reader: worker,
+    }
+    const registered: AgentDefinition[] = []
+    await hooks['core.harness.start']?.({
+      harness: {
+        agent: {
+          register: (def: AgentDefinition) => registered.push(def),
+          get: (id: string) => defs[id],
+          list: () => [...registered, worker],
+        } as any,
+        session: createMockSessionManager(new Map()),
+      },
+    })
+
+    const parts: string[] = []
+    hooks['core.prompt.system.transform']?.({ agentId: 'coordinator' }, parts)
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toContain('- reader — ')
+
+    const parts2: string[] = []
+    hooks['core.prompt.system.transform']?.({ agentId: 'reader' }, parts2)
+    expect(parts2).toHaveLength(0) // reader 的 tools 里没有 subagent
+  })
+
+  it('injectRoster: false 时完全不注入（可关）', async () => {
+    const plugin = createSubagentPlugin({ subagents: [worker], injectRoster: false })
+    const ctx = mkCtx()
+    const hooks = (await plugin.install(ctx)) as any
+    await hooks['core.harness.start']?.({
+      harness: {
+        agent: {
+          register: () => {},
+          get: () => ({ id: 'coordinator', tools: ['subagent'] }),
+          list: () => [worker],
+        } as any,
+        session: createMockSessionManager(new Map()),
+      },
+    })
+    const parts: string[] = []
+    hooks['core.prompt.system.transform']?.({ agentId: 'coordinator' }, parts)
+    expect(parts).toHaveLength(0)
+  })
+})
+
+describe('派工 roster：不把自己列进去', () => {
+  const leader: AgentDefinition = {
+    id: 'lead', name: '组长', description: '既能自己写代码，也能派工', mode: 'subagent',
+    tools: ['bash', 'subagent'], promptFragments: [],
+  }
+  const worker: AgentDefinition = {
+    id: 'reader', name: '速读员', description: '只读并回报事实', mode: 'subagent',
+    tools: ['read_file'], promptFragments: [],
+  }
+
+  it('roster 只列别的子 Agent（否则会诱导"派给自己" ⇒ 无深度上限的递归）', async () => {
+    const plugin = createSubagentPlugin({ subagents: [leader, worker] })
+    const ctx = {
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    } as any
+    const hooks = (await plugin.install(ctx)) as any
+    await hooks['core.harness.start']?.({
+      harness: {
+        agent: {
+          register: () => {},
+          get: (id: string) => ({ lead: leader, reader: worker }[id]),
+          list: () => [leader, worker],
+        } as any,
+        session: createMockSessionManager(new Map()),
+      },
+    })
+    const parts: string[] = []
+    hooks['core.prompt.system.transform']?.({ agentId: 'lead' }, parts)
+    expect(parts).toHaveLength(1)
+    expect(parts[0]).toContain('- reader — ')
+    expect(parts[0]).not.toContain('- lead — ')
   })
 })

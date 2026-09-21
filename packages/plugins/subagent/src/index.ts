@@ -243,6 +243,17 @@ export interface SubagentPluginOptions {
   /** 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），要求子 Agent 简洁结构化回复 */
   directive?: string
   /**
+   * 是否把「可派工的子 Agent 名单」注入派工方的 system prompt（缺省 true）。
+   *
+   * 为什么要注入：agent 的 `description` **不进模型上下文**（只有 `/subagents` 展示用），
+   * subagent 工具的描述也是静态 txt ⇒ 派工方**看不到有哪些子 Agent 可用**，只能靠用户点名
+   * `agentId` 或靠猜。roster 就是把 `id + 一句话触发条件` 摆到它面前。
+   *
+   * 只给**自己有 subagent 工具**的 Agent 注入（coordinator / lead 这类）；派不了工的 Agent
+   * 拿到名单是纯噪音。
+   */
+  injectRoster?: boolean
+  /**
    * 子 Agent 的引擎内自主多步步数上限（缺省 {@link DEFAULT_SUBAGENT_MAX_STEPS} = 20）。
    *
    * 为什么比主 Agent 的默认 30 小：子 Agent 的职责是**聚焦执行**（分析一个文件、改一处、
@@ -1146,6 +1157,29 @@ export function createSubagentTool(
  * @param options.maxResultLines 返回给父 Agent 的最大结果行数，超过则生成摘要。缺省 500
  * @param options.directive 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive）
  */
+/**
+ * 渲染「可派工的子 Agent 名单」（roster），注入派工方的 system prompt。
+ *
+ * 每行只给 `id + 一句话触发条件` —— agent 的 `description` 原文动辄上千字符（还常带 3 个
+ * example），全量塞进 prompt 会把刚省下来的工具载荷又吃回去；这里取第一句并截断到 60 字符。
+ */
+export function renderRoster(list: readonly AgentDefinition[]): string {
+  const rows = list.map((a) => `- ${a.id} — ${oneLine(a.description ?? a.name ?? a.id)}`)
+  return [
+    '## 可派工的子 Agent（subagent 工具的 agentId 只能取下列之一）',
+    ...rows,
+    '派工判断：能一次问清或一次改完的自己做；需要并行、或跨文件集的大块任务才派。',
+  ].join('\n')
+}
+
+/** 取简介的第一句并截断（roster 的一行） */
+function oneLine(text: string, max = 60): string {
+  const flat = text.replace(/\s+/g, ' ').trim()
+  const m = flat.match(/^[^。．.!！?？\n]{0,120}/)
+  const first = (m?.[0] ?? flat).trim()
+  return first.length > max ? first.slice(0, max - 1) + '…' : first
+}
+
 export function createSubagentPlugin(options: SubagentPluginOptions = {}): AgentPlugin {
   const {
     subagents = [],
@@ -1155,6 +1189,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     maxResultLines = 500,
     directive,
     maxSteps: subagentMaxSteps = DEFAULT_SUBAGENT_MAX_STEPS,
+    injectRoster = true,
   } = options
 
   let harness: HarnessLike | undefined
@@ -1329,6 +1364,27 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
           if (subagentTool) {
             ;(pool as { add: (t: unknown) => void }).add(subagentTool)
           }
+        },
+
+        /**
+         * 派工 roster 注入：把「可派工的子 Agent 名单」放进派工方的 system prompt。
+         *
+         * 只给**自己有 subagent 工具**的 Agent 注入 —— 别的 Agent 派不了工，拿到名单是噪音。
+         * 每轮重新渲染（不是启动时算一次）：md 定义的子 Agent 可能在运行中注册/热重载。
+         */
+        'core.prompt.system.transform'(input, parts) {
+          if (!injectRoster) return
+          if (!harness) return
+          const agentId = (input as { agentId?: string } | undefined)?.agentId
+          if (!agentId) return
+          const def = harness.agent?.get?.(agentId) as { tools?: Array<string> } | undefined
+          const tools = def?.tools
+          if (!Array.isArray(tools) || !tools.includes('subagent')) return
+          const list = registrySubagents() ?? ownSubagents()
+          // 排除自己 —— 否则 roster 会把自己列进去，诱导"派给自己"（自派工 = 无深度上限的递归）。
+          const targets = list.filter((a) => a.id !== agentId)
+          if (targets.length === 0) return
+          parts.push(renderRoster(targets))
         },
 
         'cli.commands'(input) {
