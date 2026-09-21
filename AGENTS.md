@@ -116,6 +116,14 @@
 
 - **文件工具的边界语义（刻意不对称，别再摇摆）**：`read_file` / `write_file` / `edit_file` 只在**工作目录内**工作（`PATH_OUTSIDE_CWD`），这是"防误触 + 防越权写"的作用域约定；`bash` **不做读取面限制**（它的 cwd 受限、危险命令有黑名单，但读什么路径不拦）——bash 本就被权限系统与危险模式单独把关。真机实测过模型会绕过：read_file 被拒后立刻改用 `bash cat <绝对路径>` 读同一文件（3 次里成功 2 次）。这是**已知且接受**的行为，不要在提示词里引导"用 bash 绕过"，也不要把 read_file 的拒绝文案写成绕过指引；若将来要把 cwd 变成硬安全边界，须同时收紧 bash 的读取面（属架构级改动，需先拍板）
 
+- **prompt 前缀只放恒定文本，会变的注入一律放尾部**：provider 的自动前缀缓存按**最长公共 token 前缀**命中，所以放在历史之前的文本一变，其后**全部内容（含整段历史）**都要重算。真机量化（ACP 压缩手册，越阈值时前缀 ≈ 105K tokens）：翻转一次 ≈ **95K token-equiv**，而按需省下的只有 ≈ 259 token-equiv/次 ⇒ 回本要 366 次调用，**对会越阈值的会话是净亏**。改造后手册改为 `user` role 注入尾部，前缀只留恒定的一行提示（`COMPRESS_MANUAL_HINT`）。细节与量化过程见 `docs/usage-accounting-and-prompt-cache-plan.md` §3
+
+- **想让注入落在"尾部"，必须用 `user` role**（`system` 会被上提）：`provider-anthropic` 的 `extractSystemPrompt` 与 `provider-gemini` 的 `extractSystem` 会把**任意位置**的 `system` 消息抽进顶层 `system` / `systemInstruction` 字段（原位置直接跳过）⇒ 把 system 消息挪到数组尾部**等于没挪**，它会回到前缀、缓存收益归零。只有 `provider-openai` 保持原序，不能指望它。nudge 一直用 `user` role 就是这个原因
+
+- **跨轮/跨进程的累加必须带 checkpoint + 自愈**：引擎每步把用量折叠进 `session.meta`，靠「已折叠到哪条消息」的检查点保证幂等；检查点指向的消息若不在（`/compact`、`deleteMessage`、手工改过）就退化为**全量重建**。增量与重建必须共用同一个折叠函数（`foldMessage`），否则自愈那一刻数字会跳变。只做累加不做幂等，会把「空累积器覆盖历史 ⇒ 重连后清零」变成反面的「历史被重折 ⇒ 数字翻倍」
+
+- **用量口径引擎层唯一**：`meta.usageStats` 只由 core 的 `accumulateUsage` 写（每步折叠一次），宿主（TUI/REPL/headless）一律**只读**（`harness.usage.get()`），落盘走脏会话刷盘（`updateMeta` 标脏 + CLI 轮末 `flushDirtySessions`）。宿主自己也写会与引擎分叉 —— 之前正是只有 TUI 会写，导致 headless 宿主与**子 agent 会话**完全不入账。子 agent 用量按会话各自累积，父会话的聚合在**展示层**做（`usage.children()` + `sumUsage`），不要并进父会话 meta（会让同一条链在"全部会话·当日"里被重复计入）
+
 - 与外部工具/服务对接协议时（herdr 这类终端/服务集成）**以真机为准**：官方文档没写清的边界必须实测确认后再实现。已知的三个坑都在文档之外且**静默失效**（读代码看不出来）：① 上报用过 `--seq` 后，`release-agent` 也必须带一个更高的 `--seq`，否则被 Herdr 当旧序号丢弃；② 序号水位线按 (pane, source) 存、**跨进程不重置**，新进程从 1 起算的前 N 条上报会被静默丢弃（故序号基线取微秒级时钟）；③ `process.once('exit')` **覆盖不到信号退出**（SIGTERM/SIGHUP 直接终止进程，而"关 pane"就是 SIGHUP），信号类退出必须单独挂监听，且不能抢 SIGINT（REPL/TUI 用它表示"中断当前查询"）。详见 `docs/development-log.md` 续 158
 
 ## 6. 安全与协作

@@ -1,5 +1,62 @@
 # Agent Harness 开发日志
 
+## 2026-09-21（续 168）用量纳管搬到引擎层 + ACP 手册改尾部注入（修前缀缓存失效）
+
+实施 `docs/usage-accounting-and-prompt-cache-plan.md`（该文件为本轮方案稿，同批落地）。
+用户拍板：**手册尾部注入**；`@harness/usage` 独立成包；`meta.usageStats` 保持本会话口径 + 展示层给聚合行。
+
+### 一、用量纳管（P1+P2+P4）
+
+- **抽包**：`packages/usage`（零依赖纯函数，647 行），`cli/src/usage-stats.ts` 变薄再导出
+  —— cli 351 例一行不改（迁包目的是让 core 也能累加，不是改导入路径）。
+- **引擎层唯一累加**：core `_runOneStep` 末尾 `accumulateUsage()`，把本步 assistant 消息
+  折叠进 `session.meta.usageStats`；新增 `harness.usage.get/children`。
+- **幂等靠检查点、自愈靠重建**：`meta.usageFold = { upToMessageId, state }`（state 含跨消息的
+  pending/attributed，丢了会让工具 token 归因错位）；检查点指向的消息不在（`/compact`、
+  `deleteMessage`）⇒ `rebuildUsage(messages)` 全量重算。**增量与重建共用 `foldMessage`**
+  （`usageFromMessages` 也改成它的 wrapper），有等价性测试守住"两条路径同结果"。
+  不做幂等就会把历史上"空累积器覆盖历史 ⇒ 重连清零"变成反面的"历史被重折 ⇒ 数字翻倍"。
+- **宿主只读**：TUI 删掉写 meta 与 800ms 防抖落盘，轮末向引擎对账；落盘复用脏会话刷盘。
+- **子 agent 可见**：`/stats` 增"含子 agent"行（`children()` + `sumUsage`，展示层聚合，
+  不并进父会话 meta —— 并进去会让同一条链在"全部会话·当日"里被重复计入）。
+
+### 二、ACP 手册尾部注入（方案 B）
+
+前缀（`system[1]`）只留恒定的 `COMPRESS_MANUAL_HINT`；完整手册改 **`user` role 注入尾部**，
+与 nudge 合并成同一条消息。`manualInjection:'always'` 与显式 `systemPrompt` 仍走前缀
+（两者都恒定，无翻转风险）。
+
+⚠️ 不能用 `system` role 挪到尾部：`provider-anthropic` 的 `extractSystemPrompt` 与
+`provider-gemini` 的 `extractSystem` 会把**任意位置**的 system 消息上提进顶层 system /
+systemInstruction 字段（原位置直接跳过）—— 等于没挪，它会回到前缀。只有 OpenAI 保序。
+
+### 三、providerCache 遥测接线
+
+新增 hook `core.llm.usage`（引擎广播 provider 用量，含 cacheRead/cacheWrite；**事实广播不回写**），
+acp-context 订阅后落 `providerCache` 遥测行。此前 `buildProviderCacheEvent` 的注释写着"由 core 层
+追加"但全仓无调用方 ⇒ provider 侧缓存命中**一直没有数据**，"按需注入会不会伤缓存"根本无从验证。
+
+### 四、真机验证（临时 dataDir + 真实 DeepSeek，三条链路各自独立验证）
+
+| 验证 | 结果 |
+|---|---|
+| 注入几何（小窗口逼越阈值，抓每轮请求） | 手册出现那一刻前缀**字节未变**（738 字符、指纹 `8b13b862` 全程恒定），8365 字符手册落在尾部 |
+| 缓存遥测（新接线） | 主会话 7 轮 cacheRead 1920→9344→9600→9984→10112→**10752→10752**；第 6 轮（手册首现）**未塌陷** |
+| 子 agent 用量 | 子会话 `s_session_...` 落盘 3 条消息 + `usageStats`（2 次调用 / in 19,687 / cacheRead 18,048），顶层 `parentId` 指向主会话 |
+| `/stats` 聚合行 | `含子 agent：1 个子会话 · 调用 2 次 · in 19683 / out 81（缓存命中 19328）`；"今日 5 次" = 主 3 + 子 2 |
+
+改造前对照：子会话**连 .json 都没有**（只有遥测），用量恒为 0；手册进前缀时该轮会让其后整段历史重算。
+
+### 五、真机暴露并修掉的一个取值错误
+
+`usage.children()` 最初按 `meta.parentId` 反查 ⇒ 真机永远为空（聚合行不出现）。核对落盘字段：
+**`parentId` 是 Session 的顶层字段**（`session.create({ parentId })`，subagent 派生与 CLI 恢复都用它），
+`meta.parentId` 恒为 null。改为读顶层字段 + 补测试。教训：**先确认真实落盘字段，再写取值代码**。
+
+验证：全量 **1683 pass / 0 fail**；typecheck 0 错误（新增 +6 核心守卫、+5 折叠等价性、
++2 providerCache、+3 聚合行）。AGENTS.md 新增四条硬约定（前缀只放恒定文本 / 尾部注入必须用
+user role / 累积必须 checkpoint+自愈 / 用量口径引擎层唯一）。
+
 ## 2026-09-21（续 167）会话分析暴露的 8 个问题：全部修复（含 2 个 worker 因限流中断后的接手）
 
 来源：对会话 `s_1789916436883_ra6w1` 的取证分析 + token 归因（两份报告在 `reference/workbuddy/`）。

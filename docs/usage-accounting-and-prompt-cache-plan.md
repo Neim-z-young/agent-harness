@@ -278,3 +278,75 @@ P1 抽包（低风险、无行为变化）
 ```
 
 > P1/P2 与方案 B **无依赖**，可以并行推进；方案 B 的建议顺序是"先改位置、再用 P3 的遥测证明"。
+
+---
+
+## 7. 落地状态与真机验证（2026-09-21）
+
+§5 的四项拍板结果：**`@harness/usage` 独立成包**；`meta.usageStats` 保持**本会话**口径 +
+展示层给"含子 agent"一行；**ACP 手册改尾部注入**（变量不进前缀）；Anthropic 显式缓存另议（未做）。
+
+### 7.1 落点对照
+
+| 项 | 实际落点 |
+|---|---|
+| P1 抽包 | `packages/usage`（零依赖纯函数，647 行）；`cli/src/usage-stats.ts` 变**薄再导出**，cli 351 例不动 |
+| P2 增量折叠 | core `_runOneStep` 末尾 `accumulateUsage()` → `foldMessage()` + `meta.usageFold` 检查点 |
+| P2 幂等/自愈 | 检查点 id 失效 ⇒ `rebuildUsage(messages)`；增量与重建**共用** `foldMessage`（有等价性测试） |
+| P2 宿主只读 | TUI 删掉写 meta 与 800ms 防抖落盘，轮末 `harness.usage.get()` 对账；落盘交给脏会话刷盘 |
+| P3 缓存可观测 | 新 hook `core.llm.usage`（引擎广播 provider 用量）→ acp-context 落 `providerCache` 遥测行 |
+| P4 展示聚合 | `harness.usage.children()` + `/stats` 的"含子 agent"行（`renderChildAgentRollup`） |
+| B 缓存位置 | 前缀只留 `COMPRESS_MANUAL_HINT`；完整手册改 `user` role 注入**尾部**，与 nudge 合并成一条消息 |
+
+### 7.2 真机验证①：注入几何（方案 B 的关键一格）
+
+小窗口（`modelContextLimit: 6000`）+ 低阈值（`minContextLimitPct: 0.25`）逼出"越阈值"那一刻，
+用取证插件抓每轮最终请求：
+
+| 轮 | 消息数 | 前缀 system 长度 | 前缀指纹 | 尾部临时消息 |
+|---|---|---|---|---|
+| req-01 … 05 | 3→10 | **738** | `8b13b862` | 无 |
+| **req-06**（越阈值） | 12 | **738（未变）** | `8b13b862` | **1 条，含 8365 字符手册** |
+| req-07 / 08（子会话自己的轮） | 3 / 4 | 5884 | `94b4b232` | 无 |
+| req-09（父会话下一轮） | 15 | **738** | `8b13b862` | 1 条，含手册 |
+
+⇒ **手册出现的那一刻，前缀字节未变**（`8b13b862` 全程恒定），手册落在尾部。
+改造前这一轮会把 `system[1]` 从 738 换成 8365，其后整段历史全部重算（§3.3 的 95K token-equiv）。
+
+### 7.3 真机验证②：providerCache 遥测 + 缓存未塌陷
+
+`providerCache` 行（新接线，此前该 builder 是死代码）：
+
+```
+主会话 round: 1      2      3      4      5      6      7
+cacheRead  : 1920   9344   9600   9984   10112  10752  10752
+```
+
+**第 6 轮（手册首次出现）cacheRead 没有塌陷**（10112 → 10752，继续增长）——这正是"变量没进前缀"
+的直接证据；若按旧实现，该轮的 cacheRead 会掉到只覆盖工具+首条 system 的量级。
+
+### 7.4 真机验证③：子 agent 用量终于入账
+
+同一次运行里派了一个后台子 agent（`runInBackground`），落盘结果：
+
+| 会话 | 消息数 | `usageStats` | `parentId` |
+|---|---|---|---|
+| 主会话 `s_..._iplox` | 12 | 调用 7 · in 75,918 / out 1,704 · cacheRead 62,464 | 无 |
+| **子会话 `s_session_..._9ou7q`** | **3** | **调用 2 · in 19,687 · cacheRead 18,048** | 顶层 `parentId` = 主会话 |
+
+改造前子会话**连 `.json` 都没有**（只有遥测），用量自然为 0；现在 `/stats` 的"今日 9 次"
+= 主会话 7 + 子会话 2，子 agent 成本终于可核对。
+
+### 7.5 真机暴露并修掉的一个取值错误
+
+`usage.children()` 最初按 `meta.parentId` 反查 ⇒ 真机上永远为空（`/stats` 聚合行不出现）。
+核对落盘字段发现 **`parentId` 是 Session 的顶层字段**（`session.create({ parentId })`，
+subagent 派生与 CLI 恢复都用它），`meta.parentId` 恒为 null。已改为读顶层字段并补测试。
+教训与 §1 的"路径/口径分裂"同源：**先确认真实落盘字段，再写取值代码**。
+
+### 7.6 验证汇总
+
+- 全量 **1683 pass / 0 fail**（+6 核心守卫、+2 providerCache、+3 聚合行、+5 折叠等价性…），typecheck 0 错误；
+- 真机三条链路各自独立验证（注入几何、缓存遥测、子会话用量），另有 `/stats` 聚合行；
+- 未做：Anthropic 显式缓存（§3.5，另议）；`harness run`（headless）当前不写 `meta.usageStats`
+  以外的展示入口，聚合行只在 REPL/TUI 的 `/stats` 呈现。
