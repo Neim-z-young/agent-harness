@@ -425,4 +425,54 @@ mode: subagent
     const def = agentFromMarkdown(content)
     expect(def.writesTo).toBeUndefined()
   })
+
+  // 回归：subagent 插件的 resolveSteps 读 `agent.get(id).maxSteps`，并在文档里写着
+  // 「子 Agent 应在自己的 AgentDefinition 里显式写 maxSteps」——但本函数此前从不映射该字段，
+  // md 里写它等于没写，所有 md 定义的子 Agent 只能吃插件默认 20（真机 6/6 reader 因此截断）。
+  it('maxSteps：从 frontmatter 解析（数字 / 字符串数字），未声明或非法则 undefined', () => {
+    const def = agentFromMarkdown(`---
+id: reader
+name: 速读员
+description: 通读回报
+mode: subagent
+maxSteps: 35
+---`)
+    expect(def.maxSteps).toBe(35)
+
+    const strDef = agentFromMarkdown(`---
+id: reader2
+name: R2
+description: d
+mode: subagent
+maxSteps: "40"
+---`)
+    expect(strDef.maxSteps).toBe(40)
+
+    // -1 = 不限（与 AgentDefinition.maxSteps 语义一致，引擎侧负责转 Infinity）
+    const unlimited = agentFromMarkdown(`---
+id: reader3
+name: R3
+description: d
+mode: subagent
+maxSteps: -1
+---`)
+    expect(unlimited.maxSteps).toBe(-1)
+
+    const missing = agentFromMarkdown(`---
+id: reader4
+name: R4
+description: d
+mode: subagent
+---`)
+    expect(missing.maxSteps).toBeUndefined()
+
+    const bad = agentFromMarkdown(`---
+id: reader5
+name: R5
+description: d
+mode: subagent
+maxSteps: 很多
+---`)
+    expect(bad.maxSteps).toBeUndefined()
+  })
 })

@@ -413,7 +413,8 @@ export interface ParseAgentOptions {
  * frontmatter 字段映射到 AgentDefinition 的字段：
  * - id, name, description, icon, tags, mode, tools, skills, subagents
  * - background（默认后台执行）
- * - permission, model
+ * - permission, model, maxSteps（步数上限；-1 = 不限）
+ * - writesTo, mcpServers, excludeMcpServers
  * - body（Markdown 正文）→ promptFragments[0]
  *
  * 缺省行为（只有 id 缺失才抛错）：
@@ -503,6 +504,20 @@ export function agentFromMarkdown(content: string, fallbackId?: string, opts?: P
   // writesTo（frontmatter.writesTo: [路径列表]，Coordinator 写操作串行化用）
   const writesTo = Array.isArray(frontmatter.writesTo) ? frontmatter.writesTo.map(String) : undefined
 
+  // maxSteps（frontmatter.maxSteps: number；-1 表示不限）
+  //
+  // 为什么必须在这里解析：subagent 插件的 `resolveSteps` 读的是
+  // `agent.get(id).maxSteps`，并在文档里明确写着「子 Agent 应在自己的 AgentDefinition 里显式
+  // 写 maxSteps」—— 但本函数此前**从不映射这个字段**，于是 md 里写它等于没写，
+  // 所有 md 定义的子 Agent 只能吃插件默认值 20。真机实测（会话 `s_1789996799007_9cq9r`）
+  // 6 个 reader 因 20 步上限**全部截断**，逼出第二轮补派（额外 41 次调用 / 133 万 input token）。
+  const maxStepsRaw = frontmatter.maxSteps
+  const maxSteps = typeof maxStepsRaw === 'number' && Number.isFinite(maxStepsRaw)
+    ? Math.trunc(maxStepsRaw)
+    : typeof maxStepsRaw === 'string' && maxStepsRaw.trim() !== '' && Number.isFinite(Number(maxStepsRaw))
+      ? Math.trunc(Number(maxStepsRaw))
+      : undefined
+
   // icon
   const icon = frontmatter.icon ? String(frontmatter.icon) : undefined
 
@@ -527,6 +542,7 @@ export function agentFromMarkdown(content: string, fallbackId?: string, opts?: P
   if (writesTo) def.writesTo = writesTo
   if (mcpServers) def.mcpServers = mcpServers
   if (excludeMcpServers) def.excludeMcpServers = excludeMcpServers
+  if (maxSteps !== undefined) def.maxSteps = maxSteps
   if (model) def.model = model
   if (promptFragments) def.promptFragments = promptFragments
 
