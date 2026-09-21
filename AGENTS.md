@@ -28,7 +28,9 @@
 
 - 全量类型检查：`bun run typecheck`
 
-- 全量测试：`bun test`（或 `bun --filter=* run test`）
+- 全量测试：`bun run test`（= `bun --filter=* run test`，逐包跑，退出码可用于 CI/脚本判断；此前因 `@harness/permission` 一个测试文件都没有而**恒为 1**，已补该包测试修正）
+
+> 别用根目录的 `bun test`：它会把 `reference/**`（参考代码 / 外部仓库快照）一起扫进来，那里缺 react 等依赖，会产生数百个与本次改动无关的失败。
 
 - TypeScript 严格模式（`strict: true`）、`target ESNext`、`moduleResolution: bundler`
 
@@ -82,6 +84,8 @@
 
 - CLI 权限引擎（`CliPermissionEngine`）持久化规则到 `dataDir/permissions.json`，交互模式 `allow-all | ask | deny-all`，提供 `/permission` 命令
 
+- `matchGlob`（`@harness/permission`，**路径级 allow/deny 判定的基础**，被 core 权限规则、skill 的 `paths`、subagent 黑白名单三处消费）遵循标准 glob 语义：`*` 不跨 `/`、`**` 跨层级、`?` 单字符、其余正则元字符全部转义。**`**/x` 也匹配根级 `x`** —— 修正前展开成 `.*\/x`（要求至少一层目录），于是 `**/*.ts` 漏掉根级文件、`deny: ['**/secrets*']` 漏判根级 `secrets.txt`（**不安全方向**的漏判）。已知刻意差异：`src/**` 不匹配 `src` 自身。该包现在有测试（12 例），**改 `matchGlob` 必须跑它**
+
 - `/tools` 工具管理命令由插件 `@harness/tools-manager` 提供（`cli.command` hook）：Agent 白名单启停经 cli 注入的 `setAgentTools` 持久化到 config.json 的 `agents[].tools`，`--global` 启停走运行时 `harness.tools`，本地缓存被卸载 Tool 以便恢复
 
 - 插件要持久化 config.json 时不直接自持读写，优先经 cli 注入的 `setAgentTools` / `CliCommandInput` 扩展字段（`agentId`/`harness`），保持解耦
@@ -123,6 +127,8 @@
 - **跨轮/跨进程的累加必须带 checkpoint + 自愈**：引擎每步把用量折叠进 `session.meta`，靠「已折叠到哪条消息」的检查点保证幂等；检查点指向的消息若不在（`/compact`、`deleteMessage`、手工改过）就退化为**全量重建**。增量与重建必须共用同一个折叠函数（`foldMessage`），否则自愈那一刻数字会跳变。只做累加不做幂等，会把「空累积器覆盖历史 ⇒ 重连后清零」变成反面的「历史被重折 ⇒ 数字翻倍」
 
 - **用量口径引擎层唯一**：`meta.usageStats` 只由 core 的 `accumulateUsage` 写（每步折叠一次），宿主（TUI/REPL/headless）一律**只读**（`harness.usage.get()`），落盘走脏会话刷盘（`updateMeta` 标脏 + CLI 轮末 `flushDirtySessions`）。宿主自己也写会与引擎分叉 —— 之前正是只有 TUI 会写，导致 headless 宿主与**子 agent 会话**完全不入账。子 agent 用量按会话各自累积，父会话的聚合在**展示层**做（`usage.children()` + `sumUsage`），不要并进父会话 meta（会让同一条链在"全部会话·当日"里被重复计入）
+
+- **Anthropic 侧此前压根没开 prompt 缓存**：它的缓存在 API 层需要显式标 `cache_control`（OpenAI/DeepSeek 是自动前缀缓存，无需配置）。已实现断点（`AnthropicProviderConfig.promptCache`，**默认 false**）：tools 末尾 / system / 当前对话末尾共 3 个（协议上限 4，写入 ≈1.25x、命中 ≈0.1x）。**默认关是因为开发机没有 Anthropic key、无法真机验收**（只有请求体形状的单测）。验收方法：第二次同前缀请求的 `usage.cache_read_input_tokens > 0`，且 `cache_creation_input_tokens` 只在首次/前缀变化时出现；通过后才把默认值翻成 true。同一处顺带把 `complete`/`stream` 里**逐字重复的两份 buildBody** 合并成一个 —— 加请求参数只改一处的意义就在这（"只改了一处"是本项目反复出现的静默失效来源）
 
 - 与外部工具/服务对接协议时（herdr 这类终端/服务集成）**以真机为准**：官方文档没写清的边界必须实测确认后再实现。已知的三个坑都在文档之外且**静默失效**（读代码看不出来）：① 上报用过 `--seq` 后，`release-agent` 也必须带一个更高的 `--seq`，否则被 Herdr 当旧序号丢弃；② 序号水位线按 (pane, source) 存、**跨进程不重置**，新进程从 1 起算的前 N 条上报会被静默丢弃（故序号基线取微秒级时钟）；③ `process.once('exit')` **覆盖不到信号退出**（SIGTERM/SIGHUP 直接终止进程，而"关 pane"就是 SIGHUP），信号类退出必须单独挂监听，且不能抢 SIGINT（REPL/TUI 用它表示"中断当前查询"）。详见 `docs/development-log.md` 续 158
 

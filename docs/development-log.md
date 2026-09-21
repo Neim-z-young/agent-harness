@@ -1,5 +1,54 @@
 # Agent Harness 开发日志
 
+## 2026-09-21（续 169）Anthropic 显式 prompt 缓存（未验收，默认关）+ matchGlob 的 `**/` 语义修正 + permission 补测试
+
+用户说「继续实施」⇒ 接着落方案文档 §7.6 的未做项。**先撞上硬阻塞：本机只有 DeepSeek 的 key，
+没有 Anthropic key** ⇒ 按 AGENTS.md「与外部服务对接以真机为准」，把 Anthropic 缓存做成
+**默认关 + 只做请求体形状单测**，并把验收方法写进选项注释 —— 不谎称验收过的行为。
+
+### 一、Anthropic 显式 prompt 缓存（`AnthropicProviderConfig.promptCache`，默认 false）
+
+- 现状：**该 provider 此前压根没开缓存** —— Anthropic 的 prompt 缓存必须在请求体显式标
+  `cache_control`（OpenAI/DeepSeek 是自动前缀缓存，无需配置）⇒ system + tools + 历史一直在按
+  input 全价重付。
+- 实现：3 个断点（协议上限 4）—— `tools` 最后一个（一次覆盖整块工具定义）、`system`、
+  当前对话最后一个 block（下一轮它成为历史，整段即可命中）。`system` 必须从 string 换成
+  block 数组才承载得了标记。
+- 配置可达性**核实过**：`providers[]` 条目经 `providerTypes.resolve(type).createPlugin(pc)` 整体
+  透传 ⇒ `promptCache` 能生效（不是"写了没用"）。旧路径（`ANTHROPIC_API_KEY` + 默认 provider=anthropic）
+  只构造 `{ apiKey }`，不透传该键 —— 已知边界，用 `providers[]` 声明即可。
+- **顺带把 `complete`/`stream` 里逐字重复的两份 `buildBody` 合并成一个**（加任何请求参数原本要改
+  两处，"只改了一处"正是本项目反复出现的静默失效来源）。重构当场被测试抓到一处漏改的
+  `model` 引用（`modelOut ?? model` → `body.model`）—— 这两份重复确实危险。
+
+### 二、`matchGlob` 的 `**/` 语义修正（不安全方向的漏判）
+
+补 `@harness/permission` 测试时发现：`**/x` 展开成 `.*\/x`，**要求至少一层目录** ⇒
+- `**/*.ts` 漏掉根级 `a.ts`；
+- `deny: ['**/secrets*']` **漏判根级 `secrets.txt`** —— 该拒的没拒，属**不安全方向**。
+
+已按标准 glob 语义（minimatch 同此）修正为 `(?:.*/)?`，并**调整替换顺序**：展开出来的正则片段
+自身含 `*`/`?`，必须最后处理，否则 `(?:` 里那个 `?` 会被当通配符吃掉、非捕获组语义坏掉。
+已知刻意差异：`src/**` 不匹配 `src` 自身（写成 `src(?:/.*)?` 会让两套写法分歧）。
+
+### 三、`@harness/permission` 补测试（清掉"根测试退出码恒为 1"）
+
+该包此前**一个测试文件都没有** ⇒ `bun test` 在其上报 "No tests found!" 退出 1 ⇒ 根
+`bun run test` 退出码**恒为 1**（CI/脚本无法用退出码判断）。补 12 例（结构语义 / 元字符转义 /
+`**/` 回归 / 已知差异），`matchGlob` 是路径级 allow/deny 判定的基础，判错方向可能不安全。
+
+### 四、踩坑记录
+
+块注释里写 `(?:.*/)?` 会因其中的 `*/` **提前闭合注释**，bun 直接报 `Unexpected )` —— 注释里
+不要出现 `*/` 这个序列（改写措辞即可）。
+
+### 五、验证
+
+typecheck 0 错误；全量 **1700 pass / 0 fail**；**根 `bun run test` 退出码首次为 0**（全仓再无
+"No tests found"）。Anthropic 缓存**未真机验收**（无 key），验收步骤写在选项注释与 AGENTS.md 里：
+① 第二次同前缀请求 `usage.cache_read_input_tokens > 0`；② `cache_creation_input_tokens` 只在首次/
+前缀变化时出现。通过后再把默认值翻成 true。
+
 ## 2026-09-21（续 168）用量纳管搬到引擎层 + ACP 手册改尾部注入（修前缀缓存失效）
 
 实施 `docs/usage-accounting-and-prompt-cache-plan.md`（该文件为本轮方案稿，同批落地）。
