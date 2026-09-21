@@ -98,6 +98,32 @@ export function sanitizeExampleTags(text: string): string {
   )
 }
 
+/**
+ * 占用率低于压缩阈值时注入的**极简提示**（替代约 1.9K tokens 的完整压缩手册）。
+ * 仅告诉模型"何时该压、去哪看用法"，完整要点放在 compress 工具的 `documentation`（每轮都在工具载荷里）。
+ * 这样低占用会话不再为一份用不上的说明书长期付费（真机 ra6w1 全程占用率峰值仅 13.3%，却付了 44 次手册钱）。
+ */
+export const COMPRESS_MANUAL_HINT =
+  '接近容量上限时可调用 compress 工具压缩历史；用法见该工具说明（acp_status 可查看当前占用率）。'
+
+/**
+ * compress 工具的 `documentation`：每轮都出现在工具载荷里，所以必须短（≤ 600 字符）。
+ * 从内核压缩手册（buildCompressSystemPrompt 输出）提炼"何时压 / content 给什么"的要点：
+ * 范围用 startId/endId ref、summary 必须自包含、只压"已完成且不再需要原文"的段。
+ */
+export const COMPRESS_TOOL_DOC = [
+  'compress：把 startId..endId 范围内已结束、且不再需要原文的历史折叠成一段自包含摘要，换回上下文空间。',
+  '何时压：上下文接近容量上限、或某段任务已完成且后续无需回原文时（先调 acp_status 看占用率）。',
+  'content 每段给：topic(可选)、startId/endId(用消息 ref，如 m00012)、summary。',
+  'summary 是这段历史被替换后的唯一记录，须自包含完整：用户目标与意图、决策及理由、精确路径/签名/报错原文/数值、结论、踩坑教训；丢弃已提取信息的冗余长日志，勿照搬。',
+].join('\n')
+
+/** 手册提前注入系数：占用率到达 `minContextLimitPct × 0.9` 即注入完整手册。
+ *  理由：nudge 在 occupancy ≥ minContextLimitPct 时才提示压缩；若手册与 nudge 同轮才出现，
+ *  模型在"刚跨阈值、本应开始考虑压缩"的那一轮反而没有手册可用。提前 10%（0.9 倍）注入，
+ *  保证跨阈值附近若干轮模型都已持有完整用法。低于此占用率仍只注入 COMPRESS_MANUAL_HINT。 */
+const MANUAL_INJECT_MARGIN = 0.9
+
 // ===== 工具输入类型 =====
 
 export interface CompressRangeArg {
@@ -203,6 +229,17 @@ export interface AcpContextPluginOptions {
   prompts?: Partial<Prompts>
   /** 整段覆盖压缩系统提示（优先级最高，覆盖 prompts 合成的 buildCompressSystemPrompt 输出） */
   systemPrompt?: string
+  /**
+   * 压缩系统手册（buildCompressSystemPrompt 输出，约 1.9K tokens）的注入策略。
+   *
+   * - `'on-demand'`（默认）：仅当上下文占用率接近压缩阈值
+   *   （`config.nudge.minContextLimitPct`，取阈值的 0.9 倍作为提前注入点）时才注入完整手册；
+   *   低于该占用率只注入一行极简提示 `COMPRESS_MANUAL_HINT`，避免为"用不上的说明书"长期付费。
+   * - `'always'`：每轮无条件注入完整手册（旧行为），便于 A-B 对照或回退。
+   *
+   * 例外：`systemPrompt` 被显式赋值时无论哪种策略都注入完整手册（用户显式要求，不受阈值影响）。
+   */
+  manualInjection?: 'on-demand' | 'always'
   // ---- 遥测 ----
   /** 开启运行时遥测（默认 true）；关闭后不写任何 JSONL 遥测文件 */
   telemetryEnabled?: boolean
@@ -291,6 +328,10 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   )
   const makeSystemPrompt = (): string =>
     options.systemPrompt ?? sanitizeExampleTags(buildCompressSystemPrompt(resolvedPrompts))
+  // 手册注入策略：默认 on-demand（低占用只给极简提示，省 token）；explicitSystemPrompt 表示
+  // 用户显式整段覆盖了 systemPrompt，必须始终注入完整手册（不受阈值影响）。
+  const manualInjection = options.manualInjection ?? 'on-demand'
+  const explicitSystemPrompt = options.systemPrompt !== undefined
   // token 折算口径：默认与内核同一份实现（CJK 感知）。'auto' 显式注入等价于内核默认值，
   // 目的是把口径**钉死在一处**——插件上报的 tokenCount 与内核内部计数永远是同一把尺子。
   const countTokens = options.tokenCalibration === 'chars4' ? chars4CountTokens : cjkAwareCountTokens
@@ -338,6 +379,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         id: 'compress',
         description:
           '压缩历史消息：把指定 ref 范围内的旧消息折叠成一段摘要，换回上下文空间。模型写摘要、内核做编排。',
+        documentation: COMPRESS_TOOL_DOC,
         inputSchema: withJsonSchema(makeSchema<CompressInput>(), {
           type: 'object',
           properties: {
@@ -596,6 +638,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               makeSystemPrompt,
               prompts: resolvedPrompts,
               tempMessage,
+              manualInjection,
+              explicitSystemPrompt,
               // 统一块模型：把每轮内部折叠（tier1/2/3）的 source:'acp' 块 push 给 host，
               // host 合并进 session.blocks，供视图/loader/reconstructHistory/revert 消费
               recordBlocks: (blocks) => {
@@ -653,6 +697,16 @@ interface RunPreModelDeps {
   /** session.meta 持久化访问器（用于保存/恢复压缩状态） */
   meta: { read: () => Promise<Record<string, unknown> | undefined>; patch: (patch: Record<string, unknown>) => Promise<void> }
   makeSystemPrompt: () => string
+  /**
+   * 压缩手册注入策略（默认 `'on-demand'`）。`'always'` 走旧行为每轮注入完整手册；
+   * `'on-demand'` 仅在占用率接近压缩阈值时注入完整手册，否则只注入极简提示。
+   */
+  manualInjection?: 'on-demand' | 'always'
+  /**
+   * 用户是否显式赋值了 `systemPrompt`。为真时无论 manualInjection 与占用率如何都注入完整手册
+   * （用户显式要求，不受阈值影响，也不会退化成极简提示）。
+   */
+  explicitSystemPrompt?: boolean
   /** 解析后的提示词 policy（nudge 渲染与本轮压缩系统提示保持一致）；缺省走内核默认 */
   prompts?: Prompts
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
@@ -904,7 +958,20 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   }
 
   const request: Message[] = [...systemMsgs]
-  request.push(deps.tempMessage('system', deps.makeSystemPrompt(), sessionId))
+
+  // ---- 压缩手册按需注入 ----
+  // 占用率口径与遥测一致：telemetry 的 occupancy = requestTok / window，其中 requestTok =
+  // estimateTokens(res.messages)（发往模型的 history cores，不含 system）、window = config.modelContextLimit。
+  // 这里用同一公式（estimateTokens(res.messages, countTokens) / modelContextLimit）在注入点之前算一次，
+  // 不在两处写分叉的两份算法。低占用时只注入极简提示，省下完整手册的 token。
+  const occupancy = estimateTokens(res.messages, countTokens) / Math.max(1, deps.config.modelContextLimit)
+  const manualThreshold = (deps.config.nudge?.minContextLimitPct ?? 0.35) * MANUAL_INJECT_MARGIN
+  const wantFullManual =
+    deps.manualInjection === 'always' ||
+    deps.explicitSystemPrompt === true ||
+    occupancy >= manualThreshold
+  const systemText = wantFullManual ? deps.makeSystemPrompt() : COMPRESS_MANUAL_HINT
+  request.push(deps.tempMessage('system', systemText, sessionId))
 
   if (cacheHit) {
     // 增量：复用缓存前缀 + 只渲染新增尾部 core，并把尾部并入缓存供下一轮继续命中

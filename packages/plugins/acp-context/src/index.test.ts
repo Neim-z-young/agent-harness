@@ -22,6 +22,8 @@ import {
   createAcpContextPlugin,
   ACP_META_KEY,
   ACP_ARCHIVE_KEY,
+  COMPRESS_MANUAL_HINT,
+  COMPRESS_TOOL_DOC,
 } from './index'
 import { toCores, compactHistory, idBase, baseId, estimateTokens, chars4CountTokens } from './adapter'
 import { loadPromptFiles } from './prompts'
@@ -96,7 +98,11 @@ interface Harness {
   run: (messages: Message[]) => Promise<void>
 }
 
-function makeHarness(config: Config = makeConfig(), sessionId = 's1'): Harness {
+function makeHarness(
+  config: Config = makeConfig(),
+  sessionId = 's1',
+  opts: { manualInjection?: 'on-demand' | 'always'; explicitSystemPrompt?: boolean } = {},
+): Harness {
   const engine = createCore()
   const meta: Record<string, unknown> = {}
   const patches: Array<Record<string, unknown>> = []
@@ -137,6 +143,8 @@ function makeHarness(config: Config = makeConfig(), sessionId = 's1'): Harness {
       },
       makeSystemPrompt: () => '<acp system>',
       tempMessage,
+      manualInjection: opts.manualInjection ?? 'always',
+      explicitSystemPrompt: opts.explicitSystemPrompt,
     })
   }
   return h
@@ -239,6 +247,7 @@ test('createAcpContextPlugin：systemPrompt 整段覆盖后，系统提示即该
 test('createAcpContextPlugin：prompts 覆盖后系统提示应用自定义 t1 规则并保留默认', async () => {
   const preModel = await preModelFromPlugin({
     modelContextLimit: 20000,
+    manualInjection: 'always',
     prompts: {
       howToCompressRules: 'CUSTOM_T1_RULES',
       tier2DistillRules: 'CUSTOM_T2_RULES',
@@ -850,4 +859,88 @@ test('端到端：tokenCalibration 决定 acp_status 上报的 tokenCount（中�
   expect(defaulted).toBe(auto) // 默认口径 = auto
   expect(auto).toBeGreaterThan(legacy * 3) // 中文下旧口径低估约 4 倍
   expect(legacy).toBeLessThanOrEqual(Math.ceil((zhText.length * 2) / 4) + 128) // ≈ 真实字符数的 1/4
+})
+
+// ===== 压缩手册按需注入（on-demand，token 成本优化）=====
+//
+// 背景（ra6w1 实测）：会话全程占用率峰值仅 13.3%，却每轮无条件付约 1.9K tokens 的压缩手册钱
+// （44 次）。on-demand（默认）改为仅在占用率接近压缩阈值时才注入完整手册，低占用只给一行极简提示，
+// 把完整要点挪到每轮都在载荷里的 compress 工具 documentation。占用率口径与遥测一致：
+// estimateTokens(res.messages, countTokens) / config.modelContextLimit。
+
+function onDemandConfig(minContextLimitPct = 0.5): Config {
+  // modelContextLimit 压到 2000，便于用少量历史把占用率推过/压到阈值两侧；
+  // maxContextLimitPct / emergencyThresholdPct 拉高到 0.95 / 0.99，保证测试占用率区间内
+  // processTurn 不会压缩/截断 res.messages，从而占用率决策不被改写。
+  return defaultConfig(2000, {
+    compress: { minCompressRange: 0, maxSummaryLength: 100000, minSummaryLength: 0 },
+    preserveRecentMessages: 0,
+    preserveRecentTokens: 0,
+    promotionThreshold: 1,
+    nudge: {
+      maxContextLimitPct: 0.95,
+      minContextLimitPct,
+      frequency: 1,
+      iterationThreshold: 1,
+      force: 'soft',
+      growthRatio: 0.1,
+      growthFloor: 1,
+      growthCap: 5000,
+      minGrowthFloor: 1,
+      minGrowthRatio: 0,
+      emergencyThresholdPct: 0.99,
+      tier2GrowthMultiplier: 1,
+    },
+  })
+}
+
+test('runPreModel：低占用（on-demand）只注入极简提示、不注入完整手册正文', async () => {
+  const h = makeHarness(onDemandConfig(0.5), 's1', { manualInjection: 'on-demand' })
+  const messages = history(10) // 占用率 ≈ 160/2000 = 0.08，远低于 0.5×0.9=0.45
+  await h.run(messages)
+  const sys = messages.find((m) => m.role === 'system')!
+  expect((sys.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT) // 极简提示
+  expect((sys.parts[0] as any).text).not.toBe('<acp system>') // 完整手册（mock 正文）未注入
+})
+
+test('runPreModel：占用率超过阈值（on-demand）注入完整手册', async () => {
+  const h = makeHarness(onDemandConfig(0.5), 's1', { manualInjection: 'on-demand' })
+  const messages = history(100) // 占用率 ≈ 1600/2000 = 0.8，远超 0.5×0.9=0.45（且 < 0.95 不被压缩改写）
+  await h.run(messages)
+  const sys = messages.find((m) => m.role === 'system')!
+  expect((sys.parts[0] as any).text).toBe('<acp system>') // 完整手册注入
+})
+
+test('createAcpContextPlugin：systemPrompt 显式覆盖 + on-demand，低占用也始终注入完整手册', async () => {
+  const preModel = await preModelFromPlugin({ systemPrompt: '<custom system>', modelContextLimit: 200000, manualInjection: 'on-demand' })
+  const messages = history(3) // 低占用，但显式覆盖豁免阈值
+  await preModel(messages)
+  expect(messages[0]!.role).toBe('system')
+  expect((messages[0]!.parts[0] as any).text).toBe('<custom system>')
+  expect((messages[0]!.parts[0] as any).text).not.toBe(COMPRESS_MANUAL_HINT)
+})
+
+test('createAcpContextPlugin：manualInjection always，低占用也注入完整手册（旧行为）', async () => {
+  const preModel = await preModelFromPlugin({ modelContextLimit: 200000, manualInjection: 'always' })
+  const messages = history(3) // 低占用，但 'always' 回到旧行为
+  await preModel(messages)
+  expect(messages[0]!.role).toBe('system')
+  const sysText = (messages[0]!.parts[0] as any).text
+  expect(sysText).toInclude('All compression serves the primary task') // 完整内核压缩手册正文
+  expect(sysText).not.toBe(COMPRESS_MANUAL_HINT)
+})
+
+test('createAcpContextPlugin：compress 工具 documentation 非空且 ≤ 600 字符（兜底要点齐备）', async () => {
+  const plugin = createAcpContextPlugin({ modelContextLimit: 200000 })
+  const tools = new Map<string, any>()
+  const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
+  await hooks['core.tool.pool.assemble']!({} as any, { add: (t: any) => tools.set(t.id, t) } as any)
+  const doc = tools.get('compress')!.documentation
+  expect(typeof doc).toBe('string')
+  expect(doc.length).toBeGreaterThan(0)
+  expect(doc.length).toBeLessThanOrEqual(600)
+  // 兜底要点：范围用 ref（startId/endId）、summary 必须自包含、只压已完成段
+  expect(doc).toInclude('startId')
+  expect(doc).toInclude('summary')
+  expect(doc).toInclude('不再需要原文')
 })
