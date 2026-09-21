@@ -150,13 +150,23 @@ export function matchGlob(pattern: string, path: string): boolean {
   return regex.test(path)
 }
 
-/** 将 glob 模式转换为正则表达式 */
+/**
+ * 将 glob 模式转换为正则表达式。
+ *
+ * 替换顺序是**刻意**的：先把 `**` 换成占位符、再把 `?` 换掉，最后才把占位符展开 ——
+ * 因为展开出来的正则片段自身含星号与问号，若放在后面处理会被前两步再次改写
+ * （`(?:` 里那个问号会被当成通配符吃掉，非捕获组的语义随之坏掉）。
+ */
 function globToRegExp(pattern: string): RegExp {
   const escaped = pattern
     .replace(/[.+^${}()|[\]\\]/g, '\\$&')
     .replace(/\*\*/g, '<<DOUBLESTAR>>')
     .replace(/\*/g, '[^/]*')
-    .replace(/<<DOUBLESTAR>>/g, '.*')
     .replace(/\?/g, '[^/]')
+    // `**/x` 也要匹配根级的 `x`（标准 glob 语义；minimatch 同此）。
+    // 修正前的 `.*\/x` 要求**至少一层目录**，于是 `**/*.ts` 漏掉根级 `a.ts`、
+    // `deny: ['**/secrets*']` 漏掉根级 `secrets.txt` —— 后者是**不安全方向**的漏判。
+    .replace(/<<DOUBLESTAR>>\//g, '(?:.*/)?')
+    .replace(/<<DOUBLESTAR>>/g, '.*')
   return new RegExp(`^${escaped}$`)
 }
