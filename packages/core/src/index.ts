@@ -179,6 +179,16 @@ import type {
   AgentDefinition,
 } from '@harness/agent'
 import { agentFromMarkdown } from '@harness/agent'
+import {
+  USAGE_STATS_KEY,
+  emptyFoldState,
+  foldMessage,
+  hydrateUsage,
+  isBlankUsage,
+  rebuildUsage,
+  type UsageFoldState,
+  type UsageStats,
+} from '@harness/usage'
 import { createSkillManager, formatSkillForPrompt, type SkillManager, type Skill, type SkillSource } from '@harness/skill'
 import {
   MultiDirLoader,
@@ -1593,6 +1603,27 @@ const MAX_STEPS_WRAP_UP =
   '若任务尚未完成，请说明已完成的部分与剩余待办。'
 
 /**
+ * 用量折叠检查点：记录「已折叠到哪条 assistant 消息」+ 跨消息的折叠状态。
+ *
+ * 为什么必须存：引擎每步折叠一次，重开会话（或同一会话被再次 prompt）时若从零再折一遍
+ * 就会**重复计数** —— 这正是 TUI 时代那条「空累积器覆盖已持久化历史 ⇒ 重连后用量清零」
+ * 的反面。存消息 id 而不是计数，是因为 `/compact`、`deleteMessage` 会改写消息列表：
+ * 一旦 id 对不上就退化为全量重建（见 `HarnessImpl.accumulateUsage`）—— 宁可重算，不能算错。
+ */
+const USAGE_FOLD_KEY = 'usageFold'
+
+/** 用量折叠检查点的持久化形态 */
+interface UsageFoldCheckpoint {
+  /** 已折叠的最后一条 assistant 消息 id */
+  upToMessageId: string
+  /**
+   * 跨消息折叠状态。必须与累积器一起存：`pending`（待归并的 LLM 用量）如果丢了，
+   * 下一个工具的 token 归并就会落到错误的步上，两个口径立刻分叉。
+   */
+  state: UsageFoldState
+}
+
+/**
  * 判断签名序列尾部是否已构成 doom-loop（末尾 threshold 个完全相同）。
  *
  * 纯函数、只看最近 threshold 个 —— 早于窗口的重复不算（避免把"开了三个文件再回头重开第一个"
@@ -1648,6 +1679,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
       readonly cwd: string
       /** 可选：快照服务工厂（注入后自动 capture 挂载 meta.snapshot） */
       readonly snapshot?: () => SnapshotService
+      /** 可选：宿主 logger（用于"已忽略"类告警 —— 可观测性增强不得静默失效） */
+      readonly logger?: import('@harness/plugin').PluginContext['log']
     }
   ) {
     this.defaultAgentId = defaultAgentId
@@ -2264,6 +2297,24 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
 
     await this.deps.session.addMessage(sessionId, assistant)
+    // 引擎事实广播：provider 返回的用量（含缓存命中/写入）。消费方是各家的可观测性
+    // （ACP 遥测的 providerCache 行即靠它 —— 此前那个 builder 只有定义没有调用方）。
+    if (tokenUsage) {
+      await this.deps.triggerPlugin('core.llm.usage', {
+        sessionId,
+        ...(agentId ? { agentId } : {}),
+        ...(model ? { model } : {}),
+        step,
+        input: tokenUsage.input,
+        output: tokenUsage.output,
+        ...(tokenUsage.cacheRead !== undefined ? { cacheRead: tokenUsage.cacheRead } : {}),
+        ...(tokenUsage.cacheWrite !== undefined ? { cacheWrite: tokenUsage.cacheWrite } : {}),
+      })
+    }
+    // 引擎层唯一累加：把本步折叠进会话用量（幂等，见 accumulateUsage）。
+    // 必须在 addMessage 之后：此刻 assistant.parts 已含本步 tool 结果，
+    // 而"LLM 用量归并到紧随的首个工具"这条规则依赖 tool part 已就位。
+    await this.accumulateUsage(sessionId, assistant)
     // A 方案：每步都发 done（语义 =「这一步结束」），step 让上层能区分中间步与最终步。
     yield {
       type: 'done',
@@ -2290,11 +2341,81 @@ export class AgentRuntimeImpl implements AgentRuntime {
       ...(aborted ? { aborted } : {}),
     }
   }
+
+  /**
+   * 把一条 assistant 消息折叠进会话用量 —— **引擎层唯一累加点**。
+   *
+   * 三条设计约束（每条都对应一个踩过的坑）：
+   *
+   * 1. **幂等靠检查点**：`meta[USAGE_FOLD_KEY]` 记「已折叠到哪条消息」。重开会话 / 再次 prompt
+   *    时只折新增部分；若从零再折一遍就是**重复计数**（历史上 TUI 那条"空累积器覆盖已持久化
+   *    历史 ⇒ 重连后用量清零"是同一枚硬币的另一面）。
+   * 2. **自愈靠重建**：检查点指向的消息不在了（`/compact`、`deleteMessage`、手工改过）就用
+   *    `rebuildUsage(messages)` 全量重算 —— 复用与增量**完全相同**的 `foldMessage` 规则，
+   *    因此重建结果与"从未被破坏"时一致，不会让用户看到数字跳变。
+   * 3. **只 updateMeta、不落盘**：写文件交给已有的脏会话刷盘（CLI 轮末 `flushDirtySessions`）。
+   *    引擎直接 `sessionStore.save` 会和宿主写盘打架。
+   *
+   * 折叠状态（pending/attributed）与累积器一起持久化：只存累积器而丢掉状态，
+   * 下一个工具的 token 归并就会落到错误的步上。
+   */
+  private async accumulateUsage(sessionId: string, message: Message): Promise<void> {
+    // 可观测性增强 —— 任何异常都不得影响主流程，但也**不许静默**（本项目反复栽在静默失效上）
+    try {
+      const sess = await this.deps.session.get(sessionId)
+      if (!sess) return
+      const meta = (sess.meta ?? {}) as Record<string, unknown>
+      const ck = meta[USAGE_FOLD_KEY] as UsageFoldCheckpoint | undefined
+      const ckValid = ck != null && sess.messages.some((m) => m.id === ck.upToMessageId)
+
+      let usage: UsageStats
+      let state: UsageFoldState
+      if (ckValid) {
+        // 增量：从已持久化的累积器继续折叠这一条
+        usage = foldMessage(hydrateUsage({ meta, messages: sess.messages }), message, ck.state)
+        state = ck.state
+      } else {
+        // 自愈 / 首次：全量重建。此刻 message 已在 sess.messages 里，所以**不能**再 fold 一次
+        // （那会重复计数）。meta 里若留有旧宿主（TUI 时代）写入的用量，会被消息重建值覆盖——
+        // 两者同源，且重建值更完整（含 agent 维度归因与 tasksDone）。
+        const rebuilt = rebuildUsage(sess.messages)
+        usage = rebuilt.usage
+        state = rebuilt.state
+        // 极端退化：消息为空但 meta 已有用量（老会话只留了 meta）⇒ 保住 meta 的数字，别写小
+        if (isBlankUsage(usage) && sess.messages.length === 0) usage = hydrateUsage({ meta })
+      }
+
+      await this.deps.session.updateMeta(sessionId, {
+        [USAGE_STATS_KEY]: usage,
+        [USAGE_FOLD_KEY]: { upToMessageId: message.id, state } satisfies UsageFoldCheckpoint,
+      })
+    } catch (err) {
+      this.deps.logger?.warn?.(`[usage] 折叠会话用量失败（已忽略，不影响本轮）：${(err as Error)?.message ?? err}`)
+    }
+  }
 }
 
 // ========================================================================
 // 7. Harness 接口 + 实现
 // ========================================================================
+
+/**
+ * 用量审计访问器 —— **引擎是唯一累加者，宿主与插件只读**。
+ *
+ * 为什么放引擎层：累加口径必须唯一。在此之前的实现方只有 TUI（`tui.tsx` 模块 4），
+ * 于是 headless / REPL 宿主与子 agent 会话完全没有 `meta.usageStats`
+ * （真机：6 个子会话约 1.5M 输入 token 不入账，会话面板只看到总额的 42%）。
+ * 现在引擎在**每步结束**折叠一条 assistant 消息，任何宿主都自动获得同一份数字。
+ */
+export interface UsageAccessor {
+  /**
+   * 取某会话的用量统计（读 `session.meta.usageStats`，meta 为空时按消息重建）。
+   * 口径是**本会话**：子 agent 各自累积在自己的会话里，聚合看 `children()` + `sumUsage`。
+   */
+  get(sessionId: string): Promise<UsageStats>
+  /** 直接子会话 id 列表（按 `Session.parentId` 反查；用于"含子 agent"的聚合展示） */
+  children(sessionId: string): Promise<string[]>
+}
 
 /** 工作中的 Harness 接口（与模板文档略有差异，这里提供具体可用 API） */
 export interface Harness {
@@ -2325,6 +2446,8 @@ export interface Harness {
   readonly permission: PermissionEngine
   /** Skill 管理器（加载/查询/禁用/重载技能；插件可在 core.harness.init 中通过此注册 plugin 来源技能） */
   readonly skillManager?: SkillManager
+  /** 用量审计（引擎层唯一累加者；宿主只读，见 `UsageAccessor`） */
+  readonly usage: UsageAccessor
 
   // === 工作目录 ===
   /** 全局工具工作目录（= options.cwd ?? process.cwd()；子 Agent 判断 git worktree 用） */
@@ -2463,6 +2586,8 @@ export class HarnessImpl implements Harness {
   public readonly plugin: PluginManager
   public readonly session: SessionManager
   public readonly agent: AgentRuntime
+  /** 用量审计（引擎层唯一累加者） */
+  public readonly usage: UsageAccessor
   /** Skill 管理器（从 skillDirs 加载，通过 core.prompt.system.transform 注入） */
   public skillManager?: SkillManager
   /** 全局工具工作目录（= options.cwd ?? process.cwd()） */
@@ -2547,6 +2672,24 @@ export class HarnessImpl implements Harness {
       }
     })
 
+    // 用量审计：以 meta 为唯一真相（引擎每步折叠写入，见 accumulateUsage）。
+    // 这里刻意不持有独立累加器 —— 进程内再存一份就会与持久化值分叉，
+    // 而分叉的症状正是历史上踩过的"重连后数字变了"。
+    this.usage = {
+      get: async (sessionId: string) => {
+        const sess = await this.session.get(sessionId)
+        if (!sess) return hydrateUsage()
+        return hydrateUsage({ meta: sess.meta, messages: sess.messages })
+      },
+      children: async (sessionId: string) => {
+        const all = await this.session.list()
+        // ⚠️ parentId 是 **Session 的顶层字段**（`session.create({ parentId })`，subagent 插件
+        // 派生时写入；落盘/恢复也走顶层字段），**不在 meta 里**。真机核对过：
+        // 子会话 json 顶层有 `parentId`，`meta.parentId` 为 null。
+        return all.filter((s) => s.parentId === sessionId).map((s) => s.id)
+      },
+    }
+
     const defaultAgentId = options.defaultAgentId ?? 'default'
     const agentImpl = new AgentRuntimeImpl(defaultAgentId, {
       session: this.session,
@@ -2558,6 +2701,7 @@ export class HarnessImpl implements Harness {
       bus: this.bus,
       cwd: options.cwd ?? process.cwd(),
       snapshot: options.snapshot,
+      logger: options.logger,
     })
     ;(options.agents ?? []).forEach((a) => agentImpl.register(a))
 

@@ -72,6 +72,7 @@ import { LifecycleEvents } from '@harness/core'
 import { startTuiRepl } from './tui'
 import {
   emptyUsage,
+  sumUsage,
   usageFromMeta,
   usageFromMessages,
   renderStatsText,
@@ -3294,6 +3295,30 @@ export type ProcessLineResult = 'continue' | 'exit'
  * 与 TUI 共用 `hydrateUsage`，保证重连（resume）后能读到重连前累计的用量，
  * 且不会被「空累积器」误判为无数据。
  */
+/**
+ * 「含子 agent」聚合行（子 agent 用量归一：父会话面板此前完全看不到这部分）。
+ *
+ * 为什么在**展示层**聚合，而不是把子会话并进父会话的 `meta.usageStats`：子会话有自己的
+ * meta 与生命周期（可能被别的入口再次打开），并进去会让同一条链在"全部会话·当日"里被
+ * 重复计入；展示层聚合随时可算、可撤。引擎侧已提供 `usage.children()`（按 `meta.parentId`
+ * 反查），这里只做求和与排版。
+ */
+export async function renderChildAgentRollup(harness: Harness, sessionId: string): Promise<string> {
+  const usageApi = (harness as { usage?: Harness['usage'] }).usage
+  if (!usageApi) return ''
+  const ids = await usageApi.children(sessionId).catch(() => [] as string[])
+  if (ids.length === 0) return ''
+  const usages: UsageStats[] = []
+  for (const id of ids) usages.push(await usageApi.get(id).catch(() => emptyUsage()))
+  const sum = sumUsage(usages)
+  return (
+    `含子 agent：${ids.length} 个子会话 · 调用 ${sum.llmCalls} 次 · ` +
+    `in ${sum.inputTokens} / out ${sum.outputTokens}` +
+    (sum.cacheReadTokens > 0 ? `（缓存命中 ${sum.cacheReadTokens}）` : '') +
+    '\n'
+  )
+}
+
 export async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
   const hydrated = hydrateUsage(current)
   if (!isBlankUsage(hydrated)) return hydrated
@@ -3684,6 +3709,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           const u = await resolveCurrentUsage(harness, current)
           const t = await resolveTodayUsage(app, current)
           out(renderStatsText(u) + '\n')
+          out(await renderChildAgentRollup(harness, current.id))
           out(`\n${todayUsageLine(t)}（全部会话·当日）\n`)
           return 'continue'
         }

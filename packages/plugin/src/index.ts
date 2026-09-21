@@ -300,6 +300,31 @@ export interface AgentTurnEndSignal {
   aborted?: boolean
 }
 
+/**
+ * 一次 LLM 调用的用量事实（引擎 → 插件广播）。
+ *
+ * 与 `core.agent.turn.end` 同属「引擎事实」：任何宿主都有（CLI / 内嵌库 / ACP 宿主自己
+ * 消费事件流）。用途是把 provider 返回的缓存命中/写入交给各自的可观测性去记 ——
+ * ACP 遥测的 `providerCache` 行就是靠它（此前 `buildProviderCacheEvent` 只有定义、
+ * 全仓没有调用方，于是"按需注入会不会影响缓存命中"这类问题**没有数据可答**）。
+ *
+ * 语义是**广播事实、不回写**：引擎已经拿到用量并写进 assistant 消息，改它无效。
+ */
+export interface LlmUsageSignal {
+  sessionId: string
+  agentId?: string
+  model?: string
+  /** 引擎的步序号（从 1 起） */
+  step?: number
+  /** 本次调用的输入 token（provider 口径，含缓存部分） */
+  input: number
+  output: number
+  /** 命中缓存的输入 token（OpenAI/DeepSeek `cached_tokens`、Anthropic `cache_read_input_tokens`） */
+  cacheRead?: number
+  /** 写入缓存的输入 token（Anthropic `cache_creation_input_tokens`） */
+  cacheWrite?: number
+}
+
 // ===== Hooks 接口 =====
 
 /**
@@ -348,6 +373,13 @@ export interface Hooks {
   'core.llm.params'?: (input: LLMInput, params: LLMParams) => Awaitable<void>
   /** 修改 LLM 请求头（如注入 API key、版本号） */
   'core.llm.headers'?: (input: LLMInput, headers: Record<string, string>) => Awaitable<void>
+  /**
+   * 每次 LLM 调用拿到 provider 用量后触发（引擎层事实，任何宿主都有）。
+   *
+   * 用于把 provider 侧的缓存命中/写入落进各自的可观测性（ACP 遥测的 `providerCache` 行
+   * 即消费它）。**广播事实、不回写**：引擎已把用量写进 assistant 消息，这里改不动。
+   */
+  'core.llm.usage'?: (input: LlmUsageSignal) => Awaitable<void>
 
   // === Prompt 构建链 ===
   /** 修改 System Prompt 片段数组 */

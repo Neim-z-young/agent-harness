@@ -1032,6 +1032,26 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   // 工具token归并状态：暂存本轮 LLM 用量，仅归并到紧随的第一个工具
   const pendingToolAttrRef = useRef<{ input: number; output: number } | null>(null)
   const toolAttributedRef = useRef(false)
+
+  /**
+   * 用量对账（轮末）：把显示值换成**引擎层**的权威值。
+   *
+   * 轮内仍由流事件增量累加（保证 token 数字实时跳动），轮末以引擎为准 ——
+   * 引擎是唯一写入方（core 每步折叠一次并写 meta），显示值与落盘值因此不会各说各话。
+   * 历史上"重连后用量数字变了"正是两者分叉的症状。
+   */
+  const syncUsageFromEngine = useCallback(() => {
+    const sid = options.session?.id
+    const usageApi = options.harness?.usage
+    if (!sid || !usageApi) return
+    void usageApi
+      .get(sid)
+      .then((u) => {
+        // 期间可能已切会话：只在对账目标仍是当前会话时提交
+        if (options.session?.id === sid) setUsage(u)
+      })
+      .catch(() => { /* 读数失败保持轮内增量值（不影响对话） */ })
+  }, [options.session, options.harness])
   // 选区复制（模块 D4）：读全局 renderer，Ctrl-Y 优先复制鼠标选中的文字
   const { renderer } = useAppContext()
   // 会话开始前（仅剩 system 块）展示欢迎页；发起首条消息后切换为对话块列表
@@ -1119,6 +1139,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         } else if (ev.type === 'turn_end') {
           // 整轮结束（所有 step 跑完）—— 这里才是真正该收 busy 的时机
           setBusy(false)
+          // 用量对账：轮内由流事件增量显示（响应快），轮末以**引擎层**的值为准
+          // （引擎每步折叠一次并写 meta，子 agent / headless 走同一条路）。
+          syncUsageFromEngine()
         }
         // 状态归约（纯函数）：供状态栏显示「第几步 / 在跑哪个工具 / 是否被中断」
         setAgentStatus((prev) => reduceAgentStatus(prev, ev))
@@ -1199,31 +1222,24 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }, [options.app])
   useEffect(() => { void refreshSessions() }, [refreshSessions])
 
-  // 模块 4：会话级持久化统计 —— 用量变化时写入 session.meta[usageStats] 并防抖落盘。
-  // 这样切换/恢复会话后，/stats 与 /stats-export 都能从 meta 读到历史累计。
+  // 模块 4：会话级用量展示 —— **只读**，不再写 `session.meta[usageStats]`。
   //
-  // 关键修复：空累积器不得覆盖已持久化的历史。此前挂载时 usage 恒为 emptyUsage()，
-  // 会立即把 meta[usageStats] 写成全 0 并落盘，导致重连后历史用量被清零、导出也丢失。
-  const saveUsageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // 写入权已交给引擎（core 每步折叠一次，见 `UsageAccessor`）：只有引擎写，才能覆盖
+  // headless / REPL 宿主与**子 agent 会话**（真机：6 个子会话约 1.5M 输入 token 此前完全不入账，
+  // 会话面板只看到总额的 42%）。宿主自己也写会与引擎分叉，而分叉的症状正是历史上那条
+  // 「重连后历史用量被清零」—— 当时靠 `shouldPersistUsage` 打补丁挡住；现在没有第二个写入方，
+  // 这个补丁连同它的防抖落盘一起退场。
   const hydratedSessionRef = useRef<string | undefined>(options.session?.id)
   useEffect(() => {
     const sess = options.session
     if (!sess) return
-    // 切换 / 恢复会话时重新水合：新会话的用量不应沿用上一个会话
+    // 切换 / 恢复会话时重新水合：新会话的用量不应沿用上一个会话。
+    // 优先读 meta（引擎写的），meta 为空时由 hydrateUsage 从消息重建。
     if (hydratedSessionRef.current !== sess.id) {
       hydratedSessionRef.current = sess.id
       setUsage(hydrateUsage(sess))
-      return
     }
-    // 防覆盖：本轮累积器为空、而 meta 里已有历史数据时，跳过写入
-    if (!shouldPersistUsage(usage, usageFromMeta(sess.meta))) return
-    sess.meta = { ...(sess.meta ?? {}), [USAGE_STATS_KEY]: usage }
-    if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current)
-    saveUsageTimerRef.current = setTimeout(() => {
-      void options.app.sessionStore.save(sess).catch(() => { /* 落盘失败静默 */ })
-    }, 800)
-    return () => { if (saveUsageTimerRef.current) clearTimeout(saveUsageTimerRef.current) }
-  }, [usage, options.session, options.app])
+  }, [options.session])
 
   // 当日用量归集（跨会话）：每次 LLM 调用后重算。只读持久化文件、不写回，
   // 因此重连后当天此前产生的用量依然可见（不依赖内存态）。
