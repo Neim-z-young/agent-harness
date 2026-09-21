@@ -1,5 +1,59 @@
 # Agent Harness 开发日志
 
+## 2026-09-21（续 176）工具载荷按需化 + 新增 7 个轻量子 agent（真机逐 agent 测了实际载荷）
+
+用户定：**#2（Anthropic 验收）/ #6（重复侦察复用）/ #7（schema 精简）先不做**，转做 #1 工具载荷按需化，
+并"和子 agent 提示词一起优化、创建几个简单提示词的子 agent、现有 agent 模式改一下、不常用工具不加载"。
+
+### 一、9 个现有 agent 从 `tools:"*"` 改成按角色白名单
+
+真机基线（`tools:"*"`）：**41 个工具 / 23,674 字符 / 16 个 MCP 工具**。改后逐 agent 实测（抓真正发到
+网络上的请求体 body.tools）：
+
+| agent | 工具数 | 载荷字符 | 降幅 | 说明 |
+|---|---|---|---|---|
+| coordinator | 21 | 12,111 | −49% | 能读侦察 + 派工/团队/上下文；**不写不跑命令**；MCP 全不给 |
+| 前端架构师 | 12 | 8,333 | −65% | 8 原生 + code-intel×4 |
+| coder（新） | 11 | 7,859 | −67% | 7 原生 + code-intel×4 |
+| 合规审查员 | 5 | 3,123 | −87% | **真只读**：不给 write/edit/bash（此前 `*` 时它能 rm -rf） |
+| reader（新） | 4 | 2,352 | −90% | 只读检索 |
+| summarizer（新） | **0** | 0 | −100% | `tools: []` ⇒ 请求体里 `tools` 字段整个不发出（三个 provider 都是 `if (length > 0)` 才挂） |
+
+其余（AI 集成/后端架构/性能优化 11~13 个，DevOps/API 测试 8 个，UI 设计 7 个）同理。
+外部估算：主会话 + 子 agent 合计每次省 5~7K，94 次约 500~650K/会话。
+
+### 二、新增 7 个轻量子 agent（提示词 12~18 行，按成本分档）
+
+`summarizer`（0 工具，纯文本压缩）→ `fetcher`(web_fetch) / `patcher`(read+edit) / `runner`(bash+read) →
+`reader`（只读 4 件套）→ `reviewer`（只读审查）→ `coder`（可写可跑 + code-intel）。
+其中 `coder` / `reviewer` 是**补上 coordinator 名单里挂了但从未存在的两个 id**。
+
+### 三、踩到的三个机制坑（都已写进 AGENTS.md）
+
+1. **`tools:` 精确匹配，且会先于 `mcpServers` 生效**：core 顺序是
+   `filterByWhitelist(agent.tools)` → `filterMcpTools(..., agent.mcpServers)`，所以 `mcpServers` 是
+   **二次过滤不是补充**。第一版只写 `mcpServers:[code-intel]` ⇒ 实测拿到 **0 个** MCP 工具
+   （MCP 工具在第一步就因不在 `tools:` 里被剔除）。修法：把 4 个 `mcp__code-intel__*` id 也写进 `tools:`。
+2. **递归派工只靠白名单**：`mode:'subagent'` 不会被自动排除 ⇒ 8 个 subagent 全是 `tools:"*"` 时
+   **可以无限往下派工**。新白名单一律不含 `subagent`。
+3. `subagents:` 字段**只解析不消费**（又一个"配了没用"）；`description` **不进模型上下文** ⇒
+   派工时模型看不到可用子 agent 清单，只能用户点名。这是**未修**的可用性缺口（要修可以给 subagent
+   工具动态注入一行 id+触发条件的 roster，代价约 1K 字符，待用户定）。
+
+### 四、"不加载"留给配置层（未动用户 config）
+
+- MCP 类由 config 决定：computer-use（10 工具）不用就从 `plugins` 移除 ⇒ 连 MCP server 都不启；
+  OCR server（`uvx` 起进程，较重）不用就 `enabled:false`。
+- 顺带发现：config 里 `remote` 那条指向 `mcp.example.com`（占位），**每次启动都会尝试连接并失败**。
+- 原生工具插件（builtin/search/glob/web/media）是默认启用，运行时可用 `/tools --global` 停。
+
+### 五、验证与备份
+
+- 改动落在 `~/.harness/agents/`（仓库外，未进 git），已备份到 `~/.harness/agents.bak-20260921-130642`。
+- 16 个 agent 全部用仓库解析器 `agentFromMarkdown` 校验过 tools/mcpServers 取值。
+- 真机 6 个 agent + 1 个基线逐次实测（探针包 `globalThis.fetch` 抓请求体；第一版探针读
+  `harness.context.resolve('chat.provider').calls` 拿到的是包装器，读不到 —— 改用抓网络请求才对）。
+
 ## 2026-09-21（续 175）Anthropic 显式 prompt 缓存（未验收，默认关）+ matchGlob 的 `**/` 语义修正 + permission 补测试
 
 用户说「继续实施」⇒ 接着落方案文档 §7.6 的未做项。**先撞上硬阻塞：本机只有 DeepSeek 的 key，

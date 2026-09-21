@@ -84,7 +84,12 @@
 
 - CLI 权限引擎（`CliPermissionEngine`）持久化规则到 `dataDir/permissions.json`，交互模式 `allow-all | ask | deny-all`，提供 `/permission` 命令
 
-- `matchGlob`（`@harness/permission`，**路径级 allow/deny 判定的基础**，被 core 权限规则、skill 的 `paths`、subagent 黑白名单三处消费）遵循标准 glob 语义：`*` 不跨 `/`、`**` 跨层级、`?` 单字符、其余正则元字符全部转义。**`**/x` 也匹配根级 `x`** —— 修正前展开成 `.*\/x`（要求至少一层目录），于是 `**/*.ts` 漏掉根级文件、`deny: ['**/secrets*']` 漏判根级 `secrets.txt`（**不安全方向**的漏判）。已知刻意差异：`src/**` 不匹配 `src` 自身。该包现在有测试（12 例），**改 `matchGlob` 必须跑它**
+- **Agent 能力白名单的三条实操约定**（真机实测得出，别凭直觉写）：
+  · `tools:` 只接受**精确 id**（`ToolRegistry.filterByWhitelist`；除整串 `'*'` 外不支持通配，也不支持 `mcp__xxx__*`）；未声明则回落**只读哨兵**（能读不能写）+ 告警，`tools: []` 才是"一个都不给"。
+  · **`tools:` 显式列表会先于 `mcpServers` 生效**：core 的顺序是 `filterByWhitelist(agent.tools)` → `filterMcpTools(..., agent.mcpServers)` ⇒ `mcpServers` 是**二次过滤**，不是"补给我某些 MCP 工具"。要拿"部分原生 + 部分 MCP"，必须把 MCP 工具 id 也写进 `tools:`（否则 MCP 在第一步已被剔除，实测拿到 0 个）。
+  · `mcpServers: []` = 一个 MCP 工具都不给（fail-closed：将来新增 server 也不会漏进来）；想只留某几个 server 就写 `mcpServers: [名字]`。
+
+- **子 agent 派工的两个已知事实**：① 递归深度**只靠白名单**控制（`mode:'subagent'` 不会被自动排除），所以 subagent 的 `tools:` 里不该出现 `subagent` —— 此前 8 个 subagent 全是 `tools:"*"`，等于**能无限往下派工**；② agent 的 `subagents:` 字段**只被解析、无人消费**（声明而不生效，`tools` 之外又一个"配了没用"），`description` 也**不进模型上下文**（仅供 `/subagents` 展示）⇒ 派工时模型看不到可用子 agent 清单，只能靠用户点名指定 `agentId`
 
 - `/tools` 工具管理命令由插件 `@harness/tools-manager` 提供（`cli.command` hook）：Agent 白名单启停经 cli 注入的 `setAgentTools` 持久化到 config.json 的 `agents[].tools`，`--global` 启停走运行时 `harness.tools`，本地缓存被卸载 Tool 以便恢复
 
