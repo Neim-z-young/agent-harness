@@ -112,6 +112,10 @@
 
 - **工具必须带参数 JSON schema**：`withJsonSchema(schema, {...})`（或 MCP 服务端 inputSchema 透传）——这是 provider 生成 tools 载荷时模型认识参数的**唯一**渠道（openai/anthropic/gemini 都读 `inputSchema.__jsonSchema`），缺失即退化为空对象 schema，模型只能空参瞎猜并原地空转（实测 25 步）。新工具不写 schema 视为缺陷
 
+- **schema 声明必填 ≠ 运行时校验**：schema 只影响模型"看不看得懂"，缺参的保护必须在工具 `call` 入口自己做。反例（真机会话实测）：`bash {}` 被送进 shell 得到 `bash: undefined: command not found`；`task_create {}` 在 `sanitizeName` 里抛 `name.trim` 的 TypeError；`task_list {}` 静默返回 `[]`（无法与"真的没任务"区分）。凡必填参数一律在入口挡下并返回 `{ ok:false, error:{ code:'XXX_REQUIRED' } }` 形式的结构化错误
+
+- **文件工具的边界语义（刻意不对称，别再摇摆）**：`read_file` / `write_file` / `edit_file` 只在**工作目录内**工作（`PATH_OUTSIDE_CWD`），这是"防误触 + 防越权写"的作用域约定；`bash` **不做读取面限制**（它的 cwd 受限、危险命令有黑名单，但读什么路径不拦）——bash 本就被权限系统与危险模式单独把关。真机实测过模型会绕过：read_file 被拒后立刻改用 `bash cat <绝对路径>` 读同一文件（3 次里成功 2 次）。这是**已知且接受**的行为，不要在提示词里引导"用 bash 绕过"，也不要把 read_file 的拒绝文案写成绕过指引；若将来要把 cwd 变成硬安全边界，须同时收紧 bash 的读取面（属架构级改动，需先拍板）
+
 - 与外部工具/服务对接协议时（herdr 这类终端/服务集成）**以真机为准**：官方文档没写清的边界必须实测确认后再实现。已知的三个坑都在文档之外且**静默失效**（读代码看不出来）：① 上报用过 `--seq` 后，`release-agent` 也必须带一个更高的 `--seq`，否则被 Herdr 当旧序号丢弃；② 序号水位线按 (pane, source) 存、**跨进程不重置**，新进程从 1 起算的前 N 条上报会被静默丢弃（故序号基线取微秒级时钟）；③ `process.once('exit')` **覆盖不到信号退出**（SIGTERM/SIGHUP 直接终止进程，而"关 pane"就是 SIGHUP），信号类退出必须单独挂监听，且不能抢 SIGINT（REPL/TUI 用它表示"中断当前查询"）。详见 `docs/development-log.md` 续 158
 
 ## 6. 安全与协作

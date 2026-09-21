@@ -1,5 +1,36 @@
 # Agent Harness 开发日志
 
+## 2026-09-21（续 167）会话分析暴露的 8 个问题：全部修复（含 2 个 worker 因限流中断后的接手）
+
+来源：对会话 `s_1789916436883_ra6w1` 的取证分析 + token 归因（两份报告在 `reference/workbuddy/`）。
+按文件集分 4 组并行修复（worker-swarm / worker-session / worker-subagent / worker-acp），
+其中 **worker-session 与 worker-subagent 均因 429 限流中断**（DeepSeek 配额，12:49 重置）——
+落盘检查后确认 worker-session 的改动已完整（core/session/cli 测试全绿），
+worker-subagent 的收尾修正（落盘路径）也已落地；**我的追加项（用量统计口径）由我接手完成**。
+
+| # | 问题 | 修法 | 真机验证 |
+|---|---|---|---|
+| 1 | swarm 字段名不一致 ⇒ `Team not found: undefined` | team_* 接受 `name ?? team` + schema 同步 | ✅ 传 `team="probe-team"` 得到 `Team not found: probe-team` |
+| 2 | `task_create {}` 抛 `name.trim` TypeError；`task_list {}` 静默 `[]` | 五个 task_* 入口 `requireTeam()`；`TaskListPlane` 入口 `assertTeamName()` | 单测 6 例 |
+| 3 | `bash {}` 被送进 shell（6 次 `undefined: command not found`） | 入口校验 ⇒ `COMMAND_REQUIRED` | 单测 2 例 |
+| 4 | 越界读被 bash 绕过 | 三处提示改为说明边界（工作目录/作用域/走用户确认），**不写成绕过指引**；AGENTS.md 记为已知取舍 | — |
+| 5 | 子会话 ID 中文全变下划线 + 同毫秒碰撞 | `slugifyTitle()`（ASCII-only slug）+ 5 位随机段 + 已存在 id 去重 | ✅ 落盘 `s_session_..._ftn4x`（中文 title 不再产出下划线） |
+| 6 | 子会话消息不落盘（用量与过程全丢） | SessionManager 脏集合 + CLI `flushDirtySessions()` 只存脏会话 | ✅ 子会话 `.json` 出现（3 条消息，2774B） |
+| 7 | 完成任务时父会话已结束 ⇒ 结果无人消费；结果双通道重复注入 | 落盘 `{dataDir}/tasks/*.json` + `index.jsonl`；`resultFetched` bus 事件把通知降级为一句提示 | ✅ `/tmp/verify-real/tasks/task-muajt7fr-1.json`；仓库 cwd 无污染 |
+| 8 | 用量统计"调用 0 次 / 错误 1 次" | `recordTool` 改为每次调用都计 count，失败另计 errors（并更新两处锁死旧语义的测试） | 单测 2 例 |
+
+**token 侧顺带落地**：ACP 压缩手册改为按需注入（占用率 ≥ `minContextLimitPct × 0.9` 才发完整手册，
+否则一行提示 + compress 工具 documentation 兜底）。真机抓到 system 第二段 8,365 → **57 字符**。
+
+**⚠️ 未完成的另一半（需拍板）**：子会话用量仍未"实时纳管" —— 用量累计与写盘的**唯一实现方在 TUI 层**
+（`packages/cli/src/tui.tsx:1202` 的模块 4），非 TUI 宿主（headless/REPL）与子 agent 会话都不会写
+`meta.usageStats`。本次修复让子会话**消息**落盘，因此用量可用现成的 `usageFromMessages()`
+（`usage-stats.ts:495`）从消息重建，但那是"可重建"而非"实时可见"。彻底解决需把用量累计从 TUI
+搬到引擎层（core），并处理与 TUI 现有累计的**重复计数**风险 —— 属架构级改动，先不动。
+
+提交：`9659fd3`（swarm）`423ee69`（子会话可观测性）`bab5941`（用量口径）`0e5e609`（工具校验）
+`63490af`（subagent/coordinator）`69361f4`（acp-context）。全量 **1665 pass / 0 fail**，typecheck 0 错误。
+
 ## 2026-09-20（续 172）修复 provider-openai 序列化丢弃内嵌工具结果 → DOOM_LOOP 中断
 
 **根因（provider 层）**：某真实会话（如 `s_1789916436883_ra6w1`）"输出到一半就中断"，模型推理区出现
