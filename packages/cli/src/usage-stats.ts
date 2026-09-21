@@ -189,7 +189,14 @@ export function recordCall(usage: UsageStats, rec: CallRecord = {}): UsageStats 
   }
 }
 
-/** 记录一次工具/技能调用；失败只累计 errors；可归并本轮紧随 LLM 请求的 token 用量 */
+/**
+ * 记录一次工具/技能调用；可归并本轮紧随 LLM 请求的 token 用量。
+ *
+ * 口径（真机修复）：**任何一次调用都计入 `count`，失败再额外计入 `errors`**。
+ * 早先的写法是 `count: isError ? 0 : 1` —— 只失败过的工具会呈现「调用 0 次 / 错误 1 次」
+ * 这种自相矛盾的数（真机会话 s_1789916436883_ra6w1 的 `team_status` 即如此），
+ * 用户看 /stats 无法解释。token 归因仍只在成功时累加（失败没有真实产出）。
+ */
 export function recordTool(usage: UsageStats, tool: string, rec: ToolRecord = {}): UsageStats {
   const t = tool || 'tool'
   const isError = !!rec.isError
@@ -203,7 +210,7 @@ export function recordTool(usage: UsageStats, tool: string, rec: ToolRecord = {}
       ...tools,
       {
         tool: t,
-        count: isError ? 0 : 1,
+        count: 1,
         errors: isError ? 1 : 0,
         inputTokens: isError ? 0 : attrInput,
         outputTokens: isError ? 0 : attrOutput,
@@ -215,7 +222,7 @@ export function recordTool(usage: UsageStats, tool: string, rec: ToolRecord = {}
       ...tools.slice(0, idx),
       {
         ...cur,
-        count: cur.count + (isError ? 0 : 1),
+        count: cur.count + 1,
         errors: cur.errors + (isError ? 1 : 0),
         inputTokens: cur.inputTokens + (isError ? 0 : attrInput),
         outputTokens: cur.outputTokens + (isError ? 0 : attrOutput),

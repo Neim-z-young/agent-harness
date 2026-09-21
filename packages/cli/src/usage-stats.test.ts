@@ -9,6 +9,7 @@ import { describe, it, expect } from 'bun:test'
 import {
   emptyUsage,
   recordCall,
+  recordTool,
   uncachedInput,
   dayStart,
   usageSince,
@@ -247,5 +248,29 @@ describe('usageFromMeta / 杂项', () => {
     let u2 = emptyUsage()
     u2 = recordCall(u2, { model: 'm', input: 100, output: 0, cacheRead: 30, cacheWrite: 20, ts: at(0, 9) })
     expect(uncachedInput(u2)).toBe(50)
+  })
+})
+
+describe('recordTool 计数口径（真机修复）', () => {
+  it('任何调用都计入 count，失败再额外计入 errors（不得出现"调用 0 / 错误 1"）', () => {
+    let u = emptyUsage()
+    u = recordTool(u, 'team_status', { isError: true })
+    const first = u.tools.find((t) => t.tool === 'team_status')!
+    expect(first.count).toBe(1)
+    expect(first.errors).toBe(1)
+
+    u = recordTool(u, 'team_status', { isError: true })
+    u = recordTool(u, 'team_status', { input: 100, output: 20 })
+    const t = u.tools.find((x) => x.tool === 'team_status')!
+    expect(t.count).toBe(3)
+    expect(t.errors).toBe(2)
+    // token 归因仍只在成功时累加
+    expect(t.inputTokens).toBe(100)
+    expect(t.outputTokens).toBe(20)
+  })
+
+  it('从未成功的工具也不会出现 count=0 的条目', () => {
+    const u = recordTool(emptyUsage(), 'only-fails', { isError: true })
+    expect(u.tools.every((t) => t.count > 0)).toBe(true)
   })
 })

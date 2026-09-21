@@ -514,10 +514,10 @@ describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
       { model: 'gpt-4o', calls: 2, inputTokens: 150, outputTokens: 30, cacheRead: 10, cacheWrite: 0 },
       { model: 'deepseek', calls: 1, inputTokens: 200, outputTokens: 30, cacheRead: 0, cacheWrite: 0 },
     ])
-    // 工具归并：首个工具归入紧随 LLM 用量 100/20，失败只计错误
+    // 工具归并：首个工具归入紧随 LLM 用量 100/20；每次调用都计 count，失败另计 errors（口径修正）
     expect(us.tools).toEqual([
       { tool: 'readFile', count: 2, errors: 0, inputTokens: 100, outputTokens: 20 },
-      { tool: 'shell', count: 0, errors: 1, inputTokens: 0, outputTokens: 0 },
+      { tool: 'shell', count: 1, errors: 1, inputTokens: 0, outputTokens: 0 },
     ])
     // agent 维度：root 与 sub 各自归并（deepseek 属于 sub）
     expect(us.agents).toEqual([
@@ -548,14 +548,16 @@ describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
     )
   })
 
-  it('recordTool：失败不计调用次数、只计错误；同名归并；token归并仅成功时', () => {
+  it('recordTool：每次调用都计 count、失败另计 errors；同名归并；token 归并仅成功时', () => {
+    // 口径修正（真机 s_1789916436883_ra6w1）：旧实现 `count: isError ? 0 : 1` 会让
+    // 只失败过的工具呈现「调用 0 次 / 错误 1 次」的自相矛盾数（该会话的 team_status 即如此）。
     let u = emptyUsage()
     u = recordTool(u, 'readFile', { input: 100, output: 20 })
     u = recordTool(u, 'readFile', { isError: true })
     u = recordTool(u, 'shell', { isError: true, input: 999, output: 999 })
     expect(u.tools).toEqual([
-      { tool: 'readFile', count: 1, errors: 1, inputTokens: 100, outputTokens: 20 },
-      { tool: 'shell', count: 0, errors: 1, inputTokens: 0, outputTokens: 0 },
+      { tool: 'readFile', count: 2, errors: 1, inputTokens: 100, outputTokens: 20 },
+      { tool: 'shell', count: 1, errors: 1, inputTokens: 0, outputTokens: 0 },
     ])
     expect(recordTool(emptyUsage(), '').tools[0].tool).toBe('tool')
   })
