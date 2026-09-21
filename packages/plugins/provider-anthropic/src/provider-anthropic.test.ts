@@ -4,6 +4,7 @@ import {
   createProviderAnthropicPlugin,
   providerAnthropicPlugin,
   AnthropicProviderConfig,
+  applyAnthropicCacheBreakpoints,
 } from './index'
 import type { Message, Part } from '@harness/session'
 import { defineTool, Schema, Tool } from '@harness/tool'
@@ -457,5 +458,102 @@ describe('@harness/provider-anthropic', () => {
         restore()
       }
     })
+  })
+})
+
+// ===== 显式 prompt 缓存（promptCache）=====
+//
+// 背景：Anthropic 的 prompt 缓存必须在请求体里显式标 `cache_control`，**不标就是每次把
+// system + tools + 历史按 input 全价重付**（本项目此前的状态）。断点语义是"缓存覆盖从头到
+// 该块为止的整个前缀"，协议上限 4 个，写入 ~1.25x、命中 ~0.1x。
+//
+// ⚠️ 本机**没有 Anthropic key**（配置里只有 DeepSeek），所以这里只断言**请求体形状**，
+// 不断言"缓存真的命中了" —— 后者需拿 key 看 usage.cache_read_input_tokens 验收。
+// 这也正是该选项默认 false 的原因：未验收的行为不默认影响用户（AGENTS.md「以真机为准」）。
+
+const OK_BODY = JSON.stringify({
+  id: 'm_x',
+  type: 'message',
+  role: 'assistant',
+  content: [{ type: 'text', text: 'ok' }],
+  model: 'm',
+  stop_reason: 'end_turn',
+  usage: { input_tokens: 1, output_tokens: 1 },
+})
+
+/** 跑一次 complete 并把发出去的请求体抓回来 */
+async function captureRequestBody(config: AnthropicProviderConfig, tools?: Tool[]): Promise<any> {
+  const p = new AnthropicChatProvider(config, () => tools ?? [])
+  let captured: any
+  const restore = installMock(async ({ init }) => {
+    captured = JSON.parse(init.body as string)
+    return new Response(OK_BODY, { status: 200, headers: { 'Content-Type': 'application/json' } })
+  })
+  try {
+    await p.complete({
+      providerId: 'anthropic',
+      messages: [
+        { id: 'm1', role: 'system', parts: [{ type: 'text', text: '你是助手' }], createdAt: 1 },
+        { id: 'm2', role: 'user', parts: [{ type: 'text', text: '你好' }], createdAt: 2 },
+      ],
+      params: { temperature: 0.3 },
+    })
+  } finally {
+    restore()
+  }
+  return captured
+}
+
+describe('显式 prompt 缓存断点（promptCache）', () => {
+  it('默认关闭：请求体里一个 cache_control 都没有，system 仍是 string 形态', async () => {
+    const body = await captureRequestBody({ apiKey: 'k' }, [makeTool('t1', 'd', { a: { type: 'string' } })])
+    expect(JSON.stringify(body)).not.toContain('cache_control')
+    expect(typeof body.system).toBe('string')
+  })
+
+  it('打开后打 3 个断点：tools 末尾 / system / 当前对话末尾', async () => {
+    const body = await captureRequestBody({ apiKey: 'k', promptCache: true }, [
+      makeTool('t1', 'd', { a: { type: 'string' } }),
+      makeTool('t2', 'd', { b: { type: 'string' } }),
+    ])
+    // ① tools 只标最后一个（每个都标会白占断点配额，而缓存语义本就是"到该块为止"）
+    expect(body.tools[0].cache_control).toBeUndefined()
+    expect(body.tools[1].cache_control).toEqual({ type: 'ephemeral' })
+    // ② system 必须换成 block 数组才承载得了标记
+    expect(Array.isArray(body.system)).toBe(true)
+    expect(body.system[0]).toMatchObject({
+      type: 'text',
+      text: '你是助手',
+      cache_control: { type: 'ephemeral' },
+    })
+    // ③ 当前对话末尾（下一轮它成为历史，整段即可命中）
+    const lastBlock = body.messages[body.messages.length - 1].content.at(-1)
+    expect(lastBlock.cache_control).toEqual({ type: 'ephemeral' })
+    // 断点总数 3，未超协议上限 4
+    expect((JSON.stringify(body).match(/cache_control/g) ?? []).length).toBe(3)
+  })
+
+  it('重构守卫：llmParams（temperature 等）仍照旧带上', async () => {
+    const body = await captureRequestBody({ apiKey: 'k', promptCache: true })
+    expect(body.temperature).toBe(0.3)
+  })
+})
+
+describe('applyAnthropicCacheBreakpoints（纯函数）', () => {
+  it('空请求体（无 tools / 无 system / 无 messages）不抛且返回 0', () => {
+    expect(applyAnthropicCacheBreakpoints({ model: 'm', max_tokens: 1, messages: [] } as never)).toBe(0)
+  })
+
+  it('满配置时断点数 ≤ 4（协议上限）', () => {
+    const body: any = {
+      model: 'm',
+      max_tokens: 1,
+      system: 's',
+      tools: [{ name: 'a', description: '', input_schema: { type: 'object', properties: {} } }, { name: 'b', description: '', input_schema: { type: 'object', properties: {} } }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'x' }] }],
+    }
+    const n = applyAnthropicCacheBreakpoints(body)
+    expect(n).toBeLessThanOrEqual(4)
+    expect(n).toBe(3)
   })
 })

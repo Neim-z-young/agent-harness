@@ -49,26 +49,55 @@ export interface AnthropicProviderConfig {
   apiVersion?: string
   /** 当模型输出空时是否报错误（默认 false 返回空 content） */
   strictEmptyContent?: boolean
+  /**
+   * 显式 prompt 缓存：给请求体打 Anthropic 的 `cache_control` 断点。
+   *
+   * ⚠️ **默认 false**，且本仓库**尚未在真实 Anthropic 端点上验收过**（开发机只有 DeepSeek 的
+   * key）—— 这是本项目「与外部服务对接以真机为准」约定的直接后果：**未验收的行为不默认影响用户**。
+   * 拿到 key 后应验收这两点，再把默认值翻成 true：
+   *   ① 第二次同前缀请求的 `usage.cache_read_input_tokens > 0`；
+   *   ② `cache_creation_input_tokens` 只在首次/前缀变化时出现（而不是每轮都写）。
+   * 另一个待实测项：可缓存前缀有**最小 token 数**门槛（不足则静默不缓存，不报错）。
+   *
+   * 打开后打 3 个断点（tools 末尾 / system / 当前对话末尾），代价是首次写入多付 25%，
+   * 第二次命中即回本（命中 ≈ 0.1x）。
+   */
+  promptCache?: boolean
 }
 
 // ===== Anthropic API 类型（精简子集）=====
 
-type AnthropicTextBlock = { type: 'text'; text: string }
+/**
+ * Anthropic 显式 prompt 缓存的断点标记。
+ *
+ * 与 OpenAI / DeepSeek 的**自动**前缀缓存不同：Anthropic 必须在请求体里显式标
+ * `cache_control` 才会缓存 —— 不标记就是**每次把 system + tools + 历史按 input 全价重付**
+ * （本项目此前的状态）。命中价约 0.1x、写入约 1.25x（首次写入即多付 25%），一次请求最多 4 个断点。
+ */
+export type CacheControl = { type: 'ephemeral' }
+
+/** system 的 block 形态：要带 cache_control 就不能再用纯 string */
+type AnthropicSystemBlock = { type: 'text'; text: string; cache_control?: CacheControl }
+
+type AnthropicTextBlock = { type: 'text'; text: string; cache_control?: CacheControl }
 type AnthropicImageBlock = {
   type: 'image'
   source: { type: 'base64'; media_type: string; data: string }
+  cache_control?: CacheControl
 }
 type AnthropicToolUseBlock = {
   type: 'tool_use'
   id: string
   name: string
   input: unknown
+  cache_control?: CacheControl
 }
 type AnthropicToolResultBlock = {
   type: 'tool_result'
   tool_use_id: string
   content: string
   is_error?: boolean
+  cache_control?: CacheControl
 }
 type AnthropicContentBlock =
   | AnthropicTextBlock
@@ -85,12 +114,14 @@ type AnthropicToolDef = {
   name: string
   description: string
   input_schema: { type: 'object'; properties: Record<string, unknown>; required?: string[]; additionalProperties?: boolean }
+  cache_control?: CacheControl
 }
 
 type AnthropicRequestBody = {
   model: string
   max_tokens: number
-  system?: string
+  /** 纯文本（默认）或 block 数组 —— 要带 cache_control 时必须用数组形态 */
+  system?: string | AnthropicSystemBlock[]
   messages: AnthropicMessage[]
   tools?: AnthropicToolDef[]
   temperature?: number
@@ -122,6 +153,42 @@ type AnthropicResponseBody = {
 // ===== Part 序列化工具 =====
 
 /** 合并 system prompt */
+/**
+ * 给请求体打上 Anthropic 显式缓存断点（`promptCache: true` 时调用）。返回断点个数。
+ *
+ * 断点语义：缓存覆盖「从头到该块为止」的**整个前缀**，所以只需标最靠后的那个关键点。
+ * 这里打 3 个（协议上限 4）：
+ *   ① `tools` 的**最后一个** → 一次覆盖整块工具定义（最稳、最该缓存的部分）
+ *   ② `system`（必须转成 block 数组才能带标记）→ 覆盖 tools + system
+ *   ③ 当前对话的**最后一个 block** → 下一轮这条消息成为历史，整段变成可命中前缀
+ *
+ * 为什么标「最后一条消息」而不是倒数第二条：每轮都会把最新的 user / tool_result 追加进来，
+ * 它是**下一轮唯一必然逐字相同**的锚点；标在它上面，下一轮的命中长度最大。
+ *
+ * ⚠️ 未经真机验收 —— 见 `AnthropicProviderConfig.promptCache` 的说明。
+ */
+export function applyAnthropicCacheBreakpoints(body: AnthropicRequestBody): number {
+  const cc: CacheControl = { type: 'ephemeral' }
+  let count = 0
+  const lastTool = body.tools?.[body.tools.length - 1]
+  if (lastTool) {
+    lastTool.cache_control = cc
+    count += 1
+  }
+  // 纯 string 形态无法承载 cache_control，必须换成 block 数组（协议允许两种形态）
+  if (typeof body.system === 'string' && body.system.length > 0) {
+    body.system = [{ type: 'text', text: body.system, cache_control: cc }]
+    count += 1
+  }
+  const lastMsg = body.messages[body.messages.length - 1]
+  const lastBlock = lastMsg?.content[lastMsg.content.length - 1]
+  if (lastBlock) {
+    lastBlock.cache_control = cc
+    count += 1
+  }
+  return count
+}
+
 function extractSystemPrompt(messages: Message[]): { system: string | undefined; rest: Message[] } {
   const sysParts: string[] = []
   const rest: Message[] = []
@@ -272,7 +339,7 @@ export class AnthropicChatProvider implements ChatProvider {
   private readonly config: Required<
     Pick<
       AnthropicProviderConfig,
-      'baseUrl' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'apiVersion' | 'strictEmptyContent'
+      'baseUrl' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'apiVersion' | 'strictEmptyContent' | 'promptCache'
     >
   > & { apiKey?: string }
 
@@ -294,6 +361,7 @@ export class AnthropicChatProvider implements ChatProvider {
       timeoutMs: config.timeoutMs ?? 120_000,
       apiVersion: config.apiVersion ?? '2023-06-01',
       strictEmptyContent: config.strictEmptyContent ?? false,
+      promptCache: config.promptCache ?? false,
     }
   }
 
@@ -308,6 +376,37 @@ export class AnthropicChatProvider implements ChatProvider {
   }
 
   // -------- ChatProvider.complete --------
+  /**
+   * 构造请求体（`complete` / `stream` 共用）。
+   *
+   * 抽出来的理由：这两处原本是**逐字重复**的两份（连字段顺序都一样），加任何请求参数都得改两遍
+   * —— 而"只改了一处"正是本项目反复出现的静默失效来源（见 AGENTS.md「与外部服务对接以真机为准」）。
+   */
+  private buildBody(params: {
+    model: string
+    messages: AnthropicMessage[]
+    llmParams: Record<string, unknown>
+    system?: string
+    tools?: Tool[]
+  }): AnthropicRequestBody {
+    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToAnthropicDef)
+    const body: AnthropicRequestBody = {
+      model: params.model,
+      max_tokens: this.config.maxTokens,
+      messages: params.messages,
+      stream: false,
+    }
+    if (params.system) body.system = params.system
+    if (toolsDefs.length > 0) body.tools = toolsDefs
+    const lp = params.llmParams
+    if (typeof lp.temperature === 'number') body.temperature = lp.temperature as number
+    if (typeof lp.top_p === 'number') body.top_p = lp.top_p as number
+    if (typeof lp.top_k === 'number') body.top_k = lp.top_k as number
+    if (Array.isArray(lp.stop_sequences)) body.stop_sequences = lp.stop_sequences as string[]
+    if (this.config.promptCache) applyAnthropicCacheBreakpoints(body)
+    return body
+  }
+
   async complete(params: {
     providerId: string
     modelId?: string
@@ -323,22 +422,13 @@ export class AnthropicChatProvider implements ChatProvider {
     const { system, rest } = extractSystemPrompt(params.messages)
     const messages = toAnthropicMessages(rest)
 
-    const model = params.modelId ?? this.config.defaultModel
-    const llmParams = params.params ?? {}
-    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToAnthropicDef)
-
-    const body: AnthropicRequestBody = {
-      model,
-      max_tokens: this.config.maxTokens,
+    const body = this.buildBody({
+      model: params.modelId ?? this.config.defaultModel,
       messages,
-      stream: false,
-    }
-    if (system) body.system = system
-    if (toolsDefs.length > 0) body.tools = toolsDefs
-    if (typeof llmParams.temperature === 'number') body.temperature = llmParams.temperature as number
-    if (typeof llmParams.top_p === 'number') body.top_p = llmParams.top_p as number
-    if (typeof llmParams.top_k === 'number') body.top_k = llmParams.top_k as number
-    if (Array.isArray(llmParams.stop_sequences)) body.stop_sequences = llmParams.stop_sequences as string[]
+      llmParams: params.params ?? {},
+      system,
+      tools: params.tools,
+    })
 
     const record = { body, response: undefined as AnthropicResponseBody | undefined, error: undefined as unknown }
     this.calls.push(record)
@@ -451,22 +541,13 @@ export class AnthropicChatProvider implements ChatProvider {
     const { system, rest } = extractSystemPrompt(params.messages)
     const messages = toAnthropicMessages(rest)
 
-    const model = params.modelId ?? this.config.defaultModel
-    const llmParams = params.params ?? {}
-    const toolsDefs = (params.tools ?? this.toolsGetter()).map(toolToAnthropicDef)
-
-    const body: AnthropicRequestBody = {
-      model,
-      max_tokens: this.config.maxTokens,
+    const body = this.buildBody({
+      model: params.modelId ?? this.config.defaultModel,
       messages,
-      stream: false, // 会覆盖为 true，见下方 streamBody
-    }
-    if (system) body.system = system
-    if (toolsDefs.length > 0) body.tools = toolsDefs
-    if (typeof llmParams.temperature === 'number') body.temperature = llmParams.temperature as number
-    if (typeof llmParams.top_p === 'number') body.top_p = llmParams.top_p as number
-    if (typeof llmParams.top_k === 'number') body.top_k = llmParams.top_k as number
-    if (Array.isArray(llmParams.stop_sequences)) body.stop_sequences = llmParams.stop_sequences as string[]
+      llmParams: params.params ?? {},
+      system,
+      tools: params.tools,
+    })
 
     // stream 请求体（覆盖 stream: true）
     const streamBody = { ...body, stream: true as const }
@@ -642,7 +723,7 @@ export class AnthropicChatProvider implements ChatProvider {
 
       yield {
         type: 'done',
-        model: modelOut ?? model,
+        model: modelOut ?? body.model,
         tokenUsage,
         finish: normalizeFinishReason(finishRaw),
         ...(finishRaw ? { finishRaw } : {}),
