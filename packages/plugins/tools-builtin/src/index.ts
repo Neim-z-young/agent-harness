@@ -134,7 +134,13 @@ export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
     if (!isWithinCwd(absPath, ctx.cwd)) {
       return {
         ok: false,
-        error: { message: `路径 "${input.path}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
+        error: {
+        message:
+          `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
+          'read_file / write_file / edit_file 只在工作目录内工作；' +
+          '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+        code: 'PATH_OUTSIDE_CWD',
+      },
       }
     }
 
@@ -265,7 +271,13 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
     if (!isWithinCwd(absPath, ctx.cwd)) {
       return {
         ok: false,
-        error: { message: `路径 "${input.path}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
+        error: {
+        message:
+          `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
+          'read_file / write_file / edit_file 只在工作目录内工作；' +
+          '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+        code: 'PATH_OUTSIDE_CWD',
+      },
       }
     }
 
@@ -485,6 +497,16 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
+
+      // 必填校验（评审/真机修复）：缺 command 时此前会把 undefined 一路传进 spawn，
+      // 由 shell 报出 `bash: undefined: command not found`（exit 127）—— 模型看到的是
+      // 一句和"你漏了参数"毫无关系的 shell 错误（真机会话里连撞 6 次）。
+      if (typeof input?.command !== 'string' || input.command.trim() === '') {
+        return {
+          ok: false,
+          error: { message: '缺少 command：请在入参 `command` 里给出要执行的 shell 命令', code: 'COMMAND_REQUIRED' },
+        }
+      }
 
       // ---- 沙箱防护 2 前置：危险命令检测（无论是否回退都硬性拒绝，不可豁免） ----
       if (dangerousPatterns.length > 0) {
@@ -794,7 +816,13 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
     if (!isWithinCwd(absPath, ctx.cwd)) {
       return {
         ok: false,
-        error: { message: `路径 "${input.path}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
+        error: {
+        message:
+          `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
+          'read_file / write_file / edit_file 只在工作目录内工作；' +
+          '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+        code: 'PATH_OUTSIDE_CWD',
+      },
       }
     }
 

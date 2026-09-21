@@ -189,6 +189,24 @@ describe('@harness/tools-builtin', () => {
 
   // ===== bash =====
 
+  describe('bashTool 必填校验（真机修复）', () => {
+    it('缺 command ⇒ COMMAND_REQUIRED，且不得把 undefined 送进 shell', async () => {
+      const res = await bashTool.call({} as never, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('COMMAND_REQUIRED')
+      // 真机症状是 `bash: undefined: command not found`（shell 报错），必须不再出现
+      expect(JSON.stringify(res.error)).not.toContain('command not found')
+    })
+
+    it('空串 / 纯空白 command 同样被拒', async () => {
+      for (const bad of ['', '   ']) {
+        const res = await bashTool.call({ command: bad }, makeCtx())
+        expect(res.ok).toBe(false)
+        expect(res.error!.code).toBe('COMMAND_REQUIRED')
+      }
+    })
+  })
+
   describe('bashTool', () => {
     it('执行 echo 命令', async () => {
       const res = await bashTool.call({ command: 'echo "hello world"' }, makeCtx())
