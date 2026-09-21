@@ -1,5 +1,85 @@
 # Agent Harness 开发日志
 
+## 2026-09-21（续 177）子 agent 结果落盘/提示语/步数三修 + 入参自愈（起因：会话遥测复盘）
+
+用户先让我复盘会话 `s_1789996799007_9cq9r`（lead「扫描当前项目代码生成架构图」，18.5 min /
+96 次 LLM 调用），再按其结论"实现改进建议并解决 Q1 发现的问题"。
+
+### 一、复盘结论（量化，报告 `outputs/session-analysis/session-report.html`）
+
+- **96 次调用里 100 次工具调用失败 37 次（37%）**，其中 **34 次是 `input: {}`（参数整段为空）**，
+  这些轮的 output 中位数只有 **22 token**（发个空壳就结束）。**与推理长度无关，只与上下文长度相关**：
+  `<20K 12% → 20-40K 39% → 40-60K 38% → 60-100K 50%`。失败轮吃掉全部上下文的 **43.6%**。
+- ACP 压缩**全程 0 次触发**（峰值仅占 300K 窗口的 26.9%）⇒ 本会话的浪费与压缩无关。
+- **本地 token 估算比 provider 少约 33%**（本地 Σ 4,737,214 vs provider 6,311,323）；
+  `cacheWrite` 96 轮恒为 0 ⇒ 只知命中、不知写入。
+- 前缀缓存整体 97.35%，但有 **两处断崖都在 turn 边界**：round 11（用户「继续?」）−12,928、
+  round 42（用户「继续」，前有 7 分钟空等）−46,720。
+
+### 二、Q1 查出的问题：子 agent 全文只写在 `os.tmpdir()`
+
+`subagent/index.ts` 的 `summarizeResult()` 把**全文**写 `join(os.tmpdir(), 'subagent-output-<Date.now()>.txt')`，
+返回给父 agent 的只是 head+tail 摘要。而落盘的 `{dataDir}/tasks/<taskId>.json` 实测只存**摘要**
+（3466 字符，含"已截断为摘要"）⇒ **全文只此一份，且在 macOS 会被定期清理的 `/var/folders/**/T` 里**。
+真机上父 agent 只能 `bash cp` 把它搬回工作目录再 `read_file`（约 10 轮纯管道操作）。
+
+顺带**推翻我自己上一轮的一个结论**：我曾说"提示语主动指了 read_file 这条被禁的路"——核实后是错的。
+`callerToolIds` **全仓没有任何写入方**（core 从未填 `ctx.variables.callerToolIds`，只有测试手动塞），
+所以那段"可使用 read_file 或 grep_file 工具查看"是**死代码**；真实提示走 else 分支，而 else 写的是
+**"请考虑拆分任务"**（把"报告超了 2000 字符阈值"误报成"任务太大"，会话里出现 11 次）。
+⇒ 教训：**新增字段必须核实"有没有写入方 / 有没有消费者"**（同 `subagents:` 只解析不消费）。
+
+### 三、另一个同类缺陷：`maxSteps` 在 agent md 里写了等于没写
+
+`agentFromMarkdown()` **从不映射 `maxSteps`**，而 subagent 插件的 `resolveSteps` 读的正是
+`agent.get(id).maxSteps`，其文档还明确写着"子 Agent 应在自己的 AgentDefinition 里显式写 maxSteps"
+⇒ 所有 md 定义的子 agent 只能吃插件默认 **20**。真机 6/6 个 reader 因此全部触顶、报告被截断，
+逼出第二轮补派（额外 **41 次调用 / 133 万 input token**）。
+
+### 四、落地（按用户主题分块的 3 组改动）
+
+**① subagent 结果落盘 + 提示语（`packages/plugins/subagent`）**
+
+- 全文改落 `{dataDir}/subagent-results/`（与 `tasks/` 同域、系统不清理、不污染用户仓库 cwd）；
+  无 dataDir 才退化到 `os.tmpdir()`（best-effort，不抛错）。`subagent-diff-*.patch` 同处理。
+- 文件名 = `时间戳 + 随机段`。**只用 `Date.now()` 会让同毫秒并发的多个子任务撞名互相覆盖**。
+- 提示语改为**只说自己为真的事实**，三种情形分开：路径可读（调用方确有读文件工具 **且** 路径在
+  调用方 `ctx.cwd` 内）才承诺 `read_file`；路径在 cwd 内但调用方没读文件工具 ⇒ 只报事实 + 给下一步；
+  路径在 cwd 外 ⇒ **明确说 read_file/grep_file 读不到**（不再误报"请考虑拆分任务"）。
+- `callerToolIds` 由 core 注入（见 ③），死字段被复活；判 cwd 用**调用方的 `ctx.cwd`**（决定
+  read_file 边界的是它，不是 harness 全局 cwd）。
+- **摘要阈值 2000 → 8000 字符**（`DEFAULT_MAX_RESULT_LENGTH`）。依据：实测 9 份报告正文是
+  **4532~10195 字符**，2000 阈值下 **9/9 全被截断**；8000 后 8/9 不再截断，而**上下文增量几乎为零**
+  （那些报告本来就只比 2000 高一点），却省掉整段搬运轮次。
+
+**② 步数：解封 + 分档 + 派工方覆盖**
+
+- `agentFromMarkdown` 补 `maxSteps` 解析（数字 / 字符串数字 / `-1` 不限；非法则忽略）。
+- `reader` = 35、`reviewer` = 25（`~/.harness/agents/*.md`，已备份 `agents.bak-20260921-225726`）；
+  真机脚本验证解析结果：`reader=35 reviewer=25 coder/lead/coordinator=(默认)`，0 告警。
+- `subagent({ maxSteps })` 新增可选入参，优先级 **派工方 > 子 Agent 定义 > 插件默认**：
+  同一个 reader 既可能"看一眼某个文件"（5 步够）也可能"通读 1902 个文件"（20 步不够），
+  派工方比 agent 定义更清楚**这一次**的规模。
+
+**③ core：入参自愈 + 注入 callerToolIds（`packages/core`）**
+
+- 新增 `describeMissingRequiredParams()`：工具调用失败**且必填项没给全**时，把该工具的
+  必填参数（名/类型/描述，取自 `inputSchema.__jsonSchema`）+ 最小示例（按 type 生成占位值）
+  直接拼进回喂给模型的错误消息（`[入参自愈] …`）。必填已给齐 ⇒ 不掺和（避免噪音）；
+  无 schema/无必填 ⇒ 不动文案。**原错误信息与 `code` 一律保留**（下游按 code 判定）。
+- `ctx.variables.callerToolIds = allowedTools.map(t => t.id)`：复活上面那个死字段。
+
+### 五、验证
+
+- 新增测试 13 例：core 入参自愈 4、agent `maxSteps` 解析 1、subagent 落盘/提示语/步数覆盖 8；
+  并更新 3 个编码了旧提示语行为的旧用例。
+- 全量 **1717 pass / 0 fail**、39 个包全退出码 0；`bun run typecheck` 全绿。
+- 顺带修掉 3 个**预存**的类型错误（`subagent/index.test.ts` 的 fixture 缺 `description`/`permission`，
+  是 AgentDefinition 加必填字段时漏改的；stash 验证过与本轮改动无关）。
+- 未改（需拍板）：步数配额对"零产出轮"豁免（有死循环风险，靠 doom-loop 兜底不充分）、
+  turn 边界前缀缓存回退定位、本地 token 估算口径校正、provider 超时按任务分级。
+
+
 ## 2026-09-21（续 176）工具载荷按需化 + 新增 7 个轻量子 agent（真机逐 agent 测了实际载荷）
 
 用户定：**#2（Anthropic 验收）/ #6（重复侦察复用）/ #7（schema 精简）先不做**，转做 #1 工具载荷按需化，

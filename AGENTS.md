@@ -91,6 +91,16 @@
 
 - **子 agent 派工的两个已知事实**：① 递归深度**只靠白名单**控制（`mode:'subagent'` 不会被自动排除），所以 subagent 的 `tools:` 里不该出现 `subagent` —— 此前 8 个 subagent 全是 `tools:"*"`，等于**能无限往下派工**；② agent 的 `subagents:` 字段**只被解析、无人消费**（声明而不生效，`tools` 之外又一个"配了没用"），`description` 也**不进模型上下文**（仅供 `/subagents` 展示）⇒ 派工时模型看不到可用子 agent 清单，只能靠用户点名指定 `agentId`
 
+- **子 agent 超出摘要阈值时的"全文"落 `{dataDir}/subagent-results/`，不落 `os.tmpdir()`、也不落 cwd**：macOS 会定期清理 `/var/folders/**/T`，而那份全文是**唯一一份**（`{dataDir}/tasks/<taskId>.json` 只存摘要）⇒ 落 tmp 等于随时丢数据。文件名必须**时间戳 + 随机段**（只用 `Date.now()` 会让同毫秒并发的子任务撞名互相覆盖）。默认阈值 `DEFAULT_MAX_RESULT_LENGTH = 8000` 字符（原 2000 太低：真机 9 份报告 4532~10195 字符，9/9 全被截断）
+
+- **摘要提示语只许说"当前为真"的话，且判据要两个一起看**：① `ctx.variables.callerToolIds`（由 core 从 `allowedTools` 注入）里是否真有 `read_file`/`grep_file`；② 落盘路径是否在**调用方 `ctx.cwd`** 内（`read_file` 的边界是它，不是 harness 全局 cwd）。两者缺一 → **不许承诺可读**（承诺了模型必去试、试必被 `PATH_OUTSIDE_CWD` 拒）。历史事故：该字段曾**全仓无写入方**（只有测试手动塞），"可使用 read_file 查看"整段是死代码，真实提示是"请考虑拆分任务"——把"超了字符阈值"误报成"任务太大"
+
+- **`AgentDefinition.maxSteps` 现在能从 agent md 的 `maxSteps:` 解析**（`-1` = 不限）；role 分档：`reader` = 35、`reviewer` = 25（20 是插件默认，实测 6/6 reader 触顶）。派工方还可用 `subagent({ maxSteps })` 按**本次任务**覆盖，优先级 **派工方 > agent 定义 > 插件默认**
+
+- **工具调用"入参自愈"在 core，不在各工具**：失败且必填项没给全时，core 把该工具的必填参数（名/类型/描述，取自 `inputSchema.__jsonSchema`）+ 最小示例拼进回喂的错误消息（`[入参自愈] …`），**原 `message`/`code` 一律保留**。动机：真机实测模型在长上下文下会整段丢 tool-call arguments（100 次调用 37 次失败、34 次 `input:{}`，失败率随上下文从 12% 升到 50%）。必填已给齐、或无 schema/无必填 ⇒ **不掺和**
+
+- **新增任何字段前先核实"有没有写入方 / 有没有消费者"**：本项目已连撞三次同类缺陷——`subagents:` 只解析不消费、`ctx.variables.callerToolIds` 只读不写、`agentFromMarkdown` 不映射 `maxSteps`（插件文档却让子 agent 在定义里写它）。判定手法：全仓 grep 字段名，确认写入点与消费点都存在，再动手
+
 - `/tools` 工具管理命令由插件 `@harness/tools-manager` 提供（`cli.command` hook）：Agent 白名单启停经 cli 注入的 `setAgentTools` 持久化到 config.json 的 `agents[].tools`，`--global` 启停走运行时 `harness.tools`，本地缓存被卸载 Tool 以便恢复
 
 - 插件要持久化 config.json 时不直接自持读写，优先经 cli 注入的 `setAgentTools` / `CliCommandInput` 扩展字段（`agentId`/`harness`），保持解耦
