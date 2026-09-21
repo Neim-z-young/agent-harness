@@ -371,8 +371,8 @@ subagent 派生与 CLI 恢复都用它），`meta.parentId` 恒为 null。已改
 
 | # | 事项 | 状态 | 阻塞 |
 |---|---|---|---|
-| 1 | **工具载荷按需化**（token 归因报告的建议 #1） | **未做** | 无 —— 但这是**配置层**：你 `~/.harness/agents/` 下 9 个 agent 全是 `tools: "*"`，所以每个 agent 都收全量 42 个工具。建议按角色给白名单（研究类给 read/list/glob/grep 约 5 个）。预期每次省 5~7K，主+子 94 次 ≈ 500~650K/会话 |
-| 2 | **Anthropic 缓存真机验收** | 代码已就绪（默认关） | **需要 Anthropic key** |
+| 1 | **工具载荷按需化**（token 归因报告的建议 #1） | **已做**（续 176） | 9 个现有 agent 改按角色白名单 + 新增 7 个轻量子 agent。真机基线 41 工具/23,674 字符 → coordinator −49%、合规审查员 −87%、reader −90%、summarizer −100%（详见 `docs/development-log.md` 续 176）。注意改动落在仓库外的 `~/.harness/agents/`，未进 git |
+| 2 | **Anthropic 缓存真机验收** | 代码已就绪（默认关） | **需要 Anthropic key**；用户已定「先不做」，保持默认关 |
 | 3 | **技能 `paths` 条件触发接线** | **未做**（`matchByPath` 仍是死代码，只有测试引用它） | 无。frontmatter 里写 `paths` 目前**写了不生效** —— 属"承诺了但没落地"，也正是本项目最忌的静默失效模式 |
 | 4 | `@harness/permission` 之外的匹配语义 | 已做（`**/` 修正 + 12 例测试） | — |
 | 5 | `/stats` 给缓存**命中率**（百分比） | 未做（现只印绝对值 `命中 X，写入 Y，未命中 Z`） | 无，很小 |
