@@ -62,6 +62,7 @@ import {
   createWriter as createTelemetryWriter,
   buildPreModelEvent,
   buildCompressEvent,
+  buildProviderCacheEvent,
   type TelemetryWriter,
 } from './telemetry.js'
 
@@ -118,10 +119,20 @@ export const COMPRESS_TOOL_DOC = [
   'summary 是这段历史被替换后的唯一记录，须自包含完整：用户目标与意图、决策及理由、精确路径/签名/报错原文/数值、结论、踩坑教训；丢弃已提取信息的冗余长日志，勿照搬。',
 ].join('\n')
 
-/** 手册提前注入系数：占用率到达 `minContextLimitPct × 0.9` 即注入完整手册。
- *  理由：nudge 在 occupancy ≥ minContextLimitPct 时才提示压缩；若手册与 nudge 同轮才出现，
- *  模型在"刚跨阈值、本应开始考虑压缩"的那一轮反而没有手册可用。提前 10%（0.9 倍）注入，
- *  保证跨阈值附近若干轮模型都已持有完整用法。低于此占用率仍只注入 COMPRESS_MANUAL_HINT。 */
+/**
+ * 手册提前注入系数：占用率到达 `minContextLimitPct × 0.9` 即在**尾部**注入完整手册。
+ *
+ * 理由：nudge 在 occupancy ≥ minContextLimitPct 时才提示压缩；若手册与 nudge 同轮才出现，
+ * 模型在"刚跨阈值、本应开始考虑压缩"的那一轮反而没有手册可用。提前 10%（0.9 倍）注入，
+ * 保证跨阈值附近若干轮模型都已持有完整用法。低于此占用率只在前缀留 COMPRESS_MANUAL_HINT。
+ *
+ * ⚠️ 位置约束（真机量化，见 docs/usage-accounting-and-prompt-cache-plan.md §3）：
+ * 完整手册**必须注入在尾部**，不能放前缀 —— 自动前缀缓存按最长公共 token 前缀命中，
+ * 放在历史之前会让"手册出现"那一刻其后的**全部内容（含整段历史）**重算：
+ * 越阈值时前缀 ≈ 105K tokens，翻转一次 ≈ 95K token-equiv；而按需省下的只有 ≈ 259
+ * token-equiv/次 ⇒ 回本要 366 次调用。也就是说，"变量放前缀"对**会越阈值的会话是净亏**，
+ * 而那恰恰是需要压缩的那类会话。尾部是本轮新增内容，放在那里翻转代价 ≈ 0。
+ */
 const MANUAL_INJECT_MARGIN = 0.9
 
 // ===== 工具输入类型 =====
@@ -232,12 +243,18 @@ export interface AcpContextPluginOptions {
   /**
    * 压缩系统手册（buildCompressSystemPrompt 输出，约 1.9K tokens）的注入策略。
    *
-   * - `'on-demand'`（默认）：仅当上下文占用率接近压缩阈值
-   *   （`config.nudge.minContextLimitPct`，取阈值的 0.9 倍作为提前注入点）时才注入完整手册；
-   *   低于该占用率只注入一行极简提示 `COMPRESS_MANUAL_HINT`，避免为"用不上的说明书"长期付费。
-   * - `'always'`：每轮无条件注入完整手册（旧行为），便于 A-B 对照或回退。
+   * - `'on-demand'`（默认）：占用率接近压缩阈值（`config.nudge.minContextLimitPct` 的 0.9 倍）
+   *   时，把完整手册注入到请求**尾部**；低于该占用率只在前缀留一行极简提示
+   *   `COMPRESS_MANUAL_HINT`，避免为"用不上的说明书"长期付费。
+   * - `'always'`：每轮把完整手册注入**前缀**（复刻改造前的行为），便于 A-B 对照或回退。
+   *   前缀文本恒定，因此它本身不产生缓存翻转代价。
    *
-   * 例外：`systemPrompt` 被显式赋值时无论哪种策略都注入完整手册（用户显式要求，不受阈值影响）。
+   * 为什么 on-demand 要注在尾部而不是前缀：前缀里放会变的文本，会让它之后的全部内容
+   * （含整段历史）在前缀缓存里失效，一次翻转的代价远大于按需省下的量（量化见
+   * `MANUAL_INJECT_MARGIN` 注释 / docs/usage-accounting-and-prompt-cache-plan.md §3）。
+   *
+   * 例外：`systemPrompt` 被显式赋值时，用户文本始终注入**前缀**（显式配置优先，且它恒定无风险），
+   * 不再往尾部注入手册。
    */
   manualInjection?: 'on-demand' | 'always'
   // ---- 遥测 ----
@@ -670,6 +687,36 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             plgCtx.log.warn?.('ACP core.session.compacting 处理失败，走默认压缩', { err: String(err) })
           }
         },
+
+        /**
+         * provider 侧缓存观测：把引擎广播的用量事实落成 `providerCache` 遥测行。
+         *
+         * 为什么挂这里而不是由 core 直接写：遥测按 sessionId 分文件、路径由本插件管理，
+         * core 不该反向依赖 ACP。此前 `buildProviderCacheEvent` 的注释写着"由 core 层追加"，
+         * 但全仓没有调用方 ⇒ provider 侧缓存命中**一直没有数据**，于是"按需注入会不会影响
+         * 缓存命中"这类问题无从验证（这正是这次改造要能回答的问题）。
+         *
+         * 失败不影响对话：用量已写进 assistant 消息，这里只是旁路观测。
+         */
+        'core.llm.usage'(signal) {
+          try {
+            const sctx = sessions.get(signal.sessionId)
+            if (!sctx) return
+            const ev = buildProviderCacheEvent({
+              sessionId: signal.sessionId,
+              round: sctx.round ?? 0,
+              cacheRead: signal.cacheRead,
+              cacheWrite: signal.cacheWrite,
+              requestTok: sctx.lastTokens,
+            })
+            if (!ev) return
+            // 与 preModel 同一套 writer（可能为 no-op：未配遥测路径时）
+            const telem = sctx.telemetry ?? createTelemetryWriter(undefined)
+            telem.write(ev)
+          } catch (err) {
+            plgCtx.log.warn?.('ACP providerCache 遥测写入失败（忽略）', { err: String(err) })
+          }
+        },
       } as Hooks
     },
 
@@ -959,19 +1006,22 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
   const request: Message[] = [...systemMsgs]
 
-  // ---- 压缩手册按需注入 ----
+  // ---- 压缩手册：常量在前缀、变量在尾部 ----
   // 占用率口径与遥测一致：telemetry 的 occupancy = requestTok / window，其中 requestTok =
   // estimateTokens(res.messages)（发往模型的 history cores，不含 system）、window = config.modelContextLimit。
   // 这里用同一公式（estimateTokens(res.messages, countTokens) / modelContextLimit）在注入点之前算一次，
-  // 不在两处写分叉的两份算法。低占用时只注入极简提示，省下完整手册的 token。
+  // 不在两处写分叉的两份算法。
+  //
+  // 前缀只放**恒定**文本：自动前缀缓存按最长公共 token 前缀命中，放在历史之前的文本一变，
+  // 其后全部内容（含整段历史）都要重算（代价量化见 MANUAL_INJECT_MARGIN 的注释）。
+  // 会变的完整手册一律挪到**尾部**（与 nudge 同位置），见下方 tailParts。
   const occupancy = estimateTokens(res.messages, countTokens) / Math.max(1, deps.config.modelContextLimit)
   const manualThreshold = (deps.config.nudge?.minContextLimitPct ?? 0.35) * MANUAL_INJECT_MARGIN
-  const wantFullManual =
-    deps.manualInjection === 'always' ||
-    deps.explicitSystemPrompt === true ||
-    occupancy >= manualThreshold
-  const systemText = wantFullManual ? deps.makeSystemPrompt() : COMPRESS_MANUAL_HINT
-  request.push(deps.tempMessage('system', systemText, sessionId))
+  const prefixText =
+    deps.explicitSystemPrompt === true || deps.manualInjection === 'always'
+      ? deps.makeSystemPrompt() // 宿主显式配置 / 对照臂：恒定，无翻转风险
+      : COMPRESS_MANUAL_HINT // 默认档：恒定的一行提示
+  request.push(deps.tempMessage('system', prefixText, sessionId))
 
   if (cacheHit) {
     // 增量：复用缓存前缀 + 只渲染新增尾部 core，并把尾部并入缓存供下一轮继续命中
@@ -992,10 +1042,24 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     ctx.needFull = false
   }
 
+  // 尾部注入：nudge 与（按需的）完整手册合并成**同一条** user 消息（不推两条相邻临时消息 ——
+  // 那只会多一处尾部差异，没有收益）。
+  //
+  // ⚠️ 必须用 `user` role，不能用 `system`：provider-anthropic 的 extractSystemPrompt 与
+  // provider-gemini 的 extractSystem 会把**任意位置**的 system 消息上提进顶层
+  // system / systemInstruction 字段（原位置直接 continue 跳过），用 system role 挪到尾部
+  // 等于没挪 —— 它会回到前缀，本方案的收益归零。只有 OpenAI 保持原序，不能指望它。
   const nudge = res.nudge
-  if (nudge?.shouldInject) {
-    const rendered = renderNudgeText(nudge, deps.prompts)
-    request.push(deps.tempMessage('user', rendered.text, sessionId))
+  const needTailManual =
+    deps.explicitSystemPrompt !== true &&
+    deps.manualInjection !== 'always' &&
+    occupancy >= manualThreshold
+  const tailParts = [
+    nudge?.shouldInject ? renderNudgeText(nudge, deps.prompts).text : '',
+    needTailManual ? deps.makeSystemPrompt() : '',
+  ].filter(Boolean)
+  if (tailParts.length > 0) {
+    request.push(deps.tempMessage('user', tailParts.join('\n\n'), sessionId))
   }
 
   // 原地替换待发消息

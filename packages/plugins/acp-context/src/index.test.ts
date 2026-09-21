@@ -1,4 +1,7 @@
 import { test, expect } from 'bun:test'
+import { mkdtempSync, readFileSync, existsSync } from 'node:fs'
+import { join } from 'node:path'
+import { tmpdir } from 'node:os'
 import {
   createCore,
   createInitialState,
@@ -901,23 +904,41 @@ test('runPreModel：低占用（on-demand）只注入极简提示、不注入完
   const sys = messages.find((m) => m.role === 'system')!
   expect((sys.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT) // 极简提示
   expect((sys.parts[0] as any).text).not.toBe('<acp system>') // 完整手册（mock 正文）未注入
+  // 任何位置（含尾部）都不得出现手册正文
+  expect(JSON.stringify(messages)).not.toContain('<acp system>')
 })
 
-test('runPreModel：占用率超过阈值（on-demand）注入完整手册', async () => {
+test('runPreModel：占用率超过阈值（on-demand）把完整手册注入**尾部**，前缀保持极简提示', async () => {
   const h = makeHarness(onDemandConfig(0.5), 's1', { manualInjection: 'on-demand' })
   const messages = history(100) // 占用率 ≈ 1600/2000 = 0.8，远超 0.5×0.9=0.45（且 < 0.95 不被压缩改写）
   await h.run(messages)
+
+  // 前缀必须恒定 —— 放前缀会让"手册出现"那一刻之后的整段历史在 provider 缓存里失效
+  // （量化见 MANUAL_INJECT_MARGIN 注释与 docs/usage-accounting-and-prompt-cache-plan.md §3）
   const sys = messages.find((m) => m.role === 'system')!
-  expect((sys.parts[0] as any).text).toBe('<acp system>') // 完整手册注入
+  expect((sys.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+
+  // 完整手册只在尾部，且**只有一条**尾部临时消息（nudge 与手册合并，不推两条相邻消息）
+  const tail = messages.filter((m) => m.id.startsWith('acp_user_'))
+  expect(tail).toHaveLength(1)
+  expect(tail[0]!.role).toBe('user') // 必须是 user role：system 会被 Anthropic/Gemini 上提前缀
+  expect((tail[0]!.parts[0] as any).text).toContain('<acp system>')
+  expect(messages[messages.length - 1]!.id).toBe(tail[0]!.id) // 确实在最后
+  // system 消息里不得出现手册正文
+  expect(
+    messages.filter((m) => m.role === 'system').map((m) => JSON.stringify(m.parts)).join(),
+  ).not.toContain('<acp system>')
 })
 
-test('createAcpContextPlugin：systemPrompt 显式覆盖 + on-demand，低占用也始终注入完整手册', async () => {
+test('createAcpContextPlugin：systemPrompt 显式覆盖 + on-demand，低占用也在前缀注入用户文本（不往尾部塞手册）', async () => {
   const preModel = await preModelFromPlugin({ systemPrompt: '<custom system>', modelContextLimit: 200000, manualInjection: 'on-demand' })
   const messages = history(3) // 低占用，但显式覆盖豁免阈值
   await preModel(messages)
   expect(messages[0]!.role).toBe('system')
   expect((messages[0]!.parts[0] as any).text).toBe('<custom system>')
   expect((messages[0]!.parts[0] as any).text).not.toBe(COMPRESS_MANUAL_HINT)
+  // 显式配置进**前缀**（恒定，无翻转风险）；尾部不再重复一份
+  expect(JSON.stringify(messages.slice(1))).not.toContain('<custom system>')
 })
 
 test('createAcpContextPlugin：manualInjection always，低占用也注入完整手册（旧行为）', async () => {
@@ -943,4 +964,56 @@ test('createAcpContextPlugin：compress 工具 documentation 非空且 ≤ 600 �
   expect(doc).toInclude('startId')
   expect(doc).toInclude('summary')
   expect(doc).toInclude('不再需要原文')
+})
+
+// ===== providerCache 遥测（引擎广播 core.llm.usage → 本插件落行）=====
+//
+// 背景：`buildProviderCacheEvent` 的注释一直写着"由 core 层追加"，但全仓没有调用方 ⇒
+// provider 侧缓存命中**从来没有数据**，于是"按需注入会不会影响缓存命中"这类问题无从验证。
+// 现在引擎在拿到用量后触发 `core.llm.usage`，本插件把它落成 providerCache 行。
+
+async function pluginWithTelemetry(): Promise<{ hooks: Hooks; path: string }> {
+  const dir = mkdtempSync(join(tmpdir(), 'acp-telem-'))
+  const path = join(dir, 's.telemetry.jsonl')
+  const plugin = createAcpContextPlugin({ modelContextLimit: 20000, telemetryPathBuilder: () => path })
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+  return { hooks, path }
+}
+
+const runPreModelOnce = (hooks: Hooks, messages: Message[]) =>
+  hooks['core.session.preModel']!(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] } as any,
+    messages,
+  )
+
+test('core.llm.usage：把引擎广播的缓存命中/写入落成 providerCache 遥测行', async () => {
+  const { hooks, path } = await pluginWithTelemetry()
+  // 先跑一轮 preModel：会话上下文（含遥测 writer）在那里按 sessionId 建立
+  await runPreModelOnce(hooks, history(3))
+
+  hooks['core.llm.usage']!({ sessionId: 's', input: 1000, output: 50, cacheRead: 900, cacheWrite: 0 })
+  // writer 有 500ms debounce：等一拍再读
+  await new Promise((r) => setTimeout(r, 600))
+
+  const rows = readFileSync(path, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  const pc = rows.filter((r) => r.kind === 'providerCache')
+  expect(pc).toHaveLength(1)
+  expect(pc[0].sessionId).toBe('s')
+  expect(pc[0].cacheRead).toBe(900)
+  expect(pc[0].cacheWrite).toBe(0)
+})
+
+test('core.llm.usage：无缓存字段不写行（避免噪声）；未知会话静默跳过（不抛）', async () => {
+  const { hooks, path } = await pluginWithTelemetry()
+  // 未知会话：不得抛错，也不写任何行
+  expect(() => hooks['core.llm.usage']!({ sessionId: 'nope', input: 1, output: 1, cacheRead: 5 })).not.toThrow()
+
+  await runPreModelOnce(hooks, history(3))
+  // 已知会话但没有缓存字段 ⇒ builder 返回 null ⇒ 不写 providerCache
+  hooks['core.llm.usage']!({ sessionId: 's', input: 10, output: 1 })
+  await new Promise((r) => setTimeout(r, 600))
+
+  const text = existsSync(path) ? readFileSync(path, 'utf-8') : ''
+  expect(text).not.toContain('providerCache')
+  expect(text).toContain('preModel') // 遥测本身是通的（证明"没写"不是因为整条链路没开）
 })
