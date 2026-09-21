@@ -1,0 +1,280 @@
+# 用量纳管（引擎层）与 ACP 手册注入的缓存方案
+
+> 立项背景：会话 `s_1789916436883_ra6w1` 分析与 token 归因（报告见 `reference/workbuddy/`）暴露出
+> 两个遗留问题：① 用量累计与写盘的**唯一实现方在 TUI 层**，headless/REPL 宿主与子 agent 会话的
+> 用量完全不可见；② ACP 压缩手册刚改成"按需注入"，但它是**前缀元素**，翻转会冲掉 prompt 缓存。
+> 本文给这两件事的落地方案。文中所有行号均为 2026-09-21 工作区实测。
+
+---
+
+## 0. 结论速览
+
+**① 用量纳管**：把累加器从 `packages/cli` 搬到 `@harness/core`（纯函数抽成新包 `@harness/usage`），
+TUI 退化为**渲染器**。核心难点不是"算"，而是**幂等**——必须带 fold checkpoint + 自愈重建，
+否则重开会话会把历史消息再算一遍（**重复计数**），而这正是 `status: shouldPersistUsage` 当初要挡的坑。
+
+**② 缓存**：按需注入的**方向对、位置错**。当前手册注入在 `system[1]`（整个历史之前），
+一旦越阈值翻转，其后**全部前缀（含历史）**变为未命中：
+
+| | 量级 |
+|---|---|
+| 翻转一次的成本 | ≈ **95K token-equiv**（前缀 ≈105K tokens × 未命中溢价 0.9） |
+| 按需省下的成本 | ≈ **259 token-equiv/次**（1.9K tokens × 缓存命中折算 0.137） |
+| 回本需要 | ≈ **366 次调用** |
+
+⇒ 对**会越阈值的会话是净亏**，对不越阈值的会话是纯赚（ra6w1 峰值仅 13.3%，属后者）。
+改法：**变量部分改用 `user` role 注入到尾部**（与 nudge 同位置），前缀只留常量 → 两个场景都纯赚。
+
+> ⚠️ 不能用 `system` role 移到尾部：`provider-anthropic:125` 的 `extractSystemPrompt` 与
+> `provider-gemini:117` 的 `extractSystem` 会把**任意位置**的 system 消息上提进顶层 system /
+> systemInstruction 字段（`provider-anthropic:215`、`provider-gemini:211` 跳过原位置）——
+> 移到尾部等于**白移**。只有 OpenAI（`provider-openai:173-179`）保持原序。nudge 早就用 `user`
+> role 注入尾部（`acp-context:997`），是现成的正确先例。
+
+---
+
+## 1. 证据基线
+
+| # | 事实 | 证据 |
+|---|---|---|
+| 1 | 每次调用的 usage 引擎侧**已经拿得到** | `core:1994` 声明 → `core:2047`（流式 chunk）/ `core:2089`（complete）赋值 |
+| 2 | 已经落在消息上、且随消息落盘 | `core:2105-2115` 写 `assistant.meta.tokenUsage {input,output,cacheRead,cacheWrite}`，`core:2266` 入库 |
+| 3 | 累加与写盘的**唯一实现方**在 TUI | `tui.tsx:1085-1115`（`recordCall`/`recordTool`）、`tui.tsx:1220-1222`（写 `meta[USAGE_STATS_KEY]` + 800ms 防抖落盘） |
+| 4 | 累加器是**零依赖纯函数**，可抽包 | `usage-stats.ts:111 recordCall` / `:200 recordTool` / `:309 mergeUsage` / `:391 sumUsage` |
+| 5 | 已存在"从消息重建用量"的能力 | `usage-stats.ts:495 usageFromMessages()`（含"本轮 LLM 用量归并到紧随的首个工具"规则） |
+| 6 | 会话 meta 可由引擎写 | `core:951 updateMeta(sessionId, patch)`；`:1056` 已有同款写法 |
+| 7 | 子 agent 会话走**同一条**引擎路径 | subagent 内部 `session.create()` 后仍由 `core._runOneStep` 执行 ⇒ 引擎层累加自动覆盖 |
+| 8 | provider 侧缓存命中**当前无数据** | `telemetry.ts:214 buildProviderCacheEvent` **只有定义、全仓无调用方**（注释称"由 core 层追加"，实际未接线） |
+| 9 | 全仓**无人设置**显式缓存断点 | `cache_control` / `cachedContent` 均只出现在"读用量"侧 ⇒ 缓存全依赖 provider 自动前缀缓存 |
+| 10 | ACP 手册注入点与 nudge 注入点 | 手册 `acp-context:973-974`（`system`）；nudge `acp-context:997`（`user`，尾部） |
+| 11 | ra6w1 从未越阈值 | 遥测 33 轮 `preModel`，占用率 0.009→0.133，阈值 `0.35×0.9=0.315`，**越阈轮次为空** |
+
+---
+
+## 2. 方案 A：用量纳管搬到引擎层
+
+### 2.1 口径分裂的实质
+
+```
+现在（两条链，互不知情）：
+  引擎：assistant.meta.tokenUsage  ──→  随消息落盘（所有宿主都有）
+  宿主：TUI 内存累加器            ──→  sess.meta[usageStats]（只有 TUI 写）
+                                   └─→  headless / REPL / ACP 宿主 / 子会话 → 无人写 → 用量不可见
+```
+
+子 agent 那约 1.5M 输入 token 之所以"不入账"，不是子 agent 特殊，而是**它没有 TUI**。
+
+### 2.2 目标 / 非目标
+
+**目标**
+1. 任何宿主（TUI / REPL / headless / ACP）与任何会话（含子 agent）都有 `meta.usageStats`；
+2. 同一会话的用量**只被累加一次**（幂等），重复打开不翻倍；
+3. TUI 的 `/stats`、`/stats-export`、重连后数字与落盘一致（口径单一）。
+
+**非目标**（本次不做）
+- 计费换算（不同 provider 单价不同，保持"token 口径"）；
+- 实时推送（宿主轮末读一次足够，避免为展示引入每步事件）。
+
+### 2.3 分层
+
+```
+@harness/usage（新包，纯函数，零依赖）
+  ├─ UsageStats / recordCall / recordTool / recordTaskDone / mergeUsage / sumUsage
+  ├─ usageFromMessages()      ← 自愈与迁移共用
+  ├─ hydrateUsage / renderStatsText / usageFromLines…
+  └─ foldAssistantStep(usage, message) ← 新增：单步折叠（与 usageFromMessages 同一套规则）
+
+@harness/core
+  └─ 唯一累加者：每步结束时 foldAssistantStep → session.updateMeta(USAGE_STATS_KEY)
+                  + checkpoint（见 2.4）
+
+宿主（cli/tui、repl、headless、acp）
+  └─ 只读：harness.usage.get(sessionId) / 读 session.meta[USAGE_STATS_KEY] 渲染
+```
+
+- `packages/cli/src/usage-stats.ts` 变为**薄再导出**（`export * from '@harness/usage'`），
+  保 378 个 cli 测试与既有一切导入不动 —— 与 `tui.tsx:698-712` 现有 re-export 手法一致。
+- core 新增只读 API：`harness.usage.get(sessionId) → UsageStats`，内部即 `hydrateUsage(session.meta)`。
+
+### 2.4 关键正确性：fold checkpoint + 自愈（**这是本方案唯一的硬骨头**）
+
+引擎每步折叠一次，就必须回答"这一步算过没有"。规则：
+
+1. **checkpoint**：在 `meta.usageStats` 旁存 `usageFold: { upToMessageId: string }` —— 已折叠到的
+   assistant 消息 id（会话内消息**追加为主**，最后一个已折叠 id 足以定位）；
+2. **正常打开**：读 `hydrateUsage(meta)` 作为起点，只折叠 id **不在** checkpoint 之前的部分（增量）；
+3. **自愈**：若 checkpoint 的 id 在消息列表里**找不到**（被 `/compact`、`deleteMessage`、手工编辑
+   破坏），放弃增量、用 `usageFromMessages(messages)` **全量重建**并重写 checkpoint。
+   —— 这条是必需的：`usageFromMessages` 已存在且经过测试，重建比"猜测漏算了什么"更可靠；
+4. **写入时机**：复用刚上线（续 167）的脏会话机制——`updateMeta` 会标脏，CLI 在轮末
+   `flushDirtySessions()` 落盘。**不要**在引擎里直接 `sessionStore.save`（会与宿主写盘打架）。
+5. **子会话**：无特殊处理，`_runOneStep` 自动覆盖；父会话只做**展示层聚合**（见 §5 待拍板）。
+
+> 反例警告（历史教训）：`tui.tsx` 模块 4 注释里记的"空累积器覆盖已持久化历史 ⇒ 重连后清零"
+> 就是**没有 checkpoint/幂等设计**的后果。搬到引擎层时若只搬逻辑不搬幂等，会把同一个 bug
+> 从'清零'变成'翻倍'。
+
+### 2.5 落地阶段
+
+| 阶段 | 内容 | 验收 |
+|---|---|---|
+| **P1** | 抽包 `@harness/usage`；cli 侧改再导出 | 全量测试仍 1665 pass；cli 378 例不动 |
+| **P2** | core 折叠 + checkpoint + 自愈 + `harness.usage.get`；**移除** TUI 对 `meta` 的写入（保留内存展示，改从引擎读） | 新增：① 同一会话重开两次，用量**不翻倍**；② checkpoint 被破坏 ⇒ 自愈重建且数值与 `usageFromMessages` 一致；③ 子 agent 会话 `meta.usageStats` 非空；④ headless `run` 也写出 `meta.usageStats` |
+| **P3** | 接 `providerCache` 遥测（见 §3.7）；`/stats` 增"缓存命中率"行 | 遥测出现 `kind:'providerCache'` 行；与 usage 侧 `cacheReadTokens` 对得上 |
+| **P4** | 展示层：父会话聚合子 agent 用量（可选，见 §5） | `/stats` 能区分"本会话 / 含子 agent" |
+
+### 2.6 风险与回退
+
+- **风险 1：双写期数字打架**。P2 若与旧 TUI 并存（同一次会话被新旧代码先后打开），
+  以 checkpoint 为准即可收敛（第 3 条的 id 找不到就会重建）。为稳妥，P2 上线时把 TUI 写盘
+  一并**在同一提交里**删掉，不留中间态。
+- **风险 2：`updateMeta` 频率**。折叠发生在每步结束，`updateMeta` 是内存更新（标脏），
+  真正 IO 由已有的 800ms/轮末防抖承担 ⇒ 不引入新 IO 压力。
+- **回退**：`@harness/usage` 是纯函数，回退只需让 TUI 恢复为累加者（保留本方案的再导出层即可）。
+
+---
+
+## 3. 方案 B：ACP 手册注入的缓存修正
+
+### 3.1 前缀缓存的几何
+
+请求布局（`acp-context:960-1000`）：
+
+```
+[ system(Agent 提示) ][ system(手册 | 提示行) ][ …整段历史 … ][ (可选) nudge(user) ]
+   ↑ 常量                ↑ 现在在这里：变量、且在前缀最前面          ↑ 尾部：变量，天然不伤缓存
+```
+
+自动前缀缓存按**最长公共 token 前缀**命中。手册在第 2 位 ⇒ 它一变，**后面全不匹配**（含历史）。
+
+### 3.2 翻转频率：几乎不会来回抖
+
+占用率 = `estimateTokens(res.messages)/modelContextLimit`（与遥测同公式，`acp-context:968-973`）。
+历史只追加 ⇒ **占用率单调不减**，唯一下降来源是"真的压缩了"。所以：
+
+- 未越阈值：始终 `HINT`（常量）⇒ 缓存正常；
+- 首次越 `0.315`：`HINT → 全部手册`，**一次失效**；
+- 之后：手册保持（占用率不回落）⇒ 缓存恢复正常；
+- 压缩后若占用率掉回 `0.315` 以下：`手册 → HINT`，**看似第二次失效 —— 但那一轮历史本身已被
+  改写**（`acp-context:931-933` 检测消息数变化即 `ctx.needFull`，provider 侧同样必然 miss），
+  **等于免费**。
+
+⇒ 有效翻转次数 ≈ **1 次/会话**（对会越阈值的会话）。问题不在频率，在这 1 次的**代价**。
+
+### 3.3 代价量化（为什么必须改位置）
+
+越阈值时的前缀规模 = 工具载荷 8,354 tok + system 2,504 tok + 历史 `0.315×300K = 94,500` tok
+≈ **105K tokens**。翻转使这些 token 由"命中价（≈0.1×）"变成"全价（1×）"：
+
+```
+一次翻转的额外成本 ≈ 105K × 0.9 ≈ 94.5K token-equiv
+按需注入的收益     ≈ 1,888 tok/次 × 0.137 ≈ 259 token-equiv/次
+回本需要           ≈ 366 次调用
+```
+
+也就是说：**短会话（不越阈值）赚，长会话（越阈值，正是需要压缩的那类）亏**。
+根因不是"要不要按需"，而是"把变量放进了前缀"。
+
+### 3.4 改法：常量在前缀、变量在尾部、兜底在工具文档
+
+| 位置 | 放什么 | 性质 |
+|---|---|---|
+| `system[1]`（前缀，常量） | 极简提示行（现有 `COMPRESS_MANUAL_HINT`，57 字符） | **永不变化** ⇒ 零缓存代价 |
+| 尾部（`user` role，变量） | 完整手册；仅当 `occupancy ≥ minContextLimitPct × 0.9` **或** nudge 将要注入时 | 与 nudge 同位置、同 role ⇒ 不进入前缀 |
+| `compress` 工具的 `documentation`（已做） | 223 字符的"何时压/给什么"要点 | 在工具载荷里，常量、随缓存复用 |
+
+实现要点（`acp-context:960-1000`）：
+
+```ts
+// 1) 前缀只留常量（行为不变）
+request.push(deps.tempMessage('system', COMPRESS_MANUAL_HINT, sessionId))
+
+// 2) 渲染历史（原逻辑不动）…
+
+// 3) 尾部：手册与 nudge **合并进同一条 user 消息**（避免两条相邻临时消息各触发一次尾部差异）
+const needFullManual = deps.manualInjection === 'always'
+  || deps.explicitSystemPrompt === true
+  || occupancy >= manualThreshold
+const nudgeText = res.nudge?.shouldInject ? renderNudgeText(res.nudge, deps.prompts).text : ''
+if (needFullManual || nudgeText) {
+  const tail = [nudgeText, needFullManual ? deps.makeSystemPrompt() : ''].filter(Boolean).join('\n\n')
+  request.push(deps.tempMessage('user', tail, sessionId))
+}
+```
+
+- `manualInjection: 'always'` 语义改为"每轮都在尾部注入完整手册"（**缓存代价仍为 0**，
+  因为它不再进前缀）；这比现在的"回到旧行为（进前缀）"更好，也顺手把该选项从"缓存陷阱开关"
+  变成"提示强度开关"；
+- `systemPrompt` 显式覆盖 ⇒ 同上，始终在尾部注入（保持"用户显式要求优先"）；
+- 不要用 `system` role（§0 的 ⚠️）。
+
+### 3.5 顺带发现：Anthropic 侧**根本没有缓存**
+
+`cache_control` 全仓无人设置（§1 第 9 条），而 Anthropic 的 prompt caching 需要显式断点
+（`cache_control: {type:'ephemeral'}`）才会启用。也就是说：
+
+- **DeepSeek / OpenAI / Gemini 用户**：走自动前缀缓存 → §3.3 的位置分析成立，本方案收益为正；
+- **Anthropic 用户**：压根没有缓存 ⇒ 按需注入**纯省**（省的是全价 token），但同时说明
+  Anthropic 侧一直在**全额重付 system + 工具 + 历史** —— 这是个比手册大小大得多的优化空间，
+  建议单独立项（加 1~2 个断点：工具+system 之后一个、历史尾部一个）。
+
+### 3.6 为什么这方案不牺牲压缩能力
+
+"手册只在需要时出现"完全符合手册本身的用途——它教模型**何时压、怎么给 range**，而模型决定
+压缩的时机由 nudge 驱动。尾部注入让手册与 nudge **同轮出现、位置相邻**，可读性反而优于
+"手册 8K 字符埋在第 2 位、nudge 在尾部"的现状。持久信息仍由 `compress` 工具文档承载。
+
+### 3.7 验收前提：先把 provider 缓存接上遥测
+
+现在**无法用数据回答"缓存命中受影响吗"**，因为 `buildProviderCacheEvent`（`telemetry.ts:214`）
+从未被调用。接线方式（保持分层，core 不反向依赖 acp-context）：
+
+```
+core（拿到 tokenUsage 处，core:2105 附近）
+  └─ bus.publish('provider.usage', { sessionId, round, cacheRead, cacheWrite, input, output })
+       └─ acp-context 订阅 → appendTelemetry(buildProviderCacheEvent(...))
+```
+
+验收标准（做 A/B）：
+1. 构造一个**必然越阈值**的小窗口会话（如 `modelContextLimit: 6000`，跑 20+ 轮）；
+2. 记录每轮 `providerCache.cacheRead`；预期：改位置前有**一次骤降**（≈ 前缀规模），改位置后
+   无骤降、全程平滑；
+3. 对照 `acpCacheHit`（ACP 自己的渲染前缀命中）区分"ACP 层失效"与"provider 层失效"。
+
+---
+
+## 4. 顺带修掉的两个小缺陷
+
+| # | 问题 | 位置 | 修法 |
+|---|---|---|---|
+| 1 | `buildProviderCacheEvent` 死代码 ⇒ provider 缓存命中**无数据** | `telemetry.ts:214` | §3.7 的 bus 接线 |
+| 2 | CLI 无法透传 `compression.manualInjection`（只能吃默认值） | `cli/src/index.ts:2638` 附近 | 装配处补一个透传键；做成对照实验的开关 |
+
+---
+
+## 5. 待拍板
+
+1. **`@harness/usage` 独立成包，还是直接放进 core？**
+   它零依赖、约 600 行纯函数。独立包的收益是"宿主可复用、core 不膨胀"；塞进 core 的收益是
+   少一个包、少一次 workspace 变更。我倾向前者（cli 侧要长期再导出，独立包语义更清晰）。
+2. **父会话是否把子 agent 用量并入总数？**
+   子会话现在有独立 `meta.usageStats`，父会话要看"这条链一共花了多少"就得聚合。建议：
+   `meta.usageStats` 保持**本会话**口径（不合并，避免历史会话里出现"同一个子会话被算两次"），
+   展示层提供"含子 agent"一行（数据齐备，随时可加）。
+3. **手册最终形态**：尾部注入（本方案）还是**完全不注入**（只留工具文档 + nudge 文案）？
+   后者更省，但会削弱"何时该压"的教学。建议先做尾部注入，观察压缩触发率是否变化。
+4. **Anthropic 显式缓存**是否立项？（§3.5，收益量级可能远大于本方案）
+
+---
+
+## 6. 建议的推进顺序
+
+```
+P1 抽包（低风险、无行为变化）
+ → P2 core 折叠 + checkpoint/自愈（本方案主要工程量）
+ → 方案 B 的位置修正（小改动、大收益、可独立验证）
+ → P3 providerCache 遥测接线 + A/B 验证（给方案 B 提供证据）
+ → P4 展示层聚合 / Anthropic 缓存（另议）
+```
+
+> P1/P2 与方案 B **无依赖**，可以并行推进；方案 B 的建议顺序是"先改位置、再用 P3 的遥测证明"。
