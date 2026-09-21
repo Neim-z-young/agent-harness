@@ -367,6 +367,51 @@ async function safeExecuteTool(
   }
 }
 
+/** 按 JSON Schema 的 type 生成一个占位值（只为让模型看懂"形状"，不是可直接使用的答案） */
+function placeholderForType(type?: string): unknown {
+  switch (type) {
+    case 'number':
+    case 'integer': return 0
+    case 'boolean': return true
+    case 'array': return []
+    case 'object': return {}
+    default: return '<string>'
+  }
+}
+
+/**
+ * 「入参自愈」：模型发出**零参数**工具调用时，把该工具的必填参数与最小示例直接写进错误消息。
+ *
+ * 为什么需要：schema 只影响模型"看不看得懂"，运行时的缺参保护在各工具入口（AGENTS.md 的硬约定）。
+ * 真机实测（会话 `s_1789996799007_9cq9r`）模型会整段丢掉 tool-call arguments —— 100 次调用里
+ * 37 次失败，其中 34 次 `input: {}`；这些轮的 output 中位数只有 22 token（发个空壳就结束），
+ * 且**失败率随上下文增长从 12% 升到 50%**。原样回传错误消息时模型只能盲猜重试，
+ * 每次失败都实打实烧掉一轮完整 prompt（占该会话上下文的 43.6%）。
+ *
+ * 只在「必填项一个都没给全」时才附加：必填齐全 ⇒ 是别的业务错误，不掺和（避免噪音与误伤）。
+ */
+function describeMissingRequiredParams(tool: Tool, input: unknown): string | undefined {
+  const schema = tool.inputSchema?.__jsonSchema
+  const required = Array.isArray(schema?.required) ? (schema!.required as string[]) : []
+  if (required.length === 0) return undefined
+  const obj = input && typeof input === 'object' && !Array.isArray(input)
+    ? (input as Record<string, unknown>)
+    : undefined
+  const present = required.filter((k) => obj != null && obj[k] !== undefined && obj[k] !== null)
+  if (present.length === required.length) return undefined
+  const props = (schema?.properties ?? {}) as Record<string, { type?: string; description?: string }>
+  const lines = required.map((k) => {
+    const p = props[k] ?? {}
+    return `  - ${k}（${p.type ?? 'any'}）${p.description ? `：${p.description}` : ''}`
+  })
+  const example: Record<string, unknown> = {}
+  for (const k of required) example[k] = placeholderForType(props[k]?.type)
+  const got = present.length > 0 ? `（已给出：${present.join('、')}）` : '（一个都没给）'
+  return `[入参自愈] 工具「${tool.id}」缺少必填参数${got}。\n` +
+    `必填参数：\n${lines.join('\n')}\n` +
+    `最小示例：${JSON.stringify(example)}`
+}
+
 export class DefaultPermissionEngine implements PermissionEngine {
   private rules: PermissionRuleset
   constructor(rules: PermissionRuleset = { '*': 'ask' }) {
@@ -2278,13 +2323,26 @@ export class AgentRuntimeImpl implements AgentRuntime {
         // 接上真正会 abort 的信号：bash 据此 kill 子进程、web 工具据此中止 fetch。
         // 未传 signal 时才退回新建（保持向后兼容 —— 旧调用方行为不变）。
         signal: signal ?? new AbortController().signal,
-        variables: {},
+        // callerToolIds：本轮该 Agent **实际可用**的工具 id 列表。
+        // 消费方是 subagent 插件 —— 它据此判断"回给父 Agent 的完整输出用 read_file 读不读得到"。
+        // 此前这个字段只有读取方没有写入方（声明了却没人填），提示语因此永远走错分支。
+        variables: { callerToolIds: allowedTools.map((t) => t.id) },
         cwd: tctxCwd,
         requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest, this.deps.triggerPlugin) as Promise<ToolPermissionDecision>,
       }
       const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, parsedInput, tctx)
       resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
       resultPart.isError = !res.ok
+      // 入参自愈：模型偶发发出**零参数**工具调用（`input: {}`），工具入口按 Fail-Closed 拒绝。
+      // 原样回传错误消息时模型只能盲猜重试（真机实测：37% 的调用如此，长上下文下失败率升到 50%）。
+      // 这里把"这个工具到底要什么参数"直接摆到错误消息里，让它在**同一次**重试里就能补齐。
+      if (!res.ok) {
+        const heal = describeMissingRequiredParams(tool, parsedInput)
+        if (heal && resultPart.result && typeof resultPart.result === 'object') {
+          (resultPart.result as { message?: string }).message =
+            `${(resultPart.result as { message?: string }).message ?? '入参不合法'}\n\n${heal}`
+        }
+      }
       assistant.parts.push(resultPart)
 
       yield {
