@@ -39,9 +39,9 @@ import type { AgentRuntime, SessionManager } from '@harness/core'
 import type { Message } from '@harness/session'
 import { BusEvent, type Bus } from '@harness/bus'
 import { matchGlob } from '@harness/permission'
-import { writeFileSync, existsSync, readdirSync, readFileSync } from 'node:fs'
+import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync } from 'node:fs'
 import { mkdir, writeFile, appendFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { join, dirname, resolve as resolvePath, sep } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWorktree } from './worktree'
 // SubagentTool 提示词文本（prompts/*.txt，import 加载，参考 opencode）
@@ -170,8 +170,16 @@ export const SubagentEvents = {
 export interface SubagentToolInput {
   /** 子 Agent ID（必须已注册且 mode === 'subagent'） */
   agentId: string
-  /** 派给子 Agent 的任务描述 */
+  /**
+   * 派给子 Agent 的任务描述
+   */
   prompt: string
+  /**
+   * 本次子任务的步数上限（可选）。优先级高于子 Agent 自身的 `AgentDefinition.maxSteps`
+   * 与插件默认值 —— 派工方比 agent 定义更清楚「这一次」的规模（同一 reader 既可能只看一个
+   * 文件、也可能通读整个仓库）。不传则保持旧行为。
+   */
+  maxSteps?: number
   /** 3-5 词简短描述（用于 UI 展示和工具调用日志，类似 Claude Code 的 description 参数） */
   description?: string
   /** 模型覆盖（优先级高于子 Agent 定义中的 model；不传则用子 Agent 自身配置） */
@@ -212,9 +220,15 @@ export interface SubagentToolOutput {
   summarized: boolean
   /** 子 Agent 内部工具调用次数 */
   toolCallCount: number
-  /** 完整输出的临时文件路径（summarized=true 时有值，父 Agent 可用 read_file/grep_file 探索） */
+  /**
+   * 完整输出的落盘路径（summarized=true 时有值）。
+   *
+   * 落在 `{dataDir}/subagent-results/`（与会话/任务记录同域、系统不清理）；dataDir 不可用时
+   * 退化为 OS 临时目录。**该路径通常在调用方工作目录之外**，此时 `read_file`/`grep_file`
+   * 会以 `PATH_OUTSIDE_CWD` 拒绝 —— 摘要文本里的提示会如实说明，不要假定可读。
+   */
   outputPath?: string
-  /** 相对基线 HEAD 的完整 diff 补丁临时文件路径（worktree 隔离启用且子 Agent 有改动时有值） */
+  /** 相对基线 HEAD 的完整 diff 补丁路径（worktree 隔离启用且子 Agent 有改动时有值；与 outputPath 同域） */
   diffPath?: string
   /** 后台任务 ID（runInBackground=true 时有值） */
   taskId?: string
@@ -275,6 +289,18 @@ export interface SubagentPluginOptions {
  * 子 Agent 应在自己的 AgentDefinition 里显式写 `maxSteps`，或直接用插件 `maxSteps` 选项覆盖。
  */
 export const DEFAULT_SUBAGENT_MAX_STEPS = 20
+
+/**
+ * 摘要给父 Agent 的最大结果长度（字符），超过则生成摘要并把全文落盘。
+ *
+ * 由 2000 提到 8000 的依据（真机实测，会话 `s_1789996799007_9cq9r`）：
+ * 9 份子 Agent 报告的正文是 **4532 ~ 10195 字符**，在 2000 阈值下 **9/9 全部被截断**；
+ * 父 Agent 于是不得不 `bash cp` 把 tmp 文件搬回工作目录再 read_file 逐份读回——
+ * 约 10 轮纯管道操作。提到 8000 后 8/9 不再截断，且**上下文增量几乎为零**：
+ * 那些报告本来就只比 2000 高一点，截断省下的字数远小于搬运的轮次成本。
+ * 之所以不设更大：摘要仍是"子 Agent 返回超长内容"时的安全阀，需要全文时按路径取用。
+ */
+export const DEFAULT_MAX_RESULT_LENGTH = 8000
 
 /** Harness 引用的最小接口（避免 import core 导致循环依赖） */
 interface HarnessLike {
@@ -426,6 +452,47 @@ function countToolCalls(messages: Message[]): number {
   return count
 }
 
+/** 完整子 Agent 输出的落盘子目录名（与 `{dataDir}/tasks` 同级） */
+export const SUBAGENT_RESULTS_DIRNAME = 'subagent-results'
+
+/**
+ * 把子 Agent 的完整输出落盘，返回实际写入路径。
+ *
+ * - **优先 resultsDir**（`{dataDir}/subagent-results`）：与会话/任务记录同域，系统不清理。
+ * - resultsDir 不可用或写失败 ⇒ 退化到 OS 临时目录（调用方据此如实提示，不谎称可读）。
+ * - 文件名 = 时间戳 + 随机段。**只用 `Date.now()` 会让同毫秒并发的多个子任务撞名互相覆盖**
+ *   ——同批派工的时间戳只差几毫秒，这是真实踩过的坑（子 session ID 也曾因此碰撞）。
+ *
+ * 全程 best-effort：写失败不抛错，仍返回首个候选路径供提示使用（不静默，由调用方记 warn）。
+ */
+function writeResultFile(text: string, kind: 'output' | 'diff', resultsDir?: string): string {
+  const ext = kind === 'diff' ? 'patch' : 'txt'
+  const name = `subagent-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+  const candidates = resultsDir
+    ? [join(resultsDir, name), join(tmpdir(), name)]
+    : [join(tmpdir(), name)]
+  for (const p of candidates) {
+    try {
+      mkdirSync(dirname(p), { recursive: true })
+      writeFileSync(p, text, 'utf-8')
+      return p
+    } catch { /* 换下一个候选目录 */ }
+  }
+  return candidates[0]
+}
+
+/**
+ * 判断路径是否落在给定目录内（含目录本身）。
+ * 用于回答「read_file / grep_file 到底读不读得到这个文件」——工作目录外的路径它们会被
+ * `PATH_OUTSIDE_CWD` 拒绝，所以提示里绝不能承诺可读。
+ */
+function isInsideDir(p: string, dir?: string): boolean {
+  if (!dir) return false
+  const a = resolvePath(p)
+  const b = resolvePath(dir)
+  return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep)
+}
+
 /**
  * 当子 Agent 最终回复过长时生成摘要。
  *
@@ -444,7 +511,9 @@ function countToolCalls(messages: Message[]): number {
  * @param finalText 子 Agent 最终回复文本
  * @param maxResultLength 最大结果长度（字符），超过则摘要
  * @param maxResultLines 最大结果行数，超过则摘要
- * @param callerToolIds 父 Agent 可用工具 ID 列表（用于智能提示）；不传则给出通用提示
+ * @param callerToolIds 父 Agent 可用工具 ID 列表（用于智能提示）；不传则按「不可读」处理
+ * @param resultsDir 完整输出的落盘目录（`{dataDir}/subagent-results`）；不可用时退 OS 临时目录
+ * @param callerCwd 父 Agent 工作目录；用于判定 `read_file`/`grep_file` 是否真能读到落盘文件
  * @returns { text, summarized, outputPath } 摘要后的文本、是否被摘要、完整输出文件路径
  */
 function summarizeResult(
@@ -453,6 +522,8 @@ function summarizeResult(
   maxResultLength: number,
   maxResultLines: number,
   callerToolIds?: string[],
+  resultsDir?: string,
+  callerCwd?: string,
 ): { text: string; summarized: boolean; outputPath?: string } {
   const lines = finalText.split('\n')
   const totalLines = lines.length
@@ -502,22 +573,39 @@ function summarizeResult(
       : finalText
   }
 
-  // 完整输出写入临时文件
-  const outputPath = join(tmpdir(), `subagent-output-${Date.now()}.txt`)
-  try {
-    writeFileSync(outputPath, finalText, 'utf-8')
-  } catch {
-    // 写文件失败不影响主流程，outputPath 仍返回但文件可能不存在
-  }
+  // 完整输出写入结果目录。
+  //
+  // 为什么不写 os.tmpdir()：macOS 会定期清理 `/var/folders/**/T`，重启即丢；而这里存的是
+  // **全文唯一一份**（落盘的 `{dataDir}/tasks/<taskId>.json` 只存摘要）⇒ 丢了再也找不回来。
+  // 所以优先落 `{dataDir}/subagent-results/`（与会话/任务记录同域、不被系统清理、
+  // 也不污染用户仓库 cwd）；dataDir 不可用时才退化为 OS 临时目录。
+  const outputPath = writeResultFile(finalText, 'output', resultsDir)
 
-  // 智能提示：根据父 Agent 可用工具给出不同的后续操作建议
-  // 参考 OpenCode 的 hasTaskTool 逻辑
+  // 智能提示：只说**当前真的成立**的事实。
+  //
+  // 历史教训：这里曾按「调用方有没有 read_file」拼提示，但 `callerToolIds` 全仓没有写入方
+  // （core 从未把 ctx.variables.callerToolIds 填上，只有测试手动塞）⇒ 实际永远走 else 分支，
+  // 而 else 分支写的是「请考虑拆分任务」——把「报告超了 2000 字符阈值」误报成「任务太大」。
+  // 现在两个判据缺一不可：**调用方真有 read_file/grep_file** 且 **路径确实在工作目录内**，
+  // 否则不许承诺能读（承诺了模型必然去试，试必然失败）。
   const hasReadFile = callerToolIds?.includes('read_file') ?? false
   const hasGrepFile = callerToolIds?.includes('grep_file') ?? false
   const hasSubagent = callerToolIds?.includes('subagent') ?? false
-  const hint = hasReadFile || hasGrepFile
-    ? `完整输出已保存至：${outputPath}（共 ${totalLines} 行 / ${totalChars} 字符）。可使用 read_file 或 grep_file 工具查看。${hasSubagent ? ' 或再次调用 subagent 工具委派 explore agent 处理。' : ''}`
-    : `完整输出已保存至：${outputPath}（共 ${totalLines} 行 / ${totalChars} 字符）。${hasSubagent ? '可再次调用 subagent 工具委派 explore agent 处理。' : '请考虑拆分任务。'}`
+  const insideCwd = isInsideDir(outputPath, callerCwd)
+  const sizeNote = `（共 ${totalLines} 行 / ${totalChars} 字符）`
+  const nextStep = hasSubagent
+    ? '如需其中内容，请改派一个更窄的子任务（只取其中需要的部分），不要整篇重读。'
+    : '如需其中内容，请缩小派工范围后重试。'
+  // 三种情形分别有各自**为真**的说法，不含任何猜测：
+  // ① 读得到（有读文件工具 + 路径在工作目录内）⇒ 才敢承诺可读；
+  // ② 路径在工作目录内但本次派工方没有读文件工具 ⇒ 只报事实 + 给下一步，不猜它有什么工具；
+  // ③ 路径在工作目录之外 ⇒ 明确说明 read_file/grep_file **读不到**（否则模型必去试、试必失败）。
+  const location = (hasReadFile || hasGrepFile) && insideCwd
+    ? `可使用 read_file 或 grep_file 工具查看。${hasSubagent ? ' 或再次调用 subagent 工具委派 explore agent 处理。' : ''}`
+    : insideCwd
+      ? nextStep
+      : `该路径不在工作目录内，read_file 与 grep_file 读不到它。${nextStep}`
+  const hint = `完整输出已保存至：${outputPath}${sizeNote}。${location}`
 
   // 构建摘要
   const out: string[] = [preview]
@@ -547,7 +635,7 @@ function summarizeResult(
  * @param getHarness 获取 Harness 引用的函数（插件在 core.harness.start 时缓存）
  * @param timeoutMs 执行超时
  * @param cleanupSession 完成后是否删除子 session
- * @param maxResultLength 返回给父 Agent 的最大结果长度（字符），超过则生成摘要。缺省 2000
+ * @param maxResultLength 返回给父 Agent 的最大结果长度（字符），超过则生成摘要。缺省 8000
  * @param maxResultLines 返回给父 Agent 的最大结果行数，超过则生成摘要。缺省 500
  * @param directive 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），
  *                  要求子 Agent 简洁结构化回复；不传则不注入
@@ -568,7 +656,7 @@ export function createSubagentTool(
   getHarness: () => HarnessLike | undefined,
   timeoutMs: number,
   cleanupSession: boolean,
-  maxResultLength: number = 2000,
+  maxResultLength: number = DEFAULT_MAX_RESULT_LENGTH,
   maxResultLines: number = 500,
   directive?: string,
   getRegistry?: () => BackgroundTaskRegistry | undefined,
@@ -578,12 +666,29 @@ export function createSubagentTool(
   getTasksDir?: () => string | undefined,
 ): Tool<SubagentToolInput, SubagentToolOutput> {
   /**
-   * 本次子 Agent 执行的步数上限：**子 Agent 自己的定义优先**（md 里写了 `maxSteps` 就用它），
-   * 否则用插件配置（缺省 {@link DEFAULT_SUBAGENT_MAX_STEPS}）。
-   * 这个优先级让"某个子 Agent 确实需要长链"能在定义里单独放宽，而不必改全局配置。
+   * 本次子 Agent 执行的步数上限，优先级（高 → 低）：
+   * **派工方传入的 `input.maxSteps` > 子 Agent 自己的 `AgentDefinition.maxSteps` > 插件配置**。
+   *
+   * 为什么要有最上面那层：`AgentDefinition.maxSteps` 是**固定**的，而同一个 reader 既可能被派去
+   * 「看一眼某个文件」（5 步够），也可能被派去「通读 1902 个文件回报事实」（20 步不够）。真机实测
+   * 会话 `s_1789996799007_9cq9r`：6 个 reader 因 20 步上限**全部截断**，逼出第二轮补派
+   * （额外 41 次 LLM 调用 / 133 万 input token）。派工方比 agent 定义更清楚本次任务有多大，
+   * 所以把这一层交给调用方。
    */
-  const resolveSteps = (agentId: string): number =>
-    getHarness()?.agent.get(agentId)?.maxSteps ?? subagentMaxSteps
+  const resolveSteps = (agentId: string, override?: number): number =>
+    override ?? getHarness()?.agent.get(agentId)?.maxSteps ?? subagentMaxSteps
+
+  /**
+   * 完整输出的落盘目录 = `{dataDir}/subagent-results`（与 `{dataDir}/tasks` 同域）。
+   *
+   * 为什么与 tasks 同域而不是落 cwd：本插件已有约定「任务落盘统一写到 {dataDir}，避免污染
+   * 用户仓库 cwd」（见 install 里的注释）。全文是结果的一部分，理应同域共存。
+   * getTasksDir 不可用（缺 dataDir）⇒ 返回 undefined，writeResultFile 退化到 OS 临时目录。
+   */
+  const resolveResultsDir = (): string | undefined => {
+    const tasksDir = getTasksDir?.()
+    return tasksDir ? join(dirname(tasksDir), SUBAGENT_RESULTS_DIRNAME) : undefined
+  }
 
   return defineTool<SubagentToolInput, SubagentToolOutput>({
     id: 'subagent',
@@ -618,6 +723,7 @@ export function createSubagentTool(
         },
         sessionId: { type: 'string', description: '续接已有子 session（多轮子 Agent 对话）；不传则新建' },
         runInBackground: { type: 'boolean', description: 'true = 后台运行，立即返回 taskId，结果经 task-notification 推送；默认同步等待完成' },
+        maxSteps: { type: 'number', description: '本次子任务的步数上限（可选）。不传则用子 Agent 定义的 maxSteps，再退插件默认。通读/遍历类任务请显式给足（如 35）' },
         targetFiles: { type: 'array', items: { type: 'string' }, description: '该 worker 预计写入的文件/目录（项目相对路径）。调度元数据：写操作按文件集串行化' },
       },
       required: ['agentId', 'prompt'],
@@ -830,7 +936,7 @@ export function createSubagentTool(
                 signal: controller.signal,
                 // 子 Agent 步数上限比主 Agent 保守（缺省 10）：它的任务是聚焦执行，
                 // 步数越多越容易撞上 timeoutMs 被判超时。
-                maxSteps: resolveSteps(input.agentId),
+                maxSteps: resolveSteps(input.agentId, input.maxSteps),
               })
               for await (const ev of stream) {
                 if (ev.type === 'tool_call_start') {
@@ -864,7 +970,11 @@ export function createSubagentTool(
               finalText,
               maxResultLength,
               maxResultLines,
+              // 后台路径拿不到父轮的活跃工具表（ctx.variables 不跨轮），按「不可读」如实提示
               undefined,
+              resolveResultsDir(),
+              // 用调用方的 ctx.cwd：决定 read_file 边界的是**它**，不是 harness 全局 cwd
+              ctx.cwd,
             )
             // 附加 worktree diff 摘要 + 完整 patch（会话级隔离目录）
             const { text: resultTextBg, diffPath } = await (
@@ -1032,7 +1142,7 @@ export function createSubagentTool(
           model: input.model,
           signal: controller.signal,
           // 同上：子 Agent 用更保守的步数上限
-          maxSteps: resolveSteps(input.agentId),
+          maxSteps: resolveSteps(input.agentId, input.maxSteps),
         })
 
         const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -1063,7 +1173,7 @@ export function createSubagentTool(
         const toolCallCount = countToolCalls(messages)
 
         // 超长结果生成摘要，避免上下文膨胀
-        // 从 ctx.variables 中读取 callerToolIds（由 ToolRunner 注入，用于智能提示）
+        // 从 ctx.variables 中读取 callerToolIds（由 core 注入：本轮该 Agent 实际可用的工具 id）
         const callerToolIds = Array.isArray(ctx.variables?.callerToolIds)
           ? ctx.variables.callerToolIds as string[]
           : undefined
@@ -1073,6 +1183,9 @@ export function createSubagentTool(
           maxResultLength,
           maxResultLines,
           callerToolIds,
+          resolveResultsDir(),
+          // 用调用方的 ctx.cwd：决定 read_file 边界的是**它**，不是 harness 全局 cwd
+          ctx.cwd,
         )
 
         // 附加 worktree 相对基线 HEAD 的 diff 摘要（会话级隔离目录）+ 完整 patch 路径
@@ -1153,7 +1266,7 @@ export function createSubagentTool(
  * @param options.subagents 启动时注册的子 Agent 定义列表
  * @param options.timeoutMs 子 Agent 执行超时（毫秒），缺省 120_000
  * @param options.cleanupSession 子 Agent 完成后是否删除子 session（缺省 false）
- * @param options.maxResultLength 返回给父 Agent 的最大结果长度（字符），超过则生成摘要。缺省 2000
+ * @param options.maxResultLength 返回给父 Agent 的最大结果长度（字符），超过则生成摘要。缺省 8000
  * @param options.maxResultLines 返回给父 Agent 的最大结果行数，超过则生成摘要。缺省 500
  * @param options.directive 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive）
  */
@@ -1185,7 +1298,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     subagents = [],
     timeoutMs = 120_000,
     cleanupSession = false,
-    maxResultLength = 2000,
+    maxResultLength = DEFAULT_MAX_RESULT_LENGTH,
     maxResultLines = 500,
     directive,
     maxSteps: subagentMaxSteps = DEFAULT_SUBAGENT_MAX_STEPS,
@@ -1269,8 +1382,12 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
       return { text: result.text }
     }
     if (!diff.hasChanges || !diff.summary) return { text: result.text }
-    const diffPath = join(tmpdir(), `subagent-diff-${Date.now()}.patch`)
-    try { writeFileSync(diffPath, diff.patch, 'utf-8') } catch { /* 写失败不阻塞 */ }
+    // 与完整输出同域落盘（此前写 os.tmpdir()：macOS 会清理，且路径在工作目录外读不到）
+    const diffPath = writeResultFile(
+      diff.patch,
+      'diff',
+      dataDir ? join(dataDir, SUBAGENT_RESULTS_DIRNAME) : undefined,
+    )
     const text = `${result.text}\n\n## Git Diff 摘要（相对基线 HEAD，目录 ${worktreeDir}）\n${diff.summary}`
     return { text, diffPath }
   }

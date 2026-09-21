@@ -1327,6 +1327,7 @@ describe('SubagentTool 工具调用摘要', () => {
 
   it('智能提示：父 Agent 有 read_file 时提示用 read_file/grep_file', async () => {
     const longReply = 'x'.repeat(3000)
+    const cwd = mkdtempSync(join(tmpdir(), 'sa-hint-read-'))
     const sessions = new Map<string, Session>()
     const sessionsRef = sessions
     const agent = createMockAgentRuntime([coderAgent], async (input) => {
@@ -1338,16 +1339,24 @@ describe('SubagentTool 工具调用摘要', () => {
     const session = createMockSessionManager(sessions)
     const harness = { agent, session }
 
-    const tool = createSubagentTool(() => harness, 5000, false, 2000)
-    // ctx.variables.callerToolIds 包含 read_file
-    const ctx = makeToolContext({ variables: { callerToolIds: ['read_file', 'bash'] } })
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500,
+      undefined, undefined, undefined, DEFAULT_SUBAGENT_MAX_STEPS,
+      () => join(cwd, '.harness', 'tasks'),
+    )
+    // ctx.variables.callerToolIds 包含 read_file，且结果目录在工作目录内 ⇒ 才能承诺可读
+    const ctx = makeToolContext({
+      variables: { callerToolIds: ['read_file', 'bash'] },
+      cwd,
+    })
     const res = await tool.call({ agentId: 'coder', prompt: 'test' }, ctx)
 
     expect(res.output!.summarized).toBe(true)
     expect(res.output!.message).toInclude('可使用 read_file 或 grep_file 工具查看')
+    rmSync(cwd, { recursive: true, force: true })
   })
 
-  it('智能提示：父 Agent 无探索工具时给出通用提示', async () => {
+  it('智能提示：无探索工具且路径在工作目录外时，如实说明读不到（不再误报「请考虑拆分任务」）', async () => {
     const longReply = 'x'.repeat(3000)
     const sessions = new Map<string, Session>()
     const sessionsRef = sessions
@@ -1361,15 +1370,17 @@ describe('SubagentTool 工具调用摘要', () => {
     const harness = { agent, session }
 
     const tool = createSubagentTool(() => harness, 5000, false, 2000)
-    // ctx.variables 不含 callerToolIds
+    // ctx.variables 不含 callerToolIds；cwd=/tmp，落盘在 dataDir（工作目录外）
     const res = await tool.call({ agentId: 'coder', prompt: 'test' }, makeToolContext())
 
     expect(res.output!.summarized).toBe(true)
-    expect(res.output!.message).toInclude('请考虑拆分任务')
+    expect(res.output!.message).toInclude('该路径不在工作目录内')
+    expect(res.output!.message).not.toInclude('请考虑拆分任务')
   })
 
-  it('智能提示：父 Agent 有 subagent 工具时提示可委派 explore agent', async () => {
+  it('智能提示：有 subagent 工具时提示可委派 explore agent', async () => {
     const longReply = 'x'.repeat(3000)
+    const cwd = mkdtempSync(join(tmpdir(), 'sa-hint-'))
     const sessions = new Map<string, Session>()
     const sessionsRef = sessions
     const agent = createMockAgentRuntime([coderAgent], async (input) => {
@@ -1381,14 +1392,20 @@ describe('SubagentTool 工具调用摘要', () => {
     const session = createMockSessionManager(sessions)
     const harness = { agent, session }
 
-    const tool = createSubagentTool(() => harness, 5000, false, 2000)
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500,
+      undefined, undefined, undefined, DEFAULT_SUBAGENT_MAX_STEPS,
+      () => join(cwd, '.harness', 'tasks'),
+    )
     const ctx = makeToolContext({
       variables: { callerToolIds: ['read_file', 'grep_file', 'subagent'] },
+      cwd,
     })
     const res = await tool.call({ agentId: 'coder', prompt: 'test' }, ctx)
 
     expect(res.output!.summarized).toBe(true)
     expect(res.output!.message).toInclude('或再次调用 subagent 工具委派 explore agent 处理')
+    rmSync(cwd, { recursive: true, force: true })
   })
 
   // ===== 新增：directive 注入测试 =====
@@ -2925,7 +2942,9 @@ describe('派工 roster 注入', () => {
     const defs: Record<string, AgentDefinition> = {
       coordinator: {
         id: 'coordinator', name: 'Coordinator', mode: 'coordinator',
+        description: '协调者：只看不写、负责派工',
         tools: ['subagent', 'read_file'], promptFragments: [],
+        permission: { '*': 'ask' },
       },
       reader: worker,
     }
@@ -2974,11 +2993,11 @@ describe('派工 roster 注入', () => {
 describe('派工 roster：不把自己列进去', () => {
   const leader: AgentDefinition = {
     id: 'lead', name: '组长', description: '既能自己写代码，也能派工', mode: 'subagent',
-    tools: ['bash', 'subagent'], promptFragments: [],
+    tools: ['bash', 'subagent'], promptFragments: [], permission: { '*': 'ask' },
   }
   const worker: AgentDefinition = {
     id: 'reader', name: '速读员', description: '只读并回报事实', mode: 'subagent',
-    tools: ['read_file'], promptFragments: [],
+    tools: ['read_file'], promptFragments: [], permission: { '*': 'ask' },
   }
 
   it('roster 只列别的子 Agent（否则会诱导"派给自己" ⇒ 无深度上限的递归）', async () => {
@@ -3004,5 +3023,159 @@ describe('派工 roster：不把自己列进去', () => {
     expect(parts).toHaveLength(1)
     expect(parts[0]).toContain('- reader — ')
     expect(parts[0]).not.toContain('- lead — ')
+  })
+})
+
+// ==========================================================================
+// 完整输出落盘位置 + 提示语如实 + 派工方步数覆盖
+//
+// 回归对象：会话 `s_1789996799007_9cq9r`（lead 扫描仓库生成架构图）实测到的三处缺陷：
+//   ① 全文写 `os.tmpdir()` ⇒ macOS 定期清理，而落盘的任务记录只有摘要 ⇒ 全文只此一份
+//   ② 提示语把「报告超了 2000 字符阈值」误报成「请考虑拆分任务」；
+//      且按 callerToolIds 拼的「可用 read_file 查看」分支因 core 从未注入该字段而是死代码
+//   ③ 派工方无法按本次任务规模覆盖步数上限 ⇒ 6/6 reader 撞 20 步顶、报告全被截断
+// ==========================================================================
+
+describe('完整输出落盘位置与提示语', () => {
+  const agentDef: AgentDefinition = {
+    id: 'coder', name: 'Coder', description: '负责写代码', mode: 'subagent',
+    tools: ['read_file'], promptFragments: [], permission: { '*': 'ask' },
+  }
+
+  /** 跑一次「子 Agent 返回超长文本」，返回摘要文本与完整输出路径 */
+  // getTasksDir 的契约是返回 `{dataDir}/tasks`；插件据此把全文落到 `{dataDir}/subagent-results`，
+  // 所以这里传的是 **tasksDir** 而不是结果目录本身。
+  async function run(opts: {
+    tasksDir?: string
+    callerToolIds?: string[]
+    cwd?: string
+    replyLength?: number
+  } = {}): Promise<{ message: string; outputPath: string }> {
+    const reply = 'x'.repeat(opts.replyLength ?? 3000) // 默认超 2000 阈值 ⇒ 触发摘要
+    const sessions = new Map<string, Session>()
+    const ref = sessions
+    const agent = createMockAgentRuntime([agentDef], async (input) => {
+      ref.get(input.sessionId)?.messages.push(makeMessage('assistant', reply))
+      return makeMessage('assistant', reply)
+    })
+    const session = createMockSessionManager(sessions)
+    const tool = createSubagentTool(
+      () => ({ agent, session }),
+      5000, false, 2000, 500,
+      undefined, undefined, undefined,
+      DEFAULT_SUBAGENT_MAX_STEPS,
+      () => opts.tasksDir,
+    )
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'test' },
+      makeToolContext({
+        variables: { callerToolIds: opts.callerToolIds ?? [] },
+        cwd: opts.cwd ?? '/tmp',
+      }),
+    )
+    expect(res.ok).toBe(true)
+    expect(res.output!.summarized).toBe(true)
+    return { message: res.output!.message, outputPath: res.output!.outputPath! }
+  }
+
+  it('落盘到 {dataDir}/subagent-results：文件真实存在且内容为全文（不再只写 OS 临时目录）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'sa-results-'))
+    try {
+      const expectedDir = join(base, 'subagent-results')
+      const { outputPath, message } = await run({ tasksDir: join(base, 'tasks') })
+      expect(outputPath).toStartWith(expectedDir)
+      expect(outputPath).toInclude('subagent-output-')
+      expect(existsSync(outputPath)).toBe(true)
+      expect(readFileSync(outputPath, 'utf-8')).toHaveLength(3000)
+      expect(message).toInclude(outputPath)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it('文件名带随机段：连续两次不撞名（只用 Date.now() 同毫秒会互相覆盖）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'sa-uniq-'))
+    try {
+      const tasksDir = join(base, 'tasks')
+      const a = await run({ tasksDir })
+      const b = await run({ tasksDir })
+      expect(a.outputPath).not.toBe(b.outputPath)
+      expect(existsSync(a.outputPath)).toBe(true)
+      expect(existsSync(b.outputPath)).toBe(true)
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it('结果目录不可用时退化到 OS 临时目录（旧行为不变）', async () => {
+    const { outputPath } = await run({})
+    expect(outputPath).toStartWith(tmpdir())
+  })
+
+  it('路径在工作目录外：即使调用方有 read_file 也不承诺可读（避免模型必去试、试必失败）', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'sa-out-'))
+    const cwd = mkdtempSync(join(tmpdir(), 'sa-cwd-'))
+    try {
+      const { message } = await run({
+        tasksDir: join(base, 'tasks'), cwd,
+        callerToolIds: ['read_file', 'grep_file', 'subagent'],
+      })
+      expect(message).not.toInclude('可使用 read_file')
+      expect(message).toInclude('不在工作目录内')
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+
+  it('不再把「超了字符阈值」误报成「请考虑拆分任务」', async () => {
+    const base = mkdtempSync(join(tmpdir(), 'sa-msg-'))
+    try {
+      const { message } = await run({ tasksDir: join(base, 'tasks'), callerToolIds: [] })
+      expect(message).not.toInclude('请考虑拆分任务')
+      expect(message).toInclude('已截断为摘要')
+    } finally {
+      rmSync(base, { recursive: true, force: true })
+    }
+  })
+
+  it('路径在工作目录内且调用方确有 read_file 时才承诺可读', async () => {
+    const cwd = mkdtempSync(join(tmpdir(), 'sa-in-'))
+    try {
+      const { message } = await run({
+        tasksDir: join(cwd, '.harness', 'tasks'), cwd, callerToolIds: ['read_file'],
+      })
+      expect(message).toInclude('可使用 read_file')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('派工方可按本次任务规模覆盖子 Agent 步数上限', () => {
+  const base: AgentDefinition = {
+    id: 'reader', name: '速读员', description: '只读回报事实', mode: 'subagent',
+    tools: ['read_file'], promptFragments: [], permission: { '*': 'ask' },
+  }
+
+  async function seenSteps(def: AgentDefinition, input: Partial<SubagentToolInput>): Promise<number | undefined> {
+    const seen: Array<number | undefined> = []
+    const agent = createMockAgentRuntime([def], async (i) => {
+      seen.push((i as { maxSteps?: number }).maxSteps)
+      return makeMessage('assistant', 'done')
+    })
+    const tool = createSubagentTool(() => ({ agent, session: createMockSessionManager(new Map()) }), 5000, false)
+    await tool.call({ agentId: def.id, prompt: 'x', ...input }, makeToolContext())
+    return seen[0]
+  }
+
+  it('未传 maxSteps：仍以子 Agent 定义为准（旧行为不变）', async () => {
+    expect(await seenSteps({ ...base, maxSteps: 25 }, {})).toBe(25)
+    expect(await seenSteps(base, {})).toBe(DEFAULT_SUBAGENT_MAX_STEPS)
+  })
+
+  it('传了 maxSteps：优先于子 Agent 定义与插件默认（通读类任务可显式给足）', async () => {
+    expect(await seenSteps({ ...base, maxSteps: 25 }, { maxSteps: 40 })).toBe(40)
+    expect(await seenSteps(base, { maxSteps: 40 })).toBe(40)
   })
 })
