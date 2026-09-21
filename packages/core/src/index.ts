@@ -712,11 +712,41 @@ interface SessionServices {
   readonly originalStore?: SessionOriginalStore
 }
 
+// 把任意 title 转成安全的会话 id slug：只保留 ASCII 字母/数字（CJK 与非 ASCII 直接丢弃，
+// 不引入任何拼音/转写依赖），非字母数字连续压成单个 `-`，首尾去 `-`，截断到 24 字符。
+// 这样中文描述不会像 `\W` 那样被整串变成下划线、也保证 id 可读可 grep。
+function slugifyTitle(title: string): string {
+  return title
+    .replace(/[^a-zA-Z0-9]+/g, '-') // 非 ASCII 字母数字（含中文）→ 分隔符
+    .replace(/-+/g, '-') // 连续分隔符压成一个
+    .replace(/^-+|-+$/g, '') // 首尾去 `-`
+    .slice(0, 24)
+    .replace(/^-+|-+$/g, '') // 截断后可能残留首尾 `-`
+}
+
 export class DefaultSessionManager implements SessionManager {
   private readonly sessions = new Map<string, Session>()
+  /** 脏会话集合：自上次落盘以来发生过变更的会话 id（标脏由 SessionManager 统一登记） */
+  private readonly dirty = new Set<string>()
   /** 会话惰性加载器（host 注入，供 flushHistory 按需读盘原文） */
   private readonly historyLoaders = new Map<string, HistoryLoader>()
   constructor(private readonly services?: () => SessionServices) {}
+
+  /** 标脏：登记某会话自上次落盘后有变更（供宿主在轮末批量保存） */
+  markDirty(sessionId: string): void {
+    this.dirty.add(sessionId)
+  }
+
+  /** 取出自上次落盘以来变更的会话（脏会话）并清空脏标记；供宿主在轮末批量保存 */
+  takeDirtySessions(): Session[] {
+    const out: Session[] = []
+    for (const id of this.dirty) {
+      const s = this.sessions.get(id)
+      if (s) out.push(s)
+    }
+    this.dirty.clear()
+    return out
+  }
 
   /** 访问注入的原文档案器（compact 落盘原文用） */
   private get originalStore(): SessionOriginalStore | undefined {
@@ -724,9 +754,17 @@ export class DefaultSessionManager implements SessionManager {
   }
 
   async create(options: SessionCreateOptions = {}): Promise<Session> {
-    const id = options?.title
-      ? `s_${options.title.replace(/\W/g, '_')}_${Date.now()}`
-      : `s_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`
+    // title → 安全 slug（中文等非 ASCII 直接丢弃）；空 slug 回落 'session'。
+    // 末尾拼 Date.now() + 随机段：随机段保证同一毫秒内多次 create 不会撞 id（即使 slug 相同），
+    // 再用已存在 id 兜底去重，彻底规避「同毫秒 + 相同 slug」互相覆盖。
+    const rand = () => Math.random().toString(36).slice(2, 7) // 5 位 base36
+    const slug = options?.title ? slugifyTitle(options.title) || 'session' : ''
+    let id: string
+    do {
+      id = slug
+        ? `s_${slug}_${Date.now()}_${rand()}`
+        : `s_${Date.now()}_${rand()}`
+    } while (this.sessions.has(id))
     const now = Date.now()
     const sess: Session = {
       id,
@@ -740,6 +778,8 @@ export class DefaultSessionManager implements SessionManager {
       meta: options?.meta,
     }
     this.sessions.set(id, sess)
+    // 新会话标脏：确保子会话（subagent 插件内部 create）也能在轮末被落盘
+    this.dirty.add(id)
     return sess
   }
 
@@ -755,6 +795,9 @@ export class DefaultSessionManager implements SessionManager {
       this.sessions.delete(oldId)
       sess.id = newId
       this.sessions.set(newId, sess)
+      // 脏标记随 id 迁移：否则按 newId 查不到脏状态、子会话恢复后不会被落盘
+      this.dirty.delete(oldId)
+      this.dirty.add(newId)
     }
     return sess
   }
@@ -860,6 +903,7 @@ export class DefaultSessionManager implements SessionManager {
     if (!p) return
     msg.parts[partIndex] = { ...p, ...patch } as import('@harness/session').Part
     sess.updatedAt = Date.now()
+    this.dirty.add(sessionId)
   }
 
   async addMessage(sessionId: string, message: Message): Promise<void> {
@@ -874,6 +918,7 @@ export class DefaultSessionManager implements SessionManager {
       }
     }
     sess.updatedAt = Date.now()
+    this.dirty.add(sessionId)
   }
 
   async deleteMessage(sessionId: string, messageId: string): Promise<void> {
@@ -881,6 +926,7 @@ export class DefaultSessionManager implements SessionManager {
     if (!sess) return
     sess.messages = sess.messages.filter((m) => m.id !== messageId)
     sess.updatedAt = Date.now()
+    this.dirty.add(sessionId)
   }
 
   async setMessages(sessionId: string, messages: Message[]): Promise<void> {
@@ -888,6 +934,7 @@ export class DefaultSessionManager implements SessionManager {
     if (!sess) return
     sess.messages = messages
     sess.updatedAt = Date.now()
+    this.dirty.add(sessionId)
   }
 
   async setBlocks(sessionId: string, blocks: NonNullable<Session['blocks']>): Promise<void> {
@@ -898,6 +945,7 @@ export class DefaultSessionManager implements SessionManager {
     for (const b of blocks) map.set(b.id, { ...b, at: now })
     sess.blocks = [...map.values()]
     sess.updatedAt = now
+    this.dirty.add(sessionId)
   }
 
   async updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void> {
@@ -905,6 +953,7 @@ export class DefaultSessionManager implements SessionManager {
     if (!sess) return
     sess.meta = { ...(sess.meta ?? {}), ...patch }
     sess.updatedAt = Date.now()
+    this.dirty.add(sessionId)
   }
 
   async getView(sessionId: string): Promise<SessionView> {

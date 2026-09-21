@@ -2989,6 +2989,35 @@ export class HarnessApp {
    * 流式发送：逐事件 yield AgentStreamEvent，完成后自动持久化 session。
    * `signal` 用于中断（引擎会在步边界与每个工具执行前响应它）。
    */
+  /**
+   * 落盘所有「脏会话」（自上次保存以来有变更的会话）。
+   *
+   * 设计（缺陷修复：子 agent 会话不落盘）：
+   * - 只保存有变化的会话（DefaultSessionManager 在 create / addMessage / updateMeta 等变更时统一标脏），
+   *   不无脑全量保存，避免子会话文件每轮被反复重写放大 IO；
+   * - 子会话是 subagent 插件内部 `harness.session.create()` 出来的、不在 CLI 持有的列表里，
+   *   但同属 DefaultSessionManager，标脏后这里一并保存 —— 子会话的消息与 meta（含 usageStats）随之落盘；
+   * - 落盘失败绝不能让 agent 跑挂（可观测性增强）：单条失败仅告警，并重新标脏以便后续重试。
+   */
+  async flushDirtySessions(): Promise<void> {
+    let dirty: Session[] = []
+    try {
+      dirty = this.harness.session.takeDirtySessions()
+    } catch {
+      return
+    }
+    if (dirty.length === 0) return
+    for (const s of dirty) {
+      try {
+        await this.sessionStore.save(s)
+      } catch (err) {
+        // 可观测性增强：落盘失败不应中断主流程
+        console.warn(`[WARN] 脏会话落盘失败（${s.id}）：${(err as Error)?.message ?? String(err)}`)
+        try { this.harness.session.markDirty(s.id) } catch { /* ignore */ }
+      }
+    }
+  }
+
   async *sendStream(
     sessionId: string,
     text: string,
@@ -2999,15 +3028,14 @@ export class HarnessApp {
     for await (const ev of gen) {
       yield ev
     }
-    // 持久化
-    const sess = (await h.session.get(sessionId))!
-    await this.sessionStore.save(sess)
+    // 持久化：轮末把「有变化」的会话（含本轮主会话与期间产生的子会话）统一落盘
+    await this.flushDirtySessions()
   }
 
   /** 关闭 harness */
   async shutdown(): Promise<void> {
-    const sess = await this.harness.session.list({ limit: 1 })
-    if (sess?.[0]) await this.sessionStore.save(sess[0])
+    // 退出前把残留的脏会话（含子会话）兜底落盘
+    await this.flushDirtySessions().catch(() => undefined)
     await this.harness.stop()
   }
 
@@ -4015,9 +4043,8 @@ async function startReplCore(options: ReplOptions): Promise<'exit' | 'eof' | 'sc
       const res = await processLine(line)
       if (res === 'exit') return 'exit'
     }
-    // 脚本结束后顺手 /save
-    const cur = (await harness.session.get((options as any).session.id))
-    if (cur) await app.sessionStore.save(cur)
+    // 脚本结束后顺手落盘（含期间产生的子会话）
+    await app.flushDirtySessions().catch(() => undefined)
     return 'scripted-done'
   }
 

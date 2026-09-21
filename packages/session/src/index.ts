@@ -590,6 +590,17 @@ export interface SessionManager {
   /** 合并更新会话 meta（浅合并 patch 到 meta；供 ACP 等插件持久化运行时状态） */
   updateMeta(sessionId: string, patch: Record<string, unknown>): Promise<void>
 
+  /**
+   * 标脏：登记某会话自上次落盘后有变更。由 SessionManager 实现统一登记，
+   * 供宿主（CLI）在轮末只保存"有变化"的会话，而非无脑全量保存（避免子会话反复重写放大 IO）。
+   */
+  markDirty(sessionId: string): void
+  /**
+   * 取出自上次落盘以来变更的会话（脏会话）并清空脏标记；供宿主在轮末批量保存。
+   * 返回的是当前内存中的 Session 引用，宿主应负责写盘（失败可重新 markDirty 以便重试）。
+   */
+  takeDirtySessions(): Session[]
+
   /** 创建快照（用于 revert） */
   snapshot(sessionId: string): Promise<string>
   /** 回滚到快照 */

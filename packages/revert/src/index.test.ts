@@ -134,6 +134,12 @@ class FakeSessionManager implements SessionManager {
   peekNotifications(): string[] {
     return []
   }
+  markDirty(): void {
+    /* not implemented */
+  }
+  takeDirtySessions(): Session[] {
+    return []
+  }
 }
 
 interface Env {
