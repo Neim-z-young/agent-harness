@@ -284,7 +284,8 @@ P1 抽包（低风险、无行为变化）
 ## 7. 落地状态与真机验证（2026-09-21）
 
 §5 的四项拍板结果：**`@harness/usage` 独立成包**；`meta.usageStats` 保持**本会话**口径 +
-展示层给"含子 agent"一行；**ACP 手册改尾部注入**（变量不进前缀）；Anthropic 显式缓存另议（未做）。
+展示层给"含子 agent"一行；**ACP 手册改尾部注入**（变量不进前缀）；Anthropic 显式缓存
+**已实现但默认关**（见 §7.7，等 key 验收）。§7.8 列当前真正剩余的事项。
 
 ### 7.1 落点对照
 
@@ -348,5 +349,37 @@ subagent 派生与 CLI 恢复都用它），`meta.parentId` 恒为 null。已改
 
 - 全量 **1683 pass / 0 fail**（+6 核心守卫、+2 providerCache、+3 聚合行、+5 折叠等价性…），typecheck 0 错误；
 - 真机三条链路各自独立验证（注入几何、缓存遥测、子会话用量），另有 `/stats` 聚合行；
-- 未做：Anthropic 显式缓存（§3.5，另议）；`harness run`（headless）当前不写 `meta.usageStats`
-  以外的展示入口，聚合行只在 REPL/TUI 的 `/stats` 呈现。
+- 未做（当前剩余的完整清单见 §7.8）；`harness run`（headless）目前没有用量展示入口 ——
+  `meta.usageStats` 引擎侧照写不误，但"含子 agent"聚合行只在 REPL/TUI 的 `/stats` 呈现。
+
+### 7.7 Anthropic 显式缓存：已实现，但**默认关、未验收**（2026-09-21 追加）
+
+§3.5 指出的"Anthropic 侧压根没开缓存"已实现（`AnthropicProviderConfig.promptCache`）：
+3 个断点（协议上限 4）＝ `tools` 末尾 / `system`（换成 block 数组）/ 当前对话末尾；
+独立纯函数 `applyAnthropicCacheBreakpoints()` 便于单测。顺带把 `complete`/`stream` 里**逐字重复的
+两份 `buildBody`** 合并成一份（重构当场被测试抓到一处漏改的 `model` 引用）。
+
+**为什么默认 `false`**：开发机只有 DeepSeek 的 key，**没有 Anthropic key ⇒ 无法真机验收**。
+按 AGENTS.md「与外部服务对接以真机为准」，未验收的行为不默认影响用户。只做了请求体形状单测（5 例）。
+
+**拿到 key 后的验收步骤**（通过后再把默认值翻成 true）：
+1. 同前缀连发两次请求 ⇒ 第二次 `usage.cache_read_input_tokens > 0`；
+2. `cache_creation_input_tokens` 只在首次 / 前缀变化时出现（而不是每轮都写）；
+3. 顺带验一个**静默失效**点：可缓存前缀有**最小 token 门槛**，不足时不报错也不缓存。
+
+### 7.8 当前剩余事项（按性价比排序）
+
+| # | 事项 | 状态 | 阻塞 |
+|---|---|---|---|
+| 1 | **工具载荷按需化**（token 归因报告的建议 #1） | **未做** | 无 —— 但这是**配置层**：你 `~/.harness/agents/` 下 9 个 agent 全是 `tools: "*"`，所以每个 agent 都收全量 42 个工具。建议按角色给白名单（研究类给 read/list/glob/grep 约 5 个）。预期每次省 5~7K，主+子 94 次 ≈ 500~650K/会话 |
+| 2 | **Anthropic 缓存真机验收** | 代码已就绪（默认关） | **需要 Anthropic key** |
+| 3 | **技能 `paths` 条件触发接线** | **未做**（`matchByPath` 仍是死代码，只有测试引用它） | 无。frontmatter 里写 `paths` 目前**写了不生效** —— 属"承诺了但没落地"，也正是本项目最忌的静默失效模式 |
+| 4 | `@harness/permission` 之外的匹配语义 | 已做（`**/` 修正 + 12 例测试） | — |
+| 5 | `/stats` 给缓存**命中率**（百分比） | 未做（现只印绝对值 `命中 X，写入 Y，未命中 Z`） | 无，很小 |
+| 6 | headless（`harness run`）的用量展示入口 | 未做 | 无，小 |
+| 7 | **重复侦察结果复用**（token 报告建议 #5） | 未做 | 需先定"时效性"判定，风险中等 |
+| 8 | 工具 schema 文案精简（token 报告建议 #6） | **刻意不做** | 与续 160「让模型看懂参数」的目标相反，需权衡 |
+
+已完成的（对照 token 归因报告的 6 条建议）：**#2 子 agent 用量纳管** ✅、**#3 ACP 手册按需注入** ✅
+（且进一步改成尾部注入，见 §3/§7.2）、**#4 结果通道去重** ✅。
+记忆与技能锻造线（`docs/memory-and-skill-forge-plan.md`）的 M0~M3.1 / F0~F3 **全部完成并已串联**。
