@@ -1,0 +1,18 @@
+{
+  "name": "@harness/usage",
+  "version": "0.1.0",
+  "description": "用量统计累积器（零依赖纯函数）：LLM 调用 / 工具 / agent / 模型 / 小时维度的 token 归并，支持从消息重建（used by 引擎层与各宿主）",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

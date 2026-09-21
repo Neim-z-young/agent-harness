@@ -37,6 +37,7 @@
         "@harness/tools-media": "workspace:*",
         "@harness/tools-search": "workspace:*",
         "@harness/tools-web": "workspace:*",
+        "@harness/usage": "workspace:*",
         "@harness/workspace": "workspace:*",
         "@harness/workspace-shell": "workspace:*",
         "acp-kernel": "^0.0.63",
@@ -92,6 +93,7 @@
         "@harness/tools-media": "workspace:*",
         "@harness/tools-search": "workspace:*",
         "@harness/tools-web": "workspace:*",
+        "@harness/usage": "workspace:*",
         "@harness/workspace": "workspace:*",
         "@harness/workspace-shell": "workspace:*",
         "@opentui/core": "^0.5.8",
@@ -113,6 +115,7 @@
         "@harness/skill": "workspace:*",
         "@harness/snapshot": "workspace:*",
         "@harness/tool": "workspace:*",
+        "@harness/usage": "workspace:*",
         "@harness/workspace": "workspace:*",
       },
     },
@@ -431,6 +434,10 @@
       "name": "@harness/tool",
       "version": "0.1.0",
     },
+    "packages/usage": {
+      "name": "@harness/usage",
+      "version": "0.1.0",
+    },
     "packages/workspace": {
       "name": "@harness/workspace",
       "version": "0.1.0",
@@ -529,6 +536,8 @@
     "@harness/tools-search": ["@harness/tools-search@workspace:packages/plugins/tools-search"],
 
     "@harness/tools-web": ["@harness/tools-web@workspace:packages/plugins/tools-web"],
+
+    "@harness/usage": ["@harness/usage@workspace:packages/usage"],
 
     "@harness/workspace": ["@harness/workspace@workspace:packages/workspace"],
 

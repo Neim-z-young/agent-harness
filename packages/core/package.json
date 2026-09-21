@@ -16,6 +16,7 @@
     "@harness/session": "workspace:*",
     "@harness/agent": "workspace:*",
     "@harness/skill": "workspace:*",
+    "@harness/usage": "workspace:*",
     "@harness/workspace": "workspace:*",
     "@harness/snapshot": "workspace:*"
   },

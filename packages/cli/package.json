@@ -44,6 +44,7 @@
     "@harness/tools-media": "workspace:*",
     "@harness/tools-search": "workspace:*",
     "@harness/tools-web": "workspace:*",
+    "@harness/usage": "workspace:*",
     "@harness/workspace": "workspace:*",
     "@harness/workspace-shell": "workspace:*",
     "@opentui/core": "^0.5.8",

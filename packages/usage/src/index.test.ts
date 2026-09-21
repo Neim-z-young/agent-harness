@@ -8,6 +8,9 @@
 import { describe, it, expect } from 'bun:test'
 import {
   emptyUsage,
+  emptyFoldState,
+  foldMessage,
+  rebuildUsage,
   recordCall,
   recordTool,
   uncachedInput,
@@ -26,7 +29,8 @@ import {
   exportStatsMarkdown,
   USAGE_STATS_KEY,
   type UsageStats,
-} from './usage-stats'
+  type UsageMessageLike,
+} from './index'
 
 /** 取某天本地时间 hh:mm 的时间戳 */
 function at(dayOffset: number, hour: number): number {
@@ -272,5 +276,53 @@ describe('recordTool 计数口径（真机修复）', () => {
   it('从未成功的工具也不会出现 count=0 的条目', () => {
     const u = recordTool(emptyUsage(), 'only-fails', { isError: true })
     expect(u.tools.every((t) => t.count > 0)).toBe(true)
+  })
+})
+
+describe('foldMessage / rebuildUsage（引擎增量折叠与全量重建必须同口径）', () => {
+  const msg = (o: Partial<UsageMessageLike> & { id?: string }): UsageMessageLike => o as UsageMessageLike
+
+  /** 一轮：assistant(带用量 + 工具) → assistant(带用量，无工具) */
+  const script: UsageMessageLike[] = [
+    msg({ meta: { model: 'm', tokenUsage: { input: 100, output: 20, cacheRead: 80 } }, agentId: 'root', parts: [{ type: 'tool', toolId: 'bash' }] }),
+    msg({ meta: { model: 'm', tokenUsage: { input: 150, output: 10 } }, agentId: 'root', parts: [{ type: 'text' }] }),
+    msg({ meta: { model: 'm', tokenUsage: { input: 90, output: 5 } }, agentId: 'worker', parts: [{ type: 'tool', toolId: 'read_file' }] }),
+  ]
+
+  it('分批折叠的累积器 === 一次性重建（引擎增量路径不会跑偏）', () => {
+    const rebuilt = rebuildUsage(script)
+    const state = emptyFoldState()
+    let u = emptyUsage()
+    for (const m of script.slice(0, 1)) u = foldMessage(u, m, state)
+    for (const m of script.slice(1)) u = foldMessage(u, m, state)
+    expect(u).toEqual(rebuilt.usage)
+    expect(state).toEqual(rebuilt.state)
+  })
+
+  it('跨消息的归因状态被保留：本步用量归并到紧随的首个工具', () => {
+    const { usage } = rebuildUsage(script)
+    const bash = usage.tools.find((t) => t.tool === 'bash')!
+    const read = usage.tools.find((t) => t.tool === 'read_file')!
+    expect(bash.inputTokens).toBe(100)
+    expect(read.inputTokens).toBe(90)
+  })
+
+  it('agentId 归因（引擎从消息上取，不再只落 root）', () => {
+    const { usage } = rebuildUsage(script)
+    expect(usage.agents.map((a) => a.agentId).sort()).toEqual(['root', 'worker'])
+    expect(usage.agents.find((a) => a.agentId === 'worker')!.calls).toBe(1)
+  })
+
+  it('subagent 调用成功 ⇒ 计入该 agent 的 tasksDone（对齐 TUI 时代的口径）', () => {
+    const { usage } = rebuildUsage([
+      msg({ meta: { model: 'm', tokenUsage: { input: 10, output: 1 } }, agentId: 'root', parts: [{ type: 'tool', toolId: 'subagent' }] }),
+      msg({ meta: { model: 'm', tokenUsage: { input: 10, output: 1 } }, agentId: 'root', parts: [{ type: 'tool', toolId: 'subagent', isError: true }] }),
+    ])
+    // 只有成功那次算一个子任务
+    expect(usage.agents.find((a) => a.agentId === 'root')!.tasksDone).toBe(1)
+  })
+
+  it('是 usageFromMessages 的同一套规则（wrapper 与 rebuild 结果一致）', () => {
+    expect(usageFromMessages(script)).toEqual(rebuildUsage(script).usage)
   })
 })

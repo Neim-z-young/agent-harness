@@ -47,6 +47,7 @@
     "@harness/tools-search": "workspace:*",
     "@harness/tools-web": "workspace:*",
     "@harness/telemetry": "workspace:*",
+    "@harness/usage": "workspace:*",
     "@harness/workspace": "workspace:*",
     "@harness/workspace-shell": "workspace:*",
     "acp-kernel": "^0.0.63"
