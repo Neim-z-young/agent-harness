@@ -12,6 +12,10 @@ import {
   ChatProvider,
   DefaultPermissionEngine,
   BusEventRecord,
+  extractFilePaths,
+  stableStringify,
+  shortHash,
+  resultPayload,
 } from './index'
 import { defineTool, Tool, ToolResult, Schema } from './index'
 import type { AgentPlugin, Hooks, Message } from './index'
@@ -1162,6 +1166,130 @@ ${tag} 版 body
         // 同名 greet 被 project 覆盖（name 取 project 版）
         expect(all.find((s) => s.id === 'greet')?.name).toBe('Greet Pro')
         await h.stop()
+      } finally { rmSync(root, { recursive: true, force: true }) }
+    })
+  })
+
+  describe('extractFilePaths（技能 paths 条件触发的路径提取）', () => {
+    it('提取相对/绝对/点路径，去重、剔除明显非路径', () => {
+      expect(extractFilePaths('看看 src/foo.ts 和 /Users/x/a.ts，还有 ./x 和 3.14 和 v1.2'))
+        .toEqual(['src/foo.ts', '/Users/x/a.ts', './x'])
+    })
+
+    it('无路径时返回空数组', () => {
+      expect(extractFilePaths('今天天气不错')).toEqual([])
+      expect(extractFilePaths('')).toEqual([])
+    })
+
+    it('去引号包裹', () => {
+      expect(extractFilePaths('改一下 "packages/cli/src/index.ts"')).toEqual(['packages/cli/src/index.ts'])
+    })
+  })
+
+  describe('技能 paths 条件触发走尾部动态通道（§8.1）', () => {
+    it('用户消息提及路径 ⇒ 命中 paths 的技能注入请求尾部（dynParts），不进 system 前缀', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'core-skill-paths-'))
+      try {
+        const userSkills = join(root, 'skills')
+        mkdirSync(join(userSkills, 'ts-help'), { recursive: true })
+        writeFileSync(
+          join(userSkills, 'ts-help', 'SKILL.md'),
+          '---\nname: TS Help\npaths: ["src/**/*.ts", "packages/**/*.ts"]\n---\nTypeScript 相关技能。\n',
+        )
+        mkdirSync(join(userSkills, 'readme-help'), { recursive: true })
+        writeFileSync(
+          join(userSkills, 'readme-help', 'SKILL.md'),
+          '---\nname: Readme Help\npaths: ["**/README.md"]\n---\nREADME 相关技能。\n',
+        )
+        const provider = mockChatProvider()
+        const h = await createHarness({
+          chatProvider: provider,
+          skillDirs: [{ dir: userSkills, source: 'user' }],
+          agents: [makeAgent()],
+        })
+        const sess = await h.session.create()
+        await h.start()
+        // 提及 packages/**/*.ts 路径 ⇒ 只命中 ts-help，不命中 readme-help
+        await h.agent.query({ sessionId: sess.id, message: '看看 packages/plugins/tools-builtin/src/index.ts' })
+        await h.stop()
+        const lastCall = provider.calls[provider.calls.length - 1]
+        const msgs = lastCall.messages as Message[]
+        // system 前缀不得含条件触发技能（paths 是变量 ⇒ 只能进尾部）
+        const sys = msgs.filter((m) => m.role === 'system').map((m) => JSON.stringify(m)).join('')
+        expect(sys).not.toContain('TS Help')
+        // 尾部（最后一条 user 消息）含命中技能
+        const tailUser = [...msgs].reverse().find((m) => m.role === 'user')
+        expect(JSON.stringify(tailUser)).toContain('TS Help')
+        expect(JSON.stringify(tailUser)).not.toContain('Readme Help')
+      } finally { rmSync(root, { recursive: true, force: true }) }
+    })
+  })
+
+  describe('stableStringify / shortHash / resultPayload（§8.2 结果复用的序列化基元）', () => {
+    it('对象键序无关', () => {
+      expect(stableStringify({ b: 1, a: { d: 2, c: 3 } })).toBe(stableStringify({ a: { c: 3, d: 2 }, b: 1 }))
+    })
+    it('数组/标量稳定', () => {
+      expect(stableStringify([1, 'x', null])).toBe('[1,"x",null]')
+      expect(stableStringify('s')).toBe('"s"')
+    })
+    it('shortHash 定长且确定', () => {
+      expect(shortHash('abc')).toBe(shortHash('abc'))
+      expect(shortHash('abc')).toHaveLength(16)
+      expect(shortHash('abc')).not.toBe(shortHash('abd'))
+    })
+    it('resultPayload：string 直用 / 对象取 content / 其余 JSON', () => {
+      expect(resultPayload('abc')).toBe('abc')
+      expect(resultPayload({ content: 'big', path: 'x' })).toBe('big')
+      expect(resultPayload({ a: [1] })).toBe('{"a":[1]}')
+    })
+  })
+
+  describe('§8.2 重复侦察结果截写（只读工具 + TTL + 同参同 hash）', () => {
+    it('同 read_file 同参 TTL 内重复 ⇒ 第二次结果截写为提示，工具真实执行、历史原文不动', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'core-repeat-'))
+      try {
+        const p = join(root, 'big.txt')
+        writeFileSync(p, 'line-'.repeat(2000)) // > 2000 字符
+        const cp = mockChatProvider('tool', (params) => {
+          // 每次都让模型发起同一 read_file 调用（同参数）→ 引擎自主多步重复执行
+          void params
+          return {
+            content: '',
+            model: 'mock-v1',
+            tokenUsage: { input: 5, output: 2 },
+            toolCalls: [{ toolUseId: 'tu_r', toolId: 'read_file', input: { path: p } }],
+          } as any
+        })
+        const h = await createHarness({
+          chatProvider: cp,
+          cwd: root, // read_file 只在 cwd 内工作
+          permission: new DefaultPermissionEngine({ '*': 'allow' }),
+          agents: [makeAgent()],
+          internalPlugins: [{
+            id: 'rb',
+            version: '1',
+            name: 'ReadBuiltin',
+            async install() {
+              return {
+                async 'core.tool.pool.assemble'(_i, pool: any) {
+                  const { readFileTool } = await import('@harness/tools-builtin')
+                  pool.add(readFileTool)
+                },
+              } as Hooks
+            },
+          }],
+        })
+        const sess = await h.session.create()
+        await h.start()
+        await h.agent.query({ sessionId: sess.id, message: '读文件', maxSteps: 2 })
+        await h.stop()
+        const s = (await h.session.get(sess.id))!
+        const toolParts = (s.messages as Message[]).flatMap((m) => (m.parts as any[]).filter((pt) => pt.type === 'tool'))
+        // maxSteps:2 含收尾轮 ⇒ 至少 2 次执行；取前两条验证"第一次全文、第二次截写"
+        expect(toolParts.length).toBeGreaterThanOrEqual(2)
+        expect(String((toolParts[0].result as any).content).length).toBeGreaterThan(2000)
+        expect(String((toolParts[1].result as any).content)).toContain('结果与第 1 轮一致')
       } finally { rmSync(root, { recursive: true, force: true }) }
     })
   })

@@ -373,11 +373,11 @@ subagent 派生与 CLI 恢复都用它），`meta.parentId` 恒为 null。已改
 |---|---|---|---|
 | 1 | **工具载荷按需化**（token 归因报告的建议 #1） | **已做**（续 176） | 9 个现有 agent 改按角色白名单 + 新增 7 个轻量子 agent。真机基线 41 工具/23,674 字符 → coordinator −49%、合规审查员 −87%、reader −90%、summarizer −100%（详见 `docs/development-log.md` 续 176）。注意改动落在仓库外的 `~/.harness/agents/`，未进 git |
 | 2 | **Anthropic 缓存真机验收** | 代码已就绪（默认关） | **需要 Anthropic key**；用户已定「先不做」，保持默认关 |
-| 3 | **技能 `paths` 条件触发接线** | **未做**（`matchByPath` 仍是死代码，只有测试引用它） | 无。frontmatter 里写 `paths` 目前**写了不生效** —— 属"承诺了但没落地"，也正是本项目最忌的静默失效模式 |
+| 3 | **技能 `paths` 条件触发接线** | **已做**（续 183） | `matchByPath` 经 `core.prompt.dynamic.transform` 尾部注入；core 从用户消息提取路径（`extractFilePaths`）塞进 `PromptInput.involvedPaths`。system 前缀只留白名单常量技能 |
 | 4 | `@harness/permission` 之外的匹配语义 | 已做（`**/` 修正 + 12 例测试） | — |
-| 5 | `/stats` 给缓存**命中率**（百分比） | 未做（现只印绝对值 `命中 X，写入 Y，未命中 Z`） | 无，很小 |
-| 6 | headless（`harness run`）的用量展示入口 | 未做 | 无，小 |
-| 7 | **重复侦察结果复用**（token 报告建议 #5） | 未做 | 需先定"时效性"判定，风险中等 |
+| 5 | `/stats` 给缓存**命中率**（百分比） | **已做**（续 183） | `cacheHitRate()`；`renderStatsText` 缓存行 `命中 X（Y%）` |
+| 6 | headless（`harness run`）的用量展示入口 | **已做**（续 183） | run 结束在 stderr 打一行用量 + 含子 agent 聚合行（stdout 保持纯结果） |
+| 7 | **重复侦察结果复用**（token 报告建议 #5） | **已做**（续 183，§8.2 落地） | core `maybeTruncateRepeatResult`：只读白名单 + TTL（10 轮/60s）+ 同参同 hash ⇒ 新消息只写提示；工具照常执行、历史一字不动 |
 | 8 | 工具 schema 文案精简（token 报告建议 #6） | **刻意不做** | 与续 160「让模型看懂参数」的目标相反，需权衡 |
 
 已完成的（对照 token 归因报告的 6 条建议）：**#2 子 agent 用量纳管** ✅、**#3 ACP 手册按需注入** ✅

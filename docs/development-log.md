@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 183）§7.8 四项待做全部落地（paths 接线 / 命中率 / headless 用量 / 结果复用）
+
+`docs/usage-accounting-and-prompt-cache-plan.md` §7.8 的 #3/#5/#6/#7 一并实现，状态表已更新为"已做"。
+
+**#3 技能 paths 条件触发接线**（此前 `matchByPath` 是死代码）：
+- `PromptInput` 新增 `involvedPaths?: string[]`（plugin 包）；
+- core `_prepareQueryOnce` 从用户消息提取疑似路径（新 `extractFilePaths`：中文标点先换空格防粘连、排除版本号），塞进 promptIn；
+- `core.skill-injection` 增注册 `core.prompt.dynamic.transform`：遍历 involvedPaths 调 `matchByPath`，命中技能注入**尾部动态通道**（user role、每轮重算、不落库）——system 前缀仍只放白名单常量技能，条件触发内容随轮变化也不伤前缀缓存（§8.1）。
+- 踩坑：`extractFilePaths` 首版被"中文逗号后跟中文词"粘连（`a.ts，还有` 成整串）、版本号 `v1.2` 误报；修法=中文标点替换为空格再切分 + 版本号正则排除。
+
+**#5 /stats 缓存命中率**：`@harness/usage` 新增 `cacheHitRate()`，`renderStatsText` 缓存行改为 `命中 X（Y%）`。
+
+**#6 headless 用量入口**：`harness run` 结束在 **stderr** 打印 `[用量] LLM 调用 N 次 · in/out · 缓存命中（%）` + 含子 agent 聚合行；stdout 保持纯结果（脚本可安全消费）。
+
+**#7 重复侦察结果复用**（§8.2 终稿落地）：
+- core `maybeTruncateRepeatResult`：只读白名单（`read_file/list_dir/grep_file/glob`）+ 大结果（≥2000 字符）+ TTL（60s 或 10 轮，OR）+ 同工具同参（`stableStringify`）同 hash（`shortHash` sha256×16）⇒ 本轮 `tool_result` 只写提示 `[结果与第 N 轮一致（缓存，TTL 内有效，全文见该轮）]`；
+- 工具**照常执行**（hash 是执行得来的真凭实据）；历史一字不动 ⇒ 前缀缓存不打断；
+- `resultPayload` 支持对象结果（read_file 输出取 `content` 字段截写，保留 path/行数）。
+- 序列化基元 `stableStringify`/`shortHash`/`resultPayload` 导出为纯函数并单测。
+
+测试：core 53（+5：extractFilePaths×3、序列化基元×4、结果截写集成×1）、usage 34（+3 命中率）、cli 359 全过；全量 typecheck 绿。
+待办剩余：Anthropic 缓存真机验收（等 key）、工具 schema 文案精简（刻意不做）。
+
 ## 2026-09-22（续 182）结果复用方案再修正：工具照常执行，仅新消息不重放全文
 
 用户第二轮澄清："**工具要执行**，只是不要折叠历史消息"。§8.2 从"跳过执行 + 占位提示"

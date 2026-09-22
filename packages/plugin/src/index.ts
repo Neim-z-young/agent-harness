@@ -130,6 +130,12 @@ export interface PromptInput {
    * 插件还得自己查注册表（且拿不到），只能在首轮猜。
    */
   agentMode?: string
+  /**
+   * 本轮用户输入里疑似引用的文件路径（供技能 `paths` 条件触发 —— core 从用户消息提取，
+   * 命中 `skill.paths` glob 的技能经 `core.prompt.dynamic.transform` 注入尾部）。
+   * 缺省表示未提供（插件不得依赖它做"无 paths 也注入"的判定）。
+   */
+  involvedPaths?: string[]
 }
 
 /**

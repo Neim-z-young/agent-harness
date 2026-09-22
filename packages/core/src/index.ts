@@ -139,6 +139,7 @@ export type {
   CompactionStrategy,
   SessionManager,
 } from '@harness/session'
+import { createHash } from 'node:crypto'
 
 // ===== 内部依赖 =====
 import { createBus, InMemoryBus, Bus, BusEvent, BusEventRecord, Awaitable } from '@harness/bus'
@@ -1620,6 +1621,34 @@ function isAbortError(e: unknown): boolean {
 }
 
 /**
+ * 从用户文本里提取疑似文件路径的 token，供技能 `paths` 条件触发。
+ *
+ * 判据（保守，宁多勿漏 —— matchByPath 是 glob 命中，误报只会多注入一条尾部技能，
+ * 漏报则技能完全不触发）：
+ *  - 去掉引号/括号/空白包裹后仍含 `/` 或 `.` 的连续 token（相对路径 `src/foo.ts`、
+ *    绝对路径 `/Users/x/a.ts`、点路径 `./x` / `../y`）；
+ *  - 排除纯数字/纯版本号等明显不是路径的串（至少含一个字母）。
+ */
+export function extractFilePaths(text: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  // 中文标点先换空格：路径后常紧跟中文词且无空格（如 "a.ts，还有"），否则 token 会被中文词粘连
+  const normalized = text.replace(/[，。、；：！？]/g, ' ')
+  for (const raw of normalized.split(/\s+/)) {
+    const tok = raw.replace(/^[(`"'<\[{]+|[)\]>"'\],.:;!?]+$/g, '').trim()
+    if (tok.length < 2) continue
+    if (!/[/.]/.test(tok)) continue
+    if (!/[A-Za-z]/.test(tok)) continue
+    // 排除版本号（v1.2 / 1.2.3）等明显非路径
+    if (/^v?\d+(\.\d+){1,3}$/i.test(tok)) continue
+    if (seen.has(tok)) continue
+    seen.add(tok)
+    out.push(tok)
+  }
+  return out
+}
+
+/**
  * agentic loop 的默认步数上限（含首次模型调用）。
  *
  * 30 是权衡值：够跑完 read → edit → bash → verify 这类典型链条（含若干次重试），
@@ -1633,6 +1662,49 @@ export const DEFAULT_MAX_STEPS = 30
  * 对齐 opencode `processor.ts` 的 `DOOM_LOOP_THRESHOLD = 3`。
  */
 export const DOOM_LOOP_THRESHOLD = 3
+
+// ===== 重复侦察结果复用（§8.2）=====
+
+/** 可"重复结果截写"的只读工具白名单（纯只读、无副作用才允许） */
+export const REPEAT_READONLY_TOOLS: ReadonlySet<string> = new Set(['read_file', 'list_dir', 'grep_file', 'glob'])
+/** 结果至少多少字符才算"大"（小于它直接拼最新，不值得省） */
+export const REPEAT_RESULT_MIN_CHARS = 2000
+/** TTL：时间窗口（ms）与轮次窗口（步数），双窗口 OR */
+export const REPEAT_TTL_MS = 60_000
+export const REPEAT_TTL_ROUNDS = 10
+
+/** 稳定序列化（对象键排序），保证同参必得同串 */
+export function stableStringify(v: unknown): string {
+  if (v === null || typeof v !== 'object') return JSON.stringify(v)
+  if (Array.isArray(v)) return `[${v.map(stableStringify).join(',')}]`
+  const rec = v as Record<string, unknown>
+  const keys = Object.keys(rec).sort()
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(rec[k])}`).join(',')}}`
+}
+
+/** sha256 截断（16 hex 字符，防碰撞足够） */
+export function shortHash(s: string): string {
+  return createHash('sha256').update(s).digest('hex').slice(0, 16)
+}
+
+/**
+ * 提取工具结果的"可比较载荷"（用于 §8.2 的重复判定）：
+ * string 直接用；对象取 `content` 字段（read_file 的输出结构）；其余 JSON 序列化。
+ * 载荷既决定"多大才算大"，也是 hash 的对象。
+ */
+export function resultPayload(r: unknown): string {
+  if (typeof r === 'string') return r
+  if (r !== null && typeof r === 'object') {
+    const c = (r as Record<string, unknown>).content
+    if (typeof c === 'string') return c
+    try {
+      return JSON.stringify(r)
+    } catch {
+      return ''
+    }
+  }
+  return String(r)
+}
 
 /** 步数到顶时追加的最后一条 user 消息（对齐 opencode `MAX_STEPS_PROMPT`） */
 const MAX_STEPS_WRAP_UP =
@@ -1733,6 +1805,46 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
   ) {
     this.defaultAgentId = defaultAgentId
+  }
+
+  /**
+   * §8.2 重复侦察结果缓存：键 = `sessionId\u0000toolId\u0000stable(parsedInput)`。
+   * 值 = { hash, round, ts }。只在工具**真实执行后**更新（hash 是执行得来的判定依据）。
+   * 会话级内存态：重开进程即失效（可接受 —— 跨进程复用需要持久化+过期策略，另行立项）。
+   */
+  private readonly toolResultCache = new Map<string, { hash: string; round: number; ts: number }>()
+
+  /**
+   * 大结果重复截写：只读工具白名单 + TTL 窗口内同工具同参 hash 一致 ⇒ 返回提示文本
+   * （新消息不重放全文，**历史一字不动**，见 docs/usage-accounting-and-prompt-cache-plan.md §8.2）。
+   * 未命中 / 不满足条件 ⇒ 更新缓存并返回 null（照常写全文）。
+   */
+  private maybeTruncateRepeatResult(
+    sessionId: string,
+    round: number,
+    toolId: string,
+    input: unknown,
+    result: unknown,
+  ): unknown | null {
+    if (!REPEAT_READONLY_TOOLS.has(toolId)) return null
+    const payload = resultPayload(result)
+    if (payload.length < REPEAT_RESULT_MIN_CHARS) return null
+    const key = `${sessionId}\u0000${toolId}\u0000${stableStringify(input)}`
+    const hash = shortHash(payload)
+    const prev = this.toolResultCache.get(key)
+    const now = Date.now()
+    const fresh = prev !== undefined && (now - prev.ts <= REPEAT_TTL_MS || round - prev.round <= REPEAT_TTL_ROUNDS)
+    if (fresh && prev.hash === hash) {
+      const hint = `[结果与第 ${prev.round} 轮一致（缓存，TTL 内有效，全文见该轮）]`
+      // string → 整体替换；对象含 content（read_file 输出）→ 只替换 content，保留 path/行数等小字段
+      if (typeof result === 'string') return hint
+      if (result !== null && typeof result === 'object' && 'content' in (result as object)) {
+        return { ...(result as Record<string, unknown>), content: hint }
+      }
+      return hint
+    }
+    this.toolResultCache.set(key, { hash, round, ts: now })
+    return null
   }
 
   /** 把 Session.CompactMemory 追加到 sysParts（作为长期系统记忆），让 LLM 看到已压缩的历史。 */
@@ -1904,6 +2016,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
       sessionId,
       ...(agent.mode ? { agentMode: agent.mode } : {}),
     }
+    // 技能 paths 条件触发用：从本轮用户输入提取疑似文件路径（仅命中者经动态通道注入尾部）
+    const involvedPaths = extractFilePaths(message)
+    if (involvedPaths.length > 0) promptIn.involvedPaths = involvedPaths
     await this.deps.triggerPlugin('core.prompt.system.transform', promptIn, sysParts)
 
     // 尾部动态上下文：给"内容会变"的注入一条不拖垮前缀缓存的通道。
@@ -2415,6 +2530,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
       const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, parsedInput, tctx)
       resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
       resultPart.isError = !res.ok
+      // §8.2 重复侦察结果截写：只读工具 + 大结果 + TTL 内同工具同参 hash 一致 ⇒ 新消息只写提示、
+      // 不重放全文。工具已**真实执行**（hash 是执行得来的真凭实据），历史一字不动 ⇒ 前缀缓存不打断。
+      if (res.ok && resultPart.result !== undefined && resultPart.result !== null) {
+        const truncated = this.maybeTruncateRepeatResult(sessionId, step, tc.toolId, parsedInput, resultPart.result)
+        if (truncated !== null) resultPart.result = truncated
+      }
       // 入参自愈：模型偶发发出**零参数**工具调用（`input: {}`），工具入口按 Fail-Closed 拒绝。
       // 原样回传错误消息时模型只能盲猜重试（真机实测：37% 的调用如此，长上下文下失败率升到 50%）。
       // 这里把"这个工具到底要什么参数"直接摆到错误消息里，让它在**同一次**重试里就能补齐。
@@ -3116,7 +3237,7 @@ export class HarnessImpl implements Harness {
             id: 'core.skill-injection',
             version: '0.1.0',
             name: 'Skill 注入',
-            description: '将 agent.skills 白名单中的 Skill 通过 core.prompt.system.transform 注入到 system prompt',
+            description: '将 agent.skills 白名单中的 Skill 注入 system prompt；paths 条件触发的技能经尾部动态通道注入',
             async install() {
               return {
                 async 'core.prompt.system.transform'(
@@ -3131,6 +3252,23 @@ export class HarnessImpl implements Harness {
                     if (skill) {
                       parts.push(formatSkillForPrompt(skill))
                     }
+                  }
+                },
+                // paths 条件触发：命中 skill.paths 的技能走**尾部动态通道**（不进前缀）。
+                // 位置为什么是这里：条件是"内容随轮变化"，进 sysParts 会让前缀缓存每轮失效
+                // （真机量化 ≈ 95K token-equiv/翻转，见 docs/usage-accounting-and-prompt-cache-plan.md §8.1）。
+                async 'core.prompt.dynamic.transform'(
+                  input: { agentId: string; sessionId: string; involvedPaths?: string[] },
+                  dynParts: string[],
+                ) {
+                  const paths = input.involvedPaths
+                  if (!paths || paths.length === 0) return
+                  const matched = new Map<string, ReturnType<SkillManager['get']>>()
+                  for (const p of paths) {
+                    for (const s of skillManager.matchByPath(p)) matched.set(s.id, s)
+                  }
+                  for (const s of matched.values()) {
+                    if (s) dynParts.push(formatSkillForPrompt(s))
                   }
                 },
               } as import('@harness/plugin').Hooks

@@ -80,6 +80,7 @@ import {
   exportStatsMarkdown,
   hydrateUsage,
   isBlankUsage,
+  cacheHitRate,
   todayUsageLine,
   type UsageStats,
 } from './usage-stats'
@@ -4469,6 +4470,16 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
             if (textParts.length > 0) write('\n')
           }
         }
+      }
+      // headless 用量展示（`harness run` 没有 /stats 入口）：stdout 保持纯结果，用量走 stderr
+      const runUsage = await harness.usage.get(session.id).catch(() => undefined)
+      if (runUsage && !isBlankUsage(runUsage)) {
+        const hit = runUsage.cacheReadTokens > 0 ? ` · 缓存命中 ${runUsage.cacheReadTokens}（${cacheHitRate(runUsage)}%）` : ''
+        process.stderr.write(
+          `[用量] LLM 调用 ${runUsage.llmCalls} 次 · in ${runUsage.inputTokens} / out ${runUsage.outputTokens}${hit}\n`,
+        )
+        const childLine = await renderChildAgentRollup(harness, session.id)
+        if (childLine) process.stderr.write(childLine)
       }
       return 0
     }

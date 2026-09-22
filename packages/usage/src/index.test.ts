@@ -14,6 +14,8 @@ import {
   recordCall,
   recordTool,
   uncachedInput,
+  cacheHitRate,
+  renderStatsText,
   dayStart,
   usageSince,
   todayUsage,
@@ -252,6 +254,19 @@ describe('usageFromMeta / 杂项', () => {
     let u2 = emptyUsage()
     u2 = recordCall(u2, { model: 'm', input: 100, output: 0, cacheRead: 30, cacheWrite: 20, ts: at(0, 9) })
     expect(uncachedInput(u2)).toBe(50)
+  })
+
+  it('cacheHitRate：命中/输入 百分比（一位小数）', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { model: 'm', input: 1000, output: 0, cacheRead: 250, ts: at(0, 9) })
+    expect(cacheHitRate(u)).toBe(25)
+    expect(cacheHitRate(emptyUsage())).toBe(0)
+  })
+
+  it('renderStatsText 缓存行含命中率', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { model: 'm', input: 1000, output: 0, cacheRead: 250, cacheWrite: 100, ts: at(0, 9) })
+    expect(renderStatsText(u)).toContain('缓存：命中 250（25%），写入 100，未命中 650')
   })
 })
 

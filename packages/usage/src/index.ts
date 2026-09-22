@@ -257,6 +257,12 @@ export function uncachedInput(u: UsageStats): number {
   return Math.max(0, u.inputTokens - u.cacheReadTokens - u.cacheWriteTokens)
 }
 
+/** 缓存命中率（0~100，一位小数）；无输入时为 0 */
+export function cacheHitRate(u: UsageStats): number {
+  if (u.inputTokens <= 0) return 0
+  return Math.round((u.cacheReadTokens / u.inputTokens) * 1000) / 10
+}
+
 // ------------------------------------------------------------------------
 // 当日用量 / 水合 / 归并（跨重连累计）
 // ------------------------------------------------------------------------
@@ -583,7 +589,7 @@ export function renderStatsText(u: UsageStats): string {
   const lines: string[] = []
   lines.push(`LLM 调用 ${u.llmCalls} 次 · in ${u.inputTokens} / out ${u.outputTokens}`)
   if (u.cacheReadTokens > 0 || u.cacheWriteTokens > 0) {
-    lines.push(`缓存：命中 ${u.cacheReadTokens}，写入 ${u.cacheWriteTokens}，未命中 ${uncachedInput(u)}`)
+    lines.push(`缓存：命中 ${u.cacheReadTokens}（${cacheHitRate(u)}%），写入 ${u.cacheWriteTokens}，未命中 ${uncachedInput(u)}`)
   }
   if (u.models.length) {
     lines.push('按模型：')
