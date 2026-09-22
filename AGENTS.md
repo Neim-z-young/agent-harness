@@ -103,6 +103,12 @@
 
 - **改可观测性 / 阈值 / 口径类逻辑，验证要分四层，且别用 mock 越界冒充真机**：L1 纯函数单测（分类规则、算术）→ **L2 端到端 mock**（真实引擎 + 真实插件 + 探针插件造 prompt 形态 + `MockChatProvider.usageSequence` 造逐轮用量台阶；样例见 `packages/cli/src/cache-attribution.test.ts`）→ L3 真机（临时 dataDir + 包 `globalThis.fetch` 抓真实请求体做**独立证据**）→ L4 产线遥测。**mock 能验"逻辑与装配"，验不了"系数取值"与"provider 真实行为"**。写 L2 探针时注意：**改动必须每轮重新施加** —— core 每轮从会话本体重建 messages，只改一轮会在下一轮被还原，看起来像"前缀又变了一次"
 
+- **「任务完成」类事件必须在结果真正可消费之后才发布 —— 先入队、后发事件**。事件的下游（如 coordinator barrier → CLI 注入 `<continue/>` 续轮）收到事件会**立即**试着取数据；信号先于数据 ⇒ 取到空 ⇒ 判定"无事可做" ⇒ **放弃且不重试** ⇒ 已跑完的结果滞留到用户下一次发话才送达。真机（s_1790082671456_82ikm）：4 个后台 reader 21:22:15 全部完成、barrier 也触发了，通知却到 21:25:16 才随用户敲「?」进入对话。修法是把 `enqueueNotification()` 移到 `bus.publish(completed|failed)` **之前**，而不是在消费侧加等待
+
+- **「判一次就放弃」是静默丢数据的常见形态**：任何"空转判断"（peek 到空就跳过）**必须退避重试**。两个独立异步分支之间**没有顺序保证**，靠一句 `setTimeout(0)` 去赌"一个宏任务内一定就绪"迟早会输（本项目就输过：结果滞留 3 分钟）。重试预算要远小于误判的代价（本项目约 1s vs 一次模型调用）
+
+- **请求超过 ~15s 无任何输出就要有可见心跳**：静默卡死比报错更难自查 —— 用户分不清"卡住了"还是"任务本来就慢"，只能靠重发自救（真机首轮卡 7m20s，用户把同一句话发了三遍）。心跳不改任何超时语义，只结束"毫无反馈"这一段；间隔递增（15s → 60s），收到首个事件或本轮结束即停，**且必须在 `finally` 里停**（请求报错时循环体里的 stop 不会执行 ⇒ 定时器泄漏）
+
 - **注入位置决定代价：会变的文本**绝不**放 system 区**。自动前缀缓存按最长公共 token 前缀命中，system 位于请求**位置 0**，它一变其后**整段历史**都要按全价重算（量化：越阈值时翻转一次 ≈ 95K token-equiv，回本要 366 次调用 —— 见 acp-context 的 `MANUAL_INJECT_MARGIN` 注释）。判断标准一句话：**这段文本会不会在会话中途变？会 —— 就走 `core.prompt.dynamic.transform`（尾部动态区）**。已迁：MCP resources（缓存只增不减）、memory 的一次性沉淀提示（出现一轮、下一轮消失，留 system 会付两次失效）；留在前缀的是恒定文本（agent promptFragments / skill 注入 / subagent roster / coordinator / 压缩记忆块）
 
 - **尾部动态通道的两条硬约束（都不是风格问题）**：① 必须 `user` role —— `provider-anthropic` 的 `extractSystemPrompt` 与 `provider-gemini` 的 `extractSystem` 会把**任意位置**的 system 消息上提进顶层 `system`/`systemInstruction`（原位置直接跳过），用 system 挪到尾部等于把它送回前缀、收益归零；② 必须在 `core.session.preModel` **之后**拼接 —— 那是压缩插件的折叠/回写点，放它之前有被写进持久层的风险（尾部块每轮重算，落库就是脏数据）。core 已代管这两点，用 `packages/cli/src/cache-attribution.test.ts` 的对照实验（同内容 / 同变化幅度、**唯一变量是位置**）守住

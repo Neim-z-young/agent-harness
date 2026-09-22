@@ -1,4 +1,59 @@
 # Agent Harness 开发日志
+## 2026-09-22（续 191）修会话复盘暴露的两条 P0：后台结果滞留 + 请求静默卡死
+
+用户："修两 p0 的"（承接 `s_1790082671456_82ikm` 复盘报告；报告见
+`outputs/session-analysis/session-82ikm-report.html`）。
+
+### P0-1 后台结果「跑完了却送不到」⇒ 先入队、后发事件 + peek 退避重试
+
+**现象**：4 个后台 reader 21:22:15 全部完成，barrier 也触发了（遥测
+`coordinator.barrier.completed @21:22:15.348`），通知却到 21:25:16 才进对话 —— 与用户敲「?」
+**同一秒**。中间 3 分 03 秒界面停在「（等待并行研究结果中，稍后汇总完整报告。）」。
+
+**根因（三处叠加）**：
+1. `core:2016` `drainNotifications` 只在 `_prepareQueryOnce` 调用 ⇒ 没有用户输入就永不投递；
+2. `cli` `attachAutoContinue` 注入 `<continue/>` 前会 `peekNotifications`，**空则放弃且不重试**；
+3. `subagent` 里 `bus.publish(completed)` 排在 `enqueueNotification()` **之前**，而 publish 是
+   异步的 ⇒ 驱动 barrier 的"全部完成"信号可能**先于数据**到达。CLI 原先靠一句
+   `await setTimeout(0)` 去赌"一个宏任务内通知一定入队" —— 真机上赌输了。
+
+**修法（改源头，不在消费侧加等待）**：
+- `subagent`：把 `enqueueNotification()` 移到 `bus.publish(completed|failed)` **之前**
+  （completed 与 failed 两条路径都改）⇒ barrier 从此真正意味着"结果已就绪"。
+- `cli`：删掉那条 `setTimeout(0)`，新增 `waitForPendingNotifications()` —— 退避重试
+  `[50, 100, 250, 600]` ms（总预算 ≈1s，远小于误判空转的代价）。
+
+**测试**：新增 2 例顺序回归（在 `completed`/`failed` 事件的**订阅者里** peek 队列，断言已入队）。
+并做了**反证**：把 completed 路径换回旧顺序后测试确实失败（`Expected: 1 / Received: 0`）。
+（第一次的反证脚本搜索范围越界、改到了 failed 路径，差点把空跑的测试当成有效 —— 值得记一笔。）
+
+### P0-2 请求静默卡死要有可见反馈 ⇒ 停滞心跳
+
+**现象**：首轮请求 21:11:55 发出，440 秒内没有 assistant 消息、也没有任何用量
+（`usageStats.inputTokens` 与 18 条 assistant 的 `tu_in` 之和**精确相等** ⇒ 该调用确实没返回）；
+期间不报错、不提示，用户只能靠重发自救（同一句话发了三遍）。
+
+**修法**：新增 `startStallNotice()` —— 请求发出后若无任何事件，按递增间隔
+`[15s, 15s, 30s, 60s…]` 输出一行 `⏳ 模型尚无响应（已 Ns）…`；收到首个事件即停。
+接入 REPL（`out`）与 `harness run`（**stderr**，stdout 保持"纯结果"以便脚本消费）两处。
+不改任何超时语义，只结束"毫无反馈"这一段。
+
+**顺带纠正报告里的一处猜测**：CLI 走的是 `sendStream`（流式），全仓 `preferComplete`
+**零命中** ⇒ 首轮卡死与续 178 加的 `completeTimeoutFactor` **无关**（那条只影响非流式
+`complete()`）。流式路径的兜底是 idle 120s / 总时长 ×10；若 provider 有 SSE keepalive，
+idle 计时器不会被触发，因此可能长时间既不断也不出内容 —— 这正是心跳要覆盖的场景。
+
+**注意**：`stall.stop()` 必须在 `finally` 里再调一次 —— 请求报错时循环体里的 stop 不会执行，
+定时器会一直往界面写提示。
+
+### 验证
+
+新增 9 例（subagent 顺序 2 + cli helper 7）。另做真实冒烟：`harness run "只回复两个字：收到"`
+正常出结果，确认两处接入点没破坏既有流程。
+
+**未做**（仍是 P1/P2）：通知队列是**纯内存** Map（core:1346），进程退出即丢已排队的后台结果；
+零产出轮豁免步数配额（16.5% 的输入浪费）；`tokenCalibrationScale` 取值待拍板。
+
 ## 2026-09-22（续 190）低危项收尾：配置清理 + cacheHitRate 防 NaN + TUI 字素簇计数 + 归因看见尾部动态块
 
 用户：①「清理那 8 行」（`~/.harness/agents/coordinator.md` 的 `subagents:` 声明）；
