@@ -259,8 +259,16 @@ export function uncachedInput(u: UsageStats): number {
 
 /** 缓存命中率（0~100，一位小数）；无输入时为 0 */
 export function cacheHitRate(u: UsageStats): number {
-  if (u.inputTokens <= 0) return 0
-  return Math.round((u.cacheReadTokens / u.inputTokens) * 1000) / 10
+  // 非法输入一律归 0，**绝不让 NaN 漏到 UI**。
+  //
+  // 为什么不能只写 `if (u.inputTokens <= 0)`：`NaN <= 0` 是 **false**，挡不住任何 NaN ——
+  // 分子（cacheReadTokens）为 NaN 时会算出 NaN，而两个消费方都是直接插值的
+  // （`renderStatsText` 的「缓存：命中 N（X%）」与 CLI 的 run 摘要），
+  // 用户看到的就是「命中 NaN%」。非有限值与负值同样按 0 处理。
+  const { inputTokens, cacheReadTokens } = u
+  if (!Number.isFinite(inputTokens) || inputTokens <= 0) return 0
+  if (!Number.isFinite(cacheReadTokens) || cacheReadTokens <= 0) return 0
+  return Math.round((cacheReadTokens / inputTokens) * 1000) / 10
 }
 
 // ------------------------------------------------------------------------

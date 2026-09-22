@@ -227,6 +227,20 @@ describe('usageFromMeta / 杂项', () => {
     expect(cacheHitRate(emptyUsage())).toBe(0)
   })
 
+  it('cacheHitRate：非法输入归 0，不得把 NaN 漏到 UI', () => {
+    // 回归背景：`NaN <= 0` 是 false，旧实现只在分母上做了一次 `<= 0` 判断就除法，
+    // 分子为 NaN（provider 只回报了部分字段 / 水合时字段缺失）时算出 NaN，
+    // 直接插值成「缓存：命中 NaN（NaN%）」。
+    const base = (patch: Partial<UsageStats>): UsageStats => ({ ...emptyUsage(), ...patch })
+    expect(cacheHitRate(base({ inputTokens: 1000, cacheReadTokens: NaN }))).toBe(0)
+    expect(cacheHitRate(base({ inputTokens: NaN, cacheReadTokens: 100 }))).toBe(0)
+    expect(cacheHitRate(base({ inputTokens: -5, cacheReadTokens: 100 }))).toBe(0)
+    expect(cacheHitRate(base({ inputTokens: Number.POSITIVE_INFINITY, cacheReadTokens: 100 }))).toBe(0)
+    expect(cacheHitRate(base({ inputTokens: 1000, cacheReadTokens: -1 }))).toBe(0)
+    // 渲染层端到端：绝不出现 NaN
+    expect(renderStatsText(base({ inputTokens: 1000, cacheReadTokens: NaN }))).not.toContain('NaN')
+  })
+
   it('renderStatsText 缓存行含命中率', () => {
     let u = emptyUsage()
     u = recordCall(u, { model: 'm', input: 1000, output: 0, cacheRead: 250, cacheWrite: 100, ts: at(0, 9) })
