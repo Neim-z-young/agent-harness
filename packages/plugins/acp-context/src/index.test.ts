@@ -104,7 +104,7 @@ interface Harness {
 function makeHarness(
   config: Config = makeConfig(),
   sessionId = 's1',
-  opts: { manualInjection?: 'on-demand' | 'always'; explicitSystemPrompt?: boolean } = {},
+  opts: { manualInjection?: 'on-demand' | 'always'; explicitSystemPrompt?: boolean; dynamicParts?: string[] } = {},
 ): Harness {
   const engine = createCore()
   const meta: Record<string, unknown> = {}
@@ -148,6 +148,7 @@ function makeHarness(
       tempMessage,
       manualInjection: opts.manualInjection ?? 'always',
       explicitSystemPrompt: opts.explicitSystemPrompt,
+      ...(opts.dynamicParts ? { dynamicParts: opts.dynamicParts } : {}),
     })
   }
   return h
@@ -1069,3 +1070,27 @@ function manualInjected(messages: Message[]): boolean {
   if (!last || last.role !== 'user') return false
   return (last.parts[0] as { text?: string } | undefined)?.text?.includes('<acp system>') === true
 }
+
+
+// ===== 尾部动态块规模进入归因（core 在 preModel 之后才拼，这里只能拿到规模）=====
+
+test('尾部动态块：core 传入的 dynamicParts 被记为规模，且每轮显式覆盖（含置空）', async () => {
+  // 回归背景：core 的尾部动态区（core.prompt.dynamic.transform）在 preModel **返回之后**
+  // 才拼成请求末尾的 user 消息，ACP 按 messages 建视图时看不见它 ⇒ 归因里完全没有它。
+  // 而它是请求最后一条，正是 anthropic 显式 promptCache 断点的落点：
+  // 那种装配下末尾每轮 cache write，`cacheMissReason` 却报 `none`（前缀确实没动）。
+  // core 现在通过 SessionPreModelInput.dynamicParts 把片段告知；本插件只记规模。
+  const dyn = ['mcp resources（缓存只增不减）', 'memory 一次性沉淀提示']
+  const h = makeHarness(makeConfig(), 's1', { dynamicParts: dyn })
+
+  await h.run(history(2))
+  expect((h.ctx as unknown as { lastTailDyn?: { parts: number; chars: number } }).lastTailDyn).toEqual({
+    parts: 2,
+    chars: dyn.join('').length,
+  })
+
+  // 下一轮没有尾部块 ⇒ 必须置空（上一轮的规模留在这里会被读成"本轮还有块"）
+  dyn.length = 0
+  await h.run(history(3))
+  expect((h.ctx as unknown as { lastTailDyn?: unknown }).lastTailDyn).toBeUndefined()
+})

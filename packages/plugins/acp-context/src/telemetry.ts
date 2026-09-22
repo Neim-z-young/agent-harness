@@ -113,6 +113,21 @@ export interface ProviderCacheEvent {
   systemChangedParts: number[] | null
   /** 上项的人读版（每项形如「第 2 段变化：642 → 1 284 字符（原首行：「项目长期记忆」）」） */
   systemChangedDetail: string[] | null
+  /**
+   * 本轮请求**末尾**由 core 追加的尾部动态块片段数（`null` = 无尾部动态块 / 引擎未提供）。
+   *
+   * 为什么要有这个字段：`prefixChangedKind` 与 `cacheMissReason` 只看**前缀**，而 core 的
+   * 尾部动态区（`core.prompt.dynamic.transform`：MCP resources / memory 提示 / 条件 skill 等）
+   * 是在 preModel **之后**才拼上去的 —— ACP 按 `messages` 建归因视图时根本看不见它
+   * （core 经 `SessionPreModelInput.dynamicParts` 只把片段本身告知）。
+   * 后果：anthropic 显式 promptCache 断点打在最后一条时，末尾那条每轮现拼 ⇒ 最后一段
+   * 必然 cache write，而 `cacheMissReason` 仍报 `none`（前缀确实没动）——
+   * 本字段就是给这种"读数有写入、归因说无事"提供解释。
+   * 自动前缀缓存（OpenAI / DeepSeek 等）不受影响：末尾一条本就在公共前缀之外。
+   */
+  tailDynamicParts: number | null
+  /** 上项的字符数合计（`null` = 无尾部动态块或引擎未提供） */
+  tailDynamicChars: number | null
 }
 
 export type TelemetryEvent = PreModelEvent | CompressEvent | ProviderCacheEvent
@@ -361,6 +376,13 @@ export interface ProviderCacheBuildInput {
   systemChangedParts?: number[] | null
   /** 引擎侧系统区段级归因的人读详情 */
   systemChangedDetail?: string[] | null
+  /**
+   * 本轮 core 追加的尾部动态块片段数（`null`/不传 = 无或引擎未提供）。
+   * 见 `ProviderCacheEvent.tailDynamicParts`：用来解释"前缀没动但末尾有 cache write"。
+   */
+  tailDynamicParts?: number | null
+  /** 上项的字符数合计 */
+  tailDynamicChars?: number | null
 }
 
 export function buildProviderCacheEvent(inp: ProviderCacheBuildInput): ProviderCacheEvent | null {
@@ -405,5 +427,8 @@ export function buildProviderCacheEvent(inp: ProviderCacheBuildInput): ProviderC
       : null,
     systemChangedParts: inp.systemChangedParts ?? null,
     systemChangedDetail: inp.systemChangedDetail ?? null,
+    // 尾部动态块（core 在 preModel 之后追加；不在缓存前缀内，但会占最后一个断点）
+    tailDynamicParts: inp.tailDynamicParts ?? null,
+    tailDynamicChars: inp.tailDynamicChars ?? null,
   }
 }

@@ -328,6 +328,15 @@ interface AcpSessionCtx {
    * 本项目 system 区是多插件往同一数组 push 拼出来的，不点名就只能靠猜。
    */
   lastSystemStability?: SystemStabilityReport
+  /**
+   * 本轮请求**末尾** core 追加的尾部动态块规模（来自 `core.session.preModel` 的 `dynamicParts`）。
+   *
+   * 为什么要记：core 在 preModel **之后**才把它拼到 `messages` 末尾，所以本插件建归因视图时
+   * 看不到它；而它恰好是请求的最后一条 —— anthropic 显式 promptCache 断点的落点。
+   * 只记规模不记内容：它是每轮重算的，内容没有留存价值，规模足以解释末尾的 cache write。
+   * 每轮显式覆盖（含置空），与 `lastSystemStability` 同一纪律。
+   */
+  lastTailDyn?: { parts: number; chars: number }
 }
 
 // ========================================================================
@@ -690,6 +699,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               makeSystemPrompt,
               prompts: resolvedPrompts,
               ...(input.systemStability ? { systemStability: input.systemStability } : {}),
+              ...(input.dynamicParts ? { dynamicParts: input.dynamicParts } : {}),
               tempMessage,
               manualInjection,
               explicitSystemPrompt,
@@ -750,6 +760,9 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               prefix: sctx.lastPrefixDiff,
               systemChangedParts: sctx.lastSystemStability?.changedParts ?? null,
               systemChangedDetail: sctx.lastSystemStability?.details ?? null,
+              // 尾部动态块规模（core 在 preModel 之后追加，归因视野看不见它本身）
+              tailDynamicParts: sctx.lastTailDyn?.parts ?? null,
+              tailDynamicChars: sctx.lastTailDyn?.chars ?? null,
               providerInput: signal.input,
               // 分母用引擎给的**整包**估算（含 system + 工具），不是 requestTok —— 后者只算历史
               localInputEstimate: signal.localInputEstimate,
@@ -822,6 +835,12 @@ interface RunPreModelDeps {
   prompts?: Prompts
   /** 引擎给出的系统区段级归因（仅变化时有值）；用于把 system-changed 点名到段 */
   systemStability?: SystemStabilityReport
+  /**
+   * 本轮 core 将在 preModel 之后追加到请求末尾的尾部动态片段。
+   * 本插件**看不到它拼进去之后的样子**（拼接发生在 hook 返回后），只能拿到规模用于归因；
+   * 切勿把它当历史一部分参与压缩/计数。空数组与 undefined 等价：都表示没有。
+   */
+  dynamicParts?: string[]
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
   /** 遥测 JSONL 文件路径（可选，未注入则遥测 writer 为 no-op） */
   telemetryPath?: string
@@ -861,6 +880,12 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 引擎侧的系统区段级归因落进本轮 ctx，供随后的 providerCache 行点名"第 N 段变了"。
   // 每轮显式覆盖（含置空）：它是"本轮 vs 上一轮"的结论，上一轮的值留在这里会误报。
   ctx.lastSystemStability = deps.systemStability
+
+  // 尾部动态块规模同上：core 在 preModel 之后才拼，归因视野看不到它，只记规模备查。
+  const tailDyn = deps.dynamicParts ?? []
+  ctx.lastTailDyn = tailDyn.length > 0
+    ? { parts: tailDyn.length, chars: tailDyn.join('').length }
+    : undefined
 
   // 从 session.meta 水合压缩状态（仅首次）；水合后置 needFull，强制全量重建一次
   if (!ctx.hydrated) {

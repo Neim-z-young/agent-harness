@@ -2140,6 +2140,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         // 前缀区段级归因：让压缩插件（ACP）能把 "system-changed" 细化到"第 N 段变了"。
         // 只在实际变化时有值 —— 消费方不必自己维护上一轮快照。
         ...(p.systemStability ? { systemStability: p.systemStability } : {}),
+        // 尾部动态片段（每轮现拼、稍后才拼到请求末尾）——归因方看不见它就没法解释
+        // "前缀没动但末尾还有 cache write"。注意 `dynParts` 在这里已经算好（preModel 之前），
+        // 只是**拼接**发生在 preModel 之后。
+        ...(p.dynParts.length > 0 ? { dynamicParts: p.dynParts } : {}),
       },
       messages,
     )

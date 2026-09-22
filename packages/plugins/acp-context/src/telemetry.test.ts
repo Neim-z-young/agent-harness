@@ -194,6 +194,29 @@ test('providerCache 归因：系统区变化时点名到**段**（引擎侧归�
   expect(noAttrib.systemChangedDetail).toBeNull()
 })
 
+test('providerCache：尾部动态块规模如实透传（归因视野看不见它本身）', () => {
+  // 动机：core 的尾部动态区拼在**请求最末尾**，ACP 按 messages 建视图时看不到它
+  // （拼接发生在 preModel 返回之后）。而它是请求最后一条 —— anthropic 显式 promptCache
+  // 断点的落点。不记规模，"前缀没动（none）却仍有 cache write"就成了无解释的读数。
+  const ev = buildProviderCacheEvent({
+    sessionId: 's', round: 2, cacheRead: 900, cacheWrite: 320, requestTok: 1000,
+    prev: { ts: Date.now() - 1000, cacheRead: 900 },
+    tailDynamicParts: 2,
+    tailDynamicChars: 1500,
+  })!
+  expect(ev.cacheMissReason).toBe('none') // 前缀确实没动
+  expect(ev.cacheWrite).toBe(320)         // 写入却不为 0 ⇒ 解释在下面两行
+  expect(ev.tailDynamicParts).toBe(2)
+  expect(ev.tailDynamicChars).toBe(1500)
+
+  // 没有尾部动态块（或宿主未接线）⇒ 记 null，不编造 0（0 会被读成"引擎说没有"）
+  const plain = buildProviderCacheEvent({
+    sessionId: 's', round: 2, cacheRead: 900, cacheWrite: 0, requestTok: 1000,
+  })!
+  expect(plain.tailDynamicParts).toBeNull()
+  expect(plain.tailDynamicChars).toBeNull()
+})
+
 test('providerCache 口径：calibration 的分母必须是**整包**估算，不是历史估算', () => {
   // 分母用整包（含 system + 工具）⇒ 1320/1000 = 1.32
   const ev = buildProviderCacheEvent({

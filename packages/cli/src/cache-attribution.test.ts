@@ -244,6 +244,8 @@ describe('端到端：易变内容放 system vs 放尾部（"插件插标记"的
     // R1 首轮无基线；R2 相对 R1 虽也变了，但命中量没跌 ⇒ reason 为 none
     expect(rows[0]!.systemChangedParts).toBeNull()
     expect(rows[2]!.cacheDropTokens).toBe(1000)
+    // 本轮没有尾部动态块（探针只往 system 区插）⇒ 必须如实记 null，不能编造 0
+    expect(rows.map((r) => r.tailDynamicParts)).toEqual([null, null, null])
   })
 
   it('放在尾部动态区：内容同样每轮变，但前缀**逐字未变** ⇒ reason 恒为 none', async () => {
@@ -265,6 +267,13 @@ describe('端到端：易变内容放 system vs 放尾部（"插件插标记"的
     expect(rows.map((r) => r.systemChangedParts)).toEqual([null, null, null])
     // 前缀完好：稳定前缀长度随历史递增（没有被裁到 0）
     expect(rows[2]!.prefixStableMessages as number).toBeGreaterThan(rows[1]!.prefixStableMessages as number)
+
+    // 尾部动态块的**规模**进入归因：它是请求最后一条、也是 anthropic 显式 promptCache
+    // 断点的落点，而 `prefixChangedKind` / `cacheMissReason` 只看前缀 ——
+    // 没有这个字段，"前缀没动却仍有 cache write" 在遥测里就是无解释的读数。
+    // （core 在 preModel **之后**才拼，所以只能由 core 通过入参告知规模。）
+    expect(rows.map((r) => r.tailDynamicParts)).toEqual([1, 1, 1])
+    expect(rows[0]!.tailDynamicChars).toBe('PROBE_VOLATILE_R1'.length)
 
     // 且**不落库**：尾部块是发送时拼接的临时内容，每轮重算 —— 落库就会变成下一轮的
     // 中段脏数据（既污染历史，又制造本可避免的前缀改写）

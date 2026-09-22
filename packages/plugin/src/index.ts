@@ -250,6 +250,17 @@ export interface SessionPreModelInput {
    */
   systemStability?: SystemStabilityReport
   /**
+   * 本轮 `core.prompt.dynamic.transform` 收集到的尾部动态片段（原始文本，尚未渲染拼接）。
+   *
+   * 为什么归因方需要它：core 在 preModel **返回之后**才把这些片段拼成请求末尾的那条 user
+   * 消息（见 core 的 `_buildStepMessages`），因此 preModel 里按 `messages` 建视图的插件
+   * **完全看不见它**。而它恰好是请求的最后一条 —— 也是 anthropic 显式 promptCache 断点
+   * （打最后一条）的落点。不提供这个字段，那种装配下最后一段 cache write 在遥测里就没有
+   * 任何解释：`cacheMissReason` 会说 `none`（前缀确实没动），读数却显示有写入。
+   * 空数组 = 本轮确实没有尾部动态块，不是"未接线"；宿主不传 = 未接线。
+   */
+  dynamicParts?: string[]
+  /**
    * 会话 meta 访问器：插件可据此在 session.meta 中持久化运行时状态
    * （如 ACP 压缩状态），随会话落盘、重启后恢复。patch 为浅合并。
    */
