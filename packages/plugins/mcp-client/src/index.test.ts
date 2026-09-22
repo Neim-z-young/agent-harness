@@ -837,7 +837,7 @@ describe('createMcpClientPlugin resources/prompts', () => {
 // ===== autoInjectResources 测试 =====
 
 describe('createMcpClientPlugin autoInjectResources', () => {
-  it("policy='all' 把资源 text 注入到 core.prompt.system.transform", async () => {
+  it("policy='all' 把资源 text 注入到 core.prompt.dynamic.transform（尾部，不进前缀）", async () => {
     const transport = new MockTransport()
     transport.register('initialize', () => ({
       protocolVersion: '2024-11-05',
@@ -865,12 +865,19 @@ describe('createMcpClientPlugin autoInjectResources', () => {
     const hooks = await plugin.install(ctx as any)
     await (hooks as any)['core.harness.start']?.()
 
-    const parts: string[] = ['base system prompt']
-    await (hooks as any)['core.prompt.system.transform']?.({}, parts)
-    const combined = parts.join('\n')
+    // 位置约束：resources 缓存是**只增不减**的，放 system 区等于"每读到一份新资源就让
+    // 其后的整段历史重算"；放尾部动态区则代价 ≈ 0（尾部本来就是每轮重算的部分）。
+    const sysParts: string[] = ['base system prompt']
+    const dynParts: string[] = []
+    await (hooks as any)['core.prompt.system.transform']?.({}, sysParts)
+    await (hooks as any)['core.prompt.dynamic.transform']?.({}, dynParts)
+
+    expect(sysParts.join('\n')).toBe('base system prompt') // 前缀区一字不加
+    const combined = dynParts.join('\n')
     expect(combined).toInclude('MCP Resources')
     expect(combined).toInclude('app: demo')
     expect(combined).toInclude('port: 8080')
+    expect(combined.startsWith('\n')).toBe(false) // 前导空行由 core 拼接时统一补
 
     await plugin.uninstall?.()
   })
@@ -906,9 +913,12 @@ describe('createMcpClientPlugin autoInjectResources', () => {
     const hooks = await plugin.install(ctx as any)
     await (hooks as any)['core.harness.start']?.()
 
-    const parts: string[] = []
-    await (hooks as any)['core.prompt.system.transform']?.({}, parts)
-    const combined = parts.join('\n')
+    const sysParts: string[] = []
+    const dynParts: string[] = []
+    await (hooks as any)['core.prompt.system.transform']?.({}, sysParts)
+    await (hooks as any)['core.prompt.dynamic.transform']?.({}, dynParts)
+    const combined = dynParts.join('\n')
+    expect(sysParts).toHaveLength(0)
     expect(combined).toInclude('body-file://a.txt')
     expect(combined).not.toInclude('body-file://b.txt')
 

@@ -797,7 +797,15 @@ export function createMcpClientPlugin(options: {
           }
         },
 
-        'core.prompt.system.transform'(_input, parts) {
+        /**
+         * MCP resources 注入走**尾部动态区**，不走 system 区。
+         *
+         * 理由：`injectedResourceCache` 是**只增不减**的（每读到一份资源就多一条），
+         * 放在 system 区意味着"每读到一份新资源，其后的整段历史都要重算"——
+         * 而资源正文是参考材料，本来就不需要指令级权威，放尾部零代价。
+         * 位置约束的量化见 @harness/plugin 里 `core.prompt.dynamic.transform` 的文档。
+         */
+        'core.prompt.dynamic.transform'(_input, parts) {
           // 注入自动拉取的资源文本（模板含 `# MCP Resources` 标题 + `{uri}`/`{text}` 占位符）
           if (injectedResourceCache.size > 0) {
             const rendered = Array.from(injectedResourceCache.entries())
@@ -808,7 +816,9 @@ export function createMcpClientPlugin(options: {
             const extra = rest
               .map((r) => r.startsWith(header) ? r.slice(header.length) : r)
               .join('\n\n')
-            parts.push(extra ? `\n\n${first}\n\n${extra}` : `\n\n${first}`)
+            // 片段间的空行由 core 拼接时统一补（renderDynamicBlock 用 \n\n join）——
+            // 这里不再自己加前导换行，否则尾部块里会出现多余空行
+            parts.push(extra ? `${first}\n\n${extra}` : first)
           }
         },
 

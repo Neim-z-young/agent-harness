@@ -580,12 +580,28 @@ export function createMemoryPlugin(options: MemoryPluginOptions = {}): AgentPlug
             return
           }
           // 分级发布：新内容不一定立刻进 system（攒到压缩那一刻或攒够轮数），见 MemoryPublisher
-          let text = publisher.onInject(renderMemorySection(load()))
-          if (pendingHint) {
-            text = text ? `${text}\n\n${pendingHint}` : pendingHint
-            pendingHint = null // 一次性
-          }
+          const text = publisher.onInject(renderMemorySection(load()))
           if (text) parts.push(text)
+        },
+
+        /**
+         * 一次性沉淀提示走**尾部动态区**，不走 system 区。
+         *
+         * 为什么必须挪：它天然是"出现一轮、下一轮消失"的形态。留在 system 里会产生**两次**
+         * 前缀失效 —— 出现时一次、消失时又一次；而"消失"那次并**不**伴随压缩，是纯浪费
+         * （压缩时 system 本来就会因 core 的 `appendCompactionMemory` 而变化，搭那次车才免费，
+         * 见 PublishOptions.flushAfterTurns 的说明）。放尾部则两次都免费 —— 尾部本来就是
+         * 每轮重算的部分，不参与前缀缓存。
+         *
+         * 分支判据与 system 侧保持一致（子 Agent 不注入、disableInjection 关闭），
+         * 否则会出现"主会话提示了、子 Agent 也提示了"的越界。
+         */
+        'core.prompt.dynamic.transform'(input, parts) {
+          if (options.disableInjection) return
+          if (input.agentMode === 'subagent') return
+          if (!pendingHint) return
+          parts.push(pendingHint)
+          pendingHint = null // 一次性
         },
 
         /**

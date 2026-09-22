@@ -500,10 +500,22 @@ describe('插件级：flush 三源与一次性提示', () => {
     return { hooks, w }
   }
   const sys = { agentId: 'default', sessionId: 's' }
-  const inject = async (hooks: Hooks) => {
-    const parts: string[] = []
-    await hooks['core.prompt.system.transform']!(sys, parts)
-    return parts.join('\n')
+  /**
+   * 一次收集两条通道：`system`（前缀区）+ `dynamic`（尾部动态区）。
+   *
+   * 顺序必须与引擎一致（先 system 再 dynamic）：`publisher.onInject` 在 system 侧推进
+   * 发布状态、`pendingHint` 在 dynamic 侧被消费 —— 顺序反了会拿到过期结果。
+   */
+  const collect = async (hooks: Hooks, input = sys) => {
+    const sysParts: string[] = []
+    const dynParts: string[] = []
+    await hooks['core.prompt.system.transform']!(input, sysParts)
+    await hooks['core.prompt.dynamic.transform']!(input, dynParts)
+    return { system: sysParts.join('\n'), dynamic: dynParts.join('\n') }
+  }
+  const inject = async (hooks: Hooks, input = sys) => {
+    const { system, dynamic } = await collect(hooks, input)
+    return [system, dynamic].filter(Boolean).join('\n')
   }
 
   it('外部改动（直接改文件）默认攒批：注入仍是旧内容', async () => {
@@ -533,6 +545,39 @@ describe('插件级：flush 三源与一次性提示', () => {
     const second = await inject(hooks)
     expect(second).toContain('压缩前的改动')
     expect(second).not.toContain('<memory-hint>')  // 一次性
+  })
+
+  it('一次性沉淀提示走**尾部动态区**（留在 system 会多付一次无谓的前缀失效）', async () => {
+    const { hooks, w } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
+    hooks['core.tool.post.execute']!({ tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's' } }, { ok: true })
+
+    const first = await collect(hooks)
+    expect(first.dynamic).toContain('<memory-hint>')
+    // 关键：不能留在前缀区 —— 它的形态是"出现一轮、下一轮消失"，
+    // 留在 system 里会让前缀缓存付**两次**失效（出现一次、消失一次），
+    // 而"消失"那次并不伴随压缩，纯属浪费
+    expect(first.system).not.toContain('<memory-hint>')
+
+    // 第二轮：提示已消费掉，而 system 区**逐字未变** ⇒ 本轮零前缀失效
+    const second = await collect(hooks)
+    expect(second.dynamic).not.toContain('<memory-hint>')
+    expect(second.system).toBe(first.system)
+  })
+
+  it('子 Agent 不注入：system 与动态区都不给（含一次性提示）', async () => {
+    const { hooks, w } = await hooksOf()
+    hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
+    await inject(hooks)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 压缩前的改动\n')
+    hooks['core.tool.post.execute']!({ tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's' } }, { ok: true })
+
+    const sub = { agentId: 'reader', sessionId: 'sub', agentMode: 'subagent' }
+    const { system, dynamic } = await collect(hooks, sub)
+    expect(system).not.toContain('压缩前的改动')
+    expect(dynamic).not.toContain('<memory-hint>')
   })
 
   it('ACP 压缩失败不 flush（压缩没成，窗口还没腾出来）', async () => {
@@ -623,10 +668,22 @@ describe('turn_end 计数只认主会话', () => {
   async function installAt(over: Record<string, unknown> = {}) {
     return await install({ flushAfterTurns: 2, ...over })
   }
-  const inject = async (hooks: Hooks) => {
-    const parts: string[] = []
-    await hooks['core.prompt.system.transform']!(sys, parts)
-    return parts.join('\n')
+  /**
+   * 一次收集两条通道：`system`（前缀区）+ `dynamic`（尾部动态区）。
+   *
+   * 顺序必须与引擎一致（先 system 再 dynamic）：`publisher.onInject` 在 system 侧推进
+   * 发布状态、`pendingHint` 在 dynamic 侧被消费 —— 顺序反了会拿到过期结果。
+   */
+  const collect = async (hooks: Hooks, input = sys) => {
+    const sysParts: string[] = []
+    const dynParts: string[] = []
+    await hooks['core.prompt.system.transform']!(input, sysParts)
+    await hooks['core.prompt.dynamic.transform']!(input, dynParts)
+    return { system: sysParts.join('\n'), dynamic: dynParts.join('\n') }
+  }
+  const inject = async (hooks: Hooks, input = sys) => {
+    const { system, dynamic } = await collect(hooks, input)
+    return [system, dynamic].filter(Boolean).join('\n')
   }
   const endTurn = (hooks: Hooks, sessionId?: string, mode = 'primary') => {
     // 引擎层通道：core.agent.turn.end（不是 cli.agent.stream 的 turn_end —— 那条只存在于有 UI 的宿主）
@@ -682,10 +739,22 @@ describe('turn_end 计数只认主会话', () => {
 
 describe('轮次计数的来源必须是引擎层（core.agent.turn.end）', () => {
   const sys = { agentId: 'default', sessionId: 's' }
-  const inject = async (hooks: Hooks) => {
-    const parts: string[] = []
-    await hooks['core.prompt.system.transform']!(sys, parts)
-    return parts.join('\n')
+  /**
+   * 一次收集两条通道：`system`（前缀区）+ `dynamic`（尾部动态区）。
+   *
+   * 顺序必须与引擎一致（先 system 再 dynamic）：`publisher.onInject` 在 system 侧推进
+   * 发布状态、`pendingHint` 在 dynamic 侧被消费 —— 顺序反了会拿到过期结果。
+   */
+  const collect = async (hooks: Hooks, input = sys) => {
+    const sysParts: string[] = []
+    const dynParts: string[] = []
+    await hooks['core.prompt.system.transform']!(input, sysParts)
+    await hooks['core.prompt.dynamic.transform']!(input, dynParts)
+    return { system: sysParts.join('\n'), dynamic: dynParts.join('\n') }
+  }
+  const inject = async (hooks: Hooks, input = sys) => {
+    const { system, dynamic } = await collect(hooks, input)
+    return [system, dynamic].filter(Boolean).join('\n')
   }
   const endTurn = (hooks: Hooks, mode = 'primary', sessionId: string | undefined = 's') => {
     hooks['core.agent.turn.end']!({ agentId: 'default', mode, step: 1, ...(sessionId ? { sessionId } : {}) })
