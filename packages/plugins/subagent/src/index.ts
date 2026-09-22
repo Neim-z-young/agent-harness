@@ -677,9 +677,25 @@ export function createSubagentTool(
    * 会话 `s_1789996799007_9cq9r`：6 个 reader 因 20 步上限**全部截断**，逼出第二轮补派
    * （额外 41 次 LLM 调用 / 133 万 input token）。派工方比 agent 定义更清楚本次任务有多大，
    * 所以把这一层交给调用方。
+   *
+   * 非法覆盖值（`0` / 负数 / `NaN` —— 模型在 `subagent({ maxSteps })` 里填错时的典型形态）
+   * **不参与优先级**：`0 ?? x` 不会跳过 `0`，透传下去会被引擎判为「未指定」而回落，
+   * 若按老逻辑钳成 1 步，子 Agent 会一步就收尾 —— 现象像「任务太小」，与「入参写错」完全对不上。
+   * 这里直接忽略并告警，按下一优先级取值。
    */
-  const resolveSteps = (agentId: string, override?: number): number =>
-    override ?? getHarness()?.agent.get(agentId)?.maxSteps ?? subagentMaxSteps
+  const resolveSteps = (agentId: string, override?: number, warn?: (msg: string) => void): number => {
+    // `-1` = 不限（透传给引擎转 Infinity），`>= 1` 的有限数才作数
+    const valid = (v: number | undefined): number | undefined =>
+      v === undefined || v === -1 || (Number.isFinite(v) && v >= 1) ? v : undefined
+    if (override !== undefined && valid(override) === undefined) {
+      warn?.(
+        `subagent 入参 maxSteps=${JSON.stringify(override)} 无效（应为 -1 = 不限，或 >= 1 的整数）：`
+        + '已忽略该项，按子 Agent 定义 / 插件默认执行。',
+      )
+    }
+    // 子 Agent 定义侧同样过滤：程序化注册（非 md 解析）时可能塞进非法值
+    return valid(override) ?? valid(getHarness()?.agent.get(agentId)?.maxSteps) ?? subagentMaxSteps
+  }
 
   /**
    * 完整输出的落盘目录 = `{dataDir}/subagent-results`（与 `{dataDir}/tasks` 同域）。
@@ -726,7 +742,7 @@ export function createSubagentTool(
         },
         sessionId: { type: 'string', description: '续接已有子 session（多轮子 Agent 对话）；不传则新建' },
         runInBackground: { type: 'boolean', description: 'true = 后台运行，立即返回 taskId，结果经 task-notification 推送；默认同步等待完成' },
-        maxSteps: { type: 'number', description: '本次子任务的步数上限（可选）。不传则用子 Agent 定义的 maxSteps，再退插件默认。通读/遍历类任务请显式给足（如 35）' },
+        maxSteps: { type: 'number', description: '本次子任务的步数上限（可选）。合法值：>= 1 的整数，或 -1 表示不限；填 0 / 负数会被忽略（按子 Agent 定义、再退插件默认）。不传则用子 Agent 定义的 maxSteps，再退插件默认。通读/遍历类任务请显式给足（如 35）' },
         targetFiles: { type: 'array', items: { type: 'string' }, description: '该 worker 预计写入的文件/目录（项目相对路径）。调度元数据：写操作按文件集串行化' },
       },
       required: ['agentId', 'prompt'],
@@ -1145,7 +1161,7 @@ export function createSubagentTool(
           model: input.model,
           signal: controller.signal,
           // 同上：子 Agent 用更保守的步数上限
-          maxSteps: resolveSteps(input.agentId, input.maxSteps),
+          maxSteps: resolveSteps(input.agentId, input.maxSteps, (m) => ctx.log?.warn?.(m)),
         })
 
         const timeoutPromise = new Promise<never>((_resolve, reject) => {

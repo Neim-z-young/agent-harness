@@ -3178,4 +3178,31 @@ describe('派工方可按本次任务规模覆盖子 Agent 步数上限', () => 
     expect(await seenSteps({ ...base, maxSteps: 25 }, { maxSteps: 40 })).toBe(40)
     expect(await seenSteps(base, { maxSteps: 40 })).toBe(40)
   })
+
+  // 回归：`0 ?? x` 不会跳过 `0`，非法覆盖值此前会一路透传下去。若引擎侧也无脑 `Math.max(1, 0)`，
+  // 子 Agent 就只跑 1 步 —— 现象像「任务太小」，与「模型把入参填成 0」完全对不上。
+  // 现在这一层直接忽略非法值，按下一优先级取值。
+  it('非法覆盖值（0 / <-1 / NaN）被忽略：回落子 Agent 定义或插件默认，不静默变成 1 步', async () => {
+    expect(await seenSteps({ ...base, maxSteps: 25 }, { maxSteps: 0 })).toBe(25)
+    expect(await seenSteps(base, { maxSteps: 0 })).toBe(DEFAULT_SUBAGENT_MAX_STEPS)
+    expect(await seenSteps({ ...base, maxSteps: 25 }, { maxSteps: -3 })).toBe(25)
+    expect(await seenSteps({ ...base, maxSteps: 25 }, { maxSteps: Number.NaN })).toBe(25)
+  })
+
+  it('-1 = 不限是合法覆盖值：原样透传（由引擎转 Infinity）', async () => {
+    expect(await seenSteps({ ...base, maxSteps: 25 }, { maxSteps: -1 })).toBe(-1)
+  })
+
+  it('非法覆盖值会经 ctx.log.warn 告警（可观测，不静默）', async () => {
+    const warns: string[] = []
+    const agent = createMockAgentRuntime([{ ...base, maxSteps: 25 }], async () => makeMessage('assistant', 'done'))
+    const tool = createSubagentTool(() => ({ agent, session: createMockSessionManager(new Map()) }), 5000, false)
+    await tool.call(
+      { agentId: base.id, prompt: 'x', maxSteps: 0 },
+      makeToolContext({
+        log: { info: () => {}, warn: (m: string) => { warns.push(m) }, error: () => {} },
+      }),
+    )
+    expect(warns.some((w) => w.includes('maxSteps') && w.includes('无效'))).toBe(true)
+  })
 })

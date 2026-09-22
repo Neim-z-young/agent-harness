@@ -1659,6 +1659,31 @@ export function extractFilePaths(text: string): string[] {
 export const DEFAULT_MAX_STEPS = 30
 
 /**
+ * 步数上限归一化 —— 引擎侧**唯一**的判定点（`AgentQueryInput.maxSteps` 与
+ * `AgentDefinition.maxSteps` 都经这里变成最终上限）。
+ *
+ * 合法输入：
+ * - `-1` 或 `+Infinity` → 不限（仅受 doom-loop 守卫约束）
+ * - 有限且 `>= 1` → 取下整
+ *
+ * 其余（`0`、`-2` 这类 `< -1`、`NaN`、非法类型）一律返回 `undefined`，语义是
+ * **「未指定」**，由调用方按优先级回落下一层（引擎调用点见 {@link DEFAULT_MAX_STEPS} 的取值链）。
+ *
+ * 为什么不沿用 `Math.max(1, Math.floor(configured))`：
+ * 1. 它把 `0` **静默抬成 1** —— 子 Agent 会跑一步就收尾，现象像「任务太小 / 模型没干活」，
+ *    而真实原因是入参非法（模型在 `subagent({ maxSteps })` 里填了 `0`，而 `0 ?? x` 不会跳过 `0`）。
+ * 2. 它对 `NaN` 返回 `NaN` ⇒ `step >= NaN` 恒为 `false` ⇒ **步数上限被静默取消**，
+ *    循环只能靠模型自觉或 doom-loop 守卫停下（最危险的一种：看起来像"跑得很久"，
+ *    实际是"没有上限了"）。
+ */
+export function normalizeMaxSteps(value: number | undefined | null): number | undefined {
+  if (value === undefined || value === null || typeof value !== 'number') return undefined
+  if (value === -1 || value === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY
+  if (!Number.isFinite(value) || value < 1) return undefined
+  return Math.floor(value)
+}
+
+/**
  * doom-loop 拦截阈值：同一工具 + 完全相同的入参连续出现的次数。
  * 对齐 opencode `processor.ts` 的 `DOOM_LOOP_THRESHOLD = 3`。
  */
@@ -2150,9 +2175,26 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const prepared = await this._prepareQueryOnce(input)
     const { sessionId } = prepared
 
-    // 步数上限优先级：input.maxSteps > AgentDefinition.maxSteps > DEFAULT_MAX_STEPS
-    const configured = input.maxSteps ?? this.agents.get(prepared.agentId)?.maxSteps ?? DEFAULT_MAX_STEPS
-    const maxSteps = configured === -1 ? Number.POSITIVE_INFINITY : Math.max(1, Math.floor(configured))
+    // 步数上限优先级：input.maxSteps > AgentDefinition.maxSteps > DEFAULT_MAX_STEPS。
+    // 非法取值**不静默钳制**：`normalizeMaxSteps` 把 `0`/`NaN`/`<-1` 判为「未指定」并回落下一层，
+    // 同时告警 —— 否则「0 被抬成 1」会让子 Agent 跑一步就收尾，现象与真实原因完全对不上；
+    // 而 NaN 会让 `step >= NaN` 恒假，等于把上限静默取消。
+    const agentDef = this.agents.get(prepared.agentId)
+    const fromInput = normalizeMaxSteps(input.maxSteps)
+    const fromAgent = normalizeMaxSteps(agentDef?.maxSteps)
+    if (input.maxSteps != null && fromInput === undefined) {
+      this.deps.logger?.warn?.(
+        `[maxSteps] 入参 maxSteps=${JSON.stringify(input.maxSteps)} 无效（应为 -1 = 不限，或 >= 1 的整数），`
+        + `已忽略并回落下一优先级（agent="${prepared.agentId}"）。`,
+      )
+    }
+    if (agentDef?.maxSteps != null && fromAgent === undefined) {
+      this.deps.logger?.warn?.(
+        `[maxSteps] Agent "${prepared.agentId}" 定义的 maxSteps=${JSON.stringify(agentDef.maxSteps)} 无效`
+        + '（应为 -1 = 不限，或 >= 1 的整数），已忽略并回落引擎默认值。',
+      )
+    }
+    const maxSteps = fromInput ?? fromAgent ?? DEFAULT_MAX_STEPS
 
     let step = 0
     let wrapUpInjected = false
