@@ -1,5 +1,97 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 179）"插件往系统区插标记"从定位到解决 + 探针固化
+
+用户："可以（固化 L3 探针），插件插标记的问题能解决不"。
+
+### 结论先说
+
+**能解决，而且解法在本项目里已经存在** —— `acp-context` 早就把原理量化过（`MANUAL_INJECT_MARGIN`
+注释）："**完整手册必须注入在尾部**，不能放前缀……放前缀翻转一次 ≈ 95K token-equiv，回本要 366 次
+调用"。缺的不是认知，而是**通用机制 + 约束各插件遵守**。本轮把两件都补上。
+
+### 一、机制：`core.prompt.dynamic.transform`（尾部动态区）
+
+- 新增 hook，签名与 `core.prompt.system.transform` 相同（`(PromptInput, string[]) => void`）。
+- core 把结果拼成**一条 `user` 临时消息，追加在请求最末尾**，并代管两条硬约束：
+  1. **必须 `user` role**：`provider-anthropic.extractSystemPrompt` / `provider-gemini.extractSystem`
+     会把**任意位置**的 system 消息上提进顶层 `system`/`systemInstruction`（原位置跳过）——
+     用 system 挪到尾部等于没挪。
+  2. **必须在 `core.session.preModel` 之后拼接**：那是压缩插件的折叠/回写点；放它之前有被写进
+     持久层的风险，而尾部块每轮重算，落库即脏数据。放后面 = "发送时拼接"，天然不落库。
+- 渲染成 `<host-context note="宿主注入，非用户发言；内容可能每轮变化">…</host-context>`：
+  不给标记的话模型会把它当用户发言，影响回复对象与口吻。
+
+### 二、迁移：谁本来就该待在尾部
+
+| 消费方 | 内容 | 判定 | 处理 |
+|---|---|---|---|
+| `mcp-client` | MCP resources | 缓存**只增不减**（每 read 一份就多一条）⇒ 每份新资源都让整段历史重算 | **迁移** |
+| `memory` | 一次性沉淀提示 | "出现一轮、下一轮消失"⇒ 留 system 付**两次**失效，而"消失"那次无压缩可搭车 | **迁移** |
+| `memory` | 记忆正文 | 设计上搭压缩的车（`PublishOptions.flushAfterTurns` 注释：压缩时 system 本就因 `appendCompactionMemory` 而变），只在 15 轮兜底时才是纯失效 | 留在前缀 |
+| core | 压缩记忆块 | 只随压缩变，同上一行 | 留在前缀 |
+| `subagent` roster / `core.skill-injection` / `coordinator` | 名单/技能/规则 | 恒定文本 | 留在前缀（由归因兜底） |
+
+### 三、归因：system 变了要能**点名到段**
+
+`core.prompt.system.transform` 是**多个插件往同一个数组 push** 拼出来的 ⇒ 只说"system-changed"
+等于没说。新增段级归因：
+
+- core：每 query 算 sysParts 的**段级指纹快照**（指纹 / 长度 / 首行预览），与上一轮比对，产出
+  `SystemStabilityReport`（`changedParts` / `addedParts` / `removedParts` / `details`）。
+  变化时 `logger.warn` 一条人读日志，并把报告经 `core.session.preModel` 的
+  `input.systemStability` 交给插件。首轮无基线不报（否则每个新会话都误报一次）。
+- ACP 遥测：`providerCache` 行新增 `systemChangedParts` / `systemChangedDetail`。
+- 判据是**内容指纹**，不是长度、也不是 message id：R2→R3 那种"只差一个数字、字符数相同"的
+  变化也必须判出来（provider 按字节命中，这是真失效）。已用单测钉住。
+
+### 四、验证：位置对照实验（决定性证据）
+
+`packages/cli/src/cache-attribution.test.ts` 新增两条 —— **同一份内容、同一变化幅度、唯一变量是位置**：
+
+- 放 `system` 区：`cacheMissReason = system-changed`、`prefixStableMessages = 0`、归因点名
+  `systemChangedParts = [1]` 且 detail 里能看到新旧首行。
+- 放尾部动态区：内容同样每轮不同（断言请求体最后一条确实带 `PROBE_VOLATILE_R1/R2/R3`），
+  而**前缀区三份请求逐字相同** ⇒ `reason` 恒为 `none`、`systemChangedParts` 恒为 `null`。
+  并额外断言**不落库**（`session.messages` 里既无 `PROBE_VOLATILE` 也无 `host-context`）。
+
+### 五、固化 L3 真机探针：`bun run probe:cache`
+
+原先是"一次性脚本，用完就删"的方法论。现已固化为 `packages/cli/src/probe-cache-telemetry.ts`
+（放在 cli 包内 ⇒ 进 `tsc --noEmit`，不会腐烂）：
+
+- 临时 dataDir + 复制真实 config（**复制而非软链**：软链会把探针的临时改动写回真实配置）；
+- **包 `globalThis.fetch` 抓真实请求体**做**独立证据**（系统区哈希、消息数、工具数、body 字节），
+  与内部指标交叉验证；
+- 读 ACP 遥测逐轮打印 `preModel` + `providerCache`（含 `systemChangedParts` 点名）；
+- `PROBE_ROUNDS` / `PROBE_IDLE_MIN` / `PROBE_PROMPT` / `PROBE_KEEP` 可调。
+
+#### 实跑发现（**需要拍板**，未自行改动配置）
+
+在同一台机器、同一份 config 下跑 3 轮（真实长度正文）：
+
+| 装配 | 原始比值（provider 输入 ÷ 本地未校正估算） |
+|---|---|
+| 续 178 测量的极简装配 | **1.33**（1.328 / 1.342 / 1.337 / 1.332） |
+| 本轮完整 CLI 装配（29 工具、固定开销 ≈16.0K tok） | **≈1.14**（`calibration` 稳定在 0.854~0.859，÷1.33 反推） |
+
+⇒ **1.33 在完整装配下过校正 ≈16%**，occupancy 会偏高、压缩偏早。残差主因推测是
+`estimateToolPayloadTokens` 的近似形状（只取 `name`/`description`/`parameters`，未含
+`strict`/`additionalProperties` 等），工具载荷估低会把整体比值往上推 —— 也就是说这个 scale
+实际在替"工具载荷估算误差"背锅，因此**与装配强相关，不是普适常数**。
+
+**未改动 `~/.harness/config.json`**（现值 1.33 保留）：取值属行为决策，且"全局单一常数"本身是
+一阶近似。三个候选：① 改成 1.14；② 保留 1.33（偏保守、压缩更早）；③ 不再用常数，改为在线
+用观测到的 `calibration` 缓慢自校正（去掉假设，但要防反馈回路）。需要拍板。
+
+### 六、验证
+
+新增测试 17 例（core 归因/渲染 8、acp-context 遥测 1、cli 位置对照 2、memory 位置与隔离 2、
+mcp-client 位置 2、更新既有用例）。全量 **1751 pass / 0 fail**、39 包全退出码 0、typecheck 全绿。
+
+**未做/待观察**：`cacheMissReason` 仍需等真实断崖点名（能力已就位）；memory 正文是否也值得
+下沉到尾部（取决于"搭压缩车"的假设在真实长会话里的命中率，值得用探针在长会话上量一次）。
+
 ## 2026-09-22（续 178）前缀缓存回退可观测 + token 口径校正（实测 1.33）+ 非流式超时分级
 
 用户："做2和3"（承接续 177 末尾列出的未做项：② turn 边界前缀缓存回退定位、③ 本地 token 口径校正 + provider 超时分级）。
