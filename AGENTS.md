@@ -101,6 +101,8 @@
 
 - **工具调用"入参自愈"在 core，不在各工具**：失败且必填项没给全时，core 把该工具的必填参数（名/类型/描述，取自 `inputSchema.__jsonSchema`）+ 最小示例拼进回喂的错误消息（`[入参自愈] …`），**原 `message`/`code` 一律保留**。动机：真机实测模型在长上下文下会整段丢 tool-call arguments（100 次调用 37 次失败、34 次 `input:{}`，失败率随上下文从 12% 升到 50%）。必填已给齐、或无 schema/无必填 ⇒ **不掺和**
 
+- **改可观测性 / 阈值 / 口径类逻辑，验证要分四层，且别用 mock 越界冒充真机**：L1 纯函数单测（分类规则、算术）→ **L2 端到端 mock**（真实引擎 + 真实插件 + 探针插件造 prompt 形态 + `MockChatProvider.usageSequence` 造逐轮用量台阶；样例见 `packages/cli/src/cache-attribution.test.ts`）→ L3 真机（临时 dataDir + 包 `globalThis.fetch` 抓真实请求体做**独立证据**）→ L4 产线遥测。**mock 能验"逻辑与装配"，验不了"系数取值"与"provider 真实行为"**。写 L2 探针时注意：**改动必须每轮重新施加** —— core 每轮从会话本体重建 messages，只改一轮会在下一轮被还原，看起来像"前缀又变了一次"
+
 - **诊断"前缀缓存为什么掉"看遥测的 `cacheMissReason`，不要靠猜**：`providerCache` 行现在自带 `cacheMissReason`（`first-request` / `none` / `system-changed` / `prefix-mutated` / `prefix-shrunk` / `idle-expiry`）、`prefixStableMessages`、`prefixChangedKind`、`cacheDropTokens`、`idleMs`。判据来自 `diffPromptPrefix()` 对**上一轮真正发出去的 prompt** 逐条做**内容指纹**比对（`preModel` 末尾原地替换之后才是最终内容）。**为什么必须用内容指纹而不是 id**：既有的 `commonPrefixHit` 只比 `id`，同 id 消息正文被就地改写时它照样报高命中率——那是误导性的绿灯，比没有指标更糟；而"就地改写"正是本项目最可能的失效源（ACP 折叠/占位符替换）。指纹**刻意不含 `id`**：ACP 每轮的 HINT/nudge 临时消息 id 都是新的，算进去会让指标恒为 0
 
 - **本地 token 估算与 provider 计费口径不是同一把尺子 ⇒ 用 `compression.tokenCalibrationScale` 显式校正**：真机实测（临时 dataDir 跑 3 轮 / DeepSeek deepseek-flash）稳定为 **1.33**（provider 输入 ÷ 本地**整包**估算 = 1.328/1.342/1.337/1.332，即系统性低估约 25%），校正后同一探针的 `calibration` 收敛到 **1.000 ± 0.011**。取数方法：读遥测 `providerCache.calibration`（每轮都打），连续几轮稳定即可。⚠️ **分母必须是"整包"估算（system + 工具载荷 + 消息），不是 ACP 的 `requestTok`** —— 后者只算历史 cores，拿它当分母首轮量出 **415×** 的假偏差（量到的是"漏算固定开销"，不是 tokenizer 差异）。引擎侧由 `core.llm.usage.localInputEstimate` 提供整包估算；`overheadTok = 整包 − 历史` 就是每轮重发的固定开销

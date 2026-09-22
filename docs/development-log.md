@@ -82,6 +82,33 @@
 **未做/待观察**：`cacheMissReason` 需等下一次真实断崖来点名（已具备能力）；memory 注入与 subagent
 roster 是否改动系统区未验证（那是最强嫌疑，值得用同一探针加插件复现）。
 
+### 七、验证矩阵（回答「如何验证 / 能不能用 mock 数据验」）
+
+**能，但必须分清"验逻辑"与"验结论"** —— 分四层：
+
+| 层 | 手段 | 能验证什么 | **验不了什么** | 命令 |
+|---|---|---|---|---|
+| **L1 纯函数** | 单测 | 分类规则（四形态 × 六 reason）、口径算术、非法值兜底 | 装配是否正确、字段是否真的落到文件 | `cd packages/plugins/acp-context && bun test src/telemetry.test.ts` |
+| **L2 端到端 mock** | `packages/cli/src/cache-attribution.test.ts`（**本轮新增**） | **归因闭环**：真实引擎 + 真实 acp-context 插件 + 探针插件（按轮次制造系统区变化 / 中段改写 / 删一批）+ `MockChatProvider.usageSequence`（逐轮 cacheRead 台阶）⇒ 断言 6 轮 reason 序列、kind、降幅、`prefixStableMessages`、`idleMs`、以及 `calibration` 的分母确实是**整包**估算 | **系数取值**（1.33 只能真机测）、provider 的**真实缓存行为**（何时真的过期/逐出） | `cd packages/cli && bun test src/cache-attribution.test.ts` |
+| **L3 真机** | 临时 dataDir + 真实 provider + **包 `globalThis.fetch` 抓真实请求体**做独立证据 | 系数取值、真实缓存曲线、turn 边界/空闲是否真会打破前缀 | 成本（token + 时间）；且**单次样本不能当规律** | 探针脚本（方法见 §1，用完已删） |
+| **L4 产线观察** | 遥测 `cacheMissReason` | 真实断崖的成因（**下次发生即点名**） | 已发生但没埋点的历史事件 | 读 `{dataDir}/sessions/*.telemetry.jsonl` |
+
+**L2 的额外收获（它不只是"测了一下"）**：探针里"插件在中途往系统区塞标记 ⇒ `system-changed`"
+这条路径，正是历史会话那两处断崖的**最强嫌疑**。L2 证明该机制**确实会产生这个标签**
+⇒ 一旦真实复现，遥测会直接点名，不必再靠推断。
+
+**mock 的三条边界（别越界使用）**：
+1. mock 的 `input`/`cacheRead` 是**编的**，所以 `calibration` 的**数值**无意义 —— L2 只断言
+   "分母是整包估算"这个**结构与算术**关系（若退回 `requestTok` 当分母，断言立刻算不平）。
+2. mock 不会"真的过期"或"真的按字节命中"，`idle-expiry` 在 L2 里是我把 `cacheRead` 编低触发的
+   ⇒ 它验的是**归因逻辑**，不是 provider 行为。
+3. 探针的改动必须**每轮重新施加**（core 每轮从会话本体重建 messages，只改一轮下一轮就被还原，
+   会看到"前缀又变一次"的假象）。这是写 L2 时实际踩到的坑，已写进测试注释。
+
+**顺带修的一处分类规则**：写 L2 时发现「删中段消息」会被报成 `mutated` 而非 `shrunk`。
+改为"**净变短一律归 `shrunk`**"（压缩/截断 pruned 的是旧消息，说"内容被改写"会把真正的原因盖掉）；
+同时明确：只删 1 条而历史每轮 +2 的情形，整体仍在变长，本就该是 `mutated` —— 那是改写不是截断。
+
 ## 2026-09-21（续 177）子 agent 结果落盘/提示语/步数三修 + 入参自愈（起因：会话遥测复盘）
 
 用户先让我复盘会话 `s_1789996799007_9cq9r`（lead「扫描当前项目代码生成架构图」，18.5 min /
