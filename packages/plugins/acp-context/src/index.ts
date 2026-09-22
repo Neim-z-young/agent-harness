@@ -58,6 +58,7 @@ import {
 } from './adapter.js'
 import { applyAutoTune, describeAutoTune, type LooseAcpConfig } from './auto-tune.js'
 import { loadPromptFiles } from './prompts.js'
+import type { SystemStabilityReport } from '@harness/plugin'
 import {
   createWriter as createTelemetryWriter,
   buildPreModelEvent,
@@ -319,6 +320,14 @@ interface AcpSessionCtx {
   lastPrefixDiff?: PromptPrefixDiff | null
   /** 上一轮 providerCache 行（ts + cacheRead），用于判断命中量是否下降、空等了多久 */
   lastCacheRow?: { ts: number; cacheRead: number }
+  /**
+   * 本轮来自引擎的**系统区（前缀）段级归因**（`core.session.preModel` 的 input）。
+   *
+   * 只有引擎检测到 system 区相对上一轮 query 变化时才有值。它把遥测里的
+   * `cacheMissReason: 'system-changed'` 从"系统区变了"细化到"**第 N 段**变了"——
+   * 本项目 system 区是多插件往同一数组 push 拼出来的，不点名就只能靠猜。
+   */
+  lastSystemStability?: SystemStabilityReport
 }
 
 // ========================================================================
@@ -680,6 +689,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               meta: input.meta,
               makeSystemPrompt,
               prompts: resolvedPrompts,
+              ...(input.systemStability ? { systemStability: input.systemStability } : {}),
               tempMessage,
               manualInjection,
               explicitSystemPrompt,
@@ -738,6 +748,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               // provider 实际输入（算本地口径偏差）
               prev: sctx.lastCacheRow,
               prefix: sctx.lastPrefixDiff,
+              systemChangedParts: sctx.lastSystemStability?.changedParts ?? null,
+              systemChangedDetail: sctx.lastSystemStability?.details ?? null,
               providerInput: signal.input,
               // 分母用引擎给的**整包**估算（含 system + 工具），不是 requestTok —— 后者只算历史
               localInputEstimate: signal.localInputEstimate,
@@ -808,6 +820,8 @@ interface RunPreModelDeps {
   explicitSystemPrompt?: boolean
   /** 解析后的提示词 policy（nudge 渲染与本轮压缩系统提示保持一致）；缺省走内核默认 */
   prompts?: Prompts
+  /** 引擎给出的系统区段级归因（仅变化时有值）；用于把 system-changed 点名到段 */
+  systemStability?: SystemStabilityReport
   tempMessage: (role: Message['role'], text: string, sessionId: string) => Message
   /** 遥测 JSONL 文件路径（可选，未注入则遥测 writer 为 no-op） */
   telemetryPath?: string
@@ -843,6 +857,10 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
 
   // 遥测 writer 懒初始化：宿主注入 telemetryPath 时替换掉 no-op writer
   if (deps.telemetryPath) ctx.telemetry = createTelemetryWriter(deps.telemetryPath)
+
+  // 引擎侧的系统区段级归因落进本轮 ctx，供随后的 providerCache 行点名"第 N 段变了"。
+  // 每轮显式覆盖（含置空）：它是"本轮 vs 上一轮"的结论，上一轮的值留在这里会误报。
+  ctx.lastSystemStability = deps.systemStability
 
   // 从 session.meta 水合压缩状态（仅首次）；水合后置 needFull，强制全量重建一次
   if (!ctx.hydrated) {

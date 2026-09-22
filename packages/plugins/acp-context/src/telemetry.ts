@@ -102,6 +102,17 @@ export interface ProviderCacheEvent {
    * ACP 的 occupancy 只算历史消息、不含这一项 ⇒ 阈值判断系统性偏保守。
    */
   overheadTok: number | null
+  /**
+   * 本轮相对上一轮 query **实际变化的 system 段下标**（引擎侧段级归因）。
+   *
+   * `null` = 引擎未给出（首轮无基线 / 未接线宿主）。有值时 `cacheMissReason` 必然是
+   * `system-changed` —— 本字段就是它的"点名片"：system 区是多插件往同一数组 push 拼出来的
+   * （agent promptFragments / 压缩记忆 / skill 注入 / subagent roster / MCP resources / memory），
+   * 不点名就只能靠猜。
+   */
+  systemChangedParts: number[] | null
+  /** 上项的人读版（每项形如「第 2 段变化：642 → 1 284 字符（原首行：「项目长期记忆」）」） */
+  systemChangedDetail: string[] | null
 }
 
 export type TelemetryEvent = PreModelEvent | CompressEvent | ProviderCacheEvent
@@ -341,6 +352,10 @@ export interface ProviderCacheBuildInput {
    * 真机取证（临时 dataDir 跑 3 轮）首轮比值虚高到 415×，量到的其实是"漏算固定开销"。
    */
   localInputEstimate?: number | undefined
+  /** 引擎侧系统区段级归因的「变化段下标」（`null` = 引擎未给；不传按 null 记） */
+  systemChangedParts?: number[] | null
+  /** 引擎侧系统区段级归因的人读详情 */
+  systemChangedDetail?: string[] | null
 }
 
 export function buildProviderCacheEvent(inp: ProviderCacheBuildInput): ProviderCacheEvent | null {
@@ -383,5 +398,7 @@ export function buildProviderCacheEvent(inp: ProviderCacheBuildInput): ProviderC
     overheadTok: inp.localInputEstimate !== undefined
       ? Math.max(0, inp.localInputEstimate - (inp.requestTok ?? 0))
       : null,
+    systemChangedParts: inp.systemChangedParts ?? null,
+    systemChangedDetail: inp.systemChangedDetail ?? null,
   }
 }

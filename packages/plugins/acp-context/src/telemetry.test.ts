@@ -172,6 +172,28 @@ test('providerCache 归因：首轮 / 未下降 / 系统区改写 / 中段改写
   expect(idle.idleMs).toBeGreaterThan(300_000)
 })
 
+test('providerCache 归因：系统区变化时点名到**段**（引擎侧归因透传）', () => {
+  // 动机：system 区位于请求位置 0，它一变其后整段历史都要重算。而 system 区是多个插件
+  // 往同一数组 push 拼的 —— 遥测只说 "system-changed" 等于没说，得能指认"第 N 段"。
+  const ev = buildProviderCacheEvent({
+    sessionId: 's', round: 3, cacheRead: 100, cacheWrite: 0, requestTok: 1000,
+    prev: { ts: Date.now() - 1000, cacheRead: 5000 },
+    prefix: diffPromptPrefix([msg('system', 'v1')], [msg('system', 'v2')]),
+    systemChangedParts: [1],
+    systemChangedDetail: ['第 2 段变化：642 → 1 284 字符（首行：「项目长期记忆」→「项目长期记忆 + 新增」）'],
+  })!
+  expect(ev.cacheMissReason).toBe('system-changed')
+  expect(ev.systemChangedParts).toEqual([1])
+  expect(ev.systemChangedDetail![0]).toContain('第 2 段变化')
+
+  // 引擎未给归因（首轮无基线 / 未接线宿主）⇒ 如实记 null，不编造"没变"
+  const noAttrib = buildProviderCacheEvent({
+    sessionId: 's', round: 1, cacheRead: 0, cacheWrite: 0, requestTok: 10,
+  })!
+  expect(noAttrib.systemChangedParts).toBeNull()
+  expect(noAttrib.systemChangedDetail).toBeNull()
+})
+
 test('providerCache 口径：calibration 的分母必须是**整包**估算，不是历史估算', () => {
   // 分母用整包（含 system + 工具）⇒ 1320/1000 = 1.32
   const ev = buildProviderCacheEvent({
