@@ -1072,6 +1072,20 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }, [options.session, options.harness])
   // 选区复制（模块 D4）：读全局 renderer，Ctrl-Y 优先复制鼠标选中的文字
   const { renderer } = useAppContext()
+  // 鼠标拖选（选区）高亮：订阅渲染器 selection 事件，有选区时在输入行显示「已选 N 字符 · ✕」。
+  // 选区本身的着色由 Zig 内核负责（默认反转），这里给一个明确的"选没选中"文字指示 + 一键清除。
+  // 必须放在 useAppContext 之后（renderer 声明在前一行）。
+  const [selChars, setSelChars] = useState(0)
+  useEffect(() => {
+    const onSel = () => {
+      const sel = renderer?.getSelection?.()
+      // isActive 过滤：clearSelection() 后 Zig 可能仍把旧 Selection 留在缓存里并发一次事件，
+      // 若只看 getSelectedText 会把「已清除」回弹成「已选 N 字符」（实测踩坑）。
+      setSelChars(sel?.isActive ? sel.getSelectedText().length : 0)
+    }
+    renderer?.on?.('selection', onSel)
+    return () => { renderer?.off?.('selection', onSel) }
+  }, [renderer])
   // 会话开始前（仅剩 system 块）展示欢迎页；发起首条消息后切换为对话块列表
   const hasChat = state.blocks.some((b) => b.kind !== 'system')
 
@@ -2000,7 +2014,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             })}
           </box>
         )}
-        {/* 底部输入行：运行中显示「■ 终止」按钮（点击 abort 当前查询，同 Ctrl-C 语义） */}
+        {/* 底部输入行：运行中显示「■ 终止」按钮（点击 abort 当前查询，同 Ctrl-C 语义）；
+            有拖选选区时显示「已选 N 字符 · ✕」（点击清除选区，Ctrl-Y 复制） */}
         <box flexDirection="row">
           {busyNow && (
             <text
@@ -2008,6 +2023,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
               onMouseUp={(e) => { e.preventDefault(); abortCurrent() }}
             >
               ■ 终止
+            </text>
+          )}
+          {selChars > 0 && (
+            <text
+              attributes={createTextAttributes({ bold: true, underline: true })}
+              onMouseUp={(e) => {
+                e.preventDefault()
+                renderer?.clearSelection?.()
+                setSelChars(0)
+              }}
+            >
+              ⧉ 已选 {selChars} 字符 · ✕
             </text>
           )}
           <textarea

@@ -1,5 +1,24 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 187）TUI 鼠标选区高亮：拖选后输入行显示「已选 N 字符 · ✕」
+
+用户续反馈"还有鼠标选区的高亮"（拖选文本）。OpenTUI 选区着色由 Zig 内核负责（默认反转），
+`createCliRenderer` 无选区样式配置项；且测试渲染器里拖选确实派发 `selection` 事件，
+故在应用层给"选没选中"一个明确指示：
+
+- 订阅渲染器 `selection` 事件（`renderer.on('selection')`，CliRenderer 是 EventEmitter）：
+  拖选后输入行显示 **`⧉ 已选 N 字符 · ✕`**（bold+underline），点 ✕ 清除选区（clearSelection）。
+- 布局：放在输入行左侧，与「■ 终止」同排；选区存在的指示与忙碌按钮互不干扰。
+
+**踩坑（isActive 过滤回弹）**：点击 ✕ 清除后，Zig 会再发一次 selection 事件且
+`getSelection()` 仍返回旧 Selection ⇒ 只按 `getSelectedText().length` 判的话，
+`selChars` 会从 0 回弹成"N 字符"（实测：清除后指示重现，测试抓包发现）。修复：
+`setSelChars(sel?.isActive ? len : 0)` —— 清除后 Selection.isActive=false，事件被过滤。
+**教训：事件回读 state 时，先看对象有没有"活跃/生效"标志，别只信长度类字段。**
+
+测试：tui +1（拖选 →「已选 3 字符 · ✕」→ 点 ✕ →「⧉ 已选」消失）共 114 例；cli 366 全过；
+全量 typecheck 绿。注意测试断言用「⧉ 已选」精确匹配（「▌已选中」块标记也含"已选"二字）。
+
 ## 2026-09-22（续 186）TUI 鼠标选块高亮：点击消息块整块高亮选中
 
 用户反馈"鼠标选块分不清有没有选中"。原交互只有「⧉ 复制」按钮文字变化（dim→reverse），

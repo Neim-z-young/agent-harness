@@ -1149,6 +1149,26 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
+  it('鼠标拖选文本 → 输入行显示「已选 N 字符 · ✕」，点击 ✕ 清除（isActive 过滤回弹）', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('拖选测试')
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    const start = locateChar(frame, '你好')
+    expect(start).not.toBeNull()
+    // 从"你好"拖到"助手"：Zig 端产生选区并派发 selection 事件 → 输入行显示已选字符数
+    await f.setup.mockMouse.drag(start!.x, start!.y, start!.x + 4, start!.y)
+    const withSel = await waitFrame(f.setup, (fr) => fr.includes('已选') && fr.includes('字符') && fr.includes('✕'))
+    // 点击 ✕ 清除选区 → 输入行指示消失（不能因 clearSelection 后的事件回弹；
+    // 注意与「▌已选中」块标记区分 —— 块标记可能仍在，只断言输入行的「⧉ 已选」消失）
+    const clearPos = locateChar(withSel, '✕')
+    expect(clearPos).not.toBeNull()
+    await f.setup.mockMouse.click(clearPos!.x, clearPos!.y)
+    await waitFrame(f.setup, (fr) => !fr.includes('⧉ 已选'))
+    await f.cleanup()
+  })
+
   it('鼠标点击消息区后键盘输入仍直接生效（焦点自动回到输入框）', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
