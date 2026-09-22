@@ -36,10 +36,10 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
-import { createProcessLine, listReplCommands, describeSessionRestore } from './index'
+import { createProcessLine, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
-import type { CompactionBlock, HistoryLoadRange, Message, Session } from '@harness/session'
+import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
 import { subagentCapability } from '@harness/subagent'
 import {
@@ -1029,6 +1029,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [todayTotals, setTodayTotals] = useState<UsageStats | null>(null)
   // 模块 4：侧栏各模块改为顶部图标 tab + 左右切换（每次仅展示一个面板）
   const [sidebarTab, setSidebarTab] = useState<SidebarTabId>('context')
+  // 统计面板「上下文占用」：窗口/阈值取与 /compact、/stats 同一套推导（config 加载一次即可）
+  const [ctxOccOpts, setCtxOccOpts] = useState<CompactOptions | undefined>(undefined)
+  useEffect(() => {
+    options.app.configStore
+      .load()
+      .then((cfg) => setCtxOccOpts(buildCompactionOptions(cfg, cfg.provider ?? 'anthropic')))
+      .catch(() => {})
+  }, [options.app])
+  // 运行中强制终止（点击「■ 终止」按钮 / Ctrl-C 共用）：abort 当前查询，已完成的步骤保留
+  const abortCurrent = useCallback(() => {
+    const ctl = abortCtlRef.current.current
+    if (ctl) {
+      ctl.abort()
+      setState((prev) => pushConsole(prev, '\n⏹️  已请求中断，正在停止…（已完成的步骤会保留）\n'))
+    }
+  }, [])
   // 工具token归并状态：暂存本轮 LLM 用量，仅归并到紧随的第一个工具
   const pendingToolAttrRef = useRef<{ input: number; output: number } | null>(null)
   const toolAttributedRef = useRef(false)
@@ -1914,6 +1930,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                       ))}
                     </>
                   )}
+                  {/* 上下文占用（本会话 + 子会话）：与 /stats、/compact 同一套窗口/阈值推导 */}
+                  <ContextOccupancyLine harness={options.harness} sessionId={options.session.id} compactOpts={ctxOccOpts} />
                   <text attributes={createTextAttributes({ dim: true })} wrapMode="word">── /stats 详情 · /stats-export 报告 ──</text>
                 </>
               )}
@@ -1965,12 +1983,24 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             })}
           </box>
         )}
-        <textarea
-          ref={textareaRef}
-          focused={!listMode}
-          onSubmit={() => submit(readComposer())}
-          placeholder="❯ "
-        />
+        {/* 底部输入行：运行中显示「■ 终止」按钮（点击 abort 当前查询，同 Ctrl-C 语义） */}
+        <box flexDirection="row">
+          {busyNow && (
+            <text
+              attributes={createTextAttributes({ bold: true, reverse: true })}
+              onMouseUp={(e) => { e.preventDefault(); abortCurrent() }}
+            >
+              ■ 终止
+            </text>
+          )}
+          <textarea
+            ref={textareaRef}
+            focused={!listMode}
+            onSubmit={() => submit(readComposer())}
+            placeholder="❯ "
+            style={{ flexGrow: 1 }}
+          />
+        </box>
       </box>
     </box>
   )
@@ -2072,6 +2102,28 @@ function buildEditorArgv(path: string, line?: number, base?: string): string[] {
  */
 export function buildEditorCommand(path: string, line?: number, base?: string): string[] {
   return buildEditorArgv(path, line, base)
+}
+
+/**
+ * 统计面板「上下文占用」行：本会话 + 各子会话占用率（复用 /stats 的 renderContextOccupancy，
+ * 窗口/阈值取 buildCompactionOptions 同一套推导）。每 3s 刷新一次（执行中占用会变化）。
+ */
+function ContextOccupancyLine(props: { harness: Harness; sessionId: string; compactOpts?: CompactOptions }) {
+  const [text, setText] = useState('')
+  useEffect(() => {
+    if (!props.compactOpts) return
+    let alive = true
+    const refresh = () => {
+      renderContextOccupancy(props.harness, { id: props.sessionId } as never, props.compactOpts!)
+        .then((t) => { if (alive) setText(t.trim()) })
+        .catch(() => {})
+    }
+    refresh()
+    const iv = setInterval(refresh, 3000)
+    return () => { alive = false; clearInterval(iv) }
+  }, [props.compactOpts, props.sessionId])
+  if (!text) return null
+  return <text attributes={createTextAttributes({ dim: true })} wrapMode="word">{text}</text>
 }
 
 /**

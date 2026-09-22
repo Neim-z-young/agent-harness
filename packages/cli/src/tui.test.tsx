@@ -1098,6 +1098,23 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
+  it('统计面板含上下文占用（本会话 + 自动压缩阈值）', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    for (let i = 0; i < 4; i++) f.setup.mockInput.pressArrow('right')
+    // ContextOccupancyLine 异步渲染（configStore.load + session.estimateTokens），轮询等待
+    await waitFrame(f.setup, (frame) => frame.includes('上下文占用') && frame.includes('自动压缩阈值'))
+    await f.cleanup()
+  })
+
+  it('空闲时不显示「■ 终止」按钮（仅运行中展示）', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await settleEffects(f.setup)
+    expect(f.setup.captureCharFrame()).not.toContain('■ 终止')
+    await f.cleanup()
+  })
+
   it('鼠标点击消息「复制」按钮 → 变「✓ 已复制」（onMouseUp 触发 clipboard 写入）', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))

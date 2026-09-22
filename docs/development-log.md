@@ -1,5 +1,21 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 185）TUI：统计面板加上下文占用 + 运行中「■ 终止」按钮
+
+**① 统计 tab 加上下文占用**：新子组件 `ContextOccupancyLine`（tui.tsx）复用 /stats 的
+`renderContextOccupancy`（本会话 + 各子会话占用率，窗口/阈值取 buildCompactionOptions 同一套推导），
+每 3s 刷新（执行中占用会变）。config 只加载一次（`configStore.load` → buildCompactionOptions 缓存）。
+
+**② 输入框「■ 终止」按钮**：运行中（busyNow）在输入行左侧显示 `■ 终止`（reverse 高亮），
+点击走 `abortCurrent()`——与 Ctrl-C 中断共用 `abortCtlRef.current.current.abort()`，已完成的步骤保留。
+空闲时不渲染（不占版面）。textarea 包进 flexDirection row，终止按钮 flexShrink、输入框 flexGrow。
+
+**踩坑**：`createTextAttributes` 的 TextAttributes 类型**没有 `fg` 字段**（SyntaxStyle 里才有），
+首版 `fg: RGBA(255,80,80)` 编译报错 ⇒ 改用 `reverse: true` 高亮（对属性集零依赖，稳妥）。
+
+测试：tui +2（stats tab 含"上下文占用/自动压缩阈值"、空闲无"■ 终止"）共 112 例；cli 全量 364 全过；
+全量 typecheck 绿。
+
 ## 2026-09-22（续 184）/stats 增上下文占用区：本会话 + 子会话占用率
 
 统计信息页（`/stats`）新增「上下文占用」区块：
