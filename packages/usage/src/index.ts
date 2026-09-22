@@ -427,22 +427,6 @@ export function todayUsageLine(u: UsageStats): string {
   return `今日 ${u.llmCalls}次 · in${u.inputTokens}/out${u.outputTokens}`
 }
 
-/**
- * 是否应把 `next` 写入 session.meta：空累积器不得覆盖已持久化的历史。
- *
- * 回归背景：TUI 挂载时累积器初始为空，若无条件写回 meta 并落盘，
- * 会把重连前累计的用量清零（/stats 显示 0、/stats-export 也导不出历史）。
- */
-export function shouldPersistUsage(next: UsageStats, persisted: UsageStats | undefined): boolean {
-  if (!persisted || isBlankUsage(persisted)) return true
-  // 空累积器不得覆盖已有历史
-  if (isBlankUsage(next)) return false
-  // 水合不全时不得回退：本轮调用数少于已持久化值，说明内存态没接上历史，
-  // 写回会静默丢失调用记录（比全空覆盖更隐蔽）。
-  if (next.llmCalls < persisted.llmCalls) return false
-  return true
-}
-
 /** 单模型统计行：`model ×calls · inN(⚡cr)outN` */
 export function modelUsageRow(m: ModelUsage): string {
   const cache = m.cacheRead > 0 || m.cacheWrite > 0 ? `⚡${m.cacheRead}/w${m.cacheWrite} ` : ''

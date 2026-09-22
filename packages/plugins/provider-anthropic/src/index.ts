@@ -856,5 +856,8 @@ export const providerTypeFactory: ProviderTypeFactory = {
       completeTimeoutFactor: typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
         ? config.completeTimeoutFactor
         : undefined,
+      // 显式缓存断点：ProviderConfig 有 index signature，不在这里透传就等于「配了没人消费」
+      // （config.json 里写 `promptCache: true` 会被静默丢弃）。默认仍为关。
+      promptCache: config.promptCache === true ? true : undefined,
     }),
 }

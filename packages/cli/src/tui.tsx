@@ -59,7 +59,6 @@ import {
   isBlankUsage,
   todayUsageLine,
   usageFromMeta,
-  shouldPersistUsage,
   type UsageStats,
 } from './usage-stats'
 import { collectTodayUsage } from './usage-today'

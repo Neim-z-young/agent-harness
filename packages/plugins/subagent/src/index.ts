@@ -467,7 +467,10 @@ export const SUBAGENT_RESULTS_DIRNAME = 'subagent-results'
  */
 function writeResultFile(text: string, kind: 'output' | 'diff', resultsDir?: string): string {
   const ext = kind === 'diff' ? 'patch' : 'txt'
-  const name = `subagent-${kind}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.${ext}`
+  // 随机段必须**定长**：`Math.random().toString(36)` 形如 "0.xxxx"，值 < 0.1 时 slice(2,8)
+  // 只剩 1~2 个字符（约 0.08%），那点熵挡不住同毫秒并发的子任务撞名互相覆盖。
+  const rand = Math.random().toString(36).slice(2).padEnd(8, '0').slice(0, 8)
+  const name = `subagent-${kind}-${Date.now()}-${rand}.${ext}`
   const candidates = resultsDir
     ? [join(resultsDir, name), join(tmpdir(), name)]
     : [join(tmpdir(), name)]
@@ -934,7 +937,7 @@ export function createSubagentTool(
                 // 底层 queryStream 仍在后台跑（内部循环上线后一次可能几十步，
                 // 白烧 token 并继续产生工具副作用）。S3 打通 signal 后这条链才闭环。
                 signal: controller.signal,
-                // 子 Agent 步数上限比主 Agent 保守（缺省 10）：它的任务是聚焦执行，
+                // 子 Agent 步数上限比主 Agent 保守（缺省 20）：它的任务是聚焦执行，
                 // 步数越多越容易撞上 timeoutMs 被判超时。
                 maxSteps: resolveSteps(input.agentId, input.maxSteps),
               })

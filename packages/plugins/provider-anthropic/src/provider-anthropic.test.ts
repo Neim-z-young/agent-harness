@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import {
   AnthropicChatProvider,
   createProviderAnthropicPlugin,
+  providerTypeFactory,
   providerAnthropicPlugin,
   AnthropicProviderConfig,
   applyAnthropicCacheBreakpoints,
@@ -555,5 +556,22 @@ describe('applyAnthropicCacheBreakpoints（纯函数）', () => {
     const n = applyAnthropicCacheBreakpoints(body)
     expect(n).toBeLessThanOrEqual(4)
     expect(n).toBe(3)
+  })
+})
+
+// ===== Provider 类型工厂：配置透传 =====
+
+describe('providerTypeFactory：配置字段透传', () => {
+  const fakeCtx = { config: { get: () => undefined }, log: { info: () => {} } } as never
+
+  it('promptCache 会被透传（ProviderConfig 有 index signature，不透传=config.json 里配了没用）', async () => {
+    const on = (await providerTypeFactory.createPlugin({ type: 'anthropic', apiKey: 'k', promptCache: true } as never))!
+    await on.install(fakeCtx)
+    expect((on as unknown as { provider: { config: { promptCache?: boolean } } }).provider.config.promptCache).toBe(true)
+
+    // 未显式开启 ⇒ 必须仍为默认关（不得顺手打开）
+    const off = (await providerTypeFactory.createPlugin({ type: 'anthropic', apiKey: 'k' } as never))!
+    await off.install(fakeCtx)
+    expect((off as unknown as { provider: { config: { promptCache?: boolean } } }).provider.config.promptCache).toBe(false)
   })
 })

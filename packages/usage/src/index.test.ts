@@ -2,7 +2,7 @@
  * usage-stats 单元测试：用量累积、持久化水合、当日归集与导出。
  *
  * 重点覆盖两类回归：
- * 1. 重连（resume）后用量不能从 0 开始 → hydrateUsage / shouldPersistUsage
+ * 1. 重连（resume）后用量不能从 0 开始 → hydrateUsage
  * 2. 历史消息不能被算到「今天」→ usageFromMessages 按 createdAt 归并小时桶
  */
 import { describe, it, expect } from 'bun:test'
@@ -25,7 +25,6 @@ import {
   isBlankUsage,
   usageFromMeta,
   usageFromMessages,
-  shouldPersistUsage,
   todayUsageLine,
   exportStatsJson,
   exportStatsMarkdown,
@@ -168,41 +167,6 @@ describe('hydrateUsage 水合（重连不清零）', () => {
   it('meta 与消息都无数据时返回空', () => {
     expect(isBlankUsage(hydrateUsage({ meta: {}, messages: [] }))).toBe(true)
     expect(isBlankUsage(hydrateUsage(undefined))).toBe(true)
-  })
-})
-
-describe('shouldPersistUsage（防止空累积器清零历史）', () => {
-  it('空累积器 + 已有历史 → 不写入', () => {
-    let persisted = emptyUsage()
-    persisted = recordCall(persisted, { model: 'm', input: 100, output: 1, ts: at(0, 9) })
-    expect(shouldPersistUsage(emptyUsage(), persisted)).toBe(false)
-  })
-
-  it('有数据 → 允许写入', () => {
-    let next = emptyUsage()
-    next = recordCall(next, { model: 'm', input: 1, output: 1, ts: at(0, 9) })
-    expect(shouldPersistUsage(next, undefined)).toBe(true)
-    expect(shouldPersistUsage(next, emptyUsage())).toBe(true)
-  })
-
-  it('双方都为空 → 允许写入（不阻塞初始化）', () => {
-    expect(shouldPersistUsage(emptyUsage(), emptyUsage())).toBe(true)
-  })
-
-  it('水合不全（本轮少于历史）→ 不写入，防止回退丢失调用记录', () => {
-    let persisted = emptyUsage()
-    for (let i = 0; i < 100; i++) persisted = recordCall(persisted, { model: 'm', input: 10, ts: at(0, 9) })
-    const partial = recordCall(emptyUsage(), { model: 'm', input: 10, ts: at(0, 9) })
-    expect(persisted.llmCalls).toBe(100)
-    expect(shouldPersistUsage(partial, persisted)).toBe(false)
-  })
-
-  it('正常累加（本轮多于历史）→ 允许写入', () => {
-    let persisted = emptyUsage()
-    persisted = recordCall(persisted, { model: 'm', input: 10, ts: at(0, 9) })
-    let next = persisted
-    next = recordCall(next, { model: 'm', input: 20, ts: at(0, 10) })
-    expect(shouldPersistUsage(next, persisted)).toBe(true)
   })
 })
 
