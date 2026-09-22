@@ -32,6 +32,17 @@ import type { Tool } from '@harness/tool'
 // 取 idle 的 10 倍作为宽松上限，正常请求不会触及。
 const STREAM_TOTAL_TIMEOUT_FACTOR = 10
 
+/**
+ * 非流式 `complete()` 的总时长系数，与流式的 `STREAM_TOTAL_TIMEOUT_FACTOR` 对齐。
+ *
+ * 为什么必须对齐（真机实测）：`timeoutMs` 在流式路径是 **idle**（多久没数据判死），
+ * 而 `complete()` 只有一个**总时长**计时器 —— 此前直接拿 `timeoutMs` 当总时长，
+ * 等于同一件事（整段生成要多久）在非流式路径上严 10 倍。子 Agent 走 `preferComplete`
+ * 非流式路径时因此更容易被误判超时（会话 `s_1789996799007_9cq9r` 的 reviewer 实测）。
+ * 常量刻意复用流式系数：两条路径的"总时长上限"从此同义；要退回旧行为把系数配成 1。
+ */
+const COMPLETE_TIMEOUT_FACTOR_ALIGN = STREAM_TOTAL_TIMEOUT_FACTOR
+
 // ===== 配置 =====
 
 export interface OpenAIProviderConfig {
@@ -47,6 +58,19 @@ export interface OpenAIProviderConfig {
   maxTokens?: number
   /** 请求超时（ms，默认 120_000） */
   timeoutMs?: number
+  /**
+   * 非流式 `complete()` 的总时长系数（缺省 {@link COMPLETE_TIMEOUT_FACTOR_ALIGN}）。
+   *
+   * `timeoutMs` 在两条路径上的**语义不同**，必须分级：
+   * - 流式：`timeoutMs` 是 **idle**（多久没数据判死），另有 `× STREAM_TOTAL_TIMEOUT_FACTOR` 的总时长兜底；
+   * - 非流式 `complete()`：只有一个**总时长**计时器，此前直接用 `timeoutMs` ⇒ 同一件事
+   *   （整段生成要多久）在非流式路径上比流式严 10 倍。
+   *
+   * 真机后果（会话 `s_1789996799007_9cq9r`）：子 Agent 走 `preferComplete` 非流式路径审查
+   * 77KB HTML，撞 60s 被判「OpenAI 请求超时（>60000ms）」，只能缩小范围重试。
+   * 本系数让"总时长上限"在两个路径上语义一致；设为 1 即退回旧行为。
+   */
+  completeTimeoutFactor?: number
   /** 组织 ID（可选，X-OpenAI-Organization 头） */
   organization?: string
   /** 当模型输出空时是否报错（默认 false 返回空 content） */
@@ -416,7 +440,7 @@ export class OpenAIChatProvider implements ChatProvider {
   readonly calls: Array<{ body: OpenAIRequestBody; response?: OpenAIResponseBody; error?: unknown }> = []
 
   private readonly config: Required<
-    Pick<OpenAIProviderConfig, 'baseUrl' | 'apiPath' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'strictEmptyContent' | 'providerId'>
+    Pick<OpenAIProviderConfig, 'baseUrl' | 'apiPath' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'completeTimeoutFactor' | 'strictEmptyContent' | 'providerId'>
   > & { apiKey?: string; organization?: string } & Pick<OpenAIProviderConfig, 'thinking' | 'reasoningEffort'>
 
   private toolsGetter: () => Tool[]
@@ -458,6 +482,7 @@ export class OpenAIChatProvider implements ChatProvider {
       defaultModel: config.defaultModel ?? 'gpt-4o-mini',
       maxTokens: config.maxTokens ?? 4096,
       timeoutMs: config.timeoutMs ?? 120_000,
+      completeTimeoutFactor: config.completeTimeoutFactor ?? COMPLETE_TIMEOUT_FACTOR_ALIGN,
       organization: config.organization,
       strictEmptyContent: config.strictEmptyContent ?? false,
       providerId: config.providerId ?? 'openai',
@@ -568,7 +593,12 @@ export class OpenAIChatProvider implements ChatProvider {
       if (outerSignal.aborted) inner.abort()
       else outerSignal.addEventListener('abort', onOuter, { once: true })
     }
-    const timer = setTimeout(() => inner.abort(new Error(`OpenAI 请求超时（>${this.config.timeoutMs}ms）`)), this.config.timeoutMs)
+    // 非流式的计时器是**总时长**，不是 idle ⇒ 与流式的总时长兜底取同一系数（见 completeTimeoutFactor）
+    const completeTimeoutMs = this.config.timeoutMs * this.config.completeTimeoutFactor
+    const timer = setTimeout(
+      () => inner.abort(new Error(`OpenAI 请求超时（>${completeTimeoutMs}ms = timeoutMs ${this.config.timeoutMs}ms × ${this.config.completeTimeoutFactor}）`)),
+      completeTimeoutMs,
+    )
 
     try {
       if (!this.config.apiKey) {
@@ -1023,6 +1053,10 @@ export const providerTypeFactory: ProviderTypeFactory = {
       defaultModel: config.model,
       maxTokens: config.maxTokens,
       timeoutMs: config.timeoutMs,
+      // 非流式总时长系数：ProviderConfig 有 index signature，这里的取值校验是唯一闸门
+      completeTimeoutFactor: typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
+        ? config.completeTimeoutFactor
+        : undefined,
       apiPath: config.apiPath,
       providerId: config.id,
       // 思考模式（config.json providers[].thinking / reasoningEffort）。

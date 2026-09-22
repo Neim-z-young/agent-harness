@@ -654,3 +654,65 @@ describe('@harness/provider-openai', () => {
     })
   })
 })
+
+// ==========================================================================
+// 非流式 complete() 的超时分级
+//
+// 回归背景（会话 s_1789996799007_9cq9r）：reviewer 子 Agent 走 preferComplete 非流式路径
+// 审查 77KB HTML，撞 60s 被判「OpenAI 请求超时（>60000ms）」。根因是两条路径的 timeoutMs
+// **语义不同**：stream 里它是 idle（多久没数据），另有 total = ×10 兜底；而 complete 只有一个
+// 总时长计时器，此前直接用它 ⇒ 同一件事在非流式路径上严 10 倍。
+// ==========================================================================
+
+describe('非流式 complete() 超时分级', () => {
+  const messages: Message[] = [
+    { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+  ]
+
+  /** 永不响应、但**尊重 abortSignal** 的 fetch（真 fetch 就是这行为；不尊重就无法测超时） */
+  function stallingFetch(): FetchMock {
+    return ({ init }) =>
+      new Promise<Response>((_resolve, reject) => {
+        const sig = init.signal as AbortSignal | null | undefined
+        if (!sig) return
+        if (sig.aborted) return reject(sig.reason)
+        sig.addEventListener('abort', () => reject(sig.reason), { once: true })
+      })
+  }
+
+  async function timeoutErrorOf(p: OpenAIChatProvider): Promise<{ msg: string; waited: number }> {
+    const restore = installMock(stallingFetch())
+    try {
+      const t0 = Date.now()
+      const err = await p.complete({ providerId: 'openai', messages, params: {} }).then(
+        () => null,
+        (e) => e as Error,
+      )
+      return { msg: err?.message ?? '', waited: Date.now() - t0 }
+    } finally {
+      restore()
+    }
+  }
+
+  it('总时长 = timeoutMs × completeTimeoutFactor，且错误里写明两个乘数（可诊断）', async () => {
+    const p = new OpenAIChatProvider({ apiKey: 'k', timeoutMs: 40, completeTimeoutFactor: 5 })
+    const { msg, waited } = await timeoutErrorOf(p)
+    expect(msg).toContain('>200ms')     // 40 × 5，而不是 40
+    expect(msg).toContain('× 5')
+    expect(waited).toBeGreaterThanOrEqual(180)
+    expect(waited).toBeLessThan(1500)
+  })
+
+  it('缺省系数与流式的总时长兜底对齐（×10），不再是非流式单独从严', async () => {
+    const p = new OpenAIChatProvider({ apiKey: 'k', timeoutMs: 30 })
+    const { msg } = await timeoutErrorOf(p)
+    expect(msg).toContain('>300ms')     // 30 × 10（STREAM_TOTAL_TIMEOUT_FACTOR）
+  })
+
+  it('completeTimeoutFactor: 1 可退回旧行为（总时长 = timeoutMs）', async () => {
+    const p = new OpenAIChatProvider({ apiKey: 'k', timeoutMs: 40, completeTimeoutFactor: 1 })
+    const { msg } = await timeoutErrorOf(p)
+    expect(msg).toContain('>40ms')
+    expect(msg).toContain('× 1')
+  })
+})
