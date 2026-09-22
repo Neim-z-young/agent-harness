@@ -53,8 +53,8 @@ function history(n: number): Message[] {
   return arr
 }
 
-function makeConfig(): Config {
-  return defaultConfig(20000, {
+function makeConfig(modelContextLimit = 20000): Config {
+  return defaultConfig(modelContextLimit, {
     compress: { minCompressRange: 0, maxSummaryLength: 100000, minSummaryLength: 0 },
     preserveRecentMessages: 0,
     preserveRecentTokens: 0,
@@ -1036,3 +1036,36 @@ test('uninstall：退出前 flush（不依赖 debounce 定时器）', async () =
   const rows = readFileSync(path, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
   expect(rows.filter((r) => r.kind === 'providerCache')).toHaveLength(1)
 })
+
+// ===== 前缀缓存回退归因（缓存为什么掉）=====
+
+test('前缀归因：历史增长 + 尾部动态块右移 ⇒ appended，不得误报 mutated', async () => {
+  // 背景（回归）：ACP 每轮在请求**末尾现拼**尾部动态块（nudge / 压缩手册）。历史增长一条时，
+  // 上一轮的尾部块在逐条比对里会与「新历史的第一条」相撞（上轮它在 n-1，本轮历史占了 n-1），
+  // 旧实现据此报 `mutated`（"中段某条被就地改写"）—— 排查方向被引向"谁改写了历史中段"，
+  // 而真实代价只是尾部那一条重算，与 `appended` 同级。
+  // 修法：尾部块不属于缓存前缀，比对前先剔除（两轮各自剔除，视野对齐在纯历史前缀上）。
+  const h = makeHarness(makeConfig(2000), 's1', { manualInjection: 'on-demand' })
+
+  const m1 = history(2)
+  await h.run(m1)
+  // 前提：本轮请求末尾**确实**有 ACP 追加的尾部块（否则本用例没测到目标分支）
+  expect(manualInjected(m1)).toBe(true)
+  expect((h.ctx as any).lastPrefixDiff).toBeNull() // 首轮无基线
+
+  const m2 = history(3)
+  await h.run(m2)
+  expect(manualInjected(m2)).toBe(true)
+  const d = (h.ctx as any).lastPrefixDiff
+  expect(d.changedKind).toBe('appended')
+  expect(d.changedAt).toBeNull()
+  // 稳定前缀覆盖原有历史（不是被尾部块挤到 0）：system + 上轮两条历史 = 3 条
+  expect(d.stableMessages).toBe(3)
+})
+
+/** 末尾是否为 ACP 现拼的尾部块（`tempMessage` 生成的 id 前缀 + 手册正文） */
+function manualInjected(messages: Message[]): boolean {
+  const last = messages.at(-1)
+  if (!last || last.role !== 'user') return false
+  return (last.parts[0] as { text?: string } | undefined)?.text?.includes('<acp system>') === true
+}

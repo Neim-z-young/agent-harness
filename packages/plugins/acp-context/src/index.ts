@@ -1144,7 +1144,14 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 为什么用全文投影而不是 core 的 id：ACP 复用 `prefixRender` 时会刻意让早前消息的**字节**
   // 保持不变；只看 id 无法发现"内容被就地改写"，而那是本项目最可能的失效源。
   try {
-    const view = request.map((m) => ({ role: m.role ?? '', text: partsSignature(m) }))
+    // 尾部动态块（nudge / 压缩手册）是 ACP **每轮现拼**的，不属于缓存前缀，必须先从归因视野里剔除：
+    // 历史每增长一条，上一轮的尾部块就会在逐条比对中与「新历史的第一条」相撞（上轮 tail 在
+    // 位置 n-1，本轮历史占了 n-1），于是把「追加 + 尾部右移」误判成 `mutated`（中段被就地改写）
+    // —— 实测复现（prev=5 条时 stable 停在 4、changedKind=mutated）。真实代价只是尾部那一条重算，
+    // 与 `appended` 同级；报 `prefix-mutated` 会把排查方向引向"谁改写了历史中段"。
+    // 两轮各自剔除自己的尾部块，比对就落在纯历史前缀上（本轮未追加 tail 时视野不变）。
+    const stableView = tailParts.length > 0 ? request.slice(0, -1) : request
+    const view = stableView.map((m) => ({ role: m.role ?? '', text: partsSignature(m) }))
     ctx.lastPrefixDiff = diffPromptPrefix(ctx.prevPromptView, view)
     ctx.prevPromptView = view
   } catch {

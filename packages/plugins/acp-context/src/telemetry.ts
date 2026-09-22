@@ -202,7 +202,12 @@ export interface PromptPrefixDiff {
   fingerprint: string
 }
 
-/** 计算相邻两轮 prompt 的前缀差异；prev 为空（首轮）时返回 null */
+/**
+ * 计算相邻两轮 prompt 的前缀差异；prev 为空（首轮）时返回 null。
+ *
+ * ⚠️ 调用方（acp-context）必须在比对前**剔除自己每轮现拼的尾部动态块**（nudge / 压缩手册）：
+ * 那块内容不属于缓存前缀，留着会让「历史追加 + 尾部右移」被误判成 `mutated`。
+ */
 export function diffPromptPrefix(
   prev: readonly { role?: string; text?: string }[] | undefined,
   curr: readonly { role?: string; text?: string }[],
