@@ -1,5 +1,62 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 188）提交后评审 843773f..HEAD（44 提交）：1 数据错误 + 1 归因误报 + 3 处清理
+
+用户："评审下上次评审至今的提交"。上次评审的修复提交是 `843773f`（09-20「telemetry 提交后评审」），
+本次区间 **44 提交 / 58 文件 / +7430−917**（其中非文档改动 55 文件）。
+
+**方法**：4 路并行子代理按主题切分（① 用量纳管 ② core 提示词装配/入参自愈/token 口径
+③ acp-context 遥测 + provider ④ TUI/CLI 交互 + 子 agent/多插件），**本人对每条「严重」结论实测复现后才动手**。
+（沿用 09-16 起的纪律；本轮再次证明必要：子代理给的 2 条 P1 里，1 条要换触发场景才成立、1 条不成立。）
+
+### 修了什么（3 笔提交，未 push）
+
+| 级别 | 问题 | 位置 | 实测 |
+| --- | --- | --- | --- |
+| **P1 数据** | 用量折叠把当前消息折两遍 | `core/index.ts` `accumulateUsage` | 修复前 `llmCalls=2/input=300`，正确 `1/150` |
+| **P2 归因** | 历史每增长一轮就误报 `prefix-mutated` | `acp-context/index.ts` 归因视野 | `stable=4`、`mutated`（应为 `appended`） |
+| P3 | `writeResultFile` 随机段变长 → 同毫秒撞名风险 | `subagent/index.ts` | `Math.random().toString(36)` 值 <0.1 时只剩 1~2 字符 |
+| P3 | 注释「缺省 10」实为 20 | `subagent/index.ts` | `DEFAULT_SUBAGENT_MAX_STEPS = 20` |
+| P3 | `providerTypeFactory` 吞掉 `promptCache`（配了没用） | `provider-anthropic/index.ts` | 已补透传 + 测试 |
+| P3 | `shouldPersistUsage` 零调用方（TUI 只余 import） | `usage/index.ts` + `tui.tsx` | 删除函数 + 5 条测试 + 残留 import |
+
+**P1 根因**：增量分支用 `hydrateUsage({meta, messages})` 取起点，而它在 meta 累积器为空时会
+**回退到按消息重建** —— 此刻 `message` 已在 `sess.messages` 里，重建已含它，随后再 `foldMessage` 就是第二遍。
+触发条件是「某轮 assistant 既无 tokenUsage 也无工具」（provider 未回报用量 / 流式中断）⇒
+折叠后累积器恰好**完全为空**（`llmCalls=0 / hourly=[] / tools=[]`）但检查点有效 ⇒ 下一轮双计。
+**关键区分：`累积器存在但为空` 是合法状态（该步确实没用量），`字段缺失` 才该重建。**
+修法：增量分支只认 `usageFromMeta`，`if (fromMeta)` 而非"非空才算有"。
+
+**P2 根因**：ACP 每轮在请求末尾现拼尾部动态块（nudge / 压缩手册），它不属于缓存前缀。
+历史增长一条时，上一轮的尾部块在逐条比对里与「新历史的第一条」相撞（上轮它占 n−1，本轮历史占了 n−1）
+⇒ 判成"中段被就地改写"。修法：比对前剔除本轮自己追加的尾部块（两轮各自剔除 ⇒ 视野对齐纯历史前缀）。
+
+### 评审过程中的一次方法论纠错（值得记）
+
+P1 一开始被判「不成立」：我先按子代理给的场景造探针（**首步无 usage 但有工具调用**），
+实测 `llmCalls=1` 正确、没翻倍 —— 若就此收尾就是漏报。
+换成「首步纯文本且无 usage」立刻复现（`2/300`）：**差别在"折叠后累积器是否真的完全为空"**，
+有工具则 `tools` 非空、`isBlankUsage` 为 false，走不到重建分支。
+**教训：复现不了 ≠ 不存在 —— 要先把触发条件摸清（是"某个前置状态"而不是"某个动作"），
+再判定真假。** 反向也成立：子代理的另外几条「确认」级结论我逐条核对后，有 3 条其实是设计取舍而非缺陷。
+
+### 未修（需你拍板 / 低危，已核实）
+
+1. **入参自愈对 oneOf 工具失效**（`code_semantic_edit` 顶层无 `required`，三模式写在 oneOf 分支里）：
+   模型给 `input:{}` 时不触发自愈 —— 而多模式工具恰恰最需要。修法有两种（按 `mode` 判别字段选分支 /
+   合并各分支 required 但可能误导"全必填"），涉及回喂文案语义，**先不动待你选**。
+2. **`AgentDefinition.subagents` 是死配置**（AGENTS.md 已点名，仍未消费）：要么按它过滤可派子 Agent，
+   要么删字段 —— 产品语义决策，先不动。
+3. `maxSteps: 0` 被 `Math.max(1, …)` 静默抬成 1（`-1` = 不限已有明确定义，`0` 无）；低危。
+4. `cacheHitRate` 对 `NaN` 输入不降级（真实来源未观察到）；已核实为非当前路径。
+5. ACP 的归因视野不含 core 在 `preModel` **之后**追加的 `dynParts`（尾部动态区，通常不在缓存前缀内）；
+   仅在 anthropic `promptCache` 开启（断点打最后一条）时可能漏判 —— 该功能本机无 key 未验收。
+6. TUI「已选 N 字符」用 UTF-16 `.length`，emoji 会多算 1；显示细节。
+7. `acpCacheHit`（只比 message id）与内容指纹口径并存，仍可能误导读者。
+
+**验证**：`bun run typecheck` 全绿；`bun run test` 39 个包退出码全 0（core 117、acp-context 74、
+usage 29、subagent 135、anthropic 26、cli 366）。新增回归用例 3 条（用量双计 / 归因 appended / promptCache 透传）。
+
 ## 2026-09-22（续 187）TUI 鼠标选区高亮：拖选后输入行显示「已选 N 字符 · ✕」
 
 用户续反馈"还有鼠标选区的高亮"（拖选文本）。OpenTUI 选区着色由 Zig 内核负责（默认反转），

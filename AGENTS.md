@@ -117,6 +117,10 @@
 
 - **新增任何字段前先核实"有没有写入方 / 有没有消费者"**：本项目已连撞三次同类缺陷——`subagents:` 只解析不消费、`ctx.variables.callerToolIds` 只读不写、`agentFromMarkdown` 不映射 `maxSteps`（插件文档却让子 agent 在定义里写它）。判定手法：全仓 grep 字段名，确认写入点与消费点都存在，再动手
 
+- **「值存在但为空」与「字段缺失」是两种状态，不许用一个 `if (x)` 混过去**：真机事故（09-22 提交后评审）——用量折叠的增量分支用 `hydrateUsage({meta, messages})` 取起点，而它在累积器为空时会**回退到按消息重建**，重建用的 `messages` **已含当前消息** ⇒ 随后再 `foldMessage(message)` 就是第二遍（实测 `llmCalls=2` / `input=300`，正确值 `1` / `150`）。触发条件：某轮 assistant 既无 `tokenUsage` 也无工具调用（provider 未回报用量 / 流式中断）⇒ 折叠后累积器恰好**完全为空**（`llmCalls=0` / `hourly=[]` / `tools=[]`）但检查点仍然有效 ⇒ 下一轮双计。修法：用 `usageFromMeta(...) !== undefined` 区分「存在但为空」（合法状态 → 直接增量折叠）与「字段缺失」（→ 全量重建）。凡 `if (obj.field)` / `x || fallback` 这类"空 ≡ 缺"的写法，先问一句：**空值本身是不是有意义的合法状态？**
+
+- **归因指标的"视野"必须剔除调用方自己每轮现拼的内容，否则会把「版本增长」误读成「内容改写」**：真机事故（09-22 提交后评审）——ACP 每轮在请求末尾现拼尾部动态块（nudge / 压缩手册），它不属于缓存前缀；历史增长一条时，上一轮的尾部块在逐条比对里与「新历史的第一条」相撞（上轮它占 n−1，本轮历史占了 n−1）⇒ 每一轮都报 `prefix-mutated`（"中段某条被就地改写"），而前缀其实完好，排查方向被引向"谁改写了历史中段"。修法：比对前剔除本轮自己追加的尾部块（两轮各自剔除 ⇒ 视野对齐在纯历史前缀上）。通用判据：**凡"逐条比对相邻两轮"的指标，先划清哪些条目是自己造的、不属于被观测对象**
+
 - `/tools` 工具管理命令由插件 `@harness/tools-manager` 提供（`cli.command` hook）：Agent 白名单启停经 cli 注入的 `setAgentTools` 持久化到 config.json 的 `agents[].tools`，`--global` 启停走运行时 `harness.tools`，本地缓存被卸载 Tool 以便恢复
 
 - 插件要持久化 config.json 时不直接自持读写，优先经 cli 注入的 `setAgentTools` / `CliCommandInput` 扩展字段（`agentId`/`harness`），保持解耦
