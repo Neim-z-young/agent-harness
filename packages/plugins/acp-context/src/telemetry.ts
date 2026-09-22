@@ -78,6 +78,30 @@ export interface ProviderCacheEvent {
   cacheRead: number      // 命中缓存的输入 token
   cacheWrite: number     // 写入缓存（未命中但计入）的输入 token
   requestTok: number     // 本轮发往模型的 token（preModel 估算值，用于计算 provider 侧命中率）
+  // —— 缓存回退归因（见 CacheMissReason；`cacheMissReason` 直接回答「这轮为什么掉」）
+  cacheDropTokens: number
+  /** 距上一轮**本会话**请求的空闲毫秒数（首轮为 null）。与 `idle-expiry` 交叉验证 */
+  idleMs: number | null
+  cacheMissReason: CacheMissReason
+  // —— 前缀稳定性（来自同轮 preModel 事件；未采集到为 null）
+  prefixStableMessages: number | null
+  prefixChangedKind: PromptPrefixDiff['changedKind'] | null
+  /**
+   * provider 上报输入 / 本地**整包**估算（system + 工具载荷 + 消息）。
+   *
+   * 本项目两套口径长期分叉：本地估算（acp-kernel CJK 感知口径）与 provider 实际计费输入
+   * 不是同一把尺子。分母刻意用引擎给的 `localInputEstimate` 而**不是** `requestTok`：
+   * 后者只算历史 cores，拿它当分母量到的是"漏算 system/工具固定开销"，不是 tokenizer 差异
+   * （真机首轮比值虚高到 415×，见 `overheadTok`）。
+   */
+  calibration: number | null
+  /**
+   * 整包估算 − 历史估算 = **每轮都要重发的固定开销**（system 提示 + 工具载荷）。
+   *
+   * 真机取证：默认 agent 下 body ≈ 18.7KB，其中 system 仅 187 字符 ⇒ 绝大部分是工具载荷。
+   * ACP 的 occupancy 只算历史消息、不含这一项 ⇒ 阈值判断系统性偏保守。
+   */
+  overheadTok: number | null
 }
 
 export type TelemetryEvent = PreModelEvent | CompressEvent | ProviderCacheEvent
@@ -120,6 +144,98 @@ export function commonPrefixHit(prev: CoreMessage[] | undefined, curr: CoreMessa
   const total = Math.max(1, curr.reduce((s, m) => s + (m.text?.length ?? 0), 0))
   return chars / total
 }
+
+// ===== 前缀稳定性诊断（回答「缓存为什么掉了」）=====
+
+/**
+ * 单条消息的内容指纹。
+ *
+ * ⚠️ **只取 role + 正文，刻意不含 `id`**：ACP 每轮为 HINT / nudge 生成的临时消息 id 都是新的，
+ * 把 id 算进指纹会让"前缀稳定"永远止步于第一条临时消息（指标恒为 0，等于没有）。
+ * provider 侧缓存也只看内容字节，与 id 无关。
+ *
+ * 为什么要指纹而不只比 id：`commonPrefixHit` 只比较 `id`，**同 id 消息内容被就地改写它测不出来**。
+ * 而"就地改写"恰恰是本项目最可能的失效源（ACP 折叠/占位符替换会改写早前消息的正文）。
+ * 只比 id 会在真实缓存已经塌陷时仍报高命中率 —— 那是**误导性的绿灯**，比没有指标更糟。
+ */
+function messageDigest(m: { role?: string; text?: string }): string {
+  const s = `${m.role ?? ''}\u0000${m.text ?? ''}`
+  // djb2 + 长度：够用的非加密指纹，零依赖、够快（每轮只算一遍消息数条）
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+  return `${(h >>> 0).toString(36)}:${s.length}`
+}
+
+/** 相邻两轮 prompt 的前缀差异（用于定位「缓存为什么没命中」） */
+export interface PromptPrefixDiff {
+  /** 本轮 prompt 的消息条数 */
+  promptMessages: number
+  /** 逐条比对内容指纹后，最长公共前缀的消息条数 */
+  stableMessages: number
+  /** 第一处变化的绝对下标（前缀未动时为 null） */
+  changedAt: number | null
+  /** 第一处变化处的角色（区分"系统区变了"还是"历史区变了"） */
+  changedAtRole: string | null
+  /**
+   * 变化类型（决定代价大小）：
+   * - `none`           逐条一致
+   * - `appended`       只是尾部追加 —— 前缀未动，缓存几乎全命中
+   * - `tail-rewritten` 只有最后一条被改写（nudge/手册的常规形态）—— 只重算尾部一条
+   * - `mutated`        中段某条被就地改写 —— **最致命**，其后全部重算
+   * - `shrunk`         prompt 比上轮短（截断/删消息）
+   */
+  changedKind: 'none' | 'appended' | 'tail-rewritten' | 'mutated' | 'shrunk'
+  /** 变化是否落在系统区（前导 system 消息内）—— 系统区一变，整段历史都要重算 */
+  systemChanged: boolean
+  /** 本轮 prompt 的整体指纹 */
+  fingerprint: string
+}
+
+/** 计算相邻两轮 prompt 的前缀差异；prev 为空（首轮）时返回 null */
+export function diffPromptPrefix(
+  prev: readonly { role?: string; text?: string }[] | undefined,
+  curr: readonly { role?: string; text?: string }[],
+): PromptPrefixDiff | null {
+  if (!prev || prev.length === 0) return null
+  const prevDigests = prev.map(messageDigest)
+  const currDigests = curr.map(messageDigest)
+
+  let stable = 0
+  const max = Math.min(prevDigests.length, currDigests.length)
+  while (stable < max && prevDigests[stable] === currDigests[stable]) stable++
+
+  // 系统区长度 = 前导 system 消息数
+  let systemCount = 0
+  while (systemCount < curr.length && curr[systemCount]!.role === 'system') systemCount++
+
+  let changedKind: PromptPrefixDiff['changedKind']
+  if (stable === prevDigests.length && stable === currDigests.length) changedKind = 'none'
+  else if (stable === prevDigests.length) changedKind = 'appended'
+  else if (stable === currDigests.length && curr.length < prev.length) changedKind = 'shrunk'
+  else if (stable === curr.length - 1 && curr.length === prev.length) changedKind = 'tail-rewritten'
+  else changedKind = 'mutated'
+
+  const prefixIntact = changedKind === 'none' || changedKind === 'appended'
+  return {
+    promptMessages: curr.length,
+    stableMessages: stable,
+    changedAt: prefixIntact ? null : stable,
+    changedAtRole: prefixIntact ? null : (curr[stable]?.role ?? null),
+    changedKind,
+    systemChanged: stable < systemCount,
+    fingerprint: messageDigest({ role: 'prompt', text: currDigests.join('|') }),
+  }
+}
+
+/** 缓存未命中的归类（供 providerCache 行直接回答「为什么掉了」） */
+export type CacheMissReason =
+  | 'first-request'   // 本会话首次请求，无缓存可用
+  | 'none'            // 命中量未下降
+  | 'system-changed'  // 系统区被改写 ⇒ 其后全部重算（最贵）
+  | 'prefix-mutated'  // 历史前缀某条被就地改写
+  | 'prefix-shrunk'   // prompt 变短（截断/删消息）
+  | 'idle-expiry'     // 前缀没变但命中量掉了 ⇒ 大概率是缓存过期/被逐出（看 idleMs）
+
 
 // ===== Writer =====
 
@@ -209,17 +325,60 @@ export interface ProviderCacheBuildInput {
   cacheRead: number | undefined
   cacheWrite: number | undefined
   requestTok: number | undefined
+  /** 上一轮本会话的 providerCache 行（用于判断命中量是否下降、以及空闲了多久） */
+  prev?: { ts: number; cacheRead: number } | undefined
+  /** 本轮的 prompt 前缀差异（来自 preModel 事件）；未采集到时为 null */
+  prefix?: PromptPrefixDiff | null
+  /** provider 上报的**总输入 token**（= cacheRead + 未命中）。用于校正本地估算口径 */
+  providerInput?: number | undefined
+  /**
+   * 引擎给出的**整包**本地估算（system + 工具载荷 + 消息）。
+   *
+   * ⚠️ 不能用 `requestTok` 当分母：那个只算历史 cores，不含 system 与工具载荷 ——
+   * 真机取证（临时 dataDir 跑 3 轮）首轮比值虚高到 415×，量到的其实是"漏算固定开销"。
+   */
+  localInputEstimate?: number | undefined
 }
 
 export function buildProviderCacheEvent(inp: ProviderCacheBuildInput): ProviderCacheEvent | null {
   if (inp.cacheRead === undefined && inp.cacheWrite === undefined) return null
+  const cacheRead = inp.cacheRead ?? 0
+  const prev = inp.prev
+  const idleMs = prev ? Math.max(0, Date.now() - prev.ts) : null
+  const cacheDropTokens = prev && prev.cacheRead > cacheRead ? prev.cacheRead - cacheRead : 0
+
+  // 归类顺序即优先级：系统区改写 > 历史前缀改写 > 变短 > 前缀未变（⇒ 只能是过期/逐出）
+  let reason: CacheMissReason
+  if (!prev) reason = 'first-request'
+  else if (cacheDropTokens === 0) reason = 'none'
+  else if (inp.prefix?.systemChanged) reason = 'system-changed'
+  else if (inp.prefix?.changedKind === 'mutated') reason = 'prefix-mutated'
+  else if (inp.prefix?.changedKind === 'shrunk') reason = 'prefix-shrunk'
+  else reason = 'idle-expiry'
+
   return {
     kind: 'providerCache',
     ts: Date.now(),
     sessionId: inp.sessionId,
     round: inp.round,
-    cacheRead: inp.cacheRead ?? 0,
+    cacheRead,
     cacheWrite: inp.cacheWrite ?? 0,
     requestTok: inp.requestTok ?? 0,
+    // —— 缓存回退归因（回答「这轮为什么掉」）
+    cacheDropTokens,
+    idleMs,
+    cacheMissReason: reason,
+    // 前缀稳定性（0 表示 prompt 顺序/内容在首条就变了）
+    prefixStableMessages: inp.prefix?.stableMessages ?? null,
+    prefixChangedKind: inp.prefix?.changedKind ?? null,
+    // 口径校正：provider 实际输入 / 本地**整包**估算。持续偏离 1 说明本地口径需要校正。
+    // 分母必须用整包估算（含 system + 工具），用 requestTok 会把"漏算固定开销"当成 tokenizer 差异。
+    calibration: inp.providerInput !== undefined && (inp.localInputEstimate ?? 0) > 0
+      ? inp.providerInput / inp.localInputEstimate!
+      : null,
+    /** 整包估算 − 历史估算 = system + 工具载荷的**固定开销**（每轮都要重发的那部分） */
+    overheadTok: inp.localInputEstimate !== undefined
+      ? Math.max(0, inp.localInputEstimate - (inp.requestTok ?? 0))
+      : null,
   }
 }

@@ -1017,3 +1017,22 @@ test('core.llm.usage：无缓存字段不写行（避免噪声）；未知会话
   expect(text).not.toContain('providerCache')
   expect(text).toContain('preModel') // 遥测本身是通的（证明"没写"不是因为整条链路没开）
 })
+
+test('uninstall：退出前 flush（不依赖 debounce 定时器）', async () => {
+  // 写入器有 500ms debounce，其 flush() 注释写着"正常退出 / 信号兜底时调用"，
+  // 但 uninstall() 此前只 clear 了 Map、没有调用方 ⇒ 结构性缺口（同类缺陷本项目已撞多次）。
+  // 本用例固定**机制**：卸载后立刻可读，不必等 debounce。
+  // 注：并未观测到真实丢行 —— 三次真机取证的 providerCache 行数都与 llmCalls 精确相等。
+  const dir = mkdtempSync(join(tmpdir(), 'acp-flush-'))
+  const path = join(dir, 's.telemetry.jsonl')
+  const plugin = createAcpContextPlugin({ modelContextLimit: 20000, telemetryPathBuilder: () => path })
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+
+  await runPreModelOnce(hooks, history(3))
+  hooks['core.llm.usage']!({ sessionId: 's', input: 1000, output: 50, cacheRead: 900, cacheWrite: 0 })
+  // 刻意**不等** debounce（500ms）就卸载 —— 真实退出就是这样
+  await plugin.uninstall?.()
+
+  const rows = readFileSync(path, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  expect(rows.filter((r) => r.kind === 'providerCache')).toHaveLength(1)
+})

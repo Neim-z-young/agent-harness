@@ -63,6 +63,8 @@ import {
   buildPreModelEvent,
   buildCompressEvent,
   buildProviderCacheEvent,
+  diffPromptPrefix,
+  type PromptPrefixDiff,
   type TelemetryWriter,
 } from './telemetry.js'
 
@@ -230,6 +232,16 @@ export interface AcpContextPluginOptions {
    * 两者必须一致——这正是早年"占用率显示 26% 而实际已 103%"的根因。
    */
   tokenCalibration?: 'auto' | 'chars4'
+  /**
+   * 本地 token 估算的额外校正系数（缺省 1 = 不校正）。
+   *
+   * 本地口径与 provider 实际计费口径**不是同一把尺子**：真机实测（DeepSeek / deepseek-flash）
+   * 稳定为 **1.33**（provider 输入 ÷ 本地整包估算 = 1.328 / 1.342 / 1.337 / 1.332）
+   * ⇒ 本地系统性低估约 25%，occupancy 与 tier 阈值整体偏保守（报 26.9% 时实际已约 35%）。
+   * 观测值可从遥测 `providerCache.calibration` 取；本系数由 `compression.tokenCalibrationScale`
+   * 配置。**在这里包装而不是各自乘**：engine 与本插件的占用率必须共用同一把尺子。
+   */
+  tokenCalibrationScale?: number
   /** 内置 ACP 工具名（默认全部注入，可用其中的子集） */
   toolIds?: Array<'compress' | 'decompress' | 'search_context' | 'acp_status'>
   /**
@@ -300,6 +312,13 @@ interface AcpSessionCtx {
   telemetry?: TelemetryWriter
   /** 上轮 processTurn 返回的 cores（用于计算 ACP 侧缓存命中 = 同前缀占比） */
   prevRequestCores?: CoreMessage[]
+  // ---- 前缀缓存回退归因 ----
+  /** 上一轮**实际发给模型**的 prompt 投影（role + 正文指纹用；不含 id，见 diffPromptPrefix） */
+  prevPromptView?: { role: string; text: string }[]
+  /** 本轮 prompt 的前缀差异；供随后的 providerCache 行归因 */
+  lastPrefixDiff?: PromptPrefixDiff | null
+  /** 上一轮 providerCache 行（ts + cacheRead），用于判断命中量是否下降、空等了多久 */
+  lastCacheRow?: { ts: number; cacheRead: number }
 }
 
 // ========================================================================
@@ -351,7 +370,14 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   const explicitSystemPrompt = options.systemPrompt !== undefined
   // token 折算口径：默认与内核同一份实现（CJK 感知）。'auto' 显式注入等价于内核默认值，
   // 目的是把口径**钉死在一处**——插件上报的 tokenCount 与内核内部计数永远是同一把尺子。
-  const countTokens = options.tokenCalibration === 'chars4' ? chars4CountTokens : cjkAwareCountTokens
+  const baseCountTokens = options.tokenCalibration === 'chars4' ? chars4CountTokens : cjkAwareCountTokens
+  // 校正系数在**唯一解析点**包装：engine（createCore）与本插件的占用率/遥测从此共用同一把尺子。
+  // 非法值（非正数/NaN）一律按不校正处理，不静默取一个奇怪的数。
+  const scale = options.tokenCalibrationScale
+  const countTokens: typeof baseCountTokens =
+    typeof scale === 'number' && Number.isFinite(scale) && scale > 0 && scale !== 1
+      ? (text: string) => Math.ceil(baseCountTokens(text) * scale)
+      : baseCountTokens
   // 引擎纯态：state 由宿主显式传入/取回
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const engine = createCore({ countTokens })
@@ -708,11 +734,20 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               cacheRead: signal.cacheRead,
               cacheWrite: signal.cacheWrite,
               requestTok: sctx.lastTokens,
+              // 回退归因三件套：上一行（算降幅/空闲）、本轮前缀差异（算"是不是我们改坏的前缀"）、
+              // provider 实际输入（算本地口径偏差）
+              prev: sctx.lastCacheRow,
+              prefix: sctx.lastPrefixDiff,
+              providerInput: signal.input,
+              // 分母用引擎给的**整包**估算（含 system + 工具），不是 requestTok —— 后者只算历史
+              localInputEstimate: signal.localInputEstimate,
             })
             if (!ev) return
             // 与 preModel 同一套 writer（可能为 no-op：未配遥测路径时）
             const telem = sctx.telemetry ?? createTelemetryWriter(undefined)
             telem.write(ev)
+            // 记下本行，供下一轮判断降幅与空闲时长
+            sctx.lastCacheRow = { ts: ev.ts, cacheRead: ev.cacheRead }
           } catch (err) {
             plgCtx.log.warn?.('ACP providerCache 遥测写入失败（忽略）', { err: String(err) })
           }
@@ -721,6 +756,23 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     },
 
     async uninstall() {
+      // 退出前 flush 所有 writer。
+      //
+      // 写入器有 500ms debounce，其 `flush()` 的注释明确写着"正常退出 / 信号兜底时调用"——
+      // 但此前 uninstall() 只 clear 了 Map，**没有任何调用方**去 flush（同类"只有定义没有调用方"
+      // 的缺陷本项目已撞过多次）。日志/遥测"最后一拍丢失"极难察觉，属于典型的静默数据缺失，
+      // 因此这里补上：最后一个 query 结束后立刻退出的路径（脚本化 `run`、探针）不再依赖
+      // "恰好活过 500ms 的定时器"。
+      //
+      // 说明：**并未**观测到真实的丢行事故 —— 三次真机取证里 `providerCache` 行数都与
+      // `usageStats.llmCalls` 精确相等（4/4、5/5、4/4）。这里修的是"没有调用方"的结构性缺口。
+      for (const sctx of sessions.values()) {
+        try {
+          sctx.telemetry?.flush()
+        } catch {
+          /* 遥测 flush 失败不阻塞卸载 */
+        }
+      }
       sessions.clear()
     },
   }
@@ -1065,6 +1117,38 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 原地替换待发消息
   messages.length = 0
   messages.push(...request)
+
+  // ---- 前缀缓存回退归因：把**这一轮真正要发出去**的 prompt 记下来与上轮比对 ----
+  //
+  // 为什么在这里（而不是更早）：`messages` 直到这一行才是最终待发内容；系统区、HINT、
+  // 渲染后的历史、尾部 nudge 全在里面。早一步算的都是"未完成的 prompt"，结论不可信。
+  //
+  // 为什么用全文投影而不是 core 的 id：ACP 复用 `prefixRender` 时会刻意让早前消息的**字节**
+  // 保持不变；只看 id 无法发现"内容被就地改写"，而那是本项目最可能的失效源。
+  try {
+    const view = request.map((m) => ({ role: m.role ?? '', text: partsSignature(m) }))
+    ctx.lastPrefixDiff = diffPromptPrefix(ctx.prevPromptView, view)
+    ctx.prevPromptView = view
+  } catch {
+    // 诊断失败不影响本轮请求
+    ctx.lastPrefixDiff = undefined
+  }
+}
+
+/** 把一条消息的全部 part 折叠成一个可比较的字符串（用于前缀指纹；不看 id） */
+function partsSignature(m: Message): string {
+  const parts = (m.parts ?? []) as Array<Record<string, unknown>>
+  let out = ''
+  for (const p of parts) {
+    out += `${String(p.type ?? '')}\u0001`
+    // 逐 part 取"有内容意义"的字段；时间戳/id 这类每轮必变的字段一律不取
+    if (typeof p.text === 'string') out += p.text
+    if (p.input !== undefined) out += JSON.stringify(p.input)
+    if (p.result !== undefined) out += JSON.stringify(p.result)
+    if (p.toolId !== undefined) out += String(p.toolId)
+    out += '\u0002'
+  }
+  return out
 }
 
 /** 默认导出常量插件（默认配置） */

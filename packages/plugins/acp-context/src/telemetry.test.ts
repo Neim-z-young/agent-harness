@@ -10,7 +10,7 @@
  */
 import { test, expect } from 'bun:test'
 import { createInitialState, defaultConfig, type CoreMessage } from 'acp-kernel'
-import { buildPreModelEvent } from './telemetry'
+import { buildPreModelEvent, buildProviderCacheEvent, diffPromptPrefix } from './telemetry'
 import { chars4CountTokens, cjkAwareCountTokens, estimateTokens } from './adapter'
 
 const ZH = '压'.repeat(4000) // 4000 个汉字：CJK 口径 4000 token，chars4 口径 1000 token
@@ -56,4 +56,134 @@ test('buildPreModelEvent：中文场景两档口径的占用率差约 4 倍（�
   const legacy = eventOf(chars4CountTokens)
   expect(auto.rawTok).toBeGreaterThan(legacy.rawTok * 3)
   expect(auto.occupancy! / legacy.occupancy!).toBeGreaterThan(3)
+})
+
+// ==========================================================================
+// 前缀缓存回退归因（回答「这轮缓存为什么掉」）
+//
+// 回归背景：会话 `s_1789996799007_9cq9r` 出现两处 cacheRead 断崖（−12.9K / −46.7K），
+// 但当时的遥测只有 cacheRead 一个数字，无法区分「我们自己把前缀改坏了」与
+// 「provider 侧缓存过期/被逐出」。更糟的是既有的 `commonPrefixHit` **只比 message id**，
+// 同 id 消息内容被就地改写时它仍报高命中率 —— 误导性的绿灯。
+// ==========================================================================
+
+const msg = (role: string, text: string) => ({ role, text })
+
+test('diffPromptPrefix：尾部追加 ⇒ appended，前缀未动（不该归因到前缀）', () => {
+  const prev = [msg('system', 'S'), msg('user', 'A')]
+  const curr = [msg('system', 'S'), msg('user', 'A'), msg('assistant', 'B')]
+  const d = diffPromptPrefix(prev, curr)!
+  expect(d.changedKind).toBe('appended')
+  expect(d.stableMessages).toBe(2)
+  expect(d.changedAt).toBeNull()
+  expect(d.systemChanged).toBe(false)
+})
+
+test('diffPromptPrefix：同 id 但内容被就地改写 —— id 比对测不出，指纹能测出（mutated）', () => {
+  // 这正是 commonPrefixHit 的盲区：两条消息 id 完全相同（甚至没有 id 概念），
+  // 但正文变了。provider 缓存按字节命中，所以这里是真失效。
+  const prev = [msg('user', '正文 A'), msg('user', 'B')]
+  const curr = [msg('user', '正文 A 被改写'), msg('user', 'B')]
+  const d = diffPromptPrefix(prev, curr)!
+  expect(d.changedKind).toBe('mutated')
+  expect(d.stableMessages).toBe(0)
+  expect(d.changedAt).toBe(0)
+  expect(d.changedAtRole).toBe('user')
+})
+
+test('diffPromptPrefix：系统区被改写 ⇒ systemChanged（其后整段历史重算，最贵）', () => {
+  const prev = [msg('system', '工具清单 v1'), msg('system', 'HINT'), msg('user', 'A')]
+  const curr = [msg('system', '工具清单 v2'), msg('system', 'HINT'), msg('user', 'A')]
+  const d = diffPromptPrefix(prev, curr)!
+  expect(d.systemChanged).toBe(true)
+  expect(d.changedAt).toBe(0)
+  expect(d.changedAtRole).toBe('system')
+})
+
+test('diffPromptPrefix：只有尾条被改写 ⇒ tail-rewritten（廉价，不当中段失效）', () => {
+  const prev = [msg('system', 'S'), msg('user', 'A'), msg('user', 'nudge: 1 段可压')]
+  const curr = [msg('system', 'S'), msg('user', 'A'), msg('user', 'nudge: 2 段可压')]
+  const d = diffPromptPrefix(prev, curr)!
+  expect(d.changedKind).toBe('tail-rewritten')
+  expect(d.systemChanged).toBe(false)
+})
+
+test('diffPromptPrefix：prompt 变短 ⇒ shrunk（截断/删消息）', () => {
+  const prev = [msg('system', 'S'), msg('user', 'A'), msg('user', 'B')]
+  const curr = [msg('system', 'S'), msg('user', 'A')]
+  const d = diffPromptPrefix(prev, curr)!
+  expect(d.changedKind).toBe('shrunk')
+})
+
+test('diffPromptPrefix：首轮（无上轮）返回 null', () => {
+  expect(diffPromptPrefix(undefined, [msg('user', 'A')])).toBeNull()
+  expect(diffPromptPrefix([], [msg('user', 'A')])).toBeNull()
+})
+
+test('providerCache 归因：首轮 / 未下降 / 系统区改写 / 中段改写 / 前缀完好但掉量', () => {
+  const base = { sessionId: 's', round: 1, cacheWrite: 0, requestTok: 1000 }
+
+  // 首轮
+  expect(buildProviderCacheEvent({ ...base, cacheRead: 0 })!.cacheMissReason).toBe('first-request')
+
+  // 未下降
+  const noDrop = buildProviderCacheEvent({
+    ...base, cacheRead: 900, prev: { ts: Date.now() - 1000, cacheRead: 800 },
+  })!
+  expect(noDrop.cacheMissReason).toBe('none')
+  expect(noDrop.cacheDropTokens).toBe(0)
+
+  // 系统区改写（最贵）
+  const sys = buildProviderCacheEvent({
+    ...base, cacheRead: 100,
+    prev: { ts: Date.now() - 5000, cacheRead: 5000 },
+    prefix: diffPromptPrefix([msg('system', 'v1')], [msg('system', 'v2')]),
+  })!
+  expect(sys.cacheMissReason).toBe('system-changed')
+  expect(sys.cacheDropTokens).toBe(4900)
+  expect(sys.idleMs).toBeGreaterThanOrEqual(0)
+
+  // 中段改写
+  const mut = buildProviderCacheEvent({
+    ...base, cacheRead: 100,
+    prev: { ts: Date.now(), cacheRead: 5000 },
+    prefix: diffPromptPrefix([msg('user', 'a'), msg('user', 'b')], [msg('user', 'a!'), msg('user', 'b')]),
+  })!
+  expect(mut.cacheMissReason).toBe('prefix-mutated')
+
+  // 前缀完好（append）但仍然掉量 ⇒ 只能是 provider 侧过期/逐出，靠 idleMs 佐证
+  const idle = buildProviderCacheEvent({
+    ...base, cacheRead: 100,
+    prev: { ts: Date.now() - 400_000, cacheRead: 5000 },
+    prefix: diffPromptPrefix([msg('user', 'a')], [msg('user', 'a'), msg('user', 'b')]),
+  })!
+  expect(idle.cacheMissReason).toBe('idle-expiry')
+  expect(idle.idleMs).toBeGreaterThan(300_000)
+})
+
+test('providerCache 口径：calibration 的分母必须是**整包**估算，不是历史估算', () => {
+  // 分母用整包（含 system + 工具）⇒ 1320/1000 = 1.32
+  const ev = buildProviderCacheEvent({
+    sessionId: 's', round: 1, cacheRead: 800, cacheWrite: 0,
+    requestTok: 300, localInputEstimate: 1000, providerInput: 1320,
+  })!
+  expect(ev.calibration).toBeCloseTo(1.32, 5)
+  // 固定开销 = 整包 − 历史 = system + 工具载荷（每轮都要重发的那部分）
+  expect(ev.overheadTok).toBe(700)
+
+  // 分母缺失（或为 0）⇒ null，绝不退回用 requestTok 当分母
+  // （真机取证：那样量到的是"漏算固定开销"，首轮比值虚高到 415×）
+  expect(buildProviderCacheEvent({
+    sessionId: 's', round: 1, cacheRead: 1, cacheWrite: 0,
+    requestTok: 300, localInputEstimate: 0, providerInput: 10,
+  })!.calibration).toBeNull()
+  expect(buildProviderCacheEvent({
+    sessionId: 's', round: 1, cacheRead: 1, cacheWrite: 0,
+    requestTok: 300, providerInput: 10,
+  })!.calibration).toBeNull()
+
+  // 无整包估算 ⇒ overheadTok 也为 null（不编造）
+  expect(buildProviderCacheEvent({
+    sessionId: 's', round: 1, cacheRead: 1, cacheWrite: 0, requestTok: 300,
+  })!.overheadTok).toBeNull()
 })
