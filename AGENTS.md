@@ -91,6 +91,8 @@
 
 - **子 agent 派工的两个已知事实**：① 递归深度**只靠白名单**控制（`mode:'subagent'` 不会被自动排除），所以 subagent 的 `tools:` 里不该出现 `subagent` —— 此前 8 个 subagent 全是 `tools:"*"`，等于**能无限往下派工**；② agent 的 `subagents:` 字段**只被解析、无人消费**（声明而不生效，`tools` 之外又一个"配了没用"），`description` 也**不进模型上下文**（仅供 `/subagents` 展示）⇒ 派工时模型看不到可用子 agent 清单，只能靠用户点名指定 `agentId`
 
+- **真机取证必须带"独立证据"，且别把不同层的东西当同一件事**：本轮两次差点得出错误结论 —— ① 用"provider 全量输入 ÷ 本地 history-only 估算"算口径偏差，量出 415×，其实是**漏算固定开销**而非 tokenizer 差异；② 看到"5 次 HTTP 请求 vs 4 行遥测"就断言"末轮丢行"，实际 `usageStats.llmCalls` 就是 4（HTTP 请求数 ≠ LLM 调用数）。取证据的正确姿势：包 `globalThis.fetch` 抓**真正发出去的请求体**（本轮靠它独立确认系统区哈希全程恒定 `c9cbef190aa1`），再与内部指标交叉验证；**任何"指标异常"先找同源计数对齐，再下结论**
+
 - **子 agent 超出摘要阈值时的"全文"落 `{dataDir}/subagent-results/`，不落 `os.tmpdir()`、也不落 cwd**：macOS 会定期清理 `/var/folders/**/T`，而那份全文是**唯一一份**（`{dataDir}/tasks/<taskId>.json` 只存摘要）⇒ 落 tmp 等于随时丢数据。文件名必须**时间戳 + 随机段**（只用 `Date.now()` 会让同毫秒并发的子任务撞名互相覆盖）。默认阈值 `DEFAULT_MAX_RESULT_LENGTH = 8000` 字符（原 2000 太低：真机 9 份报告 4532~10195 字符，9/9 全被截断）
 
 - **摘要提示语只许说"当前为真"的话，且判据要两个一起看**：① `ctx.variables.callerToolIds`（由 core 从 `allowedTools` 注入）里是否真有 `read_file`/`grep_file`；② 落盘路径是否在**调用方 `ctx.cwd`** 内（`read_file` 的边界是它，不是 harness 全局 cwd）。两者缺一 → **不许承诺可读**（承诺了模型必去试、试必被 `PATH_OUTSIDE_CWD` 拒）。历史事故：该字段曾**全仓无写入方**（只有测试手动塞），"可使用 read_file 查看"整段是死代码，真实提示是"请考虑拆分任务"——把"超了字符阈值"误报成"任务太大"
@@ -98,6 +100,12 @@
 - **`AgentDefinition.maxSteps` 现在能从 agent md 的 `maxSteps:` 解析**（`-1` = 不限）；role 分档：`reader` = 35、`reviewer` = 25（20 是插件默认，实测 6/6 reader 触顶）。派工方还可用 `subagent({ maxSteps })` 按**本次任务**覆盖，优先级 **派工方 > agent 定义 > 插件默认**
 
 - **工具调用"入参自愈"在 core，不在各工具**：失败且必填项没给全时，core 把该工具的必填参数（名/类型/描述，取自 `inputSchema.__jsonSchema`）+ 最小示例拼进回喂的错误消息（`[入参自愈] …`），**原 `message`/`code` 一律保留**。动机：真机实测模型在长上下文下会整段丢 tool-call arguments（100 次调用 37 次失败、34 次 `input:{}`，失败率随上下文从 12% 升到 50%）。必填已给齐、或无 schema/无必填 ⇒ **不掺和**
+
+- **诊断"前缀缓存为什么掉"看遥测的 `cacheMissReason`，不要靠猜**：`providerCache` 行现在自带 `cacheMissReason`（`first-request` / `none` / `system-changed` / `prefix-mutated` / `prefix-shrunk` / `idle-expiry`）、`prefixStableMessages`、`prefixChangedKind`、`cacheDropTokens`、`idleMs`。判据来自 `diffPromptPrefix()` 对**上一轮真正发出去的 prompt** 逐条做**内容指纹**比对（`preModel` 末尾原地替换之后才是最终内容）。**为什么必须用内容指纹而不是 id**：既有的 `commonPrefixHit` 只比 `id`，同 id 消息正文被就地改写时它照样报高命中率——那是误导性的绿灯，比没有指标更糟；而"就地改写"正是本项目最可能的失效源（ACP 折叠/占位符替换）。指纹**刻意不含 `id`**：ACP 每轮的 HINT/nudge 临时消息 id 都是新的，算进去会让指标恒为 0
+
+- **本地 token 估算与 provider 计费口径不是同一把尺子 ⇒ 用 `compression.tokenCalibrationScale` 显式校正**：真机实测（临时 dataDir 跑 3 轮 / DeepSeek deepseek-flash）稳定为 **1.33**（provider 输入 ÷ 本地**整包**估算 = 1.328/1.342/1.337/1.332，即系统性低估约 25%），校正后同一探针的 `calibration` 收敛到 **1.000 ± 0.011**。取数方法：读遥测 `providerCache.calibration`（每轮都打），连续几轮稳定即可。⚠️ **分母必须是"整包"估算（system + 工具载荷 + 消息），不是 ACP 的 `requestTok`** —— 后者只算历史 cores，拿它当分母首轮量出 **415×** 的假偏差（量到的是"漏算固定开销"，不是 tokenizer 差异）。引擎侧由 `core.llm.usage.localInputEstimate` 提供整包估算；`overheadTok = 整包 − 历史` 就是每轮重发的固定开销
+
+- **`timeoutMs` 在流式与非流式两条路径上语义不同，必须分级**：流式里它是 **idle**（多久没数据判死），另有 `× STREAM_TOTAL_TIMEOUT_FACTOR(10)` 的总时长兜底；非流式 `complete()` 只有**一个总时长**计时器，此前直接用 `timeoutMs` ⇒ 同一件事（整段生成要多久）在非流式路径严 10 倍。真机后果：子 Agent 走 `preferComplete` 非流式路径审查 77KB HTML 撞 60s 被误判超时。修法：`completeTimeoutMs = timeoutMs × completeTimeoutFactor`（缺省与流式系数对齐=10，配 1 退回旧行为），三个 provider（openai/anthropic/gemini）统一
 
 - **新增任何字段前先核实"有没有写入方 / 有没有消费者"**：本项目已连撞三次同类缺陷——`subagents:` 只解析不消费、`ctx.variables.callerToolIds` 只读不写、`agentFromMarkdown` 不映射 `maxSteps`（插件文档却让子 agent 在定义里写它）。判定手法：全仓 grep 字段名，确认写入点与消费点都存在，再动手
 

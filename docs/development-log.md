@@ -1,5 +1,87 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 178）前缀缓存回退可观测 + token 口径校正（实测 1.33）+ 非流式超时分级
+
+用户："做2和3"（承接续 177 末尾列出的未做项：② turn 边界前缀缓存回退定位、③ 本地 token 口径校正 + provider 超时分级）。
+
+### 一、前缀缓存回退：从"只有一个数字"到"一行说清原因"
+
+**新增遥测（`packages/plugins/acp-context`）**
+
+- `diffPromptPrefix(prev, curr)`：对**上一轮真正发出去的 prompt**（`preModel` hook 末尾原地替换之后）
+  逐条做**内容指纹**比对。指纹 = `role + 正文`，**刻意不含 `id`**。
+- `providerCache` 行新增：`cacheMissReason`（`first-request` / `none` / `system-changed` /
+  `prefix-mutated` / `prefix-shrunk` / `idle-expiry`）、`prefixStableMessages`、`prefixChangedKind`、
+  `cacheDropTokens`、`idleMs`。
+- 分类还区分了 `appended`（尾部追加，前缀未动）与 `tail-rewritten`（只有最后一条被改写——
+  nudge/手册的常规形态，廉价），避免把"正常追加"误报成"前缀失效"。
+
+**为什么必须换判据**：既有的 `commonPrefixHit` **只比较 message id**，同 id 消息正文被就地改写时
+它照样报高命中率 —— 是**误导性的绿灯**；而"就地改写"恰是本项目最可能的失效源（ACP 折叠/占位符替换）。
+
+**真机取证（临时 dataDir + 复用真实 config，同会话连发 3 轮，中间 6 分钟空闲）**
+
+| round | cacheRead | idleMs | prefixStable | kind | reason | calibration |
+|---|---|---|---|---|---|---|
+| 1 | 6912 | — | — | — | first-request | 1.328 |
+| 2 | 7040 | 945 | 3 | appended | none | 1.342 |
+| 3 | 7296 | 1074 | 5 | appended | none | 1.337 |
+| 4 | 7424 | **361 076** | 7 | appended | **none** | 1.332 |
+
+**独立证据**（包 `globalThis.fetch` 抓真正发出去的请求体）：5 次请求的**系统区哈希全程恒定**
+`c9cbef190aa1`、`msgs` 单调递增 ⇒ 前缀确实是纯追加。
+
+**结论（推翻两个原假设）**：**turn 边界重组**与**6 分钟空闲**都**不会**打破前缀缓存。
+历史会话 `s_1789996799007_9cq9r` 那两处断崖（−12.9K / −46.7K）另有原因（当前最强嫌疑：插件注入的
+系统区中途变化，如 memory 注入 / subagent roster），且**下一次发生时会由 `cacheMissReason` 直接点名**。
+⇒ 交付的是"定位能力"，不是"已定位"。这一点如实记录，不冒充结论。
+
+### 二、token 口径校正：从"凭感觉说差 33%"到"实测 1.33 且可复现收敛"
+
+- **先修了一个测量错误**：最初把 `calibration` 的分母取成 ACP 的 `requestTok`，首轮量出 **415×** ——
+  因为 `requestTok` **只算历史 cores，不含 system 与工具载荷**，而 provider 计费是整包。
+  量的其实是"漏算固定开销"。改为由引擎提供整包估算（`core.llm.usage.localInputEstimate` =
+  `estimateMessagesTokens(finalMessages) + estimateToolPayloadTokens(allowedTools)`，后者是新增的
+  近似 payload 估算），并新增 `overheadTok = 整包 − 历史` 把固定开销显式化。
+- **实测**：稳定 **1.33**（1.328 / 1.342 / 1.337 / 1.332）⇒ 本地系统性低估约 25%。
+- **落地**：`resolveCountTokens(calibration, scale)` + `compression.tokenCalibrationScale`
+  （缺省 1 = 不改变行为），CLI 把**同一个值**同时传给 acp-context 与 `createHarness`
+  （只在一侧校正等于制造新的口径分裂——本项目已栽过一次）。已按实测把 `~/.harness/config.json`
+  设为 **1.33**（备份 `config.json.bak-20260922-080355`）。
+- **验收**：同一真机探针，`calibration` 收敛到 **1.000 ± 0.011**（0.999 / 1.008 / 1.005 / 0.995）。
+
+### 三、非流式超时分级
+
+`timeoutMs` 在两条路径上语义不同：流式是 **idle**（另有 `×10` 总时长兜底），而非流式 `complete()`
+只有**一个总时长**计时器、此前直接用它 ⇒ 同一件事在非流式路径严 10 倍。子 Agent 走 `preferComplete`
+非流式路径时因此更容易被误判超时（续 177 查到的 reviewer 60s 超时即此）。
+
+- `completeTimeoutMs = timeoutMs × completeTimeoutFactor`（缺省 = `STREAM_TOTAL_TIMEOUT_FACTOR`=10，
+  配 1 退回旧行为）；错误消息写明两个乘数便于诊断；**openai / anthropic / gemini 三个 provider 统一**。
+- 单测实测触发时刻 201.8ms / 301.4ms / 41.5ms（= 40×5 / 30×10 / 40×1），与系数吻合。
+
+### 四、顺带修的结构性缺口
+
+`acp-context.uninstall()` 只 `sessions.clear()`，**从不 flush** 遥测 writer —— 而 writer 的 `flush()`
+注释明确写着"正常退出 / 信号兜底时调用"，即又一个"只有定义没有调用方"。已补（逐 session flush，
+单个失败不影响其余）。**注**：并未观测到真实丢行事故（三次取证的 `providerCache` 行数都与
+`usageStats.llmCalls` 精确相等：4/4、5/5、4/4），修的是结构性缺口。
+
+### 五、本轮两次自我纠错（方法论，值得重复）
+
+1. 用"provider 全量输入 ÷ 本地 history-only 估算"算口径偏差 ⇒ 415× 假偏差（见上）。
+2. 看到"5 次 HTTP 请求 vs 4 行遥测"就断言"末轮丢行" ⇒ 实际 `llmCalls` 就是 4；
+   **HTTP 请求数 ≠ LLM 调用数**（一次调用可能发多次 HTTP，如 reasoning_content 重试）。
+⇒ 教训：**任何"指标异常"先找同源计数对齐，再下结论**；取证要包 fetch 抓真实请求体做交叉验证。
+
+### 六、验证
+
+新增测试 11 例（acp-context 遥测 6 + acp-context uninstall 1 + session 校正系数 3 + provider 超时分级 3
++ cli 配置 2，含更新）。全量 **1734 pass / 0 fail**、typecheck 全绿。
+
+**未做/待观察**：`cacheMissReason` 需等下一次真实断崖来点名（已具备能力）；memory 注入与 subagent
+roster 是否改动系统区未验证（那是最强嫌疑，值得用同一探针加插件复现）。
+
 ## 2026-09-21（续 177）子 agent 结果落盘/提示语/步数三修 + 入参自愈（起因：会话遥测复盘）
 
 用户先让我复盘会话 `s_1789996799007_9cq9r`（lead「扫描当前项目代码生成架构图」，18.5 min /
