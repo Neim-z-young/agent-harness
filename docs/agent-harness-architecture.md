@@ -359,7 +359,9 @@ interface AgentDefinition {
   // === 能力白名单 ===
   tools: string[] | ['*']            // 工具 ID 列表，* 为全部
   skills?: string[]                  // 技能 ID 白名单
-  subagents?: string[]               // 允许派出哪些 subagent
+  // 注：`subagents?: string[]` 已删除（历史遗留：只解析、无消费方 ⇒ 声明了也不生效）。
+  // 递归深度 / 可派工范围由「派工方是否持有 subagent 工具」+「子 Agent 的 tools 白名单」决定；
+  // agent md 里再写 subagents 会收到一条告警（避免配置静默失效）。
 
   // === MCP Server 粒度声明（可选）===
   // 可按 MCP server 名（mcp__<server>__<tool> 中的 <server>）控制该 Agent 可用的 MCP 工具。
@@ -1272,7 +1274,9 @@ TUI 通过 `app.permission.setAskPrompt(cb)` 接管 `ask` 交互，渲染审批�
 
 ```
 _prepareQueryOnce          一次：Agent 解析 / 工具池 / 权限 / system prompt / provider-model
-while (step <= maxSteps)                    默认 30；maxSteps=1 为显式单轮
+while (step <= maxSteps)                    默认 30；maxSteps=1 为显式单轮；-1 为不限
+                                            （上限由 normalizeMaxSteps 单点归一化：-1/Infinity=不限、
+                                             >=1 取下整、其余判非法并回落下一优先级 + 告警）
   ├─ _buildStepMessages    每轮：重读会话 + getView + core.llm.params/headers + core.session.preModel 裁剪
   ├─ _runOneStep           每步：调模型（流式 / complete）→ 执行工具（含 doom-loop 拦截）→ 写回 assistant
   ├─ yield done(step, finish)               每步各一次

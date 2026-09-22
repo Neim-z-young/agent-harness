@@ -1,5 +1,67 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 189）评审遗留三项处置：subagents 死字段删除（附影响面）+ maxSteps 非法取值不再静默钳制
+
+用户对续 188 的「未修清单」逐条拍板：**① 入参自愈对 oneOf 工具失效 → 先不动**（后续考虑废弃 codeIntel 插件）；
+**② `AgentDefinition.subagents` → 删除，并评估影响面**；**③ `maxSteps: 0` 被抬成 1 → 优化**。
+
+### ① 先不动（记录理由）
+
+`code_semantic_edit` 顶层无 `required`（三模式写在 `oneOf` 分支里）⇒ 模型给 `input:{}` 时不触发入参自愈，
+而多模式工具恰恰最需要。既然 codeIntel 插件在废弃评估中，此时改自愈的分支选择逻辑投入产出比不划算。
+
+### ② 删除 `AgentDefinition.subagents`：影响面实测
+
+**删除前取证**（全仓 grep + 类型层）：该字段只有「写入方」没有「消费方」——`packages/agent/src/index.ts`
+有定义与解析赋值，而全仓 `.subagents` 的读取点为**零**（唯一命中是插件自己的 `SubagentPluginOptions.subagents`，
+那是另一个东西：插件自注册列表，被 `ownSubagents()` / `/subagents` 消费，**保留不动**）。
+
+**删除后的可见变化**（逐项核实）：
+
+| 项 | 变化 |
+| --- | --- |
+| 运行时行为 | **零变化** —— 字段从未被消费，删定义/解析/赋值不触及任何执行路径 |
+| agent md 校验 | md 里写 `subagents:` 会在解析期回调 `onWarn`（core 已接到 `logger.warn`，无 logger 时 `console.warn`）⇒ **启动时多一条告警** |
+| 类型层 | `AgentDefinition` 少一个可选字段；全仓 `bun run typecheck` 全绿 ⇒ 无调用方受影响 |
+| `/subagents` 与 subagent 工具 | 不受影响（两者以 AgentRuntime 注册表为准，不读该字段） |
+| 文档 | `docs/agent-harness-architecture.md` 字段表已改为「已删除」说明 |
+
+**实际配置会中招**：`~/.harness/agents/coordinator.md` 列了 15 项 `subagents:`（coder/reviewer/reader/…）。
+它此前**一直没生效**，删除后仍不生效，只是启动多一条告警。该文件在用户 home 下，**未动**（待用户决定是否清掉）。
+
+**为什么删字段还要留告警**：删一个"曾经看起来生效"的配置等价于一次行为变更，静默删除会让作者继续按它推理
+（"我限制了可派工范围"）。通用判据已写进 AGENTS.md：**删死配置必须让它可见**。
+
+### ③ maxSteps：非法取值不再静默钳制
+
+原实现一行两个坑（`packages/core/src/index.ts`）：
+
+```ts
+const maxSteps = configured === -1 ? Number.POSITIVE_INFINITY : Math.max(1, Math.floor(configured))
+```
+
+1. **`0` 被静默抬成 1**：子 Agent 跑一步就收尾 ⇒ 现象像「任务太小 / 模型不肯干活」，真实原因是入参写错；
+   且 `0 ?? x` **不会**跳过 `0`，模型的 `subagent({ maxSteps: 0 })` 能一路透传到引擎。
+2. **`NaN` 直接把上限取消**：`Math.max(1, NaN) = NaN` ⇒ `step >= NaN` **恒为 false** ⇒ 步数上限失效，
+   只剩 doom-loop 守卫兜底。现象是"跑得很久"，实际是"没有上限了" —— 比第一条危险得多。
+
+**修法：单点归一化 + 三层边界拦截**
+
+| 层 | 位置 | 行为 |
+| --- | --- | --- |
+| 引擎（唯一判定点） | core 新增 `normalizeMaxSteps()` | `-1`/`+Infinity` = 不限；`>= 1` 取下整；**其余 → `undefined`（视为未指定）**，按优先级回落 + `logger.warn` |
+| md 解析 | `agentFromMarkdown` | `0` / `< -1` 判非法 ⇒ 视为未声明 + 告警（`-1`、`1` 边界不得误判） |
+| 派工入参 | subagent `resolveSteps` | 非法覆盖值（含 `NaN`）不参与优先级 ⇒ 回落子 Agent 定义/插件默认 + `ctx.log.warn`；`-1` 合法透传 |
+
+优先级链不变：**input.maxSteps > AgentDefinition.maxSteps > DEFAULT_MAX_STEPS(30)**（subagent 侧插件默认 20）。
+
+**验证**：新增 `packages/core/src/max-steps.test.ts`（L1 纯函数 4 组 + L2 端到端 6 条）——`0` 回落 agent 定义
+（26 次调用，不是 1 次）、`NaN` 回落 agent 定义（修复前会取消上限）、入参与定义都非法 ⇒ 回落 30、
+`maxSteps: 1` = 显式单轮（1 次调用）、合法值零告警；`packages/agent` 新增 subagents 告警 2 条 + maxSteps 边界 1 条；
+subagent 新增 3 条（非法值回落 / `-1` 透传 / 告警经 `ctx.log.warn`）。
+
+**仍未做**：codeIntel 插件废弃评估（待用户决策）。
+
 ## 2026-09-22（续 188）提交后评审 843773f..HEAD（44 提交）：1 数据错误 + 1 归因误报 + 3 处清理
 
 用户："评审下上次评审至今的提交"。上次评审的修复提交是 `843773f`（09-20「telemetry 提交后评审」），

@@ -97,7 +97,7 @@
 
 - **摘要提示语只许说"当前为真"的话，且判据要两个一起看**：① `ctx.variables.callerToolIds`（由 core 从 `allowedTools` 注入）里是否真有 `read_file`/`grep_file`；② 落盘路径是否在**调用方 `ctx.cwd`** 内（`read_file` 的边界是它，不是 harness 全局 cwd）。两者缺一 → **不许承诺可读**（承诺了模型必去试、试必被 `PATH_OUTSIDE_CWD` 拒）。历史事故：该字段曾**全仓无写入方**（只有测试手动塞），"可使用 read_file 查看"整段是死代码，真实提示是"请考虑拆分任务"——把"超了字符阈值"误报成"任务太大"
 
-- **`AgentDefinition.maxSteps` 现在能从 agent md 的 `maxSteps:` 解析**（`-1` = 不限）；role 分档：`reader` = 35、`reviewer` = 25（20 是插件默认，实测 6/6 reader 触顶）。派工方还可用 `subagent({ maxSteps })` 按**本次任务**覆盖，优先级 **派工方 > agent 定义 > 插件默认**
+- **`AgentDefinition.maxSteps` 现在能从 agent md 的 `maxSteps:` 解析**（`-1` = 不限）；role 分档：`reader` = 35、`reviewer` = 25（20 是插件默认，实测 6/6 reader 触顶）。派工方还可用 `subagent({ maxSteps })` 按**本次任务**覆盖，优先级 **派工方 > agent 定义 > 插件默认**。**合法值只有 `-1` 与 `>= 1` 的整数**：`0` / `<-1` / `NaN` 一律判非法 → 视为未指定、回落下一优先级并告警（`normalizeMaxSteps` 是引擎侧唯一判定点；md 解析期也不接收）。注意 `0 ?? x` **不会**跳过 `0` —— 非法覆盖值必须在边界拦掉
 
 - **工具调用"入参自愈"在 core，不在各工具**：失败且必填项没给全时，core 把该工具的必填参数（名/类型/描述，取自 `inputSchema.__jsonSchema`）+ 最小示例拼进回喂的错误消息（`[入参自愈] …`），**原 `message`/`code` 一律保留**。动机：真机实测模型在长上下文下会整段丢 tool-call arguments（100 次调用 37 次失败、34 次 `input:{}`，失败率随上下文从 12% 升到 50%）。必填已给齐、或无 schema/无必填 ⇒ **不掺和**
 
@@ -115,7 +115,11 @@
 
 - **`timeoutMs` 在流式与非流式两条路径上语义不同，必须分级**：流式里它是 **idle**（多久没数据判死），另有 `× STREAM_TOTAL_TIMEOUT_FACTOR(10)` 的总时长兜底；非流式 `complete()` 只有**一个总时长**计时器，此前直接用 `timeoutMs` ⇒ 同一件事（整段生成要多久）在非流式路径严 10 倍。真机后果：子 Agent 走 `preferComplete` 非流式路径审查 77KB HTML 撞 60s 被误判超时。修法：`completeTimeoutMs = timeoutMs × completeTimeoutFactor`（缺省与流式系数对齐=10，配 1 退回旧行为），三个 provider（openai/anthropic/gemini）统一
 
-- **新增任何字段前先核实"有没有写入方 / 有没有消费者"**：本项目已连撞三次同类缺陷——`subagents:` 只解析不消费、`ctx.variables.callerToolIds` 只读不写、`agentFromMarkdown` 不映射 `maxSteps`（插件文档却让子 agent 在定义里写它）。判定手法：全仓 grep 字段名，确认写入点与消费点都存在，再动手
+- **新增任何字段前先核实"有没有写入方 / 有没有消费者"**：本项目已连撞三次同类缺陷——`subagents:` 只解析不消费（已于 09-22 删除该字段）、`ctx.variables.callerToolIds` 只读不写、`agentFromMarkdown` 不映射 `maxSteps`（插件文档却让子 agent 在定义里写它）。判定手法：全仓 grep 字段名，确认写入点与消费点都存在，再动手
+
+- **非法取值不要静默钳制到"看起来能用"的值 —— 要么回落、要么报错，且必须告警**：真机事故（09-22）——`maxSteps` 的归一化写成 `Math.max(1, Math.floor(configured))`，于是 ① `maxSteps: 0` 被**静默抬成 1 步**（子 Agent 一步就收尾，现象像「任务太小 / 模型不肯干活」，与「入参写错」完全对不上）；② `NaN` 直接算出 `maxSteps = NaN` ⇒ `step >= NaN` **恒为 false** ⇒ **步数上限被静默取消**（只有 doom-loop 守卫兜底，现象是"跑得很久"）。修法：`normalizeMaxSteps` 单点归一化，`-1`/`+Infinity` = 不限、`>= 1` 取下整、其余判为「未指定」并回落下一优先级 + `logger.warn`。判据一句话：**钳制后的值若与作者的本意无关，那它就是在掩盖错误**
+
+- **删掉"只解析不消费"的死配置时，要留一条告警而不是静默忽略**：`AgentDefinition.subagents` 删除后，agent md 里仍可能有它（真实存在：`~/.harness/agents/coordinator.md` 列了 15 项）。静默删除会让作者继续以为它在生效、继续按它推理（"我限制了可派工范围"），所以 `agentFromMarkdown` 遇到该字段仍回调 `onWarn` 说明「已删除、无效果、请移除」。通用判据：**删一个曾经"看起来生效"的配置项，等价于一次行为变更，必须让它可见**
 
 - **「值存在但为空」与「字段缺失」是两种状态，不许用一个 `if (x)` 混过去**：真机事故（09-22 提交后评审）——用量折叠的增量分支用 `hydrateUsage({meta, messages})` 取起点，而它在累积器为空时会**回退到按消息重建**，重建用的 `messages` **已含当前消息** ⇒ 随后再 `foldMessage(message)` 就是第二遍（实测 `llmCalls=2` / `input=300`，正确值 `1` / `150`）。触发条件：某轮 assistant 既无 `tokenUsage` 也无工具调用（provider 未回报用量 / 流式中断）⇒ 折叠后累积器恰好**完全为空**（`llmCalls=0` / `hourly=[]` / `tools=[]`）但检查点仍然有效 ⇒ 下一轮双计。修法：用 `usageFromMeta(...) !== undefined` 区分「存在但为空」（合法状态 → 直接增量折叠）与「字段缺失」（→ 全量重建）。凡 `if (obj.field)` / `x || fallback` 这类"空 ≡ 缺"的写法，先问一句：**空值本身是不是有意义的合法状态？**
 
