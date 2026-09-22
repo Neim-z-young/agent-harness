@@ -313,3 +313,48 @@ describe('@harness/provider-mock', () => {
     })
   })
 })
+
+// ==========================================================================
+// usageSequence：按调用次序取用量
+//
+// 为什么需要：tokenUsage 是静态值，而"缓存塌陷""用量台阶""校准比值"这类**滚动 rollout**
+// 场景必须逐轮可变 —— 否则无法验证任何依赖"相邻两轮差值"的归因逻辑
+// （acp-context 的 cacheMissReason / cacheDropTokens / calibration）。
+// ==========================================================================
+
+describe('usageSequence（逐轮用量）', () => {
+  const msgs: Message[] = [
+    { id: 'm1', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 },
+  ]
+
+  it('按次序推进；越界后回落到 tokenUsage（缺省行为不变）', async () => {
+    const p = new MockChatProvider({
+      defaultResponse: 'ok',
+      tokenUsage: { input: 7, output: 1, cacheRead: 3 },
+      usageSequence: [
+        { input: 100, output: 5, cacheRead: 90 },
+        { input: 200, output: 5, cacheRead: 50 },   // 相对上一轮"塌陷"
+      ],
+    })
+    const a = await p.complete({ providerId: 'mock', messages: msgs, params: {} })
+    const b = await p.complete({ providerId: 'mock', messages: msgs, params: {} })
+    const c = await p.complete({ providerId: 'mock', messages: msgs, params: {} })
+
+    expect(a.tokenUsage!.input).toBe(100)
+    expect(a.tokenUsage!.cacheRead).toBe(90)
+    expect(b.tokenUsage!.input).toBe(200)
+    expect(b.tokenUsage!.cacheRead).toBe(50)
+    // 第 3 次越界 ⇒ 回落到静态 tokenUsage
+    expect(c.tokenUsage!.input).toBe(7)
+    expect(c.tokenUsage!.cacheRead).toBe(3)
+  })
+
+  it('未配 usageSequence ⇒ 每次都取 tokenUsage（与旧版逐位等价）', async () => {
+    const p = new MockChatProvider({ tokenUsage: { input: 42, output: 2, cacheRead: 40 } })
+    for (let i = 0; i < 3; i++) {
+      const r = await p.complete({ providerId: 'mock', messages: msgs, params: {} })
+      expect(r.tokenUsage!.input).toBe(42)
+      expect(r.tokenUsage!.cacheRead).toBe(40)
+    }
+  })
+})

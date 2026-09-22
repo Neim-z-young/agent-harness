@@ -211,7 +211,10 @@ export function diffPromptPrefix(
   let changedKind: PromptPrefixDiff['changedKind']
   if (stable === prevDigests.length && stable === currDigests.length) changedKind = 'none'
   else if (stable === prevDigests.length) changedKind = 'appended'
-  else if (stable === currDigests.length && curr.length < prev.length) changedKind = 'shrunk'
+  // 「变短」优先于「改写」：prompt 变短意味着**有消息被删**（压缩/截断 pruned 掉旧消息，
+  // 删的通常是中段而不是尾条），此时说"内容被改写"会把真正的原因（少了东西）盖掉。
+  // changedAt 仍指向第一处分歧，定位信息不丢。
+  else if (curr.length < prev.length) changedKind = 'shrunk'
   else if (stable === curr.length - 1 && curr.length === prev.length) changedKind = 'tail-rewritten'
   else changedKind = 'mutated'
 

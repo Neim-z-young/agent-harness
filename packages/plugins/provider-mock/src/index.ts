@@ -33,6 +33,14 @@ import type { Message } from '@harness/session'
 
 // ===== 配置类型 =====
 
+/** 单次调用的 token 用量 */
+export interface MockTokenUsage {
+  input: number
+  output: number
+  cacheRead?: number
+  cacheWrite?: number
+}
+
 /** 单条响应规则 */
 export interface MockResponseRule {
   /** 匹配关键词（字符串子串匹配，或正则） */
@@ -67,7 +75,16 @@ export interface MockProviderConfig {
   /** 模型名（默认 "mock-v1"） */
   model?: string
   /** token 用量（默认 { input: 10, output: 5 }，可含缓存命中/写入） */
-  tokenUsage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number }
+  tokenUsage?: MockTokenUsage
+  /**
+   * 按**调用次序**取用的用量序列（第 n 次调用取第 n 项；越界则回落到 `tokenUsage`）。
+   *
+   * 为什么需要：`tokenUsage` 是静态值，而"缓存塌陷""用量台阶""校准比值"这类**滚动 rollout**
+   * 场景必须逐轮可变 —— 否则无法验证任何依赖"相邻两轮差值"的归因逻辑
+   * （`cacheMissReason` / `cacheDropTokens` / `calibration`）。
+   * 缺省不配 ⇒ 行为与旧版完全一致（每次都取 `tokenUsage`）。
+   */
+  usageSequence?: MockTokenUsage[]
   /** 按关键词匹配的响应规则列表 */
   responses?: MockResponseRule[]
   /** 是否记录调用历史（默认 true） */
@@ -99,10 +116,21 @@ export class MockChatProvider implements ChatProvider {
 
   private readonly config: Required<
     Pick<MockProviderConfig, 'defaultResponse' | 'defaultReasoning' | 'model' | 'tokenUsage' | 'recordCalls' | 'delayMs'>
-  > & { responses: MockResponseRule[] }
+  > & { responses: MockResponseRule[]; usageSequence?: MockTokenUsage[] }
 
   /** 已命中的 `once` 规则（用对象引用去重，允许同一规则对象被多个 provider 复用） */
   private readonly consumedOnce = new Set<MockResponseRule>()
+
+  /** 已取用的调用次数（供 `usageSequence` 顺序推进；complete/stream 共用一条序列） */
+  private usageCursor = 0
+
+  /** 取本次调用的用量：优先 `usageSequence`，越界回落 `tokenUsage` */
+  private nextUsage(): MockTokenUsage {
+    const seq = this.config.usageSequence
+    const u = seq && this.usageCursor < seq.length ? seq[this.usageCursor] : this.config.tokenUsage
+    this.usageCursor++
+    return u
+  }
 
   constructor(config: MockProviderConfig = {}) {
     this.config = {
@@ -113,6 +141,7 @@ export class MockChatProvider implements ChatProvider {
       recordCalls: config.recordCalls ?? true,
       delayMs: config.delayMs ?? 0,
       responses: config.responses ?? [],
+      ...(config.usageSequence ? { usageSequence: config.usageSequence } : {}),
     }
   }
 
@@ -180,7 +209,7 @@ export class MockChatProvider implements ChatProvider {
     const reasoning = rule?.reasoning ?? this.config.defaultReasoning
     const model = rule?.model ?? this.config.model
     const toolCalls = rule?.toolCalls
-    const tokenUsage = this.config.tokenUsage
+    const tokenUsage = this.nextUsage()
     const outUsage = {
       input: tokenUsage.input,
       output: tokenUsage.output,
@@ -243,7 +272,7 @@ export class MockChatProvider implements ChatProvider {
     const reasoning = rule?.reasoning ?? this.config.defaultReasoning
     const model = rule?.model ?? this.config.model
     const toolCalls = rule?.toolCalls
-    const tokenUsage = this.config.tokenUsage
+    const tokenUsage = this.nextUsage()
 
     // yield reasoning（按行分块）
     if (reasoning) {

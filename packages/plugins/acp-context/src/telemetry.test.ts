@@ -108,11 +108,22 @@ test('diffPromptPrefix：只有尾条被改写 ⇒ tail-rewritten（廉价，不
   expect(d.systemChanged).toBe(false)
 })
 
-test('diffPromptPrefix：prompt 变短 ⇒ shrunk（截断/删消息）', () => {
+test('diffPromptPrefix：prompt 变短 ⇒ shrunk（删尾条）', () => {
   const prev = [msg('system', 'S'), msg('user', 'A'), msg('user', 'B')]
   const curr = [msg('system', 'S'), msg('user', 'A')]
   const d = diffPromptPrefix(prev, curr)!
   expect(d.changedKind).toBe('shrunk')
+})
+
+test('diffPromptPrefix：删的是**中段**也报 shrunk（不能报成"内容被改写"）', () => {
+  // 压缩/截断 pruned 掉的是旧消息 ⇒ 删的通常在中段。若按"首处分歧"单看会得到 mutated，
+  // 那会把真正的原因（少了东西）盖掉。changedAt 仍指向分歧点，定位信息不丢。
+  const prev = [msg('system', 'S'), msg('user', 'A'), msg('user', 'B'), msg('user', 'C')]
+  const curr = [msg('system', 'S'), msg('user', 'B'), msg('user', 'C')]
+  const d = diffPromptPrefix(prev, curr)!
+  expect(d.changedKind).toBe('shrunk')
+  expect(d.changedAt).toBe(1)
+  expect(d.stableMessages).toBe(1)
 })
 
 test('diffPromptPrefix：首轮（无上轮）返回 null', () => {
