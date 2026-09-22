@@ -3275,6 +3275,107 @@ export function attachBackgroundTaskPanel(options: BackgroundTaskPanelOptions): 
 }
 
 /**
+ * 自动续轮前**退避重试**地等待后台结果入队，返回最终待处理条数。
+ *
+ * 为什么不能只 peek 一次就判空转：barrier 事件是由 `bus.publish(completed)` 驱动的，而
+ * `publish` 是**异步**的；即便 subagent 已经把入队排在 publish 之前，barrier 到达本函数时
+ * 仍可能跨在入队之前（两个独立异步分支，没有先后保证）。只 peek 一次 ⇒ 读到空队列 ⇒
+ * 判定空转 ⇒ **放弃且不重试** ⇒ 已跑完的结果滞留到用户下一次发话才送达。
+ *
+ * 真机（s_1790082671456_82ikm）：4 个 reader 21:22:15 全部完成、barrier 也触发了，通知却到
+ * 21:25:16 才随用户敲「?」进入对话 —— 中间 3 分钟界面毫无动静。总等待预算约 1s，远小于
+ * 一次模型调用的代价，换来的是"不再丢".
+ */
+export const NOTIFICATION_PEEK_BACKOFF_MS: readonly number[] = [50, 100, 250, 600]
+
+export async function waitForPendingNotifications(
+  session: { peekNotifications: (sessionId: string) => string[] },
+  sessionId: string,
+  opts: {
+    steps?: readonly number[]
+    sleep?: (ms: number) => Promise<void>
+  } = {},
+): Promise<number> {
+  const steps = opts.steps ?? NOTIFICATION_PEEK_BACKOFF_MS
+  const sleep =
+    opts.sleep ??
+    ((ms: number) =>
+      new Promise<void>((r) => {
+        const t = setTimeout(r, ms)
+        // 不阻止进程退出
+        ;(t as unknown as { unref?: () => void }).unref?.()
+      }))
+  for (const wait of steps) {
+    const n = session.peekNotifications(sessionId).length
+    if (n > 0) return n
+    await sleep(wait)
+  }
+  return session.peekNotifications(sessionId).length
+}
+
+/**
+ * 「请求已发出但迟迟没有任何响应」的**可见心跳**。
+ *
+ * 动机（真机 s_1790082671456_82ikm）：首轮请求发出后 **7 分 20 秒**内没有产出任何内容，
+ * 期间既不报错也不提示，界面完全静止 —— 用户只能靠"再发一遍"自救。静默卡死比报错更难自查
+ * （用户分不清是卡了、还是任务本来就慢）。心跳不改变任何超时语义，只结束"毫无反馈"这一段。
+ *
+ * 间隔刻意**递增**（15s / 30s / 60s / 之后每 60s）：既要尽早出声，又不能在长任务里刷屏。
+ * 收到第一个事件（或本轮结束）即停 —— 之后有内容在动，不需要再提示。
+ */
+export const STALL_NOTICE_STEPS_MS: readonly number[] = [15_000, 15_000, 30_000, 60_000]
+
+export interface StallNoticeHandle {
+  /** 收到第一个事件 / 本轮结束时调用（幂等） */
+  stop: () => void
+  /** 已提示次数（诊断与测试用） */
+  notices: () => number
+}
+
+export function startStallNotice(
+  out: (s: string) => void,
+  opts: {
+    steps?: readonly number[]
+    /** 可注入的调度器（测试用同步/假时钟） */
+    scheduler?: (fn: () => void, ms: number) => () => void
+  } = {},
+): StallNoticeHandle {
+  const steps = opts.steps ?? STALL_NOTICE_STEPS_MS
+  const schedule =
+    opts.scheduler ??
+    ((fn: () => void, ms: number) => {
+      const t = setTimeout(fn, ms)
+      ;(t as unknown as { unref?: () => void }).unref?.()
+      return () => clearTimeout(t)
+    })
+  let stopped = false
+  let count = 0
+  let elapsed = 0
+  let idx = 0
+  let cancel: (() => void) | undefined
+  const tick = (): void => {
+    if (stopped) return
+    const wait = steps[Math.min(idx, steps.length - 1)]!
+    idx++
+    cancel = schedule(() => {
+      if (stopped) return
+      elapsed += wait
+      count++
+      out(`⏳  模型尚无响应（已 ${Math.round(elapsed / 1000)}s）…\n`)
+      tick()
+    }, wait)
+  }
+  tick()
+  return {
+    stop() {
+      stopped = true
+      cancel?.()
+    },
+    notices: () => count,
+  }
+}
+
+/**
  * 挂载 Coordinator 自动续轮（Coordinator 插件配套）。
  *
  * 订阅 `coordinator.barrier.completed` 事件——coordinator 派出的后台任务
@@ -3943,11 +4044,12 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       // 没有任何待处理通知时，这一轮不会带来新信息 —— 白烧一次完整模型调用
       // （内部循环上线后尤其明显：一轮可能是多步）。
       //
-      // ⚠️ 必须先让出一个宏任务再 peek：subagent 里 `bus.publish(completed)` 排在
-      // `enqueueNotification()` **之前**，而 publish 会同步驱动 coordinator 的 barrier →
-      // 本函数。若在此同步读取，会在通知入队之前看到空队列而误判空转。
-      await new Promise((resolve) => setTimeout(resolve, 0))
-      if (harness.session.peekNotifications(current.id).length === 0) {
+      // ⚠️ 不能只 peek 一次就判空转：barrier 由**异步**的 `bus.publish(completed)` 驱动，
+      // 与 `enqueueNotification()` 是两个独立分支 —— 没有任何"事件到达时通知已入队"的保证
+      // （此前靠一句 `setTimeout(0)` 去赌，真机上赌输了：结果滞留 3 分钟才送达）。
+      // 改成退避重试若干次，总预算约 1s，远小于误判空转的代价。
+      const pending = await waitForPendingNotifications(harness.session, current.id)
+      if (pending === 0) {
         out('ℹ️  无待处理的后台任务结果，跳过本次自动续轮\n')
         return 'continue'
       }
@@ -3970,6 +4072,11 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     // 让「执行中按键 = 中断当前查询」而不是直接退出进程。
     const ctl = new AbortController()
     if (options.activeAbort) options.activeAbort.current = ctl
+    // 停滞心跳：请求已发出但迟迟没有任何事件时周期性给一行可见反馈（收到首个事件即停）。
+    // 静默卡死比报错更难自查 —— 这一行是用户区分"卡住了"和"任务本来就慢"的唯一线索。
+    // 刻意声明在 try **之外**：请求报错时循环体里的 stop 不会执行，必须靠 finally 兜住，
+    // 否则定时器会一直往界面写"模型尚无响应"。
+    const stall = startStallNotice((s) => out(s))
     try {
       const curSessionId = current.id
       const gen = app.sendStream(curSessionId, line, ctl.signal)
@@ -3981,6 +4088,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       // 打一行分隔让人看得出它自己在往下走，而不是长时间无反馈。
       let lastDoneStep: number | null = null
       for await (const ev of gen) {
+        stall.stop() // 已经有内容在动，不必再提示
         agentStatus = reduceAgentStatus(agentStatus, ev)
         // 外部集成（Herdr 等）：把**归约后**的状态广播给插件。刻意不 await ——
         // 每个 text_delta 都等一次插件链会把流式渲染拖成串行；代价是上报可能乱序，
@@ -4062,6 +4170,9 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
     } finally {
       // 正常结束 / 中断 / 报错都要清掉句柄，否则下一次 SIGINT 会 abort 一个早已结束的查询
       if (options.activeAbort) options.activeAbort.current = null
+      // 心跳也必须停：请求报错或从未产出任何事件时，循环体里的 stop 不会被执行，
+      // 定时器会一直周期性往界面写"模型尚无响应"
+      stall.stop()
     }
     const duration = Date.now() - started
     // 中断过就明说：core 会吞掉 AbortError 并保留已完成的部分，不提示的话看起来像"正常跑完了"
@@ -4479,9 +4590,12 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
       if (!prompt) { write('用法: harness run "<prompt>"\n'); return 1 }
       // 流式输出（逐 token 打印到 stdout，脚本友好）
       const gen = app.sendStream(session.id, prompt)
+      // 停滞心跳走 **stderr**：`harness run` 的 stdout 要保持"纯结果"以便脚本消费
+      const stall = startStallNotice((s) => process.stderr.write(s))
       // 一次性执行也要上报状态（在 Herdr 里跑 `harness run` 同样需要侧栏反馈）
       let runStatus = initialAgentStatus({ agentId: session.agentId ?? 'default' })
       for await (const ev of gen) {
+        stall.stop()
         runStatus = reduceAgentStatus(runStatus, ev)
         // UI 状态流（含末条 turn_end ⇒ idle）。引擎层终态在 `core.agent.turn.end`，两条通道不混。
         void harness.plugin
@@ -4512,6 +4626,8 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
           }
         }
       }
+      // 请求报错时循环体会直接抛出，走不到上面那句 stop ⇒ 这里再停一次（幂等）
+      stall.stop()
       // headless 用量展示（`harness run` 没有 /stats 入口）：stdout 保持纯结果，用量走 stderr
       const runUsage = await harness.usage.get(session.id).catch(() => undefined)
       if (runUsage && !isBlankUsage(runUsage)) {
