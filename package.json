@@ -12,7 +12,8 @@
     "dev": "bun --filter=* run dev",
     "build": "bun --filter=* run build",
     "test": "bun --filter=* run test",
-    "typecheck": "bun --filter=* run typecheck"
+    "typecheck": "bun --filter=* run typecheck",
+    "probe:cache": "bun run packages/cli/src/probe-cache-telemetry.ts"
   },
   "dependencies": {
     "@harness/agent": "workspace:*",
