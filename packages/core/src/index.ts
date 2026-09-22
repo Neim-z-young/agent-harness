@@ -187,6 +187,7 @@ import {
   hydrateUsage,
   isBlankUsage,
   rebuildUsage,
+  usageFromMeta,
   type UsageFoldState,
   type UsageStats,
 } from '@harness/usage'
@@ -2638,9 +2639,23 @@ export class AgentRuntimeImpl implements AgentRuntime {
       let usage: UsageStats
       let state: UsageFoldState
       if (ckValid) {
-        // 增量：从已持久化的累积器继续折叠这一条
-        usage = foldMessage(hydrateUsage({ meta, messages: sess.messages }), message, ck.state)
-        state = ck.state
+        // 增量：从已持久化的累积器继续折叠这一条。
+        //
+        // ⚠️ 这里**不能**用 hydrateUsage —— 它在 meta 累积器为空时会回退到「按消息重建」，
+        // 而此刻 `message` 已经在 `sess.messages` 里，重建结果**已含它**，再 fold 一次就是双计。
+        // 触发条件真实可达：某轮 assistant 既无 tokenUsage 也无工具（provider 未回报用量 /
+        // 流式中断）⇒ 折叠后累积器恰好完全为空（llmCalls=0 / hourly=[] / tools=[]），
+        // 但检查点有效 ⇒ 下一轮把当前消息折第二遍（实测：llmCalls 2 应为 1、input 300 应为 150）。
+        // 所以必须区分「累积器存在但为空」（合法状态 → 直接增量）与「字段缺失」（→ 重建）。
+        const fromMeta = usageFromMeta(meta)
+        if (fromMeta) {
+          usage = foldMessage(fromMeta, message, ck.state)
+          state = ck.state
+        } else {
+          const rebuilt = rebuildUsage(sess.messages)
+          usage = rebuilt.usage
+          state = rebuilt.state
+        }
       } else {
         // 自愈 / 首次：全量重建。此刻 message 已在 sess.messages 里，所以**不能**再 fold 一次
         // （那会重复计数）。meta 里若留有旧宿主（TUI 时代）写入的用量，会被消息重建值覆盖——

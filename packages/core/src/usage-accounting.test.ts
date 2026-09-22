@@ -58,6 +58,22 @@ const finalTextChunks: ChatStreamChunk[] = [
   { type: 'done', model: 'm', finish: 'stop', finishRaw: 'stop', tokenUsage: { input: 150, output: 10 } },
 ]
 
+/**
+ * 纯文本回复且**不回报用量**（provider 未给 usage 字段 / 流式中断）。
+ *
+ * 价值：它折叠之后**累积器完全为空**（llmCalls=0 / hourly=[] / tools=[]），而检查点仍然有效 ——
+ * 这是「累积器为空」与「检查点有效」同时成立的唯一现实形态，正是双计缺陷的触发条件。
+ */
+const plainNoUsageChunks: ChatStreamChunk[] = [
+  { type: 'text_delta', text: 'hi' },
+  { type: 'done', model: 'm', finish: 'stop', finishRaw: 'stop' },
+]
+
+const plainUsage150Chunks: ChatStreamChunk[] = [
+  { type: 'text_delta', text: 'again' },
+  { type: 'done', model: 'm', finish: 'stop', finishRaw: 'stop', tokenUsage: { input: 150, output: 10 } },
+]
+
 function scriptedProvider(
   script: ChatStreamChunk[][],
 ): ChatProvider & { calls: number } {
@@ -163,6 +179,34 @@ describe('用量纳管：引擎层折叠', () => {
     // 自愈后检查点必须被修复（下一轮回到增量路径）
     const ck = (await liveSession(h, sess.id)).meta?.['usageFold'] as { upToMessageId?: string }
     expect(live.messages.some((m) => m.id === ck?.upToMessageId)).toBe(true)
+    await h.stop()
+  })
+
+  it('回归：「累积器存在但为空」不得回退到按消息重建（否则当前消息被折两遍）', async () => {
+    // 触发条件（真机可达）：provider 未回报用量 + 该轮没有工具调用 ⇒ 折叠后累积器恰好完全为空
+    // （llmCalls=0 / hourly=[] / tools=[]），但检查点有效并指向真实消息。
+    // 修复前：下一轮走「累积器为空 ⇒ 按消息重建」，而重建用的 messages **已含当前消息**，
+    // 再 fold 一次 ⇒ 双计（实测 llmCalls 2 / input 300，正确值 1 / 150）。
+    // 判据：必须区分「累积器存在但为空」（合法 → 直接增量）与「字段缺失」（→ 重建）。
+    const provider = scriptedProvider([plainNoUsageChunks, plainUsage150Chunks])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'turn1', 1))
+    // 前提必须成立，否则本用例没打到目标分支（避免"测试绿但没测到东西"）
+    const mid = await liveSession(h, sess.id)
+    expect(mid.meta?.[USAGE_STATS_KEY]).toMatchObject({ llmCalls: 0 })
+    const ck1 = mid.meta?.['usageFold'] as { upToMessageId?: string } | undefined
+    expect(mid.messages.some((m) => m.id === ck1?.upToMessageId)).toBe(true)
+
+    await collect(h.session.promptStream(sess.id, 'turn2', 1))
+    const u = await h.usage.get(sess.id)
+    const live = await liveSession(h, sess.id)
+    expect(u.llmCalls).toBe(1)
+    expect(u.inputTokens).toBe(150)
+    // 增量口径仍须与全量重建一致
+    expect(u.llmCalls).toBe(usageFromMessages(live.messages).llmCalls)
     await h.stop()
   })
 
