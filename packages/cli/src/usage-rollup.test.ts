@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'bun:test'
-import { renderChildAgentRollup } from './index'
+import { renderChildAgentRollup, renderContextOccupancy } from './index'
 import { emptyUsage, recordCall } from './usage-stats'
+import type { CompactOptions } from '@harness/session'
 
 /**
  * 「含子 agent」聚合行（P4）。
@@ -11,13 +12,23 @@ import { emptyUsage, recordCall } from './usage-stats'
  */
 
 /** 最小 harness 替身：只提供 usage 通道 */
-const fakeHarness = (children: string[], usage: Record<string, ReturnType<typeof emptyUsage>>) =>
+const fakeHarness = (children: string[], usage: Record<string, ReturnType<typeof emptyUsage>>, est?: Record<string, number>) =>
   ({
     usage: {
       children: async () => children,
       get: async (id: string) => usage[id] ?? emptyUsage(),
     },
+    session: {
+      estimateTokens: async (id: string) => est?.[id] ?? 0,
+    },
   }) as never
+
+const compactOpts = {
+  contextWindowTokens: 200_000,
+  reservedTokens: 30_000,
+  autoCompactThresholdPct: 80,
+  tokenCalibration: 'auto',
+} as CompactOptions
 
 describe('renderChildAgentRollup', () => {
   it('无子会话 ⇒ 空串（不占版面）', async () => {
@@ -36,5 +47,28 @@ describe('renderChildAgentRollup', () => {
 
   it('宿主没有 usage 通道（旧 harness / 测试替身）⇒ 空串且不抛', async () => {
     expect(await renderChildAgentRollup({} as never, 's1')).toBe('')
+  })
+})
+
+describe('renderContextOccupancy', () => {
+  it('本会话占用 + 阈值；无子会话时只出主行', async () => {
+    const line = await renderContextOccupancy(fakeHarness([], {}, { s1: 45_000 }), { id: 's1' } as never, compactOpts)
+    expect(line).toContain('上下文占用：45,000 / 200,000 tokens（22.5%）')
+    expect(line).toContain('自动压缩阈值 136,000')
+    expect(line).not.toContain('子会话')
+  })
+
+  it('子会话逐行列出占用率', async () => {
+    const line = await renderContextOccupancy(
+      fakeHarness(['c1'], {}, { s1: 45_000, c1: 20_000 }),
+      { id: 's1' } as never,
+      compactOpts,
+    )
+    expect(line).toContain('子会话 c1：占用 20,000 / 200,000 tokens（10.0%）')
+  })
+
+  it('子会话估算失败（0）⇒ 不占版面', async () => {
+    const line = await renderContextOccupancy(fakeHarness(['c1'], {}, { s1: 45_000 }), { id: 's1' } as never, compactOpts)
+    expect(line).not.toContain('子会话 c1')
   })
 })

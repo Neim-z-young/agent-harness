@@ -1,5 +1,19 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 184）/stats 增上下文占用区：本会话 + 子会话占用率
+
+统计信息页（`/stats`）新增「上下文占用」区块：
+
+- **本会话行**：`上下文占用：45,000 / 200,000 tokens（22.5%）· 自动压缩阈值 136,000（80% ×（窗口−保留 30,000））`；
+- **子会话逐行**：每个子会话单独一行占用率（`子会话 c1：占用 20,000 / 200,000 tokens（10.0%）`），无值不占版面；
+- 数据源全部复用既有口径，不新造尺子：
+  - 窗口/保留/阈值/口径 = `buildCompactionOptions`（与 `/compact`、配置概览同一套推导，避免"同一 config 两个窗口"的老坑）；
+  - 占用 token = `harness.session.estimateTokens`（会话压缩同口径，CJK 感知）；
+  - 子会话清单 = `usage.children()`（与聚合行同源）。
+- 新函数 `renderContextOccupancy`（cli 展示层，纯展示不写盘）。
+
+测试：cli +3 例（usage-rollup.test：主行/子会话行/估算失败不占版面）共 362 全过；全量 typecheck 绿。
+
 ## 2026-09-22（续 183）§7.8 四项待做全部落地（paths 接线 / 命中率 / headless 用量 / 结果复用）
 
 `docs/usage-accounting-and-prompt-cache-plan.md` §7.8 的 #3/#5/#6/#7 一并实现，状态表已更新为"已做"。

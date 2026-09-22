@@ -3353,6 +3353,43 @@ export async function renderChildAgentRollup(harness: Harness, sessionId: string
   )
 }
 
+/**
+ * 统计页上下文占用区：本会话 + 各子会话的上下文占用率。
+ *
+ * - 窗口 / 阈值 / 保留 / 口径一律取 `/compact` 同一套推导（`buildCompactionOptions`），
+ *   避免同一份 config 又算出两个窗口（历史教训：三处各算一次 ⇒ 阈值判据失效）；
+ * - 占用 token 用 `session.estimateTokens`（与会话压缩同口径，含 CJK 感知）；
+ * - 子会话占用逐行列出（父 `/stats` 之前完全看不到子会话的上下文压力）。
+ */
+export async function renderContextOccupancy(
+  harness: Harness,
+  session: Session,
+  compactOpts: CompactOptions,
+): Promise<string> {
+  const window = compactOpts.contextWindowTokens ?? 200_000
+  const reserved = compactOpts.reservedTokens ?? 30_000
+  const pct = compactOpts.autoCompactThresholdPct ?? 80
+  const threshold = Math.floor((window - reserved) * (pct / 100))
+  const calibration = compactOpts.tokenCalibration
+  const pct1 = (n: number) => (window > 0 ? (n / window) * 100 : 0).toFixed(1)
+
+  const est = await harness.session.estimateTokens(session.id, calibration).catch(() => 0)
+  const lines = [
+    `上下文占用：${est.toLocaleString()} / ${window.toLocaleString()} tokens（${pct1(est)}%）` +
+      ` · 自动压缩阈值 ${threshold.toLocaleString()}（${pct}% ×（窗口−保留 ${reserved.toLocaleString()}））`,
+  ]
+  // 子 agent 上下文：每个子会话单独一行（同窗口近似；子会话量小则不可见 —— 有值才列）
+  const usageApi = (harness as { usage?: Harness['usage'] }).usage
+  if (usageApi) {
+    const ids = await usageApi.children(session.id).catch(() => [] as string[])
+    for (const id of ids) {
+      const childEst = await harness.session.estimateTokens(id, calibration).catch(() => 0)
+      if (childEst > 0) lines.push(`  子会话 ${id}：占用 ${childEst.toLocaleString()} / ${window.toLocaleString()} tokens（${pct1(childEst)}%）`)
+    }
+  }
+  return lines.join('\n') + '\n'
+}
+
 export async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
   const hydrated = hydrateUsage(current)
   if (!isBlankUsage(hydrated)) return hydrated
@@ -3744,6 +3781,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           const t = await resolveTodayUsage(app, current)
           out(renderStatsText(u) + '\n')
           out(await renderChildAgentRollup(harness, current.id))
+          // 上下文占用区：窗口/阈值取 /compact 同一套推导；子会话占用逐行列（无值不占版面）
+          const statsCfg = await app.configStore.load()
+          const statsCompactOpts = buildCompactionOptions(statsCfg, statsCfg.provider ?? 'anthropic')
+          out(await renderContextOccupancy(harness, current, statsCompactOpts))
           out(`\n${todayUsageLine(t)}（全部会话·当日）\n`)
           return 'continue'
         }
