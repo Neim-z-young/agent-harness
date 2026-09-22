@@ -585,9 +585,16 @@ interface SessionPreModelInput {
     read: () => Promise<Record<string, unknown> | undefined>
     patch: (patch: Record<string, unknown>) => Promise<void>  // 浅合并
   }
+  systemStability?: SystemStabilityReport        // 系统区（前缀）段级归因，仅变化时有值
+  dynamicParts?: string[]                        // 本轮尾部动态片段；**拼接在本 Hook 之后**
 }
 // Hooks['core.session.preModel'] → (input, messages: unknown[]) => Awaitable<void>
 ```
+
+> `dynamicParts` 为什么要在 Hook 入参里：尾部动态区（`core.prompt.dynamic.transform`）是在本 Hook
+> **返回之后**才拼成请求末尾那条 `user` 消息的（位置约束见 3.x「尾部动态通道」），所以插件按
+> `messages` 建视图时看不见它。而它正是请求的最后一条 —— anthropic 显式 promptCache 断点的落点。
+> 归因方（ACP）拿它记规模，用来解释「前缀没动（`cacheMissReason: none`）却仍有 cache write」。
 
 **模型驱动压缩分工**：
 

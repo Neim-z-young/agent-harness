@@ -171,6 +171,10 @@
 
 - 与外部工具/服务对接协议时（herdr 这类终端/服务集成）**以真机为准**：官方文档没写清的边界必须实测确认后再实现。已知的三个坑都在文档之外且**静默失效**（读代码看不出来）：① 上报用过 `--seq` 后，`release-agent` 也必须带一个更高的 `--seq`，否则被 Herdr 当旧序号丢弃；② 序号水位线按 (pane, source) 存、**跨进程不重置**，新进程从 1 起算的前 N 条上报会被静默丢弃（故序号基线取微秒级时钟）；③ `process.once('exit')` **覆盖不到信号退出**（SIGTERM/SIGHUP 直接终止进程，而"关 pane"就是 SIGHUP），信号类退出必须单独挂监听，且不能抢 SIGINT（REPL/TUI 用它表示"中断当前查询"）。详见 `docs/development-log.md` 续 158
 
+- **归因视野要覆盖"框架注入、且不在缓存前缀内"的内容，否则会把"有代价"读成"无异常"**：`prefixChangedKind` / `cacheMissReason` 只看**前缀**，而 core 的尾部动态区（`core.prompt.dynamic.transform`：MCP resources / memory 提示 / 条件 skill）是在 `core.session.preModel` **返回之后**才拼成请求末尾那条 `user` 消息的 —— preModel 里的插件按 `messages` 建视图时**根本看不见它**。后果：anthropic 显式 promptCache 断点打在最后一条时，末尾那条每轮现拼 ⇒ 最后一段必然 cache write，而归因报 `none`（前缀确实没动），这个成本在遥测里**没有任何解释**。修法：core 经 `SessionPreModelInput.dynamicParts` 把片段告知 preModel，ACP 记规模并在 providerCache 行输出 `tailDynamicParts` / `tailDynamicChars`。通用判据：**归因说"一切正常"时，先确认它的视野覆盖了请求的全部来源**（前缀 / 尾部动态区 / 工具载荷），漏看一处就会把有代价读成无异常
+
+- **不要对同一个文件并行发起多个编辑**（工具使用纪律）：并行编辑是"各自读取 → 各自写回"，两次读取都发生在任何写入之前 ⇒ 后完成的那次基于旧内容，**把前一次的改动整段覆盖掉**，且两次都报成功。本轮实测丢了 3 处（core / plugin 的 `dynamicParts` 定义、acp-context 的 hook 传参），全靠收尾 `grep` 关键标识符 + 测试断言失败才反查到 —— 其中两处只表现为"测试期望值对不上"，极易被当成逻辑 bug 去查错方向。批量改同一文件时按「改一处 → grep 复核落点 → 再改下一处」推进；**跨文件才可以并行**
+
 ## 6. 安全与协作
 
 - 子代理工具调用 `isConcurrencySafe` 必须为 `false`，防止并发写冲突

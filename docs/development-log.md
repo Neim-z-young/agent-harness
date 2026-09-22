@@ -1,4 +1,64 @@
 # Agent Harness 开发日志
+## 2026-09-22（续 190）低危项收尾：配置清理 + cacheHitRate 防 NaN + TUI 字素簇计数 + 归因看见尾部动态块
+
+用户：①「清理那 8 行」（`~/.harness/agents/coordinator.md` 的 `subagents:` 声明）；
+②「低危：maxSteps 0 被抬成 1 / cacheHitRate 不防 NaN / ACP 归因视野不含 dynParts / TUI 字符数用 UTF-16 length。这里其他优化项都做了吗」
+
+**核查结论**：四项里只有 `maxSteps` 在续 189 做了，其余三项此前只是**记录在案、未做**。本次补齐三项 + 清理配置。
+
+### 0. 配置清理（用户 home 下的文件：先备份再改）
+
+`~/.harness/agents/coordinator.md` 删掉 `subagents:` 与 15 项列表（备份为 `coordinator.md.bak-20260922`）。
+这是续 189 删字段后**唯一会让用户看到告警**的地方 —— 清掉后启动不再有那条 warn。
+清理后 `mcpServers: []` 紧随 tools 列表，YAML 结构正常。
+
+### 1. `cacheHitRate` 不防 NaN（P3 → 已修）
+
+原实现是 `if (u.inputTokens <= 0) return 0`。**`NaN <= 0` 是 false**，所以这个判断挡不住任何 NaN：
+分子（`cacheReadTokens`）为 NaN 时照算不误，而两个消费方都是**直接插值**——
+`renderStatsText`（`缓存：命中 N（X%）`）与 CLI 的 run 摘要，用户看到的是「命中 NaN%」。
+**修法**：非有限值 / 负值一律归 0（分母、分子各判一次）。
+**测试**：分子 NaN、分母 NaN、负值、`Infinity` 各一组 + `renderStatsText` 端到端断言输出不含 `NaN`。
+
+### 2. TUI 选区字符数按字素簇（P3 → 已修）
+
+`sel.getSelectedText().length` 是 **UTF-16 码元数**：1 个非 BMP 字符（emoji、部分罕见汉字）算 2，
+选一个 🙂 显示「已选 2 字符」。
+**修法**：新增 `countGraphemes()` —— `Intl.Segmenter`（`granularity: 'grapheme'`，本机 JSC 支持）优先，
+构造失败/不可用时降级 `Array.from`（码点数，对代理对已正确，且不抛）。
+**测试**：ASCII / 中文 / emoji / 混排四组，并显式断言 `'🙂'.length === 2` 而 `countGraphemes('🙂') === 1`
+（把"差值"本身钉住，免得将来有人改回 `.length` 还全绿）。
+
+### 3. ACP 归因视野不含 `dynParts`（P3 → 已修，**未真机验收**）
+
+**事实链**（追调用顺序得出，不是照注释推断）：core 的尾部动态区在 `_prepareQueryOnce` 里**收集**、
+在 `_buildStepMessages` 的 `core.session.preModel` **返回之后**才**拼接**成请求末尾那条 `user` 消息
+⇒ ACP 在 preModel 里按 `messages` 建归因视图时**完全看不见它**。
+**为什么值得修**：anthropic 显式 promptCache 的断点打在"当前对话末尾"那条 —— 正是 core 追加的
+`dynParts` 所在位置。它每轮现拼 ⇒ 最后一段必然 cache write，而 `cacheMissReason` 只能报 `none`
+（前缀确实没动）⇒ 遥测出现"读数有写入、归因说无事"，排查时无从归因。
+**修法**：core 经 `SessionPreModelInput.dynamicParts` 把本轮片段告知 preModel（`dynParts` 在 preModel
+之前已经算好，只是拼接在后）；ACP 只记**规模**（`lastTailDyn: {parts, chars}`，每轮显式覆盖含置空 ——
+上一轮的规模留在这里会被读成"本轮还有块"），providerCache 行输出 `tailDynamicParts` / `tailDynamicChars`。
+**边界**：自动前缀缓存（OpenAI / DeepSeek）不受影响 —— 末尾一条本就在公共前缀之外。
+本机没有 anthropic key，**该字段在真实 anthropic 缓存行为下的正确性未验收**（本次只验了链路与装配）。
+
+### 过程事故：并行编辑同一文件，静默丢 3 处改动（**值得记**）
+
+改 core / plugin / acp-context 时，我对**同一个文件**并行发起了两个 `Edit`。两次编辑各自"读取 → 写回"，
+且两次读取都发生在任何写入之前 ⇒ 后完成的那次基于**旧内容**，把前一次整段覆盖 —— 而两次都返回成功。
+丢了 3 处：`AcpSessionCtx.lastTailDyn` 定义、`ProviderCacheEvent` 的两个字段、ACP hook 里的传参。
+**暴露方式**：前两处靠收尾 `grep` 关键标识符发现（编译期报"字段不存在"）；第三处表现为
+"端到端断言拿到 `null`"，我一度按逻辑 bug 去查（怀疑模块解析走了 dist、怀疑 ctx 不同源），
+实际原因只是**代码没落盘**。
+**纪律**：同一文件按「改一处 → grep 复核落点 → 再改下一处」推进；跨文件才并行。已写进 AGENTS.md 第 5 节。
+
+**验证**：`bun run typecheck` 全绿；`bun run test` **39 包退出码全 0**
+（core 127 / cli 367 / acp-context 76 / usage 30）。新增回归用例 4 条（`cacheHitRate` 非法输入、
+`countGraphemes`、遥测尾部字段透传、tail 档端到端 + system 档记 `null` 的对照），均断言具体取值。
+**仍未做**：codeIntel 插件废弃评估（用户既定：oneOf 入参自愈先不动，等废弃决策一起处理）。
+
+
 
 ## 2026-09-22（续 189）评审遗留三项处置：subagents 死字段删除（附影响面）+ maxSteps 非法取值不再静默钳制
 
