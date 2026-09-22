@@ -1015,21 +1015,18 @@ export function createSubagentTool(
             // 落盘（无论通知是否可达，结果都持久化到可回看位置，防止父会话已结束时结果丢失）
             await persistTaskRecord(getTasksDir?.(), registry.get(taskId))
 
-            // publish completed 事件（带 taskId）
-            if (bus) {
-              bus.publish(SubagentEvents.completed, {
-                agentId: input.agentId,
-                subSessionId,
-                parentSessionId: ctx.sessionId,
-                toolUseId: ctx.toolUseId,
-                replyPreview: resultTextBg.length > 200 ? resultTextBg.slice(0, 200) + '...' : resultTextBg,
-                messageCount: messages.length,
-                durationMs: Date.now() - startTime,
-                taskId,
-                background: true,
-              }).catch(() => { /* ignore */ })
-            }
-
+            // ── 先入队、后发事件 ──
+            //
+            // 下面的 `bus.publish(completed|failed)` 会驱动 coordinator 的 barrier，而 barrier
+            // 会让 CLI 自动注入 `<continue/>` 续轮；续轮前 CLI 会 peek 待处理通知来判断是否空转。
+            // 若**事件先于入队**到达，peek 就会读到空队列 ⇒ 判定空转 ⇒ 放弃且不重试 ⇒
+            // 已经跑完的结果一直滞留到用户下一次发话才送达。
+            //
+            // 真机（s_1790082671456_82ikm）：4 个 reader 21:22:15 全部完成，barrier 也触发了
+            // （遥测 `coordinator.barrier.completed @21:22:15.348`），但通知直到 21:25:16 才随
+            // 用户敲「?」进入对话 —— 中间 3 分钟界面停在「等待并行研究结果中」，毫无动静。
+            //
+            // 把入队放到 publish **之前**，barrier 才真正意味着"结果已就绪"。
             // 自动向父 session 注入 task-notification 通知（去重）
             // 若结果已通过本地续跑通道（send_message）取回，则降级为简短提示，避免重复注入全文
             const task = registry.get(taskId)
@@ -1055,6 +1052,22 @@ export function createSubagentTool(
                 // 父会话不可用/不可写：结果已落盘，忽略投递异常，不向上抛
               }
             }
+
+            // publish completed 事件（带 taskId）
+            if (bus) {
+              bus.publish(SubagentEvents.completed, {
+                agentId: input.agentId,
+                subSessionId,
+                parentSessionId: ctx.sessionId,
+                toolUseId: ctx.toolUseId,
+                replyPreview: resultTextBg.length > 200 ? resultTextBg.slice(0, 200) + '...' : resultTextBg,
+                messageCount: messages.length,
+                durationMs: Date.now() - startTime,
+                taskId,
+                background: true,
+              }).catch(() => { /* ignore */ })
+            }
+
           } catch (err) {
             const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}`
             const failDurationMs = Date.now() - startTime
@@ -1068,21 +1081,18 @@ export function createSubagentTool(
             // 落盘（失败结果同样持久化，防止父会话已结束时错误上下文丢失）
             await persistTaskRecord(getTasksDir?.(), registry.get(taskId))
 
-            // publish failed 事件（带 taskId）
-            if (bus) {
-              bus.publish(SubagentEvents.failed, {
-                agentId: input.agentId,
-                subSessionId,
-                parentSessionId: ctx.sessionId,
-                toolUseId: ctx.toolUseId,
-                code: 'SUBAGENT_FAILED',
-                message: errMsg,
-                durationMs: failDurationMs,
-                taskId,
-                background: true,
-              }).catch(() => { /* ignore */ })
-            }
-
+            // ── 先入队、后发事件 ──
+            //
+            // 下面的 `bus.publish(completed|failed)` 会驱动 coordinator 的 barrier，而 barrier
+            // 会让 CLI 自动注入 `<continue/>` 续轮；续轮前 CLI 会 peek 待处理通知来判断是否空转。
+            // 若**事件先于入队**到达，peek 就会读到空队列 ⇒ 判定空转 ⇒ 放弃且不重试 ⇒
+            // 已经跑完的结果一直滞留到用户下一次发话才送达。
+            //
+            // 真机（s_1790082671456_82ikm）：4 个 reader 21:22:15 全部完成，barrier 也触发了
+            // （遥测 `coordinator.barrier.completed @21:22:15.348`），但通知直到 21:25:16 才随
+            // 用户敲「?」进入对话 —— 中间 3 分钟界面停在「等待并行研究结果中」，毫无动静。
+            //
+            // 把入队放到 publish **之前**，barrier 才真正意味着"结果已就绪"。
             // 自动向父 session 注入 task-notification 通知（去重）
             // 若结果已通过本地续跑通道（send_message）取回，则降级为简短提示，避免重复注入全文
             const task = registry.get(taskId)
@@ -1104,6 +1114,21 @@ export function createSubagentTool(
                 // 父会话不可用/不可写：结果已落盘，忽略投递异常，不向上抛
               }
             }
+            // publish failed 事件（带 taskId）
+            if (bus) {
+              bus.publish(SubagentEvents.failed, {
+                agentId: input.agentId,
+                subSessionId,
+                parentSessionId: ctx.sessionId,
+                toolUseId: ctx.toolUseId,
+                code: 'SUBAGENT_FAILED',
+                message: errMsg,
+                durationMs: failDurationMs,
+                taskId,
+                background: true,
+              }).catch(() => { /* ignore */ })
+            }
+
           } finally {
             clearTimeout(timerBg)
           }

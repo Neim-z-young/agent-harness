@@ -8,10 +8,15 @@
  *   subagent（后台执行 + 通知入队） → coordinator（barrier 计数 + 事件） → CLI（注入 + 空转识别）
  *
  * 核心时序事实（源码推导，本测试实证）：
- *   `bus.publish` 同步调用订阅者（bus/src/index.ts:177，async 包装无前置 await），而 subagent
- *   的 `bus.publish(completed)`（:834）排在 `enqueueNotification`（:864）**之前** ⇒ CLI 收到
- *   `<continue/>` 时通知还没入队 ⇒ 续轮决策前**必须让出宏任务**再 peek，否则会把真正的后台
- *   结果误判为空转、整条吞掉（S4 的空转识别因此设计，此前从未实测过这条时序）。
+ *   `bus.publish` 同步调用订阅者（bus/src/index.ts:177，async 包装无前置 await）。subagent 采取
+ *   **先入队、后发事件**：`enqueueNotification()` 排在 `bus.publish(completed)` **之前** ⇒
+ *   barrier 事件到达时通知**已经在队列里** ⇒ CLI 续轮前 peek 不会读到空队列，也就不会把真正的
+ *   后台结果误判为空转、整条吞掉。
+ *
+ * ⚠️ 本用例**曾经反过来断言过**（`peekAtBarrier` 应为 `[]`）—— 那时代码是"先发事件后入队"，
+ *   真机上因此把已经跑完的结果滞留了 3 分 03 秒（s_1790082671456_82ikm：4 个 reader 21:22:15
+ *   全部完成，通知 21:25:16 才随用户敲「?」进入对话）。续 191 修的就是这条，本断言现在是
+ *   **回归闸门**：一旦有人把顺序换回去，这里会立刻失败。
  */
 import { describe, it, expect } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -99,10 +104,10 @@ describe('真实 barrier 场景（subagent 后台 → coordinator → <continue/
       // 后台子 Agent 完成 → coordinator 集齐 → <continue/> 注入（异步到达）
       await waitFor(() => injected.length > 0)
 
-      // 【时序实证】事件同步到达时通知**尚未入队** —— 此刻同步 peek 必然读到空队列，
-      // 若 CLI 在这里同步决策就会误判空转、吞掉真正的后台结果。
+      // 【时序实证】事件同步到达时通知**已经入队**（先入队、后发事件）——
+      // 这才是 barrier 应有的语义：它说"全部完成"，那么结果就必须已经可取。
       expect(injected).toEqual(['<continue/>'])
-      expect<string[] | null>(peekAtBarrier).toEqual([])
+      expect(peekAtBarrier ?? []).toHaveLength(1)
 
       // ── 真实续轮（等价 REPL 的 rl.emit('line', '<continue/>')）──
       const r = await processLine('<continue/>')

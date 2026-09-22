@@ -112,6 +112,8 @@ function createMockSessionManager(sessions: Map<string, Session>): SessionManage
       if (queue.length > 0) pendingNotifications.delete(sessionId)
       return queue
     },
+    // 只读查看（不消费）：自动续轮的空转判断用它
+    peekNotifications: (sessionId: string) => [...(pendingNotifications.get(sessionId) ?? [])],
   } as unknown as SessionManager
 }
 
@@ -125,6 +127,35 @@ function makeToolContext(overrides: Partial<ToolContext> = {}): ToolContext {
     variables: {},
     cwd: '/tmp',
     ...overrides,
+  }
+}
+
+/** 最小可订阅的假 Bus：只支持本文件需要的 publish / subscribe（按事件对象身份分组） */
+function createRecordingBus() {
+  const handlers = new Map<unknown, Array<(payload: unknown) => void>>()
+  const published: Array<{ event: unknown; payload: unknown }> = []
+  return {
+    on(event: unknown, h: (payload: unknown) => void) {
+      const arr = handlers.get(event) ?? []
+      arr.push(h)
+      handlers.set(event, arr)
+    },
+    published,
+    asBus() {
+      return {
+        publish: (event: unknown, payload: unknown) => {
+          published.push({ event, payload })
+          for (const h of handlers.get(event) ?? []) h(payload)
+          return Promise.resolve()
+        },
+        subscribe: (event: unknown, h: (payload: unknown) => void) => {
+          const arr = handlers.get(event) ?? []
+          arr.push(h)
+          handlers.set(event, arr)
+          return () => {}
+        },
+      } as any
+    },
   }
 }
 
@@ -2146,6 +2177,70 @@ describe('SubagentTool runInBackground', () => {
     // 再次 drain 应为空（去重，不重复注入）
     const again = session.drainNotifications(parentSession.id)
     expect(again).toHaveLength(0)
+  })
+
+  it('completed 事件到达时通知**已经**入队（先入队后发事件）', async () => {
+    // 回归：此前 `bus.publish(completed)` 排在 `enqueueNotification()` **之前**，而 publish 是
+    // 异步的 ⇒ 驱动 barrier 的"全部完成"信号可能先于数据到达。CLI 收到 barrier 就注入
+    // `<continue/>` 续轮并 peek 待处理通知 —— 读到空队列 ⇒ 判定空转 ⇒ 放弃且不重试 ⇒
+    // 已跑完的结果滞留到用户下一次发话才送达（真机 s_1790082671456_82ikm 滞留 3 分钟）。
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const msg = makeMessage('assistant', `done ${input.message}`)
+      const s = sessionsRef.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('user', input.message)); s.messages.push(msg) }
+      return msg
+    })
+    const session = createMockSessionManager(sessions)
+    const bus = createRecordingBus()
+    const harness = { agent, session, bus: bus.asBus() }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+
+    // 在 completed 事件的**订阅者里**查看队列：这就是 CLI 自动续轮所处的位置
+    let queuedWhenEventArrived: number | undefined
+    bus.on(SubagentEvents.completed, () => {
+      queuedWhenEventArrived = session.peekNotifications(parentSession.id).length
+    })
+
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'do something', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    await registry.wait(res.output!.taskId!, 1000)
+
+    // 关键断言：事件到达时通知已在队列里（而不是"事件先到、数据后到"）
+    expect(queuedWhenEventArrived).toBe(1)
+  })
+
+  it('failed 事件到达时通知**已经**入队（先入队后发事件）', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async () => { throw new Error('agent crashed') })
+    const session = createMockSessionManager(sessions)
+    const bus = createRecordingBus()
+    const harness = { agent, session, bus: bus.asBus() }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+
+    let queuedWhenEventArrived: number | undefined
+    bus.on(SubagentEvents.failed, () => {
+      queuedWhenEventArrived = session.peekNotifications(parentSession.id).length
+    })
+
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'will fail', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    await registry.wait(res.output!.taskId!, 1000)
+
+    expect(queuedWhenEventArrived).toBe(1)
   })
 
   it('runInBackground=true 任务失败后自动注入 failed task-notification 通知', async () => {
