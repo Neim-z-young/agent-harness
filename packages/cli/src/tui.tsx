@@ -1006,6 +1006,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const approvalResolveRef = useRef<((ans: string) => void) | null>(null)
   // 鼠标复制（模块 D3）：正在展示「✓ 已复制」提示的块 id（临时高亮，配合 onMouseUp 复制）
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  // 鼠标选块：点击消息块整体高亮选中（再点取消）—— 复制/折叠等内部按钮的点击也会连带选中该块
+  const [selectedBlockId, setSelectedBlockId] = useState<number | null>(null)
   // thinking 折叠：用户显式展开过的 thinking 块 id（default 长推理折叠成一行标题，点击开关）
   const [collapsedThinking, setCollapsedThinking] = useState<Set<number>>(new Set())
   const toggleThinking = useCallback((id: number) => {
@@ -1637,20 +1639,35 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     const copyable =
       (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool') &&
       b.text.trim().length > 0
-    if (copyable) {
-      return (
-        <box key={b.id} flexDirection="column">
-          {renderBlockBody(b)}
+    // 鼠标选块：用户/助手/工具/推理 均可点选，选中整块高亮（边框 + 标记行）。
+    // 内部按钮（复制/折叠/展开）的点击会冒泡连带选中该块，行为一致、可接受。
+    const selectable = copyable || b.kind === 'thinking'
+    const selected = selectedBlockId === b.id
+    const body = renderBlockBody(b)
+    if (!selectable) return body
+    return (
+      <box
+        key={b.id}
+        flexDirection="column"
+        style={selected ? { border: true } : {}}
+        onMouseUp={() => setSelectedBlockId(selected ? null : b.id)}
+      >
+        {selected && (
+          <text attributes={createTextAttributes({ bold: true, reverse: true })}>
+            ▌已选中 · 再次点击取消
+          </text>
+        )}
+        {body}
+        {copyable && (
           <text
-            attributes={createTextAttributes(copiedId === b.id ? { reverse: true, bold: true } : { dim: true, underline: true })}
+            attributes={createTextAttributes(copiedId === b.id ? { reverse: true, bold: true } : { bold: true, underline: true })}
             onMouseUp={(e) => { e.preventDefault(); setCopiedId(b.id); copyTextToClipboard(b.text) }}
           >
             {copiedId === b.id ? '✓ 已复制' : '⧉ 复制'}
           </text>
-        </box>
-      )
-    }
-    return renderBlockBody(b)
+        )}
+      </box>
+    )
   }
 
   const renderBlockBody = (b: ChatBlock) => {

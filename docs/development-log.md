@@ -1,5 +1,18 @@
 # Agent Harness 开发日志
 
+## 2026-09-22（续 186）TUI 鼠标选块高亮：点击消息块整块高亮选中
+
+用户反馈"鼠标选块分不清有没有选中"。原交互只有「⧉ 复制」按钮文字变化（dim→reverse），
+块本身无选中反馈。
+
+- 新增 `selectedBlockId` state：点击 用户/助手/工具/推理 块任意处 → 整块选中（box 加边框 +
+  顶部「▌已选中 · 再次点击取消」reverse 标记行），再点取消；
+- 复制/折叠/展开等内部按钮点击冒泡连带选中该块（行为一致、可接受）；
+- 「⧉ 复制」按钮常态从 dim 提为 bold+underline（更易发现），点击后 reverse 不变；
+- 拖选文本（startSelection）发生在 dispatchMouseEvent 之前，不受 onMouseUp 影响（既有注释保证）。
+
+测试：tui +1（点击块 → ▌已选中 → 再点取消）共 113 例；cli 365 全过；全量 typecheck 绿。
+
 ## 2026-09-22（续 185）TUI：统计面板加上下文占用 + 运行中「■ 终止」按钮
 
 **① 统计 tab 加上下文占用**：新子组件 `ContextOccupancyLine`（tui.tsx）复用 /stats 的

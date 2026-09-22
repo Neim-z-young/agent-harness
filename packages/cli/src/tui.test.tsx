@@ -1131,6 +1131,24 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
+  it('鼠标点击消息块 → 整块高亮选中（▌已选中），再点取消', async () => {
+    const f = await mountTui()
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('选块测试')
+    pressSubmit(f.setup)
+    // 等待 assistant 回复，点击其文本区域（非复制按钮）
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    const pos = locateChar(frame, '你好，我是 TUI 助手。')
+    expect(pos).not.toBeNull()
+    // 第一次点击：整块选中高亮
+    await f.setup.mockMouse.click(pos!.x, pos!.y)
+    await waitFrame(f.setup, (fr) => fr.includes('▌已选中'))
+    // 再次点击同位置：取消选中
+    await f.setup.mockMouse.click(pos!.x, pos!.y)
+    await waitFrame(f.setup, (fr) => !fr.includes('▌已选中'))
+    await f.cleanup()
+  })
+
   it('鼠标点击消息区后键盘输入仍直接生效（焦点自动回到输入框）', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
