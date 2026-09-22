@@ -1234,7 +1234,7 @@ export class DefaultSessionManager implements SessionManager {
     const sess = this.sessions.get(sessionId)
     if (!sess) return false
     // token 估算：优先用旧的 tokensPerMessage（向后兼容），否则按 tokenCalibration 口径
-    const countTokens = resolveCountTokens(options.tokenCalibration)
+    const countTokens = resolveCountTokens(options.tokenCalibration, options.tokenCalibrationScale)
     const estimated = options.tokensPerMessage != null
       ? sess.messages.length * options.tokensPerMessage
       : this.estimateTokensForMessages(sess.messages, countTokens)
@@ -1257,45 +1257,23 @@ export class DefaultSessionManager implements SessionManager {
     return true
   }
 
-  async estimateTokens(sessionId: string, calibration?: TokenCalibration): Promise<number> {
+  async estimateTokens(
+    sessionId: string,
+    calibration?: TokenCalibration,
+    /** 额外校正系数（缺省 1）；与 `compression.tokenCalibrationScale` 同源 */
+    scale: number = 1,
+  ): Promise<number> {
     const sess = this.sessions.get(sessionId)
     if (!sess) return 0
-    return this.estimateTokensForMessages(sess.messages, resolveCountTokens(calibration))
+    return this.estimateTokensForMessages(sess.messages, resolveCountTokens(calibration, scale))
   }
 
-  /**
-   * 粗估 messages 的 token 数。
-   *
-   * 计数口径由 `countTokens` 决定（默认 CJK 感知，与 ACP 层一致）；旧口径 chars/4 会系统性
-   * 低估中文会话约 4 倍 —— 那是 Claude Code 的 roughTokenCountEstimation，按英文语料标定。
-   * text part: countTokens(text)
-   * tool part: countTokens(JSON.stringify(result) + JSON.stringify(input))
-   * 其他 part: countTokens(JSON.stringify(part))
-   */
+  /** @see estimateMessagesTokens（抽成模块级函数：`_runOneStep` 在另一个类里也要用） */
   private estimateTokensForMessages(
     messages: Message[],
     countTokens: (text: string) => number = countTokensCJK,
   ): number {
-    // 先拼成一整段再计数（而不是每段各自计数后相加）：逐段 ceiling 会累积出系统性高估，
-    // 也让"英文会话下新旧口径逐位等价"这条不变量失效。
-    let all = ''
-    const add = (s: string): void => {
-      all += s
-    }
-    for (const m of messages) {
-      for (const p of m.parts) {
-        const pt = p as any
-        if (pt.type === 'text') {
-          add(String(pt.text ?? ''))
-        } else if (pt.type === 'tool') {
-          try { add(JSON.stringify(pt.result ?? '')) } catch { add('x'.repeat(100)) }
-          try { add(JSON.stringify(pt.input ?? {})) } catch { /* ignore */ }
-        } else {
-          try { add(JSON.stringify(pt)) } catch { /* ignore */ }
-        }
-      }
-    }
-    return countTokens(all)
+    return estimateMessagesTokens(messages, countTokens)
   }
 
   async getCompactionInfo(sessionId: string) {
@@ -1722,6 +1700,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
       ) => Promise<void>
       readonly bus: Bus
       readonly cwd: string
+      /**
+       * token 折算口径（引擎侧唯一取值点；由 HarnessImpl 从 options.tokenCalibration 解析后注入）。
+       * 用于把「整包请求」的本地估算与 provider 上报用量放在同一把尺子上比对。
+       */
+      readonly countTokens: (text: string) => number
       /** 可选：快照服务工厂（注入后自动 capture 挂载 meta.snapshot） */
       readonly snapshot?: () => SnapshotService
       /** 可选：宿主 logger（用于"已忽略"类告警 —— 可观测性增强不得静默失效） */
@@ -2358,6 +2341,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 引擎事实广播：provider 返回的用量（含缓存命中/写入）。消费方是各家的可观测性
     // （ACP 遥测的 providerCache 行即靠它 —— 此前那个 builder 只有定义没有调用方）。
     if (tokenUsage) {
+      // 本地"整包请求"估算（含 system + 工具载荷）——与 provider 上报的 input 是**同类**口径。
+      // 只报历史消息的估算会让「本地 vs provider」看起来像 tokenizer 差几倍，实为漏算固定开销。
+      const localInputEstimate =
+        estimateMessagesTokens(finalMessages, this.deps.countTokens) +
+        estimateToolPayloadTokens(allowedTools, this.deps.countTokens)
       await this.deps.triggerPlugin('core.llm.usage', {
         sessionId,
         ...(agentId ? { agentId } : {}),
@@ -2367,6 +2355,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
         output: tokenUsage.output,
         ...(tokenUsage.cacheRead !== undefined ? { cacheRead: tokenUsage.cacheRead } : {}),
         ...(tokenUsage.cacheWrite !== undefined ? { cacheWrite: tokenUsage.cacheWrite } : {}),
+        localInputEstimate,
       })
     }
     // 引擎层唯一累加：把本步折叠进会话用量（幂等，见 accumulateUsage）。
@@ -2513,9 +2502,82 @@ export interface Harness {
 }
 
 /** createHarness() 参数 */
+/**
+ * 粗估一组消息的 token 数。
+ *
+ * 计数口径由 `countTokens` 决定（默认 CJK 感知，与 ACP 层一致）；旧口径 chars/4 会系统性
+ * 低估中文会话约 4 倍 —— 那是 Claude Code 的 roughTokenCountEstimation，按英文语料标定。
+ * - text part:  countTokens(text)
+ * - tool part:  countTokens(JSON.stringify(result) + JSON.stringify(input))
+ * - 其他 part:  countTokens(JSON.stringify(part))
+ *
+ * 先拼成一整段再计数（而不是每段各自 ceiling 后相加）：逐段 ceiling 会累积出系统性高估，
+ * 也让"英文会话下新旧口径逐位等价"这条不变量失效。
+ */
+export function estimateMessagesTokens(
+  messages: Message[],
+  countTokens: (text: string) => number = countTokensCJK,
+): number {
+  let all = ''
+  const add = (s: string): void => {
+    all += s
+  }
+  for (const m of messages) {
+    for (const p of m.parts) {
+      const pt = p as any
+      if (pt.type === 'text') {
+        add(String(pt.text ?? ''))
+      } else if (pt.type === 'tool') {
+        try { add(JSON.stringify(pt.result ?? '')) } catch { add('x'.repeat(100)) }
+        try { add(JSON.stringify(pt.input ?? {})) } catch { /* ignore */ }
+      } else {
+        try { add(JSON.stringify(pt)) } catch { /* ignore */ }
+      }
+    }
+  }
+  return countTokens(all)
+}
+
+/**
+ * 工具载荷的本地 token 估算（近似 provider 实际发出的 `tools` 字段形状）。
+ *
+ * 为什么必须有它：ACP 侧的 `occupancy` / `requestTok` **只算历史消息**，不含 system 与工具载荷；
+ * 而 provider 计费/缓存口径是**整包请求**。真机取证（临时 dataDir 跑 3 轮）实测：工具载荷占
+ * 请求体的绝大部分（body 18.7KB，system 仅 187 字符），把它漏掉会让"本地 vs provider"的比
+ * 看起来像 tokenizer 差 3 倍，其实主要是**漏算了固定开销**。有了这一项，口径对比才是同类相比。
+ */
+function estimateToolPayloadTokens(tools: Tool[], countTokens: (text: string) => number): number {
+  if (!tools || tools.length === 0) return 0
+  try {
+    const payload = tools.map((t) => ({
+      name: t.id,
+      description: t.description ?? '',
+      parameters: (t.inputSchema as { __jsonSchema?: unknown } | undefined)?.__jsonSchema ?? {},
+    }))
+    return countTokens(JSON.stringify(payload))
+  } catch {
+    return 0
+  }
+}
+
 export interface AgentHarnessOptions {
   /** 工作目录（注入 ToolContext.cwd，默认 process.cwd()） */
   cwd?: string
+  /**
+   * token 折算口径：`auto`（缺省，CJK 感知）/ `chars4`（旧口径）。
+   *
+   * 与 `compression.tokenCalibration` 同源，宿主应把**同一个值**传进来 —— 否则引擎侧的
+   * 用量估算与 ACP 层的占用率闸门会用两把尺子（历史上分裂过一次）。
+   */
+  tokenCalibration?: TokenCalibration
+  /**
+   * 本地 token 估算的额外校正系数（缺省 1 = 不校正）。
+   *
+   * 与 `compression.tokenCalibrationScale` 同源，宿主应把**同一个值**传进来：
+   * 本地估算与 provider 计费口径不是同一把尺子（真机实测 DeepSeek 稳定 1.33），
+   * 只在一侧校正就等于制造新的口径分裂。
+   */
+  tokenCalibrationScale?: number
   /**
    * 宿主工作区布局（由 CLI 传入，含 `--data-dir` 等实际取值）。
    *
@@ -2651,6 +2713,14 @@ export class HarnessImpl implements Harness {
   /** 全局工具工作目录（= options.cwd ?? process.cwd()） */
   public readonly cwd: string
 
+  /**
+   * token 折算口径（引擎侧唯一取值点）。
+   *
+   * 与 ACP 层、`compactIfNeeded`、`acp_status` 用**同一把尺子**：口径分裂过一次
+   * （遥测 CJK / 决策 chars4），事后无法用遥测复盘决策。缺省 `auto` = CJK 感知。
+   */
+  private readonly countTokens: (text: string) => number
+
   private chatProvider: ChatProvider
   private started = false
   private stopped = false
@@ -2658,6 +2728,7 @@ export class HarnessImpl implements Harness {
   constructor(private readonly options: AgentHarnessOptions) {
     this.bus = options.bus ?? createBus()
     this.cwd = options.cwd ?? process.cwd()
+    this.countTokens = resolveCountTokens(options.tokenCalibration, options.tokenCalibrationScale)
     this.context = new DefaultContextProvider()
     this.permission = options.permission ?? new DefaultPermissionEngine({ '*': 'ask' })
     this.tools = options.toolRegistry ?? new ToolRegistry()
@@ -2758,6 +2829,7 @@ export class HarnessImpl implements Harness {
       triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
       bus: this.bus,
       cwd: options.cwd ?? process.cwd(),
+      countTokens: this.countTokens,
       snapshot: options.snapshot,
       logger: options.logger,
     })

@@ -366,6 +366,35 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(legacy).toInclude('token 口径 chars/4（旧）')
   })
 
+  it('buildConfigOverview：显示 token 校正系数（未配则不显示）', () => {
+    const scaled = buildConfigOverview(
+      { model: 'm', compression: { enabled: true, tokenCalibrationScale: 1.33 } },
+      'mock',
+    )
+    expect(scaled).toInclude('token 口径 自动（CJK 感知）')
+    expect(scaled).toInclude('× 校正 1.33')
+
+    // 缺省 / 显式 1 都不显示（不制造噪音）
+    const none = buildConfigOverview({ model: 'm', compression: { enabled: true } }, 'mock')
+    expect(none).not.toInclude('× 校正')
+    const one = buildConfigOverview(
+      { model: 'm', compression: { enabled: true, tokenCalibrationScale: 1 } },
+      'mock',
+    )
+    expect(one).not.toInclude('× 校正')
+  })
+
+  it('checkCompressionConfig：tokenCalibrationScale 非法取值告警（> 0 的数才是合法）', () => {
+    // 合法：正数
+    expect(checkCompressionConfig({ tokenCalibrationScale: 1.33 })).toHaveLength(0)
+    // 非法：0 / 负数 / 字符串
+    for (const bad of [0, -1, '1.33'] as const) {
+      const out = checkCompressionConfig({ tokenCalibrationScale: bad })
+      expect(out.some((m) => m.includes('compression.tokenCalibrationScale'))).toBe(true)
+      expect(out.some((m) => m.includes('已按不校正（1）处理'))).toBe(true)
+    }
+  })
+
   it('checkCompressionConfig：合法配置（含全部可选键）零告警', () => {
     // 全键写满是"白名单本身正确"的守卫：任何一处白名单漏列合法键，这条就会误报
     expect(

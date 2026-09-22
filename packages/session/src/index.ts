@@ -466,9 +466,27 @@ export function countTokensChars4(text: string): number {
   return text ? Math.ceil(text.length / 4) : 0
 }
 
-/** 按口径取计数函数；缺省取 CJK 感知口径 */
-export function resolveCountTokens(calibration?: TokenCalibration): (text: string) => number {
-  return calibration === 'chars4' ? countTokensChars4 : countTokensCJK
+/**
+ * 按口径取计数函数；缺省取 CJK 感知口径。
+ *
+ * @param calibration `auto`（缺省，CJK 感知）/ `chars4`（旧口径）
+ * @param scale 额外校正系数（缺省 1 = 不校正）。
+ *
+ * 为什么需要 scale：本地估算与 provider 实际计费口径**不是同一把尺子**。真机实测
+ * （临时 dataDir 跑 3 轮，DeepSeek / deepseek-flash）稳定为 **1.33**（provider 输入 ÷
+ * 本地整包估算 = 1.328 / 1.342 / 1.337 / 1.332），即本地**系统性低估约 25%**（1 − 1/1.33）。
+ * 后果是 occupancy / 自动压缩阈值整体偏保守：报"占 26.9%"时实际已约 35%，于是压缩迟迟不触发。
+ *
+ * 刻意做成**显式系数**而不是偷偷乘：系数与模型/语料相关，应由 `compression.tokenCalibrationScale`
+ * 按实测配置；缺省 1 保证不改变既有行为。观测值见遥测 `providerCache.calibration`。
+ */
+export function resolveCountTokens(
+  calibration?: TokenCalibration,
+  scale: number = 1,
+): (text: string) => number {
+  const base = calibration === 'chars4' ? countTokensChars4 : countTokensCJK
+  if (!Number.isFinite(scale) || scale <= 0 || scale === 1) return base
+  return (text: string) => Math.ceil(base(text) * scale)
 }
 
 /** compact() / compactIfNeeded() 共用选项 */
@@ -494,6 +512,8 @@ export interface CompactOptions {
    * @see countTokensCJK
    */
   tokenCalibration?: TokenCalibration
+  /** 本地估算的额外校正系数（缺省 1）；与 `compression.tokenCalibrationScale` 同源 */
+  tokenCalibrationScale?: number
   /**
   /**
    * 触发百分比：估算 token 占"可用窗口"（contextWindow - reserved）的百分比达到此值才压缩。

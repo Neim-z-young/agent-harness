@@ -377,6 +377,18 @@ export interface HarnessConfig {
      */
     tokenCalibration?: 'auto' | 'chars4'
     /**
+     * 本地 token 估算的**额外校正系数**（缺省 1 = 不校正，保持既有行为）。
+     *
+     * 本地口径与 provider 实际计费口径不是同一把尺子。真机实测（DeepSeek / deepseek-flash，
+     * 临时 dataDir 跑 3 轮）稳定为 **1.33**（provider 输入 ÷ 本地**整包**估算 = 1.328 / 1.342 /
+     * 1.337 / 1.332）⇒ 本地系统性低估约 25%。后果是 occupancy 与 tier 阈值整体偏保守
+     * （报"占 26.9%"时实际约 35%），压缩迟迟不触发。
+     *
+     * 取值方法：看遥测 `providerCache.calibration`（每轮都会打），连续几轮稳定即可取该值。
+     * 系数与模型/语料相关（中文 vs 英文 vs 大量 JSON 各不相同），所以**不设默认值**，由实测决定。
+     */
+    tokenCalibrationScale?: number
+    /**
      * 模型上下文窗口（输入 tokens）显式覆盖。缺省时按「当前默认 Provider 的
      * providers[].contextWindowTokens → 插件默认 200_000」推导。
      */
@@ -456,6 +468,8 @@ export interface HarnessConfig {
      * `'chars4'` 会让中文会话的估算只有真值约 1/4 ⇒ 自动压缩更难触发。仅作回退与 A-B 对照。
      */
     tokenCalibration?: 'auto' | 'chars4'
+    /** 本地估算的额外校正系数（缺省 1）；与 compression.tokenCalibrationScale 同源，保持一致 */
+    tokenCalibrationScale?: number
   }
 }
 
@@ -1400,6 +1414,7 @@ const COMPRESSION_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>, 
   enabled: true,
   autoTune: true,
   tokenCalibration: true,
+  tokenCalibrationScale: true,
   modelContextLimit: true,
   prompts: true,
   systemPrompt: true,
@@ -1463,6 +1478,14 @@ export function checkCompressionConfig(c: unknown): string[] {
       `compression.tokenCalibration 取值 ${JSON.stringify(c.tokenCalibration)} 未知（可选：auto / chars4），已按默认 auto 处理`,
     )
   }
+  if (
+    c.tokenCalibrationScale !== undefined &&
+    !(typeof c.tokenCalibrationScale === 'number' && Number.isFinite(c.tokenCalibrationScale) && c.tokenCalibrationScale > 0)
+  ) {
+    out.push(
+      `compression.tokenCalibrationScale 取值 ${JSON.stringify(c.tokenCalibrationScale)} 非法（应为 > 0 的数），已按不校正（1）处理`,
+    )
+  }
   push(collectUnknown(c.tiers, Object.keys(COMPRESSION_TIER_KEYS), '.tiers'), '未被识别，该配置不会生效')
   push(collectUnknown(c.nudge, Object.keys(COMPRESSION_NUDGE_KEYS), '.nudge'), '未被识别，该配置不会生效')
   push(collectUnknown(c.telemetry, Object.keys(COMPRESSION_TELEMETRY_KEYS), '.telemetry'), '未被识别，该配置不会生效')
@@ -1489,6 +1512,7 @@ const COMPACTION_KEYS: Record<keyof NonNullable<HarnessConfig['compaction']>, tr
   keepRecentMessages: true,
   summaryMaxChars: true,
   tokenCalibration: true,
+  tokenCalibrationScale: true,
 }
 const COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['prune', 'summary', 'agent'])
 
@@ -1538,6 +1562,7 @@ export function buildCompactionOptions(cfg: HarnessConfig, defaultProviderId: st
     ...(k?.autoCompactThresholdPct != null ? { autoCompactThresholdPct: k.autoCompactThresholdPct } : {}),
     ...(k?.reservedTokens != null ? { reservedTokens: k.reservedTokens } : {}),
     ...(k?.tokenCalibration != null ? { tokenCalibration: k.tokenCalibration } : {}),
+    ...(k?.tokenCalibrationScale != null ? { tokenCalibrationScale: k.tokenCalibrationScale } : {}),
   }
 }
 
@@ -1755,7 +1780,10 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
     lines.push(
       `会话压缩（/compact）：窗口 ${window} · 阈值 ${threshold} tokens（${pct}% ×（窗口−${reserved}））· ` +
         `策略 ${opt.strategy ?? 'summary'} · 保留最近 ${opt.keepRecentMessages ?? 10} 条 · ` +
-        `token 口径 ${opt.tokenCalibration === 'chars4' ? 'chars/4（旧）' : '自动（CJK 感知）'}` +
+        `token 口径 ${opt.tokenCalibration === 'chars4' ? 'chars/4（旧）' : '自动（CJK 感知）'}`
+        + (typeof c?.tokenCalibrationScale === 'number' && c.tokenCalibrationScale !== 1
+          ? ` × 校正 ${c.tokenCalibrationScale}`
+          : '') +
         (k ? '' : '（全部默认值，config.json → compaction 可配）'),
     )
     const compactionIssues = checkCompactionConfig(k)
@@ -2646,6 +2674,7 @@ export class HarnessApp {
         autoTune: compression.autoTune === true,
         // token 折算口径：缺省 auto（CJK 感知），与内核内部计数共用同一函数
         tokenCalibration: compression.tokenCalibration,
+        tokenCalibrationScale: compression.tokenCalibrationScale,
         telemetryEnabled,
         telemetryPathBuilder: telemetryEnabled
           ? (sessionId: string) => join(sessionsDir, `${sessionId}.telemetry.jsonl`)
@@ -2732,6 +2761,10 @@ export class HarnessApp {
         this.workspace.project.skills,
       ],
       permission: perm,
+      // token 折算口径：与 acp-context 传的是**同一个值**（引擎侧用量估算与 ACP 占用率闸门
+      // 必须用同一把尺子，否则"本地 vs provider"的偏差无法归因）
+      tokenCalibration: compression?.tokenCalibration,
+      tokenCalibrationScale: compression?.tokenCalibrationScale,
       snapshot: this.snapshotService ? () => this.snapshotService! : undefined,
       // 上下文压缩·阶段二（Route B）：宿主注入原文档案存储器，compact 裁剪前把被压缩窗口原文落盘到
       // sessions/{id}.cmp.orig/，供惰性 loader 按块还原全文（内存瘦身 + 全文可回溯）。

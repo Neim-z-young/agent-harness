@@ -323,6 +323,14 @@ export interface LlmUsageSignal {
   cacheRead?: number
   /** 写入缓存的输入 token（Anthropic `cache_creation_input_tokens`） */
   cacheWrite?: number
+  /**
+   * 本次请求的**整包**本地 token 估算（system + 工具载荷 + 全部消息）。
+   *
+   * 消费方据此校正口径：`input / localInputEstimate` 偏离 1 说明本地估算与 provider 实际
+   * 计费口径分叉。**不要**拿 ACP 的 `requestTok` 当分母 —— 那个只算历史消息，不含 system 与
+   * 工具载荷（真机实测两者相差数倍，比值里混的是"漏算固定开销"而不是 tokenizer 差异）。
+   */
+  localInputEstimate?: number
 }
 
 // ===== Hooks 接口 =====

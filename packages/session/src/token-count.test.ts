@@ -60,3 +60,32 @@ describe('token 折算口径（与 acp-kernel defaultCountTokens 同口径）', 
     expect(resolveCountTokens(undefined)('中文')).toBe(2)
   })
 })
+
+// ==========================================================================
+// tokenCalibrationScale：本地估算 vs provider 计费口径的显式校正
+//
+// 回归背景（真机实测，临时 dataDir 跑 3 轮 / DeepSeek deepseek-flash）：
+// provider 输入 ÷ 本地**整包**估算 = 1.328 / 1.342 / 1.337 / 1.332，稳定 ≈1.33
+// ⇒ 本地系统性低估约 25%，occupancy 与自动压缩阈值整体偏保守。
+// ==========================================================================
+
+describe('resolveCountTokens 的显式校正系数', () => {
+  const text = '压'.repeat(100) // CJK 口径 = 100 token
+
+  it('缺省（scale=1）与显式 1 都退回原口径，不改变既有行为', () => {
+    expect(resolveCountTokens()(text)).toBe(100)
+    expect(resolveCountTokens('auto', 1)(text)).toBe(100)
+    expect(resolveCountTokens('auto', 1)).toBe(countTokensCJK) // 同一个函数引用，零包装开销
+  })
+
+  it('给定系数则按系数放大（实测 1.33 用于 DeepSeek 口径）', () => {
+    expect(resolveCountTokens('auto', 1.33)(text)).toBe(133)
+    expect(resolveCountTokens('chars4', 1.33)(text)).toBe(34) // chars4 = 25 → ×1.33 = 33.25 → ceil 34
+  })
+
+  it('非法系数（0 / 负数 / NaN / Infinity）一律按不校正处理，不静默取怪值', () => {
+    for (const bad of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      expect(resolveCountTokens('auto', bad)(text)).toBe(100)
+    }
+  })
+})
