@@ -133,8 +133,6 @@ export interface AgentDefinition {
   tools: string[] | ['*']
   /** 技能 ID 白名单 */
   skills?: string[]
-  /** 允许派出的 subagent ID 列表（mode=primary/coordinator 时有效） */
-  subagents?: string[]
 
   // === MCP Server 白名单（可选） ===
   /**
@@ -163,6 +161,8 @@ export interface AgentDefinition {
    * 单次查询内允许的最大步数（工具结果回喂续轮的次数上限，含首次模型调用）。
    *
    * 语义对齐 opencode 的 `agent.steps`：-1 表示不限（仅受 doom-loop 保护约束）。
+   * **合法值只有 `-1` 与 `>= 1` 的整数**；`0` / 小于 -1 的负数会被 `agentFromMarkdown`
+   * 判为非法（视为未声明 + 告警），引擎侧 `normalizeMaxSteps` 同样会拒收（回落默认值）。
    * 未设置时用引擎默认值；`AgentQueryInput.maxSteps` 优先级最高。
    */
   maxSteps?: number
@@ -411,11 +411,15 @@ export interface ParseAgentOptions {
  * 从 Markdown 配置文件内容构建 AgentDefinition。
  *
  * frontmatter 字段映射到 AgentDefinition 的字段：
- * - id, name, description, icon, tags, mode, tools, skills, subagents
+ * - id, name, description, icon, tags, mode, tools, skills
  * - background（默认后台执行）
- * - permission, model, maxSteps（步数上限；-1 = 不限）
+ * - permission, model, maxSteps（步数上限；-1 = 不限，>= 1 为有限步数；其余视为无效并告警）
  * - writesTo, mcpServers, excludeMcpServers
  * - body（Markdown 正文）→ promptFragments[0]
+ *
+ * **已删除字段**：`subagents`（历史上只解析、无任何消费方 ⇒ 写了不生效）。为了不让既有配置
+ * 悄悄失效，本函数遇到它仍会回调 `onWarn`。递归/派工范围由「派工方是否持有 `subagent` 工具」
+ * 加「子 Agent 自己的 `tools:` 白名单」决定，不靠这份名单。
  *
  * 缺省行为（只有 id 缺失才抛错）：
  * - `mode` 缺省 subagent；`permission` 缺省 `{ '*': 'ask' }`
@@ -489,8 +493,19 @@ export function agentFromMarkdown(content: string, fallbackId?: string, opts?: P
   // skills
   const skills = Array.isArray(frontmatter.skills) ? frontmatter.skills.map(String) : undefined
 
-  // subagents
-  const subagents = Array.isArray(frontmatter.subagents) ? frontmatter.subagents.map(String) : undefined
+  // subagents（**已删除的字段**）
+  //
+  // 它此前只是被解析进 AgentDefinition、全仓零消费方 —— 写了不生效（同 `maxSteps` 早期那种
+  // 「配了没用」）。真正存在这种配置：`~/.harness/agents/coordinator.md` 列了 15 项。
+  // 这里**保留一条告警而不是静默忽略**：静默会让作者继续以为它在限制可派工范围。
+  // 递归深度与可派工范围由「派工方是否持 `subagent` 工具」+「子 Agent 的 `tools:` 白名单」决定。
+  if (frontmatter.subagents !== undefined) {
+    const count = Array.isArray(frontmatter.subagents) ? frontmatter.subagents.length : 0
+    opts?.onWarn?.(
+      `Agent "${id}" 声明了已删除的字段 subagents（${count} 项）—— 该字段无消费方，当前不产生任何效果，请移除。`
+      + ' 可派工范围由「派工方是否持有 subagent 工具」与「子 Agent 的 tools 白名单」决定。',
+    )
+  }
 
   // mcpServers / excludeMcpServers（MCP server 粒度白名单/黑名单）
   const mcpServers = parseStringArr(frontmatter.mcpServers)
@@ -512,11 +527,24 @@ export function agentFromMarkdown(content: string, fallbackId?: string, opts?: P
   // 所有 md 定义的子 Agent 只能吃插件默认值 20。真机实测（会话 `s_1789996799007_9cq9r`）
   // 6 个 reader 因 20 步上限**全部截断**，逼出第二轮补派（额外 41 次调用 / 133 万 input token）。
   const maxStepsRaw = frontmatter.maxSteps
-  const maxSteps = typeof maxStepsRaw === 'number' && Number.isFinite(maxStepsRaw)
+  const maxStepsParsed = typeof maxStepsRaw === 'number' && Number.isFinite(maxStepsRaw)
     ? Math.trunc(maxStepsRaw)
     : typeof maxStepsRaw === 'string' && maxStepsRaw.trim() !== '' && Number.isFinite(Number(maxStepsRaw))
       ? Math.trunc(Number(maxStepsRaw))
       : undefined
+  // 合法性判定：`-1`（不限）或 `>= 1`（有限步数）才作数，其余（`0` / `< -1` / 非数字）**视为未声明**。
+  //
+  // 为什么要在这里拦 `0`：`0` 会一路带到引擎，被其归一化拒收 ⇒ 回落默认值。若不拦且引擎也照旧
+  // `Math.max(1, 0)`，则「写了 0」被静默抬成「1 步」—— 子 Agent 跑一步就收尾，
+  // 现象像「任务太小 / 模型不肯干活」，与真实的「配置写错」完全对不上。宁可在解析处就把话说清楚。
+  const maxStepsValid = maxStepsParsed !== undefined && (maxStepsParsed === -1 || maxStepsParsed >= 1)
+  const maxSteps = maxStepsValid ? maxStepsParsed : undefined
+  if (maxStepsRaw !== undefined && !maxStepsValid) {
+    opts?.onWarn?.(
+      `Agent "${id}" 的 maxSteps 取值无效（${JSON.stringify(maxStepsRaw)}）：应为 -1（不限）或 >= 1 的整数。`
+      + ' 该项已忽略，将回落「插件默认 / 引擎默认」步数。',
+    )
+  }
 
   // icon
   const icon = frontmatter.icon ? String(frontmatter.icon) : undefined
@@ -537,7 +565,6 @@ export function agentFromMarkdown(content: string, fallbackId?: string, opts?: P
   if (icon) def.icon = icon
   if (tags) def.tags = tags
   if (skills) def.skills = skills
-  if (subagents) def.subagents = subagents
   if (background !== undefined) def.background = background
   if (writesTo) def.writesTo = writesTo
   if (mcpServers) def.mcpServers = mcpServers

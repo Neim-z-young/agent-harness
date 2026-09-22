@@ -348,8 +348,11 @@ tools: "*"
     expect(def.tools).toEqual(['*'])
   })
 
-  it('subagents 列表', () => {
-    const content = `---
+  // 已删除字段：`subagents` 历史上有解析、无消费方（配了不生效）。删字段但**保留告警** ——
+  // 真实存在这种配置（`~/.harness/agents/coordinator.md` 列了 15 项），静默会让作者继续以为它生效。
+  it('subagents 字段已删除：不再映射进定义，但会告警（避免配置静默失效）', () => {
+    const warns: string[] = []
+    const def = agentFromMarkdown(`---
 id: coordinator
 name: Coordinator
 description: 调度 Agent
@@ -358,9 +361,17 @@ subagents:
   - coder
   - reviewer
   - explorer
----`
-    const def = agentFromMarkdown(content)
-    expect(def.subagents).toEqual(['coder', 'reviewer', 'explorer'])
+---`, undefined, { onWarn: (m) => warns.push(m) })
+    expect((def as unknown as Record<string, unknown>).subagents).toBeUndefined()
+    expect(warns.some((w) => w.includes('subagents') && w.includes('3 项'))).toBe(true)
+  })
+
+  it('未声明 subagents 时不产生该类告警（不给正常配置添噪音）', () => {
+    const warns: string[] = []
+    agentFromMarkdown('---\nid: c\nname: C\nmode: subagent\ntools: ["*"]\n---', undefined, {
+      onWarn: (m) => warns.push(m),
+    })
+    expect(warns.filter((w) => w.includes('subagents')).length).toBe(0)
   })
 
   it('background: true → 默认后台执行声明', () => {
@@ -474,5 +485,43 @@ mode: subagent
 maxSteps: 很多
 ---`)
     expect(bad.maxSteps).toBeUndefined()
+  })
+
+  // 回归：`maxSteps: 0` 此前会被原样带进定义，引擎再用 `Math.max(1, 0)` 静默抬成「1 步」——
+  // 子 Agent 跑一步就收尾，现象像「任务太小 / 模型不肯干活」，与「配置写错」完全对不上。
+  // 现在解析处就判定为非法：视为未声明 + 告警。`< -1` 同理（合法负数只有 `-1` = 不限）。
+  it('maxSteps：0 / < -1 视为非法（视为未声明 + 告警），不静默抬成 1 步', () => {
+    const zeroWarns: string[] = []
+    const zero = agentFromMarkdown(`---
+id: reader6
+name: R6
+description: d
+mode: subagent
+maxSteps: 0
+---`, undefined, { onWarn: (m) => zeroWarns.push(m) })
+    expect(zero.maxSteps).toBeUndefined()
+    expect(zeroWarns.some((w) => w.includes('maxSteps') && w.includes('无效'))).toBe(true)
+
+    const negWarns: string[] = []
+    const neg = agentFromMarkdown(`---
+id: reader7
+name: R7
+description: d
+mode: subagent
+maxSteps: -2
+---`, undefined, { onWarn: (m) => negWarns.push(m) })
+    expect(neg.maxSteps).toBeUndefined()
+    expect(negWarns.some((w) => w.includes('maxSteps'))).toBe(true)
+
+    // 边界：1（显式单轮）与 -1（不限）是合法值，不得被误判
+    expect(agentFromMarkdown('---\nid: r8\nname: R8\nmode: subagent\nmaxSteps: 1\n---').maxSteps).toBe(1)
+    expect(agentFromMarkdown('---\nid: r9\nname: R9\nmode: subagent\nmaxSteps: -1\n---').maxSteps).toBe(-1)
+
+    // 未声明不告警
+    const noneWarns: string[] = []
+    agentFromMarkdown('---\nid: r10\nname: R10\nmode: subagent\ntools: ["*"]\n---', undefined, {
+      onWarn: (m) => noneWarns.push(m),
+    })
+    expect(noneWarns.filter((w) => w.includes('maxSteps')).length).toBe(0)
   })
 })
