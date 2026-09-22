@@ -132,6 +132,37 @@ export interface PromptInput {
   agentMode?: string
 }
 
+/**
+ * 系统区（前缀区）跨 turn 稳定性报告 —— 回答"这一轮是谁把前缀改了"。
+ *
+ * 为什么需要：自动前缀缓存按**最长公共 token 前缀**命中，而 system prompt 位于请求位置 0。
+ * 它里面任何一个字符变化，其后**整个历史**都要按全价重算（真机量化见 acp-context 的
+ * `MANUAL_INJECT_MARGIN` 注释：越阈值时翻转一次 ≈ 95K token-equiv）。而 system 区是
+ * **多个插件往同一个数组 push** 拼出来的 —— 出问题时想知道的是"谁 push 的那段变了"，
+ * 不是"system 变了"。所以这里做**段级**归因，而不是整段文本比对。
+ *
+ * 归因结果同时进两处：引擎的 `logger.warn`（人读）与 `core.session.preModel` 的
+ * `input.systemStability`（机器读，ACP 写进遥测 `providerCache.systemChangedParts`）。
+ */
+export interface SystemStabilityReport {
+  /** 本轮快照时间戳 */
+  at: number
+  /** 上一轮快照时间戳（两者间隔越久说明两次变化距得越远） */
+  prevAt: number
+  /** 本轮 system 段数 */
+  parts: number
+  /** 上一轮 system 段数 */
+  prevParts: number
+  /** 内容发生变化的段下标（同下标、指纹不同） */
+  changedParts: number[]
+  /** 上一轮没有、本轮新增的段下标 */
+  addedParts: number[]
+  /** 上一轮有、本轮被移除的段下标 */
+  removedParts: number[]
+  /** 人读归因（每项形如「第 2 段变化：642 → 1 284 字符（原首行：「项目长期记忆」）」） */
+  details: string[]
+}
+
 export interface CompactionContext {
   /** 保留最近 N 条消息（插件可改写） */
   keepLast?: number
@@ -203,6 +234,15 @@ export interface SessionPreModelInput {
     source?: 'generic' | 'acp'
     archiveRef?: string
   }[]
+  /**
+   * 本轮相对**上一轮 query** 的系统区（前缀）稳定性归因；首轮无基线时为 undefined。
+   *
+   * 只在确实发生变化时有值（`details` 非空），因此可以直接拿来当"前缀这一轮被改坏了"
+   * 的判据 —— 不必自己再维护一份上一轮的 system 快照。
+   * 典型消费者：ACP 把 `changedParts` 写进遥测，让 `cacheMissReason: 'system-changed'`
+   * 从"系统区变了"细化到"**第 N 段**变了"。
+   */
+  systemStability?: SystemStabilityReport
   /**
    * 会话 meta 访问器：插件可据此在 session.meta 中持久化运行时状态
    * （如 ACP 压缩状态），随会话落盘、重启后恢复。patch 为浅合并。
@@ -390,8 +430,40 @@ export interface Hooks {
   'core.llm.usage'?: (input: LlmUsageSignal) => Awaitable<void>
 
   // === Prompt 构建链 ===
-  /** 修改 System Prompt 片段数组 */
+  /**
+   * 修改 System Prompt 片段数组（**前缀区**）。
+   *
+   * ⚠️ 只放**恒定**文本。自动前缀缓存按最长公共 token 前缀命中，前缀里的文本一变，
+   * 其后的全部内容（含整段历史）都要重算。代价已真机量化（见 acp-context 的
+   * `MANUAL_INJECT_MARGIN` 注释 / docs/usage-accounting-and-prompt-cache-plan.md §3）：
+   * 越阈值时前缀 ≈ 105K tokens，翻转一次 ≈ 95K token-equiv，回本要 366 次调用。
+   *
+   * 会变的内容（记忆更新、资源缓存增长、一次性提示、按需手册）一律走
+   * {@link Hooks['core.prompt.dynamic.transform'] 尾部通道}。
+   * 判断标准很简单：**这段文本会不会在会话中途变？会 —— 就走尾部。**
+   */
   'core.prompt.system.transform'?: (input: PromptInput, parts: string[]) => Awaitable<void>
+  /**
+   * 注入**尾部动态上下文**（每轮追加在请求末尾，`user` 角色、不落库、不进前缀）。
+   *
+   * 与 `core.prompt.system.transform` 的区别只有一个 —— **位置**，但这就是全部：
+   * 前缀缓存按最长公共前缀命中，放前缀的文本一变，其后所有内容重算；放尾部则
+   * 只影响"本轮新增的那一小段"，翻转代价 ≈ 0（尾部本来就是每轮变化的部分）。
+   *
+   * 适用：内容会随会话推进变化、且**不需要指令级权威**的注入 —— 记忆刷新、MCP 资源、
+   * 一次性提示、按需加载的长文档等。
+   *
+   * 实现约束（core 已代管，插件不必操心）：
+   * - 用 `user` role 追加在**请求末尾**。**不能用 `system` role**：provider-anthropic 的
+   *   `extractSystemPrompt` 与 provider-gemini 的 `extractSystem` 会把任意位置的 system
+   *   消息上提进顶层 `system` / `systemInstruction` 字段（原位置直接跳过）—— 用 system
+   *   挪到尾部等于没挪，它会回到前缀，收益归零。
+   * - 在 `core.session.preModel` **之后**拼接，因此不参与压缩插件的折叠/回写，**永不落库**。
+   *
+   * 多个插件都注入时按 hook 执行顺序拼进**同一条**消息（不推多条相邻临时消息 —— 那只会
+   * 多几处尾部差异，没有收益）。
+   */
+  'core.prompt.dynamic.transform'?: (input: PromptInput, parts: string[]) => Awaitable<void>
 
   // === Session 生命周期 ===
   /** 会话压缩阶段 */

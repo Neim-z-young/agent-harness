@@ -160,7 +160,7 @@ import {
   PermissionRequestLike,
   PermissionDecisionLike,
 } from '@harness/plugin'
-import type { CompactionContext } from '@harness/plugin'
+import type { CompactionContext, SystemStabilityReport } from '@harness/plugin'
 import {
   Tool,
   ToolResult,
@@ -1565,8 +1565,22 @@ export interface AgentRuntime {
 interface PreparedQuery {
   agentId: string
   sessionId: string
-  /** system prompt 片段（已过 `core.prompt.system.transform` 与压缩记忆注入） */
+  /**
+   * 前缀区 system prompt 片段（已过 `core.prompt.system.transform` 与压缩记忆注入）。
+   *
+   * ⚠️ 只应包含**恒定**文本。位置在请求最前，一变则其后全部内容（含整段历史）
+   * 在前缀缓存里失效。会变的内容走 {@link dynParts}。
+   */
   sysParts: string[]
+  /**
+   * 尾部动态上下文片段（已过 `core.prompt.dynamic.transform`）。
+   *
+   * 与 `sysParts` 的唯一区别是**位置** —— 这些拼在请求最末尾（`user` 角色、每轮重算、
+   * 不落库）。前缀缓存按最长公共前缀命中，所以同一份会变的文本放在这里，翻转代价 ≈ 0。
+   */
+  dynParts: string[]
+  /** 本轮相对上一轮 query 的系统区段级归因；仅在实际变化时有值（首轮无基线时也没有） */
+  systemStability?: SystemStabilityReport
   allowedTools: Tool[]
   providerId: string
   modelId?: string
@@ -1686,6 +1700,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
   private snapshotSvc: SnapshotService | undefined
   /** 每 session 最近一次快照（用于计算本轮变更文件列表） */
   private readonly lastSnapshots = new Map<string, SnapshotID>()
+  /**
+   * 每 session 最近一次的系统区（前缀）段级快照 —— 用于跨 turn 归因"谁把前缀改了"。
+   *
+   * 为什么不复用 `lastSnapshots`：那是文件快照 ID，语义不同；这里的键是**段指纹**。
+   * 只存内存（进程内存续即可）：跨重启后首轮无基线 ⇒ 不报变化，不会误报。
+   */
+  private readonly sysSnapshots = new Map<string, SystemSnapshot>()
   constructor(
     defaultAgentId: string,
     private readonly deps: {
@@ -1731,6 +1752,38 @@ export class AgentRuntimeImpl implements AgentRuntime {
     blockLines.push(info.memory.summaryText)
     blockLines.push('===============================================')
     sysParts.push(blockLines.join('\n'))
+  }
+
+  /**
+   * 记录本轮系统区快照并归因相对上一轮的变化；有变化时告警并返回报告。
+   *
+   * 系统区位于请求位置 0，任何一个字符变化都会让其后的**整个历史**按全价重算
+   * （代价量化见 acp-context 的 MANUAL_INJECT_MARGIN 注释：越阈值时翻转一次
+   * ≈ 95K token-equiv）。所以"system 变了"是高代价事件，必须能点名到段。
+   *
+   * 开销：每 query 一次段遍历（段数十来条），无 IO。首轮只建立基线、不报（否则每次
+   * 新会话都会误报一次"前缀变化"）。
+   */
+  private noteSystemStability(
+    sessionId: string,
+    sysParts: string[],
+  ): SystemStabilityReport | undefined {
+    const curr = systemSnapshotOf(sysParts, Date.now())
+    const prev = this.sysSnapshots.get(sessionId)
+    this.sysSnapshots.set(sessionId, curr)
+    if (!prev) return undefined
+    const report = buildSystemStabilityReport(prev, curr)
+    if (!report) return undefined
+    try {
+      this.deps.logger?.warn?.(
+        `system 区（前缀）本轮变化 ${report.details.length} 处 —— 自动前缀缓存将整段重算：` +
+          report.details.join('；'),
+        { sessionId },
+      )
+    } catch {
+      // 告警失败不影响主流程
+    }
+    return report
   }
 
   /** 惰性获取快照服务（deps.snapshot 未注入则不启用自动快照） */
@@ -1853,6 +1906,17 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
     await this.deps.triggerPlugin('core.prompt.system.transform', promptIn, sysParts)
 
+    // 尾部动态上下文：给"内容会变"的注入一条不拖垮前缀缓存的通道。
+    //
+    // 为什么不把它们也扔进 sysParts：前缀缓存按最长公共 token 前缀命中，system 位于位置 0，
+    // 它一变其后**整段历史**都要按全价重算；而同样的文本放在请求末尾，翻转代价 ≈ 0。
+    // 判断标准：**这段文本会不会在会话中途变？会就走这里。**
+    const dynParts: string[] = []
+    await this.deps.triggerPlugin('core.prompt.dynamic.transform', promptIn, dynParts)
+
+    // 系统区（前缀）跨 turn 归因：变化时点名到段（告警 + 交给插件写遥测）
+    const systemStability = this.noteSystemStability(sessionId, sysParts)
+
     // input.model 优先级高于 agent.model（SubagentTool 派出子 Agent 时可覆盖模型）
     const providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'
     const modelId = input.model?.modelId ?? agent.model?.modelId
@@ -1863,7 +1927,17 @@ export class AgentRuntimeImpl implements AgentRuntime {
       ...(agent.model?.options ?? {}),
     }
 
-    return { agentId, sessionId, sysParts, allowedTools, providerId, modelId, paramsBase }
+    return {
+      agentId,
+      sessionId,
+      sysParts,
+      dynParts,
+      ...(systemStability ? { systemStability } : {}),
+      allowedTools,
+      providerId,
+      modelId,
+      paramsBase,
+    }
   }
 
   /**
@@ -1922,11 +1996,36 @@ export class AgentRuntimeImpl implements AgentRuntime {
           patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
         },
         blocksPatch: preModelBlocks,
+        // 前缀区段级归因：让压缩插件（ACP）能把 "system-changed" 细化到"第 N 段变了"。
+        // 只在实际变化时有值 —— 消费方不必自己维护上一轮快照。
+        ...(p.systemStability ? { systemStability: p.systemStability } : {}),
       },
       messages,
     )
     // 统一块模型：把插件（ACP）每轮内部折叠的 source:'acp' 块合并进 session.blocks（按 id 去重覆盖）
     if (preModelBlocks.length > 0) this.deps.session.setBlocks(sessionId, preModelBlocks)
+
+    // ---- 尾部动态上下文：拼在请求**最末尾** ----
+    //
+    // 两个位置约束都不是风格问题：
+    // ① **必须在 `core.session.preModel` 之后** —— 那是压缩插件的折叠/回写点。放它之前会被
+    //    折叠流程看见，有被写进持久层的风险；而这段内容每轮重算，落库就是脏数据。放这里
+    //    即"发送时拼接"，天然不落库（`messages` 是每步新建的数组，返回后只用于本次请求）。
+    // ② **必须用 `user` role** —— provider-anthropic 的 `extractSystemPrompt` 与
+    //    provider-gemini 的 `extractSystem` 会把**任意位置**的 system 消息上提进顶层
+    //    `system` / `systemInstruction`（原位置直接跳过）。用 system 角色放尾部等于把它送回
+    //    前缀，收益归零。只有 OpenAI 保持原序，不能指望它。
+    //
+    // 为什么值得单开一条通道：同一份文本换个位置，代价差几个数量级 —— 放前缀是"整段历史
+    // 重算"，放尾部是"只有这一小段不命中"。
+    if (p.dynParts.length > 0) {
+      messages.push({
+        id: `dyn_${Date.now()}`,
+        role: 'user',
+        parts: [{ type: 'text', text: renderDynamicBlock(p.dynParts) }],
+        createdAt: Date.now(),
+      })
+    }
 
     return { messages, params, headers }
   }
@@ -2501,7 +2600,109 @@ export interface Harness {
   readonly cwd: string
 }
 
-/** createHarness() 参数 */
+/**
+ * 系统区（前缀区）的**段级**快照。
+ *
+ * system 区是多个插件往同一个数组 push 拼出来的，所以快照按"段"存三项：
+ * 指纹（判等）、长度（说清变化量级）、首行预览（说清这是谁的那段）。
+ */
+export interface SystemSnapshot {
+  digests: string[]
+  lengths: number[]
+  previews: string[]
+  at: number
+}
+
+/** 单段文本的稳定指纹（djb2 + 长度；非加密，只用于判等） */
+function segDigest(s: string): string {
+  let h = 5381
+  for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0
+  return `${(h >>> 0).toString(36)}:${s.length}`
+}
+
+/** 段首行预览 —— 让归因结果能直接指认"这是哪个插件 push 的那段" */
+function segPreview(s: string): string {
+  const line = s.split('\n').find((l) => l.trim().length > 0) ?? ''
+  const t = line.trim()
+  return t.length > 40 ? `${t.slice(0, 40)}…` : t
+}
+
+export function systemSnapshotOf(parts: readonly string[], at: number): SystemSnapshot {
+  return {
+    digests: parts.map(segDigest),
+    lengths: parts.map((s) => s.length),
+    previews: parts.map(segPreview),
+    at,
+  }
+}
+
+/**
+ * 比对两次系统区快照，产出**段级**归因；无变化返回 null。
+ *
+ * 为什么逐段比而不是整段比文本：整段比只能告诉你"system 变了"，逐段比能告诉你
+ * "第 3 段由 1.2K 变成 2.4K 字符、首行是「项目长期记忆」" —— 直接指向插件。
+ * 本项目的 system 区已知贡献者：agent promptFragments / systemPrompt、压缩记忆、
+ * core.skill-injection、subagent roster、coordinator、mcp-client resources、memory。
+ *
+ * 同下标指纹不同 = 该段被就地改写；超出上轮长度的下标 = 新增；超出本轮长度的 = 移除。
+ * 只判等、不猜语义：段内容的增删改都如实落在 details 里。
+ */
+export function buildSystemStabilityReport(
+  prev: SystemSnapshot,
+  curr: SystemSnapshot,
+): SystemStabilityReport | null {
+  const changedParts: number[] = []
+  const addedParts: number[] = []
+  const removedParts: number[] = []
+  const details: string[] = []
+
+  const common = Math.min(prev.digests.length, curr.digests.length)
+  for (let i = 0; i < common; i++) {
+    if (prev.digests[i] === curr.digests[i]) continue
+    changedParts.push(i)
+    // 首行预览给**新旧两份**：只有旧预览时，"变了"是知道了、但"变成了什么"还得自己去翻
+    // （排障时最想确认的恰恰是"新增的这段是不是 memory / roster / MCP resources"）。
+    // 两份首行相同（只改了段内后文）时只留一份，避免制造噪音。
+    const samePreview = prev.previews[i] === curr.previews[i]
+    details.push(
+      `第 ${i + 1} 段变化：${prev.lengths[i]} → ${curr.lengths[i]} 字符（首行：「${prev.previews[i]}」` +
+        (samePreview ? '' : ` → 「${curr.previews[i]}」`) +
+        '）',
+    )
+  }
+  for (let i = common; i < curr.digests.length; i++) {
+    addedParts.push(i)
+    details.push(`第 ${i + 1} 段新增：${curr.lengths[i]} 字符（首行：「${curr.previews[i]}」）`)
+  }
+  for (let i = common; i < prev.digests.length; i++) {
+    removedParts.push(i)
+    details.push(`第 ${i + 1} 段移除：原 ${prev.lengths[i]} 字符（原首行：「${prev.previews[i]}」）`)
+  }
+
+  if (details.length === 0) return null
+  return {
+    at: curr.at,
+    prevAt: prev.at,
+    parts: curr.digests.length,
+    prevParts: prev.digests.length,
+    changedParts,
+    addedParts,
+    removedParts,
+    details,
+  }
+}
+
+/**
+ * 尾部动态上下文的渲染（core 在 `core.prompt.dynamic.transform` 之后拼接）。
+ *
+ * 用一层标记把"宿主注入的上下文"和"用户真的说了什么"分开：这段是 `user` 角色（因为
+ * anthropic/gemini 会把任意位置的 system 上提到前缀，见 `_buildStepMessages` 的注释），
+ * 不加标记的话模型会把它当成用户发言，进而影响回复对象/口吻。
+ */
+export function renderDynamicBlock(parts: readonly string[]): string {
+  return `<host-context note="宿主注入，非用户发言；内容可能每轮变化">\n${parts.join('\n\n')}\n</host-context>`
+}
+
 /**
  * 粗估一组消息的 token 数。
  *
@@ -2560,6 +2761,7 @@ function estimateToolPayloadTokens(tools: Tool[], countTokens: (text: string) =>
   }
 }
 
+/** createHarness() 参数 */
 export interface AgentHarnessOptions {
   /** 工作目录（注入 ToolContext.cwd，默认 process.cwd()） */
   cwd?: string
