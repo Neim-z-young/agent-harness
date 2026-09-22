@@ -828,6 +828,32 @@ export function selectionTextFrom(
   return renderer?.getSelection?.()?.getSelectedText?.() ?? ''
 }
 
+/**
+ * 字素簇计数（给「已选 N 字符」用）。
+ *
+ * 为什么不用 `String.length`：那是 UTF-16 码元数 —— 任何非 BMP 字符（emoji、部分罕见汉字）
+ * 都算 **2**，选一个 🙂 会显示「已选 2 字符」（真机显示过）。
+ * `Intl.Segmenter` 按用户感知的字素簇切分（ZWJ 序列如家庭 emoji 尽量算 1）；
+ * 运行时不支持 / 构造抛错时降级为按码点（`Array.from`）—— 对代理对已经是正确值，
+ * 仍比码元数准，且不会抛。
+ */
+export function countGraphemes(text: string): number {
+  if (!text) return 0
+  const Seg = (Intl as unknown as {
+    Segmenter?: new (locale?: string, opts?: { granularity: string }) => {
+      segment(s: string): Iterable<unknown>
+    }
+  }).Segmenter
+  if (typeof Seg === 'function') {
+    try {
+      return [...new Seg('zh', { granularity: 'grapheme' }).segment(text)].length
+    } catch {
+      // 交给下面的码点计数
+    }
+  }
+  return Array.from(text).length
+}
+
 // ------------------------------------------------------------------------
 // 主题：markdown / 代码高亮配色（GitHub Dark 系）
 // ------------------------------------------------------------------------
@@ -1080,7 +1106,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       const sel = renderer?.getSelection?.()
       // isActive 过滤：clearSelection() 后 Zig 可能仍把旧 Selection 留在缓存里并发一次事件，
       // 若只看 getSelectedText 会把「已清除」回弹成「已选 N 字符」（实测踩坑）。
-      setSelChars(sel?.isActive ? sel.getSelectedText().length : 0)
+      // 计数用字素簇而非 UTF-16 码元：`.length` 会把一个 emoji 算成 2。
+      setSelChars(sel?.isActive ? countGraphemes(sel.getSelectedText()) : 0)
     }
     renderer?.on?.('selection', onSel)
     return () => { renderer?.off?.('selection', onSel) }

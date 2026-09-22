@@ -54,6 +54,7 @@ import {
   buildWelcomeBanner,
   WELCOME_BANNER,
   selectionTextFrom,
+  countGraphemes,
   approvalLine,
   __KEYLOG,
   __resetKeyLog,
@@ -628,6 +629,18 @@ describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
     expect(
       selectionTextFrom({ getSelection: () => ({ getSelectedText: () => '选中的文字' }) }),
     ).toBe('选中的文字')
+  })
+
+  it('countGraphemes：按字素簇计数（UTF-16 length 会把 emoji 算成 2）', () => {
+    expect(countGraphemes('')).toBe(0)
+    expect(countGraphemes('abc')).toBe(3)
+    expect(countGraphemes('中文')).toBe(2)
+    // 关键回归：非 BMP 字符在 UTF-16 里占 2 个码元，但用户只选了「一个字符」
+    expect('🙂'.length).toBe(2)
+    expect(countGraphemes('🙂')).toBe(1)
+    expect(countGraphemes('a🙂中')).toBe(3)
+    // 与 UTF-16 口径的差值就是显示 bug 的大小
+    expect(countGraphemes('🙂🙂')).toBeLessThan('🙂🙂'.length)
   })
 })
 
