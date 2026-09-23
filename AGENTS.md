@@ -32,6 +32,10 @@
 
 > 别用根目录的 `bun test`：它会把 `reference/**`（参考代码 / 外部仓库快照）一起扫进来，那里缺 react 等依赖，会产生数百个与本次改动无关的失败。
 
+- **`bun test` 不做类型检查 ⇒ 测试全绿 ≠ 类型正确**：往测试文件里加用例（尤其 `const script = [...]` 这类**先赋值给变量**的字面量，会丢掉调用点的上下文类型 ⇒ `'text_delta'` 被拓宽成 `string` ⇒ TS2345）后，必须**单独跑 `typecheck`**。改完代码的收尾验证要**同时**给出 `typecheck` 与 `test` 两行结果
+
+- **验证结果必须与"最后一次改动"对齐**：不要引用早于最后一次改动的验证结论（曾用旧的全量 typecheck 结果盖过其后新增的测试文件，把 1 个 TS2345 漏报成"39 包 0 error"）。收尾时按「改完 → 跑全量 typecheck + test → 记录数字」的顺序一次做完
+
 - TypeScript 严格模式（`strict: true`）、`target ESNext`、`moduleResolution: bundler`
 
 > 注意：本机 shell `PATH` 异常，运行 bun/git 建议用绝对路径 `/opt/homebrew/bin/bun`、`/usr/bin/git`。
@@ -151,7 +155,7 @@
 
 - 文档索引：架构 `docs/agent-harness-architecture.md`、开发日志 `docs/development-log.md`、工作区模块 `docs/workspace-management.md`、代码情报插件规划 `docs/codeintel-plugin.md`、MCP 服务使用 `docs/mcp-services.md`、ACP 压缩配置参考 `docs/acp-context-config.md`
 
-- **步间闸门 `core.agent.step.gate`（引擎层）只在"空转步"前有意义**：一步只要产生 `tool_calls` 就会**立刻续轮**（`outcome.finish === 'tool_calls'` 本身就是续轮判据），**没有机会等到对端** ⇒ 每步开跑前询问"还有存活后台任务吗"、`decision.pending = true` 即按退避阶梯等待，**语义是「每个步边界最多等一次」**（写成 `while (gateClosed)` 会在对端恒报存活时无限卡死）。多插件合并是 **OR**、`aliveCount` 取最大；**引擎侧必须有等待总预算兜底**（`STEP_GATE_MAX_TOTAL_MS`），不能把终止条件全托给插件。默认阶梯 `[3s,6s,12s,24s,48s,60s]`，可经 `AgentHarnessOptions.stepGate` 注入覆盖（测试压到毫秒级）。等待**必须发 `step_gate` 事件**（>15s 无输出要有心跳）、CLI 进 `waiting` 相位。纯函数 `stepGateDelayMs(n)` 对 `NaN` 必须显式落 0 档——`Math.floor(NaN)` 是 NaN，索引出 `undefined` 且类型上不报错
+- **步间闸门 `core.agent.step.gate`（引擎层）挂靠在「续轮」上，不是挂在「空转」上**：检查点 = 每个步边界、即每次模型推理开跑**之前**（`step >= 1`，第 2 步起）；此处引擎**不可能知道**这一步将产出 `tool_calls` 还是最终答复（那是本次推理的结果，尚未发生）⇒ 只要插件报 `pending` 就等，**与这一步的产出形态无关**。真正的触达条件是 `shouldContinueStep()`（判据 `toolCallCount > 0` 且 finish 正常）——**上一步没调工具时本轮直接结束，闸门根本不会被触达**。所以「有 tool call 就不等」是**反的**：恰恰是有 tool call 的步才续轮、下一步开跑前才经过闸门。真机语境里的"空转"指**有 tool call 但无进展**（反复 read_file/bash 查状态），这类步同样续轮、同样被闸门减速。**语义是「每个步边界最多等一次」**（写成 `while (gateClosed)` 会在对端恒报存活时无限卡死）。多插件合并是 **OR**、`aliveCount` 取最大；**引擎侧必须有等待总预算兜底**（`STEP_GATE_MAX_TOTAL_MS`），不能把终止条件全托给插件。探测为"静默"时只把**阶梯归零**（下一波派工从最小档重起），**不是关闸门** —— 每个步边界仍会重探（同一轮里 coordinator 可能再派一批）。默认阶梯 `[3s,6s,12s,24s,48s,60s]`，可经 `AgentHarnessOptions.stepGate` 注入覆盖（测试压到毫秒级）。等待**必须发 `step_gate` 事件**（>15s 无输出要有心跳）、CLI 进 `waiting` 相位。纯函数 `stepGateDelayMs(n)` 对 `NaN` 必须显式落 0 档——`Math.floor(NaN)` 是 NaN，索引出 `undefined` 且类型上不报错
 
 - **`coordinator.worker.completed`（单任务完成即唤醒）与 `barrier.completed`（全波收尾）是两条事件**：前者**仅在 `remaining > 0` 时发**（最后一个走 barrier），否则外层会注入两行 `<continue/>`。**`remaining` 必须在 `tracker.onWorkerFinished()` 之前算** —— 后者在计数归零时会 `active.delete`，之后再问 `activeCount()` 恒为 0（"快任务完成也报 0"⇒ 事件永远发不出来）
 
