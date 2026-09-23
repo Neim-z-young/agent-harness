@@ -48,14 +48,23 @@ export function isBoundaryEvent(name: string): boolean {
  *
  * `core.tool.post.execute` hook 的 (ctx, result) 里：
  *  - `ctx.tool.id`：工具 id；
+ *  - `ctx.ctx.sessionId / agentId`：**归属**（会话级 JSONL 靠它分流，见下）；
  *  - `result.ok === false` 且 `result.error.code`：`PERMISSION_DENIED` / `DOOM_LOOP` / 其它。
  * 据此把三类失败细分到独立 kind（而非全落在通用的 telemetry.bus.*），便于异常检索/告警。
  * 纯函数（无 IO），便于单测。成功（ok !== false）返回 null。
+ *
+ * ⚠️ `sessionId` 必须带上：`TelemetryService.persist` 用 `attrs.sessionId` 决定写哪个文件，
+ * 缺了就会 `switchWriter(undefined)` ⇒ 事件全部落到 **run 级** `run.telemetry.jsonl`，
+ * 会话文件里一条都没有（实测 79 条 tool.fail 的 `sessionId` 全为 undefined，9 个会话文件合计 0 条）
+ * —— 于是"按会话取证"永远看不到工具失败，而工具失败恰恰是最需要会话归属的一类事件。
  */
 export function toolFailureEnvelope(ctx: unknown, result: unknown): TelemetryEnvelope | null {
+  const h = ctx as
+    | { tool?: { id?: string }; ctx?: { sessionId?: string; agentId?: string } }
+    | undefined
   const r = result as { ok?: boolean; error?: { code?: string }; meta?: { durationMs?: number } } | undefined
   if (!r || r.ok !== false) return null
-  const toolId = (ctx as { tool?: { id?: string } } | undefined)?.tool?.id
+  const toolId = h?.tool?.id
   const code = r.error?.code
   let kind = 'telemetry.tool.fail'
   let errName: string | undefined = code
@@ -68,5 +77,9 @@ export function toolFailureEnvelope(ctx: unknown, result: unknown): TelemetryEnv
   }
   const metrics: Record<string, number> = {}
   if (typeof r.meta?.durationMs === 'number') metrics.durationMs = r.meta.durationMs
-  return makeEnvelope(kind, { toolId, errName }, metrics)
+  return makeEnvelope(
+    kind,
+    { toolId, errName, sessionId: h?.ctx?.sessionId, agentId: h?.ctx?.agentId },
+    metrics,
+  )
 }

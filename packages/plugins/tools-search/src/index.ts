@@ -201,6 +201,8 @@ export interface GrepFileInput {
   caseSensitive?: boolean
   include?: string
   maxResults?: number
+  /** 按**纯文本**搜索（不编译正则）。默认 false = 先按正则解释，编译失败自动退化为字面量。 */
+  literal?: boolean
 }
 
 export interface GrepMatch {
@@ -218,22 +220,38 @@ export interface GrepFileOutput {
   count: number
   filesSearched: number
   truncated: boolean
+  /** 本次实际使用的解释口径；`regex`（默认）时省略，不占上下文 */
+  mode?: 'literal'
+  /** 模式被自动**重新解释**时的说明（正则编译失败 ⇒ 已退化为字面量），必须回给模型 */
+  notify?: string
 }
 
 const MAX_GREP_FILES = 200
 
+/** 把任意文本转义成"只匹配它自己"的正则源（字面量搜索用） */
+export function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
 export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
   id: 'grep_file',
-  description: '在文件或目录中搜索文本模式（正则表达式）。支持 glob 文件过滤、大小写敏感、递归搜索。',
+  description:
+    '在文件或目录中搜索文本。pattern 默认按**正则**解释；编译失败会自动退化为字面量搜索并在结果里注明。' +
+    '要搜纯文本（如 `](`、`![`、`.*` 这类符号）请显式传 literal:true。支持 glob 过滤、大小写、递归。',
   inputSchema: withJsonSchema(makeSchema<GrepFileInput>(), {
     type: 'object',
     properties: {
-      pattern: { type: 'string', description: '要搜索的文本（字面量）' },
+      // ⚠️ 这条描述曾经写的是「要搜索的文本（字面量）」，与实现（按正则编译）矛盾 ——
+      // 模型信了描述、传 `](` `![` 这类 Markdown 片段，真机实测该工具 113 次调用里 43 次
+      // 以 INVALID_REGEX 告终（38%），并把子 Agent 拖到 120s 硬超时。描述即契约，别写反。
+      pattern: { type: 'string', description: '搜索模式：默认按正则解释；literal:true 时按纯文本' },
       path: { type: 'string', description: '搜索根目录或文件（默认 "."）' },
       recursive: { type: 'boolean', description: '是否递归子目录（默认 true）' },
-      caseSensitive: { type: 'boolean', description: '是否区分大小写（默认 false）' },
+      // 实现是 `caseSensitive === false ? 'gi' : 'g'` ⇒ 缺省=区分大小写。原描述写「默认 false」是反的。
+      caseSensitive: { type: 'boolean', description: '是否区分大小写（默认 true = 区分；传 false 则忽略大小写）' },
       include: { type: 'string', description: '文件名过滤 glob（如 "*.ts"）' },
       maxResults: { type: 'number', description: '最大匹配数' },
+      literal: { type: 'boolean', description: '按纯文本搜索，不做正则解释（默认 false）' },
     },
     required: ['pattern'],
     additionalProperties: false,
@@ -256,11 +274,24 @@ export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
     }
 
     try {
+      // pattern 的解释口径 —— 这里曾是全仓失败率最高的工具问题。
+      // 过去：schema 写「字面量」、实现按正则编译，且编译失败**硬报错**。模型要搜 Markdown 链接
+      // 语法（`](` / `![` / `../`）时必失败，43/113 = 38%，重试风暴还把子 Agent 拖到硬超时。
+      // 现在：literal=true 直接纯文本；否则先试正则，**编译失败自动退化为字面量**，
+      // 并在输出里用 notify 说清"我改了什么" —— 不静默改口径，也不为可恢复的输入让整轮报废。
+      const literal = input.literal === true
+      const flags = input.caseSensitive === false ? 'gi' : 'g'
       let regex: RegExp
-      try {
-        regex = new RegExp(input.pattern, input.caseSensitive === false ? 'gi' : 'g')
-      } catch (e: any) {
-        return { ok: false, error: { message: `正则表达式无效: ${e.message}`, code: 'INVALID_REGEX' } }
+      let literalFallback: string | undefined
+      if (literal) {
+        regex = new RegExp(escapeRegExp(input.pattern), flags)
+      } else {
+        try {
+          regex = new RegExp(input.pattern, flags)
+        } catch (e: any) {
+          literalFallback = e?.message ?? String(e)
+          regex = new RegExp(escapeRegExp(input.pattern), flags)
+        }
       }
 
       const recursive = input.recursive ?? true
@@ -335,6 +366,16 @@ export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
           count: matches.length,
           filesSearched,
           truncated,
+          ...(literal
+            ? { mode: 'literal' as const }
+            : literalFallback
+              ? {
+                  mode: 'literal' as const,
+                  notify:
+                    `pattern 不是合法正则（${literalFallback}），已按**字面量**搜索 "${input.pattern}"。` +
+                    `若你要的是正则，请修正后重试；若本意就是纯文本，下次传 literal:true。`,
+                }
+              : {}),
         },
       }
     } catch (err: any) {

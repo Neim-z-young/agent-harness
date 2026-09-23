@@ -405,6 +405,27 @@ export class ToolPermissionAskRequiredError extends Error {
   }
 }
 
+// ===== 错误 → ToolResult 的**唯一**映射点 =====
+
+/**
+ * 把 pipeline 抛出的错误归一化为失败 `ToolResult`。
+ *
+ * 为什么必须集中在这一处：同一个失败会走两条路 ——
+ * ① `safeExecuteTool`（core）兜住异常后把它变成回给**模型**的结果；
+ * ② `ToolPipeline` 的错误路径用它喂 **PostHook**（遥测 / 轨迹 / 记忆）。
+ * 两处各写一份映射就会漂移 ⇒ 遥测里看到的 code 与模型看到的不是一回事，排查时对不上账。
+ *
+ * 权限拒绝按**错误名**判定（不依赖类绑定，AGENTS.md 约定）。
+ */
+export function normalizeToolError(err: unknown): ToolResult {
+  const name = (err as { name?: string } | undefined)?.name
+  const message = (err as { message?: string } | undefined)?.message ?? String(err)
+  if (name === 'ToolPermissionDeniedError') {
+    return { ok: false, error: { message: `权限被拒绝：${message}`, code: 'PERMISSION_DENIED' } }
+  }
+  return { ok: false, error: { message, code: 'TOOL_ERROR' } }
+}
+
 // ===== Tool Pipeline Hooks =====
 
 /** PreHook 回调：在权限检查之后、真正 tool.call 之前被调用（中间件风格支持 next） */
@@ -768,20 +789,30 @@ export class ToolPipeline {
   ): Promise<ToolResult> {
     const startedAt = performance.now()
 
-    // --- Step 1: inputSchema 硬校验 ---
-    const parseResult = tool.inputSchema.safeParse(rawInput)
-    if (!parseResult.success) {
-      throw new ToolSchemaError(tool.id, 'input', parseResult.error)
-    }
-    let input: unknown = parseResult.data
-
-    // --- Step 2: 语义校验（validateInput）---
-    if (tool.validateInput) {
-      try {
-        await tool.validateInput(input as any, ctx)
-      } catch (err) {
-        throw new ToolValidationError(tool.id, err)
+    // --- Step 1: inputSchema 硬校验 + Step 2: 语义校验（validateInput）---
+    //
+    // ⚠️ 这两步的失败**也必须**让 PostHook 看到：它们挡在 Step 7 之前，直接 throw 会让
+    // 所有 PostHook 消费方（遥测 tool.fail / skill-forge 失败轨迹）完全看不到这类失败。
+    // 真机代价：同一次会话 6 次丢入参，bash 的 3 次（工具内 return COMMAND_REQUIRED）上报了，
+    // read_file 的 3 次（inputSchema 抛错）没上报 —— 只用遥测算失败率会系统性偏低一半。
+    // 统一走 `_throwToolFailureWithHooks`：归一化 → 喂 PostHook → 原样 rethrow。
+    let input: unknown
+    try {
+      const parseResult = tool.inputSchema.safeParse(rawInput)
+      if (!parseResult.success) {
+        throw new ToolSchemaError(tool.id, 'input', parseResult.error)
       }
+      input = parseResult.data
+
+      if (tool.validateInput) {
+        try {
+          await tool.validateInput(input as any, ctx)
+        } catch (err) {
+          throw new ToolValidationError(tool.id, err)
+        }
+      }
+    } catch (err) {
+      return await this._throwToolFailureWithHooks(err, tool, rawInput, ctx)
     }
 
     // --- 构造 preHook context ---
@@ -878,20 +909,63 @@ export class ToolPipeline {
       })
     }
 
-    let result = await dispatch(index, input)
-
-    // --- Step 7: PostHook 管道（按顺序）---
+    // PostHook 在**成功路径**上按顺序跑
     const postCtx: ToolPostHookContext = {
       tool,
       input,
       ctx,
       toolUseId: ctx.toolUseId,
     }
+
+    let result: ToolResult
+    try {
+      result = await dispatch(index, input)
+    } catch (err) {
+      // Step 3（preHook 拦截）/ Step 4（权限拒绝）/ Step 5 / Step 6（outputSchema）
+      // 也是"先 throw、后跳过 Step 7"，同样交给统一的失败路径处理。
+      // 归一化后的结果只**喂给 PostHook**，然后原样 rethrow —— 调用方（core 的
+      // safeExecuteTool）仍按错误名判定权限拒绝、异常语义与模型看到的消息都不变。
+      return await this._throwToolFailureWithHooks(err, tool, input, ctx)
+    }
+
+    // --- Step 7: PostHook 管道（按顺序）---
     for (const hook of this.postHooks) {
       result = await Promise.resolve(hook(postCtx, result))
     }
 
     return result
+  }
+
+  /**
+   * 抛错前先让 PostHook 看到这次失败，然后原样抛出。
+   *
+   * PostHook 的消费方是"观测类"插件（遥测细分 kind、技能轨迹、失败回写记忆）。它们此前只能在
+   * Step 7 被调用，于是**所有挡在 Step 7 之前的失败**（Step 1/2/3/4/6）对它们全部不可见。
+   * 真机铁证：`telemetry.permission.deny` 与 `telemetry.doomloop` 两类 kind 全仓 0 条。
+   *
+   * 两条边界：
+   * - `ToolPermissionAskRequiredError` 是"请去问用户"的**控制流信号**，不是失败，不上报
+   *   （当失败计入会把权限交互的失败率算高）；
+   * - PostHook 自己抛错**不能顶掉原始错误**（否则"到底为什么失败"彻底失真），只记日志。
+   */
+  private async _throwToolFailureWithHooks(
+    err: unknown,
+    tool: Tool,
+    input: unknown,
+    ctx: ToolContext,
+  ): Promise<never> {
+    if ((err as { name?: string } | undefined)?.name !== 'ToolPermissionAskRequiredError') {
+      try {
+        const postCtx: ToolPostHookContext = { tool, input, ctx, toolUseId: ctx.toolUseId }
+        let r = normalizeToolError(err)
+        for (const hook of this.postHooks) {
+          r = await Promise.resolve(hook(postCtx, r))
+        }
+      } catch (hookErr) {
+        ctx.log?.error?.('postHook failed on error path', { toolId: tool.id, error: hookErr })
+      }
+    }
+    throw err
   }
 
   /** 截断超大 ToolResult 输出（仅用于展示层提示，不破坏原结构时尽量保留） */

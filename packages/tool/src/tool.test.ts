@@ -18,6 +18,7 @@ import {
   partitionToolCalls,
   parseMcpToolId,
   filterMcpTools,
+  normalizeToolError,
   McpToolIndex,
   resolveMcpTool,
   READONLY_TOOLS_SENTINEL,
@@ -633,6 +634,72 @@ describe('@harness/tool', () => {
         }))
         const r = await p.execute(readFileTool, { path: '/x' }, makeCtx())
         expect(r.output).toBe('read:/x|h1|h2')
+      })
+
+      it('抛错路径也要跑 PostHook：schema 失败时能看到归一化后的失败结果', async () => {
+        // 回归：Step 1/2/3/6 都是"先 throw、后跳过 Step 7" ⇒ 这些失败对 PostHook 消费方
+        // （遥测 tool.fail / skill-forge 失败轨迹）完全不可见。真机表现：同一次会话 6 次丢入参，
+        // bash 的 3 次（工具内 return）上报了、read_file 的 3 次（schema 抛错）没上报。
+        const p = new ToolPipeline()
+        const seen: Array<{ ok?: boolean; code?: string; toolId?: string }> = []
+        p.addPostHook(async (ctx, r) => {
+          seen.push({ ok: r.ok, code: r.error?.code, toolId: ctx.tool.id })
+          return r
+        })
+        const err = await p
+          .execute(readFileTool, { path: 12345 } as any, makeCtx())
+          .then(() => null, (e) => e)
+        expect(err).toBeInstanceOf(ToolSchemaError) // 异常语义不变，仍抛给调用方
+        expect(seen).toEqual([{ ok: false, code: 'TOOL_ERROR', toolId: 'read_file' }])
+      })
+
+      it('抛错路径：权限拒绝上报为 PERMISSION_DENIED（telemetry.permission.deny 的唯一来源）', async () => {
+        const p = new ToolPipeline({ checkPermission: () => ({ behavior: 'deny' }) })
+        const codes: Array<string | undefined> = []
+        p.addPostHook(async (_ctx, r) => {
+          codes.push(r.error?.code)
+          return r
+        })
+        const err = await p
+          .execute(writeFileTool, { path: '/w', content: 'x' }, makeCtx())
+          .then(() => null, (e) => e)
+        expect(err).toBeInstanceOf(ToolPermissionDeniedError)
+        expect(codes).toEqual(['PERMISSION_DENIED'])
+      })
+
+      it('抛错路径：ToolPermissionAskRequiredError 是控制流信号，不当失败上报', async () => {
+        const p = new ToolPipeline({ checkPermission: () => ({ behavior: 'ask' }) })
+        let calls = 0
+        p.addPostHook(async (_ctx, r) => {
+          calls += 1
+          return r
+        })
+        const err = await p
+          .execute(writeFileTool, { path: '/w', content: 'x' }, makeCtx())
+          .then(() => null, (e) => e)
+        expect(err).toBeInstanceOf(ToolPermissionAskRequiredError)
+        expect(calls).toBe(0)
+      })
+
+      it('抛错路径：PostHook 自己炸了不能顶掉原始错误', async () => {
+        const p = new ToolPipeline()
+        p.addPostHook(async () => {
+          throw new Error('hook 崩了')
+        })
+        const err = await p
+          .execute(readFileTool, { path: 12345 } as any, makeCtx())
+          .then(() => null, (e) => e)
+        expect(err).toBeInstanceOf(ToolSchemaError)
+        expect(err.message).toContain('input schema validation failed')
+      })
+
+      it('normalizeToolError 是错误→结果的唯一映射点（core 侧同源）', () => {
+        const denied = normalizeToolError(new ToolPermissionDeniedError('t', 'w', ['/x']))
+        expect(denied.error?.code).toBe('PERMISSION_DENIED')
+        expect(denied.error?.message).toContain('权限被拒绝')
+        const other = normalizeToolError(new Error('boom'))
+        expect(other.error?.code).toBe('TOOL_ERROR')
+        expect(other.error?.message).toBe('boom')
       })
     })
 

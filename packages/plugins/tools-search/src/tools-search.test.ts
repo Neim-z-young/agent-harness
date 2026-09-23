@@ -164,11 +164,43 @@ describe('grepFileTool', () => {
     expect(res.output!.matches).toEqual([])
   })
 
-  it('无效正则返回错误', async () => {
-    const res = await grepFileTool.call!({ pattern: '[invalid', path: '.' } as any, ctx)
-    expect(res.ok).toBe(false)
-    if (res.ok) return
-    expect(res.error!.code).toBe('INVALID_REGEX')
+  it('非法正则自动退化为字面量搜索，并在输出里说明（不再硬报错）', async () => {
+    // 真机事故：模型要搜 Markdown 图片语法 `![`，被当正则编译必失败（未闭合字符类）。
+    // 现在必须"能出结果 + 说明改了口径"，既不静默也不让整轮报废。
+    writeFileSync(join(dir, 'a.md'), 'see ![x](y.png)\nsee ![z](w.png)\nplain')
+
+    const res = await grepFileTool.call!({ pattern: '![', path: 'a.md' } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.output!.count).toBe(2)
+    expect(res.output!.mode).toBe('literal')
+    expect(res.output!.notify).toContain('字面量')
+  })
+
+  it('literal:true 时不解释元字符，且输出标注 mode=literal', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'a.c\naXc\nabc')
+
+    const asRegex = await grepFileTool.call!({ pattern: 'a.c', path: 'a.txt' } as any, ctx)
+    expect(asRegex.ok).toBe(true)
+    if (!asRegex.ok) return
+    expect(asRegex.output!.count).toBe(3) // 正则：`.` 匹配任意字符
+    expect(asRegex.output!.mode).toBeUndefined()
+
+    const asLiteral = await grepFileTool.call!({ pattern: 'a.c', path: 'a.txt', literal: true } as any, ctx)
+    expect(asLiteral.ok).toBe(true)
+    if (!asLiteral.ok) return
+    expect(asLiteral.output!.count).toBe(1) // 字面量：只命中真正的 "a.c"
+    expect(asLiteral.output!.mode).toBe('literal')
+    expect(asLiteral.output!.notify).toBeUndefined() // 显式 literal 不是"退化"，无需说明
+  })
+
+  it('默认区分大小写（与 schema 声明一致）', async () => {
+    writeFileSync(join(dir, 'a.txt'), 'Hello\nhello')
+
+    const res = await grepFileTool.call!({ pattern: 'hello', path: 'a.txt' } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.output!.count).toBe(1)
   })
 })
 

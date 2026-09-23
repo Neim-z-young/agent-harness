@@ -183,4 +183,18 @@ describe('toolFailureEnvelope（异常场景专项埋点）', () => {
   test('result 为空 ⇒ null', () => {
     expect(toolFailureEnvelope(ctx, undefined)).toBeNull()
   })
+
+  test('带上 ctx 的会话归属（否则事件会落到 run 级文件、会话取证永远看不到）', () => {
+    // 回归：此前不带 sessionId ⇒ TelemetryService.persist 走 switchWriter(undefined)
+    // ⇒ 全落 run.telemetry.jsonl。实测 79 条 tool.fail 的 sessionId 全为 undefined，
+    // 9 个会话文件合计 0 条 —— 按会话取证时工具失败完全不可见。
+    const withCtx = {
+      tool: { id: 'grep_file' },
+      ctx: { sessionId: 's_123', agentId: 'reader' },
+    }
+    const ev = toolFailureEnvelope(withCtx, { ok: false, error: { code: 'TOOL_ERROR' } })!
+    expect(ev.attrs.sessionId).toBe('s_123')
+    expect(ev.attrs.agentId).toBe('reader')
+    expect(ev.attrs.toolId).toBe('grep_file')
+  })
 })
