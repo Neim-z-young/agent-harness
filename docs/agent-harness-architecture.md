@@ -1298,8 +1298,13 @@ yield turn_end                              整轮只一次
 | 层 | 职责 | 触发条件 |
 |---|---|---|
 | 引擎内循环 | 工具结果回喂 → 继续推理（同步、同会话、受步数限制） | 本步**有工具调用** |
-| coordinator barrier | 后台 subagent 任务集齐后的一次跨轮推进 | **所有后台任务完成** |
-| CLI `<continue/>` | barrier 的载体（伪输入），并做**空转识别** | 由 barrier 事件注入 |
+| 引擎步间闸门 | 轮内减速：让出的时间**不花步数**（§17，续 196 新增） | 插件报"本会话仍有存活后台任务" |
+| coordinator barrier | 后台 subagent 任务集齐后的一次跨轮推进 | **最后一个**后台任务完成 |
+| `coordinator.worker.completed` | 单个任务完成即唤醒（§17.6，续 196 新增） | **任一**任务完成，且 `remaining > 0` |
+| CLI `<continue/>` | barrier / worker 事件的载体（伪输入），并做**空转识别** | 由上述两条事件注入 |
+
+> 上表后三行在 2026-09-24（续 196）增补：原表只有"barrier 等**所有**任务完成"，
+> 实测会让先完成的快结果被拖到最慢任务同毫秒才送达（真机 gap 53s）。现在**部分到达是常态**。
 
 四条关键设计（细节见计划文档）：
 
@@ -1341,3 +1346,172 @@ yield turn_end                              整轮只一次
 - **ACP 按轮设计**：`core.session.preModel` 本就每轮执行，`bench/compress-params.ts` 的 `--steps=100/140/200` 就是模拟多轮，参数表在此基础上实测 ⇒ 循环上线后无需重调参数。
 
 **主要风险**在协调层：`coordinator` 的 barrier 续轮已在承担「链式执行」职责，内部循环上线后两者可能双重驱动。计划把 S0~S3 在关闭 coordinator 的前提下验证，S4 再单独协调三层职责（引擎内循环 = 工具结果回喂；barrier = 跨轮推进；`<continue/>` = 仅 barrier 场景）。
+
+## 十七、步间闸门：派工后的轮内减速（续 196）
+
+> 记录日期：2026-09-24。落地见提交 `fe5006d`；17.4 的"硬等"语义与 17.6 的勘误见提交 `ae47cb1`。
+> 触发它的真机会话是 `s_1790163574429_tg1a6`（取证报告见 `outputs/session-analysis/session-tg1a6-report.html` 观察点 3）。
+
+### 17.1 现象：额度被"查状态"的步烧光
+
+真机会话里，lead 派完 4 个 reader（各耗时约 120s）后，**在 20 秒内把 30 步额度跑完**：
+msg31 与 msg66 两次撞顶，**第一次撞顶时后台任务只做了一半**。这 30 步绝大多数是
+"反复 `read_file` / `bash` 查任务状态"——有 tool call、但无实质进展。
+
+链条是这样闭合的：引擎内循环的续轮判据是"本步**有工具调用**"（§16.1 第 1 条），
+所以这类"查状态"的步每一步都合法地吃一步额度；额度一空，循环退出，
+后台任务的成果就只能等到**下一轮 query**（用户再发话，或 barrier 注入 `<continue/>`）才可能被看到。
+
+注意病根**不是"额度给少了"**——加额度只会让空转更久。真正要做的是**让"等"不花步数**。
+
+### 17.2 机制：引擎层 hook `core.agent.step.gate`
+
+引擎在每个**步边界**（即下一次模型推理开跑之前）询问所有插件"还有存活的后台任务吗"：
+
+```ts
+// packages/plugin/src/index.ts
+'core.agent.step.gate'?: (input: AgentStepGateInput, decision: AgentStepGateDecision) => Awaitable<void>
+
+interface AgentStepGateInput {
+  sessionId: string
+  nextStep: number      // 即将开始的那一步（从 1 数）
+  agentId: string
+  waitAttempt: number   // 本轮 query 内已连续等待的次数（0 = 还没等过）
+  waitedMs: number      // 本轮 query 内已累计等待的毫秒数
+  step: number          // 刚结束的那一步
+}
+interface AgentStepGateDecision {
+  pending?: boolean     // true = 请等一会儿
+  aliveCount?: number   // 存活任务数（多插件取最大）
+  reason?: string       // 给界面/遥测的说明
+}
+```
+
+插件置 `pending = true` 即表示"别急着跑下一步"，引擎按退避阶梯休眠：
+
+```
+waitMs = stepGateDelayMs(gateAttempt)   // [3s, 6s, 12s, 24s, 48s, 60s]，封顶后固定 60s
+```
+
+四条边界，逐条都是踩过或推演过的：
+
+| 边界 | 规则 | 为什么 |
+|---|---|---|
+| 起点 | 只在 `step >= 1` 触发 | 第 1 步之前不存在"派出去的任务"，等了也没意义 |
+| 频度 | **每个步边界最多等一次**（不是"等到没任务为止"） | 后者会让单独一步阻塞好几分钟，与"每执行一轮都等一会"的字面语义不符；分散到各步上，界面心跳也是一段一段的 |
+| 阶梯复位 | 探测为**静默**时把阶梯归零（`gateAttempt = 0`），**不关闸门** | 同一轮里可能再派一批，新一波该从最小档重新起步；而探测本身只是一次内存过滤，重探成本可忽略 |
+| 终止兜底 | 累计等待超过 `STEP_GATE_MAX_TOTAL_MS`（300s）后本轮后续步不再等 | 终止条件依赖插件上报，**引擎侧必须有兜底**，否则插件误报就能把一轮 query 拖成"看起来死了" |
+
+参数可注入（`AgentHarnessOptions.stepGate` / `AgentRuntimeImpl.deps.stepGate`）：
+
+```ts
+interface StepGateOptions { enabled?: boolean; ladderMs?: readonly number[]; maxTotalMs?: number }
+```
+
+测试把它压到毫秒级（`ladderMs: [5, 10]`），因此闸门可以进单测而不用真等 3 秒。
+
+**多插件语义是 OR**：任一插件置 `pending` 即等待；`aliveCount` 取最大值；`reason` 取首个非空。
+只认**严格 `true`**（`decision.pending !== true` 一律当静默），避免插件写成 `pending: 'yes'` 这类真值。
+
+参考实现的现状：`subagent` 插件是当前唯一的实现方，判据是 `BackgroundTaskRegistry`
+（只认 `status === 'pending' | 'running'`——"唯一地面真相"，不去猜别处的状态）：
+
+```ts
+'core.agent.step.gate'(input, decision) {
+  const alive = registry.list({ parentSessionId: input.sessionId })
+    .filter((t) => t.status === 'pending' || t.status === 'running').length
+  if (alive > 0) { decision.pending = true; decision.aliveCount = alive; decision.reason = `${alive} 个后台子任务仍在运行` }
+}
+```
+
+### 17.3 触达条件：**续轮**，不是"空转"（勘误）
+
+初稿曾把这条写反成"只对空转步生效"。准确关系是**相反的**：
+
+```ts
+// core/src/index.ts — 循环能回到闸门处的唯一前提
+function shouldContinueStep(o: StepOutcome): boolean {
+  if (o.toolCallCount === 0) return false      // ← 没调工具 ⇒ break ⇒ 回不到循环顶
+  ...
+}
+```
+
+- 引擎在**推理之前**问（`if (step >= 1 && stepGate?.enabled !== false)`），此刻**不可能预知**
+  这一步会产出 `tool_calls` 还是最终答复——那是本次推理的结果，尚未发生。所以只要插件报 `pending` 就等，**与产出形态无关**。
+- 上一步没调工具 ⇒ 本轮**直接 break** ⇒ 闸门**连问都不会被问到**。
+- 反过来，"有 tool call 的步"才是会经过闸门的那批。真机语境里的"空转"指**有 tool call 但无进展**，
+  这类步同样续轮、同样被闸门减速——**闸门治的正是它们**。
+
+代码级反证（`core/src/step-gate.test.ts` 的 L2 剧本）：
+剧本是 `[stepChunks('a'), stepChunks('b'), finalChunks]`，前两步 finish 都是 `'tool_calls'`，
+闸门恰好探测 **2 次**（`probe.probes === 2`，即第 2、3 步开跑前）；第三步 `finalChunks`（finish `'stop'`）
+收尾，**一次探测都没触发**。`maxSteps = 1` + 单步收尾那条用例是 `probes === 0`。
+
+### 17.4 等待语义：**硬等一档，不提前返回**
+
+`sleepAbortable(ms, signal)` 只有两条 resolve 路径：
+
+1. `setTimeout(ms)` 到点；
+2. `signal` 收到 `abort`（用户 Ctrl-C）。
+
+**没有第三条**——全仓没有任何"后台任务完成即唤醒"的通道（无 `wake` / `notifyStepGate` 之类入口）。
+也就是说：**假如子任务在第 1 秒就跑完了，闸门仍会把这一档睡满（最坏 60s）**，
+要到**下一个步边界重探**时才可能知道"已经没任务了"。
+
+这是一个**刻意的取舍**，代价与收益都要说清：
+
+- **代价**：快任务被白拖一档（≤ 60s）。最难受的情形是"任务其实已经全完成，而闸门正睡在 60s 档上"——
+  用户看到界面显示"等待后台任务"，实际无事可等。
+- **收益**：引擎层**零跨包耦合**——它不需要知道"谁在什么时候完成了"；等待可被 `signal` 立刻打断；
+  逻辑收敛成"纯函数算档位 + 一个定时器"，易测、易注入（`ladderMs`）。
+- **兜底**：每步重探 ⇒ 单次白等的上限是**一档**而不是累计；累计等待另有 300s 封顶。
+
+在 60s 档位上这个取舍是可以接受的（相对 120s 的任务，浪费 ≤ 50%），但在 3s/6s 档上
+就是对快任务的纯损耗。改进方向见 17.7。
+
+### 17.5 可见性：`step_gate` 事件 + `waiting` 相位
+
+等待必须**可见**——否则用户分不清"卡住了"还是"任务本来就慢"，
+只能靠重发同一句话自救（AGENTS.md 的 >15s 心跳约定）。故每次等待发一条流式事件：
+
+```ts
+| 'step_gate'
+gate?: { waitMs: number; waitedMs: number; attempt: number; aliveCount?: number; reason?: string }
+```
+
+- 字段收在**嵌套 `gate` 对象**里，不把 `step_gate` 专属字段平铺到 `AgentStreamEvent` 上。
+- CLI 的 REPL 打一行 `⏳ 等一会再跑下一步：…（本次 Xs，累计 Ys）`，
+  并把 `step_gate` 排除出"自主续轮分隔"的判定（它不是一轮的开始）。
+- `AgentStatusSnapshot.phase` 扩出 `'waiting'` 相位（`formatAgentPhase` → `等待后台任务`），
+  这样 UI **不会把等待算进"模型耗时"**。
+- 中断时**不发**这条事件：本轮已经结束，报一条"等了 60s"反而是假信息。
+
+### 17.6 与相邻机制的分工
+
+闸门只解决"轮内空转"，它与另两条通道的边界必须分清（§16.1 的层表据此更新）：
+
+| 层 | 职责 | 触发条件 |
+|---|---|---|
+| 引擎内循环 | 工具结果回喂 → 继续推理 | 本步**有工具调用** |
+| 引擎步间闸门（本章） | 轮内**减速**：让出的时间不花步数 | 插件报"仍有存活后台任务" |
+| coordinator barrier | 后台任务集齐后的**跨轮**收尾推进 | **最后一个**任务完成 |
+| `coordinator.worker.completed` | 后台任务**单个**完成即唤醒 | **任一**任务完成，且 `remaining > 0` |
+| CLI `<continue/>` | barrier/worker 事件的载体（伪输入），并做空转识别 | 由上述两条事件注入 |
+
+两条事件的分工要点：`worker.completed` 只在 `remaining > 0` 时发（最后一个走 barrier，
+否则外层会注入**两行** `<continue/>`）。而 `remaining` **必须在 `tracker.onWorkerFinished()` 之前算**——
+后者在计数归零时会 `active.delete`，之后再问 `activeCount()` 恒为 0（"快任务完成也报 0"
+⇒ 这条事件永远发不出来）。
+
+### 17.7 演进方向：可唤醒等待（未落地）
+
+要消除 17.4 的白等，有三条路，按**耦合度**从低到高：
+
+| 方案 | 做法 | 代价 | 备注 |
+|---|---|---|---|
+| A. 分段睡眠 + 片间重探 | 把一档拆成若干小片（如 500ms~1s），每片后重跑一次 `core.agent.step.gate`，静默即提前结束 | 单档最多打 ~60 次 hook；要求插件实现**必须轻量**（现实现是内存过滤，符合） | 零新 API、复用已有探测，改动最小 |
+| B. 显式唤醒 | 引擎暴露 `notifyStepGateWake(sessionId)`，插件在任务完成时调用；等待改为 `race(sleep, wakeup)` | 插件需拿到 harness 引用；引擎要维护"会话 → 唤醒器"表，注意等待结束/中断时的清理 | 响应最及时，但引入一条新 API 与新的生命周期 |
+| C. 事件订阅 | 引擎订阅后台任务完成事件 | 引擎层会依赖具体插件的**事件名**，破坏"core 不碰具体插件"的边界 | 不建议 |
+
+方案 A 与现有注释"探测本身只是一次内存过滤，重探的成本可以忽略"是自洽的，
+**若要落地，A 优先**；B 只在 A 的粒度不够（如要求 <100ms 响应）时才值得引入。
