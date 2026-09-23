@@ -1,4 +1,238 @@
 # Agent Harness 开发日志
+
+## 2026-09-23（续 196）观察点 2/3/4/7/8/9 全部落地：单任务完成即唤醒 + 步间退避闸门 + 只读 bash + 中途草稿 + 跳过空压缩 + 免计步
+
+用户逐条定方向："2 改成单任务完成即入队；3 派任务后，会话每执行一轮都等一会再跑，考虑指数退避，
+例如先 3s, 6s 再 12s，最长 60s 之类的，等到最大后需要探测子任务是否存活。4 可以 7 可以 8 可以 9 可以"。
+续 195 只落了 1/5/6/10（正确性缺陷），剩 6 条属"s 策略 or 产品判断"，本轮全部闭环。
+
+### 一、观察点 2：barrier 拆出「单任务完成」事件（`coordinator` + `cli`）
+
+- 新增 `CoordinatorEvents.workerCompleted`（载荷 `{sessionId, taskId, status, remaining}`），
+  **仅 `remaining > 0` 才发** —— 最后一个任务仍走 `barrier.completed`，否则外层会注入两行 `<continue/>`。
+- **关键顺序**：`remaining` 必须在 `tracker.onWorkerFinished()` **之前**算 —— 后者在计数归零时会
+  `active.delete(parentSessionId)`，之后再问 `activeCount()` 恒为 0（"快任务完成也报 remaining=0"
+  ⇒ `workerCompleted` 永远发不出来）。
+- `attachAutoContinue` 同时订阅两条事件，卸载函数**两条都摘**；`coordinator.txt` 派工规则改为
+  "系统**不等全部任务结束**"，续轮段新增"**部分到达是常态**…不要因为'还差几个'就空转等待"。
+- 测试：coordinator 33 pass（+3 条）、cli 379 pass（+1 条）。
+
+### 二、观察点 3：步间闸门 + 指数退避（本轮最大改动；`core` + `plugin` + `subagent` + `cli`）
+
+**病根重新定性**：原观察点写作「任务通知注入 = maxSteps 额度重置」，但真病根不是"额度给少了"，
+而是**空转把额度烧光**（lead 撞顶两次共 60 步）。所以解法不是改额度语义，而是**让等待不耗步**。
+
+- 引擎层新 hook **`core.agent.step.gate`**：每步开跑前问插件"还有存活后台任务吗"，插件置
+  `decision.pending = true` 即等待。多插件语义是 **OR**，`aliveCount` 取最大。
+- 退避参数可注入（测试可压到毫秒）：`STEP_GATE_BACKOFF_MS = [3s, 6s, 12s, 24s, 48s, 60s]`、
+  累计上限 `STEP_GATE_MAX_TOTAL_MS = 300s`；宿主经 `AgentHarnessOptions.stepGate` /
+  `AgentRuntimeImpl.deps.stepGate` 覆盖。
+- **`stepGateDelayMs(NaN)` 的坑**：`Math.floor(NaN)` 是 NaN，`Math.max/min` 拦不住 ⇒ `ladder[NaN]`
+  返回 `undefined`（类型上还骗过了 `number`）。必须显式 `Number.isNaN(attempt) ? 0 : Math.floor(attempt)`。
+- **语义收紧为「每个步边界最多等一次」** —— 这是实测发现：`outcome.finish === 'tool_calls'` 本身就是
+  "续轮"判据，**干活的步没有机会等到对端**（它立刻发起下一轮）⇒ 闸门只在"空转步"前等才正确；
+  写成 `while (gateClosed)` 会在探针恒报存活时**无限卡死**（e2e 5000ms 超时）。
+- 等待**必须可见**（>15s 无输出要有心跳）：发 `step_gate` 流事件（载荷 `waitMs/waitedMs/attempt/
+  aliveCount/reason`）；CLI 新增 `waiting` 相位、`formatAgentPhase` 返回「等待后台任务」。
+- 插件侧实现（`subagent`）：**唯一地面真相是 `BackgroundTaskRegistry`**，只认 `pending` / `running`。
+- 终止条件依赖插件上报 ⇒ 引擎侧**必须有等待总预算兜底**（`maxTotalMs`）—— 硬约束。
+- 测试：新建 `packages/core/src/step-gate.test.ts` **15 pass**（L1 阶梯/NaN/空阶梯/decision 清洗；
+  L2 端到端 8 条：逐次发事件 / 静默即归零 / 每步重探 / 预算兜底 / `enabled:false` 连探测都不做 /
+  `maxSteps=1` 不触发 / 中断可打断 / 无插件行为不变）。
+
+### 三、观察点 4：只读哨兵给沙箱只读 bash（`bash_ro`，`tools-builtin`）
+
+- `wc` / `grep` / `python3 -c` 一类只读命令可用；**入参不可覆盖环境变量**（ENV 是绕过只读的后门，
+  实测注入被拒、退出码非 0）。
+- **测试坑**：新增的 `describe('bash_ro…')` 是**顶层** describe，不在外层
+  `describe('@harness/tools-builtin')` 里 ⇒ 外层 `beforeEach`（建 TMP_DIR）/`afterEach`（删 TMP_DIR）
+  **管不到它**，其他用例的 `afterEach` 已删掉 TMP_DIR ⇒ `writeFile` ENOENT、`spawn` 的 `cwd` 不存在
+  ⇒ `SPAWN_ERROR`。修法是给该 describe 补自己的 `beforeEach/afterEach`。
+- **类型坑**：`ToolResult` 是**非判别联合**（`ok: boolean` + 可选 `output?/error?`）⇒ `if (!r.ok)`
+  **不收窄**类型，断言要写 `r.error?.code` / `r.output?.exitCode`。
+- 测试：tools-builtin 83 pass（两处修复后 0 fail）。
+
+### 四、观察点 7：长任务中途草稿落盘（`subagent`）
+
+- `writeDraftFile(taskId, body, resultsDir)`：按 taskId **固定命名 + 覆盖写**（永远只有一份最新草稿）。
+- **触发点用「步边界」而不是定时器** —— 步边界本来就是天然刷盘点；草稿状态（`draftDigest`/`draftPath`）
+  必须声明在 `try` **之外**（catch 里要用 `flushDraft()`）。
+- **正常结束 `rmSync(draftPath, { force: true })`** ⇒ 于是「有草稿文件 ⇔ 这次被掐断」成为可判定的事实；
+  失败/超时路径把草稿路径 + **如实**的可读性说明（`describeDraftLocation`）拼进 `errorMessage`。
+- 落盘位置守既有约定：`{dataDir}/subagent-results/`，**不落 `os.tmpdir()`**（macOS 定期清理），**不落 cwd**。
+- 测试：subagent 143 pass（新增 3 条：掐断留稿 / 覆盖只一份 / 正常结束无残留）。
+
+### 五、观察点 8：跳过零收益空压缩（`acp-context` + `core`）
+
+零收益时（`createdBlocks:0 && tokensCompressed:0 && ranges:[{chars:0}]`）`compress` 改回
+**`ok:false + NO_EFFECT`**；core `compact()` 空窗口不生成摘要 ⇒ 省一次完整 LLM 调用。
+
+### 六、观察点 9：必填全缺的回喂免计一步（`core` + `plugin`）
+
+- **两套计数**：`billedSteps`（吃额度）与 `step`（展示步号）；`StepOutcome.selfHealOnly` 在"本步
+  `toolCalls` **全部**命中入参自愈"时置真（用 `selfHealIdx: Set<number>` 在 `[入参自愈]` 追加处
+  **单点登记**，漏出口只会更保守）。
+- **硬上限 `MAX_SELF_HEAL_FREE_STEPS = 3` 是必要兜底**：doom-loop 只认「同一工具+同一入参连续 3 次 /
+  连续 3 步整步签名相同」，**`A,B,A,B…` 交替空参能完美绕开它** ⇒ 免费额度必须有天花板，
+  否则会架空 `maxSteps` 这个唯一刹车。
+- `turn_end` 事件与 `core.agent.turn.end` hook 都带 `freeSteps`，解释"步号 ≠ 额度"。
+- 测试：`tool-arg-selfheal.test.ts` 8 pass（+4 条，含交替空参不无限循环：`freeSteps=3`、`provider.calls=6`）。
+
+### 七、验证
+
+- `bun run typecheck`：**39 包全 0 error**。
+- `bun run test`：**1884 pass / 0 fail**、39 包逐包跑、**`EXIT=0`**；较本轮起点（1840）**+44 条**。
+- 报告更新为 **92.5 KB**：观察点表 10 项全 `已修`、第十二章标题改「（十项）」+ 新增 6 行改动一览、
+  验证矩阵换新数字并新增 5 行、共同设计原则 4→9 条、附录补齐修复 5~10。
+
+### 八、复用要点
+
+- **"等对端"的闸门只在空转步前有意义** —— 一步只要产生 tool_calls 就会立刻续轮，给它加等待是无效的。
+- **事件载荷要用的计数，必须在会改它的那次调用之前取**（`remaining` vs `onWorkerFinished`）。
+- **任何"免费额度/豁免"都必须封顶**，并顺带检查它会不会绕开既有的循环守卫。
+- **草稿类落盘用"正常结束即删"编码语义**，比额外写状态标记可靠（文件存在性本身就是状态）。
+- 顶层 `describe` 不继承外层 `beforeEach/afterEach` —— 拆分测试块时最容易踩的一脚。
+- 本机两个小坑：`grep 'a\|b'` 在 BSD grep 下不可靠（用 Grep 工具）；**BSD awk 不支持三参
+  `match($0, re, arr)`**（聚合日志改用 Python）。
+
+---
+
+## 2026-09-23（续 195）四项修复：grep_file 契约 / throw 型失败遥测 / FEEDBACK.md 单列 / skill-forge 会话隔离 + 线上迁移
+
+用户："1、技能的也要修一下 2、选单列 FEEDBACK.md 3、还有其他优化的也一起优化"。
+
+### 修复 1：grep_file 契约错位（`packages/plugins/tools-search`）
+
+**根因不是"模型不会用工具"，是 schema 描述与实现直接矛盾**：`pattern` 描述原文写「要搜索的文本（**字面量**）」，
+实现却按 `new RegExp` 编译；`caseSensitive` 描述写「默认 false」实际默认 true。
+⇒ 改为：默认仍按正则；**编译失败自动退化为字面量再搜一次**，输出带 `mode:'literal'` + `notify` 说明
+（**不静默改口径**）；新增显式 `literal:true`；新增纯函数 `escapeRegExp()`；两处文案修正。
+测试 18 pass（删旧的"无效正则硬报错"1 条，新增 3 条）。
+
+### 修复 2：throw 型失败遥测盲区（`tool` / `core` / `telemetry`）
+
+- 关键设计：**不在 `safeExecuteTool` 的 catch 里补上报**（那会开出第二条实现路径、与 pipeline 漂移）；
+  改为在 pipeline 内部**把错误路径也接进 postHooks** —— `_throwToolFailureWithHooks()` 先归一化成失败
+  `ToolResult` 喂 hook，**然后原样 rethrow**（调用方仍按错误名判权限拒绝、模型看到的 message 不变）。
+  `ToolPermissionAskRequiredError` 是控制流信号，刻意不上报。
+- 新增 `normalizeToolError()` 作**全仓唯一**「错误 → ToolResult」映射点，core 的 `safeExecuteTool` 改为委托它。
+- Step 1/2 包进 try/catch；Step 3~6 的 dispatch 同样包 ⇒ 错误路径全部可达 Step 7
+  （`telemetry.permission.deny` 此前恒为 0 的成因同上）。domm-loop 两处短路手工补派发
+  （`_emitUnpipelinedToolFailure`）；`toolFailureEnvelope` 带上 `sessionId`。
+
+### 修复 3：feedback 单列 `FEEDBACK.md` 并改走尾部动态区（`memory` + `skill-forge`）
+
+用户选 C。理由：feedback 是**机器自动回写、时刻与用户的轮无关**，住 system 前缀区等于
+"一次工具报错换一次全量前缀失效"；尾部动态区不参与前缀缓存（代价是每轮全价，故条数/字节压到
+**5 条 / 800 B**，文件不存在时零成本）。
+
+- `renderFeedbackSection()`（尾部、逐条从最新往旧、超字节丢最旧）、`splitFeedbackEntries()`（迁移纯函数）、
+  `MemoryStore.rawText()/rewrite()`、`/memory migrate` 显式命令、`/memory path|show|list` 扩展。
+- `renderMemorySection()` 参数化（`MemorySectionStyle`），**默认措辞逐字不动**（那是前缀缓存的一部分）。
+- **顺带修的权限缺陷**：`writeAtomic` 的"临时文件 + rename"会把权限重置成 umask 默认（644）⇒ 迁移后
+  `FEEDBACK.md` 果然从 600 掉到 644。已 `chmodSync(tmp, 原 mode)` 再 rename
+  （`writeFileSync` 的 `mode` 会被 umask 掩掉，只有 chmod 准）。
+- skill-forge 的失败回写目标一并改指 `FEEDBACK.md`。
+- 测试：memory 88 pass（+19 条）。
+
+### 修复 4：skill-forge 延迟注入按会话隔离
+
+与 memory（续 194）同构：`Map<sessionId, SkillInjectScheduler>` + `mainSessions` 白名单
+（由 `core.prompt.system.transform` 登记）+ 缺 sessionId fail-closed。
+**额外堵住一条反向泄漏**：原 `takeDue()` 不判会话 ⇒ **子 Agent 建 prompt 会把主会话的待发布队列消费掉**
+（技能被"领走"却没注入主会话）。测试 57 pass（新增 6 条会话隔离，含"主会话自己 compress 照常发布"的正向对照）。
+
+### 线上迁移（一次性）
+
+`~/.harness/memory/MEMORY.md` 的 5 条 `[feedback]`（570 B）→ `FEEDBACK.md`（570 B，chmod 600）；
+备份 `MEMORY.md.bak-20260923-223151`；`MEMORY.md` 归 0 字节。迁移经 `/memory migrate` 显式发起
+（不静默改用户记忆文件）。
+
+---
+
+## 2026-09-23（续 194）查清并修掉「子 Agent 的压缩击穿主会话前缀缓存」（memory 发布器按会话隔离）
+
+用户问："memory 写入会击穿前缀缓存，但之前已实现新 memory 不直接进系统提示词。"
+结论：**分级注入（M3）没有失效，失效的是"谁有权按下发布键"。**
+
+### 根因（证据链闭合到字符级）
+
+1. **system 区「一次查询内不变」**：`core/src/index.ts:1993 _prepareQueryOnce`（"一次查询内**只做一次**的准备"）
+   → `PreparedQuery{sysParts,dynParts,systemStability}` 被该 turn 的每一轮复用 ⇒ 记忆段只在**轮边界**落地；
+   也解释了遥测 round 32~35 的 `systemChangedDetail`/`tailDynamicChars` **四行完全一样**（同一份对象）。
+2. **发布器/沉淀提示是 `install()` 的闭包局部量**，主会话与所有子 Agent 会话共用；而
+   `core.tool.post.execute` 里 `if (toolId === 'compress')` **无会话条件**（hook ctx 里一直有 `ctx.sessionId`）。
+3. 本 run **仅有的 2 次 compress 都在失败 reader `s_Markdown…t7oks` 会话**：19:42:55（未达阈值）、
+   19:43:23（成功，压缩 77,563 token）⇒ 主会话 `publisher.forced = true`。
+4. 19:43:47 skill-forge F3 把该 reader 的 2 条 grep 失败回写 `~/.harness/memory/MEMORY.md`（401 字符，+192）。
+5. turn 2 第一轮（round 32）重建 system 区 → `forced` → 直接发布 619 版
+   ⇒ `cacheMissReason: system-changed` / `prefixStableMessages: 0` / **`cacheDropTokens: 52,096`**（占该轮 87.7%）。
+
+### 复算（逐字符）
+
+- `renderMemorySection` 固定装饰 = **218 字符**；3 条 209 → 427、5 条 401 → 619，**与遥测逐位吻合**。
+- 前 3 条来源用"扫全部会话的错误串"定位：09-21 `s_…ra6w1`（read_file 越界）、09-22 `s_…9cq9r`（bash / subagent 未注册）
+  ⇒ **本会话 turn 1 起该段就是 427**，turn 1 全程缓存健康（没有"中途长出记忆段"这回事）。
+- **独立证据**：round 32 `tailDynamicChars = 270` == `buildReflectionHint(...)` 逐字长度；而主会话
+  `stats.compressionCount = 0` ⇒ 那句"刚刚发生了上下文压缩"是**子会话产生、主会话消费**的**假事实**
+  （正确性问题，不只是成本）。
+
+### 修复（`packages/plugins/memory/src/index.ts`）
+
+- `publishers: Map<sid, MemoryPublisher>` / `hints: Map<sid, string>` / `mainSessions: Set<sid>`；
+  `publisherFor()` 只为主会话惰性创建（数量与主会话数同阶，不被派工刷爆）。
+- compress 与 `core.session.compacting` 都加 `mainSessions.has(ctx.sessionId)`；**缺 sessionId 一律
+  fail-closed 不 flush**（代价不对称：晚发布几轮 vs 5 万 token 前缀报废）。
+- `turn.end` 只推进"确实发布过的主会话"；字段缺失时对所有已发布主会话各推进一格（保住"兜底不能变死代码"）。
+- `/memory add|reload|list` 同样只作用于发起会话。
+- 验证：memory **69 pass / 0 fail**（新增 7 条会话隔离回归，含正向对照）。
+
+---
+
+## 2026-09-23（续 193）会话 s_1790163574429_tg1a6 及遥测取证分析（产出报告，未改代码）
+
+用户："分析这个会话及遥测"。对象 = 19:39:34~19:46:39（425.2s）的 lead 会话，任务
+「分析 claude-code-analysis-main 并生成 html 文档」，模型 deepseek-flash，62 轮 / 68 消息 /
+输入 3,286,491 tok / 输出 46,971 / cacheRead 3,154,176（96.0%）。
+
+产出：`outputs/session-analysis/session-tg1a6-report.html`（54.9 KB）+ 可复用脚本
+`analyze_session.py`、`build_report.py`。
+
+### 四条发现（按硬度排序）
+
+1. **唯一缓存失效点 = `<memory>` 段中途变大**。round 32 遥测给到
+   `systemChangedDetail: ["第 2 段变化：427 → 619 字符（首行：「<memory>」）"]`、
+   `prefixChangedKind=mutated` + `cacheDropTokens=52096`。溯源到 `~/.harness/memory/MEMORY.md`（570 B）：
+   **后 2 条正是失败 subagent 产生的「grep_file 反复失败」feedback**，前 3 行包装 ≈427 字符、
+   5 行 ≈619 字符，数字吻合 ⇒ **一个 subagent 的工具报错 → 记忆写入 → 主会话 52K token 前缀缓存归零**。
+2. **`grep_file` 缺字面量语义** —— 43 次 `INVALID_REGEX`，模型想搜的是 markdown 链接语法
+   `](` `![` `](../` 这类**字面量**，被当正则编译。失败率 43/113=38%，该工具独吞 944,575 input token
+   （占该 subagent 输入的 66%）。错误消息里**无修正指引**。
+3. **两个 reader 同任务对照，结局相反**：成功者 36 轮 / 66.6s / grep 22 次 0 失败；失败者 35 轮 /
+   **119,916ms 撞后台 120s 硬超时** / grep 113 次 43 失败。**LLM 轮次几乎相同（36 vs 35），耗时差 1.8 倍**
+   ⇒ 瓶颈是工具形态不是模型。失败者另撞 `reader.md` 的 `maxSteps: 35` 上限，正在生成最终答复时被杀，
+   `tasksDone=0` —— **只读任务无中途落盘，成果全丢**；round 11 还有一次零收益空压缩
+   （`createdBlocks:0, tokensCompressed:0, ranges:[{chars:0}]`）。
+4. **遥测埋点错位**：`toolFailureEnvelope` 挂在 `core.tool.post.execute` = `ToolPipeline.execute()` 的 **Step 7**；
+   而 Step 1（`inputSchema.safeParse`）、Step 2（`validateInput`）、Step 3（preHook 洋葱）**失败即 throw，
+   跳过 Step 7** ⇒ **schema 校验类 / preHook 拦截类失败全部不上报**。证据：同会话 6 次「模型丢入参」
+   （`input={}`），bash 的 3 次（工具内部 `return`，code `COMMAND_REQUIRED`）上报了，read_file 的 3 次
+   （`throw` 后被 `safeExecuteTool` 归一化为 code `TOOL_ERROR`）**没上报**。
+
+### 顺带确认的两条工程事实
+
+- **`barrier` 等全部任务完成才发通知**：reader#2 19:43:10 完成，`barrier.completed` 19:44:03 才触发
+  （与最慢任务同毫秒）⇒ 快结果被拖 53s，就绪时 lead 已无活跃 query ⇒ 滞留到 19:45:06 用户敲「？」才注入。
+- **`<task-notification>` 注入会重置 maxSteps 额度**：lead 无 `maxSteps` ⇒ 走 `DEFAULT_MAX_STEPS=30`，
+  但本会话撞顶两次（msg31/msg66），两份额度共 60 步；通知以 `user` 角色注入 ⇒ 新 query ⇒ 计数从 0 重开。
+
+### ⚠️ 读遥测的口径陷阱（下次别再踩）
+
+- `~/.harness/sessions/run.telemetry.jsonl` 是**跨 run 累积**（1258 行 / 9 次 harness 初始化），不是单会话；
+  单会话口径要读 `sessions/<sid>.telemetry.jsonl`。混用两个文件的计数会得出荒谬结论。
+- **Grep 工具默认遵守 .gitignore ⇒ 搜不到 `dist/`**；要连构建产物一起搜得走 Bash 的 `grep -rn`。
+
+---
 ## 2026-09-22（续 192）TUI 三项：侧栏滚动条 / 统计加缓存命中率 / 选区闪烁与可点击复制
 
 用户："1、Tab 页实现滚动条 2、tab 统计信息增加缓存命中率 3、鼠标选区时能否增加选中文字闪烁，

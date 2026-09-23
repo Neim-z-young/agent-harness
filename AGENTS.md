@@ -151,6 +151,16 @@
 
 - 文档索引：架构 `docs/agent-harness-architecture.md`、开发日志 `docs/development-log.md`、工作区模块 `docs/workspace-management.md`、代码情报插件规划 `docs/codeintel-plugin.md`、MCP 服务使用 `docs/mcp-services.md`、ACP 压缩配置参考 `docs/acp-context-config.md`
 
+- **步间闸门 `core.agent.step.gate`（引擎层）只在"空转步"前有意义**：一步只要产生 `tool_calls` 就会**立刻续轮**（`outcome.finish === 'tool_calls'` 本身就是续轮判据），**没有机会等到对端** ⇒ 每步开跑前询问"还有存活后台任务吗"、`decision.pending = true` 即按退避阶梯等待，**语义是「每个步边界最多等一次」**（写成 `while (gateClosed)` 会在对端恒报存活时无限卡死）。多插件合并是 **OR**、`aliveCount` 取最大；**引擎侧必须有等待总预算兜底**（`STEP_GATE_MAX_TOTAL_MS`），不能把终止条件全托给插件。默认阶梯 `[3s,6s,12s,24s,48s,60s]`，可经 `AgentHarnessOptions.stepGate` 注入覆盖（测试压到毫秒级）。等待**必须发 `step_gate` 事件**（>15s 无输出要有心跳）、CLI 进 `waiting` 相位。纯函数 `stepGateDelayMs(n)` 对 `NaN` 必须显式落 0 档——`Math.floor(NaN)` 是 NaN，索引出 `undefined` 且类型上不报错
+
+- **`coordinator.worker.completed`（单任务完成即唤醒）与 `barrier.completed`（全波收尾）是两条事件**：前者**仅在 `remaining > 0` 时发**（最后一个走 barrier），否则外层会注入两行 `<continue/>`。**`remaining` 必须在 `tracker.onWorkerFinished()` 之前算** —— 后者在计数归零时会 `active.delete`，之后再问 `activeCount()` 恒为 0（"快任务完成也报 0"⇒ 事件永远发不出来）
+
+- **"免费额度 / 豁免"一律必须封顶**：`MAX_SELF_HEAL_FREE_STEPS = 3` 是「必填全缺回喂免计一步」的必要兜底 —— doom-loop 只认「同一工具+同一入参连续 3 次 / 连续 3 步整步签名相同」，**`A,B,A,B…` 交替空参能完美绕开它**；不加天花板就会架空 `maxSteps` 这个唯一刹车。`billedSteps`（吃额度）与 `step`（展示步号）是两套计数，`turn_end` 带 `freeSteps` 解释二者为何不一致
+
+- **中途草稿用"正常结束即删"编码语义**（比额外维护状态标记可靠）：文件存在性本身就是状态 ⇒ **有草稿 ⇔ 这次被掐断**。触发点用**步边界**而非定时器（步边界本就是天然刷盘点）；按 taskId 固定命名 + 覆盖写（同毫秒并发不撞名）；草稿状态必须声明在 `try` **之外**（catch 要用）。落盘仍守既有约定：`{dataDir}/subagent-results/`，**不落 `os.tmpdir()`、不落 cwd**；失败路径给的可读性说明必须**如实**（能不能被 `read_file` 读到要实测判定，不猜）
+
+- **测试块约定：顶层 `describe` 不继承外层 `beforeEach/afterEach`** —— 往已有测试文件里追加独立 `describe` 时若忘了自带 setup/cleanup，会因外层 `afterEach` 已清掉临时目录而 ENOENT/`SPAWN_ERROR`（表现为"新写的用例莫名失败"）。另：`ToolResult` 是**非判别联合**（`ok: boolean` + 可选 `output?/error?`），`if (!r.ok)` **不收窄**类型，断言写 `r.error?.code` / `r.output?.exitCode`
+
 ## 5. 工程约定
 
 - 自定义错误类定义在各模块（`*Error`），不抛裸字符串
