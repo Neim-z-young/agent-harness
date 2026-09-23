@@ -10,6 +10,10 @@ import {
   createToolsBuiltinPlugin,
   toolsBuiltinPlugin,
   builtinTools,
+  readOnlyBashTool,
+  createReadOnlyBashTool,
+  checkReadOnlyCommand,
+  DEFAULT_READONLY_COMMANDS,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
@@ -701,8 +705,152 @@ describe('@harness/tools-builtin', () => {
       await h.stop()
     })
 
-    it('builtinTools 导出包含四个原语工具', () => {
-      expect(builtinTools.map((t) => t.id).sort()).toEqual(['bash', 'edit_file', 'read_file', 'write_file'])
+    it('builtinTools 导出包含四个原语工具 + 只读 bash（bash_ro 供只读哨兵用）', () => {
+      expect(builtinTools.map((t) => t.id).sort()).toEqual(['bash', 'bash_ro', 'edit_file', 'read_file', 'write_file'])
+      // bash_ro 必须**恒只读** —— 只读哨兵（@readonly）是按 isReadOnly() 展开的，
+      // 它一旦不是 true，reader 类 Agent 就又拿不到任何 shell 了。
+      expect(readOnlyBashTool.isReadOnly?.()).toBe(true)
+      expect(readOnlyBashTool.isConcurrencySafe?.()).toBe(true)
+      expect(readOnlyBashTool.isDestructive?.()).toBe(false)
+      // bash 本身仍是"可写"语义（只读能力由独立工具承担，不给 bash 加开关）
+      expect(bashTool.isReadOnly?.()).toBe(false)
     })
+  })
+})
+
+// ===== 只读 bash（bash_ro）—— 观察点 4 =====
+//
+// 背景：只读哨兵 `@readonly` 是按 `isReadOnly()` 展开的，而 bash 是 false ⇒ 缺省 tools 的
+// Agent（reader 类）**一个 shell 都拿不到**。真机 s_1790163574429_tg1a6：成功那个 reader
+// 在报告开头自述「本轮工具集无命令执行能力（白名单仅 read_file / list_dir / glob / grep_file），
+// 无法运行 wc/python3」，它的统计章节只能标注"未覆盖" —— 量化盘点类任务天生残废。
+// 这里固定"只读哨兵能拿到一个被约束住的只读 shell"。
+describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
+  // 本段是**顶层** describe（不在 `@harness/tools-builtin` 里面），所以外层的
+  // beforeEach/afterEach 管不到 —— 得自己建/清 TMP_DIR。
+  // （踩过：漏了这两句 ⇒ TMP_DIR 不存在 ⇒ writeFile ENOENT、spawn 的 cwd 不存在 ⇒ SPAWN_ERROR。）
+  beforeEach(async () => {
+    await mkdir(TMP_DIR, { recursive: true })
+  })
+
+  afterEach(async () => {
+    await rm(TMP_DIR, { recursive: true, force: true })
+  })
+
+  describe('checkReadOnlyCommand：白名单 + 结构性写入通道', () => {
+    it('放行读 / 算 / 查类命令（含管道与分号链接）', () => {
+      for (const cmd of [
+        'wc -l README.md',
+        'grep -rn "foo" packages/',
+        'cat a.txt',
+        'ls -la',
+        'find . -name "*.ts" -type f',
+        'git log --oneline -20',
+        'git -C /tmp log',
+        'git --version',
+        'python3 -c "print(len(open(\'a.txt\').read()))"',
+        'grep -c x a.txt | wc -l',
+        'wc -l a.txt; head -3 b.txt',
+      ]) {
+        expect({ cmd, ...checkReadOnlyCommand(cmd) }).toEqual({ cmd, ok: true })
+      }
+    })
+
+    it('拒绝输出重定向（> / >> / 2>）——写文件的第一通道', () => {
+      expect(checkReadOnlyCommand('wc -l a.txt > out.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_REDIRECT' })
+      expect(checkReadOnlyCommand('cat a.txt >> out.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_REDIRECT' })
+      expect(checkReadOnlyCommand('ls 2> err.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_REDIRECT' })
+      // 但 fd 复制（2>&1）不写文件，不该被误伤
+      expect(checkReadOnlyCommand('ls -la 2>&1')).toMatchObject({ ok: true })
+    })
+
+    it('拒绝命令替换 / 进程替换 / heredoc —— 藏在参数里的第二条命令', () => {
+      expect(checkReadOnlyCommand('cat $(rm -rf /)')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SUBST' })
+      expect(checkReadOnlyCommand('cat `whoami`')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SUBST' })
+      expect(checkReadOnlyCommand('diff <(ls) <(ls)')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SUBST' })
+      expect(checkReadOnlyCommand('cat <<EOF')).toMatchObject({ ok: false, code: 'SANDBOX_RO_HEREDOC' })
+    })
+
+    it('拒绝提权与系统控制命令', () => {
+      expect(checkReadOnlyCommand('sudo ls')).toMatchObject({ ok: false })
+      expect(checkReadOnlyCommand('ls; osascript -e "tell app"')).toMatchObject({ ok: false, code: 'SANDBOX_RO_PRIV' })
+    })
+
+    it('多段链路里只要有一段越界就整体拒绝（不能借管道夹带写操作）', () => {
+      expect(checkReadOnlyCommand('wc -l a.txt && rm a.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      expect(checkReadOnlyCommand('cat a.txt | tee b.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      expect(checkReadOnlyCommand('ls; touch new.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      expect(checkReadOnlyCommand('xargs rm')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+    })
+
+    it('参数级禁区：首命令合法但开关会写', () => {
+      expect(checkReadOnlyCommand('sed -i s/a/b/ f.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      expect(checkReadOnlyCommand('find . -name x -delete')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      expect(checkReadOnlyCommand('sort -o out.txt in.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      // 同一命令不带写开关时要放行
+      expect(checkReadOnlyCommand('sed s/a/b/ f.txt')).toMatchObject({ ok: true })
+      expect(checkReadOnlyCommand('find . -name x')).toMatchObject({ ok: true })
+    })
+
+    it('git 只放行只读子命令', () => {
+      expect(checkReadOnlyCommand('git push origin main')).toMatchObject({ ok: false, code: 'SANDBOX_RO_ALLOWLIST' })
+      expect(checkReadOnlyCommand('git commit -m x')).toMatchObject({ ok: false })
+      expect(checkReadOnlyCommand('git tag v1')).toMatchObject({ ok: false }) // 少给能力，不留"看似只读实则能写"的口子
+      expect(checkReadOnlyCommand('git diff HEAD')).toMatchObject({ ok: true })
+      expect(checkReadOnlyCommand('git status')).toMatchObject({ ok: true })
+    })
+
+    it('解释器：纯计算放行，出现写/网特征即拒绝', () => {
+      expect(checkReadOnlyCommand('python3 -c "print(1+1)"')).toMatchObject({ ok: true })
+      expect(checkReadOnlyCommand('python3 -c "open(\'x\',\'w\').write(1)"')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SCRIPT' })
+      expect(checkReadOnlyCommand('python3 -c "import os; os.remove(\'x\')"')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SCRIPT' })
+      expect(checkReadOnlyCommand('python3 -c "import requests; requests.get(\'http://x\')"')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SCRIPT' })
+      expect(checkReadOnlyCommand('node -e "require(\'child_process\').exec(\'rm -rf /\')"')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SCRIPT' })
+      expect(checkReadOnlyCommand('node -e "require(\'fs\').writeFileSync(\'a\',\'x\')"')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SCRIPT' })
+    })
+
+    it('空命令给可执行的指引，而不是静默通过', () => {
+      const v = checkReadOnlyCommand('   ')
+      expect(v.ok).toBe(false)
+      if (!v.ok) expect(v.code).toBe('COMMAND_REQUIRED')
+    })
+
+    it('默认白名单里不含任何能"顺手写一下"的命令', () => {
+      for (const forbidden of ['rm', 'mv', 'cp', 'tee', 'dd', 'truncate', 'curl', 'wget', 'ssh', 'chmod', 'xargs', 'npm', 'make']) {
+        expect(DEFAULT_READONLY_COMMANDS as readonly string[]).not.toContain(forbidden)
+      }
+    })
+  })
+
+  it('bash_ro 真跑一条只读命令并回 stdout', async () => {
+    await writeFile(join(TMP_DIR, 'sample.txt'), 'l1\nl2\nl3\n', 'utf-8')
+    const r = await readOnlyBashTool.call({ command: 'wc -l sample.txt' }, makeCtx())
+    expect(r.ok).toBe(true)
+    expect(r.output?.exitCode).toBe(0)
+    expect(String(r.output?.stdout)).toContain('3 sample.txt')
+  })
+
+  it('bash_ro 拒绝写命令：文件根本没被创建（失败是"没执行"，不是"执行后报错"）', async () => {
+    const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
+    const outPath = join(TMP_DIR, 'should-not-exist.txt')
+    const r = await tool.call({ command: `echo hi > ${outPath}` }, makeCtx())
+    expect(r.ok).toBe(false)
+    expect(r.error?.code).toBe('SANDBOX_RO_REDIRECT')
+    expect(existsSync(outPath)).toBe(false)
+  })
+
+  it('bash_ro 不接受入参覆盖环境变量（ENV 是绕过只读的后门）', async () => {
+    const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
+    const r = await tool.call(
+      // schema 里本就没有 env 字段；这里模拟模型硬塞
+      { command: 'printenv EVIL', env: { EVIL: 'pwned' } } as never,
+      makeCtx(),
+    )
+    // `ok` 只表示"命令跑起来了"（与退出码无关，见 runBash 的 ok 语义），所以这里 ok 应为 true。
+    expect(r.ok).toBe(true)
+    // 两个一起看：① stdout 里没有注入的值；② 退出码非 0 ⇒ printenv 确实找不到 EVIL，
+    // 证明"没被注入"而不是"命令没跑"。
+    expect(String(r.output?.stdout)).not.toContain('pwned')
+    expect(r.output?.exitCode).not.toBe(0)
   })
 })

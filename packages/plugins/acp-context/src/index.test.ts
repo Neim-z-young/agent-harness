@@ -8,6 +8,7 @@ import {
   defaultConfig,
   refForRaw,
   activeBlocks,
+  assignRefs,
   type Config,
   type CompressionState,
   type CompressionBlock,
@@ -22,6 +23,7 @@ import {
   collectCoveredIds,
   blockSpan,
   coveredSpan,
+  measureRangeChars,
   createAcpContextPlugin,
   ACP_META_KEY,
   ACP_ARCHIVE_KEY,
@@ -1093,4 +1095,150 @@ test('尾部动态块：core 传入的 dynamicParts 被记为规模，且每轮�
   dyn.length = 0
   await h.run(history(3))
   expect((h.ctx as unknown as { lastTailDyn?: unknown }).lastTailDyn).toBeUndefined()
+})
+
+
+// ===== 观察点 8：零收益空压缩 =====
+//
+// 真机 reader#1 round 11：`createdBlocks:0, tokensCompressed:0, ranges:[{chars:0}]`
+// —— 模型调了 compress、内核一个块都没建（范围已被覆盖/太小/ref 未知），
+// 但工具回的是 `ok: true` + output.errors，模型倾向于把它当成功继续；而遥测里
+// `ranges[].chars` 恒为 0（插件写死），"模型要求折叠多少内容"根本测不出来，
+// 于是零收益压缩与"真折了一大段"在遥测里长得一模一样。两条都修在这里。
+
+test('measureRangeChars：按压缩前 ref 真实统计区间字符数（此前恒为 0）', () => {
+  const cores: CoreMessage[] = [
+    { id: 'c1', role: 'user', contentType: 'text', text: 'aaaa' },
+    { id: 'c2', role: 'assistant', contentType: 'text', text: 'bbbbbb' },
+    { id: 'c3', role: 'user', contentType: 'text', text: 'cc' },
+  ]
+  const { map } = assignRefs(cores, { existing: createInitialState().messageRefs, nextIndex: 1 })
+  const state = { ...createInitialState(), messageRefs: map }
+  const stats = measureRangeChars(state, cores, [
+    { topic: '前两条', startRef: refForRaw(map, 'c1')!, endRef: refForRaw(map, 'c2')! },
+    { topic: '第三条', startRef: refForRaw(map, 'c3')!, endRef: refForRaw(map, 'c3')! },
+    { topic: 'ref 解析不出', startRef: 'nope', endRef: 'nope2' },
+  ])
+  expect(stats.map((s) => s.chars)).toEqual([10, 2, 0])
+  expect(stats.map((s) => s.topic)).toEqual(['前两条', '第三条', 'ref 解析不出'])
+})
+
+async function pluginWithCompressTool(config?: Config): Promise<{ hooks: Hooks; tools: Map<string, any> }> {
+  const plugin = createAcpContextPlugin({
+    modelContextLimit: 20000,
+    ...(config ? { config } : {}),
+  })
+  const tools = new Map<string, any>()
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+  await (hooks['core.tool.pool.assemble']! as any)({} as any, { add: (t: any) => tools.set(t.id, t) })
+  return { hooks, tools }
+}
+
+function toolCtx(sessionId: string): any {
+  return {
+    sessionId,
+    agentId: 'a',
+    messageId: 'mm',
+    toolUseId: 'tu',
+    signal: new AbortController().signal,
+    variables: {},
+    cwd: process.cwd(),
+    requestPermission: async () => ({ behavior: 'allow' }),
+  }
+}
+
+/** 从渲染后的消息里抓出内核注入的 ref 标签（形如 `<acp …>m00007</acp>`） */
+function refsIn(messages: Message[]): string[] {
+  const out: string[] = []
+  for (const m of messages) {
+    for (const p of m.parts as Array<{ type?: string; text?: string }>) {
+      if (p?.type !== 'text' || typeof p.text !== 'string') continue
+      for (const mm of p.text.matchAll(/<acp[^>]*>(m\d+)<\/acp>/g)) out.push(mm[1]!)
+    }
+  }
+  return out
+}
+
+test('compress 工具：零收益时回**失败**结果（NO_EFFECT），并把内核说明原样带给模型', async () => {
+  const { hooks, tools } = await pluginWithCompressTool(makeConfig())
+  const messages = history(12)
+  await (hooks['core.session.preModel']! as any)(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+    messages,
+  )
+  // ref 全部未知 ⇒ 内核必然零收益（这条路径不依赖 minCompressRange 配置，稳定）
+  const r = await tools.get('compress')!.call(
+    { content: [{ startId: 'm99001', endId: 'm99002', summary: '无论写什么都不会生效' }] },
+    toolCtx('s'),
+  )
+  expect(r.ok).toBe(false)
+  expect(r.error.code).toBe('NO_EFFECT')
+  expect(r.error.message).toContain('零收益')
+  expect(r.error.message).toContain('内核说明') // 内核的 gate 说明原样回喂，不是被吞掉
+  expect(r.error.message).toContain('acp_status') // 给下一步动作，避免模型反复撞同一面墙
+})
+
+test('compress 工具：成功折叠时回 charsCompressed（可判断这次调用有没有价值）', async () => {
+  const { hooks, tools } = await pluginWithCompressTool(makeConfig())
+  const messages = history(12)
+  await (hooks['core.session.preModel']! as any)(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+    messages,
+  )
+  const refs = refsIn(messages)
+  expect(refs.length).toBeGreaterThanOrEqual(6)
+  const r = await tools.get('compress')!.call(
+    { content: [{ topic: 'zhe', startId: refs[1]!, endId: refs[4]!, summary: '自包含摘要' }] },
+    toolCtx('s'),
+  )
+  expect(r.ok).toBe(true)
+  expect(r.output.blocksCreated).toBe(1)
+  expect(r.output.charsCompressed).toBeGreaterThan(0)
+})
+
+test('遥测：零收益压缩标 zeroYield，成功压缩不标（且 ranges.chars 真实非 0）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'acp-zero-'))
+  const path = join(dir, 's.telemetry.jsonl')
+  const plugin = createAcpContextPlugin({
+    modelContextLimit: 20000,
+    config: makeConfig(),
+    telemetryPathBuilder: () => path,
+  })
+  const tools = new Map<string, any>()
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+  await (hooks['core.tool.pool.assemble']! as any)({} as any, { add: (t: any) => tools.set(t.id, t) })
+
+  const messages = history(12)
+  await (hooks['core.session.preModel']! as any)(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+    messages,
+  )
+  const refs = refsIn(messages)
+
+  // 一次成功、一次零收益
+  await tools.get('compress')!.call(
+    { content: [{ startId: refs[1]!, endId: refs[4]!, summary: '摘要 A' }] },
+    toolCtx('s'),
+  )
+  await tools.get('compress')!.call(
+    { content: [{ startId: 'm99001', endId: 'm99002', summary: '摘要 B' }] },
+    toolCtx('s'),
+  )
+
+  // 遥测写入器有 500ms debounce：用 uninstall 的 flush 收口，别靠 sleep
+  await plugin.uninstall?.()
+
+  const events = readFileSync(path, 'utf-8')
+    .trim()
+    .split('\n')
+    .map((l) => JSON.parse(l))
+    .filter((e) => e.kind === 'compress')
+  expect(events).toHaveLength(2)
+  // 成功那次：真实字符数、无 zeroYield
+  expect(events[0].createdBlocks).toBe(1)
+  expect(events[0].ranges[0].chars).toBeGreaterThan(0)
+  expect(events[0].zeroYield).toBeUndefined()
+  // 零收益那次：chars 为 0（ref 不可解析）+ 显式标 zeroYield
+  expect(events[1].createdBlocks).toBe(0)
+  expect(events[1].zeroYield).toBe(true)
 })

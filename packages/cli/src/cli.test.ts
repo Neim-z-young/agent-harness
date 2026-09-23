@@ -2244,6 +2244,41 @@ describe('Coordinator 自动续轮 attachAutoContinue', () => {
   })
 
   /**
+   * 观察点 2：`barrier.completed` 只在**全部**任务结束时发 —— 真机 s_1790163574429_tg1a6 里
+   * 快任务 19:43:10 就完成了，barrier 到 19:44:03 才触发，快结果被慢任务拖了 53 秒。
+   * coordinator 因此补了一条「单个任务完成」事件，这里固定"它也能唤醒续轮"。
+   */
+  it('coordinator.worker.completed（单任务完成）同样触发注入 <continue/>，且卸载函数两条都摘', async () => {
+    const chunks: string[] = []
+    const stdout = { write: (s: string) => { chunks.push(s) } }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+    const { harness } = await app.boot()
+
+    const injected: string[] = []
+    const detach = attachAutoContinue(harness, (line) => injected.push(line))
+    await harness.bus.publish(CoordinatorEvents.workerCompleted, {
+      sessionId: 's_parent', taskId: 'task-a', status: 'completed', remaining: 2,
+    } as any)
+    expect(injected).toEqual(['<continue/>'])
+
+    // 卸载必须把**两条**订阅都摘掉：只摘一条会让"已在后台等待唤醒"的订阅泄漏到下一次装配
+    detach()
+    await harness.bus.publish(CoordinatorEvents.workerCompleted, {
+      sessionId: 's_parent', taskId: 'task-b', status: 'completed', remaining: 1,
+    } as any)
+    await harness.bus.publish(CoordinatorEvents.barrierCompleted, {
+      sessionId: 's_parent', taskIds: ['task-a', 'task-b'],
+    } as any)
+    expect(injected).toEqual(['<continue/>'])
+
+    await app.shutdown()
+  })
+
+  /**
    * 自动续轮（`<continue/>`）的空转识别。
    *
    * 内部循环上线后，一次自动续轮可能跑多步（每步都是一次模型调用），所以

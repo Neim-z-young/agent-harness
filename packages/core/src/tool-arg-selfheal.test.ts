@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test'
-import type { AgentDefinition, ChatProvider, ChatStreamChunk, Message } from './index'
-import { createHarness, defineTool } from './index'
+import type { AgentDefinition, AgentStreamEvent, ChatProvider, ChatStreamChunk, Message } from './index'
+import { createHarness, defineTool, MAX_SELF_HEAL_FREE_STEPS } from './index'
 import { withJsonSchema } from '@harness/tool'
 
 /**
@@ -187,6 +187,160 @@ describe('入参自愈：零参数工具调用时把必填参数摆给模型', (
     }
     expect(msg).toBe('随便失败了')
     expect(msg).not.toContain('[入参自愈]')
+    await h.stop()
+  })
+})
+
+// ===== 观察点 9：必填全缺的回喂步免计额度 =====
+//
+// 动机：这类步的产出只有一条 `[入参自愈]` 说明 + 模型的一次重试，等于把额度花在"把参数写全"上。
+// 真机 lead 6 次 `input={}`（bash×3 / read_file×3）就是 6 步额度，一个字的结果都没产出。
+
+/** 第二个带必填的工具：用来演示"交替空参"（单一工具会先被 doom-loop 拦掉） */
+const needPathTool = defineTool({
+  id: 'need_path',
+  description: '需要一个 path 参数',
+  inputSchema: withJsonSchema(
+    {
+      parse: (v: unknown) => v as { path: string },
+      safeParse: (v: unknown) => ({ success: true as const, data: v as { path: string } }),
+    },
+    {
+      type: 'object',
+      properties: { path: { type: 'string', description: '文件路径' } },
+      required: ['path'],
+      additionalProperties: false,
+    },
+  ),
+  isReadOnly: () => true,
+  async call(input: { path?: string }) {
+    if (!input?.path) {
+      return { ok: false as const, error: { message: '缺少 path', code: 'PATH_REQUIRED' } }
+    }
+    return { ok: true as const, output: { path: input.path } }
+  },
+})
+
+/** 造一段「调用 a（空参）→ 调用 b（空参）→ …」的交替空参剧本，共 n 步 */
+function alternatingEmptyCalls(n: number): ChatStreamChunk[][] {
+  const out: ChatStreamChunk[][] = []
+  for (let i = 0; i < n; i++) {
+    const id = i % 2 === 0 ? 'need_cmd' : 'need_path'
+    out.push([
+      { type: 'tool_use_start', toolUseId: `tu_${i}`, toolId: id },
+      { type: 'tool_use_delta', inputDelta: '{}' },
+      { type: 'tool_use_stop', toolUseId: `tu_${i}` },
+      { type: 'done', model: 'm', finish: 'tool_calls', finishRaw: 'tool_calls' },
+    ])
+  }
+  return out
+}
+
+describe('入参自愈的额度代价：必填全缺的回喂步免计（有上限）', () => {
+  it('全是空参调用的步不吃额度：maxSteps=2 也能跑完 3 步（第 3 步是真正的收尾）', async () => {
+    const script = [
+      ...alternatingEmptyCalls(2),
+      [
+        { type: 'text_delta', text: '参数补齐了' },
+        { type: 'done', model: 'm', finish: 'stop', finishRaw: 'stop' },
+      ],
+    ]
+    const provider = scriptedProvider(script)
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(needCmdTool)
+    h.tools.register(needPathTool)
+    const sess = await h.session.create()
+
+    const events: AgentStreamEvent[] = []
+    for await (const ev of h.session.promptStream(sess.id, '跑一下', 2)) events.push(ev)
+
+    // 改造前：2 步额度被两次空参回喂吃光，第 3 次模型调用根本不会发生
+    expect(provider.calls).toBe(3)
+    const dones = events.filter((e) => e.type === 'done')
+    expect(dones.map((d) => d.step)).toEqual([1, 2, 3]) // 展示步号照常单调递增
+    const turnEnd = events.find((e) => e.type === 'turn_end')
+    expect(turnEnd?.freeSteps).toBe(2) // 免计 2 步：步号 3 但只花了 1 步额度
+    await h.stop()
+  })
+
+  it('免计有硬上限（MAX_SELF_HEAL_FREE_STEPS）：交替空参不会变成无限循环', async () => {
+    // 剧本给足 10 步交替空参；真实上限是 3 ⇒ 之后每一步都正常吃额度，
+    // maxSteps=2 的额度随即耗尽（若上限失效，这个用例会一直跑到 bun 超时）
+    const provider = scriptedProvider(alternatingEmptyCalls(10))
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(needCmdTool)
+    h.tools.register(needPathTool)
+    const sess = await h.session.create()
+
+    const events: AgentStreamEvent[] = []
+    for await (const ev of h.session.promptStream(sess.id, '跑一下', 2)) events.push(ev)
+
+    expect(MAX_SELF_HEAL_FREE_STEPS).toBe(3)
+    const turnEnd = events.find((e) => e.type === 'turn_end')
+    // 恰好免 3 步，多一步都不免
+    expect(turnEnd?.freeSteps).toBe(3)
+    // 循环确实终止了：额度耗尽后还会给一次收尾机会（MAX_STEPS_WRAP_UP）
+    expect(provider.calls).toBe(6)
+    await h.stop()
+  })
+
+  it('一步里有任何一个工具真的执行了 ⇒ 这一步照常吃额度（只有全缺才免）', async () => {
+    // 同一步两个调用：一个空参（会被自愈）、一个必填给齐（业务失败但**不是**缺参）
+    const provider = scriptedProvider([
+      [
+        { type: 'tool_use_start', toolUseId: 'tu_1', toolId: 'need_cmd' },
+        { type: 'tool_use_delta', inputDelta: '{}' },
+        { type: 'tool_use_stop', toolUseId: 'tu_1' },
+        { type: 'tool_use_start', toolUseId: 'tu_2', toolId: 'need_cmd' },
+        { type: 'tool_use_delta', inputDelta: '{"command":"ls"}' },
+        { type: 'tool_use_stop', toolUseId: 'tu_2' },
+        { type: 'done', model: 'm', finish: 'tool_calls', finishRaw: 'tool_calls' },
+      ],
+      [
+        { type: 'text_delta', text: '结束' },
+        { type: 'done', model: 'm', finish: 'stop', finishRaw: 'stop' },
+      ],
+    ])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(needCmdTool)
+    const sess = await h.session.create()
+
+    const events: AgentStreamEvent[] = []
+    for await (const ev of h.session.promptStream(sess.id, '跑一下', 1)) events.push(ev)
+
+    // maxSteps=1 ⇒ 第 1 步就吃满额度，不再续轮
+    expect(provider.calls).toBe(1)
+    const turnEnd = events.find((e) => e.type === 'turn_end')
+    expect(turnEnd?.freeSteps).toBeUndefined()
+    await h.stop()
+  })
+
+  it('必填给齐后正常执行 ⇒ 后续步照常吃额度（免计只覆盖"补齐参数"的那一步）', async () => {
+    const provider = scriptedProvider([
+      ...alternatingEmptyCalls(1), // 第 1 步：空参（免计）
+      [
+        { type: 'tool_use_start', toolUseId: 'tu_ok', toolId: 'need_path' },
+        { type: 'tool_use_delta', inputDelta: '{"path":"a.ts"}' },
+        { type: 'tool_use_stop', toolUseId: 'tu_ok' },
+        { type: 'done', model: 'm', finish: 'tool_calls', finishRaw: 'tool_calls' },
+      ],
+      [
+        { type: 'text_delta', text: '结束' },
+        { type: 'done', model: 'm', finish: 'stop', finishRaw: 'stop' },
+      ],
+    ])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(needCmdTool)
+    h.tools.register(needPathTool)
+    const sess = await h.session.create()
+
+    const events: AgentStreamEvent[] = []
+    for await (const ev of h.session.promptStream(sess.id, '跑一下', 2)) events.push(ev)
+
+    // step1 免计（额度 0/2）→ step2 吃 1 步（1/2）→ step3 吃第 2 步（2/2）→ 收尾步
+    expect(provider.calls).toBe(3)
+    const turnEnd = events.find((e) => e.type === 'turn_end')
+    expect(turnEnd?.freeSteps).toBe(1)
     await h.stop()
   })
 })

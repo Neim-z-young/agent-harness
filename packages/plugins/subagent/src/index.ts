@@ -39,7 +39,7 @@ import type { AgentRuntime, SessionManager } from '@harness/core'
 import type { Message } from '@harness/session'
 import { BusEvent, type Bus } from '@harness/bus'
 import { matchGlob } from '@harness/permission'
-import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync } from 'node:fs'
+import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync, rmSync } from 'node:fs'
 import { mkdir, writeFile, appendFile } from 'node:fs/promises'
 import { join, dirname, resolve as resolvePath, sep } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -275,6 +275,13 @@ export interface SubagentPluginOptions {
    * 注意**子 Agent 自己的 `AgentDefinition.maxSteps` 优先**（md 定义的子 Agent 可显式覆盖）。
    */
   maxSteps?: number
+  /**
+   * 长任务中途草稿的落盘间隔（毫秒，缺省 {@link DRAFT_FLUSH_INTERVAL_MS} = 15s）。
+   *
+   * 见 observe 7：子 Agent 超时被掐断时成果会全丢，草稿是唯一留存。宿主的 `timeoutMs`
+   * 口径不同（默认 120s，有的宿主配 10 分钟），合适的草稿密度随之不同 —— 所以可配。
+   */
+  draftFlushIntervalMs?: number
 }
 
 /**
@@ -496,6 +503,56 @@ function isInsideDir(p: string, dir?: string): boolean {
   return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep)
 }
 
+// ===== 长任务中途草稿（观察点 7）=====
+
+/**
+ * 中途草稿的落盘间隔（毫秒）。
+ *
+ * 15s 的来历：子 Agent 默认超时 120s ⇒ 一个"跑到被掐断"的长任务能留下约 7 个版本，
+ * 足够覆盖"工具都跑完了、只差最后那次总结"的那段（真机 reader#1 正是在 119,916ms
+ * 被掐断，差的就是总结那一步）。间隔太小会让只读盘点类任务频繁同步写盘，
+ * 太大则可能一次都留不下。
+ */
+export const DRAFT_FLUSH_INTERVAL_MS = 15_000
+
+/** 草稿正文上限（字符）：草稿是"防止全丢"的保险，不是完整档案（完整结果另有全文落盘） */
+export const DRAFT_MAX_CHARS = 20_000
+
+/**
+ * 写中途草稿，返回实际路径（连临时目录都写不进去时返回 undefined）。
+ *
+ * 文件名**按 taskId 固定**（不加时间戳）：同一任务反复覆盖同一份草稿，路径稳定、好找、
+ * 也不会像带时间戳那样在一个被掐断的任务里堆出十几份半成品。
+ * 目录选择与 {@link writeResultFile} 一致：优先 `{dataDir}/subagent-results/`，
+ * 不可用才退 OS 临时目录（并接受"可能被系统清理"这一降级）。
+ */
+function writeDraftFile(taskId: string, body: string, resultsDir?: string): string | undefined {
+  const name = `subagent-draft-${taskId}.md`
+  const candidates = resultsDir
+    ? [join(resultsDir, name), join(tmpdir(), name)]
+    : [join(tmpdir(), name)]
+  for (const p of candidates) {
+    try {
+      mkdirSync(dirname(p), { recursive: true })
+      writeFileSync(p, body, 'utf-8')
+      return p
+    } catch { /* 换下一个候选目录 */ }
+  }
+  return undefined
+}
+
+/**
+ * 草稿路径的**如实**描述（与 `summarizeResult` 的 hint 同一套纪律）。
+ *
+ * 后台路径拿不到父轮的活跃工具表（`ctx.variables` 不跨轮）⇒ 按「不可读」如实提示，
+ * 绝不承诺 `read_file` 能读到 —— 承诺了模型必去试、试必被 `PATH_OUTSIDE_CWD` 拒。
+ */
+function describeDraftLocation(draftPath: string, callerCwd?: string): string {
+  return isInsideDir(draftPath, callerCwd)
+    ? '可使用 read_file 查看。'
+    : '该路径不在工作目录内，read_file 与 grep_file 读不到它。'
+}
+
 /**
  * 当子 Agent 最终回复过长时生成摘要。
  *
@@ -667,7 +724,15 @@ export function createSubagentTool(
   subagentMaxSteps: number = DEFAULT_SUBAGENT_MAX_STEPS,
   /** 后台任务结果落盘目录（{dataDir}/tasks）；取不到时退化为不落盘（记 warn，不抛错） */
   getTasksDir?: () => string | undefined,
+  /**
+   * 中途草稿的落盘间隔（毫秒），缺省 {@link DRAFT_FLUSH_INTERVAL_MS}。
+   *
+   * 做成可注入而不是读常量：宿主的子 Agent 超时口径不同（默认 120s，有的宿主配 10 分钟），
+   * 合适的草稿密度随之不同；测试也需要把它压到毫秒级才能覆盖"刷过草稿后正常结束"那条路径。
+   */
+  draftFlushIntervalMs?: number,
 ): Tool<SubagentToolInput, SubagentToolOutput> {
+  const draftIntervalMs = draftFlushIntervalMs ?? DRAFT_FLUSH_INTERVAL_MS
   /**
    * 本次子 Agent 执行的步数上限，优先级（高 → 低）：
    * **派工方传入的 `input.maxSteps` > 子 Agent 自己的 `AgentDefinition.maxSteps` > 插件配置**。
@@ -913,6 +978,43 @@ export function createSubagentTool(
         //    使用 queryStream：遍历工具调用事件，实时发布 subagent.progress（P1-5）
         const effectivePromptBg = directive ? `${directive}\n\n${input.prompt}` : input.prompt
         const timerBg = setTimeout(() => controller.abort(), timeoutMs)
+
+        // ── 长任务中途草稿（观察点 7）──
+        //
+        // 声明在 try **之外**：catch 分支要用 `flushDraft()` 把最后一版刷下来，
+        // 而 try 块里声明的变量在 catch 里不可见。
+        //
+        // 动机（真机 s_1790163574429_tg1a6）：reader#1 在 119,916ms 被 120s 超时掐断，
+        // 而它当时"正在生成最终答复" —— registry 里 `tasksDone=0`，成果**全丢**。
+        // 只读盘点型长任务尤其亏：工具早跑完了，差的就是最后那一次总结，掐掉等于白跑。
+        //
+        // 节奏按**步边界**触发而不是另起定时器：定时器会在子 Agent 卡在模型请求上时
+        // 也写盘，而"没有新内容"的草稿没有任何价值（还把 15s 的间隔浪费掉）。
+        const draftDigest: string[] = []
+        let lastDraftAt = startTime
+        let draftPath: string | undefined
+        const flushDraft = (): void => {
+          const body = [
+            '# 后台子任务中途草稿',
+            '',
+            `- taskId: ${taskId}`,
+            `- agent: ${input.agentId}`,
+            `- 已运行: ${Math.round((Date.now() - startTime) / 1000)}s`,
+            `- 说明: 任务**尚未结束**时的阶段性留存（每 ${Math.round(draftIntervalMs / 1000)}s 覆盖一次）。`,
+            '  任务正常结束时会被完整结果取代（本文件删除）；失败或超时时它是唯一留存。',
+            '',
+            '## 任务描述',
+            input.prompt.slice(0, 2000),
+            '',
+            '## 进展',
+            draftDigest.join('\n') || '(尚无)',
+          ].join('\n')
+          const capped = body.length > DRAFT_MAX_CHARS
+            ? body.slice(0, DRAFT_MAX_CHARS) + '\n... [草稿已截断（保留最早的部分）]'
+            : body
+          draftPath = writeDraftFile(taskId, capped, resolveResultsDir()) ?? draftPath
+        }
+
         void (async () => {
           try {
             const timeoutPromise = new Promise<never>((_resolve, reject) => {
@@ -940,6 +1042,8 @@ export function createSubagentTool(
                 timestamp: Date.now(),
               }).catch(() => { /* Bus 发布失败不影响主流程 */ })
             }
+
+            // ── 长任务中途草稿（观察点 7）：见 try 外那份声明 ──
 
             // 遍历 queryStream：yield tool_call_start / tool_call_result / done
             const execPromise = (async () => {
@@ -971,8 +1075,16 @@ export function createSubagentTool(
                     ev.toolId ?? '',
                     preview || (ev.isError ? '执行失败' : '完成'),
                   )
+                  draftDigest.push(`- ${ev.isError ? '❌' : '✅'} \`${ev.toolId ?? ''}\` ${preview.slice(0, 200)}`)
                 } else if (ev.type === 'done') {
                   finalMessage = ev.message
+                  const stepText = ev.message ? extractFinalAssistantText([ev.message]) : ''
+                  if (stepText) draftDigest.push(`\n### 第 ${ev.step ?? '?'} 步产出\n${stepText.slice(0, 4000)}`)
+                  // 只在**跨过间隔**时写盘：草稿本身不参与最终结果，写盘频率纯粹是"丢多少"的赌注
+                  if (Date.now() - lastDraftAt >= draftIntervalMs) {
+                    lastDraftAt = Date.now()
+                    flushDraft()
+                  }
                 }
               }
               return finalMessage
@@ -1011,6 +1123,16 @@ export function createSubagentTool(
               diffPath,
               durationMs: Date.now() - startTime,
             })
+
+            // 任务正常结束 ⇒ 中途草稿使命结束（完整结果已由 summarizeResult 落盘，
+            // 草稿留着只会让 subagent-results/ 里多出一份内容更旧的同名文件）。
+            // 注意：草稿可能只写了「已覆盖」，之后再无新进展 —— 但那时它已被删掉，
+            // 所以「有草稿文件」永远等于「这次任务是被掐断的」，语义干净。
+            if (draftPath) {
+              try {
+                rmSync(draftPath, { force: true })
+              } catch { /* 删不掉也不影响结果（草稿只是冗余副本） */ }
+            }
 
             // 落盘（无论通知是否可达，结果都持久化到可回看位置，防止父会话已结束时结果丢失）
             await persistTaskRecord(getTasksDir?.(), registry.get(taskId))
@@ -1069,7 +1191,14 @@ export function createSubagentTool(
             }
 
           } catch (err) {
-            const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}`
+            // 中途草稿（观察点 7）：**先强制刷一次**再报错。失败/超时正是草稿存在的理由 ——
+            // 真机 reader#1 被 120s 超时掐断时 registry 里 `tasksDone=0`，成果全丢；
+            // 有了这份草稿，至少"已经跑完的工具与产出"能留给调用方（不必重跑一遍）。
+            flushDraft()
+            const draftNote = draftPath
+              ? `；已保留中途草稿：${draftPath}（含完成到超时为止的工具产出）${describeDraftLocation(draftPath, ctx.cwd)}`
+              : ''
+            const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}${draftNote}`
             const failDurationMs = Date.now() - startTime
             // 更新 task 为 failed
             registry.fail(taskId, {
@@ -1347,6 +1476,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     directive,
     maxSteps: subagentMaxSteps = DEFAULT_SUBAGENT_MAX_STEPS,
     injectRoster = true,
+    draftFlushIntervalMs,
   } = options
 
   let harness: HarnessLike | undefined
@@ -1464,6 +1594,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
         { resolve: resolveWorktree, attachDiff: attachWorktreeDiff },
         subagentMaxSteps,
         () => tasksDir,
+        draftFlushIntervalMs,
       )
 
 
@@ -1518,6 +1649,33 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
             } catch (err) {
               ctx.log.error(`注册子 Agent "${def.id}" 失败`, { error: String((err as Error)?.message ?? err) })
             }
+          }
+        },
+
+        /**
+         * 步间闸门：本会话还有后台任务在跑时，请引擎在下一步开跑前按退避阶梯等一会。
+         *
+         * 为什么由本插件实现：`BackgroundTaskRegistry` 是"本会话还有几个后台任务在跑"的
+         * **唯一地面真相**（coordinator 的 barrier tracker 只是同一批 bus 事件的投影）。
+         * 只在这一处实现，避免两个插件各算一遍、口径分叉。
+         *
+         * 判据刻意保守：
+         * - 只认 `pending` / `running`。已完成/已失败的**不算存活** —— 它们的通知已经入队，
+         *   再等就是纯粹白等（而且会把"结果已就绪"拖成"还在等"）。
+         * - 拿不准宁可不置 `pending`：等待是有成本的（单步最长 60s），少等一次只是没优化，
+         *   错等一次是让用户面对一个看起来卡住的界面。
+         *
+         * 与 `enqueueNotification`（观察点 2）的分工：那边管"结果什么时候**可见**"，
+         * 这边管"引擎什么时候**花下一步**"。两者互不替代。
+         */
+        'core.agent.step.gate'(input, decision) {
+          const alive = registry
+            .list({ parentSessionId: input.sessionId })
+            .filter((t) => t.status === 'pending' || t.status === 'running').length
+          if (alive > 0) {
+            decision.pending = true
+            decision.aliveCount = alive
+            decision.reason = `${alive} 个后台子任务仍在运行`
           }
         },
 

@@ -8,6 +8,7 @@ import {
   HarnessImpl,
   HarnessEvents,
   AgentDefinition,
+  DefaultSessionManager,
   ChatCompletionOutput,
   ChatProvider,
   DefaultPermissionEngine,
@@ -1292,5 +1293,50 @@ ${tag} 版 body
         expect(String((toolParts[1].result as any).content)).toContain('结果与第 1 轮一致')
       } finally { rmSync(root, { recursive: true, force: true }) }
     })
+  })
+})
+
+// ===== 观察点 8：零收益空压缩（core 侧短路）=====
+//
+// 真机 reader#1 round 11 出现过一次零收益压缩（createdBlocks:0 / tokensCompressed:0）。
+// 而生成摘要是要花**一次完整模型调用**的（strategy==='agent' 走 tryAgentSummary）——
+// 窗口为空时那次调用纯属白烧。这里固定"没有可折叠窗口就不生成摘要"。
+describe('compact：没有可折叠窗口时不生成摘要（零收益短路）', () => {
+  it('插件把 keepLast 抬到 ≥ 消息数 ⇒ 一次模型调用都不发，也不建块', async () => {
+    let agentCalls = 0
+    const mgr = new DefaultSessionManager(() => ({
+      agent: {
+        async query() {
+          agentCalls += 1
+          return { id: 'x', role: 'assistant', parts: [{ type: 'text', text: '摘要' }], createdAt: 0 }
+        },
+      },
+      currentAgentId: () => 'default',
+      async triggerPlugin(_name: string, _input: unknown, ctx: any) {
+        // 模拟插件在 hook 里把"保留段"抬到覆盖全部消息 ⇒ 可折叠窗口变为空
+        if (ctx && typeof ctx === 'object') ctx.keepLast = 999
+      },
+    }) as any)
+
+    const sess = await mgr.create()
+    sess.agentId = 'default'
+    for (let i = 0; i < 6; i++) {
+      await mgr.addMessage(sess.id, {
+        id: `m${i}`,
+        role: i % 2 ? 'assistant' : 'user',
+        parts: [{ type: 'text', text: `msg ${i}` }],
+        createdAt: i,
+      } as Message)
+    }
+
+    await mgr.compact(sess.id, 'agent')
+
+    // 关键断言：窗口为空 ⇒ 不烧那一次完整模型调用
+    expect(agentCalls).toBe(0)
+    // 也没建任何压缩块（空块会污染 session.blocks / revert 视图）
+    const after = (await mgr.get(sess.id))!
+    expect(after.blocks ?? []).toHaveLength(0)
+    // 消息一条不少（没有可折叠的就别动历史）
+    expect(after.messages).toHaveLength(6)
   })
 })

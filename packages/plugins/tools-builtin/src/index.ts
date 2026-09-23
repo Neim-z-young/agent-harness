@@ -606,11 +606,346 @@ async function confirmHostRun(
   return decision.behavior !== 'deny'
 }
 
+// ========================================================================
+// 4.5 只读 bash（bash_ro）—— 给「只读哨兵」用
+// ========================================================================
+
+/**
+ * 只读命令白名单（首命令级）。
+ *
+ * 只放行「读 / 算 / 查」三类；凡是会写文件、改系统状态、联网、提权的命令一律不在表内。
+ * 刻意**不含** `xargs`（它能把任意命令当参数执行）、`curl`/`wget`/`ssh`/`scp`（联网）、
+ * `tee`/`dd`/`truncate`（写）、以及 `npm`/`tsc`/`make` 这类会产出构建物的命令。
+ */
+export const DEFAULT_READONLY_COMMANDS: readonly string[] = [
+  // 文本查看 / 统计
+  'cat', 'head', 'tail', 'wc', 'nl', 'sort', 'uniq', 'cut', 'tr', 'paste', 'rev', 'fold',
+  'column', 'comm', 'join', 'diff', 'cmp', 'strings', 'od', 'hexdump',
+  // 搜索 / 结构化查询
+  'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk', 'jq',
+  // 目录 / 文件元信息
+  'ls', 'find', 'tree', 'stat', 'file', 'du', 'df', 'pwd', 'realpath', 'basename', 'dirname', 'readlink',
+  // 杂项只读
+  'echo', 'printf', 'seq', 'true', 'false', 'test', 'expr', 'date', 'which', 'type', 'id', 'uname',
+  'printenv', 'hostname', 'whoami',
+  // 解释器（见 checkReadOnlyCommand 的「协作式只读」说明）
+  'python', 'python3', 'node', 'bun', 'deno',
+  // 版本控制（子命令另有只读白名单）
+  'git',
+]
+
+/**
+ * `git` 的只读子命令白名单（其余一律拒绝）。
+ *
+ * 刻意**不含** `tag` / `branch` / `remote` / `config` / `stash` / `worktree`：
+ * 它们既能列出（读）也能带参数创建/修改（写），而只读工具没法按"有没有给参数"再分档
+ * —— 宁可在只读模式下少给一点能力，也不要留一个"看起来只读实则能写"的口子。
+ */
+export const READONLY_GIT_SUBCOMMANDS: readonly string[] = [
+  'log', 'show', 'diff', 'status', 'blame', 'grep', 'ls-files', 'ls-tree', 'rev-parse', 'rev-list',
+  'describe', 'shortlog', 'cat-file', 'show-ref', 'for-each-ref', 'symbolic-ref', 'merge-base',
+  'count-objects', 'diff-files', 'diff-tree', 'diff-index', 'name-rev', 'whatchanged',
+]
+
+/** 命令参数级禁区：首命令在白名单里，但这些开关/子命令会写 */
+const READONLY_FORBIDDEN_ARGS: ReadonlyArray<{ cmd: string; re: RegExp; why: string }> = [
+  { cmd: 'sed', re: /(^|\s)-i(\s|$)|--in-place/, why: 'sed -i 会就地写文件' },
+  { cmd: 'find', re: /-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/, why: 'find -delete/-exec 会写或执行命令' },
+  { cmd: 'jq', re: /(^|\s)-i(\s|$)|--in-place/, why: 'jq -i 会就地写文件' },
+  { cmd: 'sort', re: /(^|\s)-o(\s|$)|--output/, why: 'sort -o 会写文件' },
+  { cmd: 'awk', re: /\bsystem\s*\(|\bprint(?:f)?\b[^;\n]*>\s*["'A-Za-z_./~/]/, why: 'awk 可 system() 或重定向写文件（> 在引号内，结构检查看不到）' },
+  { cmd: 'date', re: /(^|\s)-s(\s|$)|--set/, why: 'date -s 会改系统时间' },
+]
+
+/**
+ * 解释器（python/node/bun/deno）内联代码里的写/网特征。
+ *
+ * ⚠️ **这是过滤器，不是沙箱**。解释器天然能写文件，任何基于字符串的检查都能被绕过
+ * （动态拼接、base64、getattr…）。只读哨兵给的是**协作式只读**：挡住"顺手写一下"这类
+ * 常见误用，真正的写权限仍由 permission 引擎与宿主沙箱兜底。之所以仍然放行解释器，
+ * 是因为量化统计类任务（`wc` 数不出来、需要按结构解析）离了它就只能靠 list_dir 的 size 字段凑
+ * —— 真机里成功那个 reader 就是这么残废的。
+ */
+const INTERPRETER_WRITE_PATTERNS: readonly RegExp[] = [
+  // 注意：模式必须锚在**逗号后**的 mode 参数上。早先写成 `open\([^)]*['"][wax]` 会把
+  // `open('a.txt')`（只读！）误判成写 —— 文件名首字母恰好是 a/x/w 就中招。
+  /\bopen\s*\([^)]*,\s*['"](?:w|a|x|w\+|a\+|r\+|wb|ab|xb|wt|at)[b+]*['"]/,
+  /\bos\.(remove|unlink|rmdir|makedirs|mkdir|rename|replace|chmod|chown|truncate|system|popen)\b/,
+  /\bshutil\./,
+  /\bsubprocess\b/,
+  /\bos\.(fork|exec)\w*/,
+  /\brequests\b/,
+  /\burllib\b/,
+  /\bsocket\b/,
+  /\bhttp\.client\b/,
+  /\bfs\.(write|append|unlink|rm|mkdir|rename|chmod)\w*/,
+  /\brequire\s*\(\s*['"](?:fs|child_process|http|https|net|os)['"]\s*\)/,
+  /\bBun\.(write|spawn|file)\b/,
+  /\bprocess\.(exit|kill)\b/,
+  /\bDeno\.(write|remove|mkdir|run|Command)\w*/,
+]
+
+/** 这些命令的"脚本内容"需要额外做写/网特征扫描 */
+const INTERPRETER_COMMANDS: readonly string[] = ['python', 'python3', 'node', 'bun', 'deno']
+
+/** 只读校验裁决 */
+export type ReadOnlyVerdict = { ok: true } | { ok: false; code: string; reason: string }
+
+/** 结构性写入通道（在**去掉引号内容**的投影上检查：引号里的 `>` 是数据不是重定向） */
+const WRITE_CHANNEL_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
+  { re: />>?/, code: 'SANDBOX_RO_REDIRECT', why: '输出重定向（> / >>）会写文件' },
+  { re: /<\(|>\(/, code: 'SANDBOX_RO_SUBST', why: '进程替换（<() / >()）会执行子命令' },
+  { re: /<</, code: 'SANDBOX_RO_HEREDOC', why: 'heredoc（<<）会被当作脚本执行' },
+]
+
+/** 命令替换：**引号内依然生效**（`"$(rm -rf /)"` 真的会执行），所以按原文检查 */
+const SUBSTITUTION_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
+  { re: /\$\(|`/, code: 'SANDBOX_RO_SUBST', why: '命令替换（$( ) / 反引号）会执行子命令' },
+]
+
+/** 提权 / 系统控制 */
+const PRIV_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
+  { re: /(^|[\s;&|])(sudo|doas|su|osascript|launchctl)\b/, code: 'SANDBOX_RO_PRIV', why: '提权 / 系统控制命令' },
+]
+
+/**
+ * 把引号内的内容替换成占位符，得到"只含 shell 结构"的投影。
+ *
+ * 为什么必须这么做：`python3 -c "import os; os.remove('x')"` 里的 `;` 是**脚本内容**，
+ * 不是 shell 的分段符；不做这一步就会把它切段，然后把 `os.remove(...)` 当成首命令报
+ * "不在白名单"——错误码和真实原因完全对不上（写出来的是"命令不白名单"，实际是"脚本在写文件"）。
+ */
+function stripQuoted(command: string): string {
+  let out = ''
+  let q: string | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (q) {
+      if (ch === q) { q = null; out += '""' }
+      continue
+    }
+    if (ch === '"' || ch === "'") { q = ch; continue }
+    out += ch
+  }
+  return out
+}
+
+/** 按 shell 分段符切段，**引号内的分隔符不算** */
+function splitSegments(command: string): string[] {
+  const out: string[] = []
+  let buf = ''
+  let q: string | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (q) {
+      buf += ch
+      if (ch === q) q = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { q = ch; buf += ch; continue }
+    if (ch === '\n' || ch === ';') { out.push(buf); buf = ''; continue }
+    if (ch === '&' && command[i + 1] === '&') { out.push(buf); buf = ''; i++; continue }
+    if (ch === '|' && command[i + 1] === '|') { out.push(buf); buf = ''; i++; continue }
+    if (ch === '|') { out.push(buf); buf = ''; continue }
+    buf += ch
+  }
+  out.push(buf)
+  return out.map((s) => s.trim()).filter(Boolean)
+}
+
+/**
+ * 校验一条命令是否**只读**（纯函数，可单测）。
+ *
+ * 判定顺序（任一不满足即拒绝，fail-closed）：
+ * 1. 结构性写入通道（重定向 / 进程替换 / heredoc，按去引号投影）/ 命令替换（按原文）/
+ *    提权（按去引号投影）—— 命中即整体拒绝；
+ * 2. 按 shell 分段符切段（**引号内的分隔符不算**），每一段的首命令都必须 ∈ 白名单；
+ * 3. 参数级禁区（sed -i / find -delete / sort -o / awk system 等）；
+ * 4. `git` 子命令只读白名单；
+ * 5. 解释器内联代码不得含写/网特征。
+ */
+export function checkReadOnlyCommand(
+  command: string,
+  allowlist: readonly string[] = DEFAULT_READONLY_COMMANDS,
+): ReadOnlyVerdict {
+  const raw = String(command ?? '')
+  if (raw.trim() === '') {
+    return { ok: false, code: 'COMMAND_REQUIRED', reason: '缺少 command：请在入参 `command` 里给出要执行的只读命令' }
+  }
+  // 1a. 只作用于 shell 结构的通道：先剥掉 2>&1 / 1>&2 这类 fd 复制（不写文件），再去引号
+  const noFdDup = raw.replace(/[12]>&[12]/g, '')
+  const structural = stripQuoted(noFdDup)
+  for (const p of WRITE_CHANNEL_PATTERNS) {
+    if (p.re.test(structural)) {
+      return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
+    }
+  }
+  for (const p of PRIV_PATTERNS) {
+    if (p.re.test(structural)) {
+      return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
+    }
+  }
+  // 1b. 命令替换在引号内依然生效 ⇒ 按**原文**检查
+  for (const p of SUBSTITUTION_PATTERNS) {
+    if (p.re.test(noFdDup)) {
+      return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
+    }
+  }
+  // 2. 逐段校验首命令
+  const segments = splitSegments(stripQuoted(raw))
+  const rawSegments = splitSegments(raw)
+  if (segments.length === 0) {
+    return { ok: false, code: 'COMMAND_REQUIRED', reason: '只读模式拒绝：命令为空' }
+  }
+  for (let si = 0; si < segments.length; si++) {
+    const seg = segments[si]!
+    // 引号被剥掉后，段内只剩结构与命令名；脚本内容从对应的原文段取
+    const rawSeg = rawSegments[si] ?? seg
+    const cmd = extractFirstCommand(seg)
+    if (!allowlist.includes(cmd)) {
+      return {
+        ok: false,
+        code: 'SANDBOX_RO_ALLOWLIST',
+        reason:
+          `只读模式拒绝：「${cmd}」不在只读命令白名单内。`
+          + '允许的命令见工具说明；需要写/联网/构建请让主 Agent 用 bash。',
+      }
+    }
+    // 3. 参数级禁区（在原文段上判，避免被去引号影响）
+    for (const f of READONLY_FORBIDDEN_ARGS) {
+      if (cmd === f.cmd && f.re.test(rawSeg)) {
+        return { ok: false, code: 'SANDBOX_RO_ALLOWLIST', reason: `只读模式拒绝：${f.why}` }
+      }
+    }
+    // 4. git 子命令白名单
+    if (cmd === 'git') {
+      // 先剥掉"带值的全局旗标"（-C <dir> / --git-dir <dir> / -c <k=v>），
+      // 否则它们的**值**会被误当成子命令（`git -C /x log` 里的 /x）。
+      const args = seg.trim().split(/\s+/).slice(1)
+      const cleaned: string[] = []
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i]!
+        if (a === '-C' || a === '--git-dir' || a === '--work-tree' || a === '-c') { i++; continue }
+        if (a.startsWith('--git-dir=') || a.startsWith('--work-tree=')) continue
+        cleaned.push(a)
+      }
+      const sub = cleaned.find((t) => !t.startsWith('-'))
+      // 没有子命令词（如 `git --version`）⇒ 只剩只读旗标，放行
+      if (sub !== undefined && !READONLY_GIT_SUBCOMMANDS.includes(sub)) {
+        return {
+          ok: false,
+          code: 'SANDBOX_RO_ALLOWLIST',
+          reason:
+            `只读模式拒绝：git 子命令「${sub}」不在只读白名单内`
+            + `（只读：${READONLY_GIT_SUBCOMMANDS.join(' / ')}）。需要提交/推送请让主 Agent 用 bash。`,
+        }
+      }
+    }
+    // 5. 解释器内联代码（在原文段上判，含引号内容）
+    if (INTERPRETER_COMMANDS.includes(cmd)) {
+      for (const re of INTERPRETER_WRITE_PATTERNS) {
+        if (re.test(rawSeg)) {
+          return {
+            ok: false,
+            code: 'SANDBOX_RO_SCRIPT',
+            reason: `只读模式拒绝：脚本里出现写/网特征（${String(re)}）。只读模式只允许纯计算与读取。`,
+          }
+        }
+      }
+    }
+  }
+  return { ok: true }
+}
+
+/** 只读 bash 配置 */
+export interface ReadOnlyBashConfig {
+  /** 覆盖只读命令白名单（默认 {@link DEFAULT_READONLY_COMMANDS}） */
+  allowlist?: readonly string[]
+  /** 工作目录沙箱根（默认 ctx.cwd） */
+  rootDir?: string
+  /** 超时（毫秒，默认 15000 —— 只读命令通常很快，卡住多半是错的） */
+  timeoutMs?: number
+}
+
+/**
+ * 创建**只读** bash 工具（`bash_ro`）。
+ *
+ * 为什么单独一个工具而不是给 bash 加开关：`isReadOnly()` 是**无入参**的静态谓词，
+ * 而 `@readonly` 哨兵是按它展开的（`ToolRegistry.filterByWhitelist`）。要让只读哨兵拿到 shell，
+ * 只能提供一个"恒只读"的工具 —— 于是有了它。
+ *
+ * 真机背景（s_1790163574429_tg1a6）：成功那个 reader 在报告开头自述
+ * 「本轮工具集**无命令执行能力**（白名单仅 read_file / list_dir / glob / grep_file），
+ * 无法运行 wc/python3」，导致它的统计章节只能标注"未覆盖" —— 哨兵把 bash 一起禁掉，
+ * 让量化盘点类任务天生残废。
+ *
+ * 安全声明：
+ * - isReadOnly: true（{@link checkReadOnlyCommand} 强制只读白名单，非白名单即拒绝）
+ * - isConcurrencySafe: true（只读，可与其它只读调用并行）
+ * - 不做宿主回退（回退等于绕过只读约束）
+ * - **协作式只读**：挡的是"顺手写一下"，不是恶意绕过；硬边界仍由 permission 引擎与宿主沙箱负责
+ */
+export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<BashInput, BashOutput> {
+  const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
+  const timeoutDefault = config.timeoutMs ?? 15_000
+
+  return defineTool<BashInput, BashOutput>({
+    id: 'bash_ro',
+    description:
+      '执行**只读** shell 命令（白名单受限：cat/head/tail/wc/grep/sed/awk/find/ls/stat/du/git log/python3 -c 等）。'
+      + '拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。',
+    inputSchema: withJsonSchema(makeSchema<BashInput>(), {
+      type: 'object',
+      properties: {
+        command: { type: 'string', description: '要执行的只读命令（不得含 >、$()、反引号、heredoc）' },
+        cwd: { type: 'string', description: '工作目录（默认当前会话 cwd，且不得逃出它）' },
+        timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 15000）' },
+      },
+      required: ['command'],
+      additionalProperties: false,
+    }),
+    isReadOnly: () => true,
+    isDestructive: () => false,
+    isConcurrencySafe: () => true,
+    permission: {
+      key: 'bash_ro',
+      extractPatterns: (input) => [input.command],
+    },
+    async call(input, ctx): Promise<ToolResult<BashOutput>> {
+      const verdict = checkReadOnlyCommand(input?.command, allowlist)
+      if (!verdict.ok) {
+        return { ok: false, error: { message: verdict.reason, code: verdict.code } }
+      }
+      const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
+      const requestedCwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : null
+      if (requestedCwd && !isWithinCwd(requestedCwd, rootDir)) {
+        return {
+          ok: false,
+          error: { message: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, code: 'SANDBOX_CWD' },
+        }
+      }
+      // 只读工具不接受入参覆盖环境变量：ENV 是绕过只读的常见后门（PYTHONSTARTUP / NODE_OPTIONS
+      // 都能让"只读命令"执行任意代码）。一律用过滤后的宿主环境，不做任何合并。
+      const env = sanitizeEnv(process.env, [])
+      const result = await runBash({
+        command: input.command,
+        cwd: requestedCwd ?? rootDir,
+        env,
+        timeoutMs: input.timeoutMs ?? timeoutDefault,
+        signal: ctx.signal,
+      })
+      return result
+    },
+  })
+}
+
+/** 默认只读 bash 工具（只读哨兵用） */
+export const readOnlyBashTool: Tool<BashInput, BashOutput> = createReadOnlyBashTool()
+
 /** 执行一条 bash 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
  * viaHost=true 时在返回的 BashOutput 上标注，表示这次是宿主 bash 回退执行（放开白名单与 env 隔离）。
  */
-function runBash(opts: {
-  command: string
+function runBash(opts: {  command: string
   cwd: string
   env: Record<string, string | undefined>
   timeoutMs: number
@@ -930,8 +1265,8 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
 /** 默认 bash 工具（沙箱使用推荐配置） */
 export const bashTool: Tool<BashInput, BashOutput> = createBashTool()
 
-/** 内置工具列表（仅保留文件 I/O + Shell 四个原语；搜索类见 @harness/tools-search） */
-export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, editFileTool]
+/** 内置工具列表（文件 I/O + Shell 原语 + 只读 shell；搜索类见 @harness/tools-search） */
+export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, editFileTool, readOnlyBashTool]
 
 /**
  * 内置 Tool 插件
@@ -941,21 +1276,29 @@ export const builtinTools: Tool[] = [readFileTool, writeFileTool, bashTool, edit
  *
  * @param options.toolIds 可选：只注入指定 ID 的工具（默认全部）
  * @param options.bash 可选：bash 沙箱配置（危险命令检测 / env 隔离 / cwd 限制 / 白名单）
+ * @param options.readOnlyBash 可选：只读 bash（`bash_ro`）配置；传 `false` 不注册该工具
  */
 export function createToolsBuiltinPlugin(options?: {
   toolIds?: string[]
   bash?: BashSandboxConfig
+  readOnlyBash?: ReadOnlyBashConfig | false
 }): AgentPlugin {
   const toolIds = options?.toolIds
   const tools = toolIds
     ? builtinTools.filter((t) => toolIds.includes(t.id))
-    : builtinTools.map((t) => t.id === 'bash' && options?.bash ? createBashTool(options.bash) : t)
+    : builtinTools
+        .filter((t) => !(t.id === 'bash_ro' && options?.readOnlyBash === false))
+        .map((t) => {
+          if (t.id === 'bash' && options?.bash) return createBashTool(options.bash)
+          if (t.id === 'bash_ro' && options?.readOnlyBash) return createReadOnlyBashTool(options.readOnlyBash)
+          return t
+        })
 
   return {
     id: 'tools.builtin',
     version: '0.3.0',
     name: '内置工具',
-    description: '提供 read_file / write_file / bash / edit_file 四个文件 I/O + Shell 原语（搜索类见 @harness/tools-search）',
+    description: '提供 read_file / write_file / bash / bash_ro / edit_file 五个文件 I/O + Shell 原语（搜索类见 @harness/tools-search）',
     async install(ctx) {
       ctx.log.info('内置工具插件已加载', { tools: tools.map((t) => t.id) })
       return {

@@ -3378,17 +3378,30 @@ export function startStallNotice(
 /**
  * 挂载 Coordinator 自动续轮（Coordinator 插件配套）。
  *
- * 订阅 `coordinator.barrier.completed` 事件——coordinator 派出的后台任务
- * 全部完成/失败时触发——向 REPL 注入一行 `<continue/>` 作为伪用户输入，
- * 从而启动下一轮 query：drainNotifications 将任务完成通知注入对话，
- * coordinator 自动汇总结果、继续派工或输出最终报告（用户零操作）。
+ * 订阅两条 Coordinator 事件，都向 REPL 注入一行 `<continue/>` 作为伪用户输入，
+ * 从而启动下一轮 query：drainNotifications 将任务完成通知注入对话，coordinator
+ * 自动汇总结果、继续派工或输出最终报告（用户零操作）。
+ *
+ * 为什么要订阅**两条**（观察点 2）：`coordinator.barrier.completed` 只在**全部**任务
+ * 结束时发 —— 真机 s_1790163574429_tg1a6 里 reader#2 19:43:10 就完成了，barrier 到
+ * 19:44:03（最慢那个失败）才触发，快结果被拖了 53 秒，那 53 秒正是"界面停在等待中"的那段。
+ * `coordinator.worker.completed` 是"单个任务完成"（coordinator 只在**还剩**其它任务时才发它），
+ * 因此两条不会在同一时刻都注入：最后一个任务走 barrier，中间的走 worker。
+ *
+ * 两处注入都不怕重复：`processLine` 对 `<continue/>` 会先退避 peek 待处理通知，
+ * 读到空就跳过该轮 —— 所以"多注入一行"的代价只是一次 peek，不会被放大成空转。
  *
  * @param emitLine 把一行注入 REPL 输入队列的函数（readline 模式：rl.emit('line', l)）
  * @returns 卸载函数
  */
 export function attachAutoContinue(harness: Harness, emitLine: (line: string) => void): () => void {
   if (!harness.bus) return () => {}
-  return harness.bus.subscribe(CoordinatorEvents.barrierCompleted, () => emitLine('<continue/>'))
+  const offBarrier = harness.bus.subscribe(CoordinatorEvents.barrierCompleted, () => emitLine(AUTO_CONTINUE_LINE))
+  const offWorker = harness.bus.subscribe(CoordinatorEvents.workerCompleted, () => emitLine(AUTO_CONTINUE_LINE))
+  return () => {
+    offBarrier()
+    offWorker()
+  }
 }
 
 /** REPL 自动续轮标记消息（不作为用户输入展示/回显） */
@@ -4104,8 +4117,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             sessionId: curSessionId,
           })
           .catch(() => undefined)
-        // turn_end 是「整轮结束」标记，不是「下一步开始了」⇒ 不能触发续轮分隔
-        if (ev.type !== 'done' && ev.type !== 'turn_end' && lastDoneStep != null) {
+        // turn_end 是「整轮结束」标记，不是「下一步开始了」⇒ 不能触发续轮分隔。
+        // step_gate 同样不能：它发生在**下一步开跑之前**，此时打「第 N 步（自主续轮）」
+        // 会让"等待中"看起来像"已经在跑下一步了"。
+        if (ev.type !== 'done' && ev.type !== 'turn_end' && ev.type !== 'step_gate' && lastDoneStep != null) {
           if (!onEvent) out(`\n🔄  第 ${lastDoneStep + 1} 步（自主续轮）\n`)
           lastDoneStep = null
           inText = false
@@ -4160,6 +4175,19 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             // 整轮结束：转发给 TUI 收尾（busy 状态等），REPL 的收尾在循环外统一做
             onEvent?.(ev)
             break
+          case 'step_gate': {
+            // 步间闸门：派工后后台任务还没跑完，引擎让出时间（单次最长 60s）。
+            // 必须打一行 —— 静默等几十秒等于把「静默卡死」重新引入一次（心跳约定）。
+            if (inText || inReasoning) { out('\n'); inText = false; inReasoning = false }
+            onEvent?.(ev)
+            const g = ev.gate
+            if (g) {
+              const alive = g.aliveCount !== undefined ? `，${g.aliveCount} 个在跑` : ''
+              out(`⏳  等一会再跑下一步：${g.reason ?? '后台任务尚未跑完'}${alive}`
+                + `（本次 ${Math.round(g.waitMs / 1000)}s，累计 ${Math.round(g.waitedMs / 1000)}s）\n`)
+            }
+            break
+          }
         }
       }
       // 结构化模式（onEvent）下收尾换行由 TUI 负责，避免向控制台混入空行

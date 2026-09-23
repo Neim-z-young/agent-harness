@@ -1,6 +1,6 @@
 import { describe, it, expect, afterAll } from 'bun:test'
 import { tmpdir } from 'node:os'
-import { mkdtempSync, rmSync, writeFileSync, realpathSync, existsSync, readFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, realpathSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
 import { runGit, gitTopLevel } from './worktree'
 import {
@@ -2580,6 +2580,141 @@ describe('runInBackground 结果落盘可回看（缺陷2）', () => {
     expect(rec.errorCode).toBe('SUBAGENT_FAILED')
     expect(rec.errorMessage).toInclude('query error')
     rmSync(tasksDir, { recursive: true, force: true })
+  })
+
+  // ===== 观察点 7：长任务中途草稿 =====
+  //
+  // 真机 s_1790163574429_tg1a6：reader#1 在 119,916ms 被 120s 超时掐断，而它当时"正在生成
+  // 最终答复" —— registry 里 tasksDone=0，成果全丢。只读盘点型长任务尤其亏：工具早跑完了，
+  // 差的就是最后那次总结，掐掉等于白跑。
+
+  it('失败/超时被掐断时把中途产出落成草稿，并在失败信息里给出路径', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-draft-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    // 剧本：先产出两条工具结果（"已经跑完的盘点"），然后在生成总结时炸掉
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      undefined,
+      async function* () {
+        yield {
+          type: 'tool_call_result', toolUseId: 't1', toolId: 'grep_file',
+          result: 'packages/a.ts:12: TODO 待办', isError: false,
+        }
+        yield {
+          type: 'tool_call_result', toolUseId: 't2', toolId: 'bash',
+          result: '1902 files', isError: false,
+        }
+        throw new Error('后台子 Agent 执行超时（120000ms）')
+      },
+    )
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const ctx = makeToolContext({ sessionId: parentSession.id })
+    const res = await tool.call({ agentId: 'coder', prompt: '盘点全仓 TODO', runInBackground: true }, ctx)
+    const taskId = res.output!.taskId!
+    const task = await registry.wait(taskId, 1000)
+    expect(task!.status).toBe('failed')
+    await new Promise((r) => setTimeout(r, 50))
+
+    // 草稿文件按 taskId 固定命名，落在 {dataDir}/subagent-results/（与全文落盘同域）
+    const draftPath = join(dataDir, 'subagent-results', `subagent-draft-${taskId}.md`)
+    expect(existsSync(draftPath)).toBe(true)
+    const draft = readFileSync(draftPath, 'utf-8')
+    // ① 任务描述留着（否则草稿读不懂在干什么）；② 已完成的两条工具产出留着（这就是"没全丢"）
+    expect(draft).toInclude('盘点全仓 TODO')
+    expect(draft).toInclude('grep_file')
+    expect(draft).toInclude('TODO 待办')
+    expect(draft).toInclude('1902 files')
+    // ③ 标题如实说明这是未完成的中间态，不是最终结果
+    expect(draft).toInclude('中途草稿')
+
+    // 失败信息里带路径 + **如实**的可读性说明（草稿在 dataDir 下，通常不在工作目录内）
+    const rec = JSON.parse(readFileSync(join(tasksDir, `${taskId}.json`), 'utf-8'))
+    expect(rec.errorMessage).toInclude('超时')
+    expect(rec.errorMessage).toInclude(draftPath)
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  it('草稿按 taskId 覆盖（同一任务只留一份，不堆半成品）', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-draft-one-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      undefined,
+      async function* () {
+        yield { type: 'tool_call_result', toolUseId: 't1', toolId: 'bash', result: 'a', isError: false }
+        throw new Error('boom')
+      },
+    )
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'do', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    await registry.wait(res.output!.taskId!, 1000)
+    await new Promise((r) => setTimeout(r, 50))
+
+    const resultsDir = join(dataDir, 'subagent-results')
+    const drafts = readdirSync(resultsDir).filter((f) => f.startsWith('subagent-draft-'))
+    expect(drafts).toEqual([`subagent-draft-${res.output!.taskId!}.md`])
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  it('任务正常结束 ⇒ 草稿被删除（"有草稿文件"恒等于"这次被掐断"，语义干净）', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-draft-clean-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    // 间隔压到 0：第一次 done 之前的两条工具结果就会刷出一版草稿，
+    // 之后任务正常收尾 ⇒ 必须把那份草稿删掉（完整结果已另存全文）
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      undefined,
+      async function* (input) {
+        yield { type: 'tool_call_result', toolUseId: 't1', toolId: 'bash', result: 'halfway', isError: false }
+        const msg = makeMessage('assistant', '最终报告：全部完成')
+        const s = sessions.get(input.sessionId)
+        if (s) { s.messages.push(makeMessage('user', input.message), msg) }
+        yield { type: 'done', message: msg, step: 1 }
+      },
+    )
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir, 0,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'do', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    const taskId = res.output!.taskId!
+    const task = await registry.wait(taskId, 1000)
+    expect(task!.status).toBe('completed')
+    await new Promise((r) => setTimeout(r, 50))
+
+    const resultsDir = join(dataDir, 'subagent-results')
+    // 草稿已清：短结果整段内联回喂，不会另存全文，所以这里只断言"没有草稿残留"
+    // （"草稿存在 ⇔ 被掐断"这条不变量就是靠它成立的）
+    expect(existsSync(join(resultsDir, `subagent-draft-${taskId}.md`))).toBe(false)
+    const leftovers = existsSync(resultsDir) ? readdirSync(resultsDir).filter((f) => f.includes('draft')) : []
+    expect(leftovers).toEqual([])
+    // 结果本身照常回到调用方（草稿的清理不影响结果）
+    expect(task!.result ?? '').toInclude('最终报告')
+    rmSync(dataDir, { recursive: true, force: true })
   })
 
   it('tasksDir 不可用时退化为不落盘且不抛异常', async () => {

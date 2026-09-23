@@ -304,9 +304,11 @@ export interface AgentStatusSnapshot {
    * - `thinking` 模型推理中（含工具返回后的继续推理）
    * - `streaming` 正在收到文本增量
    * - `tool` 工具执行中（失败时也留在此态，便于显示「卡在哪个工具上」）
+   * - `waiting` 步间等待中（`step_gate`：派工后的后台任务未跑完，引擎在下一步之前让出时间；
+   *   此时**没有**模型调用在跑，集成方不要把这一段时间算进"模型耗时"）
    * - `aborted` 被中断（Ctrl-C / 超限被拦）
    */
-  phase: 'idle' | 'thinking' | 'streaming' | 'tool' | 'aborted'
+  phase: 'idle' | 'thinking' | 'streaming' | 'tool' | 'waiting' | 'aborted'
   /** 当前步序号（多步循环下从 1 开始；已知时填） */
   step?: number
   /** 正在执行的工具 ID（phase=tool 时） */
@@ -351,10 +353,70 @@ export interface AgentTurnEndSignal {
   sessionId?: string
   /** 本轮实际跑了几步（从 1 起；未跑起来就结束时为 0） */
   step: number
+  /**
+   * 本轮有多少步**没有**计入 `maxSteps` 额度（缺省 0，即有值时才填）。
+   *
+   * 唯一来源是「必填全缺」的入参回喂步（模型发了零参数工具调用，core 用 `[入参自愈]`
+   * 回喂必填清单 —— 那一步只是在把参数补齐，不该吃额度）。没有这个字段时，
+   * "步号 30 但额度没耗尽"看起来像 bug；有了它，消费方不必猜。
+   */
+  freeSteps?: number
   /** 末步结束原因（stop / tool_calls / length …；中断或未起步时可能缺省） */
   finish?: string
   /** 是否因外部中断（`signal`）而提前结束 */
   aborted?: boolean
+}
+
+/**
+ * `core.agent.step.gate` hook 的输入：引擎在**下一步开跑前**问"要不要先等一会"。
+ *
+ * 动机（真机 s_1790163574429_tg1a6）：lead 派完 4 个后台 reader 后无事可做，却仍在
+ * 20 秒内把 30 步额度烧光（证据：msg31 / msg66 两次撞顶，共 60 步，而第一次撞顶时
+ * 后台任务只做了一半）。步数是"引擎内自主续轮"的预算，烧完就只能在**下一轮 query**
+ * 里才可能看到结果 —— 于是要么用户自己敲键唤醒，要么靠 barrier 事件续轮。
+ *
+ * 闸门机制：每步开跑前（step ≥ 2）触发本 hook，插件报"还有存活的背景任务"时，
+ * 引擎按 3s → 6s → 12s → 24s → 48s → 60s（封顶）退避等待，**每步都重新探测一次存活**，
+ * 直到没有存活任务（或到达本轮等待总预算）为止。效果是把"20 秒烧 30 步"摊成
+ * "后台任务跑完的那段时间里烧同样多的步"，于是结果更可能在**同一条 query 内**到达。
+ *
+ * 分层判据：这是引擎事实（CLI / 内嵌库 / ACP 宿主都该有），所以是 `core.` 前缀；
+ * 触发者只有 core.queryStream 一处。
+ *
+ * 与 bus 事件的分工：事件（`subagent.completed` 等）是"发生了什么"的广播，
+ * 本 hook 是"要不要等一下"的**询问**（需要返回值），因此走 hook 不走 bus。
+ */
+export interface AgentStepGateInput {
+  /** 会话 ID */
+  sessionId: string
+  /** 即将开跑的那一步的序号（从 1 起；本 hook 只在 step ≥ 2 触发） */
+  nextStep: number
+  /** 跑这一轮的 Agent */
+  agentId: string
+  /**
+   * 本步内**已连续等待**的次数（0 = 还没等过）。
+   * 插件可据此把"刚派工"与"已经等了很久"分开处理；引擎只用它取退避阶梯。
+   */
+  waitAttempt: number
+  /** 本步内**已累计等待**的毫秒数 */
+  waitedMs: number
+  /** 本轮 query 已经跑了多少步 */
+  step: number
+}
+
+/**
+ * `core.agent.step.gate` 的**可变决策**（管道式：插件原地改写）。
+ *
+ * 多插件都实现时语义是 **OR**：任一插件置 `pending = true` 引擎就等一次
+ * （不会按插件个数等多次）。`aliveCount` 取各插件上报的最大值（都是"我这里还有几个在跑"）。
+ */
+export interface AgentStepGateDecision {
+  /** 还有存活的后台任务 ⇒ 值得等一会（默认 false：不等） */
+  pending?: boolean
+  /** 存活的后台任务数（诊断与界面心跳用；多插件取最大值） */
+  aliveCount?: number
+  /** 为什么还值得等（写给界面那一行心跳；缺省时引擎自己拼一句） */
+  reason?: string
 }
 
 /**
@@ -532,6 +594,18 @@ export interface Hooks {
    * 逻辑（如记忆的攒批放行）挂这里；纯 UI 状态（busy/spinner/侧栏）挂 `cli.agent.stream`。
    */
   'core.agent.turn.end'?: (input: AgentTurnEndSignal) => Awaitable<void>
+  /**
+   * **步间闸门**（引擎层）：每步开跑前询问"还有存活的背景任务吗"。
+   *
+   * 置 `pending = true` 的插件会让引擎在下一步之前按退避阶梯休眠一次
+   * （3s → 6s → 12s → 24s → 48s → 60s 封顶，每步重新探测）。用来把"派完工后的
+   * 空转步"摊到后台任务真正跑完的那段时间里，而不是让 lead 在 20 秒内烧完 30 步额度。
+   *
+   * 实现方应是**能回答"本会话还有几个后台任务在跑"的插件**（subagent / coordinator）。
+   * 判据要保守：拿不准就**不要**置 pending —— 等待的成本（每步几十秒）远大于
+   * 偶尔少等一次的成本。
+   */
+  'core.agent.step.gate'?: (input: AgentStepGateInput, decision: AgentStepGateDecision) => Awaitable<void>
 
   // === CLI 扩展 ===
   /** 注册 CLI 斜杠命令：插件往 input.commands 追加自己的命令定义 */

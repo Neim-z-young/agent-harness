@@ -66,6 +66,14 @@ export interface CompressEvent {
   ranges: { topic?: string; chars: number }[]
   createdBlocks: number
   tokensCompressed: number
+  /**
+   * 本次压缩**零收益**（`createdBlocks === 0`）—— 白烧了一次模型调用。
+   *
+   * 为什么单独标一位而不是"看 createdBlocks 是否 0"：`createdBlocks` 为 0 也可能是
+   * 正常的幂等复用（该窗口已被既有块覆盖）。`zeroYield` 只在"模型真的调了 compress、
+   * 内核也确实跑了 applyCompression、结果一个块都没建"时为 true —— 这才是可优化的浪费。
+   */
+  zeroYield?: boolean
   blocksAfter: { t1: number; t2: number; t3: number }
 }
 
@@ -345,6 +353,7 @@ export function buildCompressEvent(inp: CompressBuildInput): CompressEvent {
     ranges: inp.ranges,
     createdBlocks: inp.result.blocksCreated,
     tokensCompressed: inp.result.tokensCompressed,
+    ...(inp.result.blocksCreated === 0 && inp.ranges.length > 0 ? { zeroYield: true } : {}),
     blocksAfter: {
       t1: countTier(inp.state, 1),
       t2: countTier(inp.state, 2),

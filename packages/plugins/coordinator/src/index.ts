@@ -49,8 +49,12 @@ import coordinatorPrompt from './prompts/coordinator.txt'
 
 export const CoordinatorEvents = {
   /**
-   * Barrier 完成事件：某个 session 派出的后台任务全部完成/失败后发布。
+   * Barrier 完成事件：某个 session 派出的后台任务**全部**完成/失败后发布。
    * 外层（CLI REPL / SDK）订阅此事件后应触发下一轮 query（注入 `<continue/>`）。
+   *
+   * 语义边界（观察点 2 之后）：本事件只负责「这一波结束了」的**收尾判定**，
+   * 不再承担「结果就绪」的职责 —— 那是 {@link workerCompleted} 的事。
+   * 两者都发时，单个任务那条**不会**在最后一个任务上重复发（见 `remaining === 0` 的分支）。
    */
   barrierCompleted: BusEvent.define<{
     /** 父 session ID（coordinator 所在会话） */
@@ -58,6 +62,31 @@ export const CoordinatorEvents = {
     /** 本轮 barrier 包含的任务 ID 列表 */
     taskIds: string[]
   }>('coordinator.barrier.completed'),
+
+  /**
+   * **单个** worker 完成/失败（观察点 2）。
+   *
+   * 为什么需要它：barrier 事件要等**全部**任务结束才发。真机 s_1790163574429_tg1a6 里
+   * reader#2 在 19:43:10 就完成了，barrier 直到 19:44:03（最慢那个失败时）才 completed ——
+   * 快结果被慢任务拖了 53 秒，而那 53 秒正是"界面停在等待中"的那段。
+   *
+   * 只在 `remaining > 0` 时发布：`remaining === 0` 意味着这是最后一个任务，
+   * 此时 `barrierCompleted` 已经作为"本波收尾"发出——两条都发只会让外层注入两行
+   * `<continue/>`（第二行必然空转，白跑一次判定）。
+   *
+   * 外层消费提示：收到本事件即可唤醒下一轮（CLI 侧的 `attachAutoContinue` 就是这么做的），
+   * 但**不要**把它当成"任务全齐了"——那是 barrierCompleted。
+   */
+  workerCompleted: BusEvent.define<{
+    /** 父 session ID（coordinator 所在会话） */
+    sessionId: string
+    /** 刚结束的后台任务 ID */
+    taskId: string
+    /** 该任务的结局 */
+    status: 'completed' | 'failed'
+    /** 本波里**仍未结束**的任务数（>0 才会发本事件） */
+    remaining: number
+  }>('coordinator.worker.completed'),
 } as const
 
 // ===== Coordinator System Prompt =====
@@ -509,6 +538,32 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
           harness = h
           bus = h.bus
 
+          /**
+           * 单个 worker 结束的收口点（观察点 2：单任务完成即让外层可以唤醒，不等整波）。
+           *
+           * 顺序很关键：`remaining` 必须在 `onWorkerFinished` **之前**算 —— 后者在计数归零时
+           * 会把这波 barrier 组整个删掉（`active.delete`），之后再问永远是 0，
+           * 于是"快任务完成时也报 remaining=0" ⇒ `workerCompleted` 永远发不出来，
+           * 又退回"等最慢那个"的老行为。
+           */
+          const onWorkerDone = (
+            parentSessionId: string,
+            taskId: string,
+            status: 'completed' | 'failed',
+          ): void => {
+            const remaining = Math.max(0, tracker.activeCount(parentSessionId) - 1)
+            tracker.onWorkerFinished({ taskId, parentSessionId, status })
+            // 最后一个任务：barrierCompleted 会作为"本波收尾"发出，这里不重复唤醒
+            if (remaining <= 0) return
+            if (!autoContinue || !bus) return
+            bus.publish(CoordinatorEvents.workerCompleted, {
+              sessionId: parentSessionId,
+              taskId,
+              status,
+              remaining,
+            }).catch(() => { /* Bus 发布失败不影响主流程 */ })
+          }
+
           // barrier 完成 → 发布事件（外层订阅后注入 <continue/> 自动续轮）
           tracker.onBarrierCompleted((sessionId, taskIds) => {
             if (!autoContinue || !bus) return
@@ -529,19 +584,11 @@ export function createCoordinatorPlugin(options: CoordinatorPluginOptions = {}):
             })
             bus.subscribe(SubagentEvents.completed, ({ payload }) => {
               if (!payload.taskId) return
-              tracker.onWorkerFinished({
-                taskId: payload.taskId,
-                parentSessionId: payload.parentSessionId,
-                status: 'completed',
-              })
+              onWorkerDone(payload.parentSessionId, payload.taskId, 'completed')
             })
             bus.subscribe(SubagentEvents.failed, ({ payload }) => {
               if (!payload.taskId) return
-              tracker.onWorkerFinished({
-                taskId: payload.taskId,
-                parentSessionId: payload.parentSessionId,
-                status: 'failed',
-              })
+              onWorkerDone(payload.parentSessionId, payload.taskId, 'failed')
             })
           }
         },

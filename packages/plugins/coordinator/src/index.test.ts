@@ -414,6 +414,111 @@ describe('createCoordinatorPlugin', () => {
     off()
   })
 
+  // ===== 观察点 2：单任务完成即唤醒（不等整波）=====
+
+  /** 造一次 subagent.started / completed 事件（字段只需 barrier 跟踪用到的那些） */
+  async function publishStarted(bus: ReturnType<typeof createBus>, taskId: string, n: number): Promise<void> {
+    await bus.publish(SubagentEvents.started, {
+      agentId: 'researcher', agentName: 'Researcher', subSessionId: `s${n}`,
+      parentSessionId: 's_parent', parentAgentId: 'coordinator', parentMessageId: 'm1',
+      toolUseId: `t${n}`, prompt: `任务 ${taskId}`, isContinuation: false, startedAt: Date.now(),
+      taskId, background: true,
+    } as any)
+  }
+
+  async function publishFinished(
+    bus: ReturnType<typeof createBus>,
+    taskId: string,
+    n: number,
+    status: 'completed' | 'failed' = 'completed',
+  ): Promise<void> {
+    const base = {
+      agentId: 'researcher', subSessionId: `s${n}`, parentSessionId: 's_parent', toolUseId: `t${n}`,
+      durationMs: 10, taskId, background: true,
+    }
+    if (status === 'completed') {
+      await bus.publish(SubagentEvents.completed, { ...base, replyPreview: `${taskId} 结果`, messageCount: 3 } as any)
+    } else {
+      await bus.publish(SubagentEvents.failed, { ...base, code: 'SUBAGENT_FAILED', message: '炸了' } as any)
+    }
+  }
+
+  it('单任务完成即发布 coordinator.worker.completed（带 remaining），最后一个只走 barrier', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['core.harness.start']({ harness })
+
+    const workerEvents: any[] = []
+    const barrierEvents: any[] = []
+    const offW = bus.subscribe(CoordinatorEvents.workerCompleted, ({ payload }) => { workerEvents.push(payload) })
+    const offB = bus.subscribe(CoordinatorEvents.barrierCompleted, ({ payload }) => { barrierEvents.push(payload) })
+
+    await publishStarted(bus, 'task-a', 1)
+    await publishStarted(bus, 'task-b', 2)
+    await publishStarted(bus, 'task-c', 3)
+    expect(workerEvents).toHaveLength(0)
+
+    // ① 最快那个完成：还剩 2 个 ⇒ 立刻发 worker.completed（旧行为要等到 task-c 才出声，快结果被拖）
+    await publishFinished(bus, 'task-a', 1)
+    expect(workerEvents.map((e) => [e.taskId, e.remaining])).toEqual([['task-a', 2]])
+    expect(barrierEvents).toHaveLength(0)
+
+    // ② 第二个完成（其中一个是失败）：还剩 1 个 ⇒ 同样发，status 如实透传
+    await publishFinished(bus, 'task-b', 2, 'failed')
+    expect(workerEvents.map((e) => [e.taskId, e.remaining, e.status]))
+      .toEqual([['task-a', 2, 'completed'], ['task-b', 1, 'failed']])
+
+    // ③ 最后一个：remaining=0 ⇒ **不**再发 worker.completed（否则外层会注入第二行 <continue/>），
+    //    由 barrier.completed 承担"本波收尾"
+    await publishFinished(bus, 'task-c', 3)
+    expect(workerEvents).toHaveLength(2)
+    expect(barrierEvents).toHaveLength(1)
+    expect(barrierEvents[0].taskIds.sort()).toEqual(['task-a', 'task-b', 'task-c'])
+
+    // ④ 每个事件都带 sessionId：外层要据此判断"这波是不是当前会话的"
+    expect(workerEvents.every((e) => e.sessionId === 's_parent')).toBe(true)
+
+    offW(); offB()
+  })
+
+  it('autoContinue=false ⇒ 两条唤醒事件都不发（连单任务那条也不发）', async () => {
+    const { bus, harness, plugin } = setup({ autoContinue: false })
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['core.harness.start']({ harness })
+
+    const workerEvents: any[] = []
+    const barrierEvents: any[] = []
+    const offW = bus.subscribe(CoordinatorEvents.workerCompleted, ({ payload }) => { workerEvents.push(payload) })
+    const offB = bus.subscribe(CoordinatorEvents.barrierCompleted, ({ payload }) => { barrierEvents.push(payload) })
+
+    await publishStarted(bus, 'task-a', 1)
+    await publishStarted(bus, 'task-b', 2)
+    await publishFinished(bus, 'task-a', 1)
+    await publishFinished(bus, 'task-b', 2)
+
+    expect(workerEvents).toHaveLength(0)
+    expect(barrierEvents).toHaveLength(0)
+    offW(); offB()
+  })
+
+  it('barrier 完成事件不受 worker 事件影响（既有语义原样保留）', async () => {
+    const { bus, harness, plugin } = setup()
+    const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)
+    await hooks['core.harness.start']({ harness })
+
+    const barrierEvents: any[] = []
+    const off = bus.subscribe(CoordinatorEvents.barrierCompleted, ({ payload }) => { barrierEvents.push(payload) })
+
+    await publishStarted(bus, 'task-a', 1)
+    await publishStarted(bus, 'task-b', 2)
+    await publishFinished(bus, 'task-a', 1)
+    // 只完成一个 ⇒ barrier 不发（与改造前一致）
+    expect(barrierEvents).toHaveLength(0)
+    await publishFinished(bus, 'task-b', 2)
+    expect(barrierEvents).toHaveLength(1)
+    off()
+  })
+
   it('core.prompt.system.transform：coordinator 身份注入 orchestrator prompt', async () => {
     const { bus, harness, plugin } = setup()
     const hooks: any = await plugin.install({ log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} } } as any)

@@ -63,6 +63,8 @@ export type {
   CliCommandDef,
   CliCommandsInput,
   CliCommandInput,
+  AgentStepGateInput,
+  AgentStepGateDecision,
 } from '@harness/plugin'
 
 export {
@@ -75,6 +77,7 @@ export {
   ToolValidationError,
   ToolPermissionDeniedError,
   ToolPermissionAskRequiredError,
+  normalizeToolError,
 } from '@harness/tool'
 export type {
   Awaitable as ToolAwaitable,
@@ -161,7 +164,7 @@ import {
   PermissionRequestLike,
   PermissionDecisionLike,
 } from '@harness/plugin'
-import type { CompactionContext, SystemStabilityReport } from '@harness/plugin'
+import type { CompactionContext, SystemStabilityReport, AgentStepGateDecision } from '@harness/plugin'
 import {
   Tool,
   ToolResult,
@@ -175,6 +178,7 @@ import {
   PermissionRequest as ToolPermissionRequest,
   PermissionDecision as ToolPermissionDecision,
   filterMcpTools,
+  normalizeToolError,
 } from '@harness/tool'
 import type {
   AgentDefinition,
@@ -361,11 +365,10 @@ async function safeExecuteTool(
   try {
     return await pipeline.execute(tool, input, tctx)
   } catch (err: any) {
-    // 避免依赖 re-export 的类绑定，用错误名判定（tool 层 ToolPermissionDeniedError.name 固定）
-    if (err?.name === 'ToolPermissionDeniedError') {
-      return { ok: false, error: { message: `权限被拒绝：${err.message}`, code: 'PERMISSION_DENIED' }, interrupted: false }
-    }
-    return { ok: false, error: { message: err?.message ?? String(err), code: 'TOOL_ERROR' }, interrupted: false }
+    // 归一化只此一处（@harness/tool 的 normalizeToolError）—— pipeline 的错误路径会
+    // 用同一函数造出"喂给 PostHook 的那份结果"，两处共用才不会让遥测与模型看到的 code 漂移。
+    const r = normalizeToolError(err)
+    return { ...r, interrupted: false }
   }
 }
 
@@ -638,6 +641,14 @@ export interface AgentStreamEvent {
     | 'tool_call_result' // 工具执行结果
     | 'done'             // **一步**结束（A 方案：引擎内自主多步时每个 step 都发一次，含 step 序号）
     | 'turn_end'         // **整轮**结束：所有 step 已跑完，本次查询不会再有任何事件
+    /**
+     * 步间闸门：本步开跑前因"后台任务还没跑完"而按退避阶梯等待（见 `core.agent.step.gate`）。
+     *
+     * 为什么要发事件而不是只 sleep：AGENTS.md 的心跳约定 —— 超过 ~15s 无任何输出就必须有
+     * 可见反馈，否则用户分不清"卡住了"和"任务本来就慢"。等待最长可到分钟级，
+     * 静默等待等于把"静默卡死"重新引入一次，因此每次等待都发一条。
+     */
+    | 'step_gate'
   text?: string
   toolUseId?: string
   toolId?: string
@@ -669,6 +680,32 @@ export interface AgentStreamEvent {
    * 仍会写回会话，故上层应把它呈现为"已中断（保留已完成部分）"而非失败。
    */
   aborted?: boolean
+  /**
+   * `turn_end` 时：本轮有多少步**没计入** `maxSteps` 额度。
+   *
+   * 唯一来源是「必填全缺」的入参回喂步（模型发出零参数工具调用、core 用 `[入参自愈]`
+   * 回喂必填清单，见 `MAX_SELF_HEAL_FREE_STEPS`）。有了它，`step` 与额度不一致时
+   * 消费方不必猜 —— 少了这个字段，"步号 30 但额度没耗尽"看起来像 bug。
+   */
+  freeSteps?: number
+  /**
+   * `step_gate` 事件载荷：这一次等待的细节（界面心跳 / 遥测用）。
+   *
+   * 只在 `type === 'step_gate'` 时有值。字段用嵌套对象而不是平铺，是为了不把
+   * "等待"这一族字段混进 text/toolId 这些通用槽位里。
+   */
+  gate?: {
+    /** 本步本次等待的毫秒数 */
+    waitMs: number
+    /** 本步**已累计**等待的毫秒数 */
+    waitedMs: number
+    /** 这是本步第几次等待（从 1 起） */
+    attempt: number
+    /** 插件上报的存活后台任务数（多插件取最大；未上报时 undefined） */
+    aliveCount?: number
+    /** 等待原因（插件的说明，缺省时引擎拼一句） */
+    reason?: string
+  }
 }
 
 /**
@@ -1133,7 +1170,12 @@ export class DefaultSessionManager implements SessionManager {
     let summaryText: string | undefined = pluginSummary
     const prevMemory = this.readMemory(sess)
 
-    if (summaryText === undefined && (strat === 'summary' || strat === 'agent')) {
+    // 零收益短路：**没有可折叠的窗口就不生成摘要**。
+    // 生成摘要是要花一次完整模型调用的（strat==='agent' 走 tryAgentSummary），窗口为空时那次
+    // 调用纯属白烧 —— 真机见过 `createdBlocks:0 / tokensCompressed:0` 的空压缩把额度吃在摘要上。
+    // 注意只跳过**摘要生成**，不提前 return：插件可能已在 hook 里折叠并回传 blocksPatch，
+    // 下面合并 session.blocks 的那段必须照常执行。
+    if (windowToPrune.length > 0 && summaryText === undefined && (strat === 'summary' || strat === 'agent')) {
       const maxChars = options.summaryMaxChars ?? 8000
       if (strat === 'agent') {
         // 尝试调用 agent（通过 services?.agent）——缺失或失败则 fallback 到规则摘要
@@ -1612,6 +1654,13 @@ interface StepOutcome {
   doomLoopTripped?: boolean
   /** 本步是否因外部中断（`signal`）而提前结束（中断后不再续轮） */
   aborted?: boolean
+  /**
+   * 本步的工具调用**全部**是「必填项没给全」的失败（观察点 9）。
+   *
+   * 判据刻意严格 —— 要求**每一个**调用都命中 `[入参自愈]`：只要有一个工具真的执行了，
+   * 这一步就干了实事，理应吃额度。为 false / undefined 时语义与改造前完全一致。
+   */
+  selfHealOnly?: boolean
 }
 
 /** 判断一个异常是否为 AbortError（各家实现细节不一，按 name/形状兜底判断） */
@@ -1684,10 +1733,123 @@ export function normalizeMaxSteps(value: number | undefined | null): number | un
 }
 
 /**
+ * 每轮 query 最多**免计**多少步「必填全缺」的入参回喂（观察点 9）。
+ *
+ * 背景：模型偶发整段丢掉 tool-call arguments（真机 100 次调用里 37 次失败、34 次 `input:{}`），
+ * core 会用 `[入参自愈]` 把必填清单回喂。这类步的产出只是"把参数补齐"，不该吃步数额度 ——
+ * 真机 lead 6 次 `input={}` 等于 6 步额度，而那 6 步一个字的结果都没产出。
+ *
+ * 为什么**必须有**这个上限：`maxSteps` 是循环唯一的上界，免计步等于在它之外开了一个缺口。
+ * doom-loop 守卫兜不住这个缺口 —— 它的两条判据是「同一工具+同一入参连续 3 次」与
+ * 「连续 3 步整步签名相同」，而模型交替发两个空参调用（A,B,A,B…）时两条都恒不命中。
+ * 取 3 是权衡：足够覆盖"连续几次丢参数"的真实形态，又让最坏情况多花不超过 3 次模型调用。
+ */
+export const MAX_SELF_HEAL_FREE_STEPS = 3
+
+/**
  * doom-loop 拦截阈值：同一工具 + 完全相同的入参连续出现的次数。
  * 对齐 opencode `processor.ts` 的 `DOOM_LOOP_THRESHOLD = 3`。
  */
 export const DOOM_LOOP_THRESHOLD = 3
+
+// ===== 步间闸门（派工后的轮内减速）=====
+
+/**
+ * 步间闸门的退避阶梯（毫秒）：3s → 6s → 12s → 24s → 48s → 60s（之后按 60s 继续）。
+ *
+ * 取值理由：3s 起 —— 后台子任务多是"秒级起步、分钟级收尾"，3s 足以让同批里更快的那些
+ * 结果落地；封顶 60s —— 超过一分钟的等待对"摊平步数"已无边际收益，只会让用户觉得卡。
+ * 刻意**不**从 0 起步：闸门的意义就是让出时间，0 等于没等。
+ */
+export const STEP_GATE_BACKOFF_MS: readonly number[] = [3_000, 6_000, 12_000, 24_000, 48_000, 60_000]
+
+/**
+ * 步间闸门在本轮 query 内的**等待总预算**（毫秒），默认 5 分钟。
+ *
+ * 为什么必须有个上限：闸门的终止条件是"没有存活的后台任务"，而这个条件由插件上报 ——
+ * 插件判断出错（或某个任务卡在非超时路径上）就会让一整轮 query 无限期减速。
+ * 5 分钟覆盖得住默认 120s 的子 Agent 超时，又不会让一次卡壳变成"进程像死了"。
+ * 预算耗尽后本轮的后续步**不再等待**（闸门关闭，不影响步数上限与其它守卫）。
+ */
+export const STEP_GATE_MAX_TOTAL_MS = 300_000
+
+/**
+ * 取第 `attempt` 次等待的时长（毫秒）。`attempt` 从 0 起，超出阶梯长度后**保持末档**
+ * （即 60s 起封顶），而不是重置或线性延长 —— 阶梯只负责"尽量早出声"，封顶负责"别太久"。
+ */
+export function stepGateDelayMs(attempt: number, ladder: readonly number[] = STEP_GATE_BACKOFF_MS): number {
+  if (ladder.length === 0) return 0
+  // NaN 必须显式落 0 档：`Math.floor(NaN)` 是 NaN，后面的 `Math.max/min` 都拦不住它，
+  // 最终 `ladder[NaN]` 会返回 `undefined` ⇒ 等待时长变成 undefined（真等下去是"立即返回"，
+  // 但类型上已经骗过了 `number`，属于最难查的一类静默失效）。
+  const n = Number.isNaN(attempt) ? 0 : Math.floor(attempt)
+  const idx = Math.max(0, Math.min(n, ladder.length - 1))
+  return ladder[idx]!
+}
+
+/** 步间闸门的可调参数（宿主注入；缺省即本模块导出的阶梯与预算） */
+export interface StepGateOptions {
+  /** 关掉闸门（完全不在步间等待） */
+  enabled?: boolean
+  /** 退避阶梯（毫秒）；空数组等价于"每次都不等" */
+  ladderMs?: readonly number[]
+  /** 本轮 query 内的等待总预算（毫秒） */
+  maxTotalMs?: number
+}
+
+/**
+ * 把各插件上报的闸门决策**合并**成一条（多插件时的 OR 语义）。
+ *
+ * 抽成纯函数是为了能单测"两次上报怎么写进同一个 decision"：引擎只触发一次 hook、
+ * 传同一个 decision 对象给所有插件原地改写，但插件拿到的是 `any`（hook 入参是 unknown），
+ * 写坏字段（如 `aliveCount: NaN`）时不该把引擎带下水。
+ */
+export function mergeStepGateDecision(
+  decision: AgentStepGateDecisionLike | undefined,
+): { pending: boolean; aliveCount?: number; reason?: string } {
+  if (!decision || decision.pending !== true) return { pending: false }
+  const alive = decision.aliveCount
+  return {
+    pending: true,
+    ...(typeof alive === 'number' && Number.isFinite(alive) ? { aliveCount: alive } : {}),
+    ...(typeof decision.reason === 'string' && decision.reason ? { reason: decision.reason } : {}),
+  }
+}
+
+/** {@link mergeStepGateDecision} 的输入形态（结构化最小面，避免把 plugin 类型漏进引擎内部） */
+interface AgentStepGateDecisionLike {
+  pending?: unknown
+  aliveCount?: unknown
+  reason?: unknown
+}
+
+/**
+ * 可被 `signal` 打断的 sleep（步间闸门用）。
+ *
+ * 为什么不用裸 `setTimeout`：闸门单次最长 60s，用户此刻按 Ctrl-C 必须**立刻**停 ——
+ * 裸 sleep 会让"中断"最多晚 60 秒才生效，那和没中断没区别。中断时立即 resolve，
+ * 由调用方检查 `signal.aborted` 决定后续（不是在这里抛错：闸门不是错误路径）。
+ * 定时器 `unref` 掉，避免一个等待中的长定时器把进程钉住。
+ */
+function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve()
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, ms)
+    ;(timer as unknown as { unref?: () => void }).unref?.()
+    const onAbort = (): void => {
+      cleanup()
+      resolve()
+    }
+    function cleanup(): void {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 // ===== 重复侦察结果复用（§8.2）=====
 
@@ -1820,12 +1982,28 @@ export class AgentRuntimeImpl implements AgentRuntime {
       readonly bus: Bus
       readonly cwd: string
       /**
+       * 手工派发一次 `core.tool.post.execute`（顺序与 pipeline 的 Step 7 一致）。
+       *
+       * 供**不走 pipeline** 的失败路径复用：doom-loop 守卫挡在 pipeline 之前、自己造结果，
+       * 于是从不经过 Step 7 ⇒ 遥测/轨迹全盲（见 `_emitUnpipelinedToolFailure`）。
+       * 交给 HarnessImpl 注入而不是在这里 `listHooks`：hook 派发只有一份实现，别开第二条路。
+       */
+      readonly dispatchToolPostHooks: (
+        ctx: ToolPostHookContext,
+        result: ToolResult,
+      ) => Promise<ToolResult>
+      /**
        * token 折算口径（引擎侧唯一取值点；由 HarnessImpl 从 options.tokenCalibration 解析后注入）。
        * 用于把「整包请求」的本地估算与 provider 上报用量放在同一把尺子上比对。
        */
       readonly countTokens: (text: string) => number
       /** 可选：快照服务工厂（注入后自动 capture 挂载 meta.snapshot） */
       readonly snapshot?: () => SnapshotService
+      /**
+       * 可选：步间闸门参数（宿主可覆盖阶梯与预算；缺省见 {@link STEP_GATE_BACKOFF_MS}）。
+       * 注入点在这里而不是读模块常量，是为了让宿主能按自己的节奏调（也能在测试里压到毫秒级）。
+       */
+      readonly stepGate?: StepGateOptions
       /** 可选：宿主 logger（用于"已忽略"类告警 —— 可观测性增强不得静默失效） */
       readonly logger?: import('@harness/plugin').PluginContext['log']
     }
@@ -2201,6 +2379,22 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const maxSteps = fromInput ?? fromAgent ?? DEFAULT_MAX_STEPS
 
     let step = 0
+    /**
+     * 计入 `maxSteps` 额度的步数（与展示用的 `step` 分开，观察点 9）。
+     *
+     * 为什么要两套计数：「必填全缺」的入参回喂步不该吃额度，但步号仍要连续递增 ——
+     * 否则 `done.step` 会重复，UI/遥测里的步号就不再单调（那是更难查的一类混乱）。
+     */
+    let billedSteps = 0
+    /**
+     * 本轮已经**免计**了多少步（上限 {@link MAX_SELF_HEAL_FREE_STEPS}）。
+     * 既做上限判定，也在 `turn_end` 里报出去 —— 否则"步号比额度大"这件事没人解释得了。
+     */
+    let selfHealFreeUsed = 0
+    // 步间闸门状态（见循环内那一段的说明）：`gateAttempt` = 连续等待了几次（决定阶梯档位，
+    // 探测到"没有存活任务"即归零），`gateWaitedMs` = 本轮累计等待（对总预算兜底）。
+    let gateAttempt = 0
+    let gateWaitedMs = 0
     let wrapUpInjected = false
     const signal = input.signal
     // 最近若干次工具调用签名（跨步累积，供 doom-loop 检测）。保持 threshold-1 个即可：
@@ -2218,6 +2412,64 @@ export class AgentRuntimeImpl implements AgentRuntime {
         // 这样不会把一步切成两半，已产生的 assistant 消息与工具结果都保持完整。
         if (signal?.aborted) break
 
+        // ── 步间闸门（派工后的轮内减速）──
+        //
+        // 走到这里说明**上一步要求续轮**（否则上面已 break），也就是引擎打算再花一步额度。
+        // 若此刻仍有本会话的后台任务在跑，先让出一次时间：真机上 lead 派完 4 个 reader 后
+        // 能在 20 秒内把 30 步额度烧光（msg31 / msg66 两次撞顶，第一次撞顶时任务只做了一半），
+        // 于是结果只能在**下一轮 query** 里才可能被看到。
+        //
+        // 四条边界，逐条都是踩过或推演过的：
+        // · 只在 step ≥ 2 触发 —— 第 1 步之前没有"派出去的任务"可言，等了也没意义；
+        // · **每个步边界最多等一次**（不是"等到没任务为止"）—— 后者会让单独一步阻塞好几分钟，
+        //   且与"每执行一轮都等一会"的字面语义不符；分散到各步上，界面上的心跳也是一段一段的；
+        // · 探测为"静默"时把阶梯**归零**（而不是永久关闸门）：同一轮里 coordinator 可能再派一批，
+        //   新一波该从最小档重新起步；探测本身只是一次内存过滤，重探的成本可以忽略；
+        // · 累计等待达到 `STEP_GATE_MAX_TOTAL_MS` 后本轮的后续步都不再等 —— 闸门的终止条件
+        //   依赖插件上报，必须有引擎侧兜底，否则插件误报就能把一轮 query 拖成"看起来死了"。
+        if (step >= 1 && this.deps.stepGate?.enabled !== false) {
+          const gateCfg = this.deps.stepGate
+          const ladder = gateCfg?.ladderMs ?? STEP_GATE_BACKOFF_MS
+          const maxTotalMs = gateCfg?.maxTotalMs ?? STEP_GATE_MAX_TOTAL_MS
+          const waitMs = stepGateDelayMs(gateAttempt, ladder)
+          const decision: AgentStepGateDecision = {}
+          await this.deps.triggerPlugin(
+            'core.agent.step.gate',
+            {
+              sessionId,
+              nextStep: step + 1,
+              agentId: prepared.agentId,
+              waitAttempt: gateAttempt,
+              waitedMs: gateWaitedMs,
+              step,
+            },
+            decision,
+          )
+          const merged = mergeStepGateDecision(decision)
+          if (!merged.pending) {
+            // 静默：这一波任务已经没有了 ⇒ 阶梯归零（下一波从最小档起）
+            gateAttempt = 0
+          } else if (waitMs > 0 && gateWaitedMs + waitMs <= maxTotalMs && !signal?.aborted) {
+            await sleepAbortable(waitMs, signal)
+            // 等待期间被中断：不再记这一次（本轮已经结束，报一条"等了 60s"反而是假信息）
+            if (!signal?.aborted) {
+              gateAttempt += 1
+              gateWaitedMs += waitMs
+              yield {
+                type: 'step_gate',
+                gate: {
+                  waitMs,
+                  waitedMs: gateWaitedMs,
+                  attempt: gateAttempt,
+                  ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
+                  reason: merged.reason ?? '后台任务尚未跑完',
+                },
+              }
+            }
+          }
+        }
+        if (signal?.aborted) break
+
         step++
         const outcome = yield* this._runOneStep(
           prepared,
@@ -2233,11 +2485,24 @@ export class AgentRuntimeImpl implements AgentRuntime {
           stepSigs = [...stepSigs, outcome.stepSig].slice(-(DOOM_LOOP_THRESHOLD - 1))
         }
 
+        // ── 额度计数：「必填全缺」的入参回喂步免税（观察点 9）──
+        //
+        // 这类步的产出只有一条 `[入参自愈]` 说明加模型的一次重试，等于把一次额度花在
+        // "把参数写全"上（真机 lead 6 次 `input={}`，即 6 步额度）。**但不是白送**：
+        // 每轮最多免 `MAX_SELF_HEAL_FREE_STEPS` 步 —— 免计步会绕过 maxSteps 这个唯一的
+        // 上界，而 doom-loop 守卫只挡"连续 3 次同一调用"，模型交替发两个空参调用就能
+        // 绕开它（A,B,A,B… 两个判据都恒不命中）。没有这个上限就是一条无限循环通道。
+        if (outcome.selfHealOnly === true && selfHealFreeUsed < MAX_SELF_HEAL_FREE_STEPS) {
+          selfHealFreeUsed += 1
+        } else {
+          billedSteps += 1
+        }
+
         // doom-loop 被拒 / 被中断 ⇒ 立刻收手，不再续轮
         if (outcome.doomLoopTripped || outcome.aborted) break
         if (!shouldContinueStep(outcome)) break
 
-        if (step >= maxSteps) {
+        if (billedSteps >= maxSteps) {
           // 到顶但模型仍想继续：给一次收尾机会（追加提示再跑一步），而非硬截断。
           // 例外：maxSteps=1 是「显式单轮」语义（子 Agent 只要一次工具结果、旧调用方要单轮行为），
           // 此时不追加收尾步 —— 否则「1 步」会变成 2 次模型调用。
@@ -2276,11 +2541,18 @@ export class AgentRuntimeImpl implements AgentRuntime {
           ...(def?.mode ? { mode: def.mode } : {}),
           sessionId,
           step,
+          ...(selfHealFreeUsed > 0 ? { freeSteps: selfHealFreeUsed } : {}),
           ...(lastOutcome?.finish ? { finish: lastOutcome.finish } : {}),
           ...(signal?.aborted ? { aborted: true } : {}),
         })
         .catch(() => undefined)
-      yield { type: 'turn_end', ...(signal?.aborted ? { aborted: true } : {}) }
+      yield {
+        type: 'turn_end',
+        ...(signal?.aborted ? { aborted: true } : {}),
+        // 轮内步号与额度不一致时的解释：`step` 是展示步号，其中 `freeSteps` 步没吃额度
+        // （「必填全缺」的入参回喂步，见 MAX_SELF_HEAL_FREE_STEPS）。
+        ...(selfHealFreeUsed > 0 ? { freeSteps: selfHealFreeUsed } : {}),
+      }
     }
   }
 
@@ -2291,6 +2563,38 @@ export class AgentRuntimeImpl implements AgentRuntime {
    * 用 async generator 而非普通函数，是为了让流式增量照常 `yield` 给上层；
    * 终值（StepOutcome）通过 `yield*` 的返回值传出，避免再引一条回调通道。
    */
+  /**
+   * 让**不走 pipeline** 的失败也能被 `core.tool.post.execute` 的消费方看到。
+   *
+   * 为什么需要：doom-loop 守卫挡在 pipeline **之前**（见 `_runOneStep` 里两处 DOOM_LOOP 的说明），
+   * 自己直接构造失败结果 —— 于是它从不经过 Step 7，遥测的 `telemetry.doomloop`、skill-forge 的
+   * 失败轨迹都收不到它。实测：全仓 `telemetry.doomloop` **0 条**，这条被反复打磨（25 步空转
+   * 21 秒那次的产物）的守卫在生产遥测里完全不可观测。这里手工派发一次 post hook 补齐。
+   *
+   * 只做**上报**：hook 的返回值丢弃，会话里写回的仍是上游那份原样结果。
+   * `ABORTED`（用户主动中断）刻意不走这里 —— 它是控制流信号而非工具失败，计进失败率会失真。
+   */
+  private async _emitUnpipelinedToolFailure(
+    tool: Tool | undefined,
+    input: unknown,
+    tctx: Omit<ToolContext, 'toolUseId'> & { toolUseId: string },
+    result: ToolResult,
+  ): Promise<void> {
+    // 工具都没解析出来（未注册）时没有可归因的对象 —— 不编造 `tool`，直接跳过
+    if (!tool) return
+    try {
+      await this.deps.dispatchToolPostHooks(
+        { tool, input, ctx: tctx, toolUseId: tctx.toolUseId },
+        result,
+      )
+    } catch (err) {
+      // 上报失败绝不能顶掉 doom-loop 本身的中断语义
+      this.deps.logger?.error?.(
+        `core.tool.post.execute 派发失败（doom-loop 路径）：${(err as Error)?.message ?? err}`,
+      )
+    }
+  }
+
   private async *_runOneStep(
     prepared: PreparedQuery,
     step: number,
@@ -2444,9 +2748,38 @@ export class AgentRuntimeImpl implements AgentRuntime {
     const sessCwd = (await this.deps.session.get(sessionId))?.cwd
     const tctxCwd = sessCwd ?? this.deps.cwd
 
+    // 工具上下文中与**具体 tool_call 无关**的部分。提到循环外有两个理由：
+    // ① 每个调用之间只有 `toolUseId` 不同；
+    // ② doom-loop 的两处短路（挡在执行之前）也要用它派发 post hook —— 见
+    //    `_emitUnpipelinedToolFailure`，那里解释了"为什么这条路径也必须上报"。
+    const tctxBase: Omit<ToolContext, 'toolUseId'> = {
+      sessionId,
+      agentId,
+      messageId: assistantId,
+      // 接上真正会 abort 的信号：bash 据此 kill 子进程、web 工具据此中止 fetch。
+      // 未传 signal 时才退回新建（保持向后兼容 —— 旧调用方行为不变）。
+      signal: signal ?? new AbortController().signal,
+      // callerToolIds：本轮该 Agent **实际可用**的工具 id 列表。
+      // 消费方是 subagent 插件 —— 它据此判断"回给父 Agent 的完整输出用 read_file 读不读得到"。
+      // 此前这个字段只有读取方没有写入方（声明了却没人填），提示语因此永远走错分支。
+      variables: { callerToolIds: allowedTools.map((t) => t.id) },
+      cwd: tctxCwd,
+      requestPermission: (r) =>
+        resolvePermission(this.deps.permission, r as ToolPermissionRequest, this.deps.triggerPlugin) as Promise<ToolPermissionDecision>,
+    }
+
     // 执行 tool calls
     const toolSigs: string[] = []
     let doomLoopTripped = false
+    /**
+     * 本步里**因为"必填项没给全"而失败**的调用下标（观察点 9）。
+     *
+     * 用"记录命中者"而不是"记未命中者"：工具调用的执行路径有 4 条出口（未注册工具、
+     * 整步重复、同调用重复、正常执行），只有一条会真的产生入参自愈消息。要求每条出口
+     * 都记得把标志清掉是易漏的写法；反过来只在这唯一命中点登记，末尾按
+     * `命中数 === 调用总数` 判定，漏一条出口只会让判定更保守（不吃额度）。
+     */
+    const selfHealIdx = new Set<number>()
     // 跨步累积（priorSigs）+ 本步顺序追加 ⇒ 尾部连续 threshold 个相同即判定死循环
     const sigs = [...priorSigs]
 
@@ -2484,6 +2817,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         input: parsedInput,
       }
 
+      // 本调用对应的工具执行上下文。**公共部分提到循环外**（与具体 tool_call 无关的那些字段），
+      // 因为 doom-loop 的两处短路也要用它 —— 见 `_emitUnpipelinedToolFailure`。
+      const tctx: ToolContext = { ...tctxBase, toolUseId: tc.toolUseId }
+
       // 中断检查：已 abort ⇒ 不再执行剩余工具（含当前这个），逐个标记为 ABORTED。
       // **不丢已完成的部分**：本步此前已 push 的工具结果与已收到的 assistant 文本照常写回会话
       // （对齐 opencode cleanup 的收尾语义）。放在 tool_call_start 之前 —— 没执行就不该报"开始"。
@@ -2513,6 +2850,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
           code: 'DOOM_LOOP',
         }
         resultPart.isError = true
+        // 不走 pipeline ⇒ 手工补一次 post hook 派发，否则这次拦截在遥测/轨迹里不存在
+        await this._emitUnpipelinedToolFailure(tool, parsedInput, tctx, {
+          ok: false,
+          error: { message: resultPart.result.message, code: 'DOOM_LOOP' },
+        })
         assistant.parts.push(resultPart)
         yield {
           type: 'tool_call_result',
@@ -2540,6 +2882,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
           code: 'DOOM_LOOP',
         }
         resultPart.isError = true
+        // 同上：不走 pipeline 的拦截要手工派发 post hook（telemetry.doomloop 的唯一来源）
+        await this._emitUnpipelinedToolFailure(tool, parsedInput, tctx, {
+          ok: false,
+          error: { message: resultPart.result.message, code: 'DOOM_LOOP' },
+        })
         assistant.parts.push(resultPart)
         yield {
           type: 'tool_call_result',
@@ -2559,21 +2906,6 @@ export class AgentRuntimeImpl implements AgentRuntime {
         continue
       }
 
-      const tctx: ToolContext = {
-        sessionId,
-        agentId,
-        messageId: assistantId,
-        toolUseId: tc.toolUseId,
-        // 接上真正会 abort 的信号：bash 据此 kill 子进程、web 工具据此中止 fetch。
-        // 未传 signal 时才退回新建（保持向后兼容 —— 旧调用方行为不变）。
-        signal: signal ?? new AbortController().signal,
-        // callerToolIds：本轮该 Agent **实际可用**的工具 id 列表。
-        // 消费方是 subagent 插件 —— 它据此判断"回给父 Agent 的完整输出用 read_file 读不读得到"。
-        // 此前这个字段只有读取方没有写入方（声明了却没人填），提示语因此永远走错分支。
-        variables: { callerToolIds: allowedTools.map((t) => t.id) },
-        cwd: tctxCwd,
-        requestPermission: (r) => resolvePermission(this.deps.permission, r as ToolPermissionRequest, this.deps.triggerPlugin) as Promise<ToolPermissionDecision>,
-      }
       const res: ToolResult = await safeExecuteTool(this.deps.toolPipeline, tool, parsedInput, tctx)
       resultPart.result = res.ok ? res.output : { message: res.error?.message, code: res.error?.code }
       resultPart.isError = !res.ok
@@ -2591,6 +2923,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
         if (heal && resultPart.result && typeof resultPart.result === 'object') {
           (resultPart.result as { message?: string }).message =
             `${(resultPart.result as { message?: string }).message ?? '入参不合法'}\n\n${heal}`
+          // 唯一命中点：这次调用的失败**就是**"必填项没给全"（观察点 9 的免计依据）
+          selfHealIdx.add(i)
         }
       }
       assistant.parts.push(resultPart)
@@ -2653,6 +2987,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
       stepSig,
       ...(doomLoopTripped ? { doomLoopTripped } : {}),
       ...(aborted ? { aborted } : {}),
+      // 本步**每一个**调用都是"必填项没给全"的失败 ⇒ 这一步只是在把参数补齐，
+      // 由 queryStream 决定是否免计额度（见 MAX_SELF_HEAL_FREE_STEPS）。
+      ...(toolCalls.length > 0 && selfHealIdx.size === toolCalls.length ? { selfHealOnly: true } : {}),
     }
   }
 
@@ -3037,6 +3374,15 @@ export interface AgentHarnessOptions {
    * 未注入则压缩不产原文档案（仍产 blocks 与摘要，全文回溯退化为仅摘要）。
    */
   originalStore?: SessionOriginalStore
+  /**
+   * 可选：步间闸门（派工后的轮内减速）参数。
+   *
+   * 语义见 `core.agent.step.gate`：每步开跑前问插件"还有存活的后台任务吗"，
+   * 有则按 {@link STEP_GATE_BACKOFF_MS} 退避等待（每步重探，累计不超过
+   * {@link STEP_GATE_MAX_TOTAL_MS}）。宿主可在这里换一套阶梯/预算，
+   * 或 `{ enabled: false }` 整个关掉（不希望轮内被让出时间时）。
+   */
+  stepGate?: StepGateOptions
   /** 可选：透传给 PluginManager（测试注入 dynamicImport） */
   pluginOverrides?: Partial<PluginManagerOptions>
   /** 可选：透传 logger */
@@ -3211,10 +3557,13 @@ export class HarnessImpl implements Harness {
       chatProvider: (providerId?: string) => this.resolveChatProvider(providerId),
       permission: this.permission,
       triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
+      // 复用 pipeline 的那份派发逻辑（同一个 postHook 闭包），别开第二条实现路径
+      dispatchToolPostHooks: async (postCtxIn, result) => postHook(postCtxIn, result),
       bus: this.bus,
       cwd: options.cwd ?? process.cwd(),
       countTokens: this.countTokens,
       snapshot: options.snapshot,
+      stepGate: options.stepGate,
       logger: options.logger,
     })
     ;(options.agents ?? []).forEach((a) => agentImpl.register(a))

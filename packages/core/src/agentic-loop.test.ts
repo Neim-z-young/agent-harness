@@ -7,10 +7,13 @@ import {
   DOOM_LOOP_THRESHOLD,
   DEFAULT_MAX_STEPS,
   type AgentDefinition,
+  type AgentPlugin,
   type AgentStreamEvent,
   type ChatProvider,
   type ChatStreamChunk,
+  type Hooks,
   type Message,
+  type ToolResult,
 } from './index'
 
 /**
@@ -272,6 +275,50 @@ describe('S2 续轮判据与保护', () => {
     expect(engine.asks).toBe(0)
     // 拦下即收手：模型只被调用 3 次，第 4 步的「收尾」剧本不会被用到
     expect(provider.calls).toBe(DOOM_LOOP_THRESHOLD)
+    await h.stop()
+  })
+
+  it('doom-loop 短路也要派发 core.tool.post.execute（telemetry.doomloop 的唯一来源）', async () => {
+    // doom-loop 守卫挡在 pipeline **之前**、自己造失败结果 ⇒ 从不经过 Step 7（PostHook）。
+    // 若不手工补派发，这次拦截在遥测/轨迹里根本不存在 —— 真机测过：全仓 `telemetry.doomloop` 0 条。
+    // 本用例锁住「短路路径确实补了一次派发」+「带上了会话归属」。
+    const provider = scriptedProvider([toolCallScript('same')])
+    const seen: Array<{ toolId?: string; code?: string; sessionId?: string }> = []
+    const PostHookProbe: AgentPlugin = {
+      id: 'post-hook-probe',
+      version: '1',
+      name: 'PostHookProbe',
+      async install() {
+        return {
+          async 'core.tool.post.execute'(ctx: any, result: ToolResult) {
+            seen.push({
+              toolId: ctx?.tool?.id,
+              code: (result as any)?.error?.code,
+              // 缺 sessionId ⇒ 事件会落 run 级文件、会话取证永远看不到（本轮一并修的坑）
+              sessionId: ctx?.ctx?.sessionId,
+            })
+            return result
+          },
+        } as Hooks
+      },
+    }
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [PostHookProbe],
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'loop'))
+
+    // 前两次真的执行（post hook 带 ok:true ⇒ 无 error.code），第 3 次被硬拦 ⇒ 恰好 1 条 DOOM_LOOP
+    const doom = seen.filter((s) => s.code === 'DOOM_LOOP')
+    expect(doom).toHaveLength(1)
+    expect(doom[0]?.toolId).toBe('echo')
+    expect(doom[0]?.sessionId).toBe(sess.id)
+    // 成功路径的两次派发也在（证明短路补派发没有替代/污染正常路径）
+    expect(seen).toHaveLength(DOOM_LOOP_THRESHOLD)
     await h.stop()
   })
 

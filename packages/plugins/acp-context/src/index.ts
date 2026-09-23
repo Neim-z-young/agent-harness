@@ -122,6 +122,45 @@ export const COMPRESS_TOOL_DOC = [
   'summary 是这段历史被替换后的唯一记录，须自包含完整：用户目标与意图、决策及理由、精确路径/签名/报错原文/数值、结论、踩坑教训；丢弃已提取信息的冗余长日志，勿照搬。',
 ].join('\n')
 
+/** ref（形如 `m00012`）末尾的序号；解析不出返回 NaN */
+function refSeq(ref: string | null | undefined): number {
+  const m = /(\d+)\s*$/.exec(String(ref ?? ''))
+  return m ? Number(m[1]) : NaN
+}
+
+/**
+ * 统计各 range 覆盖的**原文字符数**（遥测口径，纯计算、不改状态）。
+ *
+ * 为什么需要：`compress` 事件的 `ranges[].chars` 长期恒为 0 ⇒「模型要求折叠多少内容」
+ * 完全不可测，**零收益压缩**在遥测里与「折了一大段」长得一模一样
+ * （真机 round 11：`createdBlocks:0, tokensCompressed:0, ranges:[{chars:0}]`）。
+ * 这里按**压缩前**的 ref 映射把区间还原成字符数。
+ */
+export function measureRangeChars(
+  state: CompressionState,
+  cores: readonly CoreMessage[],
+  ranges: readonly { topic?: string; startRef?: string; endRef?: string }[],
+): { topic?: string; chars: number }[] {
+  return ranges.map((r) => {
+    const topic = r.topic ?? undefined
+    const lo = refSeq(r.startRef)
+    const hi = refSeq(r.endRef)
+    if (Number.isNaN(lo) || Number.isNaN(hi)) return { topic, chars: 0 }
+    let chars = 0
+    for (const c of cores) {
+      let ref: string | undefined
+      try {
+        ref = refForRaw(state.messageRefs, c.id) ?? undefined
+      } catch {
+        ref = undefined
+      }
+      const n = refSeq(ref)
+      if (!Number.isNaN(n) && n >= lo && n <= hi) chars += c.text?.length ?? 0
+    }
+    return { topic, chars }
+  })
+}
+
 /**
  * 手册提前注入系数：占用率到达 `minContextLimitPct × 0.9` 即在**尾部**注入完整手册。
  *
@@ -156,6 +195,8 @@ export interface CompressOutput {
   tokensCompressed: number
   errors: string[]
   warnings: string[]
+  /** 本次实际折叠掉的原文字符数（零收益时为 0；便于模型判断这次调用有没有价值） */
+  charsCompressed?: number
 }
 
 export interface DecompressInput {
@@ -479,6 +520,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           if (!ranges.length) {
             return { ok: false, error: { message: 'compress 参数无法解析出有效范围', code: 'NO_RANGES' } }
           }
+          // 遥测要统计的是"模型要求折叠多少"，必须用**压缩前**的 ref 映射（压缩后 refs 会变）
+          const preState = sctx.state
           const applied = engine.applyCompression({
             ranges: ranges.map((r) => ({
               startRef: r.startRef,
@@ -496,6 +539,9 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           sctx.needFull = true
 
           // ---- 遥测：compress 事件（模型主动调用时） ----
+          // ranges 的 chars 用**压缩前**的 ref 映射真实统计（此前恒为 0，零收益与真折叠不可分辨）。
+          const rangeStats = measureRangeChars(preState, sctx.lastCores, ranges)
+          const charsAttempted = rangeStats.reduce((n, r) => n + r.chars, 0)
           const telem = sctx.telemetry ?? createTelemetryWriter(undefined)
           try {
             const ev = buildCompressEvent({
@@ -504,11 +550,30 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               window: config.modelContextLimit,
               state: applied.state,
               result: applied.result,
-              ranges: ranges.map((r) => ({ topic: r.topic, chars: 0 })),
+              ranges: rangeStats,
             })
             telem.write(ev)
           } catch {
             // 遥测失败不影响主流程
+          }
+
+          // ---- 零收益：一个块都没建 ⇒ 不是「成功但没变化」，而是**这次调用白烧了** ----
+          // 内核已经给出很具体的 gate 说明（哪些 ref 已覆盖 / 范围太小 / ref 未知），
+          // 之前把它塞在 `ok: true` 的 output.errors 里 ⇒ 模型倾向于当成成功继续。
+          // 这里升级为失败结果，把内核说明原样回喂，并给下一步动作。
+          if (applied.result.blocksCreated === 0) {
+            return {
+              ok: false,
+              error: {
+                message: [
+                  `本次 compress **零收益**（未产生任何压缩块，尝试范围共 ${charsAttempted} 字符）——这次调用等于白烧。`,
+                  ...(applied.result.errors.length > 0 ? ['内核说明：', ...applied.result.errors] : []),
+                  ...(applied.result.warnings.length > 0 ? ['内核提示：', ...applied.result.warnings] : []),
+                  '下一步：先调 acp_status 取**当前**可压缩范围再发 compress；或把范围扩大到未被覆盖的连续段。',
+                ].join('\n'),
+                code: 'NO_EFFECT',
+              },
+            }
           }
 
           return {
@@ -518,6 +583,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               tokensCompressed: applied.result.tokensCompressed,
               errors: applied.result.errors,
               warnings: applied.result.warnings,
+              charsCompressed: charsAttempted,
             },
           }
         },

@@ -22,6 +22,15 @@ export type AgentPhase =
   | 'streaming'
   /** 执行工具：tool_call_start 之后、tool_call_result 之前 */
   | 'tool'
+  /**
+   * 步间等待：收到 step_gate —— 派工后的后台任务还没跑完，引擎在下一步之前让出时间
+   * （见 `core.agent.step.gate`）。
+   *
+   * 为什么单独一个相位而不是复用 'thinking'：这段时间**没有**任何模型调用在进行，
+   * 状态栏若显示"推理"，用户会去怪模型慢；显示"等待后台任务"才指向真实原因
+   * （最长可达数十秒，必须与"卡住了"分得开）。
+   */
+  | 'waiting'
   /** 已中断：done/turn_end 带 aborted */
   | 'aborted'
 
@@ -74,6 +83,9 @@ export function reduceAgentStatus(prev: AgentStatus, ev: AgentStreamEvent): Agen
     case 'turn_end':
       // 整轮结束（异常路径也会送达 —— core 用 try/finally 保证）
       return { ...prev, phase: prev.phase === 'aborted' ? 'aborted' : 'idle' }
+    case 'step_gate':
+      // 步间等待：不是 idle（引擎还在这一轮里），也不是 thinking（没有模型调用在跑）
+      return { ...prev, phase: 'waiting' }
     default:
       return prev
   }
@@ -105,6 +117,8 @@ export function formatAgentPhase(s: AgentStatus): string {
       return '输出'
     case 'tool':
       return s.toolId ? `工具·${shorten(s.toolId, 10)}` : '工具'
+    case 'waiting':
+      return '等待后台任务'
     case 'aborted':
       return '已中断'
     default:
