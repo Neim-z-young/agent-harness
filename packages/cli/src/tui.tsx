@@ -48,6 +48,7 @@ import {
   recordTool,
   recordTaskDone,
   uncachedInput,
+  cacheHitRate,
   modelUsageRow,
   toolUsageRow,
   agentUsageRow,
@@ -97,6 +98,20 @@ export type TuiReplExit = 'exit'
 
 /** 侧栏面板宽度（单元格） */
 const SIDEBAR_WIDTH = 26
+
+/**
+ * 侧栏滚动条配色。
+ *
+ * 为什么必须显式给：OpenTUI 的滑块默认色是 `RGBA(37,37,39)`（近黑），在深色背景上**等于看不见**
+ * —— 用户会以为"这个面板不能滚"。这里只改滑块色，轨道保持透明（不抢注意力）。
+ */
+const SIDEBAR_SCROLLBAR_OPTIONS = { trackOptions: { foregroundColor: '#8b93a1' } } as const
+
+/** 选区闪烁周期（ms）。450ms 接近终端光标闪烁节奏：够显眼又不晃眼 */
+export const SELECTION_BLINK_MS = 450
+/** 选区闪烁的两套配色（A 亮黄底黑字 / B 暗灰底浅字，交替即"闪"） */
+export const SELECTION_BLINK_A = { bg: '#d7a521', fg: '#1a1f29' } as const
+export const SELECTION_BLINK_B = { bg: '#3a4150', fg: '#e6e9ef' } as const
 /** 侧栏最多展示的文件引用条数 */
 const MAX_FILE_REFS = 8
 
@@ -711,6 +726,7 @@ export {
   recordTool,
   recordTaskDone,
   uncachedInput,
+  cacheHitRate,
   modelUsageRow,
   toolUsageRow,
   agentUsageRow,
@@ -778,6 +794,17 @@ export function computeTuiStats(
     users, assistants, thinking, tools, chars, tokens: Math.round(chars / 4), tasksRunning, tasksDone, elapsedMs,
     usage,
   }
+}
+
+/**
+ * 缓存用量一行：命中量 / 未命中量 / **命中率**。
+ *
+ * 命中率是这三项里唯一需要"算"的（前两个是原始计数），也是判断缓存到底有没有在起作用的关键
+ * 一眼 —— 此前侧栏只给绝对量，用户得自己拿计算器除。口径集中走 `cacheHitRate()`：它已把
+ * 非法值/零输入一律归 0，绝不让 `NaN%` 漏到界面。
+ */
+export function cacheUsageLine(u: UsageStats): string {
+  return `缓存⚡${u.cacheReadTokens} · 未命中${uncachedInput(u)} · 命中率${cacheHitRate(u)}%`
 }
 
 /** 转友好时长：<60s → "12s"；<60m → "3m12s"；否则 "1h05m" */
@@ -1107,11 +1134,120 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       // isActive 过滤：clearSelection() 后 Zig 可能仍把旧 Selection 留在缓存里并发一次事件，
       // 若只看 getSelectedText 会把「已清除」回弹成「已选 N 字符」（实测踩坑）。
       // 计数用字素簇而非 UTF-16 码元：`.length` 会把一个 emoji 算成 2。
-      setSelChars(sel?.isActive ? countGraphemes(sel.getSelectedText()) : 0)
+      const text = sel?.isActive ? sel.getSelectedText() : ''
+      const n = countGraphemes(text)
+      setSelChars(n)
+      // 只在**出现新选区**时复位复制反馈。
+      // 不能在 n===0 时也复位：点 chip 的 mousedown 会先清掉选区并触发一次 n=0 的事件，
+      // 那会把刚设好的「✓ 已复制」立刻抹掉（chip 随即消失，用户看着像"点了没反应"）。
+      if (n > 0) {
+        selSnapshotRef.current = { text, chars: n }
+        setSelCopied(false)
+      }
     }
     renderer?.on?.('selection', onSel)
     return () => { renderer?.off?.('selection', onSel) }
   }, [renderer])
+  /**
+   * 选区**闪烁**（模块 D5）：有选区时，选中文字的高亮每 `SELECTION_BLINK_MS` 在两套配色间切换。
+   *
+   * 为什么需要：拖选后的高亮由渲染内核负责、默认只是"反显"，在一屏彩色 markdown 里很容易和
+   * 语法高亮混淆 —— 选完不知道到底选上没有（用户反馈）。
+   *
+   * 实现抓手是 `selectionBg` / `selectionFg`：OpenTUI 没有暴露"选区样式"API，但
+   * `TextBufferRenderable` 的这两个属性就是内核读选区配色的入口（见该类型定义）。
+   * 属性只定义**调色板**，具体哪几个字被染色仍由内核按选区范围决定 —— 所以这里把 props
+   * 挂在所有可选中的正文元素上，未选中的文字不受影响。
+   * 只在有选区时开定时器，清掉选区即停（不留后台定时器）。
+   */
+  const [selBlink, setSelBlink] = useState(false)
+  useEffect(() => {
+    if (selChars <= 0) {
+      setSelBlink(false)
+      return
+    }
+    const t = setInterval(() => setSelBlink((v) => !v), SELECTION_BLINK_MS)
+    return () => clearInterval(t)
+  }, [selChars])
+  /** 选区配色（无选区时给空对象：不覆盖内核默认，避免影响非选区渲染） */
+  const selStyleProps =
+    selChars > 0
+      ? {
+          selectionBg: selBlink ? SELECTION_BLINK_A.bg : SELECTION_BLINK_B.bg,
+          selectionFg: selBlink ? SELECTION_BLINK_A.fg : SELECTION_BLINK_B.fg,
+        }
+      : {}
+  /** 点过「⧉ 复制」后的即时反馈（下一个选区/清除时复位） */
+  const [selCopied, setSelCopied] = useState(false)
+  /**
+   * 选区**快照**（文本 + 字素数）。
+   *
+   * 为什么必须存快照而不能点击时现取：点 chip 的 mousedown 会让渲染内核**先清掉选区**
+   * （mouse down 即开始一次新选区），`onMouseUp` 随后很可能落在已经卸载的节点上 —— 表现就是
+   * "点了复制没反应"。快照在 selection 事件里更新，与点击时序无关。
+   */
+  const selSnapshotRef = useRef<{ text: string; chars: number }>({ text: '', chars: 0 })
+  /** mousedown + mouseup 双触发的去重时间戳（同一指示器派发顺序随实现而变，不能只挂一个） */
+  const lastSelCopyAtRef = useRef(0)
+  /** 「✓ 已复制」的自动收起时长：复制后若选区已被清掉，chip 自行消失（无需 ✕ 按钮） */
+  const COPIED_NOTICE_MS = 2500
+  useEffect(() => {
+    if (!selCopied || selChars > 0) return
+    const t = setTimeout(() => setSelCopied(false), COPIED_NOTICE_MS)
+    return () => clearTimeout(t)
+  }, [selCopied, selChars])
+
+  /**
+   * 选区 chip 的文案。
+   *
+   * 刻意做成**单个 `<text>`**（而不是"复制按钮 + ✕ 按钮"两个相邻元素）：实测同一行里两个相邻
+   * `<text>` 的命中测试不可靠 —— 点 ✕ 会被判到复制按钮上（copy 连触发 4 次、✕ 处理器一次没进），
+   * 于是"想清除选区的点击"变成了"又复制一次"。单个元素内按点击 **x** 分派就没有这个问题，
+   * 同时保住了原有契约（点末尾 ✕ = 清除选区）。
+   */
+  const selectionChipLabel = selCopied
+    ? `✓ 已复制 ${selSnapshotRef.current.chars || selChars} 字符`
+    : `⧉ 复制 ${selChars} 字符 ✕`
+
+  /** chip 点击分派：落在末尾 ✕ 上 ⇒ 清除选区；其余位置 ⇒ 复制 */
+  const onSelectionChipMouse = (e: {
+    x?: number
+    currentTarget?: { screenX?: number } | null
+    preventDefault: () => void
+  }) => {
+    e.preventDefault()
+    const xAt = selectionChipLabel.indexOf('✕')
+    const localX =
+      typeof e.x === 'number' && typeof e.currentTarget?.screenX === 'number'
+        ? e.x - e.currentTarget.screenX
+        : -1
+    if (xAt >= 0 && localX >= xAt) {
+      clearSelectionState()
+      return
+    }
+    copyCurrentSelection(e)
+  }
+
+  /** 点 chip 的复制：内容取自快照（点击时选区可能已被 mousedown 清掉） */
+  const copyCurrentSelection = (e: { preventDefault(): void }) => {
+    e.preventDefault()
+    const now = Date.now()
+    if (now - lastSelCopyAtRef.current < 300) return // mousedown/mouseup 双触发去重
+    const snap = selSnapshotRef.current
+    const text = snap.text || selectionTextFrom(renderer)
+    if (!text) return
+    lastSelCopyAtRef.current = now
+    copyTextToClipboard(text)
+    setSelCopied(true)
+  }
+  /** 清掉选区就复位快照，避免"再点一次复制"复制到上一次的旧文本 */
+  const clearSelectionState = () => {
+    renderer?.clearSelection?.()
+    setSelChars(0)
+    setSelCopied(false)
+    selSnapshotRef.current = { text: '', chars: 0 }
+  }
+
   // 会话开始前（仅剩 system 块）展示欢迎页；发起首条消息后切换为对话块列表
   const hasChat = state.blocks.some((b) => b.kind !== 'system')
 
@@ -1714,6 +1850,13 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     switch (b.kind) {
       case 'assistant':
         return (
+          /*
+            ⚠️ 这里**刻意不挂** selStyleProps：`MarkdownOptions`（@opentui/core 0.5.8）没有
+            selectionBg/selectionFg 字段，挂了也不生效（实测：助手 markdown 块的选区底色恒为
+            内核默认的浅灰 #e6edf3，不随 props 变）—— 与其留一个"看起来在用"的死 prop，不如
+            把限制写清楚。用户/工具/思考块是纯 text，那几处挂了、也确实生效（有测试守着）。
+            上游若给 MarkdownOptions 补上这两个字段，把 {...selStyleProps} 加回来即可。
+          */
           <markdown
             key={b.id}
             content={b.text}
@@ -1724,7 +1867,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         )
       case 'user':
         return (
-          <text key={b.id} attributes={createTextAttributes({ bold: true })} wrapMode="word">
+          <text key={b.id} attributes={createTextAttributes({ bold: true })} wrapMode="word" {...selStyleProps}>
             ❯ {b.text}
           </text>
         )
@@ -1754,7 +1897,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
               {header}
             </text>
             {!collapsed && (
-              <text attributes={createTextAttributes({ italic: true, dim: true })} wrapMode="word">
+              <text attributes={createTextAttributes({ italic: true, dim: true })} wrapMode="word" {...selStyleProps}>
                 {b.text}
               </text>
             )}
@@ -1770,8 +1913,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           : ''
         return (
           <box key={b.id} flexDirection="column">
-            <text attributes={createTextAttributes({ bold: true, dim: true })} wrapMode="word">{first}</text>
-            {body && <text attributes={createTextAttributes({ dim: true })} wrapMode="word">{body}</text>}
+            <text attributes={createTextAttributes({ bold: true, dim: true })} wrapMode="word" {...selStyleProps}>{first}</text>
+            {body && <text attributes={createTextAttributes({ dim: true })} wrapMode="word" {...selStyleProps}>{body}</text>}
           </box>
         )
       }
@@ -1867,7 +2010,16 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             <text attributes={createTextAttributes({ bold: true, dim: sidebarTab !== 'stats' })} style={{ flexShrink: 0 }}>
               {SIDEBAR_TABS.find((t) => t.id === sidebarTab)?.label ?? sidebarTab}
             </text>
-            <scrollbox style={{ flexGrow: 1, width: SIDEBAR_WIDTH }}>
+            {/*
+              宽度必须是 '100%' 而不是 SIDEBAR_WIDTH：外层 box 的 width 含**边框**（26 里 2 列是
+              左右边框），内部可用宽度只有 24。写 26 会让 scrollbox 比容器宽 2 列，位于其右边缘的
+              垂直滚动条因此被父容器裁掉 —— 表现为"面板没有滚动条、内容还溢出边框"。
+              另显式给滚动条配色：默认滑块近黑，深色背景下看不见（见 SIDEBAR_SCROLLBAR_OPTIONS）。
+            */}
+            <scrollbox
+              style={{ flexGrow: 1, width: '100%' }}
+              verticalScrollbarOptions={SIDEBAR_SCROLLBAR_OPTIONS}
+            >
               {/* 面板：会话上下文 */}
               {sidebarTab === 'context' && (
                 <>
@@ -1944,7 +2096,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                   </text>
                   {(stats.usage.cacheReadTokens > 0 || stats.usage.cacheWriteTokens > 0) && (
                     <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
-                      缓存⚡{stats.usage.cacheReadTokens} · 未命中{uncachedInput(stats.usage)}
+                      {cacheUsageLine(stats.usage)}
                     </text>
                   )}
                   {stats.usage.models.length > 0 && (
@@ -2051,16 +2203,17 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
               ■ 终止
             </text>
           )}
-          {selChars > 0 && (
+          {(selChars > 0 || selCopied) && (
             <text
-              attributes={createTextAttributes({ bold: true, underline: true })}
-              onMouseUp={(e) => {
-                e.preventDefault()
-                renderer?.clearSelection?.()
-                setSelChars(0)
-              }}
+              attributes={createTextAttributes(
+                // 有选区时按钮本身跟着闪（与选中文字同一节奏）：即使选中的是 markdown 块
+                // （那类块的选区配色改不了），用户也能从按钮的闪动确知"已经选中了"
+                selCopied ? { bold: true, reverse: true } : { bold: true, underline: true, reverse: selBlink },
+              )}
+              onMouseDown={onSelectionChipMouse}
+              onMouseUp={onSelectionChipMouse}
             >
-              ⧉ 已选 {selChars} 字符 · ✕
+              {selectionChipLabel}
             </text>
           )}
           <textarea

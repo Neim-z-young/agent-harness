@@ -37,6 +37,10 @@ import {
   toSessionRows,
   sessionRowText,
   computeTuiStats,
+  cacheUsageLine,
+  SELECTION_BLINK_A,
+  SELECTION_BLINK_B,
+  SELECTION_BLINK_MS,
   formatDuration,
   latestAssistantText,
   emptyUsage,
@@ -677,6 +681,16 @@ async function mountTui(
      * - `'other-cwd'`：会话落在另一个工作目录 → 不该恢复，但要说明「为什么没接着上次」
      */
     resume?: boolean | 'other-cwd'
+    /** 渲染器尺寸（缺省 80×24）。侧栏滚动条这类**溢出才有**的行为需要更矮的窗口来触发 */
+    size?: { width: number; height: number }
+    /**
+     * 挂载前预置 N 个会话（同样的 dataDir）。
+     * 侧栏「会话」tab 的滚动条只在列表溢出时出现 —— 真机上要攒够会话才看得到，
+     * 测试里必须能一次造出来。
+     */
+    seedSessions?: number
+    /** mock provider 上报的 token 用量（带 cacheRead 才能让统计 tab 的缓存行出现） */
+    tokenUsage?: { input: number; output: number; cacheRead?: number; cacheWrite?: number }
   } = {},
 ): Promise<TuiFixture> {
   const dir = mkdtempSync(join(tmpdir(), 'harness-tui-test-'))
@@ -688,6 +702,7 @@ async function mountTui(
     mockProviderConfig: {
       defaultResponse: '你好，我是 TUI 助手。',
       responses: extra.responses ?? [],
+      ...(extra.tokenUsage ? { tokenUsage: extra.tokenUsage } : {}),
     },
   })
   if (extra.resume) {
@@ -703,10 +718,21 @@ async function mountTui(
     await seed.sessionStore.save((await first.harness.session.get(first.session.id))!)
     await seed.shutdown()
   }
+  if (extra.seedSessions) {
+    const seed = mkApp()
+    const first = await seed.boot()
+    for (let i = 0; i < extra.seedSessions; i++) {
+      const s = await first.harness.session.create({ title: `预置会话 ${i}` })
+      await seed.sessionStore.save((await first.harness.session.get(s.id))!)
+    }
+    await seed.shutdown()
+  }
   const app = mkApp()
   const { harness, session } = await app.boot()
   const setup = await createTestRenderer({
-    width: 80, height: 24, useMouse: true,
+    width: extra.size?.width ?? 80,
+    height: extra.size?.height ?? 24,
+    useMouse: true,
     ...(extra.kittyKeyboard ? { kittyKeyboard: true } : {}),
   })
   const root = createRoot(setup.renderer)
@@ -1162,7 +1188,7 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
-  it('鼠标拖选文本 → 输入行显示「已选 N 字符 · ✕」，点击 ✕ 清除（isActive 过滤回弹）', async () => {
+  it('鼠标拖选文本 → 输入行显示「⧉ 复制 N 字符 ✕」，点击 ✕ 清除（isActive 过滤回弹）', async () => {
     const f = await mountTui()
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('拖选测试')
@@ -1172,13 +1198,16 @@ describe('TuiApp 集成（mock provider）', () => {
     expect(start).not.toBeNull()
     // 从"你好"拖到"助手"：Zig 端产生选区并派发 selection 事件 → 输入行显示已选字符数
     await f.setup.mockMouse.drag(start!.x, start!.y, start!.x + 4, start!.y)
-    const withSel = await waitFrame(f.setup, (fr) => fr.includes('已选') && fr.includes('字符') && fr.includes('✕'))
-    // 点击 ✕ 清除选区 → 输入行指示消失（不能因 clearSelection 后的事件回弹；
-    // 注意与「▌已选中」块标记区分 —— 块标记可能仍在，只断言输入行的「⧉ 已选」消失）
+    const withSel = await waitFrame(f.setup, (fr) => /⧉ 复制 \d+ 字符 ✕/.test(fr))
+    // chip 必须长在**输入行**上（正文块里也有「⧉ 复制」，不能用整帧判断）
+    expect(inputLine(f.setup)).toContain('✕')
+    // 点击 ✕ 清除选区 → 输入行指示消失（不能因 clearSelection 后的事件回弹）。
+    // ⚠️ chip 是**单个 text、按点击 x 分派**：点末尾 ✕ 才是清除，点其余位置是复制 ——
+    // 这条用例就是那个分派的回归闸门。
     const clearPos = locateChar(withSel, '✕')
     expect(clearPos).not.toBeNull()
     await f.setup.mockMouse.click(clearPos!.x, clearPos!.y)
-    await waitFrame(f.setup, (fr) => !fr.includes('⧉ 已选'))
+    await waitFrame(f.setup, () => !inputLine(f.setup).includes('✕'))
     await f.cleanup()
   })
 
@@ -1670,4 +1699,174 @@ describe('parseCliArgs --tui', () => {
     const args = parseCliArgs(['repl'])
     expect(args.tui).toBeUndefined()
   })
+})
+// ------------------------------------------------------------------------
+// 侧栏滚动条 / 缓存命中率 / 鼠标选区闪烁与可点击复制（模块 D5）
+// ------------------------------------------------------------------------
+
+/** 取某行的 spans（captureSpans 的便捷包装） */
+function setupSpans(setup: TestRendererSetup, y: number) {
+  return setup.captureSpans().lines[y]?.spans ?? []
+}
+
+/** 在整帧里找所有滑块字形（排除边框字符 '│'，它每行都有） */
+function findBlockGlyphs(frame: string): Array<{ x: number; y: number; g: string }> {
+  const GLYPHS = ['▀', '▄', '█', '▐', '▌', '░', '▒', '▓']
+  const out: Array<{ x: number; y: number; g: string }> = []
+  frame.split('\n').forEach((line, y) => {
+    for (const g of GLYPHS) {
+      let x = line.indexOf(g)
+      while (x >= 0) { out.push({ x, y, g }); x = line.indexOf(g, x + 1) }
+    }
+  })
+  return out
+}
+
+describe('侧栏 tab 滚动条', () => {
+  it('会话列表溢出时，滑块出现在侧栏**内部**（修前被父容器裁掉）', async () => {
+    // 矮窗口 + 一批会话 ⇒ 会话 tab 必然溢出
+    const f = await mountTui({ size: { width: 80, height: 14 }, seedSessions: 14 })
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    // 输入为空且非列表模式时，◀/▶ 循环切侧栏 tab（context → sessions）
+    f.setup.mockInput.pressKey('ARROW_RIGHT')
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('预置会话'))
+
+    // 侧栏占最右 26 列（含边框）；滑块必须落在其内部才能看见
+    const inSidebar = findBlockGlyphs(frame).filter((h) => h.x >= 80 - 26)
+    expect(inSidebar.length).toBeGreaterThan(0)
+
+    // 交叉验证：滑块必须在侧栏**右边界以内**（x < 79）。修前 scrollbox 比容器宽 2 列，
+    // 滚动条被推到边框之外 ⇒ 这里会失败。
+    expect(inSidebar.every((h) => h.x < 79)).toBe(true)
+
+    // 滑块还得是**看得见**的颜色：默认滑块近黑（RGBA 37,37,39），深色背景下等于隐身。
+    // 用 captureSpans 查滑块所在单元格的前/背景，必须命中 SIDEBAR_SCROLLBAR_OPTIONS 的颜色。
+    const want = (() => {
+      const n = parseInt('#8b93a1'.slice(1), 16)
+      return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]
+        .map((v) => v.toFixed(3)).join(',')
+    })()
+    const keyOf = (c: { r: number; g: number; b: number }): string =>
+      [c.r, c.g, c.b].map((v) => v.toFixed(3)).join(',')
+    let thumbColored = false
+    for (const hit of inSidebar) {
+      let x = 0
+      for (const sp of setupSpans(f.setup, hit.y)) {
+        if (x === hit.x && (keyOf(sp.fg) === want || keyOf(sp.bg) === want)) thumbColored = true
+        x += sp.width
+      }
+    }
+    expect(thumbColored).toBe(true)
+    await f.cleanup()
+  })
+})
+
+describe('统计 tab：缓存命中率', () => {
+  it('cacheUsageLine：命中率按 cacheHitRate 口径（一位小数），零输入不产生 NaN', () => {
+    expect(cacheUsageLine({ ...emptyUsage(), inputTokens: 1000, cacheReadTokens: 840 }))
+      .toBe('缓存⚡840 · 未命中160 · 命中率84%')
+    expect(cacheUsageLine({ ...emptyUsage(), inputTokens: 1000, cacheReadTokens: 845 }))
+      .toBe('缓存⚡845 · 未命中155 · 命中率84.5%')
+    // 零输入 / NaN：必须是 0%，不能是 NaN%
+    expect(cacheUsageLine(emptyUsage())).toContain('命中率0%')
+    expect(cacheUsageLine({ ...emptyUsage(), inputTokens: Number.NaN, cacheReadTokens: Number.NaN }))
+      .toContain('命中率0%')
+  })
+
+  it('真实渲染：跑到 stats tab 能看见「命中率」一行', async () => {
+    const f = await mountTui({ tokenUsage: { input: 1000, output: 20, cacheRead: 840 }, size: { width: 100, height: 24 } })
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    await f.setup.mockInput.typeText('hi')
+    pressSubmit(f.setup)
+    await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
+    // context → sessions → tasks → files → stats
+    for (let i = 0; i < 4; i++) f.setup.mockInput.pressKey('ARROW_RIGHT')
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('命中率'))
+    expect(frame).toContain('缓存⚡840')
+    expect(frame).toContain('命中率84%')
+    await f.cleanup()
+  })
+})
+
+describe('鼠标选区：闪烁 + 可点击复制', () => {
+  /**
+   * `captureSpans()` 的 bg 分量是 **0~1 浮点**（不是 0~255）—— 直接拿 hex 去比永远不相等。
+   * 用同一个 toFixed(3) 口径归一，颜色常量改了测试也不会失效。
+   */
+  const rgbKey = (hex: string): string => {
+    const n = parseInt(hex.slice(1), 16)
+    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255]
+      .map((v) => v.toFixed(3))
+      .join(',')
+  }
+  const keyOf = (c: { r: number; g: number; b: number }): string =>
+    [c.r, c.g, c.b].map((v) => v.toFixed(3)).join(',')
+
+  /** 取某行 [x 起点, 背景色 key] 列表 */
+  function lineBgs(setup: TestRendererSetup, y: number): Array<{ x: number; rgb: string }> {
+    let x = 0
+    return (setup.captureSpans().lines[y]?.spans ?? []).map((sp) => {
+      const row = { x, rgb: keyOf(sp.bg) }
+      x += sp.width
+      return row
+    })
+  }
+
+  it('拖选后出现可点击的「⧉ 复制」，且选中文字高亮在 A/B 两套配色间交替', async () => {
+    const f = await mountTui({ responses: [{ match: /选我/, response: '可以拖选的测试文本在这一行。' }] })
+    await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
+    await f.setup.mockInput.typeText('选我')
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('可以拖选的测试文本'))
+    // 在**用户消息行**（纯 text 块）上拖选：`❯ 选我`
+    const pos = locateChar(frame, '❯ 选我')
+    expect(pos).not.toBeNull()
+    const selX = pos!.x + 2
+
+    await f.setup.mockMouse.drag(selX, pos!.y, selX + 1, pos!.y)
+    await settleEffects(f.setup)
+    // ⚠️ 行号会**位移**：拖选的 mouseUp 会冒泡选中整块，块上方插入「▌已选中」标记行，
+    // 正文整体下移一行 —— 必须重新定位，否则采样的是别的行（踩过）。
+    const selY = locateChar(f.setup.captureCharFrame(), '❯ 选我')!.y
+
+    // 1) 输入行出现**可点击**的复制按钮（修前整条 chip 只能"点一下清除选区"，没有复制入口）
+    const chip = await waitFrame(f.setup, (fr) => /⧉ 复制 \d+ 字符/.test(fr))
+    const n = Number(/⧉ 复制 (\d+) 字符/.exec(chip)![1])
+    expect(n).toBeGreaterThan(0)
+
+    // 2) 闪烁：采样选中行，背景应在 A/B 两套之间切换（内核读 selectionBg/selectionFg）
+    const A = rgbKey(SELECTION_BLINK_A.bg)
+    const B = rgbKey(SELECTION_BLINK_B.bg)
+    const seen = new Set<string>()
+    for (let i = 0; i < 20 && seen.size < 2; i++) {
+      for (const { x, rgb } of lineBgs(f.setup, selY)) {
+        if (x >= selX && x <= selX + 1 && (rgb === A || rgb === B)) seen.add(rgb)
+      }
+      await new Promise((r) => setTimeout(r, 80))
+      await pumpOnce(f.setup)
+    }
+    expect(seen.has(A)).toBe(true)
+    expect(seen.has(B)).toBe(true)
+
+    // 3) 点击复制按钮 ⇒ 出现「✓ 已复制」反馈，且**不清掉选区**
+    //
+    // ⚠️ 必须按「带数量」的特征定位**输入行的 chip**：正文块里也有一个「⧉ 复制」按钮，
+    // `locateChar(frame, '⧉ 复制')` 会命中上面那个（踩过：结果点成块的复制，还把选区弄丢了）。
+    const chipBtn = (() => {
+      const lines = f.setup.captureCharFrame().split('\n')
+      for (let y = 0; y < lines.length; y++) {
+        const m = /⧉ 复制 \d+ 字符/.exec(lines[y])
+        if (m) return { x: m.index, y }
+      }
+      return null
+    })()
+    expect(chipBtn).not.toBeNull()
+    await f.setup.mockMouse.click(chipBtn!.x + 2, chipBtn!.y)
+    const after = await waitFrame(f.setup, (fr) => fr.includes('✓ 已复制'))
+    expect(after).toContain(`✓ 已复制 ${n} 字符`)
+
+    // 4) 复制提示会自动收起（没有 ✕ 子按钮：同一行两个相邻 text 的命中测试不可靠，实测点不中）
+    await waitFrame(f.setup, (fr) => !fr.includes('✓ 已复制'), 1200)
+    await f.cleanup()
+  }, 20_000)
 })
