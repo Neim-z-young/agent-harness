@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliCommandInput, Hooks, PluginContext, PluginWorkspaceView } from '@harness/plugin'
@@ -11,8 +11,10 @@ import {
   buildReflectionHint,
   createMemoryPlugin,
   readCapped,
+  renderFeedbackSection,
   renderMemorySection,
   resolveMemoryPaths,
+  splitFeedbackEntries,
 } from './index'
 
 let dir: string
@@ -135,6 +137,75 @@ describe('renderMemorySection', () => {
   })
 })
 
+describe('renderFeedbackSection（失败反馈走尾部动态区）', () => {
+  const mk = (label: string, text: string, exists = true) => ({
+    label,
+    read: { path: `/p/${label}`, exists, text, totalLines: text ? text.split('\n').length : 0, truncated: false },
+  })
+
+  it('文件不存在 → 空串（不花一个 token）', () => {
+    expect(renderFeedbackSection([mk('用户失败反馈', '', false)])).toBe('')
+  })
+
+  it('用独立标签（不与 <memory> 混淆），并说明是自动记录的、不要复述', () => {
+    const s = renderFeedbackSection([mk('用户失败反馈', '- [feedback] grep_file 反复失败')])
+    expect(s.startsWith('<memory-feedback>')).toBe(true)
+    expect(s.endsWith('</memory-feedback>')).toBe(true)
+    expect(s).not.toContain('<memory>')
+    expect(s).toContain('自动')
+    expect(s).toContain('不要向用户复述')
+    expect(s).toContain('grep_file 反复失败')
+  })
+
+  it('只注入最近 N 条（默认 5），更早的只报数', () => {
+    const lines = Array.from({ length: 9 }, (_, i) => `- [feedback] 第 ${i + 1} 条`)
+    const s = renderFeedbackSection([mk('用户失败反馈', lines.join('\n'))])
+    expect(s).toContain('第 9 条')
+    expect(s).toContain('第 5 条')
+    expect(s).not.toContain('第 4 条')
+    expect(s).toContain('另有 4 条更早的反馈未注入')
+  })
+
+  it('字节超限时丢**最旧**的，保证"最近的坑"留下', () => {
+    const lines = [
+      `- [feedback] 旧：${'x'.repeat(60)}`,
+      `- [feedback] 新：${'y'.repeat(60)}`,
+    ]
+    const s = renderFeedbackSection([mk('用户失败反馈', lines.join('\n'))], { maxBytes: 100 })
+    expect(s).toContain('新：')
+    expect(s).not.toContain('旧：')
+    expect(s).toContain('另有 1 条更早的反馈未注入')
+  })
+
+  it('README/标题等非条目行不计入条数', () => {
+    const s = renderFeedbackSection([mk('用户失败反馈', '# 标题\n\n- [feedback] 唯一一条\n')])
+    expect(s).toContain('唯一一条')
+    expect(s).not.toContain('未注入')
+  })
+})
+
+describe('splitFeedbackEntries（迁移用）', () => {
+  it('摘出 [feedback] 行，保留其余内容与末尾换行', () => {
+    const { kept, moved } = splitFeedbackEntries(
+      '- 喜欢 pnpm\n- [feedback] grep_file 反复失败\n- 提交前跑 typecheck\n',
+    )
+    expect(moved).toEqual(['- [feedback] grep_file 反复失败'])
+    expect(kept).toBe('- 喜欢 pnpm\n- 提交前跑 typecheck\n')
+  })
+
+  it('没有 feedback 条目时原样返回（不产生空行差异）', () => {
+    const { kept, moved } = splitFeedbackEntries('- a\n- b')
+    expect(moved).toEqual([])
+    expect(kept).toBe('- a\n- b')
+  })
+
+  it('只认 `- [feedback]` 前缀：正文里提到 feedback 的普通条目不受影响', () => {
+    const { kept, moved } = splitFeedbackEntries('- 关于 [feedback] 机制的设计决定\n')
+    expect(moved).toEqual([])
+    expect(kept).toBe('- 关于 [feedback] 机制的设计决定\n')
+  })
+})
+
 describe('resolveMemoryPaths', () => {
   it('四个路径：两级索引 + 两级项目指令', () => {
     const p = resolveMemoryPaths(ws())
@@ -142,6 +213,12 @@ describe('resolveMemoryPaths', () => {
     expect(p.project.index).toBe(join(dir, 'proj', '.harness', 'memory', 'MEMORY.md'))
     expect(p.user.instruction).toBe(join(dir, 'store', 'AGENTS.md'))
     expect(p.project.instruction).toBe(join(dir, 'proj', 'AGENTS.md'))
+  })
+
+  it('两级失败反馈也各有独立文件（拆分是"注入位置不同"的实现前提）', () => {
+    const p = resolveMemoryPaths(ws())
+    expect(p.user.feedback).toBe(join(dir, 'store', 'memory', 'FEEDBACK.md'))
+    expect(p.project.feedback).toBe(join(dir, 'proj', '.harness', 'memory', 'FEEDBACK.md'))
   })
 })
 
@@ -219,6 +296,59 @@ describe('插件装配与注入', () => {
     await hooks['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's' }, parts)
     expect(parts).toEqual([])
   })
+
+  it('失败反馈走**尾部动态区**，不进 system 前缀（改动它不该动前缀缓存）', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '人工维护的记忆')
+    writeFileSync(join(w.user.memory, 'FEEDBACK.md'), '- [feedback] grep_file 反复失败（2 次）：正则无效')
+    const { hooks } = await install({ flushAfterTurns: 0 })
+    const input = { agentId: 'default', sessionId: 's' }
+    const sys: string[] = []
+    const dyn: string[] = []
+    await hooks['core.prompt.system.transform']!(input, sys)
+    await hooks['core.prompt.dynamic.transform']!(input, dyn)
+
+    expect(sys.join('\n')).toContain('人工维护的记忆')
+    expect(sys.join('\n')).not.toContain('[feedback]') // ← 核心断言：机器回写不占前缀
+    expect(dyn.join('\n')).toContain('<memory-feedback>')
+    expect(dyn.join('\n')).toContain('grep_file 反复失败')
+  })
+
+  it('子 Agent 也不拿失败反馈（与 system 侧的隔离判据一致）', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(join(w.user.memory, 'FEEDBACK.md'), '- [feedback] 不该进子 Agent')
+    const { hooks } = await install({ flushAfterTurns: 0 })
+    const dyn: string[] = []
+    await hooks['core.prompt.dynamic.transform']!(
+      { agentId: 'sub', sessionId: 's', agentMode: 'subagent' },
+      dyn,
+    )
+    expect(dyn).toEqual([])
+  })
+
+  it('改 FEEDBACK.md 不影响 system 段逐字内容（前缀缓存不被击穿）', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '人工维护的记忆')
+    writeFileSync(join(w.user.memory, 'FEEDBACK.md'), '- [feedback] 第一条')
+    const { hooks } = await install({ flushAfterTurns: 0 })
+    const input = { agentId: 'default', sessionId: 'same' }
+    const before: string[] = []
+    await hooks['core.prompt.system.transform']!(input, before)
+
+    // 模拟 harness 又回写了一条失败反馈（时刻与用户的轮无关）
+    writeFileSync(join(w.user.memory, 'FEEDBACK.md'), '- [feedback] 第一条\n- [feedback] 第二条')
+
+    const after: string[] = []
+    await hooks['core.prompt.system.transform']!(input, after)
+    expect(after.join('\n')).toBe(before.join('\n')) // 逐字相同 ⇒ 前缀仍然命中
+
+    const dyn: string[] = []
+    await hooks['core.prompt.dynamic.transform']!(input, dyn)
+    expect(dyn.join('\n')).toContain('第二条') // 但模型仍然看得到最新反馈
+  })
 })
 
 describe('/memory 命令', () => {
@@ -281,6 +411,61 @@ describe('/memory 命令', () => {
     expect(text).toContain('项目指令')
     expect(text).toContain('AGENTS.md')
     expect(text).toContain('MEMORY.md')
+    expect(text).toContain('FEEDBACK.md')
+  })
+
+  it('list：索引里混着 [feedback] 旧数据时给出迁移提示', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 普通条目\n- [feedback] grep_file 反复失败\n')
+    const { hooks } = await install()
+    const input = cmdInput('')
+    hooks['cli.command']!(input)
+    expect(input.lines.join('')).toMatch(/1 条是 \[feedback\].*\/memory migrate/)
+  })
+
+  it('migrate：把 [feedback] 条目从索引搬到 FEEDBACK.md，普通条目一字不动', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(
+      join(w.user.memory, 'MEMORY.md'),
+      '- 偏好：中文回答\n- [feedback] bash 反复失败（2 次）：缺少 command\n- 提交前跑 typecheck\n',
+    )
+    const { hooks } = await install()
+    const input = cmdInput('migrate')
+    hooks['cli.command']!(input)
+
+    expect(input.lines.join('')).toContain('搬走 1/1 条')
+    expect(readFileSync(join(w.user.memory, 'MEMORY.md'), 'utf-8')).toBe(
+      '- 偏好：中文回答\n- 提交前跑 typecheck\n',
+    )
+    expect(readFileSync(join(w.user.memory, 'FEEDBACK.md'), 'utf-8')).toContain(
+      'bash 反复失败（2 次）',
+    )
+  })
+
+  it('migrate：没有 feedback 条目时明确说"没有"，不白写文件', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 只有普通条目\n')
+    const { hooks } = await install()
+    const input = cmdInput('migrate')
+    hooks['cli.command']!(input)
+    expect(input.lines.join('')).toContain('没有 [feedback] 条目')
+    expect(existsSync(join(w.user.memory, 'FEEDBACK.md'))).toBe(false)
+  })
+
+  it('migrate：重复条目不会在 FEEDBACK.md 里写两遍', async () => {
+    const w = ws()
+    mkdirSync(w.user.memory, { recursive: true })
+    const line = '- [feedback] grep_file 反复失败（2 次）：正则无效'
+    writeFileSync(join(w.user.memory, 'FEEDBACK.md'), `${line}\n`)
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), `${line}\n- 普通条目\n`)
+    const { hooks } = await install()
+    const input = cmdInput('migrate')
+    hooks['cli.command']!(input)
+    expect(input.lines.join('')).toContain('搬走 0/1 条')
+    expect(readFileSync(join(w.user.memory, 'FEEDBACK.md'), 'utf-8')).toBe(`${line}\n`)
   })
 
   it('其它命令不拦截（command 不匹配时不动 result）', async () => {
@@ -362,6 +547,30 @@ describe('MemoryStore', () => {
     expect(b.maxLines).toBe(50)
     expect(b.maxBytes).toBe(999)
     expect(b.lines).toBeGreaterThan(0)
+  })
+
+  it('权限：新文件按 0600 建，已存在则沿用原模式（别把 600 写成 644）', () => {
+    const st = new MemoryStore(storePath())
+    st.add('第一条')
+    expect(statSync(storePath()).mode & 0o777).toBe(0o600)
+    // 用户自己调过权限（或文件由别的工具创建）⇒ 写入不得悄悄改成 umask 默认
+    chmodSync(storePath(), 0o640)
+    st.add('第二条')
+    expect(statSync(storePath()).mode & 0o777).toBe(0o640)
+  })
+
+  it('rewrite：整文件重写仍走上限校验与原子写（迁移用）', () => {
+    const st = new MemoryStore(storePath())
+    st.add('a')
+    const ok = st.rewrite('- b\n- c\n')
+    expect(ok.ok).toBe(true)
+    expect(st.entries().map((e) => e.text)).toEqual(['b', 'c'])
+
+    const over = new MemoryStore(storePath(), { maxLines: 2 })
+    const bad = over.rewrite('- 1\n- 2\n- 3\n')
+    expect(bad.ok).toBe(false)
+    expect(bad.reason).toBe('over-limit')
+    expect(st.entries().map((e) => e.text)).toEqual(['b', 'c']) // 超限不落盘
   })
 })
 
@@ -628,6 +837,129 @@ describe('插件级：flush 三源与一次性提示', () => {
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 第一条', out: () => {}, sessionId: 's' })
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 第二条', out: () => {}, sessionId: 's' })
     expect(await inject(hooks)).toContain('第二条')
+  })
+})
+
+// ===== 会话隔离：发布状态与沉淀提示都不能跨会话 =====
+
+/**
+ * 历史事故回归（真机 s_1790163574429_tg1a6）。
+ *
+ * 一个进程里主会话与子 Agent 会话共存（swarm / coordinator 后台派工），而 compress 的 flush
+ * 信号是引擎层广播的。发布器若是插件实例级单例，**子 Agent 的一次压缩就会把主会话的 system 区
+ * 重发一遍**，实测报废 52,096 token 的前缀缓存；同一轮请求还会捎带上子 Agent 的沉淀提示
+ * （270 字符 = `buildReflectionHint` 逐字长度）—— 主会话被喂了一句"刚刚发生了上下文压缩"，
+ * 而它自己 `compressionCount: 0`。
+ */
+describe('会话隔离：子 Agent 的压缩不得击穿主会话前缀', () => {
+  const MAIN = { agentId: 'default', sessionId: 'main' }
+  const SUB = { agentId: 'reader', sessionId: 'sub-1', agentMode: 'subagent' }
+
+  /** 攒批轮数设到不可能触发，把"是否发布"完全交给 flush 路径判定 */
+  const collect = async (hooks: Hooks, input = MAIN) => {
+    const sysParts: string[] = []
+    const dynParts: string[] = []
+    await hooks['core.prompt.system.transform']!(input, sysParts)
+    await hooks['core.prompt.dynamic.transform']!(input, dynParts)
+    return { system: sysParts.join('\n'), dynamic: dynParts.join('\n') }
+  }
+  const injectMain = async (hooks: Hooks) => {
+    const { system, dynamic } = await collect(hooks, MAIN)
+    return [system, dynamic].filter(Boolean).join('\n')
+  }
+  async function fixture() {
+    const w = ws()
+    const { hooks } = await install({ flushAfterTurns: 99 })
+    // 主会话先注入一次 ⇒ 建立基线发布内容
+    await hooks['cli.command']!({
+      raw: 'memory add', command: 'memory', arg: 'add 初始内容', out: () => {}, sessionId: 'main',
+    })
+    await injectMain(hooks)
+    // 子 Agent 也走一次（真实链路里子 Agent 也会过这两个 hook，只是被插件早退）
+    await collect(hooks, SUB)
+    return { hooks, w }
+  }
+
+  it('子 Agent 的 compress ⇒ 主会话仍攒批（这就是那次 52K 缓存报废的成因）', async () => {
+    const { hooks, w } = await fixture()
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 子 Agent 触发写入的条目\n')
+
+    // 子 Agent 自己的压缩（腾的是它自己的窗口）
+    hooks['core.tool.post.execute']!(
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 'sub-1' } },
+      { ok: true },
+    )
+    expect(await injectMain(hooks)).toContain('初始内容')
+    expect(await injectMain(hooks)).not.toContain('子 Agent 触发写入的条目')
+  })
+
+  it('对照：主会话自己的 compress 照旧立即发布（别把修复做过头）', async () => {
+    const { hooks, w } = await fixture()
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 主会话触发写入的条目\n')
+
+    hooks['core.tool.post.execute']!(
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 'main' } },
+      { ok: true },
+    )
+    expect(await injectMain(hooks)).toContain('主会话触发写入的条目')
+  })
+
+  it('子 Agent 的压缩不把沉淀提示转交主会话（否则是喂给模型一条假事实）', async () => {
+    const { hooks } = await fixture()
+    hooks['core.tool.post.execute']!(
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 'sub-1' } },
+      { ok: true },
+    )
+    const { dynamic } = await collect(hooks, MAIN)
+    expect(dynamic).not.toContain('<memory-hint>')
+  })
+
+  it('session compaction 同样按会话隔离', async () => {
+    const { hooks, w } = await fixture()
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 子会话 compact 写入的条目\n')
+
+    hooks['core.session.compacting']!({ agentId: 'reader', sessionId: 'sub-1' } as never, {} as never)
+    expect(await injectMain(hooks)).not.toContain('子会话 compact 写入的条目')
+    // 主会话自己 compact 时才发布
+    hooks['core.session.compacting']!({ agentId: 'default', sessionId: 'main' } as never, {} as never)
+    expect(await injectMain(hooks)).toContain('子会话 compact 写入的条目')
+  })
+
+  it('两个主会话各自独立：A 的压缩不影响 B 的发布状态', async () => {
+    const { hooks, w } = await fixture()
+    const B = { agentId: 'default', sessionId: 'main-b' }
+    await collect(hooks, B) // B 建立自己的基线
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- A 压缩时的改动\n')
+
+    hooks['core.tool.post.execute']!(
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 'main' } },
+      { ok: true },
+    )
+    const b = await collect(hooks, B)
+    expect(b.system).not.toContain('A 压缩时的改动')
+    expect(b.dynamic).not.toContain('<memory-hint>')
+  })
+
+  it('compress 缺 sessionId ⇒ fail-closed 不 flush（攒批最多晚几轮，误 flush 是 5 万 token）', async () => {
+    const { hooks, w } = await fixture()
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 无归属压缩的改动\n')
+
+    hooks['core.tool.post.execute']!({ tool: { id: 'compress' }, input: {}, ctx: {} }, { ok: true })
+    expect(await injectMain(hooks)).not.toContain('无归属压缩的改动')
+  })
+
+  it('从未注入过的会话（子 Agent 独占会话）的 compress 不建发布器、也不影响主会话', async () => {
+    const { hooks, w } = await fixture()
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 陌生会话压缩的改动\n')
+
+    hooks['core.tool.post.execute']!(
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: '从未见过的会话' } },
+      { ok: true },
+    )
+    expect(await injectMain(hooks)).not.toContain('陌生会话压缩的改动')
+    // 轮末兜底也只推进"已发布过的主会话"，不会因为陌生会话而给主会话记一笔
+    hooks['core.agent.turn.end']!({ agentId: 'default', mode: 'primary', sessionId: '从未见过的会话', step: 1 })
+    expect(await injectMain(hooks)).not.toContain('陌生会话压缩的改动')
   })
 })
 

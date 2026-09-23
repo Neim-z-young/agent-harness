@@ -12,6 +12,10 @@
  * 3. **生成的技能 `allowEmbedShell=false`** —— 不能让模型给自己生成带 !\`cmd\` 的可执行技能
  *    （等于自我授权的 RCE 通道）。落盘由 `@harness/skill` 的 `SkillManager.save()` 强制。
  * 4. **只提示不自动写**（F3 才做隐式检测）；去重命中时提示"更新已有"而不是新建（F2）。
+ * 5. **延迟注入队列按会话隔离**（见 `schedulers` 上的长注释）：compress / compacting 都是引擎层
+ *    广播，子 Agent 压缩不得替主会话发布技能，子 Agent 建 prompt 也不得 drain 主会话队列。
+ * 6. **失败回写落 `FEEDBACK.md`**（不是 `MEMORY.md`）—— 反馈是自动产生的，放 system 前缀区
+ *    会让"一次工具报错"绑上"整段前缀缓存报废"。
  *
  * 轨迹来源刻意用**引擎层**的 `core.tool.post.execute`，而不是 `cli.agent.stream`
  * —— 后者是 UI 消费层（只有走 CLI 的宿主才触发），靠它采集会在内嵌/ACP 宿主下静默失效
@@ -350,6 +354,9 @@ export function findSimilarSkill(
  *
  * ⚠️ 触发源必须双份：`core.session.compacting`（ACP/压缩路径）+ `core.agent.turn.end`
  * （引擎层轮末兜底）—— 只认前者在关闭压缩时永远等不到，只认后者则要白等十几轮。
+ *
+ * ⚠️ **实例不隔离会话**：本类只管"一个会话的队列与发布状态"，多会话共存时由调用方按
+ * sessionId 各持一个实例（见 `createSkillForgePlugin` 里的 `schedulers`）。不要把它改回单例。
  */
 export class SkillInjectScheduler {
   private pending = new Map<string, string | undefined>() // skillId → 绑定目标 agentId
@@ -425,6 +432,16 @@ export interface FeedbackCandidate {
 
 const MEMORY_INDEX_FILE = 'MEMORY.md'
 const ENTRY_PREFIX = '- '
+
+/**
+ * 失败回写落到**独立的 `FEEDBACK.md`**（权威定义见 `@harness/memory` 的 `FEEDBACK_FILE`）。
+ *
+ * 为什么这里重复一份常量而不是 import：`writeFeedbackMemory` 刻意**不依赖** `@harness/memory`
+ * —— 用户可能没启用记忆插件，而这只是"顺手留一条事实"。但**文件名必须与那边一致**，
+ * 否则反馈会重新落回 `MEMORY.md`（= 回到 system 前缀区：一条自动回写就能让整段前缀缓存报废，
+ * 真机实测 52,096 token）。改这里时请同时改 `packages/plugins/memory/src/index.ts`。
+ */
+const FEEDBACK_FILE = 'FEEDBACK.md'
 
 /** 归一化（与 memory 插件一致：去空白，便于精确去重） */
 function normalizeEntry(text: string): string {
@@ -546,9 +563,33 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
   let ctxLog: PluginContext['log'] | undefined
   /** install 里赋值：/forge 转发子命令时要复用技能侧的命令处理器 */
   let commandHandler: ((input: any) => void) | undefined
-  const scheduler = new SkillInjectScheduler({
-    ...(options.flushAfterTurns != null ? { flushAfterTurns: options.flushAfterTurns } : {}),
-  })
+
+  /**
+   * 延迟注入队列**按会话隔离**（与 `@harness/memory` 的 publishers 是同一族缺陷、同一套修法）。
+   *
+   * 为什么不能是实例级单例：一个进程里主会话与若干子 Agent 会话共存，而
+   * `core.tool.post.execute` 的 compress 判定 / `core.session.compacting` 都是**引擎层广播**
+   * —— 子 Agent 压缩腾的是它自己的窗口，凭什么替主会话按下"发布技能"的键；而技能一旦绑进
+   * `agent.skills` 白名单，主会话下一轮 system 就变了 ⇒ 前缀缓存整段报废。
+   * 反向也有一条：`core.prompt.system.transform` 里 drain 队列的动作如果不判会话，
+   * **子 Agent 建 prompt 会把主会话的待发布队列消费掉**（发布时机被挪到子会话的一轮上）。
+   *
+   * `mainSessions` 记录"确认过的非子 Agent 会话"；缺失 sessionId 时一律 **fail-closed 不发布**
+   * —— 代价不对称：晚发布几轮 vs 一次五万 token 级的前缀报废。
+   */
+  const schedulers = new Map<string, SkillInjectScheduler>()
+  const mainSessions = new Set<string>()
+  /** 惰性建调度器。键只在主会话上出现（system.transform 的非 subagent 分支、CLI 命令） */
+  const schedulerFor = (sessionId: string): SkillInjectScheduler => {
+    let s = schedulers.get(sessionId)
+    if (!s) {
+      s = new SkillInjectScheduler({
+        ...(options.flushAfterTurns != null ? { flushAfterTurns: options.flushAfterTurns } : {}),
+      })
+      schedulers.set(sessionId, s)
+    }
+    return s
+  }
 
   const scopeOf = (flags: Set<string>): 'user' | 'project' =>
     flags.has('--project') ? 'project' : (options.scope ?? 'user')
@@ -604,8 +645,10 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
     }
 
     if (sub === 'flush') {
-      scheduler.flush() // 先标记到期，再取 —— 否则 takeDue 只会返回空（面板显示待注入、flush 却说没有）
-      const due = scheduler.takeDue()
+      // 只作用于**发起命令的会话**：/forge flush 是用户手动的"现在就发布"，不该顺手改别的会话
+      const sched = schedulerFor(input.sessionId)
+      sched.flush() // 先标记到期，再取 —— 否则 takeDue 只会返回空（面板显示待注入、flush 却说没有）
+      const due = sched.takeDue()
       for (const d of due) bindToAgent(d.skillId, d.agentId)
       out(
         due.length
@@ -649,16 +692,20 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
     // 默认：沉淀面板
     const trace = recorder.list(input.sessionId ?? '')
     const found = detectRepeatable(trace)
-    const st = scheduler.state()
+    const st = schedulerFor(input.sessionId).state()
     const memFile = ws?.user.memory ? join(ws.user.memory, MEMORY_INDEX_FILE) : undefined
-    const memCount = memFile && existsSync(memFile)
-      ? readFileSync(memFile, 'utf-8').split('\n').filter((l) => l.trim().length > 0).length
-      : 0
+    const fbFile = ws?.user.memory ? join(ws.user.memory, FEEDBACK_FILE) : undefined
+    const countLines = (f: string | undefined): number =>
+      f && existsSync(f) ? readFileSync(f, 'utf-8').split('\n').filter((l) => l.trim().length > 0).length : 0
+    const memCount = countLines(memFile)
+    const fbCount = countLines(fbFile)
     out(
       `\n沉淀面板（单条事实 → 记忆；多步流程 → 技能）\n` +
         `  可固化流程  ${found.length} 段${found.length ? `（${found.slice(0, 3).map((f) => f.toolIds.join('→')).join('、')}）` : ''}\n` +
         `  待注入技能  ${st.pending.length ? `${st.pending.join('、')}（${st.dirtyTurns}/${st.flushAfterTurns} 轮）` : '无'}\n` +
         `  用户记忆    ${memCount} 条\n` +
+        // 反馈是机器回写的、走尾部动态区（不进 system 前缀）；单独列出来免得和"人工记忆"混在一起看
+        `  失败反馈    ${fbCount} 条（自动回写，尾部注入）\n` +
         `  已装技能    ${manager ? manager.all().length : 0} 个\n` +
         `  下一步：/forge skill <name> 固化流程 · /forge memory add <事实> · /forge flush 立即发布\n`,
     )
@@ -699,10 +746,15 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
       // （那只由 session compaction / /compact 触发）—— 之前只挂 compacting 时，
       // ACP 主路径上延迟队列永远等不到发布。compress 与普通工具一样过
       // core.tool.post.execute 且 ctx 带 tool.id ⇒ 在引擎层就能识别，任何宿主都有。
-      if (toolId === 'compress' && r?.ok !== false) scheduler.flush()
+      //
+      // ⚠️ 必须判**会话归属**：子 Agent 压缩不能替主会话发布（见 schedulers 上的注释）。
+      // sessionId 缺失 ⇒ 不 flush（fail-closed）。
+      if (toolId === 'compress' && r?.ok !== false && sessionId && mainSessions.has(sessionId)) {
+        schedulerFor(sessionId).flush()
+      }
 
-      // F3 闭环的一半：同一工具+入参反复失败 ⇒ 回写一条 feedback 到长期记忆。
-      // 节流到"一次会话一条"，否则一次连环失败会把记忆刷满。
+      // F3 闭环的一半：同一工具+入参反复失败 ⇒ 回写一条 feedback。
+      // 节流到"一次会话一条"，否则一次连环失败会把反馈刷满。
       if (options.writeBackOnFailure !== false && r?.ok === false && ws && sessionId) {
         const key = `${sessionId}:${toolId}|${inputSummary}`
         if (!writtenFeedback.has(key)) {
@@ -713,14 +765,16 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
             writtenFeedback.add(key)
             const memoryDir =
               (options.feedbackScope ?? 'user') === 'project' ? ws.project.memory : ws.user.memory
-            // 路径为空时绝不落笔：join('', 'MEMORY.md') 会解析成相对路径 ⇒ 写到进程 cwd
+            // 路径为空时绝不落笔：join('', 'FEEDBACK.md') 会解析成相对路径 ⇒ 写到进程 cwd
             if (!memoryDir) return
-            const file = join(memoryDir, MEMORY_INDEX_FILE)
+            // ⚠️ 落 FEEDBACK.md（不是 MEMORY.md）：反馈是**自动**产生的、时刻与用户的轮无关，
+            // 放 system 前缀区（MEMORY.md）会让"一次工具报错"绑上"整段前缀缓存报废"。
+            const file = join(memoryDir, FEEDBACK_FILE)
             const res = writeFeedbackMemory(
               file,
               `[feedback] ${toolId} 反复失败（${failures} 次）：${(r.error?.message ?? '未知原因').slice(0, 120)}`,
             )
-            ctxLog?.debug?.(`失败回写记忆：${res.message}`)
+            ctxLog?.debug?.(`失败回写反馈：${res.message}`)
           }
         }
       }
@@ -761,18 +815,34 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
         })
       }
 
-      // 延迟注入的两个触发源（缺一不可，见 SkillInjectScheduler 的注释）
-      hooks['core.session.compacting'] = () => {
-        scheduler.flush()
+      // 延迟注入的两个触发源（缺一不可，见 SkillInjectScheduler 的注释）。
+      // **两处都要判会话归属**：子 Agent 的压缩 / 轮末不能替主会话按下发布键
+      // （技能一绑进白名单，主会话下一轮 system 就变 ⇒ 前缀缓存整段报废）。
+      // 缺 sessionId ⇒ 不发布（fail-closed，代价不对称：晚几轮 vs 五万 token 级报废）。
+      hooks['core.session.compacting'] = (input: { sessionId?: string }) => {
+        const sid = input?.sessionId
+        if (!sid || !mainSessions.has(sid)) return
+        schedulerFor(sid).flush()
       }
       hooks['core.agent.turn.end'] = (signal: { mode?: string; sessionId?: string }) => {
         if (signal?.mode === 'subagent') return
-        scheduler.onTurnEnd()
+        const sid = signal?.sessionId
+        if (!sid) {
+          // 字段缺失时按"无法归因"照常推进（正常路径只有一个主会话）；
+          // 否则兜底会变成死代码 —— 那种失效表现为"锻造了技能却永远不注入"，极难排查。
+          for (const s of schedulers.values()) s.onTurnEnd()
+          return
+        }
+        schedulers.get(sid)?.onTurnEnd()
       }
 
       // 下一轮真正发生注入前，把到期的技能绑进白名单
-      hooks['core.prompt.system.transform'] = () => {
-        const due = scheduler.takeDue()
+      hooks['core.prompt.system.transform'] = (input: { sessionId: string; agentMode?: string }) => {
+        // 先记会话再判分支：子 Agent 的 prompt 构建**不得** drain 主会话的待发布队列
+        // （否则发布时机被挪到子会话的某一轮上，主会话的 system 会以意料之外的时刻变化）
+        if (input.agentMode !== 'subagent') mainSessions.add(input.sessionId)
+        if (input.agentMode === 'subagent') return
+        const due = schedulerFor(input.sessionId).takeDue()
         for (const d of due) {
           // 评审修复：bindToAgent 失败（找不到目标 Agent）此前被静默吞掉 —— 队列已清空、
           // 技能永远不注入，用户却以为在延迟队列里。失败必须留痕。
@@ -910,8 +980,10 @@ export function createSkillForgePlugin(options: SkillForgePluginOptions = {}): A
               if (flags.has('--now')) {
                 out(`${bindToAgent(name, target)}\n`)
               } else if (flags.has('--bind') || flags.has('--defer')) {
-                scheduler.schedule(name, target)
-                const st = scheduler.state()
+                // 排入**本会话**的队列：发布时机由本会话的压缩/轮末决定（见 schedulers 上的注释）
+                const sched = schedulerFor(input.sessionId)
+                sched.schedule(name, target)
+                const st = sched.state()
                 out(
                   `   已排入延迟注入队列（${st.pending.join('、')}）—— 下次压缩、或 ${st.flushAfterTurns} 轮后发布；\n` +
                     `   立即发布：/forge flush（也可在 --confirm 时加 --now）\n`,

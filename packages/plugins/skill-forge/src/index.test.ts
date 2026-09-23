@@ -77,7 +77,18 @@ async function setup(opts: { maxSkills?: number } = {}) {
       ok ? { ok: true } : { ok: false, error: { message: error ?? '失败' } },
     )
   }
-  return { base, ws, manager, hooks, lines, run, record, agents, logWarns }
+  /**
+   * 模拟"这一轮开始建 prompt"：真实链路里 `core.prompt.system.transform` 一定**先于**
+   * 任何 compress / turn_end 发生（它顺带把会话登记成主会话）。
+   * 不先登记就没有发布权 —— 那正是按会话隔离的核心语义，所以测试也要按真实顺序走。
+   */
+  const beginPrompt = (sessionId = 's1', agentMode?: string) => {
+    const parts: string[] = []
+    hooks['core.prompt.system.transform']({ sessionId, ...(agentMode ? { agentMode } : {}) }, parts)
+    return parts
+  }
+  beginPrompt() // 建立会话基线（此时队列为空，不会提前发布任何东西）
+  return { base, ws, manager, hooks, lines, run, record, beginPrompt, agents, logWarns }
 }
 
 // ===== 轨迹与草稿 =====
@@ -379,12 +390,15 @@ describe('F3 命令侧', () => {
     expect(lines.join('')).toContain('未检测到')
   })
 
-  it('反复失败 ⇒ 回写一条 feedback 到记忆（同一工具+入参只写一次）', async () => {
+  it('反复失败 ⇒ 回写一条 feedback 到 FEEDBACK.md（同一工具+入参只写一次）', async () => {
     const { ws, record } = await setup()
     for (let i = 0; i < 3; i += 1) record('read_file', { path: 'x' }, false, 'ENOENT')
     await new Promise((r) => setTimeout(r, 5))
-    const file = join(ws.user.memory, 'MEMORY.md')
+    // 落 FEEDBACK.md 而不是 MEMORY.md：反馈是自动产生的，进 system 前缀区会让
+    // "一次工具报错"绑上"整段前缀缓存报废"（真机 52,096 token）
+    const file = join(ws.user.memory, 'FEEDBACK.md')
     expect(existsSync(file)).toBe(true)
+    expect(existsSync(join(ws.user.memory, 'MEMORY.md'))).toBe(false)
     const text = readFileSync(file, 'utf-8')
     expect(text).toContain('[feedback]')
     expect(text.split('\n').filter((l) => l.includes('[feedback]')).length).toBe(1)
@@ -402,8 +416,8 @@ describe('F3 命令侧', () => {
     expect(lines.join('')).toContain('延迟注入队列')
 
     // 压缩（ACP 路径）触发发布 ⇒ 下一轮 prompt 构建时进白名单
-    hooks['core.session.compacting']()
-    hooks['core.prompt.system.transform']({}, [])
+    hooks['core.session.compacting']({ sessionId: 's1' })
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
     expect(agents.default.skills).toContain('bindme')
   })
 
@@ -548,7 +562,7 @@ describe('ACP 压缩触发延迟注入（引擎层 compress 工具信号）', ()
       { tool: { id: 'compress' }, input: { content: [] }, ctx: { sessionId: 's1' } },
       { ok: true },
     )
-    hooks['core.prompt.system.transform']({}, [])
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
     expect(agents.default.skills).toContain('acp-defer')
   })
 
@@ -562,7 +576,7 @@ describe('ACP 压缩触发延迟注入（引擎层 compress 工具信号）', ()
       { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's1' } },
       { ok: false, error: { message: 'x' } },
     )
-    hooks['core.prompt.system.transform']({}, [])
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
     expect(agents.default.skills).not.toContain('fail-comp')
   })
 
@@ -576,8 +590,88 @@ describe('ACP 压缩触发延迟注入（引擎层 compress 工具信号）', ()
       { tool: { id: 'list_dir' }, input: {}, ctx: { sessionId: 's1' } },
       { ok: true },
     )
-    hooks['core.prompt.system.transform']({}, [])
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
     expect(agents.default.skills).not.toContain('other-tool')
+  })
+})
+
+// ===== 会话隔离：子 Agent 的压缩不得替主会话发布 =====
+//
+// 与 @harness/memory 的 publishers 是同一族缺陷。真机事故（s_1790163574429_tg1a6）：
+// 失败 reader 子会话压缩 ⇒ 主会话 round 32 前缀缓存报废 52,096 token。
+
+describe('会话隔离：子会话不得替主会话发布技能', () => {
+  const tick = () => new Promise((r) => setTimeout(r, 10))
+
+  /** 造一个"已排入延迟队列"的主会话（s1），返回 hooks 与断言用的 agents */
+  async function deferOne(name: string) {
+    const env = await setup()
+    env.record('bash', { command: 'ls' })
+    env.run(name)
+    env.run(`--confirm ${name} --bind`)
+    await tick()
+    expect(env.agents.default.skills).not.toContain(name)
+    return env
+  }
+
+  it('子会话的 compress 不发布；主会话自己的 compress 照旧发布（正向对照）', async () => {
+    const { hooks, agents } = await deferOne('sub-leak')
+    // 子 Agent 会话压缩（引擎层广播，sessionId 是子会话）
+    hooks['core.tool.post.execute'](
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 'sub-1' } },
+      { ok: true },
+    )
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).not.toContain('sub-leak')
+
+    // 正向对照：不能为了"防子会话"把主会话自己也防死
+    hooks['core.tool.post.execute'](
+      { tool: { id: 'compress' }, input: {}, ctx: { sessionId: 's1' } },
+      { ok: true },
+    )
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).toContain('sub-leak')
+  })
+
+  it('子会话的 compacting 同样不发布（两个触发源都要判归属）', async () => {
+    const { hooks, agents } = await deferOne('sub-compact')
+    hooks['core.session.compacting']({ sessionId: 'sub-1' })
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).not.toContain('sub-compact')
+  })
+
+  it('compress 缺 sessionId ⇒ fail-closed 不发布（代价不对称：晚几轮 vs 五万 token）', async () => {
+    const { hooks, agents } = await deferOne('no-sid')
+    hooks['core.tool.post.execute']({ tool: { id: 'compress' }, input: {}, ctx: {} }, { ok: true })
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).not.toContain('no-sid')
+  })
+
+  it('子 Agent 建 prompt 不得 drain 主会话的待发布队列', async () => {
+    const { hooks, agents } = await deferOne('keep-me')
+    hooks['core.session.compacting']({ sessionId: 's1' }) // 本会话已到期
+    // 真实链路里子 Agent 的 prompt 构建会先跑 —— 它不能把主会话的队列消费掉
+    hooks['core.prompt.system.transform']({ sessionId: 'sub-1', agentMode: 'subagent' }, [])
+    expect(agents.default.skills).not.toContain('keep-me')
+
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).toContain('keep-me')
+  })
+
+  it('turn_end 只推进对应会话的计数（别人的轮不是你的轮）', async () => {
+    const { hooks, agents } = await deferOne('counter')
+    // flushAfterTurns 默认 15：别的会话攒 14 轮 + 本会话 1 轮，仍不该到期
+    for (let i = 0; i < 14; i += 1) hooks['core.agent.turn.end']({ sessionId: 'other' })
+    hooks['core.agent.turn.end']({ sessionId: 's1' })
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).not.toContain('counter')
+  })
+
+  it('子 Agent 模式（mode=subagent）的轮末不计入任何会话', async () => {
+    const { hooks, agents } = await deferOne('sub-turn')
+    for (let i = 0; i < 20; i += 1) hooks['core.agent.turn.end']({ sessionId: 's1', mode: 'subagent' })
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
+    expect(agents.default.skills).not.toContain('sub-turn')
   })
 })
 
@@ -599,8 +693,8 @@ describe('评审修复', () => {
     run('--confirm ghost-bind --bind missing-agent')
     await new Promise((r) => setTimeout(r, 10))
     // 发布时 Agent 不存在 ⇒ bindToAgent 返回 ⚠️ ⇒ 必须出现在 warn 日志里（评审修复前被吞掉）
-    hooks['core.session.compacting']() // 触发发布（否则队列未到期）
-    hooks['core.prompt.system.transform']({}, [])
+    hooks['core.session.compacting']({ sessionId: 's1' }) // 触发发布（否则队列未到期）
+    hooks['core.prompt.system.transform']({ sessionId: 's1' }, [])
     expect(logWarns.join('\n')).toContain('延迟注入绑定失败')
     // 且技能不得凭空进入白名单
     expect(agents.default.skills).not.toContain('ghost-bind')

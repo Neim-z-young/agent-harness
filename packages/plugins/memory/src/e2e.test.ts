@@ -34,7 +34,7 @@ function probeProvider(sink: Message[][]): ChatProvider {
   } as unknown as ChatProvider
 }
 
-async function setup(memory: string, opts: { withAgentsMd?: boolean } = {}) {
+async function setup(memory: string, opts: { withAgentsMd?: boolean; feedback?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'mem-e2e-'))
   dirs.push(dir)
   const cwd = join(dir, 'proj')
@@ -42,6 +42,7 @@ async function setup(memory: string, opts: { withAgentsMd?: boolean } = {}) {
   mkdirSync(cwd, { recursive: true })
   mkdirSync(join(dataDir, 'memory'), { recursive: true })
   writeFileSync(join(dataDir, 'memory', 'MEMORY.md'), memory)
+  if (opts.feedback !== undefined) writeFileSync(join(dataDir, 'memory', 'FEEDBACK.md'), opts.feedback)
   if (opts.withAgentsMd) writeFileSync(join(cwd, 'AGENTS.md'), '项目约定：提交前跑 typecheck')
 
   const workspace = resolveWorkspace({ cwd, dataDir })
@@ -102,6 +103,26 @@ describe('端到端：记忆真的到达模型请求', () => {
       void _
     }
     expect(systemTextOf(sink[0]!)).not.toContain('<memory>')
+    await h.stop()
+  })
+
+  it('失败反馈真的进请求了，但**不在 system 段**（尾部动态通道）', async () => {
+    const { h, sink } = await setup('人工维护：偏好中文', {
+      feedback: '- [feedback] grep_file 反复失败（2 次）：正则无效',
+    })
+    const sess = await h.session.create()
+    for await (const _ of h.agent.queryStream({ sessionId: sess.id, agentId: 'default', message: 'hi' })) {
+      void _
+    }
+    const req = sink[0]!
+    const sys = systemTextOf(req)
+    const all = req
+      .map((m) => m.parts.map((p) => (p as { text?: string }).text ?? '').join('\n'))
+      .join('\n')
+    expect(sys).toContain('人工维护：偏好中文')
+    expect(sys).not.toContain('<memory-feedback>') // 不在前缀区 ⇒ 改它不动前缀缓存
+    expect(all).toContain('<memory-feedback>') // 但确实送到了模型（尾部通道没有断）
+    expect(all).toContain('grep_file 反复失败')
     await h.stop()
   })
 })
