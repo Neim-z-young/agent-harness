@@ -238,7 +238,9 @@ function alternatingEmptyCalls(n: number): ChatStreamChunk[][] {
 
 describe('入参自愈的额度代价：必填全缺的回喂步免计（有上限）', () => {
   it('全是空参调用的步不吃额度：maxSteps=2 也能跑完 3 步（第 3 步是真正的收尾）', async () => {
-    const script = [
+    // 必须显式标注：先赋值给变量就失去了 `scriptedProvider(...)` 的上下文类型，
+    // 内联的 `{ type: 'text_delta', … }` 会被拓宽成 `string` ⇒ 不再满足 ChatStreamChunk。
+    const script: ChatStreamChunk[][] = [
       ...alternatingEmptyCalls(2),
       [
         { type: 'text_delta', text: '参数补齐了' },
