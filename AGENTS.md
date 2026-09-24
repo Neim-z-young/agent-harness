@@ -165,6 +165,14 @@
 
 - **测试块约定：顶层 `describe` 不继承外层 `beforeEach/afterEach`** —— 往已有测试文件里追加独立 `describe` 时若忘了自带 setup/cleanup，会因外层 `afterEach` 已清掉临时目录而 ENOENT/`SPAWN_ERROR`（表现为"新写的用例莫名失败"）。另：`ToolResult` 是**非判别联合**（`ok: boolean` + 可选 `output?/error?`），`if (!r.ok)` **不收窄**类型，断言写 `r.error?.code` / `r.output?.exitCode`
 
+- **遥测（telemetry）通道按「事实归属」选，绝不给同一件事开两条通道**：三类落法各有适用面，别一刀切——
+  · **core/引擎层已有 hook 的事实**（如整轮终态 `core.agent.turn.end`）⇒ **注册那条 hook**（telemetry 现在这么做，落 `telemetry.turn.end`）。**不要**再补一条同义的 bus 事件：同一个事实两条通道就是历史事故的翻版（同一个名字由两层分别触发 ⇒ 消费方分不清来源、按轮计数翻倍）。
+  · **插件自己产生的事实**（如 subagent 的草稿归属）⇒ **走 bus**（`SubagentEvents.draft`）：telemetry 是通用插件，**不该 import 具体插件的类型**，只能靠 bus 解耦。
+  · **两条通道都是"聚合后抛"，没有哪条更安全**（别想当然）：`bus.publish` 用 `Promise.allSettled` 并发跑完**全部**订阅者，再把失败收成 `AggregateError` **抛出**；`PluginManager.trigger` 顺序跑完后同样抛。⇒ **凡上报类事件一律挂 `.catch(() => undefined)`**（本项目惯用写法：subagent 的 `bus.publish(...).catch(() => {})`、core 的 `void ...triggerPlugin(...).catch(() => undefined)`）。**上报绝不能顶掉主语义** —— 尤其别让一条遥测把 agent 主循环带下水。
+  · **插件已有自己的遥测 writer**（acp-context 的 `sessions/*.telemetry.jsonl` 自有 schema）⇒ **扩自己的 schema**，不要绕道 telemetry。
+  「新事件自动入明细」是 telemetry 的设计（`subscribeAll` → `telemetry.bus.<name>`），所以走 bus 时**不必改 telemetry**；改的是"要让 kind 语义化/要派生指标"的时候。
+- **布尔字段在遥测里会被自动折叠为 `0 | 1`**，不必手写数值：`pickAttrs` / `pickMetrics` 的 `asNumber()` 已支持（此前只收 `string | number` ⇒ 载荷里的布尔被**静默丢弃**，消费方只能把"字段不存在"当 false，分不清"真是 false"与"压根没采到"）。已确认曾中招：`SubagentEvents.*` 的 `background` / `isContinuation`、`AgentTurnEndSignal.aborted`。事件契约里**照写布尔**（说人话），折叠是提取层的事。注意 `0` 是有意义的值 ⇒ 别指望"缺省即 false"和"显式 false"在落盘后还能区分。
+
 ## 5. 工程约定
 
 - 自定义错误类定义在各模块（`*Error`），不抛裸字符串

@@ -1,5 +1,85 @@
 # Agent Harness 开发日志
 
+## 2026-09-24（续 199）给本轮新机制补遥测：整轮终态落盘 + 草稿归属事件 + 布尔字段不再静默丢
+
+用户「增加遥测」。先盘了一遍**本轮六个观察点各自的遥测现状**，结论比预想的分化：
+
+| 机制 | 原状 | 处置 |
+|---|---|---|
+| 观察点 2 · `coordinator.worker.completed` | **已有**（走 `ctx.bus` ⇒ telemetry 的 `subscribeAll` 自动落 `telemetry.bus.coordinator.worker.completed`） | 不动 |
+| 观察点 3 · 闸门等待 | **零遥测**（只发 `step_gate` **流式事件**，只到 UI；core 的 bus 只有 7 条生命周期事件） | **待定通道**（见下） |
+| 观察点 7 · 中途草稿 | **零遥测**（"有草稿文件 ⇔ 被掐断"只能靠 `ls`） | **本次落地** `SubagentEvents.draft` |
+| 观察点 8 · 零收益压缩 | **已有**（`CompressEvent.zeroYield`，已写已测） | 不动 |
+| 观察点 9 · 免计步 `freeSteps` | **零遥测**（只在 `turn_end` 流事件 + `core.agent.turn.end` hook 里） | **本次落地**（注册既有 hook） |
+
+### 一、通道不是"全局选一个"，而是按**事实归属**选
+
+三类落法，各有适用面（已写进 `AGENTS.md` §4）：
+
+- **core 已有 hook 的事实**（整轮终态）⇒ **注册那条 hook**，**不要**再补同义的 bus 事件 ——
+  同一个事实两条通道＝历史事故翻版（同名字由两层触发 ⇒ 消费方按轮计数翻倍）。
+- **插件自己产生的事实**（草稿）⇒ **必须走 bus**：telemetry 是通用插件，**不该 import 具体插件的类型**。
+- **插件已有自己的遥测 writer**（acp-context 的 `sessions/*.telemetry.jsonl` 自有 schema）⇒ 扩自己的 schema。
+
+> ⚠️ 顺带纠正了我自己上一轮说法里的一处**想当然**：我当时以为 `bus.publish` 是"错误隔离、不会把发布方带下水"。
+> 实测**不是** —— 它用 `Promise.allSettled` 并发跑完**全部**订阅者后，把失败收成 `AggregateError` **抛出**；
+> `PluginManager.trigger` 顺序跑完后**同样抛**。两条通道都会抛，**没有哪条更安全** ⇒
+> 凡上报类事件一律挂 `.catch(() => undefined)`（别让一条遥测把 agent 主循环带下水）。
+
+### 二、观察点 9：注册 `core.agent.turn.end` → `telemetry.turn.end`
+
+- 新增纯函数 `turnEndEnvelope()`（`telemetry/map.ts`）：落 `sessionId / agentId / agentName / mode / finish`
+  作 attrs，`step / freeSteps / billedSteps` 作 metrics。
+- **`billedSteps` 是派生量**（`step - freeSteps`），它才是 `maxSteps` 的消耗口径 ——
+  观察点 9 之后"步号 30 但额度没耗尽"是**常态**，只看 `step` 会以为额度算错了。两个都落，消费方不必猜。
+- `freeSteps === 0` 时**不落该字段**（缺省即 0，不塞无用字段）；`aborted` 只在真中断时记 1。
+- 缺 `sessionId` **不丢事件**（照 `toolFailureEnvelope` 的口径：只在语义上该过滤时才返回 null）——
+  无 sessionId 的轮落到 run 级文件，那也是它的正确归宿。
+- 子 Agent 的轮**也会**走这条 hook（引擎不做"哪一轮算用户的轮"的判断）⇒ 靠 `mode` 标签区分，消费方自己筛。
+
+### 三、观察点 7：`SubagentEvents.draft`（草稿的最终归属）
+
+- 只在**真的写过草稿**时发（`flushCount > 0`）：15s 内跑完的快任务从不写草稿，
+  给它发一条"没有草稿"是用噪声充数；**分母由 `completed` / `failed` 提供**。
+- 载荷：`kept`（true = 被掐断、草稿是唯一留存；false = 正常结束已删除）、`chars`（保留时的字符数，
+  `kept=false` 时为 0）、`flushCount`（步边界刷了几次）、`durationMs`、`path`（仅 kept 时给）。
+- 顺带把"正常结束删草稿"那段改成**记录删除是否成功**：`rmSync` 失败时（原来静默 `catch {}`）
+  草稿文件仍在，此时**必须上报 `kept=true`** —— 否则 `subagent-results/` 里会出现一个遥测无法解释的
+  孤儿文件，"有草稿文件 ⇔ 被掐断"的等式就破了。
+- `flushCount` / `chars` **只在写成功时递增**：写失败却报"刷了 3 次"会让线上排查拿到假证据。
+
+### 四、修掉一类**静默丢字段**：布尔在遥测里一直是被丢的
+
+`pickAttrs` / `pickMetrics` 原本只收 `string | number` ⇒ 载荷里的**布尔字段整条消失**。
+已确认中招：`SubagentEvents.started { isContinuation: boolean }`、
+`SubagentEvents.* { background?: boolean }`（`background: true` 一直在发、一直在丢）、
+`AgentTurnEndSignal { aborted?: boolean }`。消费方只能把"字段不存在"当 false，
+**分不清"真是 false"与"压根没采到"**。
+
+修法：新增 `asNumber()` 把布尔折叠为 `0 | 1`（真实布尔以外的值——对象/数组/null/NaN/Infinity/空串——仍旧丢弃）。
+事件契约里**照写布尔**（说人话），折叠是提取层的事。
+
+### 五、验证
+
+- `bun run typecheck`：**39 包 0 error**（`EXIT=0`）。
+- `bun run test`：**1902 pass / 0 fail**（较上一篇 1890 **+12**）。分项：telemetry 30 → **39**（+9）、
+  subagent 143 → **146**（+3）。
+- 新增用例：`turnEndEnvelope` 6 条（含 `billedSteps` 分叉、aborted 折叠、缺 sessionId 不丢、子 Agent 轮）、
+  提取器布尔折叠 2 条（含"不放宽其它类型"）、插件 hook 落会话文件 1 条（端到端，`crash: false`）；
+  subagent 草稿事件 3 条（掐断 kept=true / 正常结束 kept=false 且 chars=0 / 快任务不发）。
+
+### 六、复用要点
+
+- **加遥测前先盘"这件事现在有没有人看得见"**：本轮五个机制里三个已有、两个为零 ——
+  不盘就动手，很可能写一堆重复采集。判据：`grep` 事件名 + 看它走的是 `bus` 还是**流式事件**
+  （**流式事件只到 UI，遥测一条都看不到**，这是最容易误判的一处）。
+- **"文件存在性 = 状态"这类隐式语义，一旦要统计就必须事件化**：`ls` 能验证不变量，
+  但答不了"掐断率是多少"。
+- **别把"我以为的框架行为"当事实**：本轮我误判 `bus.publish` 错误隔离，差点把它当"更安全的通道"写进
+  `AGENTS.md`（那条会进每次会话的上下文）。**判据要看实现，不看直觉**。
+
+---
+
 ## 2026-09-24（续 198）闸门等待语义改为「分片睡眠 + 片间重探」（方案 A）：不再睡满整档
 
 用户追问"闸门是硬等固定时间，还是有结果就可以返回执行了"，复核后确认是**硬等一档**，
