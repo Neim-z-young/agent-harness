@@ -47,6 +47,23 @@ import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWork
 // SubagentTool 提示词文本（prompts/*.txt，import 加载，参考 opencode）
 import subagentToolDescription from './prompts/subagent-tool-description.txt'
 import subagentToolDocumentation from './prompts/subagent-tool-documentation.txt'
+// 子 Agent 输出指令（prompts/subagent-directive.txt）：约束子 Agent 的回复结构与长度
+import subagentDirective from './prompts/subagent-directive.txt'
+
+/**
+ * 子 Agent 的默认输出指令（前置到派工 prompt）。
+ *
+ * 为什么要有默认值：**子 Agent 的整段回复会原样进入父 Agent 的上下文**——没有约束时，
+ * 它倾向于写"我先读了 X、然后发现 Y、最后…"的过程流水账并附上大段原文，父 Agent 拿到的
+ * 有效信息密度极低，还要为这些噪音付费（真机 9 份报告 4532~10195 字符，大半是过程复述）。
+ * 指令只做两件事：限定**结构**（结论/依据/变更/未决）与**长度**（60 行以内），
+ * 不做任何内容层面的限制——该有的证据一样都不能少。
+ *
+ * 这是**插件级默认**，不是工具级：`createSubagentTool` 的 directive 参数仍严格"不传即不注入"
+ * （保持可测试性）。宿主想换一套指令就传 `options.directive`；想彻底关掉传**空字符串**。
+ * 文本在 `prompts/subagent-directive.txt`，可直接编辑。
+ */
+export const SUBAGENT_OUTPUT_DIRECTIVE = subagentDirective.trim()
 
 // ===== Subagent Bus 事件定义 =====
 
@@ -286,7 +303,15 @@ export interface SubagentPluginOptions {
   maxResultLength?: number
   /** 返回给父 Agent 的最大结果行数，超过则生成摘要。缺省 500（先于 maxResultLength 触发更精准） */
   maxResultLines?: number
-  /** 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），要求子 Agent 简洁结构化回复 */
+  /**
+   * 注入子 Agent 的结构化输出指令（类似 Claude Code 的 fork directive），前置到派工 prompt。
+   *
+   * 缺省用 {@link SUBAGENT_OUTPUT_DIRECTIVE}（结论/依据/变更/未决 四段 + 60 行上限 + 禁过程
+   * 流水账），因为子 Agent 的回复会**原样**进父 Agent 的上下文，不约束就会被过程复述灌满。
+   *
+   * 传**空字符串**可彻底关闭注入（宿主有自己的子 Agent 输出规范时用）。
+   * 注意这是插件级默认：`createSubagentTool` 的 directive 参数仍是"不传即不注入"。
+   */
   directive?: string
   /**
    * 是否把「可派工的子 Agent 名单」注入派工方的 system prompt（缺省 true）。
@@ -340,6 +365,18 @@ export const DEFAULT_SUBAGENT_MAX_STEPS = 20
  * 之所以不设更大：摘要仍是"子 Agent 返回超长内容"时的安全阀，需要全文时按路径取用。
  */
 export const DEFAULT_MAX_RESULT_LENGTH = 8000
+
+/**
+ * 摘要里「工具调用列表」最多显示多少条（按 `toolId + 入参预览` **合并同类**后计）。
+ *
+ * 为什么要限：一个跑了 30 步的子 Agent 会把 30 行 `- read_file: …` 塞进父 Agent 的上下文，
+ * 而父 Agent 真正要的是结论——这份列表只是"它到底动过哪些地方"的佐证，不是报告正文。
+ * 真机 9 份报告被截断时，列表能占掉摘要近三分之一。
+ *
+ * 12 的依据：够覆盖"改了 3~5 个文件 + 跑了几次命令"的典型任务全貌；再多就是在报流水账。
+ * 超出部分**不静默丢弃**——末尾会写明"其余 N 次已省略"，完整记录随全文落盘（outputPath）。
+ */
+export const TOOL_SUMMARY_MAX_ITEMS = 12
 
 /** Harness 引用的最小接口（避免 import core 导致循环依赖） */
 interface HarnessLike {
@@ -705,11 +742,30 @@ function summarizeResult(
   if (toolCalls.length > 0) {
     out.push('')
     out.push(`[工具调用摘要（${toolCalls.length} 次）]`)
+    // 合并同类（同一工具 + 同一入参预览）：重复调用同一文件在父 Agent 侧是纯噪音，
+    // 但"调了几次"本身有价值（能看出空转），所以用 ×N 折叠而不是丢弃。
+    const groups = new Map<string, { toolId: string; inputPreview: string; count: number; isError: boolean }>()
     for (const tc of toolCalls) {
-      const errFlag = tc.isError ? ' [错误]' : ''
-      const inputPart = tc.inputPreview ? `: ${tc.inputPreview}` : ''
-      out.push(`- ${tc.toolId}${inputPart}${errFlag}`)
+      const key = `${tc.toolId}\t${tc.inputPreview}`
+      const g = groups.get(key)
+      if (g) {
+        g.count += 1
+        g.isError = g.isError || tc.isError
+      } else {
+        groups.set(key, { toolId: tc.toolId, inputPreview: tc.inputPreview, count: 1, isError: tc.isError })
+      }
     }
+    const all = [...groups.values()]
+    const shown = all.slice(0, TOOL_SUMMARY_MAX_ITEMS)
+    for (const g of shown) {
+      const errFlag = g.isError ? ' [错误]' : ''
+      const inputPart = g.inputPreview ? `: ${g.inputPreview}` : ''
+      const countPart = g.count > 1 ? ` ×${g.count}` : ''
+      out.push(`- ${g.toolId}${inputPart}${countPart}${errFlag}`)
+    }
+    // 省略了多少次要如实写出来 —— 静默截断会让父 Agent 以为"它就动了这些"
+    const hidden = toolCalls.length - shown.reduce((n, g) => n + g.count, 0)
+    if (hidden > 0) out.push(`- …（其余 ${hidden} 次调用已省略，完整记录见下方全文路径）`)
   }
 
   out.push('')
@@ -826,7 +882,14 @@ export function createSubagentTool(
       type: 'object',
       properties: {
         agentId: { type: 'string', description: '子 Agent ID（必须已注册且 mode === subagent）' },
-        prompt: { type: 'string', description: '派给子 Agent 的任务描述（要自包含：目标、上下文、验收标准）' },
+        prompt: {
+          type: 'string',
+          description:
+            '派给子 Agent 的任务描述。**子 Agent 看不到本会话**，必须自包含地写清：'
+            + '① 一句话目标；② 相关文件路径/符号/行号；③ 你已知的结论与约束（别让它重查）；'
+            + '④ 验收标准（怎样算完成）；⑤ 范围边界（不要做什么）。'
+            + '禁止「看一下 X 有什么问题」这类缺目标缺路径的派工。',
+        },
         description: { type: 'string', description: '3-5 词简短描述（用于 UI 展示与调用日志，可选）' },
         model: {
           type: 'object',
@@ -1527,6 +1590,8 @@ export function renderRoster(list: readonly AgentDefinition[]): string {
     '## 可派工的子 Agent（subagent 工具的 agentId 只能取下列之一）',
     ...rows,
     '派工判断：能一次问清或一次改完的自己做；需要并行、或跨文件集的大块任务才派。',
+    // 派工上下文提醒：子 Agent 看不到本会话，不给上下文的派工换回的是泛泛而谈
+    '派工时 prompt 必须给足上下文：目标 + 路径/符号 + 已知结论与约束 + 验收标准 + 不要做什么。',
   ].join('\n')
 }
 
@@ -1545,7 +1610,7 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
     cleanupSession = false,
     maxResultLength = DEFAULT_MAX_RESULT_LENGTH,
     maxResultLines = 500,
-    directive,
+    directive = SUBAGENT_OUTPUT_DIRECTIVE,
     maxSteps: subagentMaxSteps = DEFAULT_SUBAGENT_MAX_STEPS,
     injectRoster = true,
     draftFlushIntervalMs,

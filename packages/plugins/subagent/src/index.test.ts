@@ -17,6 +17,8 @@ import {
   isAgentDenied,
   filterAccessibleAgents,
   renderRoster,
+  SUBAGENT_OUTPUT_DIRECTIVE,
+  TOOL_SUMMARY_MAX_ITEMS,
   type SubagentToolInput,
   type SubagentToolOutput,
   type SubagentPluginOptions,
@@ -840,7 +842,9 @@ describe('Subagent 端到端', () => {
 
     // 4. 验证结果
     expect(res.ok).toBe(true)
-    expect(res.output!.message).toBe('已完成任务：把 foo() 重构为 bar()')
+    // 派工 prompt 前面已带上默认输出指令（子 Agent 的回复要精简结构化），任务原文仍在
+    expect(res.output!.message).toInclude(SUBAGENT_OUTPUT_DIRECTIVE)
+    expect(res.output!.message).toInclude('把 foo() 重构为 bar()')
     expect(res.output!.messageCount).toBe(2)
     expect(res.output!.sessionId).not.toBe('parent-session') // 独立 session
   })
@@ -1560,6 +1564,70 @@ describe('SubagentTool 工具调用摘要', () => {
     expect(bashLine).toBeDefined()
     expect(bashLine!.length).toBeLessThan(longCmd.length + 20)
     expect(bashLine).toInclude('...')
+  })
+
+  it('工具调用摘要合并同类（×N）并限制条数，超出部分如实报省略次数', async () => {
+    const longReply = 'r'.repeat(2500)
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    // 20 次同文件 read_file（同类，合并为 1 条）+ 15 次不同路径 ⇒ 共 35 次 / 16 组
+    const calls: Array<{ toolUseId: string; toolId: string; input: Record<string, unknown> }> = [
+      ...Array.from({ length: 20 }, (_, i) => ({
+        toolUseId: `tu_same_${i}`, toolId: 'read_file', input: { path: '/a.ts' },
+      })),
+      ...Array.from({ length: 15 }, (_, i) => ({
+        toolUseId: `tu_diff_${i}`, toolId: 'read_file', input: { path: `/f${i}.ts` },
+      })),
+    ]
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const s = sessionsRef.get(input.sessionId)
+      if (s) {
+        s.messages.push(makeMessage('user', input.message))
+        s.messages.push(makeAssistantWithToolCalls('处理', calls))
+        s.messages.push(makeMessage('assistant', longReply))
+      }
+      return makeMessage('assistant', longReply)
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false, 2000)
+    const res = await tool.call({ agentId: 'coder', prompt: 'test' }, makeToolContext())
+
+    const msg = res.output!.message
+    // 总次数照实报（合并/省略都不改这个数）
+    expect(msg).toInclude('[工具调用摘要（35 次）]')
+    // 同类合并成一条，次数用 ×N 表达（不是丢掉"调了 20 次"这个事实）
+    expect(msg).toInclude('- read_file: /a.ts ×20')
+    // 只显示前 12 组；被省略的 4 次要点名，不能静默截断
+    expect(msg).toInclude('其余 4 次调用已省略')
+    const listLines = msg.split('\n').filter((l) => l.startsWith('- '))
+    expect(listLines.length).toBe(TOOL_SUMMARY_MAX_ITEMS + 1) // 上限条数 + 1 行省略说明
+  })
+
+  it('合并同类时错误标记不丢（任一次失败整条标 [错误]）', async () => {
+    const longReply = 'r'.repeat(2500)
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const s = sessionsRef.get(input.sessionId)
+      if (s) {
+        s.messages.push(makeMessage('user', input.message))
+        s.messages.push(makeAssistantWithToolCalls('处理', [
+          { toolUseId: 'tu_1', toolId: 'bash', input: { command: 'npm test' } },
+          { toolUseId: 'tu_2', toolId: 'bash', input: { command: 'npm test' }, isError: true },
+        ]))
+        s.messages.push(makeMessage('assistant', longReply))
+      }
+      return makeMessage('assistant', longReply)
+    })
+    const session = createMockSessionManager(sessions)
+    const harness = { agent, session }
+
+    const tool = createSubagentTool(() => harness, 5000, false, 2000)
+    const res = await tool.call({ agentId: 'coder', prompt: 'test' }, makeToolContext())
+
+    expect(res.output!.message).toInclude('- bash: npm test ×2 [错误]')
   })
 })
 
@@ -3557,5 +3625,60 @@ describe('派工方可按本次任务规模覆盖子 Agent 步数上限', () => 
       }),
     )
     expect(warns.some((w) => w.includes('maxSteps') && w.includes('无效'))).toBe(true)
+  })
+})
+
+describe('子 Agent 输出指令（directive）：插件级默认', () => {
+  const worker: AgentDefinition = {
+    id: 'reader', name: '速读员', description: '只读回报事实', mode: 'subagent',
+    tools: ['read_file'], promptFragments: [], permission: { '*': 'allow' },
+  }
+
+  /** 走完整插件装配（install → core.harness.start → pool.assemble）取出 subagent 工具并派一次工 */
+  async function dispatchAndCapture(options: SubagentPluginOptions): Promise<string> {
+    let captured: string | undefined
+    const sessions = new Map<string, Session>()
+    const sessionsRef = sessions
+    const agent = createMockAgentRuntime([worker], async (input) => {
+      captured = input.message
+      const msg = makeMessage('assistant', 'done')
+      sessionsRef.get(input.sessionId)?.messages.push(msg)
+      return msg
+    })
+    const plugin = createSubagentPlugin(options)
+    const hooks = (await plugin.install({
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+      bus: { publish: async () => {}, subscribe: () => () => {} },
+      config: { get: () => undefined, set: () => {} },
+    } as any)) as any
+    await hooks['core.harness.start']?.({
+      harness: { agent, session: createMockSessionManager(sessions) },
+    })
+    const added: any[] = []
+    hooks['core.tool.pool.assemble']?.({}, { add: (t: any) => added.push(t) })
+    const tool = added.find((t: any) => t.id === 'subagent')
+    await tool.call({ agentId: 'reader', prompt: '读一下 /a.ts 的导出' }, makeToolContext())
+    return captured!
+  }
+
+  it('默认注入 SUBAGENT_OUTPUT_DIRECTIVE（约束结构与长度，减少回传给父 Agent 的噪音）', async () => {
+    const msg = await dispatchAndCapture({ subagents: [worker] })
+    expect(msg).toStartWith(SUBAGENT_OUTPUT_DIRECTIVE)
+    expect(msg).toInclude('读一下 /a.ts 的导出')
+    // 默认指令本身要有的三条硬约束（缺一条就管不住输出长度）
+    expect(SUBAGENT_OUTPUT_DIRECTIVE).toInclude('## 结论')
+    expect(SUBAGENT_OUTPUT_DIRECTIVE).toInclude('过程流水账')
+    expect(SUBAGENT_OUTPUT_DIRECTIVE).toInclude('60 行')
+  })
+
+  it('传空字符串可关闭默认注入（宿主自带输出规范时）', async () => {
+    const msg = await dispatchAndCapture({ subagents: [worker], directive: '' })
+    expect(msg).toBe('读一下 /a.ts 的导出')
+  })
+
+  it('显式 directive 覆盖默认（不是叠加）', async () => {
+    const msg = await dispatchAndCapture({ subagents: [worker], directive: '只回一句' })
+    expect(msg).toStartWith('只回一句')
+    expect(msg).not.toInclude('过程流水账')
   })
 })
