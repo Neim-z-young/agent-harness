@@ -1,5 +1,104 @@
 # Agent Harness 开发日志
 
+## 2026-09-24（续 200）闸门遥测走 bus：`agent.step.gate`（含"该等却没等"）—— 顺带删掉一个不可达状态
+
+上一篇给出的通道判据是"按**事实归属**选"，闸门那条留了待定：本次按用户定的"**走 bus**"落地。
+
+### 一、为什么闸门可以走 bus（而不违反"同一事实不开两条通道"）
+
+禁令针对的是**同一件事有两个发布入口**（历史上同一个 hook 名字由两层分别触发 ⇒
+消费方分不清来源、按轮计数翻倍）。闸门不符合那个形态，两点理由：
+
+1. **`core.agent.step.gate` hook 是输入侧提问**（"还有存活任务吗"），等待的**结果**
+   （实际等了多久、睡了几片、是否被切片提前结束）**回不到 `decision` 对象里** ⇒
+   非流式通道上没有任何同义的东西，这不是"再补一条"。
+2. **`step_gate` 流事件只到 UI**（进程结束即蒸发）—— 这一点最容易误判成"已经上报过了"。
+   实测：该事件在 `sessions/*.telemetry.jsonl` 里**一条都没有**，产线遥测里闸门是完整盲区，
+   而切片粒度/退避档位只能靠线上数据调。
+
+所以规则补成三条（已同步 `AGENTS.md` §4）：
+
+- core 已有 hook 的事实 ⇒ 注册 hook（**不要**补同义 bus 事件）；
+- **引擎自身的执行事实、且非流式通道上还是空白** ⇒ core 定义 bus 事件并由引擎发布；
+- 同一事实的**两个消费者**（UI / 遥测）≠ 两条通道 —— 判据是"**这条事实有几个地方会发它**"，>1 才是事故原型。
+
+### 二、core：`AgentEvents.stepGate`（事件名 `agent.step.gate`）
+
+新开一组 `AgentEvents`（与 `LifecycleEvents` 分开：那组是"插件启停"的跨层解耦命令，本组是
+引擎自身的执行轨迹）。**事件名 + 一个 `outcome` 判别式**（照 `harness.error` 用 `stage` 分档的先例），
+而不是拆成 `waited` / `skipped` 两个名字 —— 它们是同一个问题的两个答案，拆开要消费方自己 join。
+
+- `outcome: 'waited'`：`waitMs`（**实际**）/ `slices` / `sliceMs` / `plannedMs?`（仅提前结束时）……
+- `outcome: 'skipped'`：`plannedMs`（**没能等的那一档**）/ `skipReason`。
+
+发布点就在已有的 `step_gate` yield 旁边，同一份事实投递给两个消费者；`slices` 同时补进流事件
+（它说明**引擎问了几次**，而探测次数正是 gate hook 的实现成本量级）。
+
+发布方式是 **fire-and-forget + `.catch`**：`bus.publish` **不是**错误隔离（上一篇已实测），
+一条写坏的遥测订阅者能把 agent 主循环带下水。守卫用例：`step-gate.test.ts` 的
+「订阅者抛错不打断本轮」（少了 `.catch` 会冒 unhandled rejection / 主循环中断）。
+
+### 三、⚠️ 删掉一个我自己刚写的不可达状态：`skipReason: 'aborted'`
+
+初稿的 `skipReason` 是 `'budget_exhausted' | 'aborted' | 'zero_ladder'`，还配着注释
+"`aborted` 是用户中断（正常，但要让本轮为何没减速可解释）"。**测试直接把它证伪了**：
+断言 `records` 长度为 1，实际是 **0**。
+
+真因：中断检查 `if (signal?.aborted) break` 在**循环顶部**（`core/src/index.ts:2487`），
+**在闸门那段之前** —— 中断时循环直接 break，闸门**根本不会被问到**。所以那次写成
+`signal?.aborted ? 'aborted' : …` 的三元分支永远取不到第一个值，是**死码**。
+
+修法：把该分支收敛为 `} else if (!signal?.aborted) {`（信号在探测期间被置上的窄窗口不值得
+为它造一个到不了的状态），`skipReason` 只剩两个真实可达值；中断用例反手改成**负断言**
+（`probe.probes === 0` + `records.length === 0`），钉住"闸门在中断检查之后"这个顺序 ——
+将来有人把闸门挪到中断检查之前，这条会红。
+
+### 四、顺带纠正 `@harness/bus` 里两处误导性注释
+
+`Bus.publish` 的接口文档写着"某个订阅者抛错不影响其他订阅者，错误收集到 AggregateError"、
+类文档写"单个错误隔离" —— 读起来像"错误被隔离掉、调用方不必管"，**这正是上一轮把我带偏的源头**
+（结论当时已在 `AGENTS.md` 纠正，但代码注释没改，会继续误导下一个读它的人）。
+已改为"订阅者之间互不影响、**调用方不隔离**，失败收成 `AggregateError` 抛给调用方 ⇒
+上报类事件请自行 `.catch`"。
+
+### 五、telemetry：**零改动**
+
+`subscribeAll` → `telemetry.bus.<name>`，新事件按名字自动入明细。补了 2 条口径测试钉住字段落法
+（`waitMs`/`plannedMs`/`slices`/`waitedMs`/`aliveCount` 进 metrics 可求和；`outcome`/`skipReason`/`reason`
+与归属 `sessionId`/`agentId` 进 attrs）。测试里刻意**不 import core 的类型**（事件按名匹配），
+保持 telemetry 对具体包零依赖。
+
+读法（会话级遥测，一条事件一行 JSON）：
+
+```bash
+jq -c 'select(.kind=="telemetry.bus.agent.step.gate") | {ts, o:.attrs.outcome, a:.attrs.agentId} + .metrics' \
+  ~/.harness/sessions/<sid>.telemetry.jsonl
+```
+
+聚合口径：`sum(waitMs)` = 真的让出了多少时间；`sum(plannedMs - waitMs)` = 切片重探省掉的等待
+（只在被提前结束时不等，故用两者相减才不重复计数）；`outcome=="skipped"` 条数 ÷ 检查点数 =
+闸门实际退化比例，配 `attrs.skipReason` 看原因。
+
+### 六、验证
+
+- `bun run typecheck`：**39 包 0 error**（`EXIT=0`）。
+- `bun run test`：**1911 pass / 0 fail**（39 包，较上一篇 1902 **+9**）。分项：core 154 → **161**（+7）、
+  telemetry 39 → **41**（+2）、bus 包（注释改动，条数不变 22）。
+- 新增用例（core）：waited 与流事件同源（含 `slices`）、提前结束 `waitMs < plannedMs`、
+  预算用尽 `skipped(budget_exhausted)`、空阶梯 `skipped(zero_ladder)`、**静默不落事件**、
+  无插件零事件、**订阅者抛错不打断本轮**；中断用例改为负断言。
+
+### 七、复用要点
+
+- **写枚举值之前先问"哪条路径能走到这里"，并写出触发它的用例**：写不出就是不可达。
+  留着的代价不只是死码 —— 它会让消费方以为"中断也会记一条"，还会养成"契约里多写几个值没关系"的习惯。
+  这一条靠测试发现（我原本很自信地把它写进了 doc 注释）。
+- **"流事件 = 已上报"是个反复出现的错觉**：判可见性要看**落盘文件里有没有**，不看 UI 上有没有打印。
+- **注释里的错误结论比没有注释更坏**：`@harness/bus` 那两行注释把我带偏了一整轮，
+  而纠正结论时只改了 `AGENTS.md`、没改源头 ⇒ 这轮补上。发现一处就要连源头一起扫。
+
+---
+
 ## 2026-09-24（续 199）给本轮新机制补遥测：整轮终态落盘 + 草稿归属事件 + 布尔字段不再静默丢
 
 用户「增加遥测」。先盘了一遍**本轮六个观察点各自的遥测现状**，结论比预想的分化：

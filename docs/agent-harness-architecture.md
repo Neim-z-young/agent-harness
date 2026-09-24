@@ -1486,22 +1486,71 @@ function shouldContinueStep(o: StepOutcome): boolean {
 > 引擎要到整档结束才记一次账，插件正是靠这两个值区分"片间重探"与"新的一次等待"；
 > ② 正好睡满时**不会**再补一次探测（那时问了只会得到"还有任务"，纯浪费）。
 
-### 17.5 可见性：`step_gate` 事件 + `waiting` 相位
+### 17.5 可见性：`step_gate` 流事件 + `agent.step.gate` bus 事件 + `waiting` 相位
 
 等待必须**可见**——否则用户分不清"卡住了"还是"任务本来就慢"，
-只能靠重发同一句话自救（AGENTS.md 的 >15s 心跳约定）。故每次等待发一条流式事件：
+只能靠重发同一句话自救（AGENTS.md 的 >15s 心跳约定）。可见性走**两条通道**，
+分工按"谁消费"划：
+
+| 通道 | 载体 | 消费者 | 生命周期 |
+|---|---|---|---|
+| 流式事件 `step_gate` | `AgentStreamEvent` | CLI / TUI | 进程结束即蒸发 |
+| bus 事件 `agent.step.gate` | `AgentEvents.stepGate` | telemetry（`subscribeAll` 自动入明细）、其它插件 | 落 `sessions/*.telemetry.jsonl` |
+
+**为什么两条都要**：流事件只到 UI，产线遥测里闸门原本是**完整盲区**——而切片粒度、
+退避档位这些参数只能靠线上数据调（§17.7 把"L4 产线遥测"列为验证的一层）。
+反过来说，这**不是** AGENTS.md 禁止的"同一事实两条通道"——那条禁令说的是
+**同一件事有两个上报入口**（历史上同一个 hook 名字由两层分别触发 ⇒ 消费方按轮计数翻倍）；
+这里是同一份事实往两个**不同消费者**投递，且只有引擎一个发布方。
 
 ```ts
+// 流事件（嵌套对象，不把 step_gate 专属字段平铺到 AgentStreamEvent 上）
 | 'step_gate'
-gate?: { waitMs: number; waitedMs: number; attempt: number; aliveCount?: number; reason?: string }
+gate?: { waitMs: number; waitedMs: number; attempt: number; slices?: number
+         plannedMs?: number; aliveCount?: number; reason?: string }
+
+// bus 事件（AgentEvents.stepGate，事件名 'agent.step.gate'）
+{ sessionId, agentId, step, nextStep, attempt, waitedMs,
+  outcome: 'waited' | 'skipped',
+  waitMs?, plannedMs?, slices?, sliceMs?, aliveCount?, reason?,
+  skipReason?: 'budget_exhausted' | 'zero_ladder' }
 ```
 
-- 字段收在**嵌套 `gate` 对象**里，不把 `step_gate` 专属字段平铺到 `AgentStreamEvent` 上。
-- CLI 的 REPL 打一行 `⏳ 等一会再跑下一步：…（本次 Xs，累计 Ys）`，
-  并把 `step_gate` 排除出"自主续轮分隔"的判定（它不是一轮的开始）。
-- `AgentStatusSnapshot.phase` 扩出 `'waiting'` 相位（`formatAgentPhase` → `等待后台任务`），
-  这样 UI **不会把等待算进"模型耗时"**。
-- 中断时**不发**这条事件：本轮已经结束，报一条"等了 60s"反而是假信息。
+几条**刻意的取舍**，每一条都是为了"不产生假数据"：
+
+- `waitMs` 报**实际**等待、不是档位值；被切片提前结束时另带 `plannedMs`
+  （报"等了 3s"而实际 0.5s 就是假信息）。`slices` 说明**引擎问了几次**——
+  探测次数正是 gate hook 实现的成本量级。
+- `skipped` 记的是"插件报存活、引擎却没等"，这在改造前**完全静默**（界面一片安静、
+  步数照烧，事后只能从"额度莫名耗尽"倒推）。两种原因：`budget_exhausted`（本轮等待
+  预算用尽，`plannedMs` 是没能等的那一档）与 `zero_ladder`（阶梯配成 0，等于关了等待
+  却还在每步探测）。
+- **不记中断**：中断在循环顶部的步边界检查就 `break`（在闸门之前），闸门根本不会被问到，
+  为它造一档会得到一个实际到不了的状态。整轮级的中断由 `turn_end.aborted` 负责。
+- **探测为静默（没有存活任务）不落 bus 事件**：那是每一步都会走的常态，落下来只会把
+  明细淹掉；要分母就用 `turn.end` 的 `step`（`turn_end` 里 `step` 与 `billedSteps` 分叉
+  可见观察点 9 的免计步）。
+
+发布侧是 **fire-and-forget + `.catch`**：`bus.publish` **不是**错误隔离（它 `allSettled`
+跑完全部订阅者后把失败收成 `AggregateError` **抛给调用方**），一条写坏的遥测订阅者
+就能把 agent 主循环带下水。守卫用例见 `step-gate.test.ts` 的"订阅者抛错不打断本轮"。
+
+读回这组数据（会话级遥测，一条事件一行 JSON）：
+
+```bash
+jq -c 'select(.kind=="telemetry.bus.agent.step.gate") | {ts, o:.attrs.outcome, a:.attrs.agentId} + .metrics' \
+  ~/.harness/sessions/<sid>.telemetry.jsonl
+```
+
+聚合要点：`sum(metrics.waitMs)` = 本轮真的让出了多少时间；`sum(metrics.plannedMs -
+metrics.waitMs)` = 切片重探省掉的等待；`outcome=="skipped"` 的条数 ÷ 检查点数 = 闸门
+实际退化比例（配 `attrs.skipReason` 看原因）。
+
+CLI 侧：REPL 打一行 `⏳ 等一会再跑下一步：…（本次 Xs（原定 Ys），累计 Zs）`，
+并把 `step_gate` 排除出"自主续轮分隔"的判定（它不是一轮的开始）；
+`AgentStatusSnapshot.phase` 扩出 `'waiting'` 相位（`formatAgentPhase` → `等待后台任务`），
+这样 UI **不会把等待算进"模型耗时"**。中断时**不发**流事件：本轮已经结束，
+报一条"等了 60s"反而是假信息（此时也不会记 bus 事件，闸门压根没被问到）。
 
 ### 17.6 与相邻机制的分工
 

@@ -167,11 +167,15 @@
 
 - **遥测（telemetry）通道按「事实归属」选，绝不给同一件事开两条通道**：三类落法各有适用面，别一刀切——
   · **core/引擎层已有 hook 的事实**（如整轮终态 `core.agent.turn.end`）⇒ **注册那条 hook**（telemetry 现在这么做，落 `telemetry.turn.end`）。**不要**再补一条同义的 bus 事件：同一个事实两条通道就是历史事故的翻版（同一个名字由两层分别触发 ⇒ 消费方分不清来源、按轮计数翻倍）。
+  · **引擎自身的执行事实、且非流式通道上还是空白**（如闸门处置 `AgentEvents.stepGate` / `agent.step.gate`）⇒ **在 core 定义 bus 事件并由引擎发布**。判据不是"core 的事就该走 hook"，而是**现有通道里有没有同义的**：`core.agent.step.gate` 那条 hook 是**输入侧提问**（"还有存活任务吗"），等待的**结果**（实际等了多久、睡了几片、是否被提前结束）回不到 decision 对象里 ⇒ 不构成"同义双通道"。**同时**：`step_gate` 流事件只到 UI（进程结束即蒸发），所以"已经上报过了"是错觉 —— 遥测里仍是零。
+  · **同一事实的两个消费者 ≠ 两条通道**：流事件给 UI、bus 事件给遥测/其它插件，是**一份事实往两个消费者投递**，且只有引擎一个发布方；被禁的是**同一件事有两个发布入口**。判断方法：问"这条事实有几个地方会发它"——>1 就是事故原型。
   · **插件自己产生的事实**（如 subagent 的草稿归属）⇒ **走 bus**（`SubagentEvents.draft`）：telemetry 是通用插件，**不该 import 具体插件的类型**，只能靠 bus 解耦。
   · **两条通道都是"聚合后抛"，没有哪条更安全**（别想当然）：`bus.publish` 用 `Promise.allSettled` 并发跑完**全部**订阅者，再把失败收成 `AggregateError` **抛出**；`PluginManager.trigger` 顺序跑完后同样抛。⇒ **凡上报类事件一律挂 `.catch(() => undefined)`**（本项目惯用写法：subagent 的 `bus.publish(...).catch(() => {})`、core 的 `void ...triggerPlugin(...).catch(() => undefined)`）。**上报绝不能顶掉主语义** —— 尤其别让一条遥测把 agent 主循环带下水。
   · **插件已有自己的遥测 writer**（acp-context 的 `sessions/*.telemetry.jsonl` 自有 schema）⇒ **扩自己的 schema**，不要绕道 telemetry。
   「新事件自动入明细」是 telemetry 的设计（`subscribeAll` → `telemetry.bus.<name>`），所以走 bus 时**不必改 telemetry**；改的是"要让 kind 语义化/要派生指标"的时候。
 - **布尔字段在遥测里会被自动折叠为 `0 | 1`**，不必手写数值：`pickAttrs` / `pickMetrics` 的 `asNumber()` 已支持（此前只收 `string | number` ⇒ 载荷里的布尔被**静默丢弃**，消费方只能把"字段不存在"当 false，分不清"真是 false"与"压根没采到"）。已确认曾中招：`SubagentEvents.*` 的 `background` / `isContinuation`、`AgentTurnEndSignal.aborted`。事件契约里**照写布尔**（说人话），折叠是提取层的事。注意 `0` 是有意义的值 ⇒ 别指望"缺省即 false"和"显式 false"在落盘后还能区分。
+
+- **不许为"实际到不了的状态"造契约值（枚举/字段/分支）**：闸门遥测初稿写了 `skipReason: 'aborted'`，但中断在**循环顶部的步边界检查**就 `break`（`if (signal?.aborted) break` 在闸门那段之前）⇒ 闸门根本不会被问到，那个值永远是死码。写之前先问"**哪条路径能走到这里**"，验证方式是**写出触发它的那条用例** —— 写不出就是不可达，删掉而不是留着"以防万一"（留着会误导消费方以为"中断也会记一条"，还在给下一轮埋"配了没用"的坑）。同族历史：`subagents:` 字段只解析无人消费、摘要提示语的判据 `ctx.variables.callerToolIds` 曾全仓无写入方。
 
 ## 5. 工程约定
 
