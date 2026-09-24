@@ -358,12 +358,14 @@ describe('闸门遥测：agent.step.gate 自动入明细', () => {
     await svc.plugin.uninstall?.()
   })
 
-  test('skipped 记录：skipReason 落 attrs，且不带 waitMs（没等就没有"等了多久"）', async () => {
+  test('overBudget 记录：布尔折叠成 0|1、waited 带 waitMs；skipReason 只有 zero_ladder 才会出现', async () => {
     const svc = createTelemetryService({ enabled: true, dataDir: dir, pathBuilder: pathBuilder(), crash: false })
     const bus = new InMemoryBus()
     await svc.plugin.install({ bus } as never)
 
     const StepGate = BusEvent.define<Record<string, unknown>>('agent.step.gate')
+    // 超预算仍等待：outcome=waited + overBudget=true（预算=提醒阈值）。
+    // overBudget 是布尔，落盘应折叠成 1（而不是被静默丢弃）。
     await bus.publish(StepGate, {
       sessionId: 'sessS',
       agentId: 'lead',
@@ -371,20 +373,37 @@ describe('闸门遥测：agent.step.gate 自动入明细', () => {
       nextStep: 8,
       attempt: 5,
       waitedMs: 300_000,
+      outcome: 'waited',
+      waitMs: 60_000,
+      overBudget: true,
+      aliveCount: 3,
+    }, { source: 'agent' })
+    // 配错阶梯：skipped(zero_ladder)—— 预算耗尽不再产生 skipped，这是唯一合法 skipReason
+    await bus.publish(StepGate, {
+      sessionId: 'sessS',
+      agentId: 'lead',
+      step: 8,
+      nextStep: 9,
+      attempt: 1,
+      waitedMs: 300_000,
       outcome: 'skipped',
-      plannedMs: 60_000,
-      skipReason: 'budget_exhausted',
+      skipReason: 'zero_ladder',
       aliveCount: 3,
     }, { source: 'agent' })
     svc.telemetry.flush()
 
-    const line = readLines('sessS').find((l) => l.kind === 'telemetry.bus.agent.step.gate')
-    expect(line).toBeDefined()
-    expect(line!.attrs.outcome).toBe('skipped')
-    expect(line!.attrs.skipReason).toBe('budget_exhausted')
-    expect(line!.metrics.plannedMs).toBe(60_000)
-    // 没等 ⇒ 不许有 waitMs（有它就是假信息：消费方会把 0 也算进"总等待"）
-    expect(line!.metrics.waitMs).toBeUndefined()
+    const lines = readLines('sessS').filter((l) => l.kind === 'telemetry.bus.agent.step.gate')
+    expect(lines).toHaveLength(2)
+    const [over, skipped] = lines
+    // 超预算那条：outcome=waited、带 waitMs、overBudget 折叠成 1
+    expect(over!.attrs.outcome).toBe('waited')
+    expect(over!.metrics.waitMs).toBe(60_000)
+    expect(over!.metrics.overBudget).toBe(1)
+    expect(over!.attrs.skipReason).toBeUndefined()
+    // skipped 那条：只有 zero_ladder 是合法 skipReason
+    expect(skipped!.attrs.outcome).toBe('skipped')
+    expect(skipped!.attrs.skipReason).toBe('zero_ladder')
+    expect(skipped!.metrics.waitMs).toBeUndefined() // 没等 ⇒ 不许有 waitMs
     await svc.plugin.uninstall?.()
   })
 })

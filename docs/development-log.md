@@ -1,5 +1,48 @@
 # Agent Harness 开发日志
 
+## 2026-09-24（续 203）闸门预算改语义：`maxTotalMs` 从"终止条件"变"提醒阈值"，超预算仍等待并从 CLI 提示用户
+
+用户：「超过 5 分钟后也不应该 skip，而是继续 60s 等待，但需要探测任务执行情况，有异常就提示用户」。
+
+### 问题
+
+旧设计把 `STEP_GATE_MAX_TOTAL_MS` 当**等待总预算**：累计等待达到它就关闸门、本轮的
+后续步不再等待（`skipped/budget_exhausted`）。但这是"该等却没等"的形态 —— 后台任务
+只做了一半就撞预算，结果真正跑完却没等到、下一轮才送达（真机 s_1790163574429_tg1a6）。
+用户要求：超预算**不是放弃等待**，而是**继续等**，同时把"可能异常"明确提示出来。
+
+### 改动
+
+- **core**（`packages/core/src/index.ts`）：
+  - 等待分支条件去掉 `gateWaitedMs + waitMs <= maxTotalMs`，改为 `waitMs > 0 && !signal.aborted`：
+    只要插件报存活且未中断就照常等待（档位 60s 封顶）。
+  - 新增 `overBudget = gateWaitedMs + waitMs > maxTotalMs`，超预算的每档等待在 `gate` 流事件
+    与 `AgentStepGateRecord` 上都带 `overBudget: true`。
+  - `skipped` 分支只剩 `zero_ladder`（阶梯配空数组），删掉 `budget_exhausted` 枚举与 `plannedMs` 附带
+    —— 因为预算不再产生 skipping。
+  - 注释泛化：`STEP_GATE_MAX_TOTAL_MS`、`StepGateOptions.maxTotalMs` 语义全部改写为"提醒阈值"。
+- **CLI**（`packages/cli/src/index.ts`）：`step_gate` case 里当 `g.overBudget` 且本轮未提示过时，
+  打一行 `⚠️ 等待后台任务已超过 5 分钟预算，可能卡死/异常；可 Ctrl-C 结束本轮…`；用 per-query
+  `overBudgetNotified` 去重，后续心跳照发但不重复刷屏。
+
+### 验证
+
+- core `step-gate.test.ts`：预算耗尽用例重写为"超预算仍等待 + overBudget 标记"（`waitMs/attempt/waitedMs`
+  逐档递增，`outcome` 恒为 waited）；删除 budget_exhausted 断言。
+- telemetry `index.test.ts`：`overBudget` 布尔折叠登记（`metrics.overBudget: 1`）+ `zero_ladder`
+  为唯一合法 skipReason。
+- 全量 `bun run typecheck`：0 error；全量 test：39 包 0 fail。
+
+### 复用要点
+
+- **"预算耗尽就放行"这类兜底，得先问"放行之后结果能马上拿到吗"** —— 后台任务没跑完就放行，
+  等于把"等一会儿就能拿到的结果"推迟到下一轮，这是静默丢数据的变体。宁可继续等 + 明说"可能异常"，
+  也不要静默跳过。
+- **终止条件不能交给"预估毫秒"，必须交给"确凿信号"**（插件不再报存活 / 用户中断）；
+  `maxTotalMs` 这类阈值只配做"提醒"，不当"哨兵"。
+
+---
+
 ## 2026-09-24（续 202）TUI 两处实测问题修复：选区闪烁 + 引擎告警不再污染渲染流
 
 用户：「从新读下最近提交，并解决这两个问题 —— ①鼠标选区闪烁功能没实现；②缓存失效告警日志

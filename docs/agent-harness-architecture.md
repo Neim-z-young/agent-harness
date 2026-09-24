@@ -1401,7 +1401,7 @@ waitMs = stepGateDelayMs(gateAttempt)   // [3s, 6s, 12s, 24s, 48s, 60s]，封顶
 | 频度 | **每个步边界最多等一档**（不是"等到没任务为止"） | 后者会让单独一步阻塞好几分钟，与"每执行一轮都等一会"的字面语义不符；分散到各步上，界面心跳也是一段一段的 |
 | 档内重探 | 等待按 `STEP_GATE_SLICE_MS`（默认 500ms）**分片**，每片后重探一次，插件静默即**提前结束这一档** | 硬等会把"子任务第 1 秒就跑完了"拖成整档（最坏 60s）——界面写着"等待后台任务"而实际无事可等。代价是探测次数随档位增长（60s 档 = 120 次）⇒ **该 hook 必须纯内存、禁 IO** |
 | 阶梯复位 | 探测为**静默**时把阶梯归零（`gateAttempt = 0`），**不关闸门** | 同一轮里可能再派一批，新一波该从最小档重新起步；而探测本身只是一次内存过滤，重探成本可忽略 |
-| 终止兜底 | 累计等待超过 `STEP_GATE_MAX_TOTAL_MS`（300s）后本轮后续步不再等 | 终止条件依赖插件上报，**引擎侧必须有兜底**，否则插件误报就能把一轮 query 拖成"看起来死了" |
+| 提醒阈值 | 累计等待超过 `STEP_GATE_MAX_TOTAL_MS`（300s）后，后续每档等待带 `overBudget: true`，UI 提示"可能异常"；**不停止等待** | 预算从"终止条件"改为"提醒阈值"：插件仍报存活且未被中断时**会持续等待**（档位 60s 封顶）。真正终止交还给"插件不再报存活 + 用户中断"。历史教训：旧设计把它当总预算、耗尽即跳过 —— 后台任务只做一半就撞预算、结果真正跑完却没等到、下一轮才送达（真机 s_1790163574429_tg1a6） |
 
 参数可注入（`AgentHarnessOptions.stepGate` / `AgentRuntimeImpl.deps.stepGate`）：
 
@@ -1409,7 +1409,7 @@ waitMs = stepGateDelayMs(gateAttempt)   // [3s, 6s, 12s, 24s, 48s, 60s]，封顶
 interface StepGateOptions {
   enabled?: boolean
   ladderMs?: readonly number[]   // 退避阶梯；空数组 = 每次都不等
-  maxTotalMs?: number            // 本轮等待总预算
+  maxTotalMs?: number            // 累计等待的提醒阈值（默认 300s）：超过后带 overBudget:true，非终止条件
   sliceMs?: number               // 档内切片（默认 500ms）；0/负数/NaN = 关掉切片、整档硬等
 }
 ```
@@ -1507,13 +1507,13 @@ function shouldContinueStep(o: StepOutcome): boolean {
 // 流事件（嵌套对象，不把 step_gate 专属字段平铺到 AgentStreamEvent 上）
 | 'step_gate'
 gate?: { waitMs: number; waitedMs: number; attempt: number; slices?: number
-         plannedMs?: number; aliveCount?: number; reason?: string }
+         plannedMs?: number; aliveCount?: number; reason?: string; overBudget?: boolean }
 
 // bus 事件（AgentEvents.stepGate，事件名 'agent.step.gate'）
 { sessionId, agentId, step, nextStep, attempt, waitedMs,
   outcome: 'waited' | 'skipped',
-  waitMs?, plannedMs?, slices?, sliceMs?, aliveCount?, reason?,
-  skipReason?: 'budget_exhausted' | 'zero_ladder' }
+  waitMs?, plannedMs?, slices?, sliceMs?, aliveCount?, reason?, overBudget?,
+  skipReason?: 'zero_ladder' }
 ```
 
 几条**刻意的取舍**，每一条都是为了"不产生假数据"：
@@ -1522,9 +1522,11 @@ gate?: { waitMs: number; waitedMs: number; attempt: number; slices?: number
   （报"等了 3s"而实际 0.5s 就是假信息）。`slices` 说明**引擎问了几次**——
   探测次数正是 gate hook 实现的成本量级。
 - `skipped` 记的是"插件报存活、引擎却没等"，这在改造前**完全静默**（界面一片安静、
-  步数照烧，事后只能从"额度莫名耗尽"倒推）。两种原因：`budget_exhausted`（本轮等待
-  预算用尽，`plannedMs` 是没能等的那一档）与 `zero_ladder`（阶梯配成 0，等于关了等待
-  却还在每步探测）。
+  步数照烧，事后只能从"额度莫名耗尽"倒推）。改造后只剩**一个原因**：`zero_ladder`（阶梯
+  配成 0，等于关了等待却还在每步探测）。旧的 `budget_exhausted` 已删除 —— 预算成了提醒
+  阈值而不是终止条件。
+- `waited` 会被打上 `overBudget: true`：累计等待超过 `maxTotalMs`（默认 300s）后，UI 据此
+  提示"后台任务可能卡死/异常，可 Ctrl-C"—— 引擎**不会**因预算停止等待（非终止条件）。
 - **不记中断**：中断在循环顶部的步边界检查就 `break`（在闸门之前），闸门根本不会被问到，
   为它造一档会得到一个实际到不了的状态。整轮级的中断由 `turn_end.aborted` 负责。
 - **探测为静默（没有存活任务）不落 bus 事件**：那是每一步都会走的常态，落下来只会把

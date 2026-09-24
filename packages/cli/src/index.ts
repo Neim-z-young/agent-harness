@@ -4111,6 +4111,8 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       let inReasoning = false
       let inText = false
       let inToolOutput = false
+      // 本次 query 是否已提示过"等待超预算"（普通 step_gate 心跳每档都发，这个警告只发一次防刷屏）
+      let overBudgetNotified = false
       // 引擎自主多步（agentic loop）：A 方案下**每步**都发一次 done，故 done ≠ 整轮结束。
       // 这里把 done 当作「这一步的收尾渲染」；若之后还有事件到来，说明引擎在自主续轮，
       // 打一行分隔让人看得出它自己在往下走，而不是长时间无反馈。
@@ -4208,6 +4210,14 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
                 : secs(g.waitMs)
               out(`⏳  等一会再跑下一步：${g.reason ?? '后台任务尚未跑完'}${alive}`
                 + `（本次 ${span}，累计 ${secs(g.waitedMs)}）\n`)
+              // 超过等待总预算 ⇒ 后台任务可能卡死/异常。这是"提醒阈值"，引擎仍继续等，
+              // 但必须让用户知道异常可能存在、可用 Ctrl-C 结束 —— 否则会被误当成"任务本来就慢"。
+              // 只提示一次（后面的 step_gate 心跳照发，但不再重复刷这一行）。
+              if (g.overBudget && !overBudgetNotified) {
+                overBudgetNotified = true
+                out('⚠️  等待后台任务已超过 5 分钟预算，可能卡死/异常；可 Ctrl-C 结束本轮，'
+                  + '或 等待任务自行收尾。\n')
+              }
             }
             break
           }

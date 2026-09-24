@@ -727,6 +727,13 @@ export interface AgentStreamEvent {
     aliveCount?: number
     /** 等待原因（插件的说明，缺省时引擎拼一句） */
     reason?: string
+    /**
+     * 本次等待已经**超过**本轮等待总预算（`maxTotalMs`，默认 5 分钟）。
+     *
+     * `true` 表示"后台任务比预期久得多，可能卡死/异常"—— 引擎**不会**因超预算而停止
+     * 等待（预算不再是终止条件，只做提醒阈值），但 UI 应据此提示用户"等待异常，可 Ctrl-C"。
+     */
+    overBudget?: boolean
   }
 }
 
@@ -1786,12 +1793,15 @@ export const DOOM_LOOP_THRESHOLD = 3
 export const STEP_GATE_BACKOFF_MS: readonly number[] = [3_000, 6_000, 12_000, 24_000, 48_000, 60_000]
 
 /**
- * 步间闸门在本轮 query 内的**等待总预算**（毫秒），默认 5 分钟。
+ * 步间闸门的**提醒阈值**（毫秒），默认 5 分钟。
  *
- * 为什么必须有个上限：闸门的终止条件是"没有存活的后台任务"，而这个条件由插件上报 ——
- * 插件判断出错（或某个任务卡在非超时路径上）就会让一整轮 query 无限期减速。
- * 5 分钟覆盖得住默认 120s 的子 Agent 超时，又不会让一次卡壳变成"进程像死了"。
- * 预算耗尽后本轮的后续步**不再等待**（闸门关闭，不影响步数上限与其它守卫）。
+ * **不是终止条件**（从前的"总预算"语义已废弃）：累计等待一旦超过该值，后续每档等待都带
+ * `overBudget: true`，让 UI 提示"后台任务可能卡死/异常，可 Ctrl-C"—— 插件仍报存活且未被
+ * 中断时**会持续等待**（档位 60s 封顶）。终止交还给"插件不再报存活 + 用户中断"。
+ *
+ * 历史背景：曾经把它当**总预算**，耗尽后本轮的后续步不再等待。但那会让"后台任务迟迟不结束"
+ * 变成静默跳过——结果真正跑完了却没等、下一轮才送达（`agent.step.gate` 的"该等却没等"形态）。
+ * 真机（s_1790163574429_tg1a6）恰恰是任务只做了一半就撞预算、结果滞留。故改为提醒阈值。
  */
 export const STEP_GATE_MAX_TOTAL_MS = 300_000
 
@@ -1845,7 +1855,7 @@ export interface StepGateOptions {
   enabled?: boolean
   /** 退避阶梯（毫秒）；空数组等价于"每次都不等" */
   ladderMs?: readonly number[]
-  /** 本轮 query 内的等待总预算（毫秒） */
+  /** 累计等待的**提醒阈值**（毫秒）：超过后每档等待带 `overBudget: true`（UI 提示"可能异常"）。不是终止条件 */
   maxTotalMs?: number
   /**
    * 等待切片（毫秒）：等待期间每过一片就重探一次，插件静默即**提前结束这一档**。
@@ -2501,8 +2511,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         //   静默即提前结束（最多白等一个切片）。因此该 hook 必须纯内存、禁 IO；
         // · 探测为"静默"时把阶梯**归零**（而不是永久关闸门）：同一轮里 coordinator 可能再派一批，
         //   新一波该从最小档重新起步；探测本身只是一次内存过滤，重探的成本可以忽略；
-        // · 累计等待达到 `STEP_GATE_MAX_TOTAL_MS` 后本轮的后续步都不再等 —— 闸门的终止条件
-        //   依赖插件上报，必须有引擎侧兜底，否则插件误报就能把一轮 query 拖成"看起来死了"。
+        // · `maxTotalMs` 是**提醒阈值**而不是终止条件：累计等待一旦超过，后续每档等待都带
+        //   `overBudget: true`（后台任务可能卡死/异常，UI 提示"可 Ctrl-C"），但**不会停止等待**
+        //   —— 真正的终止交还给"插件不再报存活 + 用户中断"。需要"等完就放行"的老宿主
+        //   会把 `maxTotalMs` 理解为旧语义，因此在文档里标明这层变化。
         if (step >= 1 && this.deps.stepGate?.enabled !== false) {
           const gateCfg = this.deps.stepGate
           const ladder = gateCfg?.ladderMs ?? STEP_GATE_BACKOFF_MS
@@ -2528,7 +2540,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
             // 这里**不发遥测**：没有后台任务时每一步都会落到这条分支，那是常态；
             // 每个常态步都落一条只会把明细淹掉。要分母就用 `turn.end` 的 `step`。
             gateAttempt = 0
-          } else if (waitMs > 0 && gateWaitedMs + waitMs <= maxTotalMs && !signal?.aborted) {
+          } else if (waitMs > 0 && !signal?.aborted) {
             // ── 分片等待 + 片间重探 ──
             //
             // 不是"睡满整档"，而是每过一片就重问一次"还有存活任务吗"：插件一旦静默
@@ -2538,6 +2550,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
             //
             // 代价是探测次数随档位增长（60s 档 = 120 次），所以 `core.agent.step.gate`
             // 的实现**必须是纯内存判定、禁止 IO** —— 见 plugin/src/index.ts 的协议说明。
+            //
+            // 预算（`maxTotalMs`）不再是**终止条件**：只要插件仍报存活且未被中断，就照常
+            // 等待（档位 60s 封顶，不管累计已多久）。一旦累计等待超过预算，本档及后续
+            // 每档都带 `overBudget: true`，让 UI 提示"后台任务可能异常，可 Ctrl-C"。
+            const overBudget = gateWaitedMs + waitMs > maxTotalMs
             const sliceMs = normalizeGateSliceMs(gateCfg?.sliceMs)
             let actualMs = 0
             let slices = 0
@@ -2591,6 +2608,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
                   slices,
                   ...(actualMs < waitMs ? { plannedMs: waitMs } : {}),
                   ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
+                  ...(overBudget ? { overBudget: true } : {}),
                   reason,
                 },
               }
@@ -2607,16 +2625,14 @@ export class AgentRuntimeImpl implements AgentRuntime {
                 sliceMs,
                 ...(actualMs < waitMs ? { plannedMs: waitMs } : {}),
                 ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
+                ...(overBudget ? { overBudget: true } : {}),
                 reason,
               })
             }
           } else if (!signal?.aborted) {
-            // 插件说有存活任务，引擎却**没等** —— 改造前这条路完全没有痕迹。
-            //
-            // 它就是"闸门退化"最难自查的形态：界面一片安静（连 `step_gate` 心跳都没有）、
-            // 步数照烧，事后只能从"额度莫名耗尽"倒推。两种原因分开记：
-            // `budget_exhausted` 该调本轮等待预算；`zero_ladder` 是配置写错
-            // （阶梯配成 0，等于关了等待却还在每步探测）。
+            // 插件说有存活任务，引擎却**没等**。改造后只剩一种情形：`zero_ladder` ——
+            // 阶梯配成空（`waitMs <= 0`＝关了等待），还是配置写错，必须看得见。
+            // 旧的 `budget_exhausted` 已删除：预算现在只是提醒阈值，不再拦截等待。
             //
             // 为什么排除中断：中断在**循环顶部**就 `break` 了（步边界生效，不切碎单步），
             // 闸门根本不会被问到；信号恰好在探测期间被置上的窄窗口不值得为它造一个
@@ -2629,9 +2645,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
               attempt: gateAttempt,
               waitedMs: gateWaitedMs,
               outcome: 'skipped',
-              // 没能等的那一档：`budget_exhausted` 时即"本可等 60s 但预算不够"
-              plannedMs: waitMs,
-              skipReason: waitMs <= 0 ? 'zero_ladder' : 'budget_exhausted',
+              skipReason: 'zero_ladder',
               ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
               reason: merged.reason ?? '后台任务尚未跑完',
             })
@@ -3603,11 +3617,13 @@ export const LifecycleEvents = {
  * 问题的两个答案——「这一步到底等了没有」，分成两个名字反而要消费方自己 join：
  *
  * - `'waited'` —— 真的等了：`waitMs` / `slices` / `sliceMs` 有值；
- *   `plannedMs` 只在**被切片提前结束**时与 `waitMs` 不等。
+ *   `plannedMs` 只在**被切片提前结束**时与 `waitMs` 不等；
+ *   `overBudget: true` 说明本次等待已经**超过**总预算（后台任务可能卡死/异常）。
  * - `'skipped'` —— 插件说有存活任务、引擎**没等**（`skipReason` 说明为什么）。
  *   改造前这条路是**完全静默**的：「闸门退化了」最难自查的形态就是界面上什么都不出现、
- *   只有步数在烧。两种原因分开记，因为处置不同：`budget_exhausted` 该调预算、
- *   `zero_ladder` 是配置写错（阶梯配成 0，等于关了等待却还在每步探测）。
+ *   只有步数在烧。改造后只剩一个原因：`zero_ladder` 是配置写错（阶梯配成 0，等于关了
+ *   等待却还在每步探测）。**预算耗尽不再产生 `skipped`** —— 预算成了提醒阈值而不是
+ *   终止条件（见 `OVER_BUDGET_NOTIFY_MS`）：超预算也继续等，UI 照常提示。
  *
  * **不记中断**：中断在步边界（循环顶部）就已结束本轮，闸门通常**根本不会被问到**；
  * 那之后没有"处置"可言，是为它造一档会得到一个实际到不了的状态。整轮级的中断由
@@ -3643,8 +3659,10 @@ export interface AgentStepGateRecord {
   aliveCount?: number
   /** 等待原因（插件的说明，缺省时引擎拼一句） */
   reason?: string
-  /** `outcome === 'skipped'` 的原因：预算用尽 / 阶梯配成 0（等于关了等待） */
-  skipReason?: 'budget_exhausted' | 'zero_ladder'
+  /** 本次等待是否**超过**总预算（`maxTotalMs`，默认 5 分钟）—— 提醒阈值，不是终止条件 */
+  overBudget?: boolean
+  /** `outcome === 'skipped'` 的原因：阶梯配成 0（等于关了等待）。预算耗尽不再产生 skipped */
+  skipReason?: 'zero_ladder'
 }
 
 /**

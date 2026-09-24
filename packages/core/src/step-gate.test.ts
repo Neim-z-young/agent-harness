@@ -376,23 +376,25 @@ describe('步间闸门：真实引擎 + 探针插件', () => {
     await h.stop()
   })
 
-  it('等待总预算用尽后停止等待（按 maxTotalMs 兜底，不被插件误报拖住）', async () => {
+  it('等待超过预算后**仍继续等待**，但每档都带 overBudget 标记（预算=提醒阈值，非终止条件）', async () => {
     const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), stepChunks('c'), finalChunks])
-    const probe = gateProbe([9]) // 永远说"还有 9 个"，模拟插件误报/任务卡死
+    const probe = gateProbe([9]) // 永远说"还有 9 个"，模拟任务迟迟不结束
     const h = await createHarness({
       agents: [agent],
       chatProvider: provider,
       internalPlugins: [probe],
-      // 预算 12ms、阶梯每档 5ms ⇒ 最多等 2 次（5+5=10 ≤ 12；再等一次 15 > 12 ⇒ 关闸门）
-      stepGate: { ladderMs: [5], maxTotalMs: 12 },
+      // 预算 12ms、每档 7ms：第 1 档 7≤12 未超；第 2 档累计 14>12 ⇒ overBudget；第 3 档照等
+      stepGate: { ladderMs: [7], maxTotalMs: 12 },
     })
     h.tools.register(echoTool)
     const sess = await h.session.create()
 
     const events = await collect(h.session.promptStream(sess.id, 'go', 6))
     const gates = events.filter((e) => e.type === 'step_gate')
-    expect(gates).toHaveLength(2)
-    // 预算耗尽后**步数语义不受影响**：模型被叫了几次就几次（4 步）
+    // 引擎**不因预算停止等待**：3 步前各等一次（3 次），不是 2 次后关闸门
+    expect(gates).toHaveLength(3)
+    expect(gates.map((g) => g.gate?.overBudget)).toEqual([undefined, true, true])
+    // 预算耗尽不影响步数语义：模型被叫了几次就几次（4 步）
     expect(provider.calls).toBe(4)
     await h.stop()
   })
@@ -564,15 +566,15 @@ describe('闸门遥测：agent.step.gate（bus）', () => {
     await h.stop()
   })
 
-  it('预算用尽 ⇒ 插件仍报存活却不再等：落 skipped(budget_exhausted) 并记下"没能等的那一档"', async () => {
+  it('预算用尽 ⇒ **仍继续等待**，bus 记录全为 waited、超预算那次带 overBudget（不再产生 skipped）', async () => {
     const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), stepChunks('c'), finalChunks])
     const probe = gateProbe([9]) // 永远说"还有 9 个"（任务卡死 / 插件误报）
     const h = await createHarness({
       agents: [agent],
       chatProvider: provider,
       internalPlugins: [probe],
-      // 预算 12ms、每档 5ms ⇒ 前两次等得成（5 + 5 ≤ 12），第三次起 "本该等却没等"
-      stepGate: { ladderMs: [5], maxTotalMs: 12 },
+      // 预算 12ms、每档 7ms ⇒ 第 1 档 7≤12 未超；第 2 档起累计 14>12 ⇒ overBudget，但照等
+      stepGate: { ladderMs: [7], maxTotalMs: 12 },
     })
     h.tools.register(echoTool)
     const records = watchGateBus(h)
@@ -581,16 +583,17 @@ describe('闸门遥测：agent.step.gate（bus）', () => {
     const events = await collect(h.session.promptStream(sess.id, 'go', 6))
     await flushBus()
 
-    expect(records.map((r) => r.outcome)).toEqual(['waited', 'waited', 'skipped'])
-    const last = records[2]
-    expect(last.skipReason).toBe('budget_exhausted')
-    expect(last.plannedMs).toBe(5) // 本可再等 5ms，预算不够了
-    expect(last.waitMs).toBeUndefined() // 没等 ⇒ 不许有 waitMs（有它就是假信息）
-    expect(last.waitedMs).toBe(10) // 累计仍是真等过的那 10ms
-    expect(last.attempt).toBe(2) // 未递增（这一档没记账）
-    expect(last.aliveCount).toBe(9)
-    // 流事件只报"真的等了"的两次：界面不该显示"等待中"而实际没等
-    expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(2)
+    // 引擎不因预算停止等待：3 次都真的等了（outcome 恒为 waited）
+    expect(records.map((r) => r.outcome)).toEqual(['waited', 'waited', 'waited'])
+    // 累计等待超过预算后，后续等待带 overBudget 标记（提醒阈值，不是终止条件）
+    expect(records.map((r) => r.waitedMs)).toEqual([7, 14, 21])
+    expect(records.map((r) => r.overBudget)).toEqual([undefined, true, true])
+    expect(records.map((r) => r.attempt)).toEqual([1, 2, 3]) // 每一档都真实记账
+    // skipped 语义只剩 zero_ladder：本用例场景不再产生 budget_exhausted
+    expect(records.map((r) => r.skipReason)).toEqual([undefined, undefined, undefined])
+    expect(records.every((r) => r.waitMs !== undefined)).toBe(true) // 每一档确实等了
+    // 流事件（界面心跳）与 bus 一一对应：3 次真的等待都在界面上看得到
+    expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(3)
     await h.stop()
   })
 
@@ -612,7 +615,6 @@ describe('闸门遥测：agent.step.gate（bus）', () => {
 
     expect(records).toHaveLength(2)
     expect(records.map((r) => r.skipReason)).toEqual(['zero_ladder', 'zero_ladder'])
-    expect(records.map((r) => r.plannedMs)).toEqual([0, 0])
     expect(records.map((r) => r.outcome)).toEqual(['skipped', 'skipped'])
     // 一条流事件都没有：没等过就没有心跳，这与"界面安静但步数在烧"的真机现象一致
     expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(0)
