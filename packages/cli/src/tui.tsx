@@ -1144,6 +1144,21 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         selSnapshotRef.current = { text, chars: n }
         setSelCopied(false)
       }
+      // 选区覆盖块定位（整块响应式高亮）：沿被选中 renderable 的父链找 `blk_<id>` 容器。
+      if (!sel?.isActive) { setSelBlockIds(new Set()); return }
+      const ids = new Set<number>()
+      for (const rb of sel.selectedRenderables) {
+        let node: { id: string; parent: unknown } | null = rb
+        while (node) {
+          if (node.id.startsWith('blk_')) {
+            const blockNum = Number(node.id.slice(4))
+            if (Number.isInteger(blockNum)) ids.add(blockNum)
+            break
+          }
+          node = node.parent as { id: string; parent: unknown } | null
+        }
+      }
+      setSelBlockIds(ids)
     }
     renderer?.on?.('selection', onSel)
     return () => { renderer?.off?.('selection', onSel) }
@@ -1179,6 +1194,13 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       : {}
   /** 点过「⧉ 复制」后的即时反馈（下一个选区/清除时复位） */
   const [selCopied, setSelCopied] = useState(false)
+  /**
+   * 选区覆盖到的消息块 id 集合（整块响应式高亮）。
+   * 由 selection 事件的 `selectedRenderables` 沿 parent 向上定位到 `blk_<id>` 容器。
+   * 选区覆盖某块 ⇒ 该块整体闪烁高亮 —— 对 markdown 块也生效（markdown 内部被选中的
+   * buffer 的父链可上溯到我们的块容器，续 192 的"markdown 无法改选区配色"由此绕过）。
+   */
+  const [selBlockIds, setSelBlockIds] = useState<ReadonlySet<number>>(new Set())
   /**
    * 选区**快照**（文本 + 字素数）。
    *
@@ -1375,6 +1397,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       return { ...prev, blocks }
     })
   }, [])
+
+  // 引擎运行时告警（缓存失效 / 用量折叠失败等）改道 console 块，而非直写 stdout：
+  // OpenTUI 接管 stdout 做布局，直写会混进渲染字符流把 UI 排错位（用户反馈）。
+  // 挂 sink 后 warn/error 走应用层渲染；headless/REPL 不挂 sink，行为不变。
+  useEffect(() => {
+    const sink = (level: 'warn' | 'error', msg: string, meta?: unknown) => {
+      const metaPart = meta !== undefined ? ` ${JSON.stringify(meta)}` : ''
+      setState((prev) => pushConsole(prev, `[${level.toUpperCase()}] ${msg}${metaPart}`))
+    }
+    options.app.setLogSink(sink)
+    return () => options.app.setLogSink(undefined)
+  }, [options.app])
 
   // 阶段四·按需渲染：点击压缩提示行 → 经 loader 取回该块原文，替换提示块
   const handleExpandCompact = async (chatBlockId: number, compactBlockId: string): Promise<void> => {
@@ -1819,18 +1853,26 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     // 内部按钮（复制/折叠/展开）的点击会冒泡连带选中该块，行为一致、可接受。
     const selectable = copyable || b.kind === 'thinking'
     const selected = selectedBlockId === b.id
+    // 选区覆盖块（整块响应式高亮）：拖选落在该块 ⇒ 块顶部闪烁标记（对 markdown 也生效，
+    // 且与用户/工具块的 selectionBg 闪烁不同源、互不干扰）。`blk_<id>` 供 selection 事件沿父链定位。
+    const inSelection = selectable && selBlockIds.has(b.id)
     const body = renderBlockBody(b)
     if (!selectable) return body
     return (
       <box
         key={b.id}
+        id={`blk_${b.id}`}
         flexDirection="column"
         style={selected ? { border: true } : {}}
         onMouseUp={() => setSelectedBlockId(selected ? null : b.id)}
       >
-        {selected && (
-          <text attributes={createTextAttributes({ bold: true, reverse: true })}>
-            ▌已选中 · 再次点击取消
+        {(selected || inSelection) && (
+          <text
+            attributes={createTextAttributes(
+              inSelection && selBlink ? { bold: true, reverse: true } : { bold: true, reverse: selected },
+            )}
+          >
+            {inSelection ? '⏳ 选区已选中此块 · 再次拖选可复制 / [Ctrl-Y] 复制文字' : '▌已选中 · 再次点击取消'}
           </text>
         )}
         {body}

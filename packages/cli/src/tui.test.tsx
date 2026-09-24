@@ -1869,4 +1869,22 @@ describe('鼠标选区：闪烁 + 可点击复制', () => {
     await waitFrame(f.setup, (fr) => !fr.includes('✓ 已复制'), 1200)
     await f.cleanup()
   }, 20_000)
+
+  it('拖选 assistant（markdown）块 ⇒ 块顶部出现「选区已选中此块」闪烁标记（整块响应式高亮）', async () => {
+    const f = await mountTui({ responses: [{ match: /拖我/, response: '这是要被选中的 assistant 文本，用来验证整块的选区响应。' }] })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    await f.setup.mockInput.typeText('拖我')
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('这是要被选中的 assistant 文本'))
+    // 在 assistant（markdown）文本上拖选 —— 这是 markdown 块，内核无法改其选区配色，
+    // 修复目标是：应用层沿 selectedRenderables 父链定位到块、给块加闪烁标记。
+    const pos = locateChar(frame, '这是要被选中的')
+    expect(pos).not.toBeNull()
+    const selX = pos!.x + 2
+    await f.setup.mockMouse.drag(selX, pos!.y, selX + 1, pos!.y)
+    // 拖选 mouseUp 会冒泡选中整块、正文下移 → 以 chip 出现 + 块标记为准
+    await waitFrame(f.setup, (fr) => /⧉ 复制 \d+ 字符/.test(fr))
+    await waitFrame(f.setup, (fr) => fr.includes('选区已选中此块'))
+    await f.cleanup()
+  }, 20_000)
 })

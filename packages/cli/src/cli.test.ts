@@ -2631,3 +2631,32 @@ description: 问候技能
     await app.shutdown()
   })
 })
+
+describe('HarnessApp 日志 sink（引擎告警不该写进 TUI 渲染流）', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'harness-logsink-')) })
+  afterEach(() => { rmSync(dir, { recursive: true, force: true }) })
+
+  it('挂 sink ⇒ warn/error 走 sink 不写 stdout；卸载 ⇒ 恢复写 stdout', () => {
+    const buf: string[] = []
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      stdout: { write: (s: string) => void buf.push(s) },
+    })
+    const captured: Array<{ level: string; msg: string }> = []
+    app.setLogSink((level, msg) => { captured.push({ level, msg }) })
+    // 直接经 app 调用（保持 this 绑定；emitLog 是 private，测试用 as any 访问）
+    const emit = (l: 'warn' | 'error', m: string, meta?: unknown) => (app as unknown as { emitLog(l: 'warn' | 'error', m: string, meta?: unknown): void }).emitLog(l, m, meta)
+
+    // 挂 sink 时：路由到应用层，stdout 不被写（TUI 拿它做布局，直写会错位）
+    emit('warn', 'system 区前缀变化，缓存整段重算', { sessionId: 's1' })
+    expect(captured).toEqual([{ level: 'warn', msg: 'system 区前缀变化，缓存整段重算' }])
+    expect(buf).toEqual([])
+
+    // 卸载 sink：恢复写 stdout（headless/REPL 行为不变）
+    app.setLogSink(undefined)
+    emit('error', 'boom', { a: 1 })
+    expect(captured.length).toBe(1)
+    expect(buf.join('')).toContain('[ERROR] boom')
+  })
+})

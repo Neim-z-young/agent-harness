@@ -1,5 +1,60 @@
 # Agent Harness 开发日志
 
+## 2026-09-24（续 202）TUI 两处实测问题修复：选区闪烁 + 引擎告警不再污染渲染流
+
+用户：「从新读下最近提交，并解决这两个问题 —— ①鼠标选区闪烁功能没实现；②缓存失效告警日志
+打印到了 TUI 页面，导致 UI 错位」。两处都在 `packages/cli/src/tui.tsx` 与 `index.ts`，逐条落地。
+
+### 一、问题 ②：缓存失效告警打进 TUI 渲染流，UI 错位
+
+`core` 的 `noteSystemStability` 在「system 区前缀变化 ⇒ 缓存整段重算」时会 `logger.warn`。
+CLI 的 boot logger 把 `warn/error` 直写 `options.stdout` —— 可 TUI 模式里 stdout 已被 OpenTUI
+**接管做布局排版**，引擎每轮跑出的告警变成一行字节**混进渲染字符流**，把面板挤错位（用户反馈）。
+
+修法（`HarnessApp`，`packages/cli/src/index.ts`）：
+
+- 新增 `emitLog(level, msg, meta)` 统一出口 + `setLogSink(fn | undefined)` 挂接槽。
+- boot logger 的 `warn/error` 改走 `emitLog`（`info/debug` 仍只在 verbose 下可写，不动）。
+- TUI `mount` 时注册 sink：把 `warn/error` 经 `pushConsole` 渲染成**应用内 console 块**（UI 里
+  正常一块，不再污染字节流）；卸载时 `setLogSink(undefined)` 复位。
+- headless / REPL 不挂 sink ⇒ 行为不变（仍写 stdout）。
+
+关键点：**TUI 不是"不显示告警"而是"把它变成 UI 内的一块"** —— 直写 stdout 的问题是"错位"，
+不是"不该提示"；渲染进 console 块既保留提示、又不破坏布局。
+
+### 二、问题 ①：鼠标选区闪烁两套通道，对 markdown 也生效
+
+OpenTUI 没有"选区样式"API，拖选高亮是内核默认反显，在一屏彩色 markdown 里很难分辨
+"到底选上没有"（用户反馈）。修法分两路：
+
+- **`selectionBg / selectionFg`（user / tool / thinking 的纯 `<text>`）**：OpenTUI 的
+  `TextBufferRenderable` 这两个属性就是内核读选区配色的入口。`selBlink` 每 `SELECTION_BLINK_MS`
+  在 `SELECTION_BLINK_A`（亮黄底黑字）/ `SELECTION_BLINK_B`（暗灰底浅字）间切换 ⇒ 选中的
+  文字反显会"闪"。只在有选区时开定时器、清选区即停（不留后台定时器）。
+- **整块响应式高亮（assistant `<markdown>` 块）**：内核**改不了 markdown 的选区配色**
+  （`MarkdownOptions` 没有 `selectionBg/Fg`，续 192 已实测），改用应用层：
+  在 selection 事件里沿 `sel.selectedRenderables` 的 `parent` 链定位到我们给块容器加的
+  `id="blk_<id>"`，算出被选区覆盖的块集合 `selBlockIds`；被覆盖块顶部渲染一行
+  `⏳ 选区已选中此块 · 再次拖选可复制 / [Ctrl-Y] 复制文字`，随 `selBlink` 反显交替 ⇒ 整块"闪"。
+  与纯 text 通道不同源、互不干扰。
+
+### 三、验证
+
+- cli 包 `typecheck`：**0 error**。
+- cli 包 `bun test`：**381 pass / 0 fail**（新增「HarnessApp 日志 sink」+「拖选 assistant
+  markdown 块 ⇒ 块顶部选区标记」两个用例）。
+- 全量 `bun run typecheck`：**0 error**（39 包 Exited with code 0）。
+
+### 四、复用要点
+
+- **"直写 stdout"在 TUI 下永远危险**：OpenTUI 接管 stdout 做布局，"想打印一行日志"实际是往
+  渲染字节流里塞一个不可预测的字符 → 任何宿主层日志都必须有"挂接槽"（sink）让渲染层接入，
+  而不是自以为 stdout 还能写。
+- **内核没有的选区 API，用"整块标记 + 应用层发散闪烁"绕过**：比起改内核，给被选区覆盖的
+  容器沿 parent 链打标更稳，且对内核无法着色的 `<markdown>` 同样生效。
+
+---
+
 ## 2026-09-24（续 201）提示词收敛三项：agent 执行/输出纪律 + 派工给足上下文 + 子 Agent 回传精简
 
 用户：「优化 agent 提示词及子任务工具的提示词。使 agent 完成当前该做的事，不要发散，同时减少

@@ -2077,12 +2077,27 @@ export class HarnessApp {
    * 已归一化（id 必定存在）——供 /model ? 展示，也是 /model 解析实例的直接数据源。
    */
   private loadedProviders: ResolvedProviderConfig[] = []
-
-  /**
-   * boot() 的会话决策结果（explicit / auto / new），供 REPL、TUI 提示用。
-   * 每次 boot 覆盖。
-   */
+  /** boot() 的会话决策结果（explicit / auto / new），供 REPL、TUI 提示用。每次 boot 覆盖。 */
   sessionRestore: SessionRestoreInfo = { source: 'new', sessionId: '' }
+  /**
+   * 引擎侧运行时告警（如「system 区前缀变化 ⇒ 缓存整段重算」）的可挂载出口。
+   *
+   * TUI 会挂一个 sink：OpenTUI 接管 stdout 做布局排版，而 boot 里 `logger.warn/error`
+   * 默认直写 `stdout` —— 引擎每轮跑出的告警会**混进渲染字符流、把 UI 排错位**（用户反馈）。
+   * 挂上 sink 后，TUI 的 `warn/error` 改走应用层（渲染成 console 块）；headless/REPL
+   * 不挂 sink，行为不变（仍写 stdout）。
+   */
+  private logSink?: (level: 'warn' | 'error', msg: string, meta?: unknown) => void
+  /** 挂载/卸载命令日志出口（TUI 用；传 undefined 卸载，回到写 stdout）。 */
+  setLogSink(fn: ((level: 'warn' | 'error', msg: string, meta?: unknown) => void) | undefined): void {
+    this.logSink = fn
+  }
+  /** 引擎告警统一出口：有 sink 走应用层（TUI console 块），否则写 stdout（headless/REPL）。 */
+  private emitLog(level: 'warn' | 'error', msg: string, meta?: unknown): void {
+    const line = `[${level.toUpperCase()}] ${msg}${meta !== undefined ? ' ' + JSON.stringify(meta) : ''}\n`
+    if (this.logSink) this.logSink(level, msg, meta)
+    else this.options.stdout?.write?.(line)
+  }
 
   constructor(options: HarnessAppOptions) {
     // 工作目录：**启动参数传入即用传入值，未传才取当前进程目录**（dataDir 同理，未传取默认数据目录）。
@@ -2774,8 +2789,8 @@ export class HarnessApp {
         info: (msg, meta) => this.options.verbose
           ? this.options.stdout?.write?.(`[INFO] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}\n`)
           : undefined,
-        warn: (msg, meta) => this.options.stdout?.write?.(`[WARN] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}\n`),
-        error: (msg, meta) => this.options.stdout?.write?.(`[ERROR] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}\n`),
+        warn: (msg, meta) => this.emitLog('warn', msg, meta),
+        error: (msg, meta) => this.emitLog('error', msg, meta),
         debug: (msg, meta) => this.options.verbose
           ? this.options.stdout?.write?.(`[DEBUG] ${msg}${meta ? ' ' + JSON.stringify(meta) : ''}\n`)
           : undefined,
