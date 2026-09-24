@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test'
 import {
+  AgentEvents,
   createHarness,
   defineTool,
   mergeStepGateDecision,
@@ -10,6 +11,7 @@ import {
   STEP_GATE_SLICE_MS,
   type AgentDefinition,
   type AgentPlugin,
+  type AgentStepGateRecord,
   type AgentStreamEvent,
   type ChatProvider,
   type ChatStreamChunk,
@@ -23,11 +25,13 @@ import {
  * 把 30 步额度烧光（msg31 / msg66 两次撞顶；第一次撞顶时后台任务只做了一半），于是结果
  * 只能在**下一轮 query** 里才可能被看到 —— 要么用户自己敲键，要么等 barrier 续轮。
  *
- * 闸门要证的四件事：
+ * 闸门要证的五件事：
  * 1. 插件说"还有存活任务"时，下一步开跑前确实等了（且发 `step_gate` 事件）；
  * 2. 插件说"没了"时**这一步不再等**，但**每个步边界仍会重探**（阶梯归零，不是关闸门）；
  * 3. **档内分片重探**：任务中途跑完就不睡满整档（最多白等一个切片），`sliceMs=0` 能退回硬等；
- * 4. 没有任何插件实现时行为与改造前完全一致（不多等、不多发事件）。
+ * 4. 没有任何插件实现时行为与改造前完全一致（不多等、不多发事件）；
+ * 5. 每一步的**处置**都落一条 `agent.step.gate` 遥测 —— 其中"插件报存活、引擎却没等"
+ *    （预算用尽 / 空阶梯 / 被中断）在改造前是**完全静默**的，见文件末尾那组用例。
  *
  * ⚠️ 闸门挂靠在**续轮**上，不是挂在"空转"上：`shouldContinueStep()` 的判据是
  * `toolCallCount > 0`，所以**能走到闸门的步边界，前提都是上一步调用了工具**；
@@ -154,6 +158,23 @@ async function collect(gen: AsyncGenerator<AgentStreamEvent, void, unknown>): Pr
   for await (const ev of gen) out.push(ev)
   return out
 }
+
+/**
+ * 订阅闸门遥测（`agent.step.gate`）并收集载荷。
+ *
+ * 发布是 fire-and-forget（`void bus.publish().catch()`），订阅回调可能落在后面的任务里，
+ * 所以断言前要 `await flushBus()` —— 与生产环境的时序差别只在于"谁先跑完"。
+ */
+function watchGateBus(h: Awaited<ReturnType<typeof createHarness>>): AgentStepGateRecord[] {
+  const records: AgentStepGateRecord[] = []
+  h.bus.subscribe(AgentEvents.stepGate, ({ payload }) => {
+    records.push(payload)
+  })
+  return records
+}
+
+/** 等一次宏任务：让 bus 的发布链跑完 */
+const flushBus = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0))
 
 /**
  * 探针插件：按 `aliveSeq` 依次回答"还有几个存活任务"（越界则重复最后一个）。
@@ -425,6 +446,7 @@ describe('步间闸门：真实引擎 + 探针插件', () => {
       stepGate: { ladderMs: [10_000], maxTotalMs: 60_000, sliceMs: 50 },
     })
     h.tools.register(echoTool)
+    const records = watchGateBus(h)
     const sess = await h.session.create()
 
     const ctl = new AbortController()
@@ -436,11 +458,17 @@ describe('步间闸门：真实引擎 + 探针插件', () => {
       if (ev.type === 'done' && ev.step === 1) ctl.abort()
     }
     const elapsed = Date.now() - started
+    await flushBus()
 
     // 中断在步边界生效：等待被打断，没有真等满 10 秒
     expect(elapsed).toBeLessThan(3_000)
     expect(provider.calls).toBe(1)
     expect(events.filter((e) => e.type === 'done')).toHaveLength(1)
+    // 中断在**循环顶部的步边界检查**就 break 了（在闸门之前）⇒ 闸门根本没被问到，
+    // 因此一条闸门记录都不该有、连探测也不该发生。钉住这个顺序，免得将来有人
+    // 把闸门挪到中断检查之前（那会让中断多等一档）。
+    expect(probe.probes).toBe(0)
+    expect(records).toHaveLength(0)
     await h.stop()
   })
 
@@ -453,6 +481,203 @@ describe('步间闸门：真实引擎 + 探针插件', () => {
     const events = await collect(h.session.promptStream(sess.id, 'go', 3))
     expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(0)
     expect(provider.calls).toBe(2)
+    await h.stop()
+  })
+})
+
+// ===== 闸门遥测：`agent.step.gate`（bus 事件）=====
+
+/**
+ * 为什么要这条通道：`step_gate` **流事件**只到 UI（CLI/TUI），进程一结束就蒸发 ——
+ * 产线遥测里闸门原本是**完整盲区**，而切片粒度、退避档位这些参数只能靠线上数据调
+ * （架构 §17.7 把"L4 产线遥测"列为验证的一层）。
+ *
+ * 三类记录与被测行为的对应：
+ * - `outcome: 'waited'` —— 真的等了；
+ * - `outcome: 'skipped'` —— 插件报存活、引擎却没等（预算用尽 / 空阶梯 / 被中断）；
+ * - **一条都不发** —— 探测为静默（没有存活任务）。那是常态：每一步都会走到那条分支，
+ *   落事件只会把明细淹掉；要分母用 `turn.end` 的 `step`。
+ */
+describe('闸门遥测：agent.step.gate（bus）', () => {
+  it('真的等了 ⇒ outcome=waited，且与 step_gate 流事件描述同一件事', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([9])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      // 档位 60ms、切片 20ms ⇒ 每档恰好 3 片
+      stepGate: { ladderMs: [60], maxTotalMs: 10_000, sliceMs: 20 },
+    })
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+    await flushBus()
+    const gates = events.filter((e) => e.type === 'step_gate')
+
+    expect(records).toHaveLength(2)
+    expect(records.map((r) => r.outcome)).toEqual(['waited', 'waited'])
+    expect(records.map((r) => r.waitMs)).toEqual([60, 60])
+    // slices 说明"引擎问了几次" —— 探测次数就是 gate hook 实现的成本量级
+    expect(records.map((r) => r.slices)).toEqual([3, 3])
+    expect(records.map((r) => r.sliceMs)).toEqual([20, 20])
+    expect(records.map((r) => r.waitedMs)).toEqual([60, 120])
+    expect(records.map((r) => r.attempt)).toEqual([1, 2])
+    expect(records.map((r) => r.aliveCount)).toEqual([9, 9])
+    // 真等满了 ⇒ 不该有 plannedMs（它只在"被提前结束"时出现）
+    expect(records.map((r) => r.plannedMs)).toEqual([undefined, undefined])
+    expect(records.map((r) => r.skipReason)).toEqual([undefined, undefined])
+    // 会话/Agent 归属：telemetry 靠这两个字段决定落哪个 run/session 文件
+    expect(records.map((r) => r.sessionId)).toEqual([sess.id, sess.id])
+    expect(records.map((r) => r.agentId)).toEqual(['default', 'default'])
+    // 步号：第 1 条是"跑完第 1 步、要开第 2 步"
+    expect(records.map((r) => [r.step, r.nextStep])).toEqual([[1, 2], [2, 3]])
+    // 两条通道对同一件事的描述必须一致 —— 否则消费方会各算各的
+    expect(records.map((r) => r.waitMs)).toEqual(gates.map((g) => g.gate?.waitMs))
+    expect(records.map((r) => r.slices)).toEqual(gates.map((g) => g.gate?.slices))
+    await h.stop()
+  })
+
+  it('被切片提前结束 ⇒ waitMs < plannedMs（"省掉了多少等待"因此可算）', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([2, 0])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      stepGate: { ladderMs: [400], maxTotalMs: 10_000, sliceMs: 20 },
+    })
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'go', 5))
+    await flushBus()
+
+    expect(records).toHaveLength(1)
+    expect(records[0].outcome).toBe('waited')
+    expect(records[0].waitMs).toBe(20)
+    expect(records[0].plannedMs).toBe(400)
+    expect(records[0].slices).toBe(1)
+    await h.stop()
+  })
+
+  it('预算用尽 ⇒ 插件仍报存活却不再等：落 skipped(budget_exhausted) 并记下"没能等的那一档"', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), stepChunks('c'), finalChunks])
+    const probe = gateProbe([9]) // 永远说"还有 9 个"（任务卡死 / 插件误报）
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      // 预算 12ms、每档 5ms ⇒ 前两次等得成（5 + 5 ≤ 12），第三次起 "本该等却没等"
+      stepGate: { ladderMs: [5], maxTotalMs: 12 },
+    })
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 6))
+    await flushBus()
+
+    expect(records.map((r) => r.outcome)).toEqual(['waited', 'waited', 'skipped'])
+    const last = records[2]
+    expect(last.skipReason).toBe('budget_exhausted')
+    expect(last.plannedMs).toBe(5) // 本可再等 5ms，预算不够了
+    expect(last.waitMs).toBeUndefined() // 没等 ⇒ 不许有 waitMs（有它就是假信息）
+    expect(last.waitedMs).toBe(10) // 累计仍是真等过的那 10ms
+    expect(last.attempt).toBe(2) // 未递增（这一档没记账）
+    expect(last.aliveCount).toBe(9)
+    // 流事件只报"真的等了"的两次：界面不该显示"等待中"而实际没等
+    expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(2)
+    await h.stop()
+  })
+
+  it('阶梯配成空数组 ⇒ 每步都 skipped(zero_ladder)：这是"等于关了等待"的配置错，必须看得见', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([9])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      stepGate: { ladderMs: [] },
+    })
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+    await flushBus()
+
+    expect(records).toHaveLength(2)
+    expect(records.map((r) => r.skipReason)).toEqual(['zero_ladder', 'zero_ladder'])
+    expect(records.map((r) => r.plannedMs)).toEqual([0, 0])
+    expect(records.map((r) => r.outcome)).toEqual(['skipped', 'skipped'])
+    // 一条流事件都没有：没等过就没有心跳，这与"界面安静但步数在烧"的真机现象一致
+    expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(0)
+    await h.stop()
+  })
+
+  it('探测为静默 ⇒ 一条事件都不发（没有存活任务时的每一步都发会把明细淹掉）', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([0])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      stepGate: { ladderMs: [5] },
+    })
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'go', 5))
+    await flushBus()
+
+    expect(probe.probes).toBe(2) // 确实在每一步都探了
+    expect(records).toHaveLength(0) // 但一条都不落
+    await h.stop()
+  })
+
+  it('没有任何插件实现该 hook ⇒ 零事件（不产生新噪声）', async () => {
+    const provider = scriptedProvider([stepChunks('a'), finalChunks])
+    const h = await createHarness({ agents: [agent], chatProvider: provider })
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    await collect(h.session.promptStream(sess.id, 'go', 3))
+    await flushBus()
+
+    expect(records).toHaveLength(0)
+    await h.stop()
+  })
+
+  it('订阅者抛错不打断本轮：bus.publish 会把 AggregateError 抛回来，引擎侧必须自己吃掉', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([9])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      stepGate: { ladderMs: [5] },
+    })
+    h.tools.register(echoTool)
+    // 订阅者之间互不影响、但失败会**抛给调用方**（不是"错误隔离"）：
+    // 引擎侧若少了 `.catch`，一条写坏的遥测订阅者就能把 agent 主循环带下水。
+    // 这条用例就是那个 `.catch` 的回归守卫（少了它会冒 unhandled rejection / 主循环中断）。
+    h.bus.subscribe(AgentEvents.stepGate, () => {
+      throw new Error('遥测订阅者炸了')
+    })
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+    await flushBus()
+
+    expect(provider.calls).toBe(3) // 三步全跑完
+    expect(events.filter((e) => e.type === 'step_gate')).toHaveLength(2) // 心跳照发
+    expect(events.filter((e) => e.type === 'done')).toHaveLength(3)
     await h.stop()
   })
 })

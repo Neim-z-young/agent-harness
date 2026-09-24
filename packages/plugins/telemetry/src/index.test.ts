@@ -298,3 +298,93 @@ describe('telemetry 插件：core.agent.turn.end 落到会话文件', () => {
     await svc.plugin.uninstall?.()
   })
 })
+
+/**
+ * 闸门遥测（`agent.step.gate`）：**本包零改动**的自动入明细验证。
+ *
+ * core 把闸门每一步的处置发到 bus，`subscribeAll` 自动落成
+ * `telemetry.bus.agent.step.gate`。这里刻意**不** import core 的类型 —— 事件按**名字**
+ * 匹配，字段口径写成字面量即可；telemetry 是通用插件，不该依赖具体包。
+ */
+describe('闸门遥测：agent.step.gate 自动入明细', () => {
+  let dir: string
+  beforeAll(() => (dir = mkdtempSync(join(tmpdir(), 'tel-gate-'))))
+  afterAll(() => rmSync(dir, { recursive: true, force: true }))
+
+  const pathBuilder = () => (sid: string | undefined) => join(dir, 'sessions', `${sid ?? 'run'}.telemetry.jsonl`)
+  const readLines = (sid: string | undefined) =>
+    readFileSync(pathBuilder()(sid), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as { kind: string; attrs: Record<string, unknown>; metrics: Record<string, number> })
+
+  test('waited 记录：数值进 metrics、枚举与归属进 attrs', async () => {
+    const svc = createTelemetryService({ enabled: true, dataDir: dir, pathBuilder: pathBuilder(), crash: false })
+    const bus = new InMemoryBus()
+    await svc.plugin.install({ bus } as never)
+
+    const StepGate = BusEvent.define<Record<string, unknown>>('agent.step.gate')
+    await bus.publish(StepGate, {
+      sessionId: 'sessG',
+      agentId: 'lead',
+      step: 3,
+      nextStep: 4,
+      attempt: 2,
+      waitedMs: 9_000,
+      outcome: 'waited',
+      waitMs: 3_000,
+      plannedMs: 6_000,
+      slices: 6,
+      sliceMs: 500,
+      aliveCount: 2,
+      reason: '2 个后台子任务仍在运行',
+    }, { source: 'agent' })
+    svc.telemetry.flush()
+
+    const line = readLines('sessG').find((l) => l.kind === 'telemetry.bus.agent.step.gate')
+    expect(line).toBeDefined()
+    // 归属：telemetry 靠 sessionId 选文件
+    expect(line!.attrs.sessionId).toBe('sessG')
+    expect(line!.attrs.agentId).toBe('lead')
+    // 枚举进 attrs（可分组、低基数）
+    expect(line!.attrs.outcome).toBe('waited')
+    expect(line!.attrs.reason).toBe('2 个后台子任务仍在运行')
+    // 数值进 metrics（可求和）—— waitMs < plannedMs 即"被切片提前结束"
+    expect(line!.metrics.waitMs).toBe(3_000)
+    expect(line!.metrics.plannedMs).toBe(6_000)
+    expect(line!.metrics.slices).toBe(6)
+    expect(line!.metrics.waitedMs).toBe(9_000)
+    expect(line!.metrics.aliveCount).toBe(2)
+    await svc.plugin.uninstall?.()
+  })
+
+  test('skipped 记录：skipReason 落 attrs，且不带 waitMs（没等就没有"等了多久"）', async () => {
+    const svc = createTelemetryService({ enabled: true, dataDir: dir, pathBuilder: pathBuilder(), crash: false })
+    const bus = new InMemoryBus()
+    await svc.plugin.install({ bus } as never)
+
+    const StepGate = BusEvent.define<Record<string, unknown>>('agent.step.gate')
+    await bus.publish(StepGate, {
+      sessionId: 'sessS',
+      agentId: 'lead',
+      step: 7,
+      nextStep: 8,
+      attempt: 5,
+      waitedMs: 300_000,
+      outcome: 'skipped',
+      plannedMs: 60_000,
+      skipReason: 'budget_exhausted',
+      aliveCount: 3,
+    }, { source: 'agent' })
+    svc.telemetry.flush()
+
+    const line = readLines('sessS').find((l) => l.kind === 'telemetry.bus.agent.step.gate')
+    expect(line).toBeDefined()
+    expect(line!.attrs.outcome).toBe('skipped')
+    expect(line!.attrs.skipReason).toBe('budget_exhausted')
+    expect(line!.metrics.plannedMs).toBe(60_000)
+    // 没等 ⇒ 不许有 waitMs（有它就是假信息：消费方会把 0 也算进"总等待"）
+    expect(line!.metrics.waitMs).toBeUndefined()
+    await svc.plugin.uninstall?.()
+  })
+})

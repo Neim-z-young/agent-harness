@@ -90,7 +90,10 @@ export interface Bus {
    * 1. 若 event 带有 schema，则先校验 payload，失败则抛错
    * 2. 构造 BusEventRecord（含时间戳、来源）
    * 3. 并发通知所有事件匹配订阅者 + 全局订阅者
-   * 4. 某个订阅者抛错不影响其他订阅者，错误收集到 AggregateError
+   * 4. **全部订阅者都会跑完**（`allSettled`），但失败会被收成 `AggregateError`
+   *    **抛给 publish 的调用方** —— 这不是"错误被隔离掉、调用方不必管"。
+   *    也就是说：订阅者之间互不影响，**调用方却要自己决定怎么办**。
+   *    上报/遥测类事件务必 `.catch(() => undefined)`，别让一条订阅者把主流程带下水。
    *
    * @param event BusEvent.define() 创建的事件定义
    * @param payload 事件载荷
@@ -131,7 +134,9 @@ export interface Bus {
  *
  * 特点：
  * - 单个进程内的 Pub/Sub，不做跨进程广播
- * - publish 异步并发通知所有订阅者，单个错误隔离
+ * - publish 异步**并发**通知所有订阅者：单个订阅者抛错不影响其它订阅者
+ *   （`allSettled` 跑完全部），但失败会收成 `AggregateError` **抛给调用方**
+ *   —— 订阅者之间隔离、调用方不隔离。上报类事件请自行 `.catch`
  * - schema 校验失败直接抛错（认为是开发期错误）
  * - 订阅者重复注册：同一函数多次订阅会被多次调用
  * - 取消订阅是幂等的（多次调用 unsubscribe 无副作用）
@@ -172,8 +177,9 @@ export class InMemoryBus implements Bus {
 
     if (subscribers.length === 0) return
 
-    // 4. 并发调用，错误隔离
+    // 4. 并发调用；订阅者之间互不影响（一个抛错，其余照跑）
     // 用 async IIFE 包装：同步 throw 的订阅者也会变成 rejected promise，被 allSettled 捕获
+    // ⚠️ 「互不影响」只到订阅者之间为止：下面第 5 步会把失败**抛给调用方**。
     const results = await Promise.allSettled(
       subscribers.map(async (sub) => sub(record as BusEventRecord))
     )

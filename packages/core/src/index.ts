@@ -716,6 +716,13 @@ export interface AgentStreamEvent {
      * 有它遥测才能算出"提前结束省掉了多少等待"。
      */
     plannedMs?: number
+    /**
+     * 本档实际睡了几片（`StepGateOptions.sliceMs` 生效时 > 1；`sliceMs = 0` 的整档硬等记 1）。
+     *
+     * 为什么值得单独记：`waitMs < plannedMs` 只说明"被提前结束了"，`slices` 才说明
+     * **引擎问了几次** —— 而探测次数正是 gate hook 实现的成本量级（见该 hook 的协议说明）。
+     */
+    slices?: number
     /** 插件上报的存活后台任务数（多插件取最大；未上报时 undefined） */
     aliveCount?: number
     /** 等待原因（插件的说明，缺省时引擎拼一句） */
@@ -2064,6 +2071,21 @@ export class AgentRuntimeImpl implements AgentRuntime {
   }
 
   /**
+   * 发布「闸门对某一步的处置」事件（fire-and-forget）。
+   *
+   * 为什么必须 `.catch` 且不 `await`：`bus.publish` **不是**错误隔离 —— 它并发跑完
+   * **全部**订阅者后，把失败收成 `AggregateError` **抛出**（见 `@harness/bus` 的
+   * `publish` 实现）。上报类事件若把异常带回调用点，一条写坏的遥测订阅者就能把 agent
+   * 主循环带下水；同理不该 `await`（订阅者慢 ⇒ agent 白等一档）。两条都是同一条原则：
+   * **上报绝不能顶掉主语义**。
+   */
+  private _publishStepGate(payload: AgentStepGateRecord): void {
+    void this.deps.bus
+      .publish(AgentEvents.stepGate, payload, { source: 'agent' })
+      .catch(() => undefined)
+  }
+
+  /**
    * §8.2 重复侦察结果缓存：键 = `sessionId\u0000toolId\u0000stable(parsedInput)`。
    * 值 = { hash, round, ts }。只在工具**真实执行后**更新（hash 是执行得来的判定依据）。
    * 会话级内存态：重开进程即失效（可接受 —— 跨进程复用需要持久化+过期策略，另行立项）。
@@ -2501,7 +2523,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
           )
           const merged = mergeStepGateDecision(decision)
           if (!merged.pending) {
-            // 静默：这一波任务已经没有了 ⇒ 阶梯归零（下一波从最小档起）
+            // 静默：这一波任务已经没有了 ⇒ 阶梯归零（下一波从最小档起）。
+            //
+            // 这里**不发遥测**：没有后台任务时每一步都会落到这条分支，那是常态；
+            // 每个常态步都落一条只会把明细淹掉。要分母就用 `turn.end` 的 `step`。
             gateAttempt = 0
           } else if (waitMs > 0 && gateWaitedMs + waitMs <= maxTotalMs && !signal?.aborted) {
             // ── 分片等待 + 片间重探 ──
@@ -2515,6 +2540,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
             // 的实现**必须是纯内存判定、禁止 IO** —— 见 plugin/src/index.ts 的协议说明。
             const sliceMs = normalizeGateSliceMs(gateCfg?.sliceMs)
             let actualMs = 0
+            let slices = 0
             if (sliceMs > 0 && sliceMs < waitMs) {
               let remain = waitMs
               while (remain > 0 && !signal?.aborted) {
@@ -2522,6 +2548,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
                 await sleepAbortable(slice, signal)
                 if (signal?.aborted) break
                 actualMs += slice
+                slices += 1
                 remain -= slice
                 // 正好睡满就收工：此时再探一次只会得到"还有任务"，白搭一次探测
                 if (remain <= 0) break
@@ -2544,12 +2571,16 @@ export class AgentRuntimeImpl implements AgentRuntime {
             } else {
               // 切片关掉（sliceMs=0）或本来就只有一片 ⇒ 整档硬等，与改造前逐字一致
               await sleepAbortable(waitMs, signal)
-              if (!signal?.aborted) actualMs = waitMs
+              if (!signal?.aborted) {
+                actualMs = waitMs
+                slices = 1
+              }
             }
             // 等待期间被中断：不再记这一次（本轮已经结束，报一条"等了 60s"反而是假信息）
             if (!signal?.aborted && actualMs > 0) {
               gateAttempt += 1
               gateWaitedMs += actualMs
+              const reason = merged.reason ?? '后台任务尚未跑完'
               yield {
                 type: 'step_gate',
                 gate: {
@@ -2557,12 +2588,53 @@ export class AgentRuntimeImpl implements AgentRuntime {
                   waitMs: actualMs,
                   waitedMs: gateWaitedMs,
                   attempt: gateAttempt,
+                  slices,
                   ...(actualMs < waitMs ? { plannedMs: waitMs } : {}),
                   ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
-                  reason: merged.reason ?? '后台任务尚未跑完',
+                  reason,
                 },
               }
+              this._publishStepGate({
+                sessionId,
+                agentId: prepared.agentId,
+                step,
+                nextStep: step + 1,
+                attempt: gateAttempt,
+                waitedMs: gateWaitedMs,
+                outcome: 'waited',
+                waitMs: actualMs,
+                slices,
+                sliceMs,
+                ...(actualMs < waitMs ? { plannedMs: waitMs } : {}),
+                ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
+                reason,
+              })
             }
+          } else if (!signal?.aborted) {
+            // 插件说有存活任务，引擎却**没等** —— 改造前这条路完全没有痕迹。
+            //
+            // 它就是"闸门退化"最难自查的形态：界面一片安静（连 `step_gate` 心跳都没有）、
+            // 步数照烧，事后只能从"额度莫名耗尽"倒推。两种原因分开记：
+            // `budget_exhausted` 该调本轮等待预算；`zero_ladder` 是配置写错
+            // （阶梯配成 0，等于关了等待却还在每步探测）。
+            //
+            // 为什么排除中断：中断在**循环顶部**就 `break` 了（步边界生效，不切碎单步），
+            // 闸门根本不会被问到；信号恰好在探测期间被置上的窄窗口不值得为它造一个
+            // 实际到不了的 skipReason。整轮级的中断由 `turn_end.aborted` 记。
+            this._publishStepGate({
+              sessionId,
+              agentId: prepared.agentId,
+              step,
+              nextStep: step + 1,
+              attempt: gateAttempt,
+              waitedMs: gateWaitedMs,
+              outcome: 'skipped',
+              // 没能等的那一档：`budget_exhausted` 时即"本可等 60s 但预算不够"
+              plannedMs: waitMs,
+              skipReason: waitMs <= 0 ? 'zero_ladder' : 'budget_exhausted',
+              ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
+              reason: merged.reason ?? '后台任务尚未跑完',
+            })
           }
         }
         if (signal?.aborted) break
@@ -3522,6 +3594,73 @@ export const LifecycleEvents = {
   mcpServerRemoved:  BusEvent.define<{ name: string }>('mcp.server.removed'),
   toolEnabled:   BusEvent.define<{ id: string; agentId?: string }>('tool.enabled'),
   toolDisabled:  BusEvent.define<{ id: string; agentId?: string }>('tool.disabled'),
+} as const
+
+/**
+ * `agent.step.gate` 的载荷：闸门对**某一步**的处置。
+ *
+ * 两种 `outcome` 共用一个事件名（像 `harness.error` 用 `stage` 分档），因为它们是同一个
+ * 问题的两个答案——「这一步到底等了没有」，分成两个名字反而要消费方自己 join：
+ *
+ * - `'waited'` —— 真的等了：`waitMs` / `slices` / `sliceMs` 有值；
+ *   `plannedMs` 只在**被切片提前结束**时与 `waitMs` 不等。
+ * - `'skipped'` —— 插件说有存活任务、引擎**没等**（`skipReason` 说明为什么）。
+ *   改造前这条路是**完全静默**的：「闸门退化了」最难自查的形态就是界面上什么都不出现、
+ *   只有步数在烧。两种原因分开记，因为处置不同：`budget_exhausted` 该调预算、
+ *   `zero_ladder` 是配置写错（阶梯配成 0，等于关了等待却还在每步探测）。
+ *
+ * **不记中断**：中断在步边界（循环顶部）就已结束本轮，闸门通常**根本不会被问到**；
+ * 那之后没有"处置"可言，是为它造一档会得到一个实际到不了的状态。整轮级的中断由
+ * `turn_end` 的 `aborted` 负责。
+ *
+ * **探测为静默时不落事件**：没有存活后台任务时每一步都会走到那条分支，那是常态，
+ * 落下来只会把明细淹掉。要分母就用 `turn.end` 的 `step`。
+ */
+export interface AgentStepGateRecord {
+  /** 会话 ID */
+  sessionId: string
+  /** 跑这一轮的 Agent */
+  agentId: string
+  /** 触发本次处置的步号（刚刚跑完的那一步，从 1 起） */
+  step: number
+  /** 即将开跑的那一步（= `step + 1`；闸门只在 `nextStep ≥ 2` 时触发） */
+  nextStep: number
+  /** 本轮 query 内第几次等待（`'skipped'` 时是"本该是第几次"，未递增） */
+  attempt: number
+  /** 本轮 query 内累计**实际**等待毫秒（`'skipped'` 时不含被跳过的那一档） */
+  waitedMs: number
+  /** 真的等了 / 该等却没等 */
+  outcome: 'waited' | 'skipped'
+  /** 本次**实际**等待毫秒（`'waited'` 时有值；与 `plannedMs` 不等即被切片提前结束） */
+  waitMs?: number
+  /** 本档**原定**毫秒（`'skipped'` 时是"没能等的那一档"） */
+  plannedMs?: number
+  /** 本档实际睡了几片（`sliceMs = 0` 的整档硬等记 1；`'waited'` 时有值） */
+  slices?: number
+  /** 本次生效的切片大小（`'waited'` 时有值） */
+  sliceMs?: number
+  /** 插件上报的存活后台任务数（多插件取最大；未上报时 undefined） */
+  aliveCount?: number
+  /** 等待原因（插件的说明，缺省时引擎拼一句） */
+  reason?: string
+  /** `outcome === 'skipped'` 的原因：预算用尽 / 阶梯配成 0（等于关了等待） */
+  skipReason?: 'budget_exhausted' | 'zero_ladder'
+}
+
+/**
+ * Agent 执行过程事件（**引擎层自己产生的事实**）。
+ *
+ * 与 `LifecycleEvents` 分开：那一组是"插件启停"的跨层解耦命令，本组是引擎自身的执行轨迹，
+ * 插件只是读者。
+ *
+ * 为什么不靠 `core.agent.step.gate` hook 上报：那条 hook 是**输入侧**的提问
+ * （"还有存活任务吗"），等待的**结果**（实际等了多久、睡了几片、是否被提前结束）
+ * 回不到 decision 对象里；引擎侧没有第二条同义通道，所以这里不是"同一事实两条通道"
+ * （反例见 `telemetry/src/map.ts` 的 `turnEndEnvelope`：`freeSteps` 本就在 hook 载荷里，
+ * 就不该再补一条 bus 事件）。
+ */
+export const AgentEvents = {
+  stepGate: BusEvent.define<AgentStepGateRecord>('agent.step.gate'),
 } as const
 
 export class HarnessImpl implements Harness {
