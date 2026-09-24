@@ -2717,6 +2717,129 @@ describe('runInBackground 结果落盘可回看（缺陷2）', () => {
     rmSync(dataDir, { recursive: true, force: true })
   })
 
+  // ── 草稿的**最终归属**遥测（subagent.draft）──
+  //
+  // 为什么要有事件而不是只看文件：语义"有草稿文件 ⇔ 被掐断"依赖 `ls subagent-results/`，
+  // 目录一旦被清理、或想直接算"掐断率"，就答不上来。事件化后可聚合：掐断占比、草稿多大、刷了几次。
+
+  it('草稿遥测：被掐断 ⇒ subagent.draft kept=true，并带上 chars / flushCount', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-draft-tel-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    // 没有 done 事件（直接抛）⇒ 只有 catch 里那一次强制刷盘
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      undefined,
+      async function* () {
+        yield { type: 'tool_call_result', toolUseId: 't1', toolId: 'bash', result: 'halfway', isError: false }
+        throw new Error('boom')
+      },
+    )
+    const session = createMockSessionManager(sessions)
+    const bus = createBus()
+    const harness = { agent, session, bus }
+    const drafts: Array<{ kept: boolean; chars: number; flushCount: number; taskId: string }> = []
+    bus.subscribe(SubagentEvents.draft, ({ payload }) => { drafts.push(payload) })
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir, 0,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const res = await tool.call(
+      { agentId: 'coder', prompt: '盘点全仓 TODO', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    const taskId = res.output!.taskId!
+    await registry.wait(taskId, 1000)
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(drafts).toHaveLength(1)
+    const d = drafts[0]!
+    expect(d.kept).toBe(true)
+    expect(d.taskId).toBe(taskId)
+    expect(d.chars).toBeGreaterThan(0)   // 保留时有内容（不是空壳）
+    expect(d.flushCount).toBe(1)         // 只有 catch 那一次
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  it('草稿遥测：写过草稿但正常结束 ⇒ kept=false 且 chars=0（说明"这次没留残留"）', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-draft-tel-ok-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    // 间隔 0 ⇒ done 事件前就会刷一版草稿；随后正常收尾把它删掉
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      undefined,
+      async function* (input) {
+        yield { type: 'tool_call_result', toolUseId: 't1', toolId: 'bash', result: 'halfway', isError: false }
+        const msg = makeMessage('assistant', '最终报告：全部完成')
+        const s = sessions.get(input.sessionId)
+        if (s) { s.messages.push(makeMessage('user', input.message), msg) }
+        yield { type: 'done', message: msg, step: 1 }
+      },
+    )
+    const session = createMockSessionManager(sessions)
+    const bus = createBus()
+    const harness = { agent, session, bus }
+    const drafts: Array<{ kept: boolean; chars: number; flushCount: number; path?: string }> = []
+    bus.subscribe(SubagentEvents.draft, ({ payload }) => { drafts.push(payload) })
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir, 0,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'do', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    const task = await registry.wait(res.output!.taskId!, 1000)
+    expect(task!.status).toBe('completed')
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(drafts).toHaveLength(1)
+    expect(drafts[0]!.kept).toBe(false)
+    expect(drafts[0]!.chars).toBe(0)          // 删掉了就不能报字节数
+    expect(drafts[0]!.flushCount).toBe(1)     // done 前刷过一次
+    expect(drafts[0]!.path).toBeUndefined()   // 只在 kept 时给路径
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
+  it('草稿遥测：从没写过草稿的快任务不发事件（不拿噪声充数，分母交给 completed/failed）', async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), 'subagent-draft-tel-none-'))
+    const tasksDir = join(dataDir, 'tasks')
+    const sessions = new Map<string, Session>()
+    // 用**默认**间隔（15s）：任务秒级跑完，两次刷盘机会都没到
+    const agent = createMockAgentRuntime(
+      [coderAgent],
+      undefined,
+      async function* (input) {
+        const msg = makeMessage('assistant', '快')
+        const s = sessions.get(input.sessionId)
+        if (s) { s.messages.push(makeMessage('user', input.message), msg) }
+        yield { type: 'done', message: msg, step: 1 }
+      },
+    )
+    const session = createMockSessionManager(sessions)
+    const bus = createBus()
+    const harness = { agent, session, bus }
+    const drafts: unknown[] = []
+    bus.subscribe(SubagentEvents.draft, ({ payload }) => { drafts.push(payload) })
+    const registry = new BackgroundTaskRegistry()
+    const tool = createSubagentTool(
+      () => harness, 5000, false, 2000, 500, undefined, () => registry, undefined, undefined, () => tasksDir,
+    )
+    const parentSession = await session.create({ title: 'parent' })
+    const res = await tool.call(
+      { agentId: 'coder', prompt: 'do', runInBackground: true },
+      makeToolContext({ sessionId: parentSession.id }),
+    )
+    await registry.wait(res.output!.taskId!, 1000)
+    await new Promise((r) => setTimeout(r, 50))
+
+    expect(drafts).toEqual([])
+    rmSync(dataDir, { recursive: true, force: true })
+  })
+
   it('tasksDir 不可用时退化为不落盘且不抛异常', async () => {
     const sessions = new Map<string, Session>()
     const agent = createMockAgentRuntime([coderAgent], async () => makeMessage('assistant', 'ok'))

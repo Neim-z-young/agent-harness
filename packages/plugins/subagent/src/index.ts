@@ -141,6 +141,38 @@ export const SubagentEvents = {
   }>('subagent.result.fetched'),
 
   /**
+   * 中途草稿的**最终归属**（观察点 7 的遥测；只在**真的写过草稿**时发布）。
+   *
+   * 为什么要有这一条：草稿的语义是「文件存在 ⇔ 这次被掐断」，但那个等式只能靠
+   * `ls subagent-results/` 验证 —— 线上一旦有人清理目录、或用户只想看"掐断率有多高"，
+   * 就没法回答了。落成事件后可以直接聚合：**被掐断的占比、草稿多大、刷了几次**。
+   *
+   * 只在 `flushCount > 0 || kept` 时发：15s 内跑完的快任务从不写草稿，
+   * 给它也发一条"没有草稿"等于用噪声充数（分母由 `SubagentEvents.completed/failed` 提供）。
+   *
+   * `kept` 用布尔而**不是** 0/1：遥测的提取器已把布尔折叠为 0/1（见 `telemetry/envelope.ts`
+   * 的 `asNumber`），而事件契约该说人话。
+   */
+  draft: BusEvent.define<{
+    /** 后台任务 ID */
+    taskId: string
+    /** 父 session ID（调用方） */
+    parentSessionId: string
+    /** 子 Agent ID */
+    agentId: string
+    /** 草稿是否被保留（true = 任务失败/超时被掐断，草稿是唯一留存；false = 任务正常结束已删除） */
+    kept: boolean
+    /** 保留时草稿的**字符数**（`kept=false` 时为 0；与落盘内容同口径，非字节数） */
+    chars: number
+    /** 本次共刷了几次盘（步边界触发；0 说明还没到第一个间隔就被掐断了） */
+    flushCount: number
+    /** 任务已运行时长（ms） */
+    durationMs: number
+    /** 草稿文件路径（仅 `kept=true` 时有值；不含任何正文） */
+    path?: string
+  }>('subagent.draft'),
+
+  /**
    * 子 Agent 工具调用进度事件（P1-5）。
    * 后台任务执行期间，每次工具调用开始/完成时发布，前端实时展示进度。
    */
@@ -993,6 +1025,10 @@ export function createSubagentTool(
         const draftDigest: string[] = []
         let lastDraftAt = startTime
         let draftPath: string | undefined
+        // 遥测用（观察点 7）：刷盘次数 + 最后一版的字符数。
+        // 只在**写成功**时递增 —— 写失败却报"刷了 3 次"会让线上排查拿到假证据。
+        let draftFlushCount = 0
+        let draftChars = 0
         const flushDraft = (): void => {
           const body = [
             '# 后台子任务中途草稿',
@@ -1012,7 +1048,34 @@ export function createSubagentTool(
           const capped = body.length > DRAFT_MAX_CHARS
             ? body.slice(0, DRAFT_MAX_CHARS) + '\n... [草稿已截断（保留最早的部分）]'
             : body
-          draftPath = writeDraftFile(taskId, capped, resolveResultsDir()) ?? draftPath
+          const written = writeDraftFile(taskId, capped, resolveResultsDir())
+          if (written) {
+            draftPath = written
+            draftFlushCount += 1
+            draftChars = capped.length
+          }
+        }
+
+        /**
+         * 草稿**最终归属**上报（观察点 7）。
+         *
+         * 只在真的写过草稿时发（`flushCount > 0`）——15s 内跑完的快任务从不写草稿，
+         * 给它发一条"没有草稿"是用噪声充数；分母由 `completed` / `failed` 提供。
+         * 发布失败不影响主流程（草稿是冗余副本，丢的只是遥测）。
+         */
+        const publishDraft = (kept: boolean): void => {
+          if (!bus) return
+          if (draftFlushCount === 0 && !kept) return
+          bus.publish(SubagentEvents.draft, {
+            taskId,
+            parentSessionId: ctx.sessionId,
+            agentId: input.agentId,
+            kept,
+            chars: kept ? draftChars : 0,
+            flushCount: draftFlushCount,
+            durationMs: Date.now() - startTime,
+            ...(kept && draftPath ? { path: draftPath } : {}),
+          }).catch(() => { /* Bus 发布失败不影响主流程 */ })
         }
 
         void (async () => {
@@ -1128,11 +1191,18 @@ export function createSubagentTool(
             // 草稿留着只会让 subagent-results/ 里多出一份内容更旧的同名文件）。
             // 注意：草稿可能只写了「已覆盖」，之后再无新进展 —— 但那时它已被删掉，
             // 所以「有草稿文件」永远等于「这次任务是被掐断的」，语义干净。
+            let draftRemoved = true
             if (draftPath) {
               try {
                 rmSync(draftPath, { force: true })
-              } catch { /* 删不掉也不影响结果（草稿只是冗余副本） */ }
+              } catch {
+                // 删不掉也不影响结果（草稿只是冗余副本）—— 但要**如实上报**：
+                // 文件还在就不能说"这次没留下草稿"，否则 subagent-results/ 里会出现
+                // 一个遥测无法解释的孤儿文件（"有草稿文件 ⇔ 被掐断"的等式就破了）。
+                draftRemoved = false
+              }
             }
+            publishDraft(!draftRemoved)
 
             // 落盘（无论通知是否可达，结果都持久化到可回看位置，防止父会话已结束时结果丢失）
             await persistTaskRecord(getTasksDir?.(), registry.get(taskId))
@@ -1198,6 +1268,8 @@ export function createSubagentTool(
             const draftNote = draftPath
               ? `；已保留中途草稿：${draftPath}（含完成到超时为止的工具产出）${describeDraftLocation(draftPath, ctx.cwd)}`
               : ''
+            // 掐断路径才有草稿留存：`kept` 取"此刻真的存在一份草稿文件"，不取"flushing 有没有被调用"
+            publishDraft(draftPath !== undefined)
             const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}${draftNote}`
             const failDurationMs = Date.now() - startTime
             // 更新 task 为 failed

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { InMemoryBus, BusEvent } from '@harness/bus'
 import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity } from './envelope.js'
 import { createJsonlWriter } from './writer.js'
-import { mapBusEvent, toolFailureEnvelope } from './map.js'
+import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope } from './map.js'
 import { createTelemetryService, deriveUserID, stackHashStack } from './index.js'
 
 describe('envelope', () => {
@@ -32,6 +32,19 @@ describe('envelope', () => {
     expect(extractIdentity({ sessionId: 's' })).toEqual({ sessionId: 's' })
     expect(extractIdentity({ id: 'x' })).toEqual({}) // 任意 id 不当 sessionId（防 tool/plugin id 污染）
     expect(extractIdentity('nope')).toEqual({})
+  })
+
+  test('布尔折叠为 0/1：此前被静默丢弃（aborted / background / isContinuation 一直在丢）', () => {
+    // 回归：pickMetrics / pickAttrs 原本只收 string|number ⇒ 载荷里的布尔字段**整条消失**，
+    // 消费方只能把"字段不存在"当 false，分不清"真是 false"与"压根没采到"。
+    expect(pickMetrics({ aborted: true, cacheHit: false, n: 5 })).toEqual({ aborted: 1, cacheHit: 0, n: 5 })
+    expect(pickAttrs({ background: true, isContinuation: false, provider: 'openai' }))
+      .toEqual({ background: 1, isContinuation: 0, provider: 'openai' })
+  })
+
+  test('布尔折叠不放宽其它类型：空串 / null / 对象 / NaN 一律仍丢弃', () => {
+    expect(pickMetrics({ a: null, b: {}, c: [], d: NaN, e: Infinity })).toEqual({})
+    expect(pickAttrs({ s: '', o: { x: 1 }, n: null })).toEqual({})
   })
 })
 
@@ -196,5 +209,92 @@ describe('toolFailureEnvelope（异常场景专项埋点）', () => {
     expect(ev.attrs.sessionId).toBe('s_123')
     expect(ev.attrs.agentId).toBe('reader')
     expect(ev.attrs.toolId).toBe('grep_file')
+  })
+})
+
+describe('turnEndEnvelope（整轮终态 / 额度口径）', () => {
+  test('落 telemetry.turn.end，带 step 与派生的 billedSteps', () => {
+    const ev = turnEndEnvelope({
+      agentId: 'lead',
+      agentName: 'Lead',
+      mode: 'primary',
+      sessionId: 's_1',
+      step: 12,
+      finish: 'stop',
+    })!
+    expect(ev.kind).toBe('telemetry.turn.end')
+    expect(ev.attrs.sessionId).toBe('s_1')
+    expect(ev.attrs.agentId).toBe('lead')
+    expect(ev.attrs.mode).toBe('primary')
+    expect(ev.attrs.finish).toBe('stop')
+    expect(ev.metrics.step).toBe(12)
+    // 没有免计步时 billedSteps === step（额度口径与展示步号一致）
+    expect(ev.metrics.billedSteps).toBe(12)
+    expect(ev.metrics.freeSteps).toBeUndefined() // 0 不落无用字段
+  })
+
+  test('freeSteps > 0 时 step 与 billedSteps 分叉（观察点 9 之后这是常态，不是 bug）', () => {
+    const ev = turnEndEnvelope({ agentId: 'lead', sessionId: 's_2', step: 30, freeSteps: 3 })!
+    expect(ev.metrics.step).toBe(30)
+    expect(ev.metrics.freeSteps).toBe(3)
+    expect(ev.metrics.billedSteps).toBe(27) // 只烧了 27 步额度
+  })
+
+  test('aborted 折叠为 1（布尔会被提取器折叠，不会静默丢）', () => {
+    const ev = turnEndEnvelope({ agentId: 'lead', sessionId: 's_3', step: 4, aborted: true })!
+    expect(ev.metrics.aborted).toBe(1)
+    const ok = turnEndEnvelope({ agentId: 'lead', sessionId: 's_3', step: 4 })!
+    expect(ok.metrics.aborted).toBeUndefined()
+  })
+
+  test('子 Agent 的轮也落盘，靠 mode 区分（引擎不做"哪轮算用户的轮"的判断）', () => {
+    const ev = turnEndEnvelope({ agentId: 'reader', mode: 'subagent', sessionId: 's_sub', step: 35 })!
+    expect(ev.attrs.mode).toBe('subagent')
+  })
+
+  test('缺 sessionId 不丢事件（落到 run 级文件，不静默吞掉轮数）', () => {
+    const ev = turnEndEnvelope({ agentId: 'lead', step: 1 })!
+    expect(ev).not.toBeNull()
+    expect(ev.attrs.sessionId).toBeUndefined()
+    expect(ev.metrics.step).toBe(1)
+  })
+
+  test('非法输入 ⇒ null', () => {
+    expect(turnEndEnvelope(undefined)).toBeNull()
+    expect(turnEndEnvelope('nope')).toBeNull()
+  })
+})
+
+describe('telemetry 插件：core.agent.turn.end 落到会话文件', () => {
+  let dir: string
+  beforeAll(() => (dir = mkdtempSync(join(tmpdir(), 'tel-turnend-'))))
+  afterAll(() => rmSync(dir, { recursive: true, force: true }))
+
+  test('注册该 hook 后，整轮终态按 sessionId 落会话级 JSONL', async () => {
+    const pathBuilder = (sid: string | undefined) => join(dir, 'sessions', `${sid ?? 'run'}.telemetry.jsonl`)
+    // crash: false —— 否则会往 process 上挂 SIGTERM/uncaughtException 处理器
+    const svc = createTelemetryService({ enabled: true, dataDir: dir, pathBuilder, crash: false })
+    const bus = new InMemoryBus()
+    const hooks = (await svc.plugin.install({ bus } as never)) as {
+      'core.agent.turn.end'?: (s: unknown) => void
+    }
+    expect(typeof hooks['core.agent.turn.end']).toBe('function')
+
+    hooks['core.agent.turn.end']!({ agentId: 'lead', mode: 'primary', sessionId: 'sessT', step: 8, freeSteps: 2 })
+    svc.telemetry.flush()
+
+    const p = pathBuilder('sessT')
+    expect(existsSync(p)).toBe(true)
+    const line = JSON.parse(readFileSync(p, 'utf8').trim()) as {
+      kind: string
+      attrs: Record<string, unknown>
+      metrics: Record<string, number>
+    }
+    expect(line.kind).toBe('telemetry.turn.end')
+    expect(line.attrs.sessionId).toBe('sessT')
+    expect(line.metrics.step).toBe(8)
+    expect(line.metrics.freeSteps).toBe(2)
+    expect(line.metrics.billedSteps).toBe(6)
+    await svc.plugin.uninstall?.()
   })
 })

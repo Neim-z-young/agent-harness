@@ -54,7 +54,8 @@ export function pickMetrics(payload: unknown): Record<string, number> {
   if (payload === null || typeof payload !== 'object') return {}
   const metrics: Record<string, number> = {}
   for (const [k, v] of Object.entries(payload)) {
-    if (typeof v === 'number' && Number.isFinite(v)) metrics[k] = v
+    const n = asNumber(v)
+    if (n !== undefined) metrics[k] = n
   }
   return metrics
 }
@@ -65,9 +66,32 @@ export function pickAttrs(payload: unknown): TelemetryAttrs {
   const attrs: TelemetryAttrs = {}
   for (const [k, v] of Object.entries(payload)) {
     if (typeof v === 'string' && v.length > 0) attrs[k] = v
-    else if (typeof v === 'number' && Number.isFinite(v)) attrs[k] = v
+    else {
+      const n = asNumber(v)
+      if (n !== undefined) attrs[k] = n
+    }
   }
   return attrs
+}
+
+/**
+ * 归一化"可当数值用的载荷字段"：**布尔折叠为 0 / 1**。
+ *
+ * 为什么必须折：`pickAttrs` / `pickMetrics` 原本只收 `string | number`，于是载荷里的
+ * 布尔字段被**静默丢弃** —— 遥测看不到它，消费方只能把"字段不存在"当成 false，
+ * 分不清"确实是 false"与"压根没采到"。已确认中招的载荷：
+ * `SubagentEvents.started { isContinuation: boolean }`、
+ * `SubagentEvents.*{ background?: boolean }`（`background: true` 一直在发、一直在丢）、
+ * `AgentTurnEndSignal { aborted?: boolean }`。
+ *
+ * 折成 0/1 而不是保留布尔：遥测的两条出口（JSONL / OTLP）都以数值为指标载体，
+ * 布尔在 OTLP 里要么另开类型、要么同样丢；0/1 还能直接做 sum/avg 聚合。
+ * 真实布尔以外的值（对象、数组、null、NaN、Infinity、空串）一律返回 undefined ⇒ 丢弃。
+ */
+function asNumber(v: unknown): number | undefined {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined
+  if (typeof v === 'boolean') return v ? 1 : 0
+  return undefined
 }
 
 /**

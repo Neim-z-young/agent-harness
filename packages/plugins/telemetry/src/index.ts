@@ -26,7 +26,7 @@ import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
 import type { BusEventRecord, Unsubscribe } from '@harness/bus'
 import { createJsonlWriter, type JsonlWriter } from './writer.js'
 import { makeEnvelope, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
-import { mapBusEvent, toolFailureEnvelope } from './map.js'
+import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope } from './map.js'
 import { createCrashGuard, type CrashState } from './crash.js'
 import { createOtlpExporter, type OtlpOptions } from './otlp.js'
 
@@ -143,6 +143,21 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
       if (ev) persist(ev)
       // 遥测只读不改结果，原样返回以保持 pipeline 语义
       return result
+    },
+    /**
+     * 整轮终态（`core.agent.turn.end`）：落 `telemetry.turn.end`。
+     *
+     * 这条是**额度口径唯一的线上证据**：`step`（展示步号）与 `billedSteps`（吃 `maxSteps`
+     * 的步数）在观察点 9 之后会分叉 —— 只看步号会以为"额度算错了"。subagent 的轮也走这里
+     * （引擎不做"哪一轮算用户的轮"的判断），靠 `mode` 标签区分，消费方自己筛。
+     *
+     * 同步返回即可（core 的调用点是 `void ... .catch(() => undefined)`，本 hook 抛错也不会
+     * 影响主流程，但仍不要抛 —— 上报绝不顶掉主语义）。
+     */
+    'core.agent.turn.end'(signal: unknown): void {
+      if (!enabled) return
+      const ev = turnEndEnvelope(signal)
+      if (ev) persist(ev)
     },
   }
 

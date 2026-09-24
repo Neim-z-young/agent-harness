@@ -44,6 +44,53 @@ export function isBoundaryEvent(name: string): boolean {
 }
 
 /**
+ * 整轮终态 → 遥测事件（`core.agent.turn.end` hook 的消费）。
+ *
+ * 为什么注册这条 hook 而不是新开一条 bus 事件：`core.agent.turn.end` **本来就带**
+ * `step` / `freeSteps` / `finish` / `aborted`，且 core 的调用点已经 `.catch(() => undefined)`
+ * —— 再加一条同名事实的 bus 事件就是**同一件事两条通道**（历史事故：同一个名字由两层
+ * 分别触发 ⇒ 消费方分不清来源、按轮计数翻倍）。此处只是把既有事实落盘。
+ *
+ * `billedSteps` 是**派生量**（`step - freeSteps`），它才是 `maxSteps` 的消耗口径：
+ * 观察点 9 落地后"步号 30 但额度没耗尽"是正常现象，只看 `step` 会以为出了 bug。
+ * 两个都落，消费方不必自己猜。
+ *
+ * 缺失 `sessionId` 时**不丢事件**（照 `toolFailureEnvelope` 的口径：只在语义上该过滤时才返回
+ * null）—— 无 sessionId 的轮会落到 run 级文件，那也是它的正确归宿。
+ */
+export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
+  if (signal === null || typeof signal !== 'object') return null
+  const s = signal as {
+    agentId?: string
+    agentName?: string
+    mode?: string
+    sessionId?: string
+    step?: number
+    freeSteps?: number
+    finish?: string
+    aborted?: boolean
+  }
+  const metrics: Record<string, number> = {}
+  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
+  const free = typeof s.freeSteps === 'number' && Number.isFinite(s.freeSteps) ? s.freeSteps : 0
+  if (free > 0) metrics.freeSteps = free
+  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.billedSteps = s.step - free
+  // 只在真的中断时记一位（缺省即 0，不落无用字段）
+  if (s.aborted === true) metrics.aborted = 1
+  return makeEnvelope(
+    'telemetry.turn.end',
+    {
+      sessionId: s.sessionId,
+      agentId: s.agentId,
+      agentName: s.agentName,
+      mode: s.mode,
+      finish: s.finish,
+    },
+    metrics,
+  )
+}
+
+/**
  * 工具执行失败 → 细分遥测事件（异常场景专项埋点）。
  *
  * `core.tool.post.execute` hook 的 (ctx, result) 里：
