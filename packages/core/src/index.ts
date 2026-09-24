@@ -695,12 +695,27 @@ export interface AgentStreamEvent {
    * "等待"这一族字段混进 text/toolId 这些通用槽位里。
    */
   gate?: {
-    /** 本步本次等待的毫秒数 */
+    /**
+     * 本次等待**实际**等了多久（毫秒）。
+     *
+     * ⚠️ 与 `plannedMs` 不是一回事：片间重探（`StepGateOptions.sliceMs`）提前结束时，
+     * 这里是实际值而非档位值 —— 报"等了 3s"而实际只等了 0.5s 就是假信息。
+     */
     waitMs: number
-    /** 本步**已累计**等待的毫秒数 */
+    /**
+     * 本轮 query 内**累计**实际等待的毫秒数。
+     *
+     * ⚠️ 是**跨步累加**（引擎的 `gateWaitedMs` 声明在步循环之外、整轮不重置），
+     * 不是"本步内"—— 退避阶梯能在步与步之间递进，靠的正是这个累计值。
+     */
     waitedMs: number
-    /** 这是本步第几次等待（从 1 起） */
+    /** 这是本轮 query 内第几次等待（从 1 起；探测为静默时阶梯归零、重新从 1 数） */
     attempt: number
+    /**
+     * 本档的**计划**时长（毫秒）：仅在"被片间重探提前结束"时出现（此时 `waitMs < plannedMs`）。
+     * 有它遥测才能算出"提前结束省掉了多少等待"。
+     */
+    plannedMs?: number
     /** 插件上报的存活后台任务数（多插件取最大；未上报时 undefined） */
     aliveCount?: number
     /** 等待原因（插件的说明，缺省时引擎拼一句） */
@@ -1774,6 +1789,22 @@ export const STEP_GATE_BACKOFF_MS: readonly number[] = [3_000, 6_000, 12_000, 24
 export const STEP_GATE_MAX_TOTAL_MS = 300_000
 
 /**
+ * 步间闸门的**等待切片**（毫秒），默认 500。
+ *
+ * 等待不再是"睡满整档"，而是按切片分段：每过一片就重探一次 `core.agent.step.gate`，
+ * 插件一旦静默（后台任务全跑完）就**提前结束这一档**。
+ *
+ * 为什么要有它：硬等的代价是"子任务第 1 秒就跑完了，闸门仍睡在 60s 档上"——
+ * 用户看到界面写着"等待后台任务"，实际却无事可等。分片把这笔浪费压到**最多一个切片**
+ * （500ms 相对 3~60s 的档位可忽略不计），代价是探测次数随档位增长（60s 档 = 120 次），
+ * 因此该 hook 必须是纯内存判定、**禁止 IO**。
+ *
+ * 取值理由：500ms 是"人感觉不到"与"别把 hook 打太密"之间的折中；调到更小收益有限，
+ * 反而放大探测次数。宿主可经 `StepGateOptions.sliceMs` 覆盖（测试压到个位数毫秒）。
+ */
+export const STEP_GATE_SLICE_MS = 500
+
+/**
  * 取第 `attempt` 次等待的时长（毫秒）。`attempt` 从 0 起，超出阶梯长度后**保持末档**
  * （即 60s 起封顶），而不是重置或线性延长 —— 阶梯只负责"尽量早出声"，封顶负责"别太久"。
  */
@@ -1787,6 +1818,20 @@ export function stepGateDelayMs(attempt: number, ladder: readonly number[] = STE
   return ladder[idx]!
 }
 
+/**
+ * 把宿主的 `sliceMs` 归一成**可用的切片长度**（毫秒）；`0` 表示"关掉切片、整档硬等"。
+ *
+ * 为什么要归一而不是直接用：切片长度决定"等待期间多久重探一次"，三类脏值必须收敛掉 ——
+ * `NaN` / `Infinity` / 负数会让 `Math.min` 算出 `NaN` 或负的睡眠时长，而负值喂给
+ * `setTimeout` 会退化成"立即执行"⇒ 切片循环变成**忙等**，CPU 与探测次数一起打爆。
+ * 而 `0` 是**合法**取值（宿主显式回退到改造前的整档硬等），不能当成"未指定"。
+ */
+export function normalizeGateSliceMs(sliceMs: number | undefined): number {
+  if (sliceMs === undefined) return STEP_GATE_SLICE_MS
+  if (!Number.isFinite(sliceMs) || sliceMs <= 0) return 0
+  return Math.floor(sliceMs)
+}
+
 /** 步间闸门的可调参数（宿主注入；缺省即本模块导出的阶梯与预算） */
 export interface StepGateOptions {
   /** 关掉闸门（完全不在步间等待） */
@@ -1795,6 +1840,12 @@ export interface StepGateOptions {
   ladderMs?: readonly number[]
   /** 本轮 query 内的等待总预算（毫秒） */
   maxTotalMs?: number
+  /**
+   * 等待切片（毫秒）：等待期间每过一片就重探一次，插件静默即**提前结束这一档**。
+   * 默认 {@link STEP_GATE_SLICE_MS}；`0` / 负数 / `NaN` ⇒ 关掉切片（整档硬等，即改造前的行为）；
+   * 不小于档位时也等价于硬等（睡一片就够，不值得为一片加一次探测）。
+   */
+  sliceMs?: number
 }
 
 /**
@@ -1826,10 +1877,11 @@ interface AgentStepGateDecisionLike {
 /**
  * 可被 `signal` 打断的 sleep（步间闸门用）。
  *
- * 为什么不用裸 `setTimeout`：闸门单次最长 60s，用户此刻按 Ctrl-C 必须**立刻**停 ——
- * 裸 sleep 会让"中断"最多晚 60 秒才生效，那和没中断没区别。中断时立即 resolve，
- * 由调用方检查 `signal.aborted` 决定后续（不是在这里抛错：闸门不是错误路径）。
- * 定时器 `unref` 掉，避免一个等待中的长定时器把进程钉住。
+ * 为什么不用裸 `setTimeout`：闸门单次睡眠最长 60s（档内分片后通常只有
+ * `STEP_GATE_SLICE_MS`，但 `sliceMs=0` 的硬等路径仍是整档），用户此刻按 Ctrl-C 必须
+ * **立刻**停 —— 裸 sleep 会让"中断"最多晚 60 秒才生效，那和没中断没区别。
+ * 中断时立即 resolve，由调用方检查 `signal.aborted` 决定后续（不是在这里抛错：
+ * 闸门不是错误路径）。定时器 `unref` 掉，避免一个等待中的长定时器把进程钉住。
  */
 function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve()
@@ -2419,10 +2471,12 @@ export class AgentRuntimeImpl implements AgentRuntime {
         // 能在 20 秒内把 30 步额度烧光（msg31 / msg66 两次撞顶，第一次撞顶时任务只做了一半），
         // 于是结果只能在**下一轮 query** 里才可能被看到。
         //
-        // 四条边界，逐条都是踩过或推演过的：
+        // 五条边界，逐条都是踩过或推演过的：
         // · 只在 step ≥ 2 触发 —— 第 1 步之前没有"派出去的任务"可言，等了也没意义；
         // · **每个步边界最多等一次**（不是"等到没任务为止"）—— 后者会让单独一步阻塞好几分钟，
         //   且与"每执行一轮都等一会"的字面语义不符；分散到各步上，界面上的心跳也是一段一段的；
+        // · **档内分片重探**（`STEP_GATE_SLICE_MS`）：等到一半任务就全跑完了，没必要把整档睡满，
+        //   静默即提前结束（最多白等一个切片）。因此该 hook 必须纯内存、禁 IO；
         // · 探测为"静默"时把阶梯**归零**（而不是永久关闸门）：同一轮里 coordinator 可能再派一批，
         //   新一波该从最小档重新起步；探测本身只是一次内存过滤，重探的成本可以忽略；
         // · 累计等待达到 `STEP_GATE_MAX_TOTAL_MS` 后本轮的后续步都不再等 —— 闸门的终止条件
@@ -2450,17 +2504,60 @@ export class AgentRuntimeImpl implements AgentRuntime {
             // 静默：这一波任务已经没有了 ⇒ 阶梯归零（下一波从最小档起）
             gateAttempt = 0
           } else if (waitMs > 0 && gateWaitedMs + waitMs <= maxTotalMs && !signal?.aborted) {
-            await sleepAbortable(waitMs, signal)
+            // ── 分片等待 + 片间重探 ──
+            //
+            // 不是"睡满整档"，而是每过一片就重问一次"还有存活任务吗"：插件一旦静默
+            // （后台任务全跑完）就**提前结束这一档**。动机是硬等的浪费形态 ——
+            // 子任务第 1 秒就跑完了，闸门却还睡在 60s 档上，界面写着"等待后台任务"、
+            // 实际无事可等。分片把这笔浪费压到**最多一个切片**。
+            //
+            // 代价是探测次数随档位增长（60s 档 = 120 次），所以 `core.agent.step.gate`
+            // 的实现**必须是纯内存判定、禁止 IO** —— 见 plugin/src/index.ts 的协议说明。
+            const sliceMs = normalizeGateSliceMs(gateCfg?.sliceMs)
+            let actualMs = 0
+            if (sliceMs > 0 && sliceMs < waitMs) {
+              let remain = waitMs
+              while (remain > 0 && !signal?.aborted) {
+                const slice = Math.min(sliceMs, remain)
+                await sleepAbortable(slice, signal)
+                if (signal?.aborted) break
+                actualMs += slice
+                remain -= slice
+                // 正好睡满就收工：此时再探一次只会得到"还有任务"，白搭一次探测
+                if (remain <= 0) break
+                const probe: AgentStepGateDecision = {}
+                await this.deps.triggerPlugin(
+                  'core.agent.step.gate',
+                  {
+                    sessionId,
+                    nextStep: step + 1,
+                    agentId: prepared.agentId,
+                    // 片间重探不算新的一次等待：这一档还没记账，插件看到的仍是"已完成几次"
+                    waitAttempt: gateAttempt,
+                    waitedMs: gateWaitedMs,
+                    step,
+                  },
+                  probe,
+                )
+                if (!mergeStepGateDecision(probe).pending) break
+              }
+            } else {
+              // 切片关掉（sliceMs=0）或本来就只有一片 ⇒ 整档硬等，与改造前逐字一致
+              await sleepAbortable(waitMs, signal)
+              if (!signal?.aborted) actualMs = waitMs
+            }
             // 等待期间被中断：不再记这一次（本轮已经结束，报一条"等了 60s"反而是假信息）
-            if (!signal?.aborted) {
+            if (!signal?.aborted && actualMs > 0) {
               gateAttempt += 1
-              gateWaitedMs += waitMs
+              gateWaitedMs += actualMs
               yield {
                 type: 'step_gate',
                 gate: {
-                  waitMs,
+                  // 报**实际**等待：提前结束时小于档位，与 plannedMs 一起看才不是假信息
+                  waitMs: actualMs,
                   waitedMs: gateWaitedMs,
                   attempt: gateAttempt,
+                  ...(actualMs < waitMs ? { plannedMs: waitMs } : {}),
                   ...(merged.aliveCount !== undefined ? { aliveCount: merged.aliveCount } : {}),
                   reason: merged.reason ?? '后台任务尚未跑完',
                 },

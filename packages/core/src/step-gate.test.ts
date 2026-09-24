@@ -3,9 +3,11 @@ import {
   createHarness,
   defineTool,
   mergeStepGateDecision,
+  normalizeGateSliceMs,
   stepGateDelayMs,
   STEP_GATE_BACKOFF_MS,
   STEP_GATE_MAX_TOTAL_MS,
+  STEP_GATE_SLICE_MS,
   type AgentDefinition,
   type AgentPlugin,
   type AgentStreamEvent,
@@ -21,10 +23,11 @@ import {
  * 把 30 步额度烧光（msg31 / msg66 两次撞顶；第一次撞顶时后台任务只做了一半），于是结果
  * 只能在**下一轮 query** 里才可能被看到 —— 要么用户自己敲键，要么等 barrier 续轮。
  *
- * 闸门要证的三件事：
+ * 闸门要证的四件事：
  * 1. 插件说"还有存活任务"时，下一步开跑前确实等了（且发 `step_gate` 事件）；
  * 2. 插件说"没了"时**这一步不再等**，但**每个步边界仍会重探**（阶梯归零，不是关闸门）；
- * 3. 没有任何插件实现时行为与改造前完全一致（不多等、不多发事件）。
+ * 3. **档内分片重探**：任务中途跑完就不睡满整档（最多白等一个切片），`sliceMs=0` 能退回硬等；
+ * 4. 没有任何插件实现时行为与改造前完全一致（不多等、不多发事件）。
  *
  * ⚠️ 闸门挂靠在**续轮**上，不是挂在"空转"上：`shouldContinueStep()` 的判据是
  * `toolCallCount > 0`，所以**能走到闸门的步边界，前提都是上一步调用了工具**；
@@ -70,6 +73,26 @@ describe('mergeStepGateDecision：多插件上报的合取与清洗', () => {
     expect(mergeStepGateDecision({ pending: true, aliveCount: Number.NaN })).toEqual({ pending: true })
     expect(mergeStepGateDecision({ pending: true, aliveCount: '4' })).toEqual({ pending: true })
     expect(mergeStepGateDecision({ pending: true, reason: '' })).toEqual({ pending: true })
+  })
+})
+
+describe('normalizeGateSliceMs：切片归一化', () => {
+  it('未指定 ⇒ 默认 500ms', () => {
+    expect(STEP_GATE_SLICE_MS).toBe(500)
+    expect(normalizeGateSliceMs(undefined)).toBe(500)
+  })
+
+  it('0 / 负数 / NaN / Infinity ⇒ 0（关掉切片，回退到整档硬等）', () => {
+    expect(normalizeGateSliceMs(0)).toBe(0)
+    expect(normalizeGateSliceMs(-1)).toBe(0)
+    expect(normalizeGateSliceMs(Number.NaN)).toBe(0)
+    expect(normalizeGateSliceMs(Number.POSITIVE_INFINITY)).toBe(0)
+  })
+
+  it('正数下取整；下取整后为 0 的极小值也走硬等（0.5ms 一片等于忙等）', () => {
+    expect(normalizeGateSliceMs(12.9)).toBe(12)
+    expect(normalizeGateSliceMs(1)).toBe(1)
+    expect(normalizeGateSliceMs(0.5)).toBe(0)
   })
 })
 
@@ -137,17 +160,27 @@ async function collect(gen: AsyncGenerator<AgentStreamEvent, void, unknown>): Pr
  * `0` / `undefined` 表示"没有存活任务"。
  *
  * 为什么要用序列而不是固定值：闸门的核心行为是"探测 → 等待 → **再探测**"，
- * 必须能演出"第一次说有、第二次说没有"。
+ * 必须能演出"第一次说有、第二次说没有"。同一条序列现在还要覆盖**片间重探**——
+ * 片间重探会额外消耗序列里的元素，写用例时得把这一步算进去。
+ *
+ * 额外的 `inputs` 记录每次调用看到的 `waitAttempt` / `waitedMs`：用来钉住
+ * "片间重探不算新的一次等待"（这一档还没记账，插件看到的值不该变）。
  */
-function gateProbe(aliveSeq: Array<number | undefined>): AgentPlugin & { probes: number } {
+function gateProbe(aliveSeq: Array<number | undefined>): AgentPlugin & {
+  probes: number
+  inputs: Array<{ waitAttempt: number; waitedMs: number }>
+} {
   const plugin = {
     id: 'gate-probe',
     version: '1',
     name: 'GateProbe',
     probes: 0,
+    inputs: [] as Array<{ waitAttempt: number; waitedMs: number }>,
     async install() {
       return {
-        'core.agent.step.gate'(_input: unknown, decision: { pending?: boolean; aliveCount?: number; reason?: string }) {
+        'core.agent.step.gate'(input: unknown, decision: { pending?: boolean; aliveCount?: number; reason?: string }) {
+          const gi = (input ?? {}) as { waitAttempt?: number; waitedMs?: number }
+          plugin.inputs.push({ waitAttempt: gi.waitAttempt ?? -1, waitedMs: gi.waitedMs ?? -1 })
           const alive = aliveSeq[Math.min(plugin.probes, aliveSeq.length - 1)]
           plugin.probes++
           if (alive !== undefined && alive > 0) {
@@ -240,6 +273,88 @@ describe('步间闸门：真实引擎 + 探针插件', () => {
     await h.stop()
   })
 
+  it('档内分片重探：后台任务中途跑完 ⇒ 提前结束这一档，不把整档睡满', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    // 第 1 次探测（第 2 步开跑前）说"还有 2 个"；第 1 片之后重探就说"没了"
+    const probe = gateProbe([2, 0])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      // 档位 400ms 故意远大于切片 20ms：没提前结束的话，实测耗时必然逼近 400ms
+      stepGate: { ladderMs: [400], maxTotalMs: 10_000, sliceMs: 20 },
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const started = Date.now()
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+    const elapsed = Date.now() - started
+    const gates = events.filter((e) => e.type === 'step_gate')
+
+    expect(gates).toHaveLength(1)
+    // waitMs 是**实际**等待（一片），plannedMs 才是那一档的原定值。
+    // 两者分开报的理由：报"等了 400ms"而实际只有 20ms 就是假信息。
+    expect(gates[0].gate?.waitMs).toBe(20)
+    expect(gates[0].gate?.plannedMs).toBe(400)
+    expect(gates[0].gate?.waitedMs).toBe(20)
+    // 真的没睡满：整轮 query 的总耗时远小于档位
+    expect(elapsed).toBeLessThan(300)
+    // 探测点：第 2 步前 1 次 + 片间 1 次 + 第 3 步前 1 次（探针已序列越界 ⇒ 静默）
+    expect(probe.probes).toBe(3)
+    // 片间重探不算新的一次等待：它看到的 waitAttempt/waitedMs 与档位开始时**一致**
+    // （若实现里提前记了账，这里会变成 1 / 20）
+    expect(probe.inputs[0]).toEqual({ waitAttempt: 0, waitedMs: 0 })
+    expect(probe.inputs[1]).toEqual({ waitAttempt: 0, waitedMs: 0 })
+    await h.stop()
+  })
+
+  it('全程都有后台任务 ⇒ 睡满整档（不出现 plannedMs），片与片之间都会重探', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([9]) // 永远说"还有 9 个"，模拟任务迟迟不结束
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      // 档位 60ms、切片 20ms ⇒ 恰好 3 片
+      stepGate: { ladderMs: [60], maxTotalMs: 10_000, sliceMs: 20 },
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+    const gates = events.filter((e) => e.type === 'step_gate')
+
+    expect(gates.map((g) => g.gate?.waitMs)).toEqual([60, 60])
+    expect(gates.map((g) => g.gate?.waitedMs)).toEqual([60, 120])
+    // 睡满 ⇒ 不该有 plannedMs（它只在"被提前结束"时出现）
+    expect(gates.map((g) => g.gate?.plannedMs)).toEqual([undefined, undefined])
+    // 2 条步边界各 1 次 + 每档片间各 2 次（第 3 片后 remain=0，不再多探一次）= 6
+    expect(probe.probes).toBe(6)
+    await h.stop()
+  })
+
+  it('sliceMs=0 ⇒ 关掉切片、整档硬等（显式回退到改造前的行为）', async () => {
+    const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
+    const probe = gateProbe([9])
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [probe],
+      stepGate: { ladderMs: [30], maxTotalMs: 10_000, sliceMs: 0 },
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+    const gates = events.filter((e) => e.type === 'step_gate')
+
+    expect(gates.map((g) => g.gate?.waitMs)).toEqual([30, 30])
+    // 关掉切片后只剩"步边界"的探测，没有片间探测
+    expect(probe.probes).toBe(2)
+    await h.stop()
+  })
+
   it('等待总预算用尽后停止等待（按 maxTotalMs 兜底，不被插件误报拖住）', async () => {
     const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), stepChunks('c'), finalChunks])
     const probe = gateProbe([9]) // 永远说"还有 9 个"，模拟插件误报/任务卡死
@@ -297,15 +412,17 @@ describe('步间闸门：真实引擎 + 探针插件', () => {
     await h.stop()
   })
 
-  it('中断信号打断等待：不把"用户按了 Ctrl-C"拖到一档等满', async () => {
+  it('中断信号打断等待：不把"用户按了 Ctrl-C"拖到一档等满（切片路径同样立刻停）', async () => {
     const provider = scriptedProvider([stepChunks('a'), stepChunks('b'), finalChunks])
     const probe = gateProbe([5])
     const h = await createHarness({
       agents: [agent],
       chatProvider: provider,
       internalPlugins: [probe],
-      // 单档 10s：若 sleep 不可中断，这条用例会真的挂 10 秒（测试超时会暴露）
-      stepGate: { ladderMs: [10_000], maxTotalMs: 60_000 },
+      // 单档 10s：若 sleep 不响应 abort，这条用例会真的挂 10 秒（测试超时会暴露）。
+      // 切片 50ms 是**更严**的设定：分片后每次睡眠都短，但循环条件是 `!signal.aborted`，
+      // 中断不生效的话会一片接一片地把 10s 睡完 —— 断言依然有区分度。
+      stepGate: { ladderMs: [10_000], maxTotalMs: 60_000, sliceMs: 50 },
     })
     h.tools.register(echoTool)
     const sess = await h.session.create()

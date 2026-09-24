@@ -4176,15 +4176,23 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             onEvent?.(ev)
             break
           case 'step_gate': {
-            // 步间闸门：派工后后台任务还没跑完，引擎让出时间（单次最长 60s）。
+            // 步间闸门：派工后后台任务还没跑完，引擎让出时间（单档最长 60s）。
             // 必须打一行 —— 静默等几十秒等于把「静默卡死」重新引入一次（心跳约定）。
             if (inText || inReasoning) { out('\n'); inText = false; inReasoning = false }
             onEvent?.(ev)
             const g = ev.gate
             if (g) {
               const alive = g.aliveCount !== undefined ? `，${g.aliveCount} 个在跑` : ''
+              // 秒数带一位小数：档内分片重探会提前结束（如 3s 档只等了 1.5s），
+              // 而 `Math.round(0.5)` 会把 500ms 报成"1s" —— 报出去的数字必须是实际发生的。
+              const secs = (ms: number): string =>
+                ms % 1000 === 0 ? `${ms / 1000}s` : `${(ms / 1000).toFixed(1)}s`
+              // 提前结束时把原定档位一并报出：只说"本次 1.5s"会让人以为阶梯改了
+              const span = g.plannedMs !== undefined
+                ? `${secs(g.waitMs)}（原定 ${secs(g.plannedMs)}）`
+                : secs(g.waitMs)
               out(`⏳  等一会再跑下一步：${g.reason ?? '后台任务尚未跑完'}${alive}`
-                + `（本次 ${Math.round(g.waitMs / 1000)}s，累计 ${Math.round(g.waitedMs / 1000)}s）\n`)
+                + `（本次 ${span}，累计 ${secs(g.waitedMs)}）\n`)
             }
             break
           }
