@@ -1,5 +1,62 @@
 # Agent Harness 开发日志
 
+## 2026-09-28（续 204）选区闪烁真机取证：markdown 块两条通道都是死的，改为命令式上色
+
+用户：「鼠标选取闪烁功能没有实现，研究下为啥」。结论不是"没写"，而是**写了但两条通道在真机上都不闪**，
+且测试断言只查"标记文案出现"、没查"标记在闪"，所以一直绿。
+
+### 一、取证手法（真机探针，非测试渲染器）
+
+`createCliRenderer({ stdin: PassThrough, stdout: PassThrough, bufferedOutput: 'memory' })` 挂载真实
+`TuiApp`，往 stdin 灌真实 SGR 拖选序列（`\x1b[<0;X;YM` / drag / up），再从
+`renderer.currentRenderBuffer.getSpanLines()` 采样 span 的 fg/bg（0~1 浮点，要 `toFixed(3)` 归一）。
+渲染路径与生产**同一个 `CliRenderer` 类**（`createTestRenderer` 内部就是它），证据可信。
+
+### 二、两条通道的实测结论
+
+| 通道 | 对象 | 实测 |
+|---|---|---|
+| `selectionBg/selectionFg` 声明式 props（user / tool / thinking 的纯 `<text>`） | 纯 text 块 | **真的在闪**：8 次采样稳定 A(#d7a521) → B(#3a4150) → A → B |
+| 块顶标记行 `reverse`（assistant `<markdown>`） | markdown 块 | **恒不闪**：`attributes` 8 次采样恒为 33（BOLD｜INVERSE） |
+| markdown 选中文字 | markdown 块 | A/B 命中恒 0 —— `MarkdownOptions` 无该字段，内核默认色 |
+
+### 三、根因
+
+`tui.tsx` 标记行原写法 `inSelection && selBlink ? { reverse: true } : { bold: true, reverse: selected }`
+—— 拖选结束的 mouseUp 必然冒泡到块容器（`onMouseUp ⇒ setSelectedBlockId`）⇒ `selected` 恒为 true
+⇒ **两个分支都算出 `reverse: true`** ⇒ 标记恒定反显，`selBlink` 翻转被完全吞掉。而 markdown 的选中
+文字又不吃 `selectionBg`，于是助手块（占屏最多、最常被拖选）**完全没有闪烁**。
+
+### 四、修法（两条都修）
+
+- **命令式上色（新增）**：selection 事件里把 `sel.selectedRenderables` 存进 `selRenderablesRef`，
+  在 `selBlink` 翻转时逐个赋 `selectionBg/selectionFg`。依据：markdown 内部承载正文的
+  `CodeRenderable`（`markdown-1-block-0`）就是 `TextBufferRenderable` 子类，**直接赋值立刻生效**
+  （探针强制 A/B/A，屏上底色随之切换）；且它本来就在 `selectedRenderables` 里，无需遍历渲染树。
+  ⇒ markdown 选中文字**真闪**，与纯 text 通道同源。
+- **标记行判据修正**：改成 `inSelection ? { bold: true, reverse: selBlink } : { ... reverse: selected }`
+  —— 是否闪只由「是否在选区里」决定，「是否被点选」退为非选区态兜底。
+
+### 五、验证（新断言先证明会红）
+
+- 新断言：① markdown 选中文字底色在 A/B 间交替；② 标记行 `attributes` 至少出现 2 个不同值。
+- **反向验证**：改回旧 ternary ⇒ ② 立即红（attrs.size 恒 1）；用 env 开关临时禁用命令式通道 ⇒
+  ① 立即红（A 命中 0）。两条都是真守卫，不是"写完就绿"。
+- cli 包 `typecheck` 0 error；cli `bun test` **381 pass / 0 fail**；全量 `bun run typecheck` 39 包 0 error。
+
+### 六、复用要点
+
+- **断言"出现" ≠ 断言"闪烁"**：闪烁/动画类功能必须断言**状态在两个值之间变化**（这里就是
+  renderable 的 `attributes` 数值），只查文案出现会让整条通道死掉还全绿。
+- **`getSpanLines()` 不返回 attributes**：INVERSE 之类属性不在 span 的 fg/bg 里，验证"反显有没有在切"
+  必须直接读 renderable 的 `attributes` 数值（渲染树从 `renderer.root` 递归 `getChildren()`）。
+- **按字节切片还原终端行会整体错位**（CJK 占 2 列）：要按 spans 逐字 + 字宽重建可视列；宽字符在可视
+  行里是「字 + 一个填充空格」，子串搜索得改成单字定位。
+- **选中后块顶插入标记行 ⇒ 行号位移**，第二次拖选前必须重新取帧定位（第一轮就因此误判成
+  "markdown 选不中"）。
+- **内核没暴露的字段，未必改不了**：`MarkdownOptions` 没有 `selectionBg`，但内部 `CodeRenderable`
+  可以直接赋值 —— 遇到"上游没暴露"先下沉一层看实际 renderable 类型，别急着写"做不到"。
+
 ## 2026-09-24（续 203）闸门预算改语义：`maxTotalMs` 从"终止条件"变"提醒阈值"，超预算仍等待并从 CLI 提示用户
 
 用户：「超过 5 分钟后也不应该 skip，而是继续 60s 等待，但需要探测任务执行情况，有异常就提示用户」。

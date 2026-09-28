@@ -1870,7 +1870,25 @@ describe('鼠标选区：闪烁 + 可点击复制', () => {
     await f.cleanup()
   }, 20_000)
 
-  it('拖选 assistant（markdown）块 ⇒ 块顶部出现「选区已选中此块」闪烁标记（整块响应式高亮）', async () => {
+  /** 渲染树遍历：找文本含 needle 的 renderable（用来读它的 `attributes` 数值） */
+  function walkAll(r: any, out: any[] = []): any[] {
+    if (!r) return out
+    out.push(r)
+    let kids: any[] = []
+    try { kids = (typeof r.getChildren === 'function' ? r.getChildren() : r.children) ?? [] } catch { kids = [] }
+    for (const c of kids) walkAll(c, out)
+    return out
+  }
+  function findRenderableByText(setup: TestRendererSetup, needle: string): any | null {
+    for (const r of walkAll((setup.renderer as any).root)) {
+      let t = ''
+      try { t = String(r.plainText ?? r.text ?? r.content ?? '') } catch { continue }
+      if (t.includes(needle)) return r
+    }
+    return null
+  }
+
+  it('拖选 assistant（markdown）块 ⇒ 块顶部出现「选区已选中此块」标记，且标记与选中文字都在闪', async () => {
     const f = await mountTui({ responses: [{ match: /拖我/, response: '这是要被选中的 assistant 文本，用来验证整块的选区响应。' }] })
     await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
     await f.setup.mockInput.typeText('拖我')
@@ -1885,6 +1903,37 @@ describe('鼠标选区：闪烁 + 可点击复制', () => {
     // 拖选 mouseUp 会冒泡选中整块、正文下移 → 以 chip 出现 + 块标记为准
     await waitFrame(f.setup, (fr) => /⧉ 复制 \d+ 字符/.test(fr))
     await waitFrame(f.setup, (fr) => fr.includes('选区已选中此块'))
+
+    // (a) 选中文字**底色**要在 A/B 间交替 —— 修前 markdown 的选区色完全不受控（A/B 命中恒 0），
+    //     只能靠块顶那一行提示；现在走命令式通道给内部 CodeRenderable 赋值，真机上确实会闪。
+    //     ⚠️ 行号同样会位移，必须重新定位。
+    const selY = locateChar(f.setup.captureCharFrame(), '这是要被选中的')!.y
+    const A = rgbKey(SELECTION_BLINK_A.bg)
+    const B = rgbKey(SELECTION_BLINK_B.bg)
+    const seen = new Set<string>()
+    for (let i = 0; i < 24 && seen.size < 2; i++) {
+      for (const { rgb } of lineBgs(f.setup, selY)) {
+        if (rgb === A || rgb === B) seen.add(rgb)
+      }
+      await new Promise((r) => setTimeout(r, 80))
+      await pumpOnce(f.setup)
+    }
+    expect(seen.has(A)).toBe(true)
+    expect(seen.has(B)).toBe(true)
+
+    // (b) 块顶标记行的 `attributes` 必须**真的在两个值之间切换**。
+    //     修前是 `inSelection && selBlink ? {reverse:true} : {reverse:selected}` —— 拖选的 mouseUp
+    //     必然冒泡选中整块 ⇒ selected 恒 true ⇒ 两个分支都算出 reverse:true ⇒ 恒为 33（BOLD|INVERSE）
+    //     ⇒ 标记恒定反显、永远不闪。旧断言只查"文案出现"，漏掉了这层。
+    const marker = findRenderableByText(f.setup, '⏳')
+    expect(marker).not.toBeNull()
+    const attrs = new Set<number>()
+    for (let i = 0; i < 16 && attrs.size < 2; i++) {
+      attrs.add(Number(marker!.attributes))
+      await new Promise((r) => setTimeout(r, 120))
+      await pumpOnce(f.setup)
+    }
+    expect(attrs.size).toBeGreaterThanOrEqual(2)
     await f.cleanup()
-  }, 20_000)
+  }, 30_000)
 })

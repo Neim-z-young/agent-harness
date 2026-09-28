@@ -1145,7 +1145,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         setSelCopied(false)
       }
       // 选区覆盖块定位（整块响应式高亮）：沿被选中 renderable 的父链找 `blk_<id>` 容器。
-      if (!sel?.isActive) { setSelBlockIds(new Set()); return }
+      if (!sel?.isActive) { setSelBlockIds(new Set()); selRenderablesRef.current = []; return }
       const ids = new Set<number>()
       for (const rb of sel.selectedRenderables) {
         let node: { id: string; parent: unknown } | null = rb
@@ -1159,6 +1159,8 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         }
       }
       setSelBlockIds(ids)
+      // 存下**被选中的 renderable 本体**（含 markdown 内部的 CodeRenderable），供闪烁时直接上色。
+      selRenderablesRef.current = sel.selectedRenderables.slice() as unknown as Array<Record<string, unknown>>
     }
     renderer?.on?.('selection', onSel)
     return () => { renderer?.off?.('selection', onSel) }
@@ -1194,6 +1196,30 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       : {}
   /** 点过「⧉ 复制」后的即时反馈（下一个选区/清除时复位） */
   const [selCopied, setSelCopied] = useState(false)
+  /**
+   * 被选中的 renderable 本体（selection 事件的 `selectedRenderables` 快照）。
+   *
+   * 为什么还要命令式上色：`<markdown>` 的 `MarkdownOptions`（@opentui/core 0.5.8）没有
+   * `selectionBg/selectionFg` 字段，声明式 props 挂不上去。但实测 markdown 内部承载正文的
+   * `CodeRenderable`（id 形如 `markdown-1-block-0`）就是 `TextBufferRenderable` 的子类，
+   * **直接给它的 `selectionBg` 赋值立刻生效**（真机探针：强制 A/B/A，屏上底色随之切换）。
+   * 而这些 renderable 本来就在 `selectedRenderables` 里，无需遍历渲染树。
+   * 清掉选区时随 `selBlockIds` 一起清空（避免持有已卸载节点）。
+   */
+  const selRenderablesRef = useRef<Array<Record<string, unknown>>>([])
+  /** 有选区时，把当前闪烁配色**直接写进**被选中的 renderable（覆盖 markdown 那部分） */
+  useEffect(() => {
+    if (selChars <= 0) return
+    const bg = selBlink ? SELECTION_BLINK_A.bg : SELECTION_BLINK_B.bg
+    const fg = selBlink ? SELECTION_BLINK_A.fg : SELECTION_BLINK_B.fg
+    for (const rb of selRenderablesRef.current) {
+      if (!rb || !('selectionBg' in rb)) continue
+      try {
+        rb.selectionBg = bg
+        rb.selectionFg = fg
+      } catch { /* 选区已随块卸载：忽略 */ }
+    }
+  }, [selChars, selBlink])
   /**
    * 选区覆盖到的消息块 id 集合（整块响应式高亮）。
    * 由 selection 事件的 `selectedRenderables` 沿 parent 向上定位到 `blk_<id>` 容器。
@@ -1869,7 +1895,14 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         {(selected || inSelection) && (
           <text
             attributes={createTextAttributes(
-              inSelection && selBlink ? { bold: true, reverse: true } : { bold: true, reverse: selected },
+              /*
+                ⚠️ `reverse` 不能写成 `inSelection && selBlink ? true : selected`：拖选结束的
+                mouseUp 会冒泡到块容器（`onMouseUp` ⇒ `setSelectedBlockId`）⇒ `selected` 恒为
+                true ⇒ 两个分支都算出 `reverse: true` ⇒ 标记行恒定反显、**永远不闪**（真机探针实测
+                `attributes` 恒为 33 = BOLD|INVERSE，8 次采样零变化）。判据必须是「是否在选区里」，
+                「是否被点选」只作为非选区态的兜底。
+              */
+              inSelection ? { bold: true, reverse: selBlink } : { bold: true, reverse: selected },
             )}
           >
             {inSelection ? '⏳ 选区已选中此块 · 再次拖选可复制 / [Ctrl-Y] 复制文字' : '▌已选中 · 再次点击取消'}
@@ -1895,8 +1928,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           /*
             ⚠️ 这里**刻意不挂** selStyleProps：`MarkdownOptions`（@opentui/core 0.5.8）没有
             selectionBg/selectionFg 字段，挂了也不生效（实测：助手 markdown 块的选区底色恒为
-            内核默认的浅灰 #e6edf3，不随 props 变）—— 与其留一个"看起来在用"的死 prop，不如
+            内核默认的浅色，不随 props 变）—— 与其留一个"看起来在用"的死 prop，不如
             把限制写清楚。用户/工具/思考块是纯 text，那几处挂了、也确实生效（有测试守着）。
+            markdown 的选区上色改走**命令式通道**：`selRenderablesRef` + 上面那个 effect 直接
+            给内部 `CodeRenderable` 赋 `selectionBg/selectionFg`（真机实测立刻生效、可闪烁）。
             上游若给 MarkdownOptions 补上这两个字段，把 {...selStyleProps} 加回来即可。
           */
           <markdown
