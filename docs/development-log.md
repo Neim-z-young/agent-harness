@@ -1,5 +1,67 @@
 # Agent Harness 开发日志
 
+## 2026-09-28（续 209）工具回显改成完整打印（入参 + 结果），不截断
+
+用户要求："工具命令打印完整的信息，不要截断"。经确认，指的是 REPL/TUI 里**工具调用的两行回显**
+（`createProcessLine` 的事件循环 —— REPL 与 TUI 共用；TUI 的工具块正是由这里的 `out()` 经
+`pushConsole` 归类而来，`applyStreamEvent` 只处理文本/推理增量，不碰工具行）。
+
+### 改了什么
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `tool_call_start` | `JSON.stringify(input).slice(0, 60) + '...'` | `formatToolInput(input)` —— 完整序列化 |
+| `tool_call_result` | `typeof r === 'string' ? r.slice(0,120) : JSON.stringify(r).slice(0,120)` | `formatToolResult(result, !!onEvent)` —— 完整打印 |
+
+新增两个导出助手（`packages/cli/src/index.ts`）：
+
+- `formatToolInput`：`JSON.stringify`；`undefined → '{}'`；不可序列化（循环引用 / BigInt）
+  退化为 `util.inspect(value, { depth: null, breakLength: Infinity })`。**两条路径都完整** ——
+  原来的兜底是 `String(v)`，环形对象只剩 `[object Object]`，等于又丢一次信息
+- `formatToolResult`：string 原样（保留换行）；其它 JSON 化；多行时按 `markContinuation` 加续行标记
+
+事件的载荷本来就是完整的：core 侧 `tool_call_start` 的注释明写"含 input 完整值"，
+`tool_call_result` 带的就是完整输出 —— **截断发生在展示层，是自己把上游给的信息丢掉**。
+
+### 顺带必须解决的：多行结果会被 TUI 劈成两块
+
+截断一去掉，多行结果就成了常态，而 `pushConsole` 是**逐行**分类的：续行读不出前缀 ⇒ 落成
+`system` 块。而 tool 块渲染器**本就按多行设计**（首行加粗、结果行自动补 `│` / `└` 树状缩进），
+且**每个块各带一个「⧉ 复制」按钮** ⇒ 一次工具调用会冒出两个复制按钮。
+
+修法：给续行一个**传输用**标记 `TOOL_CONT_MARK = '┆'`，`classifyConsoleLine` 认它并**剥掉**
+（界面与复制出的文本里都看不到）。且**只在 TUI 模式加** —— REPL 是直写 stdout 的纯文本通道
+（`out = (s) => (options.stdout ?? process.stdout).write(s)`），带标记就是往用户眼前打符号；
+判据用现成的 `onEvent`（本文件里"有 onEvent = TUI 结构化模式"，与推理/文本增量的分支同源）。
+
+> 为什么这个标记实际是给 MCP 用的：内置工具的 `output` **全是对象**（`JSON.stringify` 会把换行
+> 转义成 `\n` 两个字符，压根不带真实换行）；而 MCP 工具返回的是**纯字符串**
+> （`mcp-client` 的 `texts.length === 1 ? texts[0] : texts.join('\n')`），多行是常态。
+
+### 验证
+
+- 反向验证**逐条归因**（不是一次全回退，否则说不清是哪条断言在守）：
+  - 只把入参切回 60 字符 ⇒ 「整条命令都在」变红
+  - 只把结果切回 120 字符 ⇒ 「最后一行输出在」变红
+  - 去掉 `!!onEvent` 开关 ⇒ 「TUI 模式带续行标记」变红
+  - 注释掉 `classifyConsoleLine` 的续行分支 ⇒ tui 侧 3 条变红
+- 全量 typecheck 39 包 0 error；cli 154 pass（+6）、tui 125 pass（+3）；全量 39 包 0 fail
+
+### 测试踩到的两个坑（值得记）
+
+1. 第一版断言写的是"整段输出里包含完整命令"，回退验证时**照样通过** —— 因为 `bash` 工具的
+   output 里**回显了 command**（`{stdout, stderr, exitCode, command}`），那份回显把被截断的
+   入参行蒙混过去了。断言必须**盯住 🔧 那一行**（`text.split('\n').find(l => l.startsWith('🔧'))`）。
+   **"回退验证变红"才暴露了这条断言是假的** —— 只看绿灯会以为覆盖到了。
+2. 造"多行字符串结果"不能用内置工具（output 都是对象），要用 `extraPlugins` 注入一个返回
+   `'alpha\nbeta\ngamma'` 的工具 —— 这正是 MCP 工具的形状。
+
+### 未做（先不动）
+
+`harness run`（headless）那条通道仍是收窄的：`[工具] <id>` 不打入参，结果只取**首行 + 300 字符**
+（`packages/cli/src/index.ts:4670-4682`，写 stderr、刻意保持"脚本友好"）。这与本次改的交互通道
+是两套消费场景，未一并动；要改需先定"headless 的 stderr 是否要承载完整结果"。
+
 ## 2026-09-28（续 208）MCP 工具供给语义修复 + A1-4 超时回传进展正文 + B2-3 入参提醒
 
 用户报："mcp 服务的工具没有自动注册到 tools 列表上"。查证下来**文档与实现互相打架**，
