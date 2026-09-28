@@ -648,6 +648,58 @@ function describeDraftLocation(draftPath: string, callerCwd?: string): string {
 }
 
 /**
+ * 被掐断时「进展摘要」的字符上限（A1-4）。
+ *
+ * 4000 的来历：它要能塞进一条 tool 结果而不反过来把父 Agent 的上下文顶爆；
+ * 同域的中途草稿是 20k（那是落盘档案，不进上下文），两者刻意不同口径。
+ */
+export const PARTIAL_DIGEST_MAX_CHARS = 4_000
+
+/**
+ * 把「已被掐断的任务」已经产生的进展整理成**可直接消费**的文本（A1-4）。
+ *
+ * 为什么必须回传**正文**而不是只给路径：失败消息里给的草稿 / 全文路径都在 `{dataDir}` 下，
+ * 而调用方（父 Agent）`read_file` 的边界是**它自己的 `ctx.cwd`** ⇒ 那片目录它读不到。
+ * 真机（`s_session_1790593024558_ced93`）：reviewer-4 被 120s 掐断，24 条工具日志全留在草稿里，
+ * 父 Agent 却读不到、只好自己重做 **25 轮 / 148 万 token** 去拿同一批信息 ——
+ * 草稿的意义是"少丢东西"，不是"多给一个打不开的路径"。
+ *
+ * 只如实列出"跑到哪了"（工具名 + 入参预览 + 成败 + 已写出的部分正文），
+ * **不编造任何结论**：被掐断的任务本来就没有结论。
+ */
+function buildPartialDigest(messages: Message[], maxChars = PARTIAL_DIGEST_MAX_CHARS): string | undefined {
+  const toolLines: string[] = []
+  for (const msg of messages) {
+    for (const part of msg.parts) {
+      if (part.type !== 'tool') continue
+      const tcp = part as { toolId: string; input?: unknown; isError?: boolean }
+      toolLines.push(`- ${tcp.isError ? '❌' : '✅'} \`${tcp.toolId}\` ${summarizeToolInput(tcp.toolId, tcp.input)}`)
+    }
+  }
+  const partialText = extractFinalAssistantText(messages).trim()
+  if (toolLines.length === 0 && !partialText) return undefined
+
+  const body = [
+    `⏱ 任务被掐断。以下是**已产生的进展**（不是结论，别当结论用）：`,
+    toolLines.length
+      ? `已完成的工具调用（${toolLines.length} 条）：\n${toolLines.join('\n')}`
+      : '（尚未产生任何工具调用）',
+    ...(partialText ? [`已写出的部分正文：\n${partialText}`] : []),
+  ].join('\n\n')
+  return body.length > maxChars ? `${body.slice(0, maxChars)}\n... [进展摘要已截断]` : body
+}
+
+/** 同上，但输入是后台路径边跑边攒的 `draftDigest` 行（已经格式化过，无需再从 messages 摘） */
+function buildPartialDigestFromLines(lines: readonly string[], maxChars = PARTIAL_DIGEST_MAX_CHARS): string | undefined {
+  if (lines.length === 0) return undefined
+  const body = [
+    `⏱ 任务被掐断。以下是**已产生的进展**（不是结论，别当结论用）：`,
+    lines.join('\n'),
+  ].join('\n\n')
+  return body.length > maxChars ? `${body.slice(0, maxChars)}\n... [进展摘要已截断]` : body
+}
+
+/**
  * 当子 Agent 最终回复过长时生成摘要。
  *
  * 参考 OpenCode `tool/truncation.ts` 的设计：
@@ -1389,9 +1441,15 @@ export function createSubagentTool(
             const draftNote = draftPath
               ? `；已保留中途草稿：${draftPath}（含完成到超时为止的工具产出）${describeDraftLocation(draftPath, ctx.cwd)}`
               : ''
+            // A1-4：草稿路径在 `{dataDir}` 下、调用方读不到，所以**正文也直接回传**一份。
+            // 这条摘要不依赖任何落盘路径，durable 地跟着失败消息走。
+            const digestNote = (() => {
+              const d = buildPartialDigestFromLines(draftDigest)
+              return d ? `\n\n${d}` : ''
+            })()
             // 掐断路径才有草稿留存：`kept` 取"此刻真的存在一份草稿文件"，不取"flushing 有没有被调用"
             publishDraft(draftPath !== undefined)
-            const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}${draftNote}`
+            const errMsg = `后台子 Agent 执行失败：${(err as Error)?.message ?? err}${draftNote}${digestNote}`
             const failDurationMs = Date.now() - startTime
             // 更新 task 为 failed
             registry.fail(taskId, {
@@ -1521,7 +1579,16 @@ export function createSubagentTool(
         try {
           finalMessage = await Promise.race([queryPromise, timeoutPromise])
         } catch (err) {
-          const errMsg = `子 Agent 执行失败：${(err as Error)?.message ?? err}`
+          // A1-4：前台路径此前**连草稿都没有**，超时即"成果全丢"—— 子 session 的消息虽然落盘，
+          // 但落在 `{dataDir}/sessions/` 下、调用方 `read_file` 够不着。这里把子 session 里
+          // 已产生的进展（工具调用 + 部分正文）摘要回传，父 Agent 不必自己重做一遍。
+          let digestNote = ''
+          try {
+            const partial = await session.get(subSessionId)
+            const d = buildPartialDigest(partial?.messages ?? [])
+            if (d) digestNote = `\n\n${d}`
+          } catch { /* 取子 session 失败不影响主错误 */ }
+          const errMsg = `子 Agent 执行失败：${(err as Error)?.message ?? err}${digestNote}`
           publishFailed('SUBAGENT_FAILED', errMsg, input.agentId, subSessionId)
           return {
             ok: false,

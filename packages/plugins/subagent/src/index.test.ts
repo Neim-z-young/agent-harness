@@ -3636,6 +3636,79 @@ describe('派工方可按本次任务规模覆盖子 Agent 步数上限', () => 
  * 可交付正文只有 81 字符，主 Agent 只好用 25 轮 / 148 万 token 手工重做。
  * 挂钟是**资源保护**，不该顺带当"任务该做多久"的主控参数。
  */
+/**
+ * A1-4：被掐断时把"已经跑出来的进展"**回传正文**，而不是只给一个调用方读不到的路径。
+ *
+ * 真机动机（`s_session_1790593024558_ced93`）：reviewer-4 被 120s 掐断，24 条工具日志
+ * 全留在 `{dataDir}/subagent-results/` 的草稿里，而父 Agent 的 `read_file` 边界是它的 `ctx.cwd`
+ * ⇒ 读不到 ⇒ 只好自己重做 25 轮 / 148 万 token。草稿是"少丢东西"的保险，不是"多给个路径"。
+ */
+describe('A1-4：超时/失败时把已产生的进展回传给调用方', () => {
+  const reader: AgentDefinition = {
+    id: 'reader', name: '速读员', description: '只读回报事实', mode: 'subagent',
+    tools: ['read_file'], promptFragments: [], permission: { '*': 'ask' },
+  }
+
+  it('★ 前台超时：错误消息里带工具调用摘要（父 Agent 无需 read_file 即可消费）', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([reader], async (input) => {
+      // 模拟"工具已经跑了几步，卡在最后一步"
+      const sub = sessions.get(input.sessionId)
+      sub?.messages.push({
+        id: 'm_tools',
+        role: 'assistant',
+        parts: [
+          { type: 'tool', toolId: 'read_file', input: { path: 'src/a.ts' }, isError: false, result: {} } as any,
+          { type: 'tool', toolId: 'grep_file', input: { pattern: 'TODO' }, isError: true, result: {} } as any,
+        ],
+        createdAt: Date.now(),
+      })
+      return new Promise<Message>(() => {}) // 永不 resolve ⇒ 只能靠挂钟收场
+    })
+    const tool = createSubagentTool(() => ({ agent, session: createMockSessionManager(sessions) }), 50, false)
+    const res = await tool.call({ agentId: 'reader', prompt: '盘点 x' }, makeToolContext())
+
+    expect(res.ok).toBe(false)
+    const msg = String(res.error?.message ?? '')
+    expect(msg).toInclude('超时')
+    expect(msg).toInclude('已产生的进展')
+    expect(msg).toInclude('read_file')
+    expect(msg).toInclude('grep_file')
+    expect(msg).toInclude('src/a.ts')
+  }, 10_000)
+
+  it('无任何进展时不留空壳摘要（不写"以下是进展"然后空着）', async () => {
+    const agent = createMockAgentRuntime([reader], () => new Promise<Message>(() => {}))
+    const tool = createSubagentTool(
+      () => ({ agent, session: createMockSessionManager(new Map()) }),
+      50,
+      false,
+    )
+    const res = await tool.call({ agentId: 'reader', prompt: 'x' }, makeToolContext())
+    expect(String(res.error?.message ?? '')).not.toInclude('已产生的进展')
+  }, 10_000)
+
+  it('摘要超上限被截断（不把父 Agent 的上下文顶爆）', async () => {
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([reader], async (input) => {
+      const sub = sessions.get(input.sessionId)
+      // 单条入参预览就能到几千字符：断言截断标记出现
+      sub?.messages.push({
+        id: 'm_big',
+        role: 'assistant',
+        parts: [
+          { type: 'tool', toolId: 'read_file', input: { path: 'x'.repeat(8000) }, isError: false, result: {} } as any,
+        ],
+        createdAt: Date.now(),
+      })
+      return new Promise<Message>(() => {})
+    })
+    const tool = createSubagentTool(() => ({ agent, session: createMockSessionManager(sessions) }), 50, false)
+    const res = await tool.call({ agentId: 'reader', prompt: 'x' }, makeToolContext())
+    expect(String(res.error?.message ?? '')).toInclude('[进展摘要已截断]')
+  }, 10_000)
+})
+
 describe('派工方可按本次任务规模放宽挂钟超时', () => {
   const base: AgentDefinition = {
     id: 'reader', name: '速读员', description: '只读回报事实', mode: 'subagent',
