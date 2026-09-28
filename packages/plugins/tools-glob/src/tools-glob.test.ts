@@ -134,6 +134,63 @@ describe('globTool', () => {
     if (res.ok) return
     expect(res.error!.code).toBe('NOT_A_DIR')
   })
+
+  /**
+   * 真机教训（会话 `s_1790592617954_axqkk`）：`pattern` 在 schema 里是 required，但内置工具的
+   * Step 1 是 no-op ⇒ 运行期收不到任何校验。模型丢参数时旧实现走 `if (!pat) continue`
+   * 静默跳过 → `includes` 为空 → 兜底成全匹配 ⇒ 一次扫回 215,562 字符（约 1,937 个文件）。
+   * 这三条断言是"拒绝静默降级"的守卫：任何形态的空 pattern 都必须**明确报错**，
+   * 让模型走「入参自愈」补参数，而不是拿到一份全仓清单。
+   */
+  it('pattern 缺失 / 全为空 ⇒ 拒绝退化成全仓遍历（GLOB_PATTERN_MISSING）', async () => {
+    writeFileSync(join(dir, 'a.ts'), '')
+    writeFileSync(join(dir, 'b.ts'), '')
+
+    const cases: Array<{ label: string; input: unknown }> = [
+      { label: '完全缺失', input: {} },
+      { label: '空串', input: { pattern: '' } },
+      { label: '纯空白', input: { pattern: '   ' } },
+      { label: '数组全空', input: { pattern: ['', '  '] } },
+      { label: '非法类型', input: { pattern: {} } },
+    ]
+    for (const c of cases) {
+      const res = await globTool.call!(c.input as any, ctx)
+      expect(res.ok, c.label).toBe(false)
+      if (res.ok) continue
+      expect(res.error!.code, c.label).toBe('GLOB_PATTERN_MISSING')
+    }
+  })
+
+  it('全是排除项时兜底仍可用，但规模被压制（FALLBACK 上限 + 输出字符预算）', async () => {
+    // 300 个 .txt + 300 个 .md + 1 个 .keep：够触发 FALLBACK_MAX_RESULTS(200) 与字符预算(20_000) 两道闸
+    for (let i = 0; i < 300; i++) {
+      writeFileSync(join(dir, 'f' + String(i).padStart(3, '0') + '.txt'), '')
+      writeFileSync(join(dir, 'g' + String(i).padStart(3, '0') + '.md'), '')
+    }
+    writeFileSync(join(dir, 'only.keep'), '')
+
+    // ① 正向 pattern：字符预算生效 —— 命中 300 条但只回传预算内的部分
+    const byPattern = await globTool.call!({ pattern: '*.txt' } as any, ctx)
+    expect(byPattern.ok).toBe(true)
+    if (!byPattern.ok) return
+    expect(byPattern.output!.filesScanned).toBe(601)
+    expect(byPattern.output!.count).toBeLessThan(300)
+    expect(byPattern.output!.count).toBeGreaterThan(0)
+    expect(byPattern.output!.truncated).toBe(true)
+    // 体积对比真机：旧实现这条会吐回 21 万字符级别
+    expect(JSON.stringify(byPattern.output).length).toBeLessThan(40_000)
+
+    // ② 全排除项：兜底成全匹配语义正确（"除这些之外的全部"，此处命中 301）。
+    //    两道闸取严：FALLBACK_MAX_RESULTS(200) 与字符预算(20_000) 谁先撞谁生效 ——
+    //    本例每条约 150 字符 ⇒ 字符预算先撞（131 条）。断言写成上界契约（≤200 且 < 命中数），
+    //    这样无论哪道闸生效都成立；体积本身由上面 ① 的断言直接守着。
+    const byExclude = await globTool.call!({ pattern: ['!*.txt'] } as any, ctx)
+    expect(byExclude.ok).toBe(true)
+    if (!byExclude.ok) return
+    expect(byExclude.output!.count).toBeLessThanOrEqual(200)
+    expect(byExclude.output!.count).toBeLessThan(301)   // 命中 301 ⇒ 确实被压制
+    expect(byExclude.output!.truncated).toBe(true)
+  })
 })
 
 describe('插件集成', () => {

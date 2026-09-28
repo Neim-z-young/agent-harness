@@ -121,6 +121,24 @@ export interface GlobOutput {
 
 const MAX_GLOB_RESULTS = 5000
 
+/**
+ * 兜底成「排除项之外的全部」时的结果上限，远低于常规上限。
+ *
+ * 为什么单独设：pattern 全是 `!xxx` 排除项时，兜底成「全匹配」是**正确语义**（"除这些之外的全部"），
+ * 不能报错；但这种调用没有正向约束，规模完全不可控 —— 不压上限就是"一次调用扫回整个仓库"。
+ */
+const FALLBACK_MAX_RESULTS = 200
+
+/**
+ * 输出字符预算（对 `entries` 的累积估算，非精确序列化长度）。
+ *
+ * 真机教训（会话 `s_1790592617954_axqkk`）：子 Agent 一次 `glob` 返回 **215,562 字符**
+ * （约 1,937 个文件），而合法入参重调只有 665 字符 —— 该子会话成本是干同类活的另一个的
+ * **3.05 倍**。`MAX_GLOB_RESULTS`（5000）只管条目数、不管体积，几千条短路径照样能撑爆上下文。
+ * 命中数再多也只回传预算内的部分，并置 `truncated = true` 让调用方知道要收窄 pattern。
+ */
+const MAX_GLOB_OUTPUT_CHARS = 20_000
+
 export const globTool = defineTool<GlobInput, GlobOutput>({
   id: 'glob',
   description: '按模式（glob，支持 **/*/? 通配符，! 取反）递归搜索文件，支持排除、大小过滤、深度限制。',
@@ -154,21 +172,48 @@ export const globTool = defineTool<GlobInput, GlobOutput>({
 
     // 解析 include / exclude patterns
     const rawPatterns = Array.isArray(input.pattern) ? input.pattern : [input.pattern]
+    /**
+     * 非空判定用 `trim()`：模型丢参数时的典型形态是 `''` / 纯空白 / 非法类型，
+     * 而 `if (!pat) continue` 会把它们全部静默跳过 —— 跳过之后 `includes` 为空，
+     * 再兜底成全匹配 ⇒ 退化成全仓遍历（见 MAX_GLOB_OUTPUT_CHARS 处的真机数字）。
+     */
+    const isUsable = (p: unknown): p is string => typeof p === 'string' && p.trim().length > 0
     const includes: RegExp[] = []
     const excludes: RegExp[] = []
     for (const pat of rawPatterns) {
-      if (!pat) continue
+      if (!isUsable(pat)) continue
       if (pat.startsWith('!')) excludes.push(globToRegex(pat.slice(1)))
       else includes.push(globToRegex(pat))
     }
     if (input.exclude) {
       for (const ex of input.exclude) {
-        if (ex) excludes.push(globToRegex(ex.startsWith('!') ? ex.slice(1) : ex))
+        if (isUsable(ex)) excludes.push(globToRegex(ex.startsWith('!') ? ex.slice(1) : ex))
       }
     }
-    if (includes.length === 0) includes.push(globToRegex('**/*'))
 
-    const maxResults = Math.min(input.maxResults ?? MAX_GLOB_RESULTS, MAX_GLOB_RESULTS)
+    // ⚠️ 拒绝「静默退化成全仓遍历」：pattern 缺失 / 全为空值时**直接报错**，不再兜底。
+    // schema 里 `pattern` 是 `required`，但内置工具的 Step 1 是 no-op（`makeSchema` 的
+    // safeParse 恒通过）⇒ 运行期必须自己拦。明确报错让模型走「入参自愈」补齐参数，
+    // 代价远小于把整个仓库灌进上下文。
+    if (rawPatterns.filter(isUsable).length === 0) {
+      return {
+        ok: false,
+        error: {
+          message:
+            `pattern 缺失或全为空（收到 ${JSON.stringify(input.pattern)}）：拒绝退化成全仓遍历。`
+            + '请给出明确的匹配模式，如 "src/**/*.ts" 或 ["src/**/*.ts","!src/dist/**"]。',
+          code: 'GLOB_PATTERN_MISSING',
+        },
+      }
+    }
+
+    // 合法兜底：pattern 全是排除项（"!..."）时确实要「除这些之外的全部」，但规模必须压制
+    const fellBackToAll = includes.length === 0
+    if (fellBackToAll) includes.push(globToRegex('**/*'))
+
+    const maxResults = fellBackToAll
+      ? Math.min(input.maxResults ?? FALLBACK_MAX_RESULTS, FALLBACK_MAX_RESULTS)
+      : Math.min(input.maxResults ?? MAX_GLOB_RESULTS, MAX_GLOB_RESULTS)
     const includeHidden = input.includeHidden ?? false
     const maxDepth = Math.min(input.maxDepth ?? 10, 20)
     const minSize = input.minSizeBytes
@@ -232,13 +277,27 @@ export const globTool = defineTool<GlobInput, GlobOutput>({
         return { ok: false, error: { message: `"${relRoot}" 不是目录`, code: 'NOT_A_DIR' } }
       }
       await scan(absRoot, 0)
+
+      const sorted = entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath))
+      // 字符预算裁剪：命中数再多，也只回传预算内的部分（至少留 1 条，避免"全被裁掉"的空结果）。
+      // 估算口径 = 相对路径 + 绝对路径 + 其余字段的固定开销，序列化里这两项占绝大部分。
+      let used = 0
+      let kept = 0
+      for (const e of sorted) {
+        const cost = e.relativePath.length + e.absolutePath.length + 64
+        if (kept > 0 && used + cost > MAX_GLOB_OUTPUT_CHARS) { truncated = true; break }
+        used += cost
+        kept++
+      }
+      const outEntries = kept < sorted.length ? sorted.slice(0, kept) : sorted
+
       return {
         ok: true,
         output: {
           pattern: rawPatterns,
           root: absRoot,
-          entries: entries.sort((a, b) => a.relativePath.localeCompare(b.relativePath)),
-          count: entries.length,
+          entries: outEntries,
+          count: outEntries.length,
           filesScanned,
           truncated,
         },
