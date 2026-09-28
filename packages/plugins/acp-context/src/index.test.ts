@@ -29,6 +29,7 @@ import {
   ACP_ARCHIVE_KEY,
   COMPRESS_MANUAL_HINT,
   COMPRESS_TOOL_DOC,
+  TOOL_ARGS_REMINDER,
 } from './index'
 import { toCores, compactHistory, idBase, baseId, estimateTokens, chars4CountTokens } from './adapter'
 import { loadPromptFiles } from './prompts'
@@ -952,6 +953,58 @@ test('createAcpContextPlugin：manualInjection always，低占用也注入完整
   const sysText = (messages[0]!.parts[0] as any).text
   expect(sysText).toInclude('All compression serves the primary task') // 完整内核压缩手册正文
   expect(sysText).not.toBe(COMPRESS_MANUAL_HINT)
+})
+
+// ── B2-3：工具入参完整性提醒（触发条件是"真丢过参数"，不是占用率）──
+//
+// 为什么不按占用率触发：真机 s_1790592617954_axqkk 丢 14 次空入参时 occupancy 峰值仅 22.83%，
+// 任何长上下文阈值（25% / 35%）都不会触发 ⇒ 那等于没修。改用 `core.tool.params.missing`
+// （与 selfHealOnly 免计额度同源的直接信号）作触发条件。
+test('B2-3：本会话丢过一次工具入参 ⇒ 之后每轮尾部常驻「入参完整性」提醒', async () => {
+  const plugin = createAcpContextPlugin({ modelContextLimit: 20000, manualInjection: 'on-demand' })
+  const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
+  const preModel = (raw: Message[]) =>
+    hooks['core.session.preModel']!(
+      { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] } as any,
+      raw,
+    )
+
+  // ① 还没丢过参数：尾部不出现提醒（不能无条件常驻 —— 那是白付 token）
+  const before = history(3)
+  await preModel(before)
+  expect(JSON.stringify(before)).not.toContain(TOOL_ARGS_REMINDER)
+
+  // ② core 报了一次「必填项没给全」
+  hooks['core.tool.params.missing']!({ toolId: 'read_file', sessionId: 's', agentId: 'lead', step: 3, missingCount: 1 })
+
+  // ③ 之后尾部有提醒、且**只在尾部**（前缀仍恒定，翻转不伤前缀缓存）
+  const after = history(3)
+  await preModel(after)
+  const tail = after.filter((m) => m.id.startsWith('acp_user_'))
+  expect(tail).toHaveLength(1)
+  expect((tail[0]!.parts[0] as any).text).toContain(TOOL_ARGS_REMINDER)
+  expect(after[after.length - 1]!.id).toBe(tail[0]!.id)
+  const sys = after.find((m) => m.role === 'system')!
+  expect((sys.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+  expect((sys.parts[0] as any).text).not.toContain(TOOL_ARGS_REMINDER)
+
+  // ④ 粘性：后续轮次继续提醒
+  const again = history(3)
+  await preModel(again)
+  expect(JSON.stringify(again)).toContain(TOOL_ARGS_REMINDER)
+})
+
+test('B2-3：信号里没有 sessionId 时不抛、也不误置到别的会话', async () => {
+  const plugin = createAcpContextPlugin({ modelContextLimit: 20000 })
+  const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
+  expect(() => hooks['core.tool.params.missing']!({ toolId: 'read_file', step: 1, missingCount: 2 })).not.toThrow()
+
+  const messages = history(3)
+  await hooks['core.session.preModel']!(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] } as any,
+    messages,
+  )
+  expect(JSON.stringify(messages)).not.toContain(TOOL_ARGS_REMINDER)
 })
 
 test('createAcpContextPlugin：compress 工具 documentation 非空且 ≤ 600 字符（兜底要点齐备）', async () => {

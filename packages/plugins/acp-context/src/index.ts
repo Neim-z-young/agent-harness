@@ -111,6 +111,25 @@ export const COMPRESS_MANUAL_HINT =
   '接近容量上限时可调用 compress 工具压缩历史；用法见该工具说明（acp_status 可查看当前占用率）。'
 
 /**
+ * 长上下文「工具入参完整性」提醒（B2-3，注入在**尾部**）。
+ *
+ * 动机：模型在长上下文下会**整段丢** tool-call arguments（真机 100 次调用 37 次失败、
+ * 其中 34 次是 `input:{}`，失败率随上下文从 12% 升到 50%）；会话 `s_1790592617954_axqkk`
+ * 又采样到 14 次，每次多烧一轮全量上下文（14 × 约 48.6k ≈ 0.68M ≈ 10% 成本）。
+ * core 的 `[入参自愈]` 兜住的是"报错之后能补"，兜不住"先丢一次"本身。
+ *
+ * 触发条件刻意**不用占用率**：那次事故的 occupancy 峰值只有 22.83%，任何"长上下文阈值"
+ * （25% / 35%）都不会触发，等于没修。改用 `core.tool.params.missing`（与 selfHealOnly
+ * 免计额度同源的直接信号）—— 本会话真的丢过一次参数才提醒，零猜测、零误报。
+ *
+ * 为什么放尾部而不是系统区：本提醒一旦置位就粘住（翻转代价 ≈ 0 只因为它不在前缀）；
+ * 放前缀则每翻转一次都要连带重算其后整段历史（量化见 MANUAL_INJECT_MARGIN 注释）。
+ */
+export const TOOL_ARGS_REMINDER =
+  '⚠️ 调用工具时必须携带**完整** arguments（必填参数一个都不能少）；'
+  + '若上一次调用因缺参被拒，请补齐参数后重试，不要重发空入参的调用。'
+
+/**
  * compress 工具的 `documentation`：每轮都出现在工具载荷里，所以必须短（≤ 600 字符）。
  * 从内核压缩手册（buildCompressSystemPrompt 输出）提炼"何时压 / content 给什么"的要点：
  * 范围用 startId/endId ref、summary 必须自包含、只压"已完成且不再需要原文"的段。
@@ -345,6 +364,13 @@ interface AcpSessionCtx {
   needFull: boolean
   /** 全量路径最后一次的 token 估算，用于判断增量是否逼近阈值 */
   lastTokens: number
+  /**
+   * 本会话已出现过「工具必填项没给全」⇒ 之后每轮在尾部提醒一次（B2-3）。
+   *
+   * 粘性（置位后本会话不再清除）：丢参数是"上下文一长就复发"的形态，
+   * 提醒只有一行且落在尾部，常驻比反复开关更省、也更可靠。
+   */
+  needsArgsReminder?: boolean
   /** 会话 meta 写访问器（由 runPreModel 注入，供 compress 工具即时持久化状态） */
   meta?: { patch: (patch: Record<string, unknown>) => Promise<void> }
   // ---- 遥测 ----
@@ -749,6 +775,16 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
       return {
         async 'core.tool.pool.assemble'(_input, pool) {
           for (const t of tools) (pool as { add: (t: unknown) => void }).add(t)
+        },
+
+        /**
+         * B2-3：模型把一次工具调用的必填参数整段丢了 ⇒ 给本会话置一个**粘性**标记，
+         * 从下一轮起在尾部常驻提醒（见 {@link TOOL_ARGS_REMINDER} 处为何不用占用率触发）。
+         *
+         * 只置位、不做任何 IO、不改本轮结果 —— 这条 hook 与 selfHealOnly 免计额度同源。
+         */
+        'core.tool.params.missing'(input) {
+          if (input.sessionId) getOrCreateCtx(input.sessionId).needsArgsReminder = true
         },
 
         async 'core.session.preModel'(input, rawMessages) {
@@ -1218,6 +1254,8 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const tailParts = [
     nudge?.shouldInject ? renderNudgeText(nudge, deps.prompts).text : '',
     needTailManual ? deps.makeSystemPrompt() : '',
+    // B2-3：本会话已丢过参数 ⇒ 尾部常驻一行提醒（尾部翻转不伤前缀缓存）
+    ctx.needsArgsReminder ? TOOL_ARGS_REMINDER : '',
   ].filter(Boolean)
   if (tailParts.length > 0) {
     request.push(deps.tempMessage('user', tailParts.join('\n\n'), sessionId))
