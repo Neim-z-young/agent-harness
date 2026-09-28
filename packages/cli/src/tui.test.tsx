@@ -12,7 +12,7 @@ import { describe, it, expect, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { HarnessApp, parseCliArgs } from './index'
+import { HarnessApp, parseCliArgs, TOOL_CONT_MARK } from './index'
 import {
   classifyConsoleLine,
   pushConsole,
@@ -111,6 +111,10 @@ describe('classifyConsoleLine 控制台行归类', () => {
     expect(classifyConsoleLine('🤖你好').kind).toBe('assistant')
     expect(classifyConsoleLine('🔧t1 args').kind).toBe('tool')
   })
+  it('多行工具结果的续行（┆ 标记）→ tool，且标记被剥掉（界面/复制都不该看到它）', () => {
+    expect(classifyConsoleLine(`${TOOL_CONT_MARK}beta`)).toEqual({ kind: 'tool', text: 'beta' })
+    expect(classifyConsoleLine(`${TOOL_CONT_MARK}`)).toEqual({ kind: 'tool', text: '' })
+  })
 })
 
 describe('pushConsole 追加控制台文本', () => {
@@ -172,6 +176,20 @@ describe('pushConsole 追加控制台文本', () => {
     expect(s.blocks.filter((b) => b.kind === 'tool')).toHaveLength(1)
     expect(s.blocks.map((b) => b.kind)).toEqual(['tool', 'thinking'])
     expect(s.blocks[0].text).toBe('🔧  list_dir {...}\n✅  → entries\n🔧  list_dir {}\n✅  → entries2\n🔧  bash {}\n✅  → out')
+  })
+  it('多行工具结果并进同一个 tool 块（不是 tool + system 两块），标记不出现在块文本里', () => {
+    let s = pushConsole(initialChatState, '🔧  bash {"command":"seq 1 3"}')
+    s = pushConsole(s, `✅  → 1\n${TOOL_CONT_MARK}2\n${TOOL_CONT_MARK}3`)
+    // 截断一去掉，多行结果就成了常态；若续行落到 system 块，一次工具调用会冒出两个块、
+    // 两个「⧉ 复制」按钮（tool 块渲染器本就按多行设计：结果行自动补 │/└ 树状缩进）
+    expect(s.blocks).toHaveLength(1)
+    expect(s.blocks[0].kind).toBe('tool')
+    expect(s.blocks[0].text).toBe('🔧  bash {"command":"seq 1 3"}\n✅  → 1\n2\n3')
+    expect(s.blocks[0].text).not.toContain(TOOL_CONT_MARK)
+  })
+  it('多行工具结果里的空行被保留（┆ 本身非空白，不会被 pushConsole 当空行丢掉）', () => {
+    let s = pushConsole(initialChatState, `✅  → a\n${TOOL_CONT_MARK}\n${TOOL_CONT_MARK}b`)
+    expect(s.blocks[0].text).toBe('✅  → a\n\nb')
   })
 })
 

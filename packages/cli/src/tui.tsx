@@ -36,7 +36,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
-import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy } from './index'
+import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy, TOOL_CONT_MARK } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
@@ -196,6 +196,9 @@ export function initialChatWithWelcome(welcome: string): ChatState {
 /** 单行控制台文本 → 块类型与净化后的内容 */
 export function classifyConsoleLine(line: string): { kind: ChatBlockKind; text: string } {
   const t = line.replace(/^\u0020/, '') // 去掉行首单个空格
+  // 多行工具结果的续行（见 index.ts 的 TOOL_CONT_MARK）：归回 tool 块并**剥掉标记**，
+  // 标记只在传输层存在 —— 落到块文本里的必须是干净的原文（复制出去的也一样）。
+  if (t.startsWith(TOOL_CONT_MARK)) return { kind: 'tool', text: t.slice(TOOL_CONT_MARK.length) }
   if (t.startsWith('🧑')) return { kind: 'user', text: t.replace(/^\S+\s*/, '').trim() }
   if (t.startsWith('💭')) return { kind: 'thinking', text: t.replace(/^\S+\s*/, '').trim() }
   if (t.startsWith('🤖')) return { kind: 'assistant', text: t.replace(/^\S+\s*/, '').trim() }

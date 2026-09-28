@@ -96,6 +96,7 @@ import { existsSync } from 'node:fs'
 import { readFile, writeFile, mkdir } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
 import { pathToFileURL } from 'node:url'
+import { inspect } from 'node:util'
 
 // ========================================================================
 // 1. 参数解析
@@ -3542,6 +3543,66 @@ export async function resolveTodayUsage(app: HarnessApp | undefined, current: Se
 }
 
 /**
+ * 工具结果「续行」标记：多行输出的第 2..N 行以此开头。
+ *
+ * 为什么需要：TUI 的控制台文本是**逐行**分类的（`pushConsole`），一行读不出前缀就只能落成
+ * system 块 —— 一条 `read_file` / `bash` 输出会被劈成「tool 块 + system 块」两个块；而
+ * tool 块的渲染器**本来就按多行设计**（首行加粗，结果行自动补 `│ `/`└ ` 树状缩进），
+ * 且**每个块各带一个「⧉ 复制」按钮** ⇒ 截断一去掉，一次工具调用就会冒出两个复制按钮。
+ * 给续行一个标记，分类器就能把它并回**同一个** tool 块。
+ *
+ * 该标记纯属传输用：`classifyConsoleLine` 会把它剥掉，界面与复制出的文本里都看不到它。
+ * 用 `┆`(U+2506) 而不用 `│`：后者是 tool 块渲染器给结果行补的**视觉**前缀，两者不能混。
+ */
+export const TOOL_CONT_MARK = '┆'
+
+/**
+ * JSON 序列化；失败（循环引用 / BigInt 等）退化为 `util.inspect`。
+ * 两条路径都保证是**完整**文本：工具入参/结果都来自 JSON 解析，正常走不到这里，
+ * 但真走到了也不该变成"看不见内容"的 `[object Object]`。
+ */
+function safeStringify(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? inspect(value, { depth: null, breakLength: Infinity })
+  } catch {
+    return inspect(value, { depth: null, breakLength: Infinity })
+  }
+}
+
+/**
+ * 工具调用回显的入参文本：**完整序列化，不截断**。
+ *
+ * 此前这里写死 `JSON.stringify(input).slice(0, 60) + '...'`：bash 命令稍长就只剩前半截，
+ * 用户看到的是一个**已经变形**的命令（少了重定向、少了后半段管道），而末尾那个 `...`
+ * 只说明"被砍过"，不说明砍掉了什么 —— 复核这条调用必须回去翻原始日志。
+ * 事件的 `input` 本就是完整值（core 侧 `tool_call_start` 注释明写"含 input 完整值"），
+ * 截断发生在展示层，属于自己把上游给的信息丢掉。
+ */
+export function formatToolInput(input: unknown): string {
+  if (input === undefined) return '{}'
+  return safeStringify(input)
+}
+
+/**
+ * 工具结果回显的文本：**完整打印，不截断**。
+ *
+ * 此前只取前 120 字符：grep / read_file / 测试日志这类长输出永远看不到结论，
+ * 用户只能再让模型复述一遍 —— 多烧一轮上下文，复述本身还可能失真。
+ * string 原样输出（保留换行）；其它类型 JSON 序列化。
+ *
+ * @param markContinuation 是否给第 2..N 行加 {@link TOOL_CONT_MARK}。**只有 TUI 需要**
+ *   （它逐行分类，靠标记把续行并回同一个 tool 块）；REPL 是直写 stdout 的纯文本通道，
+ *   带标记等于往用户眼前打符号。调用方按 `onEvent`（本文件里即"TUI 结构化模式"）判定。
+ */
+export function formatToolResult(result: unknown, markContinuation = false): string {
+  const body = typeof result === 'string'
+    ? result
+    : result === undefined ? '' : safeStringify(result)
+  if (!markContinuation || !body.includes('\n')) return body
+  return body.split('\n').map((l, i) => (i === 0 ? l : TOOL_CONT_MARK + l)).join('\n')
+}
+
+/**
  * 创建「处理一行输入」的函数（REPL 与 TUI 共用同一套会话处理逻辑）。
  *
  * - 处理 `/` 特殊命令（/help /exit /sessions /save /new /switch /compact
@@ -4167,15 +4228,15 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           case 'tool_call_start':
             if (inText || inReasoning) { out('\n'); inText = false; inReasoning = false }
             onEvent?.(ev)
-            out(`🔧  ${ev.toolId} ${JSON.stringify(ev.input).slice(0, 60)}...\n`)
+            // 入参完整打印（工具的"命令行"就是它的入参，截断即无法复核）
+            out(`🔧  ${ev.toolId} ${formatToolInput(ev.input)}\n`)
             break
           case 'tool_call_result': {
             const status = ev.isError ? '❌' : '✅'
-            const preview = typeof ev.result === 'string'
-              ? ev.result.slice(0, 120)
-              : JSON.stringify(ev.result ?? '').slice(0, 120)
             onEvent?.(ev)
-            out(`${status}  → ${preview}\n`)
+            // 结果完整打印：一条工具输出的结论往往在长文本尾部，截断等于没给。
+            // 多行结果的续行标记只给 TUI（它逐行分类，靠标记并回同一个 tool 块）
+            out(`${status}  → ${formatToolResult(ev.result, !!onEvent)}\n`)
             break
           }
           case 'done':

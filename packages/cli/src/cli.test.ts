@@ -40,9 +40,13 @@ import {
   buildProviderTypesSection,
   HELP_TEXT,
   main,
+  formatToolInput,
+  formatToolResult,
+  TOOL_CONT_MARK,
 } from './index'
 import { SubagentEvents } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
+import { defineTool } from '@harness/tool'
 import type { PermissionDecision } from '@harness/permission'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
@@ -1126,6 +1130,53 @@ describe('CliPermissionEngine', () => {
     expect(b.behavior).toBe('deny')
     expect(b.remember).toBe(true)
     expect(saved).toMatchObject({ bash: 'allow', foo: 'deny' })
+  })
+})
+
+/**
+ * 工具回显：**完整打印，不截断**。
+ *
+ * 此前入参写死 `JSON.stringify(input).slice(0, 60) + '...'`、结果 `.slice(0, 120)`：
+ * bash 命令稍长就只剩前半截（而且是**变形**过的前半截），长输出的结论永远落在 120 字符
+ * 之外。下面用"超过旧上限的正文必须一字不少地出现"来锁 —— 谁把 slice 加回来立刻变红，
+ * 而不是仅凭肉眼"看着差不多"。
+ */
+describe('工具回显格式化：完整打印 + 续行标记', () => {
+  it('formatToolInput：长入参原样序列化，不切、不加省略号', () => {
+    const command = `for i in $(seq 1 30); do echo "line-$i-${'p'.repeat(40)}"; done`
+    expect(command.length).toBeGreaterThan(60)                 // 旧实现在 60 字符处切断
+    const s = formatToolInput({ command, description: '遍历打印' })
+    expect(s).toBe(JSON.stringify({ command, description: '遍历打印' }))
+    expect(s).toContain(JSON.stringify(command))
+  })
+
+  it('formatToolInput：undefined → {}；不可序列化时退化为完整字符串而非抛错', () => {
+    expect(formatToolInput(undefined)).toBe('{}')
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    expect(() => formatToolInput(cyclic)).not.toThrow()
+    expect(formatToolInput(cyclic)).toContain('self')
+  })
+
+  it('formatToolResult：长结果一字不少（不再停在 120 字符）', () => {
+    const body = Array.from({ length: 200 }, (_, i) => `line-${i}-${'y'.repeat(30)}`).join('\n')
+    expect(body.length).toBeGreaterThan(5_000)
+    expect(formatToolResult(body)).toBe(body)
+  })
+
+  it('formatToolResult：对象结果 JSON 化后同样完整', () => {
+    const out = { path: '/tmp/a.ts', content: 'z'.repeat(300), totalLines: 1 }
+    expect(formatToolResult(out)).toBe(JSON.stringify(out))
+  })
+
+  it('formatToolResult：续行标记只在 TUI 模式下加', () => {
+    // REPL：纯文本通道，原样输出
+    expect(formatToolResult('l1\nl2\nl3')).toBe('l1\nl2\nl3')
+    // TUI：第 2..N 行带标记（供分类器并块）
+    expect(formatToolResult('l1\nl2\nl3', true).split('\n'))
+      .toEqual(['l1', `${TOOL_CONT_MARK}l2`, `${TOOL_CONT_MARK}l3`])
+    // 单行结果无需标记
+    expect(formatToolResult('single', true)).toBe('single')
   })
 })
 
@@ -2353,6 +2404,110 @@ describe('Coordinator 自动续轮 attachAutoContinue', () => {
 
     expect(injected).toHaveLength(0)
     await app.shutdown()
+  })
+
+  /**
+   * 工具回显：**完整打印，不截断**。
+   *
+   * 此前入参写死 `JSON.stringify(input).slice(0, 60) + '...'`、结果 `.slice(0, 120)`：
+   * bash 命令稍长就只看得到前半截（而且是**变形**后的前半截），长输出的结论永远落在
+   * 120 字符之外。下面的断言都用"超过旧上限的正文必须一字不少地出现"来锁 —— 谁把 slice
+   * 加回来，它们立刻变红（而不是仅凭肉眼"看不出区别"）。
+   */
+  it('工具回显完整打印：整条命令（>60 字符）与最后一行输出（>120 字符处）都在', async () => {
+    const command = `for i in $(seq 1 30); do echo "line-$i-${'p'.repeat(20)}"; done`
+    const lastLine = `line-30-${'p'.repeat(20)}`
+    expect(command.length).toBeGreaterThan(60)
+
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout: { write: () => {} },
+      mockProviderConfig: {
+        defaultResponse: '完成',
+        responses: [{
+          match: '跑一条命令', once: true, response: '',
+          toolCalls: [{ toolUseId: 't1', toolId: 'bash', input: { command } }],
+        }],
+      },
+    })
+    const { harness } = await app.boot()
+    const sess = await harness.session.create()
+
+    const out: string[] = []
+    const processLine = createProcessLine({ app, harness, session: sess, out: (s) => { out.push(s) } })
+    await processLine('跑一条命令')
+    const text = out.join('')
+    // 断言必须**盯住 🔧 那一行**：bash 的 output 里也回显了 command，用整段文本判"命令是否完整"
+    // 会被那份回显蒙混过去（回退验证实测：入参切到 60 字符时整段断言照样通过）。
+    const toolLine = text.split('\n').find((l) => l.startsWith('🔧')) ?? ''
+
+    // ① 入参完整（含 JSON 结尾引号）⇒ 没被切到 60 字符
+    expect(toolLine).toContain(JSON.stringify(command))
+    // ② 结果完整 ⇒ 没被切到 120 字符
+    expect(text).toContain(lastLine)
+    // ③ REPL 是直写 stdout 的纯文本通道：不能出现 TUI 专用的续行标记
+    expect(text).not.toContain(TOOL_CONT_MARK)
+
+    await app.shutdown()
+  })
+
+  it('多行字符串结果：TUI 模式带续行标记、REPL 模式是干净原文', async () => {
+    // 为什么要注入工具：MCP 工具返回的就是**纯字符串**（多行文本内容，见 mcp-client 的
+    // `texts[0]` / `texts.join('\n')`），而内置工具的 output 是对象 —— JSON.stringify 会把
+    // 换行转义成 `\n` 两个字符，压根不带真实换行。用注入工具才造得出"多行结果"。
+    const MultiText: AgentPlugin = {
+      id: 'multi-text-tool', version: '1', name: 'MultiText',
+      async install() {
+        return {
+          async 'core.tool.pool.assemble'(_i: unknown, pool: unknown) {
+            (pool as { add: (t: unknown) => void }).add(defineTool({
+              id: 'echo_text',
+              description: '回显多行文本',
+              inputSchema: {
+                parse: (v: unknown) => v,
+                safeParse: (v: unknown) => ({ success: true as const, data: v }),
+                __jsonSchema: { type: 'object', properties: {} },
+              } as never,
+              async call() { return { ok: true, output: 'alpha\nbeta\ngamma' } },
+            }))
+          },
+        } as Hooks
+      },
+    }
+    const boot = (match: string) => new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout: { write: () => {} },
+      extraPlugins: [MultiText],
+      mockProviderConfig: {
+        defaultResponse: '完成',
+        responses: [{
+          match, once: true, response: '',
+          toolCalls: [{ toolUseId: 'tt', toolId: 'echo_text', input: {} }],
+        }],
+      },
+    })
+
+    // ① REPL 模式（无 onEvent）：直写 stdout 的纯文本通道，不能出现传输用标记
+    const replApp = boot('第一次')
+    const a = await replApp.boot()
+    const aSess = await a.harness.session.create()
+    const replOut: string[] = []
+    await createProcessLine({ app: replApp, harness: a.harness, session: aSess, out: (s) => { replOut.push(s) } })('第一次')
+    expect(replOut.join('')).toContain('alpha\nbeta\ngamma')
+    expect(replOut.join('')).not.toContain(TOOL_CONT_MARK)
+    await replApp.shutdown()
+
+    // ② TUI 模式（有 onEvent）：续行带标记，分类器据此并回同一个 tool 块
+    const tuiApp = boot('第二次')
+    const b = await tuiApp.boot()
+    const bSess = await b.harness.session.create()
+    const tuiOut: string[] = []
+    await createProcessLine({
+      app: tuiApp, harness: b.harness, session: bSess,
+      out: (s) => { tuiOut.push(s) }, onEvent: () => {},
+    })('第二次')
+    expect(tuiOut.join('')).toContain(`${TOOL_CONT_MARK}beta`)
+    await tuiApp.shutdown()
   })
 })
 
