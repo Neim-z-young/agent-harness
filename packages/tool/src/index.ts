@@ -721,6 +721,60 @@ export function filterMcpTools(
   })
 }
 
+/**
+ * Agent 可用工具集的**最终组装**：原生白名单结果 + 声明的 MCP server **供给**的工具。
+ *
+ * 为什么不能只靠 {@link filterMcpTools}：它是**纯收窄**（intersection），必须喂"含 MCP 的全集"
+ * 才能挑出 MCP 工具。而装配链路的实际入参是 `filterByWhitelist(agent.tools)` 的结果 ——
+ * MCP 工具**在那一步就被剔掉了**（它们不在显式 `tools:` 列表里），于是第二阶段再怎么筛都是空集。
+ * 真机代价：agent md 里写了 `mcpServers: ['code-intel']`，却一个 MCP 工具都拿不到
+ * （探针实测 `TOOL_NOT_ALLOWED`），只有把 `mcp__code-intel__*` 逐条手写进 `tools:` 才生效 ——
+ * 而文档（`@harness/agent` 的 `AgentDefinition.mcpServers`）写的是"声明该 Agent 可用哪些 server 的**全部工具**"，
+ * 即**供给**语义。本函数把实现拉回文档语义。
+ *
+ * 规则（`picked` = `filterByWhitelist(agent.tools)` 的结果，`all` = 注册表全量）：
+ * - `mcpServers` 为**非空数组** → 该列表内每个 server 的**全部**工具补进结果（去重）；
+ *   同时把 `picked` 里 server 不在列表内的 MCP 工具剔除（`picked` 可能因 `'*'` 已含 MCP）。
+ * - `mcpServers: []` → 拒绝全部 MCP（连 `picked` 里显式列出的 MCP 工具也剔除，fail-closed）。
+ * - `mcpServers` undefined → **不供给**：MCP 工具只能靠 `tools:` 显式写 id（或 `'*'`）进入。
+ *   （刻意与文档的"undefined = 全可见"不同：那是 fail-open，会让 `tools: ['read_file']` 的
+ *   agent 静默拿到全部 MCP 工具。要全可见就写 `'*'`，要让某 agent 用某 server 就声明它。）
+ * - `excludeMcpServers` → 黑名单，仅在 `mcpServers` 未定义时生效，剔除对应 server 的 MCP 工具
+ *   （含 `picked` 里显式列出的）。白名单优先于黑名单。
+ * - 非 MCP 工具始终不受影响；server 名匹配前 trim。
+ */
+export function supplyMcpTools(
+  picked: Tool[],
+  all: Tool[],
+  mcpServers?: string[],
+  excludeMcpServers?: string[],
+  index: McpToolIndex = globalMcpToolIndex,
+): Tool[] {
+  const white = mcpServers === undefined ? undefined : new Set(mcpServers.map((s) => s.trim()))
+  const black = excludeMcpServers === undefined ? undefined : new Set(excludeMcpServers.map((s) => s.trim()))
+  const serverOf = (id: string): string | undefined => resolveMcpTool(id, index)?.server.trim()
+
+  const kept = picked.filter((t) => {
+    const server = serverOf(t.id)
+    if (server === undefined) return true // 非 MCP 工具恒保留
+    if (white !== undefined) return white.has(server) // 白名单（含空数组=全拒）优先
+    return !black?.has(server)
+  })
+
+  // 供给：仅当显式声明了非空 server 列表
+  if (white === undefined || white.size === 0) return kept
+  const seen = new Set(kept.map((t) => t.id))
+  const out = [...kept]
+  for (const t of all) {
+    if (seen.has(t.id)) continue
+    const server = serverOf(t.id)
+    if (server === undefined || !white.has(server)) continue
+    out.push(t)
+    seen.add(t.id)
+  }
+  return out
+}
+
 // ===== ToolPipeline =====
 
 /** ToolPipeline 构造参数 */

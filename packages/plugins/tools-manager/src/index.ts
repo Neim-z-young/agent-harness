@@ -16,7 +16,7 @@
  */
 
 import type { CliCommandInput, AgentPlugin, Hooks, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
-import { globalMcpToolIndex, resolveMcpTool, formatToolWhitelist, type Tool } from '@harness/tool'
+import { globalMcpToolIndex, resolveMcpTool, supplyMcpTools, formatToolWhitelist, type Tool } from '@harness/tool'
 import type { Bus, Unsubscribe } from '@harness/bus'
 import { LifecycleEvents } from '@harness/core'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
@@ -31,7 +31,13 @@ interface HarnessView {
     filterByWhitelist(whitelist: string[] | ['*']): Tool[]
   }
   agent: {
-    get(agentId: string): { id: string; tools: string[] } | undefined
+    get(agentId: string): {
+      id: string
+      tools: string[]
+      /** MCP server 声明：非空数组 = 供给这些 server 的全部工具（与 core 装配同一判据） */
+      mcpServers?: string[]
+      excludeMcpServers?: string[]
+    } | undefined
   }
 }
 
@@ -87,6 +93,33 @@ function unionTools(loaded: Tool[], meta: ToolMetaLookup | undefined): Array<Too
 }
 
 /**
+ * Agent 最终可用工具（**与 core 装配同一判据**）：
+ * `filterByWhitelist(agent.tools)` 定原生部分，再由 `supplyMcpTools` 在注册表全量上
+ * 补齐 agent 声明的 `mcpServers` 的全部工具。
+ *
+ * 为什么必须共用同一个函数：`/tools` 展示的是"模型能调什么"。若这里只按 `filterByWhitelist`
+ * 算，声明了 `mcpServers: ['gh']` 的 agent 会被显示成「拿不到 gh 工具」，
+ * 而实际执行已经能调 —— 展示与执行两套判据，用户就没法信任其中任何一套。
+ */
+function agentAllowedTools(inp: ToolsCtx): Tool[] {
+  const def = inp.harness.agent.get(inp.agentId)
+  const whitelist = def?.tools ?? ['*']
+  // `tools: []`（"一个都不给"）是绝对逃生口，连 MCP 供给一并关掉 —— 与 core 装配同一判据
+  if (whitelist.length === 0) return []
+  return supplyMcpTools(
+    inp.harness.tools.filterByWhitelist(whitelist),
+    inp.harness.tools.list(),
+    def?.mcpServers,
+    def?.excludeMcpServers,
+  )
+}
+
+/** 上述结果的 id 集合（表格按行查状态用；一次算好，避免逐行重算） */
+function agentAllowedIds(inp: ToolsCtx): Set<string> {
+  return new Set(agentAllowedTools(inp).map((t) => t.id))
+}
+
+/**
  * 计算 Agent 的全部可用工具（不受懒加载影响）：
  * 「已加载且在白名单内的运行时工具」+「白名单内未加载的静态元信息」。
  * 通配（*）白名单时补全部静态元信息；显式白名单时仅补白名单内未加载的工具。
@@ -96,7 +129,7 @@ function agentUsableEntries(inp: ToolsCtx): Array<Tool | ToolMetaEntry> {
   const harness = inp.harness
   const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
   const wildcard = agentTools.length === 1 && agentTools[0] === '*'
-  const loaded = harness.tools.filterByWhitelist(agentTools)
+  const loaded = agentAllowedTools(inp)
   if (wildcard) return unionTools(loaded, inp.toolMeta)   // 全允许：补全部静态元信息
   const meta = inp.toolMeta
   if (!meta) return loaded
@@ -124,17 +157,17 @@ function entryLoaded(t: Tool | ToolMetaEntry): boolean {
 
 /**
  * 状态串：启用/禁用（相对当前 Agent 白名单）+ 加载状态（已加载 / 仅元信息）。
- * 未加载的元信息占位：仅在 Agent 白名单为通配 * 时视为启用，否则为禁用。
+ * 未加载的元信息占位：仅在 Agent 白名单为通配 *（或显式列出）时视为启用，否则为禁用。
+ * `allowedIds` 由 {@link agentAllowedIds} 一次算好传入 —— 已加载的工具必须用它判，
+ * 才能与 core 的装配判据（含 MCP server 供给）保持一致。
  */
-function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry): string {
+function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry, allowedIds: Set<string>): string {
   const agentTools = inp.harness.agent.get(inp.agentId)?.tools ?? ['*']
   const wildcard = agentTools.length === 1 && agentTools[0] === '*'
   const loaded = entryLoaded(t)
-  const enabled = wildcard
-    ? true
-    : isMetaEntry(t)
-      ? agentTools.includes(t.id)                       // 未加载但显式在白名单 → 启用
-      : inp.harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
+  const enabled = isMetaEntry(t)
+    ? (wildcard || agentTools.includes(t.id))            // 未加载的占位只能按显式白名单判
+    : allowedIds.has(t.id)                               // 已加载 ⇒ 与装配同源
   const en = enabled ? '启用' : '禁用'
   const ld = loaded ? '已加载' : '仅元信息'
   return [en, ld].join('·')
@@ -142,10 +175,11 @@ function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry): string {
 
 /** 渲染工具表格：ID | 元信息(描述) | 权限键 | 状态（启用·加载·安全） */
 function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>, mcpDownServer?: Set<string>): string {
+  const allowedIds = agentAllowedIds(inp)
   const rows = entries.map((t) => {
     const { readOnly, destructive, concurrent } = entryFlags(t)
     const safety = [...(readOnly ? ['只读'] : []), ...(destructive ? ['危险'] : []), ...(concurrent === false ? ['非并发'] : [])]
-    const base = entryStatus(inp, t)
+    const base = entryStatus(inp, t, allowedIds)
     let status = safety.length ? `${base}·${safety.join(',')}` : base
     if (t.id.startsWith('mcp__')) {
       // MCP 场景化工具：标注来源 server；server 已被 /mcp 禁用时状态改为「禁用」并额外标注
@@ -195,8 +229,7 @@ function renderDetail(inp: ToolsCtx, toolArg: string): void {
     out(`工具 "${toolArg}" 未找到（先看 /tools --all 确认 id）。\n`)
     return
   }
-  const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
-  const enabled = agentTools.includes('*') || harness.tools.filterByWhitelist(agentTools).some((x) => x.id === t.id)
+  const enabled = agentAllowedIds(inp).has(t.id)
   out(`工具：${t.id}\n`
     + `  描述：${t.description ?? ''}\n`
     + `  别名：${t.aliases?.join(', ') ?? '-'}\n`

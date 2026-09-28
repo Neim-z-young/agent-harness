@@ -18,6 +18,7 @@ import {
   partitionToolCalls,
   parseMcpToolId,
   filterMcpTools,
+  supplyMcpTools,
   normalizeToolError,
   McpToolIndex,
   resolveMcpTool,
@@ -869,6 +870,81 @@ describe('@harness/tool', () => {
     })
     it('server 名匹配前 trim', () => {
       expect(ids(filterMcpTools(set, [' github ']))).toEqual(['bash', 'mcp__github__a', 'mcp__github__b'])
+    })
+  })
+
+  describe('supplyMcpTools（Agent 可用工具集的最终组装：原生 + MCP 供给）', () => {
+    function mkTool(id: string): Tool {
+      return { id, description: id, call: async () => ({ ok: true, output: {} }) } as unknown as Tool
+    }
+    const ids = (arr: Tool[]) => arr.map((t) => t.id).sort()
+    // 注册表全量（含两个 MCP server 的工具）
+    const all = [
+      mkTool('read_file'),
+      mkTool('bash'),
+      mkTool('mcp__github__a'),
+      mkTool('mcp__github__b'),
+      mkTool('mcp__filesystem__re'),
+    ]
+    const freshIndex = new McpToolIndex()
+
+    /** 模拟 core 装配：filterByWhitelist 的结果（`'*'` 全给，显式列表按 id 取） */
+    const pick = (whitelist: string[] | ['*']) =>
+      whitelist.length === 1 && whitelist[0] === '*'
+        ? [...all]
+        : (whitelist as string[]).map((id) => all.find((t) => t.id === id)).filter((t): t is Tool => !!t)
+
+    it('★ 核心回归：显式 tools 列表 + mcpServers: [server] ⇒ 该 server 的工具被**供给**进来', () => {
+      // 这是修复前的真机形态：agent 写了 mcpServers: ['github']，却一个 MCP 工具都拿不到
+      // （filterByWhitelist 已把它们剔掉，旧实现只能做减法 ⇒ 空集）
+      const out = supplyMcpTools(pick(['read_file']), all, ['github'], undefined, freshIndex)
+      expect(ids(out)).toEqual(['mcp__github__a', 'mcp__github__b', 'read_file'])
+    })
+
+    it('mcpServers undefined ⇒ 不供给（MCP 工具只能靠 tools 显式写 id / 或 *）', () => {
+      const onlyExplicit = supplyMcpTools(pick(['read_file', 'mcp__github__a']), all, undefined, undefined, freshIndex)
+      expect(ids(onlyExplicit)).toEqual(['mcp__github__a', 'read_file'])
+      const nothing = supplyMcpTools(pick(['read_file']), all, undefined, undefined, freshIndex)
+      expect(ids(nothing)).toEqual(['read_file'])
+    })
+
+    it('mcpServers: [] ⇒ 拒绝全部 MCP，连 tools 里显式列出的 MCP id 也剔除（fail-closed）', () => {
+      const out = supplyMcpTools(pick(['read_file', 'mcp__github__a']), all, [], undefined, freshIndex)
+      expect(ids(out)).toEqual(['read_file'])
+    })
+
+    it('通配白名单 + mcpServers: [server] ⇒ 收窄到该 server（`*` 带进来的其他 MCP 被剔除）', () => {
+      const out = supplyMcpTools(pick(['*']), all, ['github'], undefined, freshIndex)
+      expect(ids(out)).toEqual(['bash', 'mcp__github__a', 'mcp__github__b', 'read_file'])
+    })
+
+    it('excludeMcpServers（mcpServers 未定义时生效）剔除显式列出的 MCP 工具', () => {
+      const out = supplyMcpTools(pick(['read_file', 'mcp__github__a', 'mcp__filesystem__re']), all, undefined, ['github'], freshIndex)
+      expect(ids(out)).toEqual(['mcp__filesystem__re', 'read_file'])
+    })
+
+    it('白名单优先于黑名单：同时给出时按白名单供给，忽略黑名单', () => {
+      const out = supplyMcpTools(pick(['read_file']), all, ['github'], ['github'], freshIndex)
+      expect(ids(out)).toEqual(['mcp__github__a', 'mcp__github__b', 'read_file'])
+    })
+
+    it('非 MCP 工具始终不受影响；结果去重（`*` 已带进来时不重复）', () => {
+      const out = supplyMcpTools(pick(['*']), all, ['github', 'filesystem'], undefined, freshIndex)
+      expect(ids(out)).toEqual(['bash', 'mcp__filesystem__re', 'mcp__github__a', 'mcp__github__b', 'read_file'])
+      expect(new Set(out.map((t) => t.id)).size).toBe(out.length)
+    })
+
+    it('server 名匹配前 trim', () => {
+      const out = supplyMcpTools(pick(['read_file']), all, [' github '], undefined, freshIndex)
+      expect(ids(out)).toEqual(['mcp__github__a', 'mcp__github__b', 'read_file'])
+    })
+
+    it('归属索引能精确反解 server 名含 __ 的工具（parseMcpToolId 切不出来）', () => {
+      const idx = new McpToolIndex()
+      idx.index('a__b', ['mcp__a__b__x'])
+      const nested = [mkTool('read_file'), mkTool('mcp__a__b__x')]
+      const out = supplyMcpTools([nested[0]], nested, ['a__b'], undefined, idx)
+      expect(ids(out)).toEqual(['mcp__a__b__x', 'read_file'])
     })
   })
 })

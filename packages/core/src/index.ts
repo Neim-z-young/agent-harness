@@ -177,7 +177,7 @@ import {
   ToolContext,
   PermissionRequest as ToolPermissionRequest,
   PermissionDecision as ToolPermissionDecision,
-  filterMcpTools,
+  supplyMcpTools,
   normalizeToolError,
 } from '@harness/tool'
 import type {
@@ -2282,11 +2282,24 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
     const pool = new DefaultToolPool(this.deps.toolRegistry)
     await this.deps.triggerPlugin('core.tool.pool.assemble', { agentId } as ToolPoolAssembleInput, pool)
-    const allowedTools = filterMcpTools(
-      this.deps.toolRegistry.filterByWhitelist(agent.tools),
-      agent.mcpServers,
-      agent.excludeMcpServers,
-    )
+    // 两步组装，顺序与职责都不能换：
+    // ① `filterByWhitelist(agent.tools)` 定"原生部分"（含 `'*'` 与显式 id 两种形态）；
+    // ② `supplyMcpTools` 在**注册表全量**上补齐 agent 声明的 MCP server 的工具。
+    // ②必须能"加法"：只喂①的结果会让 MCP 工具在①就被剔掉、②再筛也是空集
+    //（真机：agent md 写了 `mcpServers: ['code-intel']` 却拿到 0 个 MCP 工具）。
+    //
+    // 例外：`tools: []` 是"一个都不给"的**绝对**逃生口（AGENTS.md 约定），
+    // 连 MCP 供给也一并关掉 —— 否则安全审查写下的 `tools: []` 会被 mcpServers 静默架空，
+    // 又是一次 fail-open。
+    const pickedTools = this.deps.toolRegistry.filterByWhitelist(agent.tools)
+    const allowedTools = agent.tools.length === 0
+      ? []
+      : supplyMcpTools(
+        pickedTools,
+        this.deps.toolRegistry.list(),
+        agent.mcpServers,
+        agent.excludeMcpServers,
+      )
 
     this.deps.permission.updateRules({
       ...this.deps.permission.getRules(),

@@ -519,9 +519,11 @@ describe('@harness/core', () => {
         internalPlugins: [McpPlugin],
       })
     }
-    async function runQuery(h: Harness, chooseToolId: string) {
+    async function runQuery(h: Harness, _chooseToolId: string) {
       const sess = await h.session.create()
-      const reply = await h.agent.query({ sessionId: sess.id, message: 'x' })
+      // maxSteps: 1 —— mock provider 每次都回同一个 tool call，不限步会先撞 DOOM_LOOP，
+      // 那样断言到的就不是白名单判定结果了。
+      const reply = await h.agent.query({ sessionId: sess.id, message: 'x', maxSteps: 1 })
       return reply.parts.find((p: any) => p.type === 'tool') as any
     }
 
@@ -536,6 +538,31 @@ describe('@harness/core', () => {
       const h = await buildHarness({}, 'mcp__fs__read')
       const toolPart = await runQuery(h, 'mcp__fs__read')
       expect(toolPart.toolId).toBe('mcp__fs__read')
+      await h.stop()
+    })
+
+    // ── 修复回归：`mcpServers` 是**供给**语义，不是"二次过滤" ──
+    // 修复前 `_prepareQueryOnce` 写的是 `filterMcpTools(filterByWhitelist(agent.tools), ...)`，
+    // 第二阶段只能做减法，而 MCP 工具在第一步（显式列表）就已被剔掉 ⇒ 声明了 server 也拿到 0 个。
+    it('★ 显式 tools 列表 + 声明 mcpServers ⇒ 该 server 的工具被供给（修复前被 TOOL_NOT_ALLOWED 挡掉）', async () => {
+      const h = await buildHarness({ tools: ['read_file'], mcpServers: ['gh'] } as any, 'mcp__gh__create_issue')
+      const toolPart = await runQuery(h, 'mcp__gh__create_issue')
+      expect(toolPart.toolId).toBe('mcp__gh__create_issue')
+      expect(toolPart.isError).toBeFalsy()
+      await h.stop()
+    })
+
+    it('显式 tools 列表 + 未声明 mcpServers ⇒ 不供给（不给没声明 MCP 的 agent 静默扩权）', async () => {
+      const h = await buildHarness({ tools: ['read_file'] } as any, 'mcp__gh__create_issue')
+      const toolPart = await runQuery(h, 'mcp__gh__create_issue')
+      expect((toolPart.result as any)?.code).toBe('TOOL_NOT_ALLOWED')
+      await h.stop()
+    })
+
+    it('tools: [] 是绝对逃生口 ⇒ 连 mcpServers 声明的工具也不给', async () => {
+      const h = await buildHarness({ tools: [], mcpServers: ['gh'] } as any, 'mcp__gh__create_issue')
+      const toolPart = await runQuery(h, 'mcp__gh__create_issue')
+      expect((toolPart.result as any)?.code).toBe('TOOL_NOT_ALLOWED')
       await h.stop()
     })
   })

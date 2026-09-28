@@ -34,7 +34,7 @@ function mkTool(id: string): Tool {
   } as unknown as Tool
 }
 
-function makeHarness(initTools: Tool[], agentTools: string[]) {
+function makeHarness(initTools: Tool[], agentTools: string[], agentExtra?: { mcpServers?: string[]; excludeMcpServers?: string[] }) {
   const registry = new Map<string, Tool>()
   for (const t of initTools) registry.set(t.id, t)
   const calls: string[] = []
@@ -48,7 +48,7 @@ function makeHarness(initTools: Tool[], agentTools: string[]) {
         filterByWhitelist: (wl: string[] | ['*']) =>
           wl.length === 1 && wl[0] === '*' ? [...registry.values()] : wl.map((id) => registry.get(id)).filter((t): t is Tool => !!t),
       },
-      agent: { get: () => ({ id: 'default', tools: agentTools }) },
+      agent: { get: () => ({ id: 'default', tools: agentTools, ...(agentExtra ?? {}) }) },
     } as unknown as CliCommandInput['harness'],
     out: [] as string[],
     saved: [] as Array<[string, string[]]>,
@@ -163,6 +163,43 @@ describe('tools-manager 插件', () => {
     expect(text).toContain('glob')
     expect(text).toContain('仅元信息')
     expect(text).toContain('read')
+  })
+
+  // 展示与执行必须同一判据：core 已把 `mcpServers` 改成"供给"（声明 server ⇒ 该 server 全部工具可用），
+  // `/tools` 若仍按 `filterByWhitelist(agent.tools)` 算，就会把"能调"的工具显示成「禁用」。
+  it('★ 显式白名单 + 声明 mcpServers ⇒ MCP 工具在列表中显示为「启用」', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness(
+      [mkTool('read_file'), mkTool('mcp__gh__create_issue')],
+      ['read_file'],
+      { mcpServers: ['gh'] },
+    )
+    await run(h, '', { harness, out, saved })
+    const line = out.join('').split('\n').find((l) => l.includes('mcp__gh__create_issue')) ?? ''
+    expect(line).toContain('启用')
+    expect(line).toContain('源自mcp')
+  })
+
+  it('★ 反向：未声明 mcpServers ⇒ 该 MCP 工具不在「Agent 可用工具」列表里', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness(
+      [mkTool('read_file'), mkTool('mcp__gh__create_issue')],
+      ['read_file'],
+    )
+    await run(h, '', { harness, out, saved })
+    // 未授权工具不进"可用工具"列表（与白名单外的原生工具同规矩），但 --all 里仍在
+    expect(out.join('')).not.toContain('mcp__gh__create_issue')
+    await run(h, '--all', { harness, out, saved })
+    expect(out.join('')).toContain('mcp__gh__create_issue')
+  })
+
+  it('★ 详情视图的「当前 Agent 启用」与列表同源（显式白名单内 ⇒ 是；白名单外 ⇒ 否）', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('read_file'), mkTool('bash')], ['read_file'])
+    await run(h, 'read_file', { harness, out, saved })
+    expect(out.join('')).toContain('当前 Agent 启用：是')
+    await run(h, 'bash', { harness, out, saved })
+    expect(out.join('')).toContain('当前 Agent 启用：否')
   })
 })
 

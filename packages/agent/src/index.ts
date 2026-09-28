@@ -136,15 +136,26 @@ export interface AgentDefinition {
 
   // === MCP Server 白名单（可选） ===
   /**
-   * MCP Server 白名单：按 server 名（`mcp__<server>__<tool>` 中的 <server>）声明该 Agent 可用哪些 MCP server 的全部工具。
-   * - 缺省(undefined)：不限制，MCP server 全部可见（保持向后兼容）
-   * - 定义了（含空数组）：仅保留白名单内 server 的工具；白名单优先于 excludeMcpServers
-   * - 空数组 [] 含义为「拒绝全部 MCP 工具」，与 undefined（全可见）刻意区分
+   * MCP Server 白名单：按 server 名（`mcp__<server>__<tool>` 中的 <server>）声明该 Agent
+   * 可用哪些 MCP server 的**全部工具** —— 是**供给**语义，不是"二次收窄"。
+   *
+   * 实现口径（`supplyMcpTools`，core 装配期调用）：
+   * - 非空数组：该列表内每个 server 的**全部**工具被补进可用集（无需再把 `mcp__…` 逐条写进 `tools:`）；
+   *   同时 `tools:` 里显式列出的、属于列表外 server 的 MCP 工具会被剔除。
+   * - 空数组 []：拒绝全部 MCP 工具（连 `tools:` 里显式列出的 MCP id 也剔除，fail-closed）。
+   * - 缺省(undefined)：**不供给** —— MCP 工具只能靠 `tools:` 显式写 id（或 `'*'`）进入。
+   *   刻意不是"全可见"：那会让 `tools: ['read_file']` 这类只读 agent 静默拿到全部 MCP 工具（fail-open）。
+   *   要全可见就写 `tools: ['*']`，要让某 agent 用某 server 就声明它。
+   * - `tools: []` 是"一个都不给"的**绝对**逃生口，连 MCP 供给也一并关掉。
+   *
+   * ⚠️ 历史坑（2026-09-28 修复）：此前 core 写成 `filterMcpTools(filterByWhitelist(agent.tools), …)`，
+   * 第二阶段只能做减法，而 MCP 工具在第一步（显式 `tools:` 列表）就被剔掉了 ⇒ 声明了 server
+   * 也拿不到任何 MCP 工具（真机实测 0 个），只有把 `mcp__…` 逐条手写进 `tools:` 才生效。
    */
   mcpServers?: string[]
   /**
-   * MCP Server 黑名单：当 mcpServers 未定义（undefined）时生效，剔除这些 server 的全部工具。
-   * 白名单优先于黑名单。
+   * MCP Server 黑名单：仅在 `mcpServers` 未定义（undefined）时生效，
+   * 剔除这些 server 的全部工具 —— 包括 `tools:` 里**显式列出**的（fail-closed）。白名单优先于黑名单。
    */
   excludeMcpServers?: string[]
 

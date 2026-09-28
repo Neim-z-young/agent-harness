@@ -127,6 +127,41 @@ CLI 现在会在导入前探测插件的裸依赖：无法解析时就在插件�
 
 > 说明：**代码注册** server（computer-use、code-intel 等）无 config.json 槽位，`/mcp disable` 为**本次进程生效**（重启后自动恢复连接）；随插件整体装卸请用 `/plugins disable|enable <pluginId>`——插件卸载时其注册的 MCP server 自动断开、工具从工具池移除，重载后自动重连。
 
+## 4.1 Agent 侧：`mcpServers` 是**供给**语义
+
+server 连上只说明工具进了**注册表**；某个 Agent 能不能用，由它自己的声明决定
+（Agent md frontmatter / config.json 的 `agents[]`）：
+
+```yaml
+# .harness/agents/coder.md
+tools:
+  - read_file
+  - bash
+mcpServers:
+  - code-intel     # ⇒ code-intel 的**全部**工具自动可用，无需逐条写 mcp__code-intel__*
+```
+
+| 声明 | 效果 |
+|---|---|
+| `mcpServers: [名字…]`（非空） | 供给这些 server 的**全部**工具；同时剔除 `tools:` 里属于列表外 server 的 MCP 工具 |
+| `mcpServers: []` | 拒绝全部 MCP 工具（fail-closed，连 `tools:` 里显式写的也剔除） |
+| `mcpServers` 缺省 | **不供给**：MCP 工具只能靠 `tools:` 显式写 id、或 `tools: ['*']` 进来 |
+| `excludeMcpServers: [名字…]` | 黑名单，仅在 `mcpServers` 缺省时生效；连 `tools:` 里显式写的也剔除 |
+| `tools: []` | "一个都不给"的**绝对**逃生口 —— 连 `mcpServers` 声明的也一并拒掉 |
+
+> 为什么缺省刻意不是"全可见"：那会让 `tools: ['read_file']` 这种只读 Agent 静默拿到全部 MCP 工具，
+> 能力边界 fail-open。要全可见就写 `tools: ['*']`，要让某 Agent 用某 server 就声明它。
+>
+> **只要某 server 的"某几个"工具**时：**别写** `mcpServers`，把这几个 `mcp__…` id 写进 `tools:` 即可
+> （缺省不供给 + 显式 id 生效 ⇒ 精确可控）。两种写法各管一件事，不要混用：
+> 写 `mcpServers: ['x']` 会连 `tools:` 里那几条一起"补全成 x 的全部工具"。
+>
+> 历史坑（2026-09-28 修复）：此前 core 把 `mcpServers` 实现成 `filterByWhitelist(agent.tools)`
+> **之后**的二次收窄（`filterMcpTools` 只能做减法），而 MCP 工具在第一步就被剔掉了 ⇒
+> 声明了 server 也拿到 0 个，只能把 `mcp__…` 逐条手写进 `tools:` 才行。
+
+`/tools` 的列表与详情与**执行共用同一判据**（`supplyMcpTools`），不会出现"显示禁用、实际能调"。
+
 ## 5. 运行时机制
 
 - **启动**：CLI boot 时 `applyMcpServers` 读 `config.json` 的 `mcpServers`，经 `cli.mcp.configure` Hook 注入 registry 插件（仅建立配置态）；`core.harness.start` 时按 `enabled` 开关连接。
