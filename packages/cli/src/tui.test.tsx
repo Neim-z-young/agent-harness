@@ -58,6 +58,10 @@ import {
   buildWelcomeBanner,
   WELCOME_BANNER,
   selectionTextFrom,
+  windowToolText,
+  TOOL_VIEW_HEAD_LINES,
+  TOOL_VIEW_TAIL_LINES,
+  TOOL_VIEW_LINE_MAX_CHARS,
   countGraphemes,
   approvalLine,
   __KEYLOG,
@@ -190,6 +194,65 @@ describe('pushConsole 追加控制台文本', () => {
   it('多行工具结果里的空行被保留（┆ 本身非空白，不会被 pushConsole 当空行丢掉）', () => {
     let s = pushConsole(initialChatState, `✅  → a\n${TOOL_CONT_MARK}\n${TOOL_CONT_MARK}b`)
     expect(s.blocks[0].text).toBe('✅  → a\n\nb')
+  })
+})
+
+describe('windowToolText 工具块首尾窗口', () => {
+  const lines = (t: string) => windowToolText(t).lines
+
+  it('短块原样返回（不产生省略提示行，truncated=false）', () => {
+    const t = '🔧  bash {"command":"echo ok"}\n✅  → ok'
+    expect(lines(t)).toEqual(['🔧  bash {"command":"echo ok"}', '✅  → ok'])
+    expect(windowToolText(t).truncated).toBe(false)
+    expect(windowToolText(t).fullChars).toBe(t.length)
+  })
+
+  it('长结果只留首 6 + 末 4 行，中间插省略提示；🔧 行仍在**第一行**', () => {
+    const body = Array.from({ length: 3000 }, (_, i) => `n${i + 1}`)
+    const t = ['🔧  bash {"command":"seq 1 3000"}', '✅  → 1', ...body].join('\n')
+    const out = lines(t)
+    expect(out[0]).toBe('🔧  bash {"command":"seq 1 3000"}')   // 工具调用行必须仍在最前
+    expect(out).toHaveLength(TOOL_VIEW_HEAD_LINES + 1 + TOOL_VIEW_TAIL_LINES)
+    expect(out[TOOL_VIEW_HEAD_LINES]).toContain('已省略')
+    expect(out.at(-1)).toBe('n3000')                             // 尾部保留 ⇒ 结论仍看得到
+    expect(windowToolText(t).truncated).toBe(true)
+  })
+
+  it('★ 行数预算之外还有**字符**预算：结果是一整行时只限行数等于没限', () => {
+    // 工具返回对象时 JSON.stringify 把换行转义掉 ⇒ 结果是一整行。首版只按行数收窄，
+    // 80 列终端下 200 字符仍折成 3 行，🔧 行照样被挤出画面（真机帧实测）。
+    const oneLine = `✅  → {"stdout":"${Array.from({ length: 800 }, (_, i) => i).join('\\n')}"}`
+    const out = lines(`🔧  bash {"command":"seq 1 800"}\n${oneLine}`)
+    expect(out).toHaveLength(2)
+    expect(out[1]!.length).toBeLessThanOrEqual(TOOL_VIEW_LINE_MAX_CHARS)
+    expect(out[1]).toContain('本行省略')
+  })
+
+  it('★ 合并块里每条工具的 🔧 行都不丢：按「工具调用段落」分段，不被前一条的结果挤掉', () => {
+    // pushConsole 会把一次应答的所有 tool 行并成一个块 —— 若按整块收首尾，中间那几条
+    // 工具的调用行会被整段切掉，正是这次要修的毛病。
+    const big = Array.from({ length: 200 }, (_, i) => `line-${i}`)
+    const t = [
+      '🔧  read_file {"path":"a.ts"}', '✅  → a1', ...big,
+      '🔧  grep_file {"pattern":"x"}', '✅  → b1', ...big,
+      '🔧  bash {"command":"ls"}', '✅  → c1',
+    ].join('\n')
+    const out = lines(t)
+    expect(out.filter((l) => l.startsWith('🔧'))).toHaveLength(3)
+    expect(out.some((l) => l.startsWith('🔧  bash'))).toBe(true)
+    // 每条工具各自一段窗口：省略提示行出现 2 次（后两条结果短，不省略）
+    expect(out.filter((l) => l.includes('已省略')).length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('超长单行也做首尾窗口（write_file 的 content 是 JSON 单行，能到几十 KB）', () => {
+    const t = `🔧  write_file {"path":"x.ts","content":"${'A'.repeat(40_000)}"}`
+    const out = lines(t)
+    expect(out).toHaveLength(1)
+    expect(out[0]!.length).toBeLessThanOrEqual(TOOL_VIEW_LINE_MAX_CHARS)
+    expect(out[0]).toContain('本行省略')
+    expect(out[0]!.startsWith('🔧  write_file')).toBe(true)      // 头部保留：看得出调的是谁
+    expect(out[0]!.endsWith('"}')).toBe(true)                    // 尾部保留
+    expect(windowToolText(t).truncated).toBe(true)
   })
 })
 
@@ -1095,6 +1158,34 @@ describe('TuiApp 集成（mock provider）', () => {
     // 任意键关闭（Esc）
     f.setup.mockInput.pressEscape()
     await waitFrame(f.setup, (frame) => !frame.includes('打开/关闭帮助面板'))
+    await f.cleanup()
+  })
+
+  it('★ 长工具结果不再把工具调用行挤出对话框（首尾窗口 + 复制全文）', async () => {
+    // 用户报「对话框里没有工具调用信息了」的真机复现：去掉结果截断后，一条 3000 行输出
+    // 占满几十屏，而 scrollbox 粘底 ⇒ 帧里只剩结果尾巴，`🔧 工具名 {入参}` 一行都看不到。
+    const f = await mountTui({
+      responses: [
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'seq 1 3000' } }] },
+        { match: 'hi', response: '已完成' },
+      ],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKeys(['h', 'i'])
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('已完成'))
+
+    // ① 工具调用行在画面里（这次修复的核心）
+    expect(frame).toContain('🔧')
+    expect(frame).toContain('seq 1 3000')
+    // ② 结果被窗口化，且有明确的省略提示（不是静默丢弃）。
+    //    这里命中的是**单行**预算：bash 的 output 是对象，JSON.stringify 会把换行转义成 `\n`
+    //    两个字符 ⇒ 结果是**一整行** 16000 字符，只限行数等于没限（首版就栽在这）。
+    expect(frame).toContain('本行省略')
+    // ③ 完整内容仍可取：复制按钮明示「全文」+ 字符数
+    expect(frame).toContain('复制全文')
+    // ④ 尾部保留 ⇒ 结论（这里是 3000）仍看得到
+    expect(frame).toContain('n3000')
     await f.cleanup()
   })
 

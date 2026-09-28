@@ -234,6 +234,101 @@ export function pushConsole(state: ChatState, text: string): ChatState {
   return s
 }
 
+// ------------------------------------------------------------------------
+// 工具块的「首尾窗口」（只收渲染，不动块文本）
+// ------------------------------------------------------------------------
+// 为什么窗口必须加在**渲染层**、而不是回到 `formatToolResult` 里截断：
+//  1. `pushConsole` 会把一次应答里的所有 tool 行**合并成一个块**，块文本即全文 —— 「复制全文」
+//     才有全文可取。（在传输层截断的话，全文到此就没了。）
+//  2. 传输层截断**没法只截某一条工具的结果**：合并块里有多条工具，按块截会把中间几条的
+//     `🔧 工具名 {入参}` 行整段切掉 —— 那正是这次要修的毛病。真机 80×24 帧实测：拿掉截断后
+//     `bash {command:"seq 1 3000"}` 的结果把 🔧 行挤出视口，对话框里"看不到工具调用了"。
+//
+// 所以按「工具调用段落」（🔧 行起、到下一条 🔧 行前）分段，每段只留首尾。**两个预算都要**，
+// 因为它们各自堵一种灌屏方式（实测都是真机踩到的）：
+//   · 行数预算：挡「很多短行」—— `bash {command:"seq 1 3000"}` 是 3000 行 6 字符；
+//   · 字符预算：挡「少数超长行」—— 工具返回对象的 JSON 是**单行**，16000 字符在 80 列终端
+//     折成 ~13 行，只限行数等于没限（首版就栽在这里：行窗口生效了，🔧 仍被挤出画面）；
+//   · 单行预算：挡「一条 JSON 单行入参」—— `write_file` 的 content 能到几十 KB。
+export const TOOL_VIEW_HEAD_LINES = 6
+export const TOOL_VIEW_TAIL_LINES = 4
+export const TOOL_VIEW_HEAD_CHARS = 260
+export const TOOL_VIEW_TAIL_CHARS = 220
+/** 单行渲染上限（首尾各取一半，中间插省略标记） */
+export const TOOL_VIEW_LINE_MAX_CHARS = 200
+
+export interface ToolView {
+  /** 渲染用的行（含省略提示行） */
+  lines: string[]
+  /** 是否发生过省略（决定复制按钮要不要明示"全文"） */
+  truncated: boolean
+  /** 块文本的完整字符数 */
+  fullChars: number
+}
+
+/** 工具调用行前缀（`createProcessLine` 的 `🔧  <id> <入参>`） */
+const TOOL_CALL_PREFIX = '🔧'
+
+/** 单行首尾窗口：JSON 单行入参/结果能长到几十 KB，不切同样会灌满一屏 */
+function clipToolLine(line: string): string {
+  if (line.length <= TOOL_VIEW_LINE_MAX_CHARS) return line
+  const half = Math.floor((TOOL_VIEW_LINE_MAX_CHARS - 20) / 2)
+  return `${line.slice(0, half)} …（本行省略 ${line.length - half * 2} 字符）… ${line.slice(-half)}`
+}
+
+/** 按「工具调用段落」切分：每条以 🔧 行起、到下一条 🔧 行为止（结果里的 🔧 至多多切一段，无害） */
+function splitToolSegments(lines: string[]): string[][] {
+  const segments: string[][] = []
+  let current: string[] = []
+  for (const line of lines) {
+    if (line.startsWith(TOOL_CALL_PREFIX) && current.length > 0) {
+      segments.push(current)
+      current = []
+    }
+    current.push(line)
+  }
+  if (current.length > 0) segments.push(current)
+  return segments
+}
+
+/** 行数与字符数双预算地取一段（head 从头取、tail 从尾取） */
+function takeWithinBudget(lines: string[], maxLines: number, maxChars: number): string[] {
+  const taken: string[] = []
+  let used = 0
+  for (let i = 0; i < lines.length && taken.length < maxLines; i++) {
+    const cost = lines[i]!.length + 1
+    if (used + cost > maxChars) break
+    taken.push(lines[i]!)
+    used += cost
+  }
+  return taken
+}
+
+/**
+ * 工具块文本 → 渲染行（首尾窗口）。**块文本本身不变**，完整内容仍可用「复制全文」取走。
+ * 每条工具调用独立成段：一段再长也不会把下一段的 `🔧` 行挤掉。
+ */
+export function windowToolText(text: string): ToolView {
+  const out: string[] = []
+  let truncated = false
+  for (const segment of splitToolSegments(text.split('\n'))) {
+    const clipped = segment.map(clipToolLine)
+    if (clipped.some((l, i) => l !== segment[i])) truncated = true
+    const head = takeWithinBudget(clipped, TOOL_VIEW_HEAD_LINES, TOOL_VIEW_HEAD_CHARS)
+    const reversed = [...clipped].reverse()
+    const tail = takeWithinBudget(reversed, TOOL_VIEW_TAIL_LINES, TOOL_VIEW_TAIL_CHARS).reverse()
+    if (head.length + tail.length >= clipped.length) {
+      out.push(...clipped)
+      continue
+    }
+    truncated = true
+    const elided = clipped.slice(head.length, clipped.length - tail.length)
+    const elidedChars = elided.reduce((n, l) => n + l.length + 1, 0)
+    out.push(...head, `… 已省略 ${elided.length} 行 / ${elidedChars} 字符（完整内容用「复制全文」取）`, ...tail)
+  }
+  return { lines: out, truncated, fullChars: text.length }
+}
+
 /** 处理结构化流事件：reasoning→thinking 块、text→assistant 块、done→收尾 */
 export function applyStreamEvent(state: ChatState, ev: AgentStreamEvent): ChatState {
   switch (ev.type) {
@@ -1061,6 +1156,12 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const approvalResolveRef = useRef<((ans: string) => void) | null>(null)
   // 鼠标复制（模块 D3）：正在展示「✓ 已复制」提示的块 id（临时高亮，配合 onMouseUp 复制）
   const [copiedId, setCopiedId] = useState<number | null>(null)
+  /**
+   * 工具块渲染窗口（见 `windowToolText`）的缓存：窗口化是 O(文本长度) 的，而流式期间每次
+   * text_delta 都会重渲染所有块 —— 大结果块逐帧重算是真开销。按块 id 存，用**字符串同一性**
+   * 判失效：React 对未变的块复用同一个字符串引用，所以命中的比较是 O(1)（先比引用）。
+   */
+  const toolViewCacheRef = useRef(new Map<number, { text: string; view: ToolView }>())
   // 鼠标选块：点击消息块整体高亮选中（再点取消）—— 复制/折叠等内部按钮的点击也会连带选中该块
   const [selectedBlockId, setSelectedBlockId] = useState<number | null>(null)
   // thinking 折叠：用户显式展开过的 thinking 块 id（default 长推理折叠成一行标题，点击开关）
@@ -1894,12 +1995,24 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   // 模块 D：统计面板 —— 由对话块 + 后台任务实时归并（elapsed 用挂载起点）
   const stats = computeTuiStats(state.blocks, bgTasks, Date.now() - startTimeRef.current, usage)
 
+  /** 命中缓存则复用（见上面 `toolViewCacheRef`），未命中重算一次并写回 */
+  const toolViewOf = (b: ChatBlock): ToolView => {
+    const cache = toolViewCacheRef.current
+    const hit = cache.get(b.id)
+    if (hit && hit.text === b.text) return hit.view
+    const view = windowToolText(b.text)
+    cache.set(b.id, { text: b.text, view })
+    return view
+  }
+
   const renderBlock = (b: ChatBlock) => {
     // 对话消息（用户/助手/工具，非空）在正文下加一行鼠标「复制」按钮 —— 工具输出也可复制。
     // system 块（耗时行 / 元信息 / `tool` 占位等）不显示复制按钮，避免一次应答裂成多个「⧉ 复制」。
     const copyable =
       (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool') &&
       b.text.trim().length > 0
+    // 工具块按首尾窗口渲染；被省略时复制按钮必须**明示是全文**（否则用户以为拿到的是可见那段）
+    const view = b.kind === 'tool' ? toolViewOf(b) : undefined
     // 鼠标选块：用户/助手/工具/推理 均可点选，选中整块高亮（边框 + 标记行）。
     // 内部按钮（复制/折叠/展开）的点击会冒泡连带选中该块，行为一致、可接受。
     const selectable = copyable || b.kind === 'thinking'
@@ -1907,7 +2020,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     // 选区覆盖块（整块响应式高亮）：拖选落在该块 ⇒ 块顶部闪烁标记（对 markdown 也生效，
     // 且与用户/工具块的 selectionBg 闪烁不同源、互不干扰）。`blk_<id>` 供 selection 事件沿父链定位。
     const inSelection = selectable && selBlockIds.has(b.id)
-    const body = renderBlockBody(b)
+    const body = renderBlockBody(b, view)
     if (!selectable) return body
     return (
       <box
@@ -1939,14 +2052,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             attributes={createTextAttributes(copiedId === b.id ? { reverse: true, bold: true } : { bold: true, underline: true })}
             onMouseUp={(e) => { e.preventDefault(); setCopiedId(b.id); copyTextToClipboard(b.text) }}
           >
-            {copiedId === b.id ? '✓ 已复制' : '⧉ 复制'}
+            {/* 窗口化时按钮**改名**而不是再加一个：可见内容本来就能拖选 + Ctrl-Y 复制，
+                两个按钮里必有一个是垃圾；而这一个必须让人知道拿到的是**全文**。 */}
+            {copiedId === b.id
+              ? '✓ 已复制'
+              : view?.truncated ? `⧉ 复制全文（${view.fullChars} 字符）` : '⧉ 复制'}
           </text>
         )}
       </box>
     )
   }
 
-  const renderBlockBody = (b: ChatBlock) => {
+  const renderBlockBody = (b: ChatBlock, view?: ToolView) => {
     switch (b.kind) {
       case 'assistant':
         return (
@@ -2007,8 +2124,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         )
       }
       case 'tool': {
-        // 树状工具输出：首行（工具调用）加粗，结果行前加竖线缩进，视觉上与 system 命令输出区分
-        const lines = b.text.split('\n')
+        // 树状工具输出：首行（工具调用）加粗，结果行前加竖线缩进，视觉上与 system 命令输出区分。
+        // 行数按「工具调用段落」首尾窗口收窄（见 windowToolText）：一条长结果不再把 🔧 行挤出视口。
+        const lines = (view ?? windowToolText(b.text)).lines
         const first = lines[0] ?? ''
         const body = lines.length > 1
           ? lines.slice(1).map((l, i) => `${i === lines.length - 2 ? '└ ' : '│ '}${l}`).join('\n')
