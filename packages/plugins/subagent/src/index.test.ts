@@ -3628,6 +3628,74 @@ describe('派工方可按本次任务规模覆盖子 Agent 步数上限', () => 
   })
 })
 
+/**
+ * 派工方可按本次任务规模放宽挂钟超时。
+ *
+ * 真机动机（会话 `s_1790592617954_axqkk`）：reviewer 定义 `maxSteps: 25`，实际跑到**第 13 步**
+ * 就被插件级 120s 挂钟掐断 —— 步数上限根本没机会生效，120s 里吐了 28,229 个 reasoning token、
+ * 可交付正文只有 81 字符，主 Agent 只好用 25 轮 / 148 万 token 手工重做。
+ * 挂钟是**资源保护**，不该顺带当"任务该做多久"的主控参数。
+ */
+describe('派工方可按本次任务规模放宽挂钟超时', () => {
+  const base: AgentDefinition = {
+    id: 'reader', name: '速读员', description: '只读回报事实', mode: 'subagent',
+    tools: ['read_file'], promptFragments: [], permission: { '*': 'ask' },
+  }
+
+  /**
+   * 让子 Agent 永不返回 ⇒ 只能靠挂钟超时收场，错误消息里带着**实际生效**的毫秒数
+   * （这串数字是唯一能观测到"哪一层优先级赢了"的出口）。
+   */
+  async function seenTimeout(
+    input: Partial<SubagentToolInput>,
+    pluginTimeoutMs: number,
+    warns: string[] = [],
+  ): Promise<string> {
+    const agent = createMockAgentRuntime([base], () => new Promise<never>(() => {}))
+    const tool = createSubagentTool(
+      () => ({ agent, session: createMockSessionManager(new Map()) }),
+      pluginTimeoutMs,
+      false,
+    )
+    const res = await tool.call(
+      { agentId: base.id, prompt: 'x', ...input },
+      makeToolContext({
+        log: { info: () => {}, warn: (m: string) => { warns.push(m) }, error: () => {} },
+      }),
+    )
+    return res.ok ? '' : String(res.error?.message ?? '')
+  }
+
+  it('未传 timeoutMs：用插件配置（旧行为不变）', async () => {
+    expect(await seenTimeout({}, 1000)).toInclude('（1000ms）')
+  }, 10_000)
+
+  it('传了 timeoutMs：优先于插件配置（让步数上限有机会生效）', async () => {
+    expect(await seenTimeout({ timeoutMs: 1200 }, 1000)).toInclude('（1200ms）')
+  }, 10_000)
+
+  it('非法覆盖值（0 / NaN / <1000）被忽略并告警：回落插件配置', async () => {
+    const warns: string[] = []
+    expect(await seenTimeout({ timeoutMs: 0 }, 1000, warns)).toInclude('（1000ms）')
+    expect(warns.some((w) => w.includes('timeoutMs') && w.includes('无效'))).toBe(true)
+  }, 10_000)
+
+  it('超过上限被钳制到 600000 并告警（放宽不等于解除熔断）', async () => {
+    const warns: string[] = []
+    const agent = createMockAgentRuntime([base], async () => makeMessage('assistant', 'done'))
+    const tool = createSubagentTool(() => ({ agent, session: createMockSessionManager(new Map()) }), 1000, false)
+    // 立刻返回、不走超时路径：否则这条用例要真等 10 分钟
+    const res = await tool.call(
+      { agentId: base.id, prompt: 'x', timeoutMs: 9_999_999 },
+      makeToolContext({
+        log: { info: () => {}, warn: (m: string) => { warns.push(m) }, error: () => {} },
+      }),
+    )
+    expect(res.ok).toBe(true)
+    expect(warns.some((w) => w.includes('超过上限') && w.includes('600000'))).toBe(true)
+  }, 10_000)
+})
+
 describe('子 Agent 输出指令（directive）：插件级默认', () => {
   const worker: AgentDefinition = {
     id: 'reader', name: '速读员', description: '只读回报事实', mode: 'subagent',

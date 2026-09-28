@@ -229,6 +229,19 @@ export interface SubagentToolInput {
    * 文件、也可能通读整个仓库）。不传则保持旧行为。
    */
   maxSteps?: number
+  /**
+   * 本次子任务的执行超时（毫秒，可选）。优先级高于插件配置的 `timeoutMs`（缺省 120_000）。
+   *
+   * 为什么要有这一层：真机会话 `s_1790592617954_axqkk` 里，reviewer 定义 `maxSteps: 25`，
+   * 实际跑到**第 13 步**就被插件级 120s 挂钟掐断 ⇒ 步数上限根本没机会生效 ——
+   * 120s 里吐了 28,229 个 reasoning token，可交付正文只有 81 字符，主 Agent 只好自己用
+   * 25 轮 / 148 万 token 手工重做。挂钟是**资源保护**，不该顺带当"任务该做多久"的主控参数；
+   * 主控权应交给 `maxSteps`，挂钟只在步数失控时兜底。
+   *
+   * 合法值：`>= 1000` 的有限数；上限 `MAX_SUBAGENT_TIMEOUT_MS`（10 分钟）。
+   * 非法值（0 / 负数 / NaN / < 1000）忽略并告警，按插件配置执行。
+   */
+  timeoutMs?: number
   /** 3-5 词简短描述（用于 UI 展示和工具调用日志，类似 Claude Code 的 description 参数） */
   description?: string
   /** 模型覆盖（优先级高于子 Agent 定义中的 model；不传则用子 Agent 自身配置） */
@@ -353,6 +366,18 @@ export interface SubagentPluginOptions {
  * 子 Agent 应在自己的 AgentDefinition 里显式写 `maxSteps`，或直接用插件 `maxSteps` 选项覆盖。
  */
 export const DEFAULT_SUBAGENT_MAX_STEPS = 20
+
+/**
+ * 派工方（`subagent({ timeoutMs })`）能放宽到的**上限**（毫秒，缺省 10 分钟）。
+ *
+ * 为什么设上限：挂钟超时是**资源保护**，派工方放宽它是为了"让步数上限有机会生效"，
+ * 不是为了让子 Agent 无限跑。模型填错时（把秒当毫秒、或填个天文数字）若不加闸，
+ * 等于把唯一的外部熔断解除掉 —— 卡死的子 Agent 会一直占着会话与 token。
+ */
+export const MAX_SUBAGENT_TIMEOUT_MS = 600_000
+
+/** 派工方传入的 `timeoutMs` 最小值（毫秒）。低于 1s 的超时没有意义，判非法并回落。 */
+export const MIN_SUBAGENT_TIMEOUT_MS = 1_000
 
 /**
  * 摘要给父 Agent 的最大结果长度（字符），超过则生成摘要并把全文落盘。
@@ -851,6 +876,33 @@ export function createSubagentTool(
   }
 
   /**
+   * 本次子任务的执行超时（毫秒），优先级（高 → 低）：**派工方 `input.timeoutMs` > 插件配置**。
+   *
+   * 与 `resolveSteps` 的差异：`AgentDefinition` 目前**没有** `timeoutMs` 字段（只有 `maxSteps`），
+   * 所以这里是两层；将来 md 若支持 `timeoutMs:`，在此插入中间层即可。
+   *
+   * 非法值处理与 `maxSteps` 同款（忽略 + 告警 + 按下一优先级取值），另外加一道**上限钳制**：
+   * 放宽是为了让步数上限生效，不是解除熔断（见 MAX_SUBAGENT_TIMEOUT_MS 处注释）。
+   */
+  const resolveTimeoutMs = (override?: number, warn?: (msg: string) => void): number => {
+    const valid = (v: number | undefined): number | undefined =>
+      v === undefined || (Number.isFinite(v) && v >= MIN_SUBAGENT_TIMEOUT_MS) ? v : undefined
+    if (override !== undefined && valid(override) === undefined) {
+      warn?.(
+        `subagent 入参 timeoutMs=${JSON.stringify(override)} 无效（应为 >= ${MIN_SUBAGENT_TIMEOUT_MS} 的毫秒数）：`
+        + '已忽略该项，按插件配置执行。',
+      )
+    }
+    const picked = valid(override) ?? timeoutMs
+    if (picked > MAX_SUBAGENT_TIMEOUT_MS) {
+      warn?.(
+        `subagent 入参 timeoutMs=${picked}ms 超过上限 ${MAX_SUBAGENT_TIMEOUT_MS}ms：已钳制到上限。`,
+      )
+    }
+    return Math.min(picked, MAX_SUBAGENT_TIMEOUT_MS)
+  }
+
+  /**
    * 完整输出的落盘目录 = `{dataDir}/subagent-results`（与 `{dataDir}/tasks` 同域）。
    *
    * 为什么与 tasks 同域而不是落 cwd：本插件已有约定「任务落盘统一写到 {dataDir}，避免污染
@@ -903,6 +955,7 @@ export function createSubagentTool(
         sessionId: { type: 'string', description: '续接已有子 session（多轮子 Agent 对话）；不传则新建' },
         runInBackground: { type: 'boolean', description: 'true = 后台运行，立即返回 taskId，结果经 task-notification 推送；默认同步等待完成' },
         maxSteps: { type: 'number', description: '本次子任务的步数上限（可选）。合法值：>= 1 的整数，或 -1 表示不限；填 0 / 负数会被忽略（按子 Agent 定义、再退插件默认）。不传则用子 Agent 定义的 maxSteps，再退插件默认。通读/遍历类任务请显式给足（如 35）' },
+        timeoutMs: { type: 'number', description: '本次子任务的执行超时（毫秒，可选）。合法值：>= 1000；上限 600000（10 分钟），超出会被钳制。不传则用插件配置的 timeoutMs（缺省 120000）。用途：让 maxSteps（步数）而不是挂钟成为终止条件 —— 步数还没跑完就被 120s 掐断时，请按任务规模放宽这个值' },
         targetFiles: { type: 'array', items: { type: 'string' }, description: '该 worker 预计写入的文件/目录（项目相对路径）。调度元数据：写操作按文件集串行化' },
       },
       required: ['agentId', 'prompt'],
@@ -940,6 +993,11 @@ export function createSubagentTool(
           error: { message: 'Harness 未就绪（core.harness.start 未触发）', code: 'HARNESS_NOT_READY' },
         }
       }
+
+      /** 告警出口：与 resolveSteps 同款，非法覆盖值要能被派工方看见（不是静默回落） */
+      const warn = (msg: string) => ctx.log?.warn?.(msg)
+      /** 本次生效的挂钟超时：派工方 > 插件配置（见 resolveTimeoutMs 处注释） */
+      const effectiveTimeoutMs = resolveTimeoutMs(input.timeoutMs, warn)
 
       const { agent, session } = harness
 
@@ -1072,7 +1130,7 @@ export function createSubagentTool(
         //    执行完成后更新 task 状态 + publish completed/failed 事件
         //    使用 queryStream：遍历工具调用事件，实时发布 subagent.progress（P1-5）
         const effectivePromptBg = directive ? `${directive}\n\n${input.prompt}` : input.prompt
-        const timerBg = setTimeout(() => controller.abort(), timeoutMs)
+        const timerBg = setTimeout(() => controller.abort(), effectiveTimeoutMs)
 
         // ── 长任务中途草稿（观察点 7）──
         //
@@ -1145,7 +1203,7 @@ export function createSubagentTool(
           try {
             const timeoutPromise = new Promise<never>((_resolve, reject) => {
               controller.signal.addEventListener('abort', () => {
-                reject(new Error(`后台子 Agent 执行超时（${timeoutMs}ms）`))
+                reject(new Error(`后台子 Agent 执行超时（${effectiveTimeoutMs}ms）`))
               })
             })
 
@@ -1433,7 +1491,7 @@ export function createSubagentTool(
 
       // 带超时调用 agent.query（传入 model 覆盖 + directive 前置注入）
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      const timer = setTimeout(() => controller.abort(), effectiveTimeoutMs)
 
       // directive 注入：将 directive 前置到 prompt（参考 Claude Code forkSubagent.ts 的 buildChildMessage）
       // directive 用于约束子 Agent 的输出格式（如 Scope/Result/Key files/Files changed）
@@ -1455,7 +1513,7 @@ export function createSubagentTool(
 
         const timeoutPromise = new Promise<never>((_resolve, reject) => {
           controller.signal.addEventListener('abort', () => {
-            reject(new Error(`子 Agent 执行超时（${timeoutMs}ms）`))
+            reject(new Error(`子 Agent 执行超时（${effectiveTimeoutMs}ms）`))
           })
         })
 
