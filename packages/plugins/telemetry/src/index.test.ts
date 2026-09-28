@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import { InMemoryBus, BusEvent } from '@harness/bus'
 import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity } from './envelope.js'
 import { createJsonlWriter } from './writer.js'
-import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope } from './map.js'
+import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope, paramsMissingEnvelope, stepEmptyEnvelope, whitelistBlockedEnvelope } from './map.js'
 import { createTelemetryService, deriveUserID, stackHashStack } from './index.js'
 
 describe('envelope', () => {
@@ -262,6 +262,125 @@ describe('turnEndEnvelope（整轮终态 / 额度口径）', () => {
   test('非法输入 ⇒ null', () => {
     expect(turnEndEnvelope(undefined)).toBeNull()
     expect(turnEndEnvelope('nope')).toBeNull()
+  })
+})
+
+// --------------------------------------------------------------------------
+// 批次 3 埋点：入参缺失（B2）、空步（C1）与白名单越界（C2）
+//
+// 这三条的共同前提是**三件套**：core 的 hook 只是事实源，没有落盘消费方就等于死代码
+// —— 真机「开场 3 轮空转」之所以只能提出两种假设、无法证伪，正是因为两件都缺。
+// --------------------------------------------------------------------------
+
+describe('paramsMissingEnvelope（入参缺失型失败）', () => {
+  test('落 telemetry.tool.params.missing，带工具 id 与缺参数个数', () => {
+    const ev = paramsMissingEnvelope({ toolId: 'read_file', sessionId: 's_1', agentId: 'reader', step: 3, missingCount: 1 })!
+    expect(ev.kind).toBe('telemetry.tool.params.missing')
+    expect(ev.attrs.toolId).toBe('read_file')
+    expect(ev.attrs.sessionId).toBe('s_1')
+    expect(ev.metrics.step).toBe(3)
+    expect(ev.metrics.missingCount).toBe(1)
+  })
+
+  test('不落任何入参/提示词正文（遥测红线）', () => {
+    const ev = paramsMissingEnvelope({ toolId: 'read_file', sessionId: 's_1', step: 1, missingCount: 1 })!
+    const dump = JSON.stringify(ev)
+    expect(dump).not.toContain('path')
+    // undefined 键在对象里存在、但 JSON.stringify 会丢 ⇒ 落盘面只看有值的键
+    expect(Object.keys(ev.attrs).filter((k) => ev.attrs[k] !== undefined).sort()).toEqual(['sessionId', 'toolId'])
+  })
+
+  test('缺 toolId ⇒ null（无归属的事件不该落，否则计数对不上账）', () => {
+    expect(paramsMissingEnvelope({ sessionId: 's_1', step: 1 })).toBeNull()
+    expect(paramsMissingEnvelope(undefined)).toBeNull()
+  })
+})
+
+describe('stepEmptyEnvelope（空步：一次完整 prompt 换来零产出）', () => {
+  test('落 telemetry.step.empty，布尔折成 0/1 便于聚合', () => {
+    const ev = stepEmptyEnvelope({ sessionId: 's_1', agentId: 'lead', step: 1, hasTokenUsage: false, aborted: false })!
+    expect(ev.kind).toBe('telemetry.step.empty')
+    expect(ev.attrs.sessionId).toBe('s_1')
+    expect(ev.metrics.step).toBe(1)
+    expect(ev.metrics.hasTokenUsage).toBe(0)
+    expect(ev.metrics.aborted).toBe(0)
+  })
+
+  test('中断导致的空步单独标 1：不该被当成"模型没说话"计入浪费', () => {
+    const ev = stepEmptyEnvelope({ sessionId: 's_1', step: 2, aborted: true })!
+    expect(ev.metrics.aborted).toBe(1)
+  })
+
+  test('非法输入 ⇒ null', () => {
+    expect(stepEmptyEnvelope(undefined)).toBeNull()
+    expect(stepEmptyEnvelope('nope')).toBeNull()
+  })
+})
+
+describe('whitelistBlockedEnvelope（白名单越界：能力边界事件，与工具自身报错不同类）', () => {
+  test('落 telemetry.tool.whitelist.blocked，带工具 id 与步号', () => {
+    const ev = whitelistBlockedEnvelope({ toolId: 'compress', sessionId: 's_1', agentId: 'reader-4', step: 9 })!
+    expect(ev.kind).toBe('telemetry.tool.whitelist.blocked')
+    expect(ev.attrs.toolId).toBe('compress')
+    expect(ev.attrs.agentId).toBe('reader-4')
+    expect(ev.metrics.step).toBe(9)
+  })
+
+  test('不落入参/提示词正文（遥测红线）', () => {
+    const ev = whitelistBlockedEnvelope({ toolId: 'compress', sessionId: 's_1', step: 1 })!
+    expect(Object.keys(ev.attrs).filter((k) => ev.attrs[k] !== undefined).sort()).toEqual(['sessionId', 'toolId'])
+  })
+
+  test('缺 toolId ⇒ null（无归属的事件不该落）', () => {
+    expect(whitelistBlockedEnvelope({ sessionId: 's_1', step: 1 })).toBeNull()
+    expect(whitelistBlockedEnvelope(undefined)).toBeNull()
+  })
+})
+
+describe('turnEndEnvelope：emptySteps 整轮汇总', () => {
+  test('有空步时落 emptySteps（区分「模型零产出」与「整轮没跑起来」）', () => {
+    const ev = turnEndEnvelope({ agentId: 'lead', sessionId: 's_4', step: 1, emptySteps: 1 })!
+    expect(ev.metrics.emptySteps).toBe(1)
+    expect(ev.metrics.billedSteps).toBe(1)
+  })
+
+  test('无空步时不落该字段（0 值不占盘）', () => {
+    const ev = turnEndEnvelope({ agentId: 'lead', sessionId: 's_5', step: 3 })!
+    expect(ev.metrics.emptySteps).toBeUndefined()
+  })
+})
+
+describe('telemetry 插件：三个新 hook 都真的落盘（不是只挂不消费的死 hook）', () => {
+  let dir: string
+  beforeAll(() => (dir = mkdtempSync(join(tmpdir(), 'tel-batch3-'))))
+  afterAll(() => rmSync(dir, { recursive: true, force: true }))
+
+  const readLines = (sid: string) =>
+    readFileSync(join(dir, 'sessions', `${sid}.telemetry.jsonl`), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as { kind: string; attrs: Record<string, unknown>; metrics: Record<string, number> })
+
+  test('core.tool.params.missing / core.step.empty / core.tool.whitelist.blocked 各自落一条会话级事件', async () => {
+    const pathBuilder = (sid: string | undefined) => join(dir, 'sessions', `${sid ?? 'run'}.telemetry.jsonl`)
+    const svc = createTelemetryService({ enabled: true, dataDir: dir, pathBuilder, crash: false })
+    const bus = new InMemoryBus()
+    const hooks = (await svc.plugin.install({ bus } as never)) as Record<string, ((s: unknown) => void) | undefined>
+
+    expect(typeof hooks['core.tool.params.missing']).toBe('function')
+    expect(typeof hooks['core.step.empty']).toBe('function')
+    expect(typeof hooks['core.tool.whitelist.blocked']).toBe('function')
+
+    hooks['core.tool.params.missing']!({ toolId: 'read_file', sessionId: 'sessB3', agentId: 'reader', step: 7, missingCount: 1 })
+    hooks['core.step.empty']!({ sessionId: 'sessB3', agentId: 'lead', step: 1, hasTokenUsage: false, aborted: false })
+    hooks['core.tool.whitelist.blocked']!({ toolId: 'compress', sessionId: 'sessB3', agentId: 'reader', step: 9 })
+    svc.telemetry.flush()
+
+    const kinds = readLines('sessB3').map((l) => l.kind)
+    expect(kinds).toContain('telemetry.tool.params.missing')
+    expect(kinds).toContain('telemetry.step.empty')
+    expect(kinds).toContain('telemetry.tool.whitelist.blocked')
+    await svc.plugin.uninstall?.()
   })
 })
 

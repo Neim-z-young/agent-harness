@@ -386,6 +386,104 @@ describe('@harness/core', () => {
       expect((toolPart.result as any).reply).toBe('echo:hi')
       await h.stop()
     })
+
+    /**
+     * 回归守卫（真机 s_1790592617954_axqkk）：
+     *
+     * reader 的 `tools:` 只给了 read_file/list_dir/glob/grep_file，`compress` 却调用成功。
+     * 根因是执行期解析多了个回落：`allowedTools.find(...) ?? toolRegistry.get(...)`
+     * —— 一旦模型点名一个"**已注册**、但不在白名单"的工具，就会从全局注册表取到实例并执行，
+     * `tools:` 这条硬边界形同虚设（`tools: []` 同样被架空）。
+     *
+     * 断言三件：① 工具**没真被调用**；② 结果里是明确的"不在可用范围"失败（不是静默 undefined）；
+     * ③ 审计 hook `core.tool.whitelist.blocked` 有触达。
+     */
+    it('已注册但不在白名单的工具**拒绝执行**（fail-closed，而非从全局注册表回落）', async () => {
+      let otherCalled = false
+      const ToolPlugin: AgentPlugin = {
+        id: 'tools', version: '1', name: 'Tools',
+        async install() {
+          return {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
+              pool.add(createEchoTool())
+              pool.add(defineTool({
+                id: 'compress',
+                description: '已注册、但不在本 agent 白名单内',
+                inputSchema: { parse: (v: any) => v, safeParse: (v: any) => ({ success: true, data: v }) },
+                async call(): Promise<ToolResult> { otherCalled = true; return { ok: true, output: 'should-not-run' } },
+              }))
+            },
+          } as Hooks
+        },
+      }
+      const cp = mockChatProvider('tool', () => ({
+        content: '',
+        model: 'mock-v1',
+        tokenUsage: { input: 5, output: 2 },
+        toolCalls: [{ toolUseId: 'tu_1', toolId: 'compress', input: {} }],
+      }))
+      const blocked: unknown[] = []
+      const AuditProbe: AgentPlugin = {
+        id: 'audit-probe', version: '1', name: 'AuditProbe',
+        async install() {
+          return { 'core.tool.whitelist.blocked': (input: unknown) => { blocked.push(input) } } as Hooks
+        },
+      }
+      const h = await createHarness({
+        chatProvider: cp,
+        permission: new DefaultPermissionEngine({ '*': 'allow' }),
+        agents: [makeAgent({ tools: ['echo'] as any })],
+        internalPlugins: [ToolPlugin, AuditProbe],
+      })
+      const sess = await h.session.create()
+      const reply = await h.agent.query({ sessionId: sess.id, message: 'x', maxSteps: 1 })
+      const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
+      expect(toolPart.toolId).toBe('compress')
+      // ① 越界工具没有被真正执行
+      expect(otherCalled).toBe(false)
+      // ② 回喂明确原因（`TOOL_NOT_ALLOWED`），不是静默 undefined
+      expect(toolPart.isError).toBe(true)
+      expect((toolPart.result as any)?.code).toBe('TOOL_NOT_ALLOWED')
+      // ③ 审计 hook 触达且带得动 id
+      expect(blocked.length).toBe(1)
+      expect((blocked[0] as { toolId?: string }).toolId).toBe('compress')
+      await h.stop()
+    })
+
+    /**
+     * `tools: []` 是"一个都不给"（与"未声明 ⇒ 回落只读哨兵"不同，见 AGENTS.md）。
+     * 同一条回落也会架空它 —— 显式空白名单下任何工具调用都该被拒。
+     */
+    it('tools: []（一个都不给）下任何工具调用都被拒，不再从全局注册表回落', async () => {
+      let echoCalled = false
+      const ToolPlugin: AgentPlugin = {
+        id: 'tools', version: '1', name: 'Tools',
+        async install() {
+          return {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
+              pool.add(defineTool({
+                id: 'echo',
+                description: '返回传入的 msg',
+                inputSchema: { parse: (v: any) => v, safeParse: (v: any) => ({ success: true, data: v }) },
+                async call(): Promise<ToolResult> { echoCalled = true; return { ok: true, output: { reply: 'echo:hi' } } },
+              }))
+            },
+          } as Hooks
+        },
+      }
+      const h = await createHarness({
+        chatProvider: mockChatProvider('tool'), // 默认就调 echo
+        permission: new DefaultPermissionEngine({ '*': 'allow' }),
+        agents: [makeAgent({ tools: [] as any })],
+        internalPlugins: [ToolPlugin],
+      })
+      const sess = await h.session.create()
+      const reply = await h.agent.query({ sessionId: sess.id, message: 'x', maxSteps: 1 })
+      const toolPart = reply.parts.find((p: any) => p.type === 'tool') as any
+      expect(echoCalled).toBe(false)
+      expect((toolPart.result as any)?.code).toBe('TOOL_NOT_ALLOWED')
+      await h.stop()
+    })
   })
 
   describe('agent.mcpServers 按 MCP server 粒度过滤工具', () => {

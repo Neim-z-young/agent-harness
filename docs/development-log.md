@@ -1,5 +1,89 @@
 # Agent Harness 开发日志
 
+## 2026-09-28（续 207）批次 3：白名单越界的真根因 + 三条埋点落地（越界 / 空步 / 入参缺失）
+
+批次 3 原计划是"补埋点"。**实施时把 C2 的根因判断改写了** —— 它本来就是不安全的。
+
+### C2 根因：`tools:` 白名单在**执行期**被一条回落架空
+
+方案原文说"当前代码里没有 `bypassWhitelist` 之类的机制 ⇒ 更可能是白名单过滤本身有漏"。
+查证结论：过滤没错，**执行期解析多了一步回落**（`core/src/index.ts:3026`）——
+
+```ts
+const tool = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
+```
+
+`allowedTools.find` 未命中就回落**全局注册表**：模型点名一个"已注册、但不在白名单"的工具
+（真机 `s_1790592617954_axqkk` 里 reader 只授权 `read_file/list_dir/glob/grep_file`，
+却成功调用了 `compress`），照样能取到实例并执行。**`tools:` 只是"模型看得到什么"，
+不等于"模型只能调什么"** —— 有没有 MCP 豁免、有没有内置白名单都不是原因，就这一行。
+
+同一处还架空了两条既有约定：`tools: []`（AGENTS.md 明写"一个都不给"）此前任何调用都会被
+这条回落放行；alias 调用则是**唯一**需要回落 的真实理由（`allowedTools` 存真实 id）。
+
+**改法**：回落仍保留（alias 要靠它），但解析结果**必须回白名单验一次身份**：
+
+```ts
+const resolved = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
+const tool = resolved !== undefined && allowedTools.includes(resolved) ? resolved : undefined
+```
+
+并把"越界"与"未注册"分开：越界回喂 `TOOL_NOT_ALLOWED`（明确原因，别让模型当临时故障原地重试），
+未注册仍按原样静默（多半只是拼错名字，没有可审计的边界）。
+
+### C2-b（`compress` 前置短路）：**不做**，理由记档
+
+方案原文的行动 2 是"`minCompressRange` 未达时，在**执行前**就短路返回 `NO_EFFECT`"。
+核实后判定不划算，先不动：
+
+- 内核 `applyCompression` 的 gate（`acp-kernel/dist/index.js:2107`）**在任何块被构建之前**就返回，
+  且返回的是 `state: input.state` —— **不改状态**。所谓"白烧"是**模型那一步**（模型自己发起的调用，
+  引擎无法提前知道），不是被浪费的压缩计算。
+- 想在插件侧"前置"就必须复刻内核的 `totalRangeChars` / `hasBlockBoundaryRange` 判据，
+  而插件只有 `measureRangeChars`（按 ref 序号区间估算，block 边界判别不出来）⇒ 判据必然与内核漂移，
+  可能**误拒合法压缩**。风险换不到收益。
+- 顺带发现一个**微小**的真实浪费：零收益时 `sctx.needFull = true` 会强制下一轮全量重渲染
+  （CPU，非 token —— 内容逐字节不变，provider 侧前缀缓存仍命中）。收益量级不值得动 ACP 状态机。
+
+### 三条埋点（每条都是三件套：hook 声明 + core 触发 + telemetry 落盘）
+
+| 事件 | core 触发点 | 解决的问题 |
+|---|---|---|
+| `core.tool.whitelist.blocked` | 解析结果不在 `allowedTools` 内 | 能力边界事件此前**静默放行**，遥测里与正常调用同形 |
+| `core.step.empty` | 无用量 + 无正文 + 无推理 + 无工具调用 | "一次完整 prompt 换零产出"此前**完全隐形**（无 usage ⇒ 无 `providerCache` 行；无 tool call ⇒ 整轮结束） |
+| `core.tool.params.missing` | `describeMissingRequiredParams` 命中处（与 `selfHealOnly` 同源） | 分不出"缺参数型失败"（真机 14 次 `input: {}`）——`core.tool.post.execute` 触发得更早，那时自愈文本还没拼进消息 |
+
+`turn.end` 另补 `emptySteps` 整轮回填（单步事实走 `core.step.empty`，整轮汇总走 turn.end，
+两处同源不同粒度）。为让两个消费方共用同一判据，`describeMissingRequiredParams` 内部抽出
+`missingRequiredKeys`（否则"免计额度"与"埋点计数"各按一套口径算，对不上账）。
+
+### 验证
+
+- **反向验证**（AGENTS.md 要求）：临时把 `allowedTools.includes` 校验去掉 ⇒ 两条新守卫
+  （越界 / `tools: []`）**双双变红**；恢复后绿。不是"写完就绿"的假守卫。
+- **端到端落盘**（L3-lite，真实引擎 + 真实 telemetry 插件 + 临时 `dataDir`）：
+  `outputs/session-analysis/verify-batch3-e2e.ts` 把三种形态各真跑一轮 query，
+  断言 `telemetry.tool.whitelist.blocked` / `telemetry.step.empty` /
+  `telemetry.tool.params.missing` 三条都落进 `sessions/*.telemetry.jsonl`。
+  该脚本用脚本化 provider 而非 `MockChatProvider`：后者**总会带 tokenUsage 与正文**，造不出"空步"。
+
+| 项目 | 结果 |
+|---|---|
+| 全量 `bun run typecheck` | 39 包 0 error |
+| `core` | **56 pass / 0 fail**（新增 2 条白名单守卫） |
+| `telemetry` | **53 pass / 0 fail**（新增 3 条 envelope + 1 条落盘） |
+| 全量 `bun run test` | 39 包 **0 fail** |
+| 端到端落盘 | 三条埋点全部落盘（场景 A 越界 ✓ / B 空步 ✓ / C 自愈 ✓） |
+
+### 复用要点
+
+- **"白名单/边界类"配置要查两处**：过滤（模型看到什么）与解析（执行时取谁）。
+  只测"配了白名单能否执行"会全绿 —— 真机那条 8 个 subagent 全 `tools:"*"` 的旧账是同一类。
+- **"埋点"落地必须是三件套**，缺一即死代码。查死 hook 的最快方式：`grep` 消费方是否存在，
+  而不是看 hook 有没有被触发。
+- 端到端脚本里，**工具桩的 `safeParse` 必须真的失败**才能走到"入参自愈" —— 恒成功的桩会让
+  工具"执行成功"，看着像功能没生效，其实是场景没造出来。
+
 ## 2026-09-28（续 206）结果滞留的真机根因是 TUI 没挂自动续轮（不是退避不够）
 
 方案 A2 原本判断"barrier 事件与通知入队是两个独立分支，靠退避赌"，并建议再加退避/重投。

@@ -67,6 +67,7 @@ export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
     sessionId?: string
     step?: number
     freeSteps?: number
+    emptySteps?: number
     finish?: string
     aborted?: boolean
   }
@@ -75,6 +76,10 @@ export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
   const free = typeof s.freeSteps === 'number' && Number.isFinite(s.freeSteps) ? s.freeSteps : 0
   if (free > 0) metrics.freeSteps = free
   if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.billedSteps = s.step - free
+  // 空步数（有值才落）：「模型连续零产出」与「请求层整轮没跑起来」的区分依据
+  if (typeof s.emptySteps === 'number' && Number.isFinite(s.emptySteps) && s.emptySteps > 0) {
+    metrics.emptySteps = s.emptySteps
+  }
   // 只在真的中断时记一位（缺省即 0，不落无用字段）
   if (s.aborted === true) metrics.aborted = 1
   return makeEnvelope(
@@ -86,6 +91,78 @@ export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
       mode: s.mode,
       finish: s.finish,
     },
+    metrics,
+  )
+}
+
+/**
+ * 入参缺失 → `telemetry.tool.params.missing`。
+ *
+ * 三件套里的消费方：`core.tool.params.missing` hook 由 core 在「必填全缺」的唯一命中点
+ * 触发，这里落盘 ⇒ 终于能统计「入参缺失型失败」的次数与分布。此前只能靠
+ * `telemetry.tool.fail` 数失败总数，分不出类型（真机 14 次 `input: {}`，见
+ * s_1790592617954_axqkk）。
+ *
+ * 只记**缺了几个**（`missingCount`）与工具 id —— 遥测红线是不落提示词/入参正文，
+ * 参数名虽是低基数但会随工具膨胀，故也不落。
+ */
+export function paramsMissingEnvelope(signal: unknown): TelemetryEnvelope | null {
+  if (signal === null || typeof signal !== 'object') return null
+  const s = signal as { toolId?: string; sessionId?: string; agentId?: string; step?: number; missingCount?: number }
+  if (!s.toolId) return null
+  const metrics: Record<string, number> = {}
+  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
+  if (typeof s.missingCount === 'number' && Number.isFinite(s.missingCount)) metrics.missingCount = s.missingCount
+  return makeEnvelope(
+    'telemetry.tool.params.missing',
+    { toolId: s.toolId, sessionId: s.sessionId, agentId: s.agentId },
+    metrics,
+  )
+}
+
+/**
+ * 空步 → `telemetry.step.empty`。
+ *
+ * 「一次完整 prompt 换来零产出」是纯浪费，且此前**完全不可观测**：没有 tokenUsage ⇒
+ * 不触发 `core.llm.usage` ⇒ ACP 的 providerCache 行没有；没有 tool call ⇒ 整轮就此结束。
+ * 遥测里只剩一条 `telemetry.turn.end { step:1, billedSteps:1 }`，与正常收尾无异。
+ *
+ * `hasTokenUsage` / `aborted` 折成 0/1（布尔在 attrs 里会被 JSON 保留，但指标出口
+ * 只收数值，统一折 0/1 才能聚合）。
+ */
+export function stepEmptyEnvelope(signal: unknown): TelemetryEnvelope | null {
+  if (signal === null || typeof signal !== 'object') return null
+  const s = signal as { sessionId?: string; agentId?: string; step?: number; hasTokenUsage?: boolean; aborted?: boolean }
+  const metrics: Record<string, number> = {}
+  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
+  metrics.hasTokenUsage = s.hasTokenUsage === true ? 1 : 0
+  metrics.aborted = s.aborted === true ? 1 : 0
+  return makeEnvelope(
+    'telemetry.step.empty',
+    { sessionId: s.sessionId, agentId: s.agentId },
+    metrics,
+  )
+}
+
+/**
+ * 白名单越界 → `telemetry.tool.whitelist.blocked`。
+ *
+ * 三件套里的消费方：`core.tool.whitelist.blocked` hook 由 core 在"解析出的工具不在
+ * `allowedTools` 内"的唯一命中点触发，这里落盘 ⇒ 能力边界事件可被统计（哪台 agent、
+ * 第几步、点了哪个工具）。此前这类调用会被静默放行，遥测里与正常调用**完全同形**
+ * （真机 s_1790592617954_axqkk：reader 只授权 4 个只读工具，`compress` 却调用了）。
+ *
+ * 只落工具 id 与步号 —— 不落入参正文（遥测红线）。
+ */
+export function whitelistBlockedEnvelope(signal: unknown): TelemetryEnvelope | null {
+  if (signal === null || typeof signal !== 'object') return null
+  const s = signal as { toolId?: string; sessionId?: string; agentId?: string; step?: number }
+  if (!s.toolId) return null
+  const metrics: Record<string, number> = {}
+  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
+  return makeEnvelope(
+    'telemetry.tool.whitelist.blocked',
+    { toolId: s.toolId, sessionId: s.sessionId, agentId: s.agentId },
     metrics,
   )
 }

@@ -396,14 +396,10 @@ function placeholderForType(type?: string): unknown {
  * 只在「必填项一个都没给全」时才附加：必填齐全 ⇒ 是别的业务错误，不掺和（避免噪音与误伤）。
  */
 function describeMissingRequiredParams(tool: Tool, input: unknown): string | undefined {
+  const missing = missingRequiredKeys(tool, input)
+  if (!missing) return undefined
   const schema = tool.inputSchema?.__jsonSchema
   const required = Array.isArray(schema?.required) ? (schema!.required as string[]) : []
-  if (required.length === 0) return undefined
-  const obj = input && typeof input === 'object' && !Array.isArray(input)
-    ? (input as Record<string, unknown>)
-    : undefined
-  const present = required.filter((k) => obj != null && obj[k] !== undefined && obj[k] !== null)
-  if (present.length === required.length) return undefined
   const props = (schema?.properties ?? {}) as Record<string, { type?: string; description?: string }>
   const lines = required.map((k) => {
     const p = props[k] ?? {}
@@ -411,10 +407,29 @@ function describeMissingRequiredParams(tool: Tool, input: unknown): string | und
   })
   const example: Record<string, unknown> = {}
   for (const k of required) example[k] = placeholderForType(props[k]?.type)
+  const present = required.filter((k) => !missing.includes(k))
   const got = present.length > 0 ? `（已给出：${present.join('、')}）` : '（一个都没给）'
   return `[入参自愈] 工具「${tool.id}」缺少必填参数${got}。\n` +
     `必填参数：\n${lines.join('\n')}\n` +
     `最小示例：${JSON.stringify(example)}`
+}
+
+/**
+ * 该次调用的**必填项里缺了哪几个**（都没缺则返回 undefined）。
+ *
+ * 单独抽出来是因为「入参自愈」有第二个消费方：埋点 hook `core.tool.params.missing`
+ * 要报**缺了几个**（而不是把整段说明文本再算一遍）。两个消费方共用同一判据，
+ * 否则"免计额度"与"埋点计数"会各按一套口径算、对不上账。
+ */
+function missingRequiredKeys(tool: Tool, input: unknown): string[] | undefined {
+  const schema = tool.inputSchema?.__jsonSchema
+  const required = Array.isArray(schema?.required) ? (schema!.required as string[]) : []
+  if (required.length === 0) return undefined
+  const obj = input && typeof input === 'object' && !Array.isArray(input)
+    ? (input as Record<string, unknown>)
+    : undefined
+  const missing = required.filter((k) => !(obj != null && obj[k] !== undefined && obj[k] !== null))
+  return missing.length > 0 ? missing : undefined
 }
 
 export class DefaultPermissionEngine implements PermissionEngine {
@@ -1690,6 +1705,13 @@ interface StepOutcome {
    * 这一步就干了实事，理应吃额度。为 false / undefined 时语义与改造前完全一致。
    */
   selfHealOnly?: boolean
+  /**
+   * 本步是**空步**：模型什么都没给（无用量 / 无正文 / 无推理 / 无工具调用）。
+   *
+   * 由 `queryStream` 累计后随 `core.agent.turn.end` 报出（`emptySteps`）——
+   * 单步事实走 `core.step.empty`，整轮汇总走 turn.end，两处同源不同粒度。
+   */
+  emptyStep?: boolean
 }
 
 /** 判断一个异常是否为 AbortError（各家实现细节不一，按 name/形状兜底判断） */
@@ -2475,6 +2497,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
      * 既做上限判定，也在 `turn_end` 里报出去 —— 否则"步号比额度大"这件事没人解释得了。
      */
     let selfHealFreeUsed = 0
+    /**
+     * 本轮出现了几个**空步**（模型什么都没给）。
+     *
+     * 整轮粒度也要报：单步事实（`core.step.empty`）适合定位"哪一步空了"，
+     * 而"这一轮是不是整体空转过"（真机开场 3 轮各 1 空步）要在 turn 级一眼看到。
+     */
+    let emptySteps = 0
     // 步间闸门状态（见循环内那一段的说明）：`gateAttempt` = 连续等待了几次（决定阶梯档位，
     // 探测到"没有存活任务"即归零），`gateWaitedMs` = 本轮累计等待（对总预算兜底）。
     let gateAttempt = 0
@@ -2667,6 +2696,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
           recentSigs = [...recentSigs, ...outcome.toolSigs].slice(-(DOOM_LOOP_THRESHOLD - 1))
           stepSigs = [...stepSigs, outcome.stepSig].slice(-(DOOM_LOOP_THRESHOLD - 1))
         }
+        if (outcome.emptyStep === true) emptySteps += 1
 
         // ── 额度计数：「必填全缺」的入参回喂步免税（观察点 9）──
         //
@@ -2725,6 +2755,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
           sessionId,
           step,
           ...(selfHealFreeUsed > 0 ? { freeSteps: selfHealFreeUsed } : {}),
+          ...(emptySteps > 0 ? { emptySteps } : {}),
           ...(lastOutcome?.finish ? { finish: lastOutcome.finish } : {}),
           ...(signal?.aborted ? { aborted: true } : {}),
         })
@@ -2992,7 +3023,19 @@ export class AgentRuntimeImpl implements AgentRuntime {
       const tc = toolCalls[i]
       const { parsedInput, sig } = planned[i]
 
-      const tool = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
+      // 解析本次调用的工具实例，**并强制回到本 agent 的白名单边界内**。
+      //
+      // 为什么要两步解析：`allowedTools` 里存的是**真实 id**，而模型可能按 alias 调用，
+      // alias 只有全局注册表认 —— 所以未命中时要回落 `toolRegistry.get`。
+      // 但回落结果**必须再回白名单验一次**，否则模型点名一个"已注册、不在白名单"的工具
+      // 就能越过 agent 能力边界执行。真机 s_1790592617954_axqkk：reader 的 `tools:` 只有
+      // read_file/list_dir/glob/grep_file，`compress` 却调用成功。`tools:` 是硬边界，
+      // 不能只靠"模型看不到就不会点它"；`tools: []`（一个都不给）此前同样被这条回落架空。
+      const resolved = allowedTools.find((t) => t.id === tc.toolId) ?? this.deps.toolRegistry.get(tc.toolId)
+      const tool = resolved !== undefined && allowedTools.includes(resolved) ? resolved : undefined
+      // 越界（已注册但未授权）与"未注册"要分开：前者是能力边界事件、要审计并明确回喂原因，
+      // 后者多半只是名字拼错（没有可审计的边界）。
+      const blockedByWhitelist = resolved !== undefined && tool === undefined
       const resultPart: any = {
         type: 'tool',
         toolUseId: tc.toolUseId,
@@ -3082,10 +3125,31 @@ export class AgentRuntimeImpl implements AgentRuntime {
       }
 
       if (!tool) {
-        resultPart.result = undefined
-        resultPart.isError = true
+        if (blockedByWhitelist) {
+          // 能力边界被点破：回喂**明确原因**（而不是静默 undefined），否则模型会当成
+          // 临时故障原地重试，白烧更多步。同时上报审计 hook（`tools:` 是硬边界，
+          // 不该只在没人看的地方静默生效）。
+          resultPart.result = {
+            message:
+              `工具「${tc.toolId}」不在本 agent 的可用范围内（tools 白名单未授权），已拒绝执行。` +
+              '请改用可用范围内的工具；若确有需要，请让派工方在其 tools 白名单中显式授权。',
+            code: 'TOOL_NOT_ALLOWED',
+          }
+          resultPart.isError = true
+          void this.deps
+            .triggerPlugin('core.tool.whitelist.blocked', {
+              toolId: tc.toolId,
+              sessionId,
+              ...(agentId ? { agentId } : {}),
+              step,
+            })
+            .catch(() => undefined)
+        } else {
+          resultPart.result = undefined
+          resultPart.isError = true
+        }
         assistant.parts.push(resultPart)
-        yield { type: 'tool_call_result', toolUseId: tc.toolUseId, toolId: tc.toolId, result: undefined, isError: true }
+        yield { type: 'tool_call_result', toolUseId: tc.toolUseId, toolId: tc.toolId, result: resultPart.result, isError: true }
         continue
       }
 
@@ -3108,6 +3172,18 @@ export class AgentRuntimeImpl implements AgentRuntime {
             `${(resultPart.result as { message?: string }).message ?? '入参不合法'}\n\n${heal}`
           // 唯一命中点：这次调用的失败**就是**"必填项没给全"（观察点 9 的免计依据）
           selfHealIdx.add(i)
+          // 埋点：与上面同一个命中点，口径必然一致。`core.tool.post.execute` 触发得
+          // **更早**（那时自愈说明还没拼进 message），消费方在那里分不出"缺参数"这类失败，
+          // 所以单开一条 hook。只上报、不改结果；失败绝不能顶掉主流程。
+          void this.deps
+            .triggerPlugin('core.tool.params.missing', {
+              toolId: tc.toolId,
+              sessionId,
+              ...(agentId ? { agentId } : {}),
+              step,
+              missingCount: missingRequiredKeys(tool, parsedInput)?.length ?? 0,
+            })
+            .catch(() => undefined)
         }
       }
       assistant.parts.push(resultPart)
@@ -3119,6 +3195,26 @@ export class AgentRuntimeImpl implements AgentRuntime {
         result: resultPart.result,
         isError: !res.ok,
       }
+    }
+
+    // ---- 空步埋点：模型什么都没给 ----
+    //
+    // 判据：无用量 + 无正文 + 无推理 + 无工具调用。这类步目前**完全不可观测**：
+    // ① 没有 tokenUsage ⇒ `core.llm.usage` 不触发 ⇒ ACP 的 providerCache 行没有；
+    // ② toolCalls 为空 ⇒ `shouldContinueStep` 判 false ⇒ 整轮就此结束；
+    // ③ assistant 是空 parts 消息 ⇒ 会话里看不出模型干过什么。
+    // 于是遥测只剩一条 `turn.end { step:1, billedSteps:1 }`，与"模型正常收尾"无异。
+    // 真机 s_1790592617954_axqkk 开场 3 轮正是这个形态（各烧一次完整 prompt、零产出）。
+    if (assistant.parts.length === 0 && !tokenUsage) {
+      void this.deps
+        .triggerPlugin('core.step.empty', {
+          sessionId,
+          ...(agentId ? { agentId } : {}),
+          step,
+          hasTokenUsage: false,
+          aborted: aborted || signal?.aborted === true,
+        })
+        .catch(() => undefined)
     }
 
     await this.deps.session.addMessage(sessionId, assistant)
@@ -3173,6 +3269,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       // 本步**每一个**调用都是"必填项没给全"的失败 ⇒ 这一步只是在把参数补齐，
       // 由 queryStream 决定是否免计额度（见 MAX_SELF_HEAL_FREE_STEPS）。
       ...(toolCalls.length > 0 && selfHealIdx.size === toolCalls.length ? { selfHealOnly: true } : {}),
+      ...(assistant.parts.length === 0 && !tokenUsage ? { emptyStep: true } : {}),
     }
   }
 

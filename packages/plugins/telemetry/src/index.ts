@@ -26,7 +26,7 @@ import type { AgentPlugin, Hooks, PluginContext } from '@harness/plugin'
 import type { BusEventRecord, Unsubscribe } from '@harness/bus'
 import { createJsonlWriter, type JsonlWriter } from './writer.js'
 import { makeEnvelope, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
-import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope } from './map.js'
+import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope, paramsMissingEnvelope, stepEmptyEnvelope, whitelistBlockedEnvelope } from './map.js'
 import { createCrashGuard, type CrashState } from './crash.js'
 import { createOtlpExporter, type OtlpOptions } from './otlp.js'
 
@@ -157,6 +157,39 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
     'core.agent.turn.end'(signal: unknown): void {
       if (!enabled) return
       const ev = turnEndEnvelope(signal)
+      if (ev) persist(ev)
+    },
+    /**
+     * 入参缺失（`core.tool.params.missing`）：落 `telemetry.tool.params.missing`。
+     *
+     * 单独一条 kind 而不是并入 `telemetry.tool.fail`：后者触发得**更早**（那时 core 还没把
+     * `[入参自愈]` 说明拼进错误消息），消费方在那里无从判断"这次失败是缺参数"。
+     */
+    'core.tool.params.missing'(signal: unknown): void {
+      if (!enabled) return
+      const ev = paramsMissingEnvelope(signal)
+      if (ev) persist(ev)
+    },
+    /**
+     * 空步（`core.step.empty`）：落 `telemetry.step.empty`。
+     *
+     * 「一次完整 prompt 换来零产出」此前在遥测里**完全隐形**（没有用量 ⇒ 没有 providerCache 行；
+     * 没有工具调用 ⇒ 整轮结束；会话里只多一条空 parts 的 assistant）。真机开场 3 轮各 1 空步。
+     */
+    'core.step.empty'(signal: unknown): void {
+      if (!enabled) return
+      const ev = stepEmptyEnvelope(signal)
+      if (ev) persist(ev)
+    },
+    /**
+     * 白名单越界（`core.tool.whitelist.blocked`）：落 `telemetry.tool.whitelist.blocked`。
+     *
+     * 这是**能力边界**事件，与 `telemetry.tool.fail`（工具自身报错）不同类：它说明模型
+     * 试图调用一个本不在其白名单内的工具。此前该调用会被静默放行，遥测里看不出异常。
+     */
+    'core.tool.whitelist.blocked'(signal: unknown): void {
+      if (!enabled) return
+      const ev = whitelistBlockedEnvelope(signal)
       if (ev) persist(ev)
     },
   }

@@ -361,10 +361,85 @@ export interface AgentTurnEndSignal {
    * "步号 30 但额度没耗尽"看起来像 bug；有了它，消费方不必猜。
    */
   freeSteps?: number
+  /**
+   * 本轮有**几步是空步**（模型什么都没给：无用量 / 无正文 / 无推理 / 无工具调用）。
+   *
+   * 有值时才填。判据与 `core.step.empty` 同源 —— 那里是单步事实，这里是整轮汇总。
+   * 用途：区分「模型连续几次零产出」与「请求层整轮没跑起来」（后者连 `step` 都不会有 outcome）。
+   */
+  emptySteps?: number
   /** 末步结束原因（stop / tool_calls / length …；中断或未起步时可能缺省） */
   finish?: string
   /** 是否因外部中断（`signal`）而提前结束 */
   aborted?: boolean
+}
+
+/**
+ * `core.tool.params.missing` hook 的信号：一次工具调用因「必填项没给全」被拒。
+ *
+ * 只有 core 一个触发点 —— `_runOneStep` 里 `describeMissingRequiredParams` 命中处
+ * （那也是 `selfHealOnly` 免计额度的唯一登记点，两者同源、不会分叉）。
+ *
+ * 为什么不能靠 `core.tool.post.execute` 替代：那条 hook 在**工具入口返回失败时**就触发，
+ * 而 core 的 `[入参自愈]` 说明是在它**之后**才拼进错误消息的 ⇒ 消费方在 post hook 里
+ * 永远看不到"这次失败是缺参数"。真机 14 次 `input: {}`（s_1790592617954_axqkk）因此
+ * 只能统计成"工具失败 N 次"，分不出类型。
+ */
+export interface ToolParamsMissingSignal {
+  /** 工具 id（低基数） */
+  toolId: string
+  /** 会话 ID（缺失时事件会落到 run 级文件，见 telemetry 的 persist） */
+  sessionId?: string
+  agentId?: string
+  /** 步号（从 1 起） */
+  step: number
+  /** 缺了几个必填项（不记参数值，只记数量 —— 遥测红线：不落提示词/入参正文） */
+  missingCount: number
+}
+
+/**
+ * `core.step.empty` hook 的信号：一步跑完，模型**什么都没给**。
+ *
+ * 判据四条全否：无 tokenUsage、无 text、无 reasoning、无 tool call。
+ * 这类步目前完全不可观测 —— 它既没有 `core.llm.usage`（没用量），
+ * assistant 消息又是空 parts（`toolCallCount === 0` ⇒ 不续轮 ⇒ 整轮就此结束），
+ * 于是遥测里只剩一条 `turn.end`（`step=1`、`billedSteps=1`），看不出"模型根本没说话"。
+ *
+ * 真机 s_1790592617954_axqkk 开场 3 轮正是这个形态：三条同文输入、各 1 步、
+ * 有 `preModel` 无 `providerCache`、无 assistant 落盘。两种假设（请求连续失败 vs
+ * 空响应未落盘）此前无法区分 —— 本信号是"空响应"那一种的直接证据；
+ * 若整轮连本信号都没有（`step` 计数增长但无 outcome），则是另一种。
+ */
+export interface StepEmptySignal {
+  sessionId?: string
+  agentId?: string
+  /** 步号（从 1 起） */
+  step: number
+  /** provider 是否回报了用量（false = 连 usage 都没有，更可能是请求层失败） */
+  hasTokenUsage: boolean
+  /** 本步是否被外部中断（abort 导致的空步不算"模型没说话"） */
+  aborted: boolean
+}
+
+/**
+ * `core.tool.whitelist.blocked` hook 的信号：一次工具调用点名了「**已注册**、但不在本
+ * agent `tools:` 白名单内」的工具，core 已拒绝执行（Fail-Closed）。
+ *
+ * 为什么单开一条而不是并入工具失败遥测：这是**能力边界**事件，与"工具自身报错"不是一类
+ * —— 它意味着模型试图调用一个它本不该看见的工具。真机 s_1790592617954_axqkk：reader 的
+ * `tools:` 只有 read_file/list_dir/glob/grep_file，`compress` 却调用成功。根因是执行期
+ * 解析曾回落全局注册表（`allowedTools.find(...) ?? toolRegistry.get(...)`），把
+ * "看不到" 当成了 "不能调" —— 而模型并不能保证只点自己看得见的工具。
+ *
+ * 该 hook 只被"越界"触发；不存在的工具 id（单纯拼错）不触发（没有可审计的边界可谈）。
+ */
+export interface ToolWhitelistBlockedSignal {
+  /** 被点名的工具 id（低基数） */
+  toolId: string
+  sessionId?: string
+  agentId?: string
+  /** 步号（从 1 起） */
+  step: number
 }
 
 /**
@@ -628,6 +703,30 @@ export interface Hooks {
    * 偶尔少等一次的成本。
    */
   'core.agent.step.gate'?: (input: AgentStepGateInput, decision: AgentStepGateDecision) => Awaitable<void>
+
+  // === 引擎层异常/空载事实（埋点专用，返回 void，不改变控制流） ===
+  /**
+   * **工具入参缺失**：一次调用因「必填项没给全」被拒，core 已把必填清单拼进回喂消息。
+   *
+   * 触发点唯一（与 `selfHealOnly` 同源），语义是"这一步被花在补参数上"。
+   * 只做上报：不返回值、不影响 pipeline 结果 —— 想改结果请挂 `core.tool.post.execute`。
+   */
+  'core.tool.params.missing'?: (input: ToolParamsMissingSignal) => Awaitable<void>
+  /**
+   * **空步**：一步跑完但模型什么都没给（无用量、无文本、无推理、无工具调用）。
+   *
+   * 这类步意味着"一次完整 prompt 换来零产出"（真机一次约 0.05M token），
+   * 且因为无 tool call 会直接结束整轮。引擎不替消费方判断严重性，只报事实。
+   */
+  'core.step.empty'?: (input: StepEmptySignal) => Awaitable<void>
+  /**
+   * **白名单越界**：模型点名了一个已注册、但不在本 agent `tools:` 白名单内的工具，
+   * 引擎已拒绝执行并回喂 `TOOL_NOT_ALLOWED`。
+   *
+   * 只做上报：不返回值、不影响 pipeline 结果。用途是让"能力边界被点破"这件事可观测
+   * —— `tools:` 是硬边界，不该只在没人看的地方静默生效。
+   */
+  'core.tool.whitelist.blocked'?: (input: ToolWhitelistBlockedSignal) => Awaitable<void>
 
   // === CLI 扩展 ===
   /** 注册 CLI 斜杠命令：插件往 input.commands 追加自己的命令定义 */
