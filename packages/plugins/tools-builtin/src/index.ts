@@ -108,7 +108,19 @@ const MAX_CONTENT_CHARS = 256 * 1024 // 256KB
  */
 export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
   id: 'read_file',
-  description: '读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。',
+  /**
+   * 描述里**带一个可直接照抄的完整调用示例**，不只是字段说明。
+   *
+   * 为什么：真机（会话 `s_1790592617954_axqkk`）里 `read_file` 被发出 **14 次 `input: {}`**
+   * （`jeha1` 6 / `rra6h` 6 / `goggv` 2），每次都触发一轮「入参自愈」回喂 ——
+   * 自愈不吃步数，但**每一轮都是一次完整 prompt**（全 run 约 0.68M token ≈ 10%）。
+   * 规律是"重度用 read_file 的会话才丢"（以 grep 为主的 n6fl0 一次没丢），
+   * 且失败率随上下文变长而陡升 ⇒ 模型在长上下文里整段丢了 arguments。
+   * 字段清单说明了"要什么"，示例说明了"长什么样" —— 后者才是可照抄的形状。
+   */
+  description: '读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。'
+    + '调用示例：read_file({"path":"src/index.ts"})、read_file({"path":"src/index.ts","offset":1,"limit":80})；'
+    + 'path 是必填项，只给路径即可，不要省略 arguments。',
   documentation: readFileDoc.trim(),
   inputSchema: withJsonSchema(makeSchema<ReadFileInput>(), {
     type: 'object',

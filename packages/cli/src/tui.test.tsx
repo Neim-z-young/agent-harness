@@ -77,6 +77,7 @@ import { createTestRenderer, type TestRendererSetup } from '@opentui/core/testin
 import type { Harness } from '@harness/core'
 import type { CompactionBlock, Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
+import { CoordinatorEvents } from '@harness/coordinator'
 
 // ------------------------------------------------------------------------
 // 结构化块纯函数
@@ -657,6 +658,8 @@ interface TuiFixture {
   exit: Promise<TuiReplExit>
   cleanup: () => Promise<void>
   app: HarnessApp
+  /** 引擎引用（发 bus 事件 / 入队通知用；自动续轮类用例需要它当"外部刺激源"） */
+  harness: Harness
   /** 当前会话（TuiApp 收到的是可变 options 对象，/new、/resume 会回写 session 字段） */
   currentSession: () => { id: string; agentId?: string; meta?: Record<string, unknown>; messages: unknown[] }
 }
@@ -756,7 +759,7 @@ async function mountTui(
     for (const d of extraDirs) rmSync(d, { recursive: true, force: true })
   }
   activeFixtures.push(cleanup)
-  return { setup, exit, cleanup, app, currentSession: () => tuiOptions.session }
+  return { setup, exit, cleanup, app, harness, currentSession: () => tuiOptions.session }
 }
 
 afterEach(async () => {
@@ -1934,6 +1937,57 @@ describe('鼠标选区：闪烁 + 可点击复制', () => {
       await pumpOnce(f.setup)
     }
     expect(attrs.size).toBeGreaterThanOrEqual(2)
+    await f.cleanup()
+  }, 30_000)
+})
+
+// ------------------------------------------------------------------------
+// 后台任务结果的自动续轮（coordinator barrier → 注入 <continue/>）
+// ------------------------------------------------------------------------
+
+describe('TUI 自动续轮（barrier 完成后结果自动送达）', () => {
+  /**
+   * 真机教训（s_1790592617954_axqkk）：`attachAutoContinue` 此前**只挂在 REPL（readline）分支**，
+   * TUI 完全没有订阅 ⇒ 后台任务结果就绪后**无人取用**，一直滞留到用户自己敲下一句话才送达
+   * （barrier +527s 完成，通知 +2816s 才随用户发话进入对话，中间 38 分钟界面毫无动静）。
+   *
+   * TUI 与 REPL 共用 `createProcessLine`，所以这条用例只验证"事件源接通"：
+   * 不发任何按键，纯粹靠 bus 事件驱动，结果就该进对话。
+   */
+  it('barrier 事件 ⇒ 自动注入 <continue/> ⇒ 通知进入对话（无需用户发话）', async () => {
+    const f = await mountTui()
+    const sid = f.currentSession().id
+    const before = f.currentSession().messages.length
+
+    // 先入队、后发事件（coordinator 的既有契约）：否则 processLine 的 peek 会读到空队列
+    f.harness.session.enqueueNotification(sid, '[task-notification] 后台任务已完成')
+    await f.harness.bus!.publish(CoordinatorEvents.barrierCompleted, { sessionId: sid, taskIds: [] })
+
+    // 自动续轮是异步的（注入 → drain → createProcessLine → sendStream）：轮询等消息落库。
+    // 判据用"消息数增加 ≥ 2"（通知作为 user 进入 + assistant 回复），不依赖 mock 的具体回复内容。
+    const deadline = Date.now() + 8000
+    while (Date.now() < deadline) {
+      await pumpOnce(f.setup)
+      if (f.currentSession().messages.length >= before + 2) break
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(f.currentSession().messages.length).toBeGreaterThanOrEqual(before + 2)
+    await f.cleanup()
+  }, 30_000)
+
+  it('无待处理通知时续轮被跳过：不会凭空多出一次模型调用', async () => {
+    const f = await mountTui()
+    const sid = f.currentSession().id
+    const before = f.currentSession().messages.length
+
+    // 只发 barrier、**不**入队任何通知 ⇒ processLine 应判定空转并跳过该轮
+    await f.harness.bus!.publish(CoordinatorEvents.barrierCompleted, { sessionId: sid, taskIds: [] })
+    const deadline = Date.now() + 3000
+    while (Date.now() < deadline) {
+      await pumpOnce(f.setup)
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    expect(f.currentSession().messages.length).toBe(before)
     await f.cleanup()
   }, 30_000)
 })

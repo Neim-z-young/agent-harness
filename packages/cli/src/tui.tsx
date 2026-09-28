@@ -36,7 +36,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
-import { createProcessLine, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy } from './index'
+import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
@@ -1648,6 +1648,28 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   openFileRef.current = options.openFile
   const submitRef = useRef(submit)
   submitRef.current = submit
+
+  /**
+   * Coordinator 自动续轮：后台子 Agent 完成（全部完成 = barrier / 还剩其它 = worker）时，
+   * 注入一行 `<continue/>` 走 TUI 自己的 pendingLines → drain → createProcessLine，
+   * 让 drainNotifications 把结果送进对话（用户零操作）。
+   *
+   * ⚠️ 这条此前**只在 REPL（readline）分支挂过**，TUI 完全没有订阅 ⇒ 后台结果就绪后
+   * **无人取用**，一直滞留到用户自己敲下一句话才送达。真机 s_1790592617954_axqkk：
+   * barrier 在 +527s 完成，通知到 +2816s 才随用户敲「结果有了吗」进入对话 ——
+   * 中间 38 分钟界面停在等待中、毫无动静。
+   *
+   * TUI 与 REPL 共用同一个 `createProcessLine`（内含 `<continue/>` 的空转判定与退避 peek），
+   * 所以这里只需补上**事件源**，内核一行都不用改。
+   * 重复注入无害：processLine 对 `<continue/>` 会先 peek 待处理通知，读到空就跳过该轮。
+   */
+  useEffect(() => {
+    return attachAutoContinue(options.harness, (line) => {
+      pendingLines.current.push(line)
+      void drain()
+    })
+  }, [options.harness, drain])
+
   useKeyboard((key) => {
     // 模块 D：帮助面板 modal —— 任意键关闭（Esc/Ctrl-/ 均可，回车等同）
     if (helpOpen) {
