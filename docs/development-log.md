@@ -1,5 +1,63 @@
 # Agent Harness 开发日志
 
+## 2026-09-28（续 208）MCP 工具供给语义修复 + A1-4 超时回传进展正文 + B2-3 入参提醒
+
+用户报："mcp 服务的工具没有自动注册到 tools 列表上"。查证下来**文档与实现互相打架**，
+不是配置写错。
+
+### MCP：`mcpServers` 写成"二次过滤"，导致声明了 server 也拿到 0 个工具
+
+`packages/agent/src/index.ts` 的 `AgentDefinition.mcpServers` 文档写的是
+"声明该 Agent 可用哪些 MCP server 的**全部工具**"（= 供给），但 core 的实现是：
+
+```ts
+filterMcpTools(this.deps.toolRegistry.filterByWhitelist(agent.tools), agent.mcpServers, …)
+```
+
+`filterMcpTools` 是**纯收窄**（只能做减法），而它的入参已经把 MCP 工具剔掉了
+（MCP 工具不在显式 `tools:` 列表里）⇒ 第二阶段再筛也是空集。
+
+真机探针（`outputs/session-analysis/probe-mcp-whitelist.ts`，真实 core + 真实装配链路）：
+
+| 组合 | 修复前 | 修复后 |
+|---|---|---|
+| ① `tools:['*']` + `mcpServers:['gh']` | 可执行 ✓ | 可执行 ✓（对照） |
+| ② `tools:[read_file,…]` + `mcpServers:['gh']` | `TOOL_NOT_ALLOWED` ✗ | **可执行 ✓** |
+| ③ `tools:[…, mcp__gh__create_issue]` | 可执行 ✓（老绕法） | 可执行 ✓ |
+| ④ `tools:[read_file]` + 未声明 `mcpServers` | `TOOL_NOT_ALLOWED` ✗ | `TOOL_NOT_ALLOWED` ✗（保持不供给） |
+
+**改法**：新增 `supplyMcpTools(picked, all, mcpServers, excludeMcpServers, index)`，
+在**注册表全量**上补齐声明 server 的工具；core 与 `tools-manager` 共用它（展示与执行同一判据）。
+语义三条：非空数组 ⇒ 供给该 server 全部工具（并剔除列表外 server 的 MCP 工具）；
+`[]` ⇒ 拒绝全部 MCP（连显式写进 `tools:` 的也剔除）；**缺省 ⇒ 不供给**（刻意不做成
+"全可见"，那会让 `tools: ['read_file']` 的只读 agent 静默拿到全部 MCP 工具 = fail-open）。
+另：`tools: []` 是"一个都不给"的**绝对**逃生口，连 MCP 供给也一并关掉。
+
+> 那批 agent md（`AI 集成工程师.md` / `coder.md` / `lead.md` / 前端/后端架构师…）里
+> `mcpServers: ['code-intel']` + 手写 4 条 `mcp__code-intel__*` 的组合，**后者其实是绕前者的 bug**。
+
+### A1-4：被掐断时回传**进展正文**，不再只给路径
+
+草稿/全文都落 `{dataDir}` 下，调用方 `read_file` 的边界是它自己的 `ctx.cwd` ⇒ 路径给了也读不到。
+新增 `buildPartialDigest` / `buildPartialDigestFromLines`（上限 4000 字符），把
+"工具名 + 入参预览 + 成败 + 已写出的部分正文"拼进失败消息；前台超时路径此前**连草稿都没有**，
+改为从子 session 消息里摘。只报"跑到哪了"，不编结论。
+
+### B2-3：入参提醒改用「真丢过参数」触发，而不是占用率
+
+初稿方案是"上下文超阈值时提醒"。但那次事故（14 次空入参）的 **occupancy 峰值只有 22.83%**
+⇒ 任何长上下文阈值（25% / 35%）都不会触发，等于没修。改用批 3 刚落地的
+`core.tool.params.missing`（与 `selfHealOnly` 免计额度同源）置**粘性**标记，
+从下一轮起在 **ACP 尾部**常驻 `TOOL_ARGS_REMINDER`（尾部翻转不伤前缀缓存）。
+
+### 验证
+
+- **反向验证**（三条各自回退确认变红）：关掉 `supplyMcpTools` 的供给段 ⇒ core ★ 用例 + tool 包 4 条变红；
+  去掉前台 `digestNote` ⇒ subagent 2 条变红；去掉尾部注入 ⇒ acp-context 1 条变红
+- 全量 `typecheck` **39 包 0 error**；`tool` 77 pass(+9)、`core` 59 pass(+3)、`tools-manager` 16 pass(+3)、
+  `subagent` 158 pass(+3)、`acp-context` 82 pass(+2)；全量 **39 包 0 fail**
+- 探针复跑：② 由 `TOOL_NOT_ALLOWED` 转 ✓，④ 保持拒绝
+
 ## 2026-09-28（续 207）批次 3：白名单越界的真根因 + 三条埋点落地（越界 / 空步 / 入参缺失）
 
 批次 3 原计划是"补埋点"。**实施时把 C2 的根因判断改写了** —— 它本来就是不安全的。

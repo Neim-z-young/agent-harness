@@ -89,8 +89,9 @@
 - CLI 权限引擎（`CliPermissionEngine`）持久化规则到 `dataDir/permissions.json`，交互模式 `allow-all | ask | deny-all`，提供 `/permission` 命令
 
 - **Agent 能力白名单的四条实操约定**（真机实测得出，别凭直觉写）：
-  · `tools:` 只接受**精确 id**（`ToolRegistry.filterByWhitelist`；除整串 `'*'` 外不支持通配，也不支持 `mcp__xxx__*`）；未声明则回落**只读哨兵**（能读不能写）+ 告警，`tools: []` 才是"一个都不给"。
-  · **`tools:` 显式列表会先于 `mcpServers` 生效**：core 的顺序是 `filterByWhitelist(agent.tools)` → `filterMcpTools(..., agent.mcpServers)` ⇒ `mcpServers` 是**二次过滤**，不是"补给我某些 MCP 工具"。要拿"部分原生 + 部分 MCP"，必须把 MCP 工具 id 也写进 `tools:`（否则 MCP 在第一步已被剔除，实测拿到 0 个）。
+  · `tools:` 只接受**精确 id**（`ToolRegistry.filterByWhitelist`；除整串 `'*'` 外不支持通配，也不支持 `mcp__xxx__*`）；未声明则回落**只读哨兵**（能读不能写）+ 告警，`tools: []` 才是"一个都不给"——而且它是**绝对**的逃生口，连 `mcpServers` 声明的工具也一并拒掉。
+  · **`mcpServers` 是「供给」不是「二次收窄」**：core 的组装是 `supplyMcpTools(filterByWhitelist(agent.tools), registry.list(), agent.mcpServers, agent.excludeMcpServers)` —— 声明 `mcpServers: ['code-intel']` 即自动获得该 server **全部**工具，**不必**再把 `mcp__code-intel__*` 逐条写进 `tools:`。语义：非空数组=供给该 server 全部工具（并剔除 `tools:` 里属于列表外 server 的 MCP 工具）；`[]`=拒绝全部 MCP（连 `tools:` 里显式写的也剔除）；**缺省(undefined)=不供给**（MCP 只能靠 `tools:` 显式写 id 或 `'*'` 进来，刻意不是"全可见"——那会让 `tools: ['read_file']` 的只读 agent 静默拿到全部 MCP 工具）；`excludeMcpServers` 仅在 `mcpServers` 缺省时生效（黑名单，连显式写进 `tools:` 的也剔除）。
+    ⚠️ **历史坑（2026-09-28 修复）**：旧实现是 `filterMcpTools(filterByWhitelist(agent.tools), …)` —— 第二阶段只能**做减法**，而 MCP 工具在第一步就被剔掉了 ⇒ **声明了 server 也拿到 0 个**（探针实测 `TOOL_NOT_ALLOWED`），只有把 `mcp__…` 逐条手写进 `tools:` 才生效，文档与实现互相打架。**同一件事的另一半：`/tools` 展示必须与执行共用同一判据**（`tools-manager` 的 `agentAllowedTools`）——展示各写一套时，用户会把"其实能调"的工具读成「禁用」，比不显示更坏。
   · `mcpServers: []` = 一个 MCP 工具都不给（fail-closed：将来新增 server 也不会漏进来）；想只留某几个 server 就写 `mcpServers: [名字]`。
   · **白名单是"两处"判定：过滤（模型看到什么）+ 执行期解析（真正调谁）**。执行期曾写成 `allowedTools.find(...) ?? toolRegistry.get(...)` ⇒ 回落全局注册表，模型点名一个"已注册但未授权"的工具照样执行（真机 reader 只授权 4 个只读工具却调通了 `compress`），`tools: []` 同样被架空。回落**只该用于 alias 解析**，取到实例后必须 `allowedTools.includes(实例)` 再验一次；越界回喂 `TOOL_NOT_ALLOWED` + 触发 `core.tool.whitelist.blocked`（"未注册"≠"越界"，后者才要审计）。**只测"配了白名单能否执行"会全绿** —— 必须有一条"注册了但不授权 ⇒ 拒绝"的反向用例。
 
@@ -163,6 +164,12 @@
 - **"免费额度 / 豁免"一律必须封顶**：`MAX_SELF_HEAL_FREE_STEPS = 3` 是「必填全缺回喂免计一步」的必要兜底 —— doom-loop 只认「同一工具+同一入参连续 3 次 / 连续 3 步整步签名相同」，**`A,B,A,B…` 交替空参能完美绕开它**；不加天花板就会架空 `maxSteps` 这个唯一刹车。`billedSteps`（吃额度）与 `step`（展示步号）是两套计数，`turn_end` 带 `freeSteps` 解释二者为何不一致
 
 - **中途草稿用"正常结束即删"编码语义**（比额外维护状态标记可靠）：文件存在性本身就是状态 ⇒ **有草稿 ⇔ 这次被掐断**。触发点用**步边界**而非定时器（步边界本就是天然刷盘点）；按 taskId 固定命名 + 覆盖写（同毫秒并发不撞名）；草稿状态必须声明在 `try` **之外**（catch 要用）。落盘仍守既有约定：`{dataDir}/subagent-results/`，**不落 `os.tmpdir()`、不落 cwd**；失败路径给的可读性说明必须**如实**（能不能被 `read_file` 读到要实测判定，不猜）
+
+- **"留存"与"可消费"是两件事：被掐断的任务要把进展**正文**回传，不能只给路径**。草稿/全文落在 `{dataDir}` 下，而调用方 `read_file` 的边界是**它自己的 `ctx.cwd`** ⇒ 路径给了也读不到（真机 `s_session_1790593024558_ced93`：reviewer-4 被 120s 掐断，24 条工具日志全在草稿里，父 Agent 读不到、只好自己重做 **25 轮 / 148 万 token**）。所以失败消息里带一份**进展摘要正文**（工具名 + 入参预览 + 成败 + 已写出的部分正文，`PARTIAL_DIGEST_MAX_CHARS = 4000`，与同域的 20k 落盘档案刻意不同口径）；前台路径原本**连草稿都没有**，从子 session 消息里摘即可。摘要只许说"跑到哪了"，**不许编结论**——被掐断的任务本来就没有结论
+
+- **同一件事的"展示"与"执行"必须共用一个判据函数**：`/tools` 展示的是"模型能调什么"，它若自己再算一套（`tools-manager` 的 `agentAllowedTools` vs core 的 `supplyMcpTools`），两边一旦分叉，用户会把**其实能调**的工具读成「禁用」——比不显示更坏。做能力边界类改动时，把判据抽成一个导出函数让两侧共用，并各留一条断言
+
+- **"提醒类"注入的触发条件要用「真出过问题」的直接信号，而不是拿占用率之类的代理量去猜**：B2-3 初稿按"上下文超阈值"注入"工具调用必须带全 arguments"，但真机那次 14 次空入参的会话 occupancy 峰值只有 **22.83%** ⇒ 任何长上下文阈值（25%/35%）都不会触发，等于没修。改用 `core.tool.params.missing`（与 `selfHealOnly` 免计额度同源的直接信号）置一个**粘性**标记，本会话真丢过参数才提醒：零猜测、零误报。**注入位置一律走尾部**（`core.prompt.dynamic.transform` / ACP 的 tailParts），放前缀则每翻转一次都要连带重算其后整段历史
 
 - **测试块约定：顶层 `describe` 不继承外层 `beforeEach/afterEach`** —— 往已有测试文件里追加独立 `describe` 时若忘了自带 setup/cleanup，会因外层 `afterEach` 已清掉临时目录而 ENOENT/`SPAWN_ERROR`（表现为"新写的用例莫名失败"）。另：`ToolResult` 是**非判别联合**（`ok: boolean` + 可选 `output?/error?`），`if (!r.ok)` **不收窄**类型，断言写 `r.error?.code` / `r.output?.exitCode`
 
