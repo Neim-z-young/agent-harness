@@ -1,5 +1,129 @@
 # Agent Harness 开发日志
 
+## 2026-09-28（续 206）结果滞留的真机根因是 TUI 没挂自动续轮（不是退避不够）
+
+方案 A2 原本判断"barrier 事件与通知入队是两个独立分支，靠退避赌"，并建议再加退避/重投。
+**实施时证伪**：`subagent` 早就改成「先 `enqueueNotification()`、后 `bus.publish(completed)`」
+（`index.ts:1342`、`:1406` 两处注释写明该契约），顺序不是问题。
+
+真机根因是 `attachAutoContinue` **只在 REPL（readline）分支挂载**（`cli/src/index.ts:4332`，
+`rl.emit('line', line)`），**TUI 模式一次都没订阅** —— 不管顺序怎么调，TUI 里根本没人把
+`<continue/>` 投进输入队列 ⇒ 结果就绪后要等用户自己敲下一句话。
+真机 `s_1790592617954_axqkk`：barrier +527s 完成，通知 +2816s 才随用户敲「结果有了吗」进入对话。
+
+### 改动
+
+`packages/cli/src/tui.tsx`：组件内补一个 effect 订阅两条 Coordinator 事件，注入
+`pendingLines.current.push(line)` + `drain()`。TUI 与 REPL 共用 `createProcessLine`
+（内含 `<continue/>` 的空转判定与退避 peek），所以**内核一行没改**，只补事件源。
+
+### 验证（两条断言都做了反向验证）
+
+- 「barrier 事件 ⇒ 通知进入对话」：不发任何按键，只入队 + publish，断言会话消息数 +2。
+  **临时禁用挂载（`__PROBE_NO_AUTOCONTINUE__=1`）⇒ 用例红，且消息数增长为 0** ——
+  这正是真机"结果滞留"的最小复现，反证根因判断成立。
+- 「无待处理通知 ⇒ 跳过续轮」：只 publish 不入队，断言消息数不变（不凭空多烧一次模型调用）。
+
+### 同批：`read_file` 描述补可照抄示例（B2 的低成本部分）
+
+真机 14 次 `input: {}`（jeha1 6 / rra6h 6 / goggv 2），每次触发一轮「入参自愈」回喂
+（自愈不吃步数，但每轮都是一次完整 prompt，约 0.68M token ≈ 10%）。
+字段清单说明"要什么"，**示例说明"长什么样"** —— 后者才是长上下文里可照抄的形状。
+故 `tools-builtin/src/index.ts` 的 `read_file` description 直接带上两个完整调用示例。
+
+> **B2 的埋点部分本轮没做，理由记在这里**：想精确统计"入参缺失型失败"，需要
+> `core.tool.params.missing` hook + telemetry 新 kind + severity 映射**三件套**；
+> 只加 hook 而无消费方落盘就是死代码。现有 `telemetry.tool.fail` 能统计失败次数，
+> 但 hook 触发在 core 拼装 `[入参自愈]` 文本**之前** ⇒ envelope 里不含该特征，无法区分类型。
+> 留到批次 3，与"长上下文 nudge（提醒携带完整 arguments）"一起做。
+
+### 验证汇总（与最后一次改动对齐）
+
+| 项目 | 结果 |
+|---|---|
+| 全量 `bun run typecheck` | 39 包 0 error |
+| `cli` | **383 pass / 0 fail**（新增 2 条自动续轮断言） |
+| `tools-builtin` | 83 pass / 0 fail |
+| 全量 `bun run test` | 39 包 0 fail |
+
+### 复用要点
+
+- **"断言某功能存在"之前先断言它挂在哪**：`attachAutoContinue` 有单元测试、REPL 也正常，
+  但**只有一个调用点** —— 覆盖率掩盖了"另一半宿主没接"。查这类问题直接 grep **调用点数量**，
+  比读实现快得多。
+- 反向验证的价值在这里最直观：禁用后消息数增长 **0**，与真机"滞留 2,289s"是同一现象。
+
+## 2026-09-28（续 205）会话 s_1790592617954_axqkk 优化方案批次 1：glob 拒绝静默全仓 + subagent 派工级 timeoutMs
+
+由会话取证（报告 `outputs/session-analysis/session-axqkk-report.html`、方案
+`optimization-plan-axqkk.md`）推出的第一批落地。**缓存侧健康（命中 93.1%、drop 0、
+compression 0）⇒ 优化空间全在调度与工具层**，本批专挑"小改动堵大漏斗"的两项。
+
+### 一、`glob` 不再静默退化成全仓遍历（P1，≈16%）
+
+真机一次调用返回 **215,562 字符（约 1,937 文件）**，合法入参重调只有 665 字符；
+受害子会话成本是干同类活的另一个的 **3.05 倍**。根因是两行：falsy 的 pattern 被
+`if (!pat) continue` 静默跳过 ⇒ `includes` 为空 ⇒ 兜底 `**/*` 扫到 `MAX_GLOB_RESULTS(5000)`。
+`pattern` 在 schema 里是 `required`，但**内置工具的 Step 1 是 no-op**（`makeSchema` 的
+safeParse 恒通过）⇒ 运行期零校验。
+
+改动（`packages/plugins/tools-glob/src/index.ts`）：
+1. **非空判定改用 `trim()`** —— `''` / 纯空白 / 非法类型都算空；全空时直接返回
+   `GLOB_PATTERN_MISSING` **而不是兜底**，让模型走「入参自愈」补参数。
+2. **保留合法兜底**：pattern 全是 `!xxx` 排除项时"除这些之外的全部"是正确语义，不能报错；
+   但新增 `FALLBACK_MAX_RESULTS = 200` 压制规模（同时减少扫描 I/O）。
+3. **新增输出字符预算 `MAX_GLOB_OUTPUT_CHARS = 20_000`**：`MAX_GLOB_RESULTS` 只管条目数、
+   不管体积，几千条短路径照样撑爆上下文。超预算就裁到预算内并置 `truncated`（至少留 1 条）。
+
+> 实测两道闸取严：本例每条约 150 字符 ⇒ **字符预算先撞**（131 条 < 200 条上限）。
+> 断言因此写成上界契约（≤200 且 < 命中数），体积本身由另一条断言直接守。
+
+### 二、`subagent` 挂钟超时可被派工方按任务放宽（P0，≈31% 的前置）
+
+真机：reviewer 定义 `maxSteps: 25`，**跑到第 13 步就被插件级 120s 挂钟掐断** ⇒ 步数上限
+根本没机会生效；120s 里吐 28,229 个 reasoning token、可交付正文只有 81 字符，主 Agent
+只好用 25 轮 / 148 万 token 手工重做。
+
+根因：`timeoutMs` 只有**插件级**（缺省 `120_000`），而 `maxSteps` 早就有派工级三层覆盖。
+挂钟是**资源保护**，不该顺带当"任务该做多久"的主控参数；主控权应交给 `maxSteps`。
+
+改动（`packages/plugins/subagent/src/index.ts`），与 `resolveSteps` 同构：
+- `SubagentToolInput.timeoutMs` + inputSchema 描述（写明"让步数而不是挂钟成为终止条件"）；
+- `resolveTimeoutMs()`：派工方 > 插件配置（`AgentDefinition` 目前**没有** `timeoutMs`
+  字段 ⇒ 这里是两层，将来 md 支持时插中间层即可）；
+- 合法值 `>= 1000`；新增 `MIN/MAX_SUBAGENT_TIMEOUT_MS`，**上限 600_000 钳制并告警**
+  —— 放宽是为了让步数生效，不是解除熔断（否则模型填个天文数字就把唯一外部熔断解掉）；
+- 前台（同步）与后台两条路径都改用 `effectiveTimeoutMs`，超时消息里的毫秒数同步。
+
+配置侧（`~/.harness/agents/reviewer.md`）：**`maxSteps` 保持 25 不砍** —— 挂钟既然能放宽，
+砍步数只会削减产出；改为在注释里写明"派工时用 `subagent({ timeoutMs })` 放宽，否则 120s
+会让步数上限失效"，并在正文加「防空转」三条（不写推理过程 / 8 步无线索先回报 /
+先 grep 后 read_file），直接对冲"reasoning 烧光预算"这一现象。
+
+### 三、验证（与最后一次改动对齐）
+
+| 项目 | 结果 |
+|---|---|
+| 全量 `bun run typecheck` | 39 包全 0 error |
+| `tools-glob` | **14 pass / 0 fail**（新增 2 条） |
+| `subagent` | **155 pass / 0 fail**（新增 4 条） |
+| `cli` | **381 pass / 0 fail**（无回归） |
+| 全量 `bun run test` | 见本节末 |
+
+两条新断言都做了**反向验证**（临时回退修复 ⇒ 必须变红，否则是假守卫）：
+- glob：`if (false && ...)` 恢复旧兜底 ⇒ `GLOB_PATTERN_MISSING` 用例红（`ok` 收到 true）；
+  `MAX_GLOB_OUTPUT_CHARS` 放大 ⇒ 字符预算用例红（收到 300 条未被裁剪）。
+- subagent：`resolveTimeoutMs(undefined, ...)` 禁用派工方层 ⇒ "优先于插件配置"用例红
+  （收到 `（1000ms）` 而非 `（1200ms）`）。
+
+### 四、复用要点
+
+- **"required" 在运行期不算数**：内置工具的 Step 1 是 no-op，schema 必填**必须**在
+  `call()` 入口自己拦，否则缺参会被静默降级成"语义完全不同的兜底行为"。
+- **上限要按"体积"设，不能只按"条数"设**：条数闸挡不住几千条短路径；体积闸才是上下文的守门员。
+- **两类超时/上限要分清职责**：步数 = 任务该做多久（主控，可按任务给），挂钟 = 资源保护
+  （兜底，只允许放宽到有界范围）。让兜底抢了主控的位置，症状就是"步数配了但永远摸不到"。
+
 ## 2026-09-28（续 204）选区闪烁真机取证：markdown 块两条通道都是死的，改为命令式上色
 
 用户：「鼠标选取闪烁功能没有实现，研究下为啥」。结论不是"没写"，而是**写了但两条通道在真机上都不闪**，
