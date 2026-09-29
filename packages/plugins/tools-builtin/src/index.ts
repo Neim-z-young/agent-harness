@@ -49,34 +49,51 @@ function isWithinCwd(filePath: string, cwd: string): boolean {
   return !rel.startsWith('..') && !isAbsolute(rel)
 }
 
+/** 结构守卫的结果：成功给解析后的入参，失败给可直接塞进 `ToolResult` 的错误 */
+type InputGuardResult<T> =
+  | { ok: true; data: T }
+  | { ok: false; error: { message: string; code: string } }
+
 /**
- * 直调入参结构守卫（`read_file` / `write_file` / `edit_file` 共用）。
+ * 直调入参结构守卫（`read_file` / `write_file` / `edit_file` / `bash` 共用）。
  *
  * 管道内 Step 1 已经用同一份 schema 拦过一次；这段是**"越过管道直接调 `tool.call()`"**
  * 那条路径的兜底（测试正是直接调的）。规则只留一份 —— 复用的就是喂给模型的那份 schema。
  *
- * **为什么必须有**：这三个工具的 `call()` 第一行都是 `resolvePath(input.path, ctx.cwd)`，
- * 而 `resolvePath` 内部先做 `isAbsolute(inputPath)` —— 传 `undefined` / `null` / 数字 / 对象
- * 都会抛 `TypeError: The "path" property must be of type string`。更要命的是那行在 `try`
- * **之外**，异常不会被下面的 catch 收敛，会直接冒泡给调用方（权限引擎的
- * `extractPatterns` 在此之前还会先拿到 `[undefined]`）。
+ * **为什么必须有**：这些工具的 `call()` 第一行就会用入参 —— `resolvePath(input.path, ctx.cwd)`
+ * 内部先做 `isAbsolute(inputPath)`，传 `undefined` / `null` / 数字 / 对象都会抛
+ * `TypeError: The "path" property must be of type string`；bash 则会把 `undefined` 一路送进
+ * spawn，由 shell 报出 `bash: undefined: command not found`（真机会话里连撞 6 次）。
+ * 更要命的是 `resolvePath` 那行在 `try` **之外**，异常不会被下面的 catch 收敛，会直接冒泡给
+ * 调用方（权限引擎的 `extractPatterns` 在此之前还会先拿到 `[undefined]`）。
  *
- * 与 bash 的守卫同构（那边内联着写），错误码分两档：缺 `path` ⇒ `requiredCode`
- * （模型从码名就能读出少了哪个参数），其余结构问题 ⇒ `INVALID_INPUT`。
+ * 错误码分两档：缺 `requiredField` ⇒ `requiredCode`（模型从码名就能读出少了哪个参数），
+ * 其余结构问题 ⇒ `INVALID_INPUT`。
+ *
+ * 注意这把守卫只管**结构**。JSON Schema 表达不了的语义判据（如 bash 的"纯空白 command"）
+ * 仍留在各自的 `call()` 里 —— 别为了收口把语义塞进来。
+ *
+ * @param requiredField 必填字段名 —— 缺它才算"缺参数"
+ * @param requiredCode  缺 `requiredField` 时的对外错误码（如 `PATH_REQUIRED`）
  */
-function guardPathInput<T>(
+function guardInput<T>(
   schema: Schema<T>,
   input: unknown,
+  requiredField: string,
   requiredCode: string,
-): { ok: true; data: T } | { ok: false; error: { message: string; code: string } } {
+): InputGuardResult<T> {
   const parsed = schema.safeParse(input)
   if (parsed.success) return { ok: true, data: parsed.data }
-  const missingPath = schemaIssues(parsed.error).some((i) => i.rule === 'required' && i.path === 'path')
+  // 判据必须是 rule，不能只看 path：缺必填与"该字段类型不符"的 path 完全相同（都是字段名），
+  // 只看 path 会把 `command: 123` 也报成 COMMAND_REQUIRED（码说"缺"、消息说"应为 字符串"）。
+  const missing = schemaIssues(parsed.error).some(
+    (i) => i.rule === 'required' && i.path === requiredField,
+  )
   return {
     ok: false,
     error: {
       message: formatSchemaError(parsed.error),
-      code: missingPath ? requiredCode : 'INVALID_INPUT',
+      code: missing ? requiredCode : 'INVALID_INPUT',
     },
   }
 }
@@ -163,8 +180,8 @@ export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
     extractPatterns: (input) => [input.path],
   },
   async call(input, ctx): Promise<ToolResult<ReadFileOutput>> {
-    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardPathInput 的文档
-    const guard = guardPathInput(readFileInputSchema, input, 'PATH_REQUIRED')
+    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardInput 的文档
+    const guard = guardInput(readFileInputSchema, input, 'path', 'PATH_REQUIRED')
     if (!guard.ok) return { ok: false, error: guard.error }
     const absPath = resolvePath(input.path, ctx.cwd)
 
@@ -305,8 +322,8 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
     extractPatterns: (input) => [input.path],
   },
   async call(input, ctx): Promise<ToolResult<WriteFileOutput>> {
-    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardPathInput 的文档
-    const guard = guardPathInput(writeFileInputSchema, input, 'PATH_REQUIRED')
+    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardInput 的文档
+    const guard = guardInput(writeFileInputSchema, input, 'path', 'PATH_REQUIRED')
     if (!guard.ok) return { ok: false, error: guard.error }
     const absPath = resolvePath(input.path, ctx.cwd)
     const mode = input.mode ?? 'overwrite'
@@ -507,6 +524,24 @@ const DEFAULT_BASH_TIMEOUT = 30_000
 const MAX_OUTPUT_CHARS = 64 * 1024 // 64KB
 
 /**
+ * bash 的入参 schema（模块级，与 `read_file` / `write_file` / `edit_file` 同形）。
+ *
+ * 之所以不写在工厂函数里：`call()` 内的直调守卫要复用**同一份**对象 ——
+ * 复用的必须是喂给模型的那一份，否则又回到"schema 说一套、守卫判另一套"。
+ */
+const bashInputSchema = fromJsonSchema<BashInput>({
+  type: 'object',
+  properties: {
+    command: { type: 'string', description: '要执行的 shell 命令' },
+    cwd: { type: 'string', description: '工作目录（默认使用当前会话 cwd）' },
+    timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 30000）' },
+    env: { type: 'object', description: '附加环境变量', additionalProperties: { type: 'string' } },
+  },
+  required: ['command'],
+  additionalProperties: false,
+})
+
+/**
  * 创建 bash 工具（含沙箱防护）
  *
  * 安全声明：
@@ -528,19 +563,6 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
   const allowlist = config.allowlist
   const keepEnv = config.keepEnv ?? []
 
-  // 提到外面是为了让 call() 内的守卫复用**同一份** schema（见 call() 里的守卫注释）
-  const bashInputSchema = fromJsonSchema<BashInput>({
-    type: 'object',
-    properties: {
-      command: { type: 'string', description: '要执行的 shell 命令' },
-      cwd: { type: 'string', description: '工作目录（默认使用当前会话 cwd）' },
-      timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 30000）' },
-      env: { type: 'object', description: '附加环境变量', additionalProperties: { type: 'string' } },
-    },
-    required: ['command'],
-    additionalProperties: false,
-  })
-
   return defineTool<BashInput, BashOutput>({
     id: 'bash',
     description: '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
@@ -556,29 +578,14 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
 
-      // 入参守卫（分两段，避免与 schema 各说各话）：
-      //  - 结构（缺必填 / 类型不符）交 bashInputSchema 统一裁决。管道内 Step 1 已经拦过一次，
-      //    这段是"越过管道直接调 tool.call()"那条路径的兜底（测试正是直接调的）。
-      //  - 语义（纯空白串）JSON Schema 表达不了，留在下面手判。
+      // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardInput 的文档。
       // 历史（评审/真机修复）：缺 command 时曾把 undefined 一路传进 spawn，shell 报出
       // `bash: undefined: command not found`（exit 127）—— 模型看到的是一句和"你漏了参数"
       // 毫无关系的错误（真机会话里连撞 6 次）。
-      const parsedInput = bashInputSchema.safeParse(input)
-      if (!parsedInput.success) {
-        // 判据必须是 rule：缺 command 与 command 类型不符的 path 都是 'command'，
-        // 只看 path 会把 `command: 123` 也报成 COMMAND_REQUIRED（码说"缺"、消息说"应为 字符串"）。
-        const missingCommand = schemaIssues(parsedInput.error).some(
-          (i) => i.rule === 'required' && i.path === 'command',
-        )
-        return {
-          ok: false,
-          error: {
-            message: formatSchemaError(parsedInput.error),
-            code: missingCommand ? 'COMMAND_REQUIRED' : 'INVALID_INPUT',
-          },
-        }
-      }
-      if (parsedInput.data.command.trim() === '') {
+      const guard = guardInput(bashInputSchema, input, 'command', 'COMMAND_REQUIRED')
+      if (!guard.ok) return { ok: false, error: guard.error }
+      // 语义判据：JSON Schema 表达不了"纯空白串"，留在这里手判（不塞进结构守卫）。
+      if (guard.data.command.trim() === '') {
         return {
           ok: false,
           error: { message: '缺少 command：请在入参 `command` 里给出要执行的 shell 命令', code: 'COMMAND_REQUIRED' },
@@ -1226,8 +1233,8 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
     extractPatterns: (input) => [input.path],
   },
   async call(input, ctx): Promise<ToolResult<EditFileOutput>> {
-    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardPathInput 的文档
-    const guard = guardPathInput(editFileInputSchema, input, 'PATH_REQUIRED')
+    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardInput 的文档
+    const guard = guardInput(editFileInputSchema, input, 'path', 'PATH_REQUIRED')
     if (!guard.ok) return { ok: false, error: guard.error }
     const absPath = resolvePath(input.path, ctx.cwd)
 

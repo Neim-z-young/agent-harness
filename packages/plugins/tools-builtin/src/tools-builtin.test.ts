@@ -229,6 +229,24 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.message).toContain('应为 字符串')
     })
 
+    it('结构分支与语义分支可区分：缺 command 的文本由 schema 派生，纯空白走手判', async () => {
+      // 两段式的边界：同一个错误码 COMMAND_REQUIRED，来源不同 ——
+      //   缺 command     ⇒ 结构守卫复用喂给模型的那份 schema，message 是 schema 派生的；
+      //   纯空白 command ⇒ JSON Schema 表达不了，留在 call() 里手判，message 是手写的。
+      const missing = await bashTool.call({} as never, makeCtx())
+      expect(missing.ok).toBe(false)
+      if (missing.ok) return
+
+      const blank = await bashTool.call({ command: '   ' }, makeCtx())
+      expect(blank.ok).toBe(false)
+      if (blank.ok) return
+
+      expect(missing.error!.code).toBe('COMMAND_REQUIRED')
+      expect(blank.error!.code).toBe('COMMAND_REQUIRED')
+      expect(missing.error!.message).toContain('缺少必填参数')
+      expect(blank.error!.message).not.toContain('缺少必填参数')
+    })
+
     it('多带未声明字段仍能执行（默认容忍多余字段，控制组）', async () => {
       const res = await bashTool.call({ command: 'echo tolerate', recursive: true } as never, makeCtx())
       expect(res.ok).toBe(true)
@@ -252,14 +270,17 @@ describe('@harness/tools-builtin', () => {
     })
   })
 
-  // ===== 直调路径的入参守卫（read_file / write_file / edit_file 共用 guardPathInput） =====
+  // ===== 直调路径的入参守卫（read_file / write_file / edit_file / bash 共用 guardInput） =====
 
   /**
    * 上一条测的是**管道路径**（Step 1 用 schema 拦）。这里测的是**绕过管道直接调
-   * `tool.call()`** 那条路径：三个工具的 `call()` 第一行都是
+   * `tool.call()`** 那条路径：三个文件工具的 `call()` 第一行都是
    * `resolvePath(input.path, ctx.cwd)`，而 `resolvePath` 内部先做 `isAbsolute(inputPath)`
    * —— 且那行在 `try` **之外**，入参非法时会抛出**未被捕获**的
    * `TypeError: The "path" property must be of type string`。
+   *
+   * bash 同理（它把 `undefined` 送进 spawn，由 shell 报 `command not found`）——
+   * 它的守卫用例在上面的 `bashTool 必填校验` 里，两处调的是同一个 `guardInput`。
    */
   describe('直调路径：结构守卫在 resolvePath 之前拦下非法入参', () => {
     it('read_file 缺 path ⇒ PATH_REQUIRED（不再是 TypeError）', async () => {
