@@ -99,6 +99,56 @@ name: Coder
     expect(frontmatter.id).toBe('coder')
     expect(frontmatter.name).toBe('Coder')
   })
+
+  it('列表中间的注释行只跳过、不截断列表（回归：曾经静默吞掉后面的项）', () => {
+    // 背景：`parseBlock` 的列表分支遇到非 `- ` 开头的行会 **break**，而注释行不匹配 `- `。
+    // 后果不是报错而是**静默截断**：frontmatter 是逐字段白名单解析的，列表被砍掉一半后依旧
+    // “解析成功”。真实踩到：给 reader.md 的 tools 末尾追加压缩工具时，在中间插了一行说明
+    // ⇒ 四个新工具一个都没进白名单，而且没有任何提示。
+    const content = `---
+id: reader
+tools:
+  - read_file
+  # 压缩类：管的是本会话自己的上下文窗口，不碰文件系统
+  - compress
+  - decompress
+  - acp_status
+---`
+    const { frontmatter } = parseFrontmatter(content)
+    expect(frontmatter.tools).toEqual(['read_file', 'compress', 'decompress', 'acp_status'])
+  })
+
+  it('内联空数组 `[]` → `[]`（不是 `[""]`）；空内联对象同样（两个解析器的空保护必须对称）', () => {
+    // 背景：`''.split(',')` 返回 `['']`，于是 `mcpServers: []` 被解析成 `['']` ——
+    // 一个「名字是空字符串的 server」。而 `mcpServers: []` 是有明确契约的写法
+    // （空白名单 = 拒绝全部 MCP，见 @harness/tool 的 filterByMcpServers），
+    // `['']` 既不是"没有 server"、也匹配不上任何真实 server，且**毫无报错**。
+    // 长期没浮出水面是因为下游 `parseStringArr` 有 `.filter(Boolean)` 把它抹平回 `[]`，
+    // 但 `parseFrontmatter` 是导出 API，裸输出必须正确。
+    // `parseInlineObject` 当初有 `if (!inner) return {}`，两处内联列表调用点漏了同一保护 ——
+    // 这里把两侧一起钉住，防止将来只修一边。
+    const content = `---
+id: reader
+tools: [read_file, glob]
+mcpServers: []
+model: {}
+---`
+    const { frontmatter } = parseFrontmatter(content)
+    expect(frontmatter.mcpServers).toEqual([])
+    expect(frontmatter.tools).toEqual(['read_file', 'glob']) // 非空内联列表不受影响
+    expect(frontmatter.model).toEqual({})
+  })
+
+  it('嵌套对象中间的注释行同样只跳过、不截断', () => {
+    const content = `---
+permission:
+  read: allow
+  # 写操作一律问
+  write: ask
+---`
+    const { frontmatter } = parseFrontmatter(content)
+    expect(frontmatter.permission).toEqual({ read: 'allow', write: 'ask' })
+  })
 })
 
 // ===== agentFromMarkdown 测试 =====

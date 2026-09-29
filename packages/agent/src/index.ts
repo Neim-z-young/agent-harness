@@ -267,7 +267,7 @@ function parseSimpleYaml(yaml: string): Record<string, unknown> {
       continue // parseBlock 已返回下一个未消费行索引，跳过 i++
     } else if (value.startsWith('[') && value.endsWith(']')) {
       // 内联列表：[a, b, c]
-      result[key] = value.slice(1, -1).split(',').map((s) => parseScalar(s.trim()))
+      result[key] = parseInlineList(value)
     } else if (value.startsWith('{') && value.endsWith('}')) {
       // 内联对象：{key: value}（简化，不常用）
       result[key] = parseInlineObject(value)
@@ -306,6 +306,14 @@ function parseBlock(
       }
       const indent = line.length - line.trimStart().length
       if (indent < firstIndent) break
+      // 注释行跳过而**不是**终止：标准 YAML 允许在序列中间写注释，而这里一旦 break，
+      // 后面的项会**静默消失** —— frontmatter 是逐字段白名单解析的，列表被截断后依旧
+      // "解析成功"、没有任何报错。本仓真实踩到：给 reader.md 的 tools 末尾追加压缩工具时
+      // 在中间插了一行说明 ⇒ 4 个新工具一个都没进白名单（且毫无提示）。
+      if (line.trim().startsWith('#')) {
+        idx++
+        continue
+      }
       const itemMatch = line.match(/^\s*-\s+(.*)$/)
       if (!itemMatch) break
       const itemValue = itemMatch[1].trim()
@@ -332,6 +340,12 @@ function parseBlock(
     }
     const indent = line.length - line.trimStart().length
     if (indent < firstIndent) break
+    // 注释行跳过而不是终止（同列表分支）：否则在嵌套对象中间写一行说明，
+    // 后面的键会静默消失。
+    if (line.trim().startsWith('#')) {
+      idx++
+      continue
+    }
     const kvMatch = line.match(/^\s*(['"]?[\w*-]+['"]?):\s*(.*)$/)
     if (!kvMatch) break
     const k = kvMatch[1].replace(/^['"]|['"]$/g, '')
@@ -341,7 +355,7 @@ function parseBlock(
       obj[k] = parsed
       idx = nextIdx
     } else if (v.startsWith('[') && v.endsWith(']')) {
-      obj[k] = v.slice(1, -1).split(',').map((s) => parseScalar(s.trim()))
+      obj[k] = parseInlineList(v)
     } else {
       obj[k] = parseScalar(v)
     }
@@ -380,6 +394,21 @@ function parseInlineObject(s: string): Record<string, unknown> {
     obj[k] = parseScalar(v)
   }
   return obj
+}
+
+/**
+ * 解析内联列表：`[a, b, c]`。
+ *
+ * 空列表 `[]` 必须得到 `[]`、而非 `['']` —— `''.split(',')` 会返回 `['']`，于是
+ * `mcpServers: []` 变成一个「名字是空字符串的 server」：既不是"没有 server"，也匹配不上
+ * 任何真实 server，且**毫无报错**。这与 `parseInlineObject` 的空保护对称（那个当初想到了，
+ * 两处内联列表调用点漏了）；下游 `parseStringArr` 的 `.filter(Boolean)` 恰巧把 `['']` 抹平
+ * 回 `[]`，才让缺陷长期没浮出水面 —— 但 `parseFrontmatter` 是导出 API，裸输出必须正确。
+ */
+function parseInlineList(raw: string): unknown[] {
+  const inner = raw.slice(1, -1).trim()
+  if (!inner) return []
+  return inner.split(',').map((s) => parseScalar(s.trim()))
 }
 
 /**
