@@ -1807,6 +1807,12 @@ interface PreparedQuery {
   /** 本轮相对上一轮 query 的系统区段级归因；仅在实际变化时有值（首轮无基线时也没有） */
   systemStability?: SystemStabilityReport
   allowedTools: Tool[]
+  /**
+   * `allowedTools` 的 id 投影 —— 供 `core.session.preModel` 透传给插件（见 `SessionPreModelInput.agentTools`）。
+   * 在这里算一次而不是每步现算：该 hook 每步都会触发，而“这个 Agent 能用哪些工具”在一次 query 内不变
+   * （与 `allowedTools` 同一生命周期，见本接口开头“一次查询内不变的准备产物”）。
+   */
+  agentToolIds: string[]
   providerId: string
   modelId?: string
   /** 基础 LLM 参数（temperature / agent.model.options），每轮浅拷贝后交给 `core.llm.params` hook */
@@ -2552,6 +2558,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       dynParts,
       ...(systemStability ? { systemStability } : {}),
       allowedTools,
+      agentToolIds: allowedTools.map((t) => t.id),
       providerId,
       modelId,
       paramsBase,
@@ -2614,6 +2621,13 @@ export class AgentRuntimeImpl implements AgentRuntime {
           patch: async (patch) => this.deps.session.updateMeta(sessionId, patch),
         },
         blocksPatch: preModelBlocks,
+        // 该 Agent 的最终可用工具 id ⇒ 插件可判断“这份提示对它有没有用”。
+        // 判别符本就在上游（`allowedTools` 已算好），传下去即可 —— 不让插件去查注册表，
+        // 它拿不到（`PluginContext` 没有 agent registry），而“猜”正是本仓反复得过的病。
+        agentTools: p.agentToolIds,
+        // 子会话判据：`Session.parentId`（`session.create({ parentId })` 写入，subagent 插件用）。
+        // 顶层字段而非 `meta.parentId` —— 后者为 null，读错地方拿不到（core:4243 已有同类前车）。
+        ...(sess.parentId ? { parentSessionId: sess.parentId } : {}),
         // 前缀区段级归因：让压缩插件（ACP）能把 "system-changed" 细化到"第 N 段变了"。
         // 只在实际变化时有值 —— 消费方不必自己维护上一轮快照。
         ...(p.systemStability ? { systemStability: p.systemStability } : {}),

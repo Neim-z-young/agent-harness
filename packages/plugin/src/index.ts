@@ -222,6 +222,29 @@ export interface SessionPreModelInput {
   /** 目标模型 ID（可选） */
   modelId?: string
   /**
+   * 该 Agent 本轮的**最终可用工具 id 列表**（已过 agent 白名单 + MCP 供给，即真正喂给模型的那一份）。
+   *
+   * 为什么由 core 传、而不是让插件自己查：preModel 是唯一同时看得到「历史」与「该 Agent 能力边界」
+   * 的位置，而插件侧拿不到 agent 定义（`PluginContext` 里没有 agent registry）。判别符本就在上游
+   * —— `_prepareQueryOnce` 已经算好了 `agent.tools → allowedTools`，传下来即可（与 `PromptInput.agentMode`
+   * 同一决策：hook 只给 agentId 时插件只能去猜）。
+   *
+   * 典型消费者：ACP 据此决定压缩手册/提示该不该注入 —— 白名单里没有 `compress` 的 Agent 拿到手册
+   * 只会照着拼入参、然后撞 `TOOL_NOT_ALLOWED`（真机会话 `s_1790685043685_1p8sw` 里 12 次全撞，
+   * 模型自己都只能打断"the compress tool isn't actually available despite the philosophy text"）。
+   *
+   * **缺省表示未知**（非 core 宿主、单测直调）——消费方应 fail-open（按旧行为处理），不要当成空集。
+   */
+  agentTools?: readonly string[]
+  /**
+   * 本会话的父会话 id —— **子 Agent 会话才有**（由 `session.create({ parentId })` 写入）。
+   *
+   * 是「这是不是子 Agent 会话」的**可靠判据**：比按 agent 定义的 `mode` 反推更准，因为
+   * coordinator 也可能被当子 Agent 派出（那时 mode 仍是 `coordinator`）。
+   * 缺省 = 不是子会话（或宿主未提供）。
+   */
+  parentSessionId?: string
+  /**
    * 把精简后的会话消息回写持久层（不含 system）。消息 object 形态由 host 决定（本项目为 Message[]）。
    */
   save: (messages: unknown[]) => Promise<void>

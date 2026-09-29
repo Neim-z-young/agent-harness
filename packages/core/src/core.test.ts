@@ -929,6 +929,52 @@ describe('@harness/core', () => {
       await h.stop()
     })
 
+    it('core.session.preModel 透传 agentTools 与 parentSessionId（压缩插件据此决定提示该不该注入）', async () => {
+      // 背景：ACP 的压缩手册过去是无条件下发的，而只读 worker 的白名单里根本没有 compress，
+      // 模型只能照着手册拼出字段完整的调用去撞 TOOL_NOT_ALLOWED（真机 12/12）。
+      // 修法不是让插件去查 agent 注册表（它拿不到），而是 core 把已在手边的判别符传下去。
+      const seen: Array<{ agentTools?: readonly string[]; parentSessionId?: string }> = []
+      const ToolPlugin: AgentPlugin = {
+        id: 'tools', version: '1', name: 'Tools',
+        async install() {
+          return {
+            async 'core.tool.pool.assemble'(_i, pool: any) { pool.add(createEchoTool()) },
+          } as Hooks
+        },
+      }
+      const CapturePlugin: AgentPlugin = {
+        id: 'capture', version: '1', name: 'capture',
+        async install() {
+          return {
+            'core.session.preModel': async (input) => {
+              seen.push({
+                agentTools: input.agentTools,
+                ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+              })
+            },
+          } as Hooks
+        },
+      }
+      const h = await createHarness({
+        agents: [makeAgent({ tools: ['echo'] })],
+        chatProvider: mockChatProvider(),
+        internalPlugins: [ToolPlugin, CapturePlugin],
+      })
+      await h.start()
+      const root = await h.session.create()
+      await h.agent.query({ sessionId: root.id, message: '主会话' })
+      // 子会话走的就是 subagent 插件那条路：`session.create({ parentId })`
+      const child = await h.session.create({ parentId: root.id })
+      await h.agent.query({ sessionId: child.id, message: '子会话' })
+      await h.stop()
+
+      // agentTools 是**白名单过滤后**的最终 id（不是 agent 定义的原始列表，也不是全注册表）
+      expect(seen[0]!.agentTools).toEqual(['echo'])
+      expect(seen[0]!.parentSessionId).toBeUndefined() // 顶层会话没有父
+      expect(seen[1]!.agentTools).toEqual(['echo'])
+      expect(seen[1]!.parentSessionId).toBe(root.id)
+    })
+
     it('compact 后 query 的请求历史 = 摘要占位 + 近期，不含被压缩原文消息', async () => {
       const provider = mockChatProvider() // 收集 calls
       const h = await createHarness({ agents: [makeAgent()], chatProvider: provider })
