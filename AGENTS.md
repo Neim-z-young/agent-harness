@@ -257,6 +257,12 @@
 
 - **测"运行期注册立刻生效"要用「按 agentId 分流」的注入**：`_prepareQueryOnce` 每轮都 `new DefaultToolPool` + `trigger('core.tool.pool.assemble', { agentId })`，所以运行期注册的 Agent 下一轮 query 立刻有工具 —— 但这条必须有回归测试锁住（防止以后有人把组装挪回装配期）。**陷阱**：若工具插件无差别注入，那么"构造期已注入全局注册表"的实现也骗得过断言；必须让注入条件依赖 `input.agentId`（只有目标 Agent 触发才加工具），断言才真的在测"那一轮重新组装了"
 
+- **发事实事件时带上会话归属，否则它一定落进 `run` 级文件**：遥测按 `attrs.sessionId` 分文件，没有归属就落 `run.telemetry.jsonl` ⇒ **按会话取证时永远看不到它**。`provider.resolveMiss` 与 `telemetry.tool.fail`（真机 79 条 sessionId 全为 undefined）先后栽在同一个坑里。判据：**这条事实是不是"某一轮 / 某个会话里发生的"？是 —— 就必须带 `sessionId`（`agentId` 同理）**；哪怕发事件的层本身不认识会话（`ProviderRuntime.resolve` 只认 providerId），也要从调用点把上下文透传进来（`resolve(id, ctx)`，`ctx` 只影响**事件的归属**、不参与选谁）。装配期发生的事实（注册 / 默认变更）落 `run` 级是**正确**的，别硬塞归属
+
+- **遥测语义化 kind 的判据是"错误状态 vs 正常事实"，不是"重要与否"**：`mapBusEvent` 默认把所有 bus 事件落成 `telemetry.bus.<name>`（采集不依赖枚举，新事件自动入明细）。只有**错误状态**才值得独占 kind —— `provider.resolveMiss` 会让模型请求**悄悄换一个 Provider 去发**、表面完全正常，混在 `provider.registered` / `defaultChanged` 这些每次都会发生的正常事实里就再也检索不出来；反过来注册事实落通用 kind 是对的（它就该按时间线读）。**加语义化时配一个控制组断言**（"正常事实仍走通用 kind"），否则这条边界会随时间悄悄松掉
+
+- **哨兵值不是实体 id，别让它落进事实载荷**：`prepared.providerId` 的兜底是 `'default'`（`_runStep` 与 `providers.resolve` 都拿它当"未指定 ⇒ 走默认"的哨兵，而注册表里**没有**这个键）。把哨兵原样写进 `core.llm.usage` / `providerCache` 等于凭空造出一个叫 `default` 的端点，消费方按 providerId 聚合时会多出一个假分组。判据：**凡是要落进事实载荷的 id，先确认它在对应的注册表里真能查到**；查不到就归一为"不带"（缺省本身就表达"这次走默认"）
+
 ## 6. 安全与协作
 
 - 子代理工具调用 `isConcurrencySafe` 必须为 `false`，防止并发写冲突

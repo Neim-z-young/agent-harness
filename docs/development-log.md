@@ -1,5 +1,111 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 213）运行期注册 S3：事件归属、来源列、实例数、端点维度
+
+S1+S2 把「运行期注册」的能力与守卫补齐之后，S3 收口在**可观测与展示**：把已经存在的
+事实接进可观测面，并补掉两处「事实缺维度」的缺口。方案 `docs/runtime-registration-plan.md` §9；
+提交 `10e9afd`。
+
+### 计划里写的 S3-1 其实早就成立 —— 问题在别处
+
+计划 S3-1 是"bus 事件接 telemetry 插件"。核对发现 telemetry 用的是 `subscribeAll` **通配**
+订阅（`packages/plugins/telemetry/src/index.ts::install`），`ProviderEvents` / `AgentEvents`
+一直会落成 `telemetry.bus.provider.*` —— 这半件事不用做。
+
+真正的问题：`resolveMiss` 的载荷只有 `{ requested, fallbackId }`，**没有会话归属**，而遥测
+按 `attrs.sessionId` 分文件 ⇒ 它必然落进 **run 级** `run.telemetry.jsonl`。而「配置指向了不
+存在的实例」恰恰是**轮内**发生的事（`_runStep` 里 `sessionId` / `agentId` 就在手边）
+⇒ **按会话取证时"静默回退"永远看不见**。
+
+这跟 `map.ts` 里已经记过一次的坑完全同源：
+
+| | 事件 | 丢的东西 | 后果 |
+|---|---|---|---|
+| 先例 | `telemetry.tool.fail` | `sessionId`（79 条全为 undefined） | 9 个会话文件合计 0 条工具失败 —— 而工具失败最需要会话归属 |
+| 本轮 | `provider.resolveMiss` | `sessionId` / `agentId` | 静默回退只在 run 级文件里，按会话查不到 |
+
+改法：`ProviderRuntime.resolve(id, ctx)` + `HarnessImpl.resolveChatProvider(id, ctx)` +
+`_runStep` 传 `{ sessionId, agentId }`。新增 `ProviderResolveCtx`，与注册侧的
+`ProviderInstanceMeta` **刻意分开**：后者是"实例怎么来的"（写进注册表、长期有效），
+前者是"这次解析谁发起的"（只进当次载荷）—— 合在一起会让同一次注册被不同会话的解析反复改写归属。
+
+### 遥测语义化的判据：错误状态 vs 正常事实
+
+`mapBusEvent` 原本只认 `harness.error`（`ERROR_NAMES`）。改成 `SEMANTIC_KINDS` 映射表，
+新增 `provider.resolveMiss` → `telemetry.provider.resolveMiss`，并把 `requested` 提到标准
+`attrs.provider` 维度（原名保留，只加不改）。
+
+判据不是"重要与否"：注册 / 反注册 / 默认变更是**正常事实**，落通用 `telemetry.bus.*`
+就够（本就该按时间线读）；resolveMiss 会让模型请求**悄悄换一个 Provider 去发**、表面完全
+正常，不独立成 kind 就会被同类正常事实淹没。配了控制组断言（`provider.registered` 仍走通用）。
+
+### 展示层的两处收口
+
+| 命令 | 改前 | 改后 | 判据 |
+|---|---|---|---|
+| `/model ?` | 只有 type/baseUrl/model/key | 增 `来源=plugin:provider.x`（未装配时 `来源=未注册`） | **来源回答「谁把它装上去的」，不是配置意图** —— 只有它能区分"配置写了却没装配" |
+| `/plugins` | 只列插件 | 增 `已注册 Provider 实例 N：…（默认）` / `已注册 Agent M` | **装了什么插件 与 注册了什么实例是两个维度**：装了可能一个实例都没注册，一个插件也能注册多个实例 |
+
+两处都做了"没信息就不展示"：`/model` 在 boot 前（harness 未建）不做交叉、不出该列；
+`/plugins` 的 `HarnessView.providers` / `agent` 是可选字段，老宿主不注入就不报这一行
+（而不是报 0）。
+
+### openai / glm / qwen 迁移
+
+三包是同一模板，照 anthropic / gemini / mock 的范式改「新路径优先、老宿主回退」。
+迁完只剩第三方桩走老路径 —— `cli.test.ts` 里用 `_setChatProvider` 的 my-gw 桩正好成了
+**回退分支的活证据**，一次断言里同时成立两件事。
+
+### 原风险 R5：用量口径会不会串
+
+**结论：会。** `UsageStats` 的维度是 model / agent / tool / hourly，**没有 provider**；
+而 `ProviderConfig` 明确支持「同一模型挂多个端点」，此时 **model 名重复** ⇒ 用量与缓存行
+在端点之间不可区分。
+
+处置**刻意分两半**：
+
+| 动作 | 做不做 | 理由 |
+|---|---|---|
+| `LlmUsageSignal` 增 `providerId` + `_runStep` 带上 | 做 | 纯增量；core 本来就知道这个事实，不带才是丢信息 |
+| ACP `providerCache` 行增 `providerId` | 做 | 最常被消费的遥测行（bench 脚本用它），收益最大 |
+| `UsageStats` 加 provider 维度 | **不做** | 那是**落盘格式变更**（`session.meta.usageStats`），影响旧会话恢复与展示层 —— 留给独立决策 |
+
+ACP 行里 `providerId` 用 `null` 而非 undefined：**`null` 与「字段不存在」是两种意思**，
+后者会让消费方怀疑是采集漏了。
+
+### 一个"忠实"反而错的细节：哨兵 `'default'`
+
+`prepared.providerId` 的兜底是 `'default'`（`_runStep` 与 `providers.resolve` 都拿它当
+"未指定 ⇒ 走默认"的**哨兵**，注册表里**没有**这个键）。首版实现直接 `...(providerId ? {providerId} : {})`
+⇒ 未绑定 providerId 的 agent 落了 `providerId: 'default'`，等于**凭空造出一个叫 default 的端点**。
+
+改法：`providerId !== 'default'` 才带。这条是反向验证第 ⑩ 条测出来的 —— 先按"忠实反映引擎口径"
+写了一版，被断言纠正。**"忠实"不等于"正确"：落进事实载荷的 id 必须在对应注册表里查得到。**
+
+### 反向验证：10 条逐条归因
+
+| # | 摘掉什么 | 变红的用例 |
+|---|---|---|
+| ① | `_runStep` 的归属透传 | 仅"轮内 providerId 未命中" |
+| ② | `ProviderRuntime.resolve` 的 ctx 合并 | 仅 2 条归属用例 |
+| ③ | resolveMiss 语义化 | 仅 2 条 resolveMiss 用例 |
+| ④ | `requested → provider` 维度映射 | 同 2 条（不同断言） |
+| ⑤ | `listConfiguredProviders` 的来源交叉 | 仅 `/model ?` 用例 |
+| ⑥ | `/plugins` 实例数输出 | 仅 `/plugins` 用例 |
+| ⑦ | glm 退回老路径 | 仅"内置 Provider 类型全部走运行期注册表"（**功能用例仍绿** ⇒ 测的是"来源可区分"而非"功能坏了"） |
+| ⑧ | `core.llm.usage` 的 providerId | 仅 usage 用例 |
+| ⑨ | ACP 透传 providerId | 仅 providerCache 行用例 |
+| ⑩ | 去掉哨兵归一 | `toBeUndefined()` 收到 `"default"`（**先红后绿 = 这条返工**） |
+
+### 收尾
+
+- `typecheck` 39 包 0 error；全量 `test` 39 包 0 fail（**1992 → 2000** pass / +8：
+  core +3、cli +1、telemetry +3、acp-context +1）
+- `AGENTS.md` 新增四条：事实事件必须带会话归属（否则落 run 级文件）；遥测语义化的判据；
+  哨兵值不是实体 id；以及把"两处都做了'没信息就不展示'"这条口径固化在展示层约定里
+- 剩余未做：`UsageStats` 的 provider 维度（格式变更，独立决策）、`unregister` 级联、
+  `_setChatProvider` 的最终删除（当前只剩第三方桩在走）
+
 ## 2026-09-29（续 212）运行期注册 S1+S2：注册键口径、默认显式化、Agent 守卫
 
 起因是与 Pi Coding Agent 的扩展架构比较后得出的结论：**「灵活」的第一刀不是把 hook 面铺大，

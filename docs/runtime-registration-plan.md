@@ -1,11 +1,11 @@
 # 运行期注册：Provider / Agent 供给计划
 
-> 状态：**S1 + S2 已实施并提交**（2026-09-29，`36d170d` / `fd30fe7`）；S3 未做。
+> 状态：**S1 + S2 + S3 已实施并提交**（2026-09-29，`36d170d` / `fd30fe7` / `10e9afd`）。
 > 目标：把「Agent 定义 / Provider 实例」的供给从**装配期钉死**变成**运行期可增删**，
 > 并顺带修掉由此暴露的两个既有缺陷（注册键口径不一致、默认裁决隐式化）。
 > 本文只做现状盘点、方案设计与排期；每节的「验收」即实施时的回归闸门。
 > 承接 `docs/agent-harness-architecture.md` 的插件体系，与 `docs/memory-and-skill-forge-plan.md` 同格式。
-> 实施后的实际形态与偏差见 §8「实施记录」（含实施时才定下来的 `overlay` 字段与两条重要发现）。
+> 实施后的实际形态与偏差见 §8「实施记录（S1+S2）」与 §9「实施记录（S3）」。
 
 ---
 
@@ -404,12 +404,111 @@ register(def, meta) {
 收尾时全仓 typecheck 抓出 2 处测试桩（`subagent` / `coordinator` 的 `createMockAgentRuntime`）
 缺 `unregister` —— 只跑单包时看不见；已补。**改公共接口必须跑全仓。**
 
-### 8.5 未做（S3 及以下）
+### 8.5 未做（S3 起）
 
-1. bus 事件接 telemetry 插件（`packages/plugins/telemetry`）—— `ProviderEvents` / `AgentEvents`
-   的注册事实目前只有订阅方可见，没有落 JSONL。
-2. `/model` 展示增加「来源」列（`config` / `builtin` / `plugin:<id>` / `runtime`）——
-   `ProviderInstanceInfo.source` / `type` 已就绪，展示层未接。
-3. `/plugins` 展示已注册 Provider / Agent 实例数。
-4. `provider-openai` / `glm` / `qwen` 迁到 `providers.register`（去掉 `@internal` cast 依赖）。
+1. ~~bus 事件接 telemetry 插件 —— 注册事实落 JSONL~~ → **S3 已做**（§9.1）
+2. ~~`/model` 展示增加「来源」列~~ → **S3 已做**（§9.3）
+3. ~~`/plugins` 展示已注册 Provider / Agent 实例数~~ → **S3 已做**（§9.4）
+4. ~~`provider-openai` / `glm` / `qwen` 迁到 `providers.register`~~ → **S3 已做**（§9.5）
 5. `unregister` 的级联语义（方案 §7 说刻意不做，仍待真实需求驱动）。
+6. `UsageStats` 增加 provider 维度（S3 只做了一半，见 §9.6 与 §9.8）。
+
+---
+
+## 9. 实施记录（S3，2026-09-29，`10e9afd`）
+
+### 9.1 计划外但必须做的：`resolveMiss` 落错了文件
+
+计划里 S3-1 写的是"bus 事件接 telemetry"。核对时发现**这半件事早就成立了** ——
+telemetry 用 `subscribeAll` 通配订阅，`ProviderEvents` / `AgentEvents` 一直会落成
+`telemetry.bus.provider.*` / `telemetry.bus.agent.*`。真正的问题在别处：
+
+`resolveMiss` 的载荷是 `{ requested, fallbackId }`，**没有会话归属**；而遥测按
+`attrs.sessionId` 分文件 ⇒ 它必然落进 **run 级** `run.telemetry.jsonl`。而
+「配置指向了不存在的实例」恰恰是**轮内**发生的事（`_runStep` 里 `sessionId` / `agentId`
+就在手边）⇒ 按会话取证时"静默回退"永远看不见。与 `telemetry.tool.fail` 曾丢掉
+sessionId（真机 79 条全落 run 级）是**同一个坑**。
+
+改法：`ProviderRuntime.resolve(id, ctx)` + `HarnessImpl.resolveChatProvider(id, ctx)` +
+`_runStep` 传 `{ sessionId, agentId }`。新增 `ProviderResolveCtx` 类型，注释写明它
+**只影响事件归属、不参与选谁**，且与注册侧的 `ProviderInstanceMeta` 刻意分开
+（后者是"实例怎么来的"、写进注册表长期有效；前者是"这次解析谁发起的"、只进当次载荷）。
+
+### 9.2 计划外：遥测语义化的判据
+
+`mapBusEvent` 原本只有 `ERROR_NAMES = {'harness.error'}`。改为 `SEMANTIC_KINDS` 映射表，
+新增 `provider.resolveMiss` → `telemetry.provider.resolveMiss`，并把 `requested` 提到
+标准 `attrs.provider` 维度（原名保留，只加不改）。
+
+判据（写进 `AGENTS.md`）：**错误状态 vs 正常事实**，不是"重要与否"。注册 / 反注册 /
+默认变更是正常事实，落通用 `telemetry.bus.*` 就够（本就该按时间线读）；resolveMiss 会让
+模型请求悄悄换一个 Provider 去发、表面完全正常，不独立成 kind 会被同类正常事实淹没。
+配了控制组断言（`provider.registered` 仍走通用 kind）。
+
+### 9.3 `/model ?` 来源列
+
+`listConfiguredProviders()` 增 `source`：从 `harness.providers.list()` 交叉，命中给运行期
+source（`plugin:provider.x` / `legacy` / `runtime`），未命中给 `未注册`。
+
+- **来源回答的是「谁把它装上去的」，不是配置意图** —— 只有它能区分"配置写了却没装配"。
+- boot 前（harness 未建）不做交叉 ⇒ 展示层不出这一列（有信息才展示，不是硬填 `config`）。
+- 视图取用可选链（`this.harness?.providers?.list?.()`）：老宿主 / 测试桩没有 `providers`
+  时退化成 boot 前的行为。
+
+### 9.4 `/plugins` 实例数
+
+manage-plugin 增两行：`已注册 Provider 实例 N：…（默认）` / `已注册 Agent M`。
+
+**装了什么插件 与 注册了什么实例是两个维度**：装了可能一个实例都没注册（optIn 未触发 /
+装配失败），一个插件也能注册多个实例（同类型多端点）—— 只列插件时这两类偏差都不可见。
+`HarnessView.providers` / `agent` 是**可选**字段：老宿主不注入就不报这一行（而不是报 0）。
+
+CLI 侧**一行没改** —— `cli.command` 的 `cmdInput.harness` 本来就是完整的 `Harness`。
+
+### 9.5 openai / glm / qwen 迁移
+
+三包结构是同一个模板，照 anthropic / gemini / mock 的范式改成「新路径优先、老宿主回退」。
+迁移前它们的 `source` 是 `legacy`；迁完只剩第三方桩走老路径 —— `cli.test.ts` 里那个
+用 `_setChatProvider` 的 my-gw 桩正好成了**回退分支的活证据**（断言 `source === 'legacy'`），
+两件事在一次断言里同时成立。
+
+### 9.6 端点维度（原风险 R5）
+
+**核对结论**：`UsageStats` 的维度是 model / agent / tool / hourly —— **没有 provider**。
+而 `ProviderConfig` 明确支持「同一模型挂多个端点」，此时 **model 名重复** ⇒ 用量与缓存行
+在端点之间不可区分。
+
+**处置分两半**：
+
+| | 做不做 | 理由 |
+|---|---|---|
+| `LlmUsageSignal` 增 `providerId` + `_runStep` 带上 | **做** | 纯增量字段，无破坏；core 本来就知道这个事实，不带才是丢信息 |
+| ACP `providerCache` 行增 `providerId` | **做** | 这是最常被消费的遥测行（bench 脚本用它），收益最大 |
+| `UsageStats` 加 provider 维度 | **不做** | 那是**落盘格式变更**（`session.meta.usageStats`），影响旧会话恢复与展示层，留给独立决策 |
+
+`providerId` 在 ACP 行里用 `null` 而非 undefined：**`null` 与「字段不存在」是两种意思**，
+后者会让消费方怀疑是采集漏了。
+
+### 9.7 一个必须在实施中才发现的细节：哨兵 `'default'`
+
+`prepared.providerId` 的兜底是 `'default'`（`_runStep` 与 `providers.resolve` 都拿它当
+"未指定 ⇒ 走默认"的**哨兵**，注册表里**没有**这个键）。首版实现直接 `...(providerId ? {providerId} : {})`
+⇒ 未绑定 providerId 的 agent 落了 `providerId: 'default'`，等于**凭空造出一个叫 default
+的端点**，消费方按它聚合会多一个假分组。
+
+改法：`providerId && providerId !== 'default'` 才带（缺省本身就表达"这次走默认"）。
+这条是反向验证第 ⑩ 条测出来的 —— **先按"忠实反映引擎口径"写了一版，被断言纠正**。
+
+### 9.8 验收结果
+
+| 闸门 | 结果 |
+|---|---|
+| `bun run typecheck` | 39 包 0 error |
+| `bun run test` | 39 包 0 fail（1992 → **2000** pass / +8：core +3、cli +1、telemetry +3、acp-context +1） |
+| 反向验证 | **10 条逐条归因**（明细见 `docs/development-log.md` 续 213） |
+
+### 9.9 剩余未做
+
+1. `UsageStats` 的 provider 维度（§9.6 的格式变更部分）。
+2. `unregister` 的级联语义（§7 刻意不做）。
+3. `_setChatProvider` 的最终删除（当前保留为 deprecated 委托，只剩第三方桩在走）。
