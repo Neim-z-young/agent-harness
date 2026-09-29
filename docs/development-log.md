@@ -1,5 +1,67 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 218）`guardInput` 跨包共用：glob 的守卫收拢（"口径决策"被证伪）
+
+### 起因
+
+续 217 的遗留写着"`glob` 的守卫仍是自带一份 —— 要收拢得先决定『非 pattern 的结构错该报什么码』（口径决策，不是机械改动）"。
+
+**这个判断是错的。** 把两处判据摊开对齐后，它们是**逐字同构**的：
+
+| | 判据 | 专用码 | 其余 |
+|---|---|---|---|
+| `guardInput` | `rule === 'required' && path === requiredField` | `requiredCode`（调用方给） | `INVALID_INPUT` |
+| glob 内联守卫 | `rule === 'required' && path === 'pattern'` | `GLOB_PATTERN_MISSING` | `INVALID_INPUT` |
+
+`guardInput(globInputSchema, input, 'pattern', 'GLOB_PATTERN_MISSING')` 与现状**行为完全一致** ——
+没有任何码需要新决定。真正的阻碍是**工程性**的：`guardInput` 当时是 `tools-builtin` 的模块私有函数，
+glob 在另一个包里根本调不到。
+
+### 改动
+
+| 位置 | 改动 |
+|---|---|
+| `packages/tool/src/index.ts` | 新增并导出 `InputGuardResult<T>` + `guardInput<T>()`（JSDoc 从 tools-builtin 迁来，改写成跨插件口径） |
+| `packages/plugins/tools-builtin/src/index.ts` | 删掉私有副本，import 改取 `@harness/tool`；`Schema` / `formatSchemaError` / `schemaIssues` 三个导入随之不再需要 |
+| `packages/plugins/tools-glob/src/index.ts` | `call()` 内联守卫（约 18 行）→ 一行 `guardInput(...)`；`formatSchemaError` / `schemaIssues` 导入移除 |
+
+放在 `@harness/tool` 而不是某个插件里的理由：它天然跨插件（`tools-builtin` 的四个工具 + `tools-glob`），
+且它依赖的 `formatSchemaError` / `schemaIssues` 本来就在那个模块 —— 搬家不产生任何新的依赖方向。
+
+### 反向验证：1 组，且续 217 的归因模板在这里被打破
+
+摘掉 glob 的守卫返回后，**只有 1 条**变红：
+
+```
+tools-glob.test.ts:170  Expected: "INVALID_INPUT"  Received: "GLOB_PATTERN_MISSING"
+```
+
+**"pattern 缺失 / 全为空 ⇒ `GLOB_PATTERN_MISSING`"那条仍然绿 —— 而且这是对的**：
+glob 的"缺 pattern"有**双防线且同码** —— 结构守卫给 `GLOB_PATTERN_MISSING`，`call()` 尾部的语义守卫
+（`rawPatterns.filter(isUsable).length === 0`）也给同一个码（刻意如此，消费方不必区分来源）。
+摘掉结构守卫，语义守卫照样兜住它。
+
+⇒ **判据**：写反向验证前先想清楚"哪条**应该**红"。存在同码双防线的工具（glob 就是），
+"缺必填 ⇒ `XXX_REQUIRED`"那类用例**不构成**守卫存在的证据；真正在证明它的是
+"类型不符 / 其它字段结构错 ⇒ `INVALID_INPUT`"那两条。这与续 217 的 E1（"仍然绿是对的"）是同一类归因。
+
+### 验收
+
+`typecheck` 39 包 0 error；全量 `test` **2034 → 2034** pass / 0 fail —— **数字一动不动**，
+既有零改动的用例就是"纯搬家、零行为变更"的控制组。
+
+- 反向验证脚本：先 `cp` 备份 + `shasum -a 256` 记基线，还原后 `diff` 断言"与基线快照逐字节一致"
+  （续 216 的教训：同文件多补丁的备份会互相覆盖，还原可能留下"仍能编译通过"的中间态）
+- 顺带勘误：全量测试必须用 `bun run test`（根脚本是 `bun --filter=* run test`）。
+  裸 `bun test` 会从仓库根递归抓测试，把 805 个文件 / 3238 条用例（含本仓之外的 DOM 相关测试）一起跑出来
+  ⇒ 2631 pass / 607 fail，看着像大面积回归，实则命令用错
+
+### 遗留
+
+- `UsageStats` 的 provider 维度、`unregister` 级联、`_setChatProvider` 最终删除（承续 213）
+- 结构层错误码现状：`INVALID_INPUT` / `PATH_REQUIRED` / `COMMAND_REQUIRED` / `GLOB_PATTERN_MISSING`
+  四个，全仓唯一入口 `guardInput`（`@harness/tool`）
+
 ## 2026-09-29（续 217）入参守卫收拢：三份形态 → 一份 `guardInput`
 
 ### 起因
