@@ -1,5 +1,127 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 212）运行期注册 S1+S2：注册键口径、默认显式化、Agent 守卫
+
+起因是与 Pi Coding Agent 的扩展架构比较后得出的结论：**「灵活」的第一刀不是把 hook 面铺大，
+而是运行期注册**（Agent / Provider 从构造参数变成运行期可增删）。方案见
+`docs/runtime-registration-plan.md`；本轮按四项裁决（Q1 显式键 / Q2 显式 setDefault /
+Q3 回落首个 / Q4 WeakMap）落地 S1 + S2。
+
+### 调研先推翻了一个粗判：两侧成熟度差得很远
+
+- **Agent 侧早已具备运行期注册能力**：`AgentRuntime.register(def)` 是公开接口（CLI 的
+  `applyConfigAgentOverrides` 就在运行期调它），而且**工具池是每轮 query 重算**的 ——
+  `_prepareQueryOnce` 每次 `new DefaultToolPool(toolRegistry)` + `trigger('core.tool.pool.assemble', {agentId})`
+  + `filterByWhitelist(agent.tools)`。缺的从来不是能力，是**守卫**。
+- **Provider 侧是真的缺**：实例层只有 `HarnessImpl._setChatProvider` —— `@internal`、
+  **不在 `Harness` 接口里**、被 6 个 provider 包跨包 cast 调用，且「注册」与「设默认」被绑成同一件事。
+
+### P2：注册键口径不一致（真 bug，影响现网）
+
+注册表 key 取的是被注册对象**自报**的 `p.id`：
+
+```ts
+if (p?.id) this.chatProviders.set(p.id, p)      // ← 对象自报，不是调用方给的实例键
+```
+
+| Provider | 实例 id | 结果 |
+|---|---|---|
+| openai（含 glm / qwen） | 透传 `config.id` | ✅ 多实例正常 |
+| **anthropic / gemini / mock** | **硬编码 `readonly id = 'anthropic'`** | ❌ 同类多实例互相覆盖同一 key |
+
+⇒ `agent.model.providerId = 'a2'`（`ProviderConfig.id` 的派生值）在 core 侧**根本不存在** ⇒
+`resolveChatProvider` 静默回退默认。而 `ProviderConfig.id` 的注释明写支持「同一模型挂多个端点」——
+这个被明确支持的场景对 anthropic 系是坏的。CLI 只能在展示层把「请求的 id」与「实际命中的
+`provider.id`」比一下来**提示**，修不了。同一 bug 在插件层还有第二个表现：多个 anthropic 实例的
+`pluginId` 都是 `provider.anthropic`，被 `pushBuilt` 的 `builtIds` **静默去重丢掉**。
+
+### S1 改法
+
+| 环节 | 旧 | 新 |
+|---|---|---|
+| 实例注册 | `_setChatProvider(p)`：按 `p.id` 入表 + 设默认 | `providers.register(id, p, meta)`：**键由调用方给**；注册**不设默认** |
+| 默认 | 「最后注册赢」= 注册顺序即语义 | `providers.setDefault(id)`（未注册即抛错） |
+| 解析 miss | 静默回退默认 | 发 `provider.resolveMiss`（静默回退就此可见） |
+| 反注册 | 无 | `unregister(id)`；摘掉默认则回落「首个已注册」+ 发 `defaultChanged` |
+| 兼容 | —— | `_setChatProvider` 改**委托 + deprecated**（= 按 `p.id` 注册 + 设默认），老调用点行为不变 |
+
+**第一原则：注册键由调用方给，不由被注册对象自报** —— 被注册对象只知道自己「是什么类型」，
+不知道「这次装配的实例叫什么」。`readonly id = 'anthropic'` 作类型标识是对的，当唯一键就错了。
+
+三处硬编码单例照 `provider-glm` 的既有范式改造：实例 `id` 取自 `config.providerId`，工厂从
+`ProviderConfig.id` 透传，`pluginId` 随 providerId 派生，注册走 `harness.providers.register(...)`，
+老宿主回退 `_setChatProvider`。CLI boot 删掉「默认放最后 = 顺序即语义」，构造完所有实例后显式
+`providers.setDefault(chosenProviderId)` —— 特别注意 `chosenProviderId` 取**实际装配**的实例，
+**不能复用展示用的 `cpId`**：无 key 回退 mock 时配置意图是 anthropic、实际装配是 mock，拿意图去
+`setDefault('anthropic')` 会抛「未注册」。
+
+### S2 改法：Agent 侧补守卫（工具池一行没改）
+
+`register(def, meta?)` + `AgentRegisterMeta { source, overwrite?, overlay? }` + `unregister(id)`。
+
+- 同 id 覆盖 ⇒ 发 `agent.reregistered { id, from, to }`。载荷给**前后两个来源** ——
+  覆盖最需要看见的是"改动前后各是谁注册的"，只给 id 归因不了。
+- 覆盖打 WARN，但 `overlay: true` 豁免：文档化覆盖链（options → dir:user → dir:project → config）
+  与 `/tools` 落盘是正常路径，每次启动刷一条 WARN 会把真正异常的那条淹掉。
+  **事实靠事件可见，噪音靠 overlay 压掉。**
+- `overwrite: false` ⇒ 抛错，且抛错时**不动**已有定义（否则"拒绝覆盖"反而把旧定义弄丢）。
+- 来源用 `WeakMap<AgentDefinition, string>` 持有：来源是「注册这件事」的属性，加字段会跟着
+  md 序列化 / 快照落盘，还会在每次覆盖时被旧对象带进新对象。
+- 工具池**一行没改**（本来就每轮重算），但补了守护测试 —— 见下。
+
+### 验证：反向验证逐条归因（8 条）
+
+| # | 摘掉的改动 | 变红的用例 |
+|---|---|---|
+| S1-1 | `register` 退回 `provider.id` 作键 | core P2 用例（1 红） |
+| S1-2 | 摘掉 `resolveMiss` 发布 | core miss 用例（1 红） |
+| S1-3 | `setDefault` 变空操作 | core 默认相关 3 条 + **2 条既有用例**（见下） |
+| S1-4 | 摘掉 anthropic 的 `providerId` 透传 | CLI 端到端 anthropic 用例（1 红） |
+| S1-5 | 摘掉 CLI 显式 `setDefault` | 仅 anthropic 用例红 |
+| S2-1 | 摘掉每轮 `assemble` 触发（"挪回装配期"的等价物） | 工具池守护用例 |
+| S2-2 | 摘掉 `overlay` 豁免 | CLI「配置覆盖不打 WARN」 |
+| S2-3 | 摘掉 `reregistered` 发布 | 2 条事件用例 |
+| S2-4 | 不记来源 | from/to 退化成 `unknown`，归因用例单独红 |
+| S2-5 | 摘掉 `overwrite:false` 拒绝 | 仅该用例红 |
+
+**本轮最有价值的三条发现：**
+
+1. **mute S1-1（core 键退回自报）不会让 CLI 端到端用例变红。** 因为插件侧已把实例自报 id
+   修正为 `providerId`，`provider.id === 显式键`，两处修复在当前状态下**互为冗余**。core 那半的
+   价值是**防御纵深**：任何自报共享 id 的 provider 都不会再撞键。⇒ 断言必须造出"自报 id 与
+   注册键不一致"的形状（core 用例里两个 spy 都自报 `'anthropic'`，注册为 `a1`/`a2`），
+   否则测不到。
+2. **mute S1-3 让 2 条既有用例变红** —— 证明「最后注册赢」这条老语义确实由
+   `_setChatProvider` 委托的 `setDefault` 兜住；老路径不做一次性大迁移是对的，否则 6 个
+   provider 包一起改，风险全落在"新老语义混用"上。
+3. **mute S1-5 只有 anthropic 用例红、gateway 用例绿** —— 因为 openai 系仍走 `_setChatProvider`
+   老路径（它自己会 setDefault）。这正是"渐进迁移"的预期形态，也说明迁移完成度决定了
+   "显式 setDefault"是不是 load-bearing。
+
+### 一条测试设计上的陷阱（S2 工具池守护）
+
+要锁住「运行期注册的 Agent 下一轮 query 立刻有工具」，**工具注入必须按 `agentId` 分流**：
+
+```ts
+async 'core.tool.pool.assemble'(input, pool) {
+  if (input?.agentId === 'late') pool.add(createEchoTool())   // ← 条件依赖 agentId
+}
+```
+
+若插件无差别注入，"构造期已注入全局注册表"的实现也骗得过断言（`filterByWhitelist` 照旧能在
+全局表里找到它）—— 断言就没在测"那一轮重新组装了"。另加**控制组**（先跑默认 Agent，断言它
+看不到 `echo`），把"按 agentId 分流"这件事本身也纳入断言。
+
+### 收尾
+
+- 全仓 typecheck 抓出 2 处测试桩（`subagent` / `coordinator` 的 `createMockAgentRuntime`）缺
+  `unregister` —— **只跑单包时看不见**，这是"改公共接口必须跑全仓"的又一例。
+- typecheck 39 包 0 error；全量 test 39 包 0 fail（S1 后 1987 / S2 后 1992）。
+- 新增守卫：core 11 条（S1 六条 + S2 五条）+ CLI 2 条（anthropic 两端点端到端、配置覆盖不打 WARN）。
+- **未做**：S3（可观测与展示：bus 事件接 telemetry、`/model` 增来源列、`/plugins` 显实例数）；
+  `unregister` 的级联（摘 Provider 不动用它的 Agent、摘 Agent 不动历史）按方案 §7 刻意不做；
+  config.json 热加载不在本方案范围。
+
 ## 2026-09-29（续 211）会话恢复后工具输出不显示：历史渲染压根没读 tool part
 
 用户报："会话恢复后，工具输出就不显示了"。

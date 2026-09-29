@@ -247,6 +247,16 @@
 
 - **断言视觉输出前，先确认东西已经"画出来了"**：探针里 `waitFrame(f => f.includes('❯'))` 一命中就取样，恢复出来的助手正文**看起来全是空白**，一度误判成"恢复后正文也看不见"。真相是 OpenTUI 的 `<markdown>` **不是首帧就绘制**（工具行/用户行是 `<text>`，首帧即出），要多 pump 几十帧才出现。判据：**帧断言要留出稳定的绘制窗口**（固定多 pump 一段再取样，或用"直到出现目标内容"的谓词），否则会把"还没画"误判成"画不出来"，进而照着假根因改错方向
 
+- **"注册"是配置事实，不是可改写管道**：`harness.providers.register/unregister/setDefault` 与 `harness.agent.register/unregister` 都**刻意不给管道 hook**（不加 `core.provider.register` 这类）。hook 是 `(input, output)` 可改写管道，给注册加一条等于允许两个插件**静默抢注册同一个 id** —— 那正是 `Hooks` 注释警告过的"同一个 hook 名出现两个来源"。要观测用 bus 事实事件（`provider.registered/unregistered/defaultChanged/resolveMiss`、`agent.registered/unregistered/reregistered`），要干预请改配置
+
+- **注册键由调用方给，不由被注册对象自报**：被注册对象只知道自己「是什么类型」，不知道「这次装配的实例叫什么」。`AnthropicChatProvider` 里 `readonly id = 'anthropic'` 作**类型标识**是对的，但拿它当**装配实例的唯一键**就错了 —— 同一份 config 数组里可以有两个 anthropic 端点（`ProviderConfig.id` 注释明写支持"同一模型挂多个端点"），两个实例自报同一个 id 就会在注册表里互相覆盖，`agent.model.providerId='a2'` 静默回退默认（已修：实例 id 取自 `config.providerId`，工厂从 `ProviderConfig.id` 透传，注册走显式键）。通用判据：**任何"按 id 入表"的地方，先问这个 id 是"谁给的"** —— 对象自报的 id 只在"一类东西只有一个实例"时才安全
+
+- **默认值要显式裁决，别用"注册顺序"当语义**：CLI boot 曾靠「默认 Provider 放最后注册 ⇒ 兜底无前缀模型」，注释把顺序写成了语义。改成构造完所有实例后显式 `providers.setDefault(id)` 后，"注册 / 设默认"两件事才分开，`unregister` 掉默认才有确定行为（回落"首个已注册"）。旧路径 `_setChatProvider` 保留但降级为**委托**（= 按 `p.id` 注册 + 设默认），16 处老调用点行为不变 —— 渐进迁移，不做一次性大改
+
+- **每次覆盖都要看得见，但"正常路径"的 WARN 要能压掉**：Agent 同 id 重新注册发 `agent.reregistered { id, from, to }`（**给前后两个来源**：覆盖最需要看见的是"改动前后各是谁注册的"，只给 id 归因不了），并打 WARN；但 `AgentRegisterMeta.overlay` 标记的**文档化覆盖链**（options → dir:user → dir:project → config）与用户显式操作（`/tools` 落盘）豁免 WARN —— 每次启动都刷一条 WARN 会把真正异常的那条淹掉。**事实靠事件可见，噪音靠 overlay 压掉**。来源本身用 `WeakMap<AgentDefinition, string>` 持有，**不给 `AgentDefinition` 加字段**：来源是"注册这件事"的属性，加字段会跟着 md 序列化 / 快照落盘，还会在每次覆盖时被旧对象带进新对象
+
+- **测"运行期注册立刻生效"要用「按 agentId 分流」的注入**：`_prepareQueryOnce` 每轮都 `new DefaultToolPool` + `trigger('core.tool.pool.assemble', { agentId })`，所以运行期注册的 Agent 下一轮 query 立刻有工具 —— 但这条必须有回归测试锁住（防止以后有人把组装挪回装配期）。**陷阱**：若工具插件无差别注入，那么"构造期已注入全局注册表"的实现也骗得过断言；必须让注入条件依赖 `input.agentId`（只有目标 Agent 触发才加工具），断言才真的在测"那一轮重新组装了"
+
 ## 6. 安全与协作
 
 - 子代理工具调用 `isConcurrencySafe` 必须为 `false`，防止并发写冲突
