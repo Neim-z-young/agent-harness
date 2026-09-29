@@ -238,6 +238,41 @@ export { SessionPointerStore, LAST_SESSION_FILE, type SessionPointerFile } from 
 export { ConfigStore, SecretCipher, ConfigValidationError, resolveSecret } from '@harness/workspace'
 
 /** 全局配置（写 dataDir/config.json）与命令行参数合并、默认值收敛 */
+/**
+ * ACP「作用域档位」段：`compression.subagent` 与 `compression.perAgent[<agentId>]`。
+ *
+ * 字段刻意与 `compression` 顶层**同形**（少了 `tokenCalibration` / `tokenCalibrationScale`）：
+ * 折算口径与 acp-kernel 注入的 `countTokens` 是**同一个函数**，全进程只能有一把尺子。
+ * 按档位分化必然让"占用率"与"阈值"不同源 —— 本仓早年"显示 26% 实际已 103%"就是这一类。
+ *
+ * 生效优先级（后写覆盖前写）：**顶层 → `subagent`（子会话）→ `perAgent[agentId]`**。
+ */
+export interface AcpScopeSection {
+  /** 该档位的上下文窗口覆盖；缺省沿用顶层推导值（`compression.modelContextLimit → 默认 Provider → 200000`） */
+  modelContextLimit?: number
+  /** 该档位的压缩提示注入策略（`'off'` = 前缀提示 / 尾部手册 / nudge 三处全静默） */
+  manualInjection?: 'on-demand' | 'always' | 'off'
+  /** 层保留：保留最近 N 条原始消息 */
+  preserveRecentMessages?: number
+  /** 层保留：最近 N tokens 的原始上下文始终保留不压缩 */
+  preserveRecentTokens?: number
+  /** 块"存活次数"达该值才升层 */
+  promotionThreshold?: number
+  /** t1/t2/t3 各层压缩触发阈值 */
+  tiers?: {
+    tier2Trigger?: number
+    tier3Trigger?: number
+  }
+  /** 上下文压力档位（nudge 触发阈值） */
+  nudge?: {
+    maxContextLimitPct?: number
+    minContextLimitPct?: number
+    emergencyThresholdPct?: number
+  }
+  /** 高级透传：其余 kernel config（compress / truncate / absorb / protectedTools 等） */
+  config?: Record<string, unknown>
+}
+
 export interface HarnessConfig {
   /** 默认 Agent ID */
   agentId?: string
@@ -421,6 +456,32 @@ export interface HarnessConfig {
       /** 紧急提醒占用：≥ 该比例无条件提醒（默认 0.98） */
       emergencyThresholdPct?: number
     }
+    /**
+     * 压缩提示注入策略（缺省 `'on-demand'`）。
+     *
+     * - `'on-demand'`：占用率接近压缩阈值时才注入完整手册，否则只在前缀留一行极简提示
+     * - `'always'`：每轮把完整手册注入前缀（旧行为，便于 A-B 对照）
+     * - `'off'`：前缀提示 / 尾部手册 / nudge 三处全静默
+     *
+     * 与它叠加的还有一条**能力判据**：Agent 的工具白名单里确实没有 `compress` 时，无论这里
+     * 怎么配都不注入 —— 只读 worker 拿着手册只会照着拼入参、然后撞 `TOOL_NOT_ALLOWED`
+     * （真机会话 `s_1790685043685_1p8sw` 里 12 次全撞）。`systemPrompt` 被显式赋值时不受两者影响。
+     */
+    manualInjection?: 'on-demand' | 'always' | 'off'
+    /**
+     * **子会话档位**：对有父会话（`parentId` —— subagent / swarm 派生的会话）叠加的配置。
+     *
+     * 不配 = 不叠加 ⇒ 子会话逐位沿用顶层（即改造前的行为）。典型用法：子会话预算小，
+     * 把保留量压小，或于白名单里没有 `compress` 的 worker 直接关掉手册注入。
+     */
+    subagent?: AcpScopeSection
+    /**
+     * **按 Agent 的档位**（key = agent 定义 id，如 `reader` / `reviewer` / `lead`）。
+     *
+     * 比 `subagent` 更具体（同样是子会话，"只读速读员"与"实现者"的合理档位并不相同），
+     * 故优先级更高：`perAgent[agentId]` > `subagent` > 顶层。
+     */
+    perAgent?: Record<string, AcpScopeSection>
     /** 高级透传：不入上面的结构化字段的其它 kernel config（compress / truncate / protectedTools 等） */
     config?: Record<string, unknown>
     /**
@@ -1427,6 +1488,9 @@ const COMPRESSION_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>, 
   nudge: true,
   config: true,
   telemetry: true,
+  manualInjection: true,
+  subagent: true,
+  perAgent: true,
 }
 const COMPRESSION_TIER_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>['tiers'], true> = {
   tier2Trigger: true,
@@ -1439,6 +1503,98 @@ const COMPRESSION_NUDGE_KEYS: Record<keyof NonNullable<HarnessConfig['compressio
 }
 const COMPRESSION_TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>['telemetry'], true> = {
   enabled: true,
+}
+/** `compression.manualInjection` 合法取值 */
+const MANUAL_INJECTION_MODES: ReadonlySet<string> = new Set(['on-demand', 'always', 'off'])
+/** 作用域档位段（`compression.subagent` / `compression.perAgent[*]`）的合法键 */
+const COMPRESSION_SCOPE_KEYS: Record<keyof AcpScopeSection, true> = {
+  modelContextLimit: true,
+  manualInjection: true,
+  preserveRecentMessages: true,
+  preserveRecentTokens: true,
+  promotionThreshold: true,
+  tiers: true,
+  nudge: true,
+  config: true,
+}
+
+/**
+ * 校验一个作用域档位段（`compression.subagent` / `compression.perAgent[*]`）。
+ *
+ * 与顶层走**同一套**校验：只查顶层会让"顶层写错会告警、档位里写错静默"成为新的静默失效面，
+ * 而档位恰恰是最容易写错的地方（`.perAgent` 的 key 是 agent id，写错了没有任何反馈）。
+ */
+function checkCompressionScope(
+  scope: unknown,
+  path: string,
+  push: (paths: string[], tail: string) => void,
+): void {
+  if (!isPlainObject(scope)) return
+  push(collectUnknown(scope, Object.keys(COMPRESSION_SCOPE_KEYS), path), '未被识别，该档位不会生效')
+  if (scope.manualInjection !== undefined && !MANUAL_INJECTION_MODES.has(scope.manualInjection as string)) {
+    push(
+      [`${path}.manualInjection`],
+      `取值 ${JSON.stringify(scope.manualInjection)} 未知（可选：on-demand / always / off），已按 on-demand 处理`,
+    )
+  }
+  push(collectUnknown(scope.tiers, Object.keys(COMPRESSION_TIER_KEYS), `${path}.tiers`), '未被识别，该配置不会生效')
+  push(collectUnknown(scope.nudge, Object.keys(COMPRESSION_NUDGE_KEYS), `${path}.nudge`), '未被识别，该配置不会生效')
+  if (isPlainObject(scope.config)) {
+    push(collectUnknown(scope.config, Object.keys(KERNEL_CONFIG_KEYS), `${path}.config`), '内核 Config 无此字段，该配置不会生效')
+    push(collectUnknown(scope.config.tiers, Object.keys(KERNEL_TIER_KEYS), `${path}.config.tiers`), '内核 TierConfig 无此字段，该配置不会生效')
+    push(collectUnknown(scope.config.nudge, Object.keys(KERNEL_NUDGE_KEYS), `${path}.config.nudge`), '内核 NudgeConfig 无此字段，该配置不会生效')
+    push(collectUnknown(scope.config.compress, Object.keys(KERNEL_COMPRESS_KEYS), `${path}.config.compress`), '内核 CompressValidationConfig 无此字段，该配置不会生效')
+    push(collectUnknown(scope.config.truncate, Object.keys(KERNEL_TRUNCATE_KEYS), `${path}.config.truncate`), '内核 TruncateConfig 无此字段，该配置不会生效')
+    push(collectUnknown(scope.config.absorb, Object.keys(KERNEL_ABSORB_KEYS), `${path}.config.absorb`), '内核 AbsorbConfig 无此字段，该配置不会生效')
+  }
+}
+
+/**
+ * 把 `compression.subagent` / `compression.perAgent[*]` 段翻成 ACP 插件选项的形状。
+ *
+ * 与顶层**同一套翻译**（结构化字段落进 `config`，`config` 透传铺在最下层、显式字段压在它上面）——
+ * 否则顶层用 `preserveRecentTokens`、档位里得写 `config.preserveRecentTokens`，两处语法不一致，
+ * 而这种“同一个东西两套写法”正是“配了却不生效”的温床。
+ *
+ * 返回 `undefined` 表示“该段未配置” ⇒ 调用方不传该选项，插件侧不叠加（缺省零行为变更）。
+ */
+function toAcpScope(section: AcpScopeSection | undefined): Record<string, unknown> | undefined {
+  if (!section) return undefined
+  const out: Record<string, unknown> = {
+    ...(section.config ?? {}),
+    ...(section.preserveRecentMessages != null ? { preserveRecentMessages: section.preserveRecentMessages } : {}),
+    ...(section.preserveRecentTokens != null ? { preserveRecentTokens: section.preserveRecentTokens } : {}),
+    ...(section.promotionThreshold != null ? { promotionThreshold: section.promotionThreshold } : {}),
+  }
+  if (section.tiers) {
+    out.tiers = {
+      ...(section.tiers.tier2Trigger != null ? { tier2Trigger: section.tiers.tier2Trigger } : {}),
+      ...(section.tiers.tier3Trigger != null ? { tier3Trigger: section.tiers.tier3Trigger } : {}),
+    }
+  }
+  if (section.nudge) {
+    out.nudge = {
+      ...(section.nudge.maxContextLimitPct != null ? { maxContextLimitPct: section.nudge.maxContextLimitPct } : {}),
+      ...(section.nudge.minContextLimitPct != null ? { minContextLimitPct: section.nudge.minContextLimitPct } : {}),
+      ...(section.nudge.emergencyThresholdPct != null ? { emergencyThresholdPct: section.nudge.emergencyThresholdPct } : {}),
+    }
+  }
+  if (section.modelContextLimit != null) out.modelContextLimit = section.modelContextLimit
+  if (section.manualInjection != null) out.manualInjection = section.manualInjection
+  return out
+}
+
+/** 批量翻译 `perAgent` 表；空表返回 `undefined`（不传选项，与没配等价） */
+function toAcpScopeMap(
+  map: Record<string, AcpScopeSection> | undefined,
+): Record<string, unknown> | undefined {
+  if (!map) return undefined
+  const out: Record<string, unknown> = {}
+  for (const [agentId, section] of Object.entries(map)) {
+    const scoped = toAcpScope(section)
+    if (scoped) out[agentId] = scoped
+  }
+  return Object.keys(out).length > 0 ? out : undefined
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -1492,6 +1648,18 @@ export function checkCompressionConfig(c: unknown): string[] {
   push(collectUnknown(c.nudge, Object.keys(COMPRESSION_NUDGE_KEYS), '.nudge'), '未被识别，该配置不会生效')
   push(collectUnknown(c.telemetry, Object.keys(COMPRESSION_TELEMETRY_KEYS), '.telemetry'), '未被识别，该配置不会生效')
   push(collectUnknown(c.prompts, Object.keys(PROMPT_KEYS), '.prompts'), '不是 acp-kernel Prompts 的字段，该配置不会生效')
+  if (c.manualInjection !== undefined && !MANUAL_INJECTION_MODES.has(c.manualInjection as string)) {
+    out.push(
+      `compression.manualInjection 取值 ${JSON.stringify(c.manualInjection)} 未知（可选：on-demand / always / off），已按 on-demand 处理`,
+    )
+  }
+  // 作用域档位
+  checkCompressionScope(c.subagent, '.subagent', push)
+  if (isPlainObject(c.perAgent)) {
+    for (const [agentId, section] of Object.entries(c.perAgent)) {
+      checkCompressionScope(section, `.perAgent.${agentId}`, push)
+    }
+  }
 
   // config：高级透传，原样喂给内核 defaultConfig 的 overrides ⇒ 按内核 Config 形状校验
   if (isPlainObject(c.config)) {
@@ -2723,6 +2891,13 @@ export class HarnessApp {
         // token 折算口径：缺省 auto（CJK 感知），与内核内部计数共用同一函数
         tokenCalibration: compression.tokenCalibration,
         tokenCalibrationScale: compression.tokenCalibrationScale,
+        // 压缩提示注入策略（顶层）。另有一条能力判据与它叠加：该 Agent 白名单里确实没有
+        // compress 时一律不注入（只读 worker 拿着手册只会去撞 TOOL_NOT_ALLOWED）。
+        manualInjection: compression.manualInjection,
+        // 作用域档位：subagent（按 parentId，即子会话）/ perAgent（按 agent id）。
+        // 两者都不配置时不传 ⇒ 插件侧不叠加，缺省行为与改造前逐位一致。
+        subagent: toAcpScope(compression.subagent) as never,
+        perAgent: toAcpScopeMap(compression.perAgent) as never,
         telemetryEnabled,
         telemetryPathBuilder: telemetryEnabled
           ? (sessionId: string) => join(sessionsDir, `${sessionId}.telemetry.jsonl`)

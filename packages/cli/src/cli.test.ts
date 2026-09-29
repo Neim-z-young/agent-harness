@@ -415,6 +415,21 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
         tiers: { tier2Trigger: 5, tier3Trigger: 10 },
         nudge: { maxContextLimitPct: 0.75, minContextLimitPct: 0.45, emergencyThresholdPct: 0.95 },
         telemetry: { enabled: false },
+        manualInjection: 'on-demand',
+        subagent: {
+          modelContextLimit: 200_000,
+          manualInjection: 'off',
+          preserveRecentMessages: 3,
+          preserveRecentTokens: 30_000,
+          promotionThreshold: 4,
+          tiers: { tier2Trigger: 5, tier3Trigger: 10 },
+          nudge: { maxContextLimitPct: 0.75, minContextLimitPct: 0.45, emergencyThresholdPct: 0.95 },
+          config: { truncate: { threshold: 0.95 }, nudge: { growthRatio: 0 }, compress: { minSummaryLength: 50 } },
+        },
+        perAgent: {
+          reader: { manualInjection: 'off', modelContextLimit: 128_000 },
+          coordinator: { config: { absorb: { enabled: true } } },
+        },
         config: {
           truncate: { threshold: 0.95 },
           compress: { minCompressRange: 200_000, maxSummaryLength: 20_000, minSummaryLength: 50 },
@@ -433,6 +448,8 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     // 空 / undefined 也不应产生任何输出（否则每次概览都会挂一行空标题）
     expect(checkCompressionConfig(undefined)).toEqual([])
     expect(checkCompressionConfig({})).toEqual([])
+    // 非对象的档位段不误报 —— `subagent: "off"` 这种脏数据按"未配置"处理，不该刷屏
+    expect(checkCompressionConfig({ subagent: 'off', perAgent: { reader: 'off' } })).toEqual([])
   })
 
   it('checkCompressionConfig：拼错的键一律被抓出（否则会被内核静默丢弃）', () => {
@@ -455,6 +472,51 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(issues).toContain('compression.tiers.tier2trigger 未被识别，该配置不会生效')
     expect(issues).toContain('compression.config.preserveRecentToken 内核 Config 无此字段，该配置不会生效')
     expect(issues).toContain('compression.config.nudge.minGrowthFloar 内核 NudgeConfig 无此字段，该配置不会生效')
+    expect(issues.length).toBe(6)
+  })
+
+  it('checkCompressionConfig：manualInjection 非法取值告警（顶层与档位同一套口径）', () => {
+    // 三个合法档位都不告警
+    for (const mode of ['on-demand', 'always', 'off']) {
+      expect(checkCompressionConfig({ manualInjection: mode })).toEqual([])
+    }
+    // 顶层与档位段都要报 —— 只在顶层查会让"档位里写错静默"成为新的失效面
+    const bad = checkCompressionConfig({
+      manualInjection: 'never',
+      subagent: { manualInjection: 'always-on' },
+    })
+    expect(bad).toContain(
+      'compression.manualInjection 取值 "never" 未知（可选：on-demand / always / off），已按 on-demand 处理',
+    )
+    expect(bad).toContain(
+      'compression.subagent.manualInjection 取值 "always-on" 未知（可选：on-demand / always / off），已按 on-demand 处理',
+    )
+    expect(bad.length).toBe(2)
+  })
+
+  it('checkCompressionConfig：档位段内的未知键带作用域路径报出（含 perAgent 的 agent id）', () => {
+    const issues = checkCompressionConfig({
+      subagent: {
+        preserveRecentToken: 30_000, // 少个 s —— 顶层会报，档位里同样要报
+        nudge: { minGrowthFloar: 1 }, // 档位 nudge 只认三个 pct，其余键在内核里本就不存在
+        config: {
+          preserveRecentToken: 30_000, // 高级透传里同样的错
+          compress: { minSummaryLenght: 50 }, // 内核 CompressValidationConfig 拼错
+        },
+      },
+      perAgent: {
+        reader: { manualInjecton: 'off' }, // 档位顶层键拼错（agent id 写对、字段写错）
+        reviewer: { tiers: { tier2trigger: 5 } },
+      },
+    })
+    expect(issues).toContain('compression.subagent.preserveRecentToken 未被识别，该档位不会生效')
+    expect(issues).toContain('compression.subagent.nudge.minGrowthFloar 未被识别，该配置不会生效')
+    expect(issues).toContain('compression.subagent.config.preserveRecentToken 内核 Config 无此字段，该配置不会生效')
+    expect(issues).toContain(
+      'compression.subagent.config.compress.minSummaryLenght 内核 CompressValidationConfig 无此字段，该配置不会生效',
+    )
+    expect(issues).toContain('compression.perAgent.reader.manualInjecton 未被识别，该档位不会生效')
+    expect(issues).toContain('compression.perAgent.reviewer.tiers.tier2trigger 未被识别，该配置不会生效')
     expect(issues.length).toBe(6)
   })
 
