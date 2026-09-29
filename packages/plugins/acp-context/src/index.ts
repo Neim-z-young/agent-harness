@@ -258,6 +258,39 @@ export interface AcpStatusOutput {
 
 // ===== 插件选项 =====
 
+/**
+ * 手册 / 压缩提示的注入策略。
+ *
+ * - `'on-demand'`（默认）：占用率接近压缩阈值时才注入完整手册，否则只在前缀留一行极简提示。
+ * - `'always'`：每轮把完整手册注入**前缀**（复刻改造前行为，便于 A-B 对照或回退）。
+ * - `'off'`：**一次都不注入**（前缀提示 / 尾部手册 / nudge 三处全静默）。
+ */
+export type ManualInjectionMode = 'on-demand' | 'always' | 'off'
+
+/**
+ * 「作用域档位」：叠加到**某一类会话 / 某个 Agent** 上的压缩配置。
+ *
+ * 字段与 `config` 同形 —— 直接复用内核的 {@link LooseAcpConfig}（`modelContextLimit` /
+ * `preserveRecentTokens` / `preserveRecentMessages` / `promotionThreshold` / `tiers` / `nudge` /
+ * `compress` …），再额外加一个 `manualInjection`。
+ *
+ * **刻意没有 `tokenCalibration` / `tokenCalibrationScale`**：折算口径与 `createCore` 注入的
+ * `countTokens` 是**同一个函数**，全进程只能有一把尺子。按档位分化必然造成"占用率与内核阈值
+ * 不同源"，而这正是本仓早年"占用率显示 26% 而实际已 103%"的根因。
+ */
+export interface AcpScopeOverride extends LooseAcpConfig {
+  /** 该档位的压缩提示注入策略；缺省沿用上一层 */
+  manualInjection?: ManualInjectionMode
+}
+
+/** 某个作用域解析后的**生效**配置（`scopeFor` 的返回值） */
+export interface AcpResolvedScope {
+  /** 生效的内核 config（`modelContextLimit` 已换成该档位的窗口） */
+  config: AcpConfig
+  /** 生效的压缩提示注入策略 */
+  manualInjection: ManualInjectionMode
+}
+
 export interface AcpContextPluginOptions {
   /** 模型上下文窗口（tokens）。默认 200_000。 */
   modelContextLimit?: number
@@ -314,10 +347,30 @@ export interface AcpContextPluginOptions {
    * （含整段历史）在前缀缓存里失效，一次翻转的代价远大于按需省下的量（量化见
    * `MANUAL_INJECT_MARGIN` 注释 / docs/usage-accounting-and-prompt-cache-plan.md §3）。
    *
+   * - `'off'`：**一次都不注入**（前缀提示 / 尾部手册 / nudge 三处全静默）。给"工具白名单里
+   *   没有 `compress` 的 Agent"用 —— 对它是误导而非说明书：模型会照着手册拼出字段完整的
+   *   `compress` 调用，然后撞 `TOOL_NOT_ALLOWED`（真机会话 `s_1790685043685_1p8sw` 里 12 次全撞，
+   *   模型自己都只能打断"the compress tool isn't actually available despite the philosophy text"）。
+   *   注意**自动分层压缩照常运行**，关掉的只是"给模型看的提示"。
+   *
    * 例外：`systemPrompt` 被显式赋值时，用户文本始终注入**前缀**（显式配置优先，且它恒定无风险），
-   * 不再往尾部注入手册。
+   * 不再往尾部注入手册；`'off'` 也不抑制它（那是用户明确要的文本，不是我们塞的说明书）。
    */
-  manualInjection?: 'on-demand' | 'always'
+  manualInjection?: ManualInjectionMode
+  /**
+   * **子会话档位**：对有父会话（`parentSessionId` —— `session.create({ parentId })` 写入，
+   * subagent / swarm 派生）的会话叠加的配置。
+   *
+   * 与 `config` 同形（见 {@link AcpScopeOverride}）。不配 = 不叠加 ⇒ 子会话逐位沿用顶层（旧行为）。
+   */
+  subagent?: AcpScopeOverride
+  /**
+   * **按 Agent 的档位**（key = agent 定义 id，如 `reader` / `reviewer` / `lead`）。
+   *
+   * 比 `subagent` 更具体：同样是子会话，"只读速读员"和"实现者"的合理档位并不相同。
+   * 优先级：`perAgent[agentId]` > `subagent` > 顶层。
+   */
+  perAgent?: Record<string, AcpScopeOverride>
   // ---- 遥测 ----
   /** 开启运行时遥测（默认 true）；关闭后不写任何 JSONL 遥测文件 */
   telemetryEnabled?: boolean
@@ -359,6 +412,16 @@ interface AcpSessionCtx {
    * 提醒只有一行且落在尾部，常驻比反复开关更省、也更可靠。
    */
   needsArgsReminder?: boolean
+  /**
+   * 本会话生效的压缩档位（由 `core.session.preModel` 解析后绑上）。
+   *
+   * **工具必须取这一份**（`compress` 的 applyCompression、`acp_status` 的 engine.status），
+   * 不能再用工厂闭包里的全局 `config` —— 否则 hook 按档位决策、工具按全局报表，
+   * 两处口径分裂（本仓的忌讳形态："占用率显示 26% 实际已 103%"就是这一类的历史事故）。
+   *
+   * 为 undefined 时（会话尚未跑过 preModel，如 session 压缩先到）回落到默认档位。
+   */
+  scope?: AcpResolvedScope
   /** 会话 meta 写访问器（由 runPreModel 注入，供 compress 工具即时持久化状态） */
   meta?: { patch: (patch: Record<string, unknown>) => Promise<void> }
   // ---- 遥测 ----
@@ -417,12 +480,113 @@ export function resolveAcpConfig(
 }
 
 /**
+ * 把一层作用域档位合并到已有配置上：浅合并 + `tiers` / `nudge` / `compress` **三个子树深一层**。
+ *
+ * 为什么不是 `{ ...base, ...layer }`：这三个键是**子树**，浅展开会让"只改 nudge 的一个键"
+ * 把整棵 nudge 树替掉 ⇒ 其余键静默回落内核默认值（本仓同类坑已有前车：ACP 状态水合时
+ * 就是因为浅展开而让新字段缺失，见 `runPreModel` 里二级合并那段注释）。
+ *
+ * `manualInjection`（插件自己的键）与 `modelContextLimit`（由调用方单独取出当窗口用）**不进**
+ * 内核 config —— 后者留着会让 `defaultConfig` 收到两份窗口来源。
+ */
+function mergeScopeConfig(base: LooseAcpConfig | undefined, layer: AcpScopeOverride): LooseAcpConfig {
+  const baseCfg = (base ?? {}) as Record<string, unknown>
+  const merged: Record<string, unknown> = { ...baseCfg }
+  for (const [key, value] of Object.entries(layer)) {
+    if (value === undefined) continue
+    if (key === 'manualInjection' || key === 'modelContextLimit') continue
+    if (key === 'tiers' || key === 'nudge' || key === 'compress') {
+      merged[key] = { ...(baseCfg[key] as object), ...(value as object) }
+    } else {
+      merged[key] = value
+    }
+  }
+  return merged as LooseAcpConfig
+}
+
+/**
+ * 摘掉 config 里的 `modelContextLimit`。
+ *
+ * 内核的 `defaultConfig(modelContextLimit, overrides)` 实现是 `{ ...base, ...overrides }` ——
+ * overrides 里的 `modelContextLimit` 会**盖掉**作为第一个参数传进去的窗口。所以窗口必须由调用方
+ * 独占：留着它，档位里写的窗口就会被顶层 `config.modelContextLimit` 静默盖回去
+ *（"配了却不生效"，而且没有任何症状）。
+ */
+function stripWindow(cfg: LooseAcpConfig | undefined): LooseAcpConfig | undefined {
+  if (!cfg || cfg.modelContextLimit === undefined) return cfg
+  const out = { ...cfg }
+  delete out.modelContextLimit
+  return out
+}
+
+/**
+ * 这份 Agent 工具清单里到底有没有 `compress`。
+ *
+ * 返回 `undefined` 表示**未知**（宿主没传 `agentTools`，如单测直调、非 core 宿主）——
+ * 消费方应 fail-open。刻意不把"未知"当空集：两者判错的代价不对称 ——
+ * 未知时按旧行为注入只是多付一份说明书，而误判成空集会**静默关掉**一个本来能用压缩的
+ * Agent 的全部提示（用户看不到任何报错，只会觉得"压缩怎么不提醒了"）。
+ *
+ * 只认 `'compress'` 而不认 `'acp_status'`：被注入的文本（`COMPRESS_MANUAL_HINT` / 完整手册 /
+ * nudge）说的都是"调 compress 压历史"，只给 `acp_status` 的 Agent 照着它去调同样是白撞。
+ */
+export function agentCanUseCompress(agentTools: readonly string[] | undefined): boolean | undefined {
+  if (!agentTools) return undefined
+  return agentTools.includes('compress')
+}
+
+/**
  * 创建 ACP 上下文压缩插件。
  * 每轮通过 core.session.preModel 运行 acp-kernel 的 processTurn，并注入 4 个模型驱动工具。
  */
 export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): AgentPlugin {
   const modelContextLimit = options.modelContextLimit ?? 200_000
-  const config = resolveAcpConfig(modelContextLimit, options.config, options.autoTune)
+  const baseManualInjection: ManualInjectionMode = options.manualInjection ?? 'on-demand'
+
+  /**
+   * 解析某个作用域**生效**的压缩配置。
+   *
+   * 优先级（后写覆盖前写）：**顶层 → `subagent`（子会话）→ `perAgent[agentId]`**。
+   *
+   * 为什么要两个维度而不是一个：它们回答的是不同问题 ——
+   * 「凡事派生出来的子会话该怎么压」（预算小、只回摘要）与「这一种 Agent 该怎么压」
+   * （`reader` 是短命只读 worker，保留量该小些；`reviewer` 又要留多些原文）。
+   * 两者可以叠，`perAgent` 更具体所以优先级更高。
+   *
+   * 结果是纯函数（输入只有 agentId + 是否子会话），所以按 key 缓存 —— 这个解析每轮都走，
+   * 但一个进程里的档位就那么几个。
+   */
+  const scopeCache = new Map<string, AcpResolvedScope>()
+  function scopeFor(agentId?: string, parentSessionId?: string): AcpResolvedScope {
+    const key = `${parentSessionId ? 'child' : 'root'}\u0000${agentId ?? ''}`
+    const cached = scopeCache.get(key)
+    if (cached) return cached
+    let loose: LooseAcpConfig | undefined = options.config
+    let manual = baseManualInjection
+    // 顶层 `config.modelContextLimit` 也是一处窗口来源（历史行为：它会盖掉插件选项传进来的那个）
+    let window = loose?.modelContextLimit ?? modelContextLimit
+    // 数组顺序即优先级顺序：越具体的越靠后写
+    const layers: (AcpScopeOverride | undefined)[] = [
+      parentSessionId ? options.subagent : undefined,
+      agentId ? options.perAgent?.[agentId] : undefined,
+    ]
+    for (const layer of layers) {
+      if (!layer) continue
+      if (layer.modelContextLimit !== undefined) window = layer.modelContextLimit
+      if (layer.manualInjection !== undefined) manual = layer.manualInjection
+      loose = mergeScopeConfig(loose, layer)
+    }
+    const scope: AcpResolvedScope = {
+      // 窗口单独传（loose 里的已抹掉）—— 见 stripWindow 的注释
+      config: resolveAcpConfig(window, stripWindow(loose), options.autoTune),
+      manualInjection: manual,
+    }
+    scopeCache.set(key, scope)
+    return scope
+  }
+  /** 默认档位（无 agentId、非子会话）—— 拿不到判别符的宿主与单测都落这里，行为与改造前一致 */
+  const defaultScope = scopeFor()
+  const config = defaultScope.config
   // 提示词：默认来自插件目录 prompts/*.txt（可本地编辑），config 传入的 prompts 覆盖在其上，
   // systemPrompt 整段覆盖为最高优先级。nudge 渲染与本轮压缩系统提示保持一致。
   //
@@ -437,9 +601,9 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   )
   const makeSystemPrompt = (): string =>
     options.systemPrompt ?? sanitizeExampleTags(buildCompressSystemPrompt(resolvedPrompts))
-  // 手册注入策略：默认 on-demand（低占用只给极简提示，省 token）；explicitSystemPrompt 表示
-  // 用户显式整段覆盖了 systemPrompt，必须始终注入完整手册（不受阈值影响）。
-  const manualInjection = options.manualInjection ?? 'on-demand'
+  // 手册注入策略已改为**按作用域解析**（见上方 scopeFor）：顶层 `manualInjection` 是底，
+  // `subagent` / `perAgent` 档位可以覆盖。explicitSystemPrompt 表示用户显式整段覆盖了
+  // systemPrompt —— 那份文本必须始终注入（不受阈值、也不受 'off' 影响）。
   const explicitSystemPrompt = options.systemPrompt !== undefined
   // token 折算口径：默认与内核同一份实现（CJK 感知）。'auto' 显式注入等价于内核默认值，
   // 目的是把口径**钉死在一处**——插件上报的 tokenCount 与内核内部计数永远是同一把尺子。
@@ -526,6 +690,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
           if (!sctx) {
             return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
           }
+          // 取本会话生效的档位 —— 与 preModel 用的是同一份，不是工厂闭包里的全局 config
+          const scope = sctx.scope ?? scopeFor(ctx.agentId)
           const ranges = parseCompressInput(
             input,
             ctx.toolUseId,
@@ -546,7 +712,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             })),
             messages: sctx.lastCores,
             state: sctx.state,
-            config,
+            config: scope.config,
           })
           sctx.state = applied.state
           // 压缩改变了块结构/历史 → 强制下一轮全量重建，失效增量缓存
@@ -561,7 +727,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             const ev = buildCompressEvent({
               sessionId: ctx.sessionId,
               round: sctx.round ?? 0,
-              window: config.modelContextLimit,
+              window: scope.config.modelContextLimit,
               state: applied.state,
               result: applied.result,
               ranges: rangeStats,
@@ -710,7 +876,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
           }
           const tokenCount = estimateTokens(sctx.lastCores, countTokens)
-          const rep = engine.status(sctx.state, tokenCount, config)
+          // 同上：报表口径必须与决策口径同源，否则“工具说占 30%、压到 0.35 才触发”就成了两个事实
+          const rep = engine.status(sctx.state, tokenCount, (sctx.scope ?? scopeFor(ctx.agentId)).config)
           return {
             ok: true,
             output: {
@@ -758,9 +925,44 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         preserveRecentTokens: config.preserveRecentTokens,
         growthFloor: config.nudge?.growthFloor,
         minCompressRange: config.compress?.minCompressRange,
+        // 作用域档位：配了就点名，否则"配了却不生效"只能靠猜（档位是纯叠加，缺省行为不变）
+        manualInjection: baseManualInjection,
+        subagentTier: options.subagent !== undefined,
+        perAgentTiers: options.perAgent ? Object.keys(options.perAgent) : undefined,
       })
 
       return {
+        /**
+         * 档位里的 key 是 **agent id**，写错了完全没有反馈（这个键只在本插件里被查表，
+         * 写歪一个字母的效果与“特意不配”一模一样）。本仓已有前车：`subagents` 这个 frontmatter
+         * 字段在某 agent 定义里列了 15 项却毫无作用。所以在 agent 注册表就绪后核对一次 ——
+         * **只告警、不阻断**（也可能有运行期才注册的 agent，那时这台告警就是个善意的提醒）。
+         */
+        'core.harness.start'(input) {
+          const tiers = options.perAgent
+          if (!tiers || Object.keys(tiers).length === 0) return
+          // `harness` 在 hook 契约里是 unknown（非 CLI 宿主可能给别的形状）⇒ 全程防御式取用，
+          // 取不到就当“不知道”，不猜也不报。
+          const registry = (input.harness as { agent?: { list?: () => unknown } } | undefined)?.agent
+          let known: string[] | undefined
+          try {
+            const list = registry?.list?.()
+            known = Array.isArray(list)
+              ? list.map((a) => String((a as { id?: unknown })?.id ?? '')).filter(Boolean)
+              : undefined
+          } catch {
+            known = undefined
+          }
+          if (!known || known.length === 0) return
+          const unknownIds = Object.keys(tiers).filter((id) => !known.includes(id))
+          if (unknownIds.length > 0) {
+            plgCtx.log.warn?.(
+              `compression.perAgent 里有未注册的 Agent id：${unknownIds.join('、')}`
+              + ` —— 该档位不会生效（当前可用：${known.join(' / ')}）`,
+            )
+          }
+        },
+
         async 'core.tool.pool.assemble'(_input, pool) {
           for (const t of tools) (pool as { add: (t: unknown) => void }).add(t)
         },
@@ -778,12 +980,23 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         async 'core.session.preModel'(input, rawMessages) {
           const messages = rawMessages as Message[]
           try {
+            // 判别符全在 input 里（core 透传）：这是哪个 Agent 的会话、是不是子会话、以及它
+            // **实际能用哪些工具**。三者共同决定本会话走哪个档位、提示该不该注入。
+            // 不让插件自己去查 agent 注册表：`PluginContext` 里根本没有它（拿不到就只能猜）。
+            const scope = scopeFor(input.agentId, input.parentSessionId)
+            const sctx = getOrCreateCtx(input.sessionId)
+            // 把档位绑到会话上：随后的 `compress` / `acp_status` 工具必须读**同一份** config，
+            // 否则 hook 按档位决策、工具按全局报表 —— 两处口径分裂。
+            sctx.scope = scope
+            // 能力判据：白名单里确实没有 compress ⇒ 模型侧提示一律不注入（P0-1 的根因修复，
+            // 见 agentCanUseCompress 的注释）。全局 toolIds 把 compress 排除时同理。
+            const canCompress = want('compress') ? agentCanUseCompress(input.agentTools) : false
             await runPreModel({
               sessionId: input.sessionId,
               messages,
-              getCtx: () => getOrCreateCtx(input.sessionId),
+              getCtx: () => sctx,
               engine,
-              config,
+              config: scope.config,
               countTokens,
               meta: input.meta,
               makeSystemPrompt,
@@ -791,7 +1004,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               ...(input.systemStability ? { systemStability: input.systemStability } : {}),
               ...(input.dynamicParts ? { dynamicParts: input.dynamicParts } : {}),
               tempMessage,
-              manualInjection,
+              manualInjection: scope.manualInjection,
+              ...(canCompress !== undefined ? { canCompress } : {}),
               explicitSystemPrompt,
               // 统一块模型：把每轮内部折叠（tier1/2/3）的 source:'acp' 块 push 给 host，
               // host 合并进 session.blocks，供视图/loader/reconstructHistory/revert 消费
@@ -807,12 +1021,17 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
 
         async 'core.session.compacting'(input, compactCtx) {
           try {
+            const sctx = getOrCreateCtx(input.sessionId)
             await runCompacting({
               sessionId: input.sessionId,
               input: compactCtx,
-              getCtx: () => getOrCreateCtx(input.sessionId),
+              getCtx: () => sctx,
               engine,
-              config,
+              // 本 hook 的入参是 `PromptInput`（有 agentId，**没有** parentSessionId），
+              // 所以优先用 preModel 已绑到会话上的那份档位；会话还没跑过 preModel
+              // （session 压缩可能先到）才按 agentId 现算 —— 那一档少了 subagent 覆盖，
+              // 但此时本来也没有子会话判据可用。
+              config: (sctx.scope ?? scopeFor(input.agentId)).config,
               meta: compactCtx.meta ?? {
                 read: async () => undefined,
                 patch: async () => {},
@@ -915,12 +1134,24 @@ interface RunPreModelDeps {
   makeSystemPrompt: () => string
   /**
    * 压缩手册注入策略（默认 `'on-demand'`）。`'always'` 走旧行为每轮注入完整手册；
-   * `'on-demand'` 仅在占用率接近压缩阈值时注入完整手册，否则只注入极简提示。
+   * `'on-demand'` 仅在占用率接近压缩阈值时注入完整手册，否则只注入极简提示；
+   * `'off'` 三处提示全静默（见 {@link ManualInjectionMode}）。
    */
-  manualInjection?: 'on-demand' | 'always'
+  manualInjection?: ManualInjectionMode
+  /**
+   * 本会话的 Agent 是否**真的能调 `compress`**（工具白名单判据，见 {@link agentCanUseCompress}）。
+   *
+   * 为 `false` 时**不注入任何模型侧压缩提示**（前缀提示 / 尾部完整手册 / nudge）——
+   * 对用不了这个工具的 Agent，那三段文本不是说明书而是**误导**：模型会照着手册拼出字段完整的
+   * `compress` 调用，然后撞 `TOOL_NOT_ALLOWED`（真机会话 `s_1790685043685_1p8sw` 里 12 次全撞）。
+   *
+   * `undefined` = **未知**（非 core 宿主、单测直调时没有 `agentTools`）⇒ **fail-open**，
+   * 按改造前的行为照样注入。两种判错的代价不对称，所以只抑制"确实不可用"这一种。
+   */
+  canCompress?: boolean
   /**
    * 用户是否显式赋值了 `systemPrompt`。为真时无论 manualInjection 与占用率如何都注入完整手册
-   * （用户显式要求，不受阈值影响，也不会退化成极简提示）。
+   * （用户显式要求，不受阈值影响，也不会退化成极简提示，且**不受 canCompress 抑制**）。
    */
   explicitSystemPrompt?: boolean
   /** 解析后的提示词 policy（nudge 渲染与本轮压缩系统提示保持一致）；缺省走内核默认 */
@@ -1204,11 +1435,22 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 会变的完整手册一律挪到**尾部**（与 nudge 同位置），见下方 tailParts。
   const occupancy = estimateTokens(res.messages, countTokens) / Math.max(1, deps.config.modelContextLimit)
   const manualThreshold = (deps.config.nudge?.minContextLimitPct ?? 0.35) * MANUAL_INJECT_MARGIN
+  // ---- 模型侧压缩提示是否整体静默 ----
+  // 两个来源，任一成立即静默：
+  // ① 档位显式关了（`manualInjection: 'off'`）—— 给“由外部判定不可压”的场景；
+  // ② **能力判据**：本 Agent 的工具白名单里确实没有 compress（`canCompress === false`）。
+  //    这一条才是 P0-1 的根因修复：手册过去是**无条件下发**的，而只读 worker 白名单里
+  //    只有 read_file/list_dir/glob/grep_file，却拿着手册拼出字段完整的 compress 调用去撞
+  //    `TOOL_NOT_ALLOWED`（真机会话 12 次全撞）。`undefined`（未知）不算，见 canCompress。
+  // 显式 systemPrompt / `'always'` 不受影响：那是用户明确要的文本，不是我们塞的说明书。
+  const suppressHints = deps.canCompress === false || deps.manualInjection === 'off'
   const prefixText =
     deps.explicitSystemPrompt === true || deps.manualInjection === 'always'
       ? deps.makeSystemPrompt() // 宿主显式配置 / 对照臂：恒定，无翻转风险
-      : COMPRESS_MANUAL_HINT // 默认档：恒定的一行提示
-  request.push(deps.tempMessage('system', prefixText, sessionId))
+      : suppressHints
+        ? '' // 静默：连那一行极简提示也不留（它同样在教模型去调 compress）
+        : COMPRESS_MANUAL_HINT // 默认档：恒定的一行提示
+  if (prefixText) request.push(deps.tempMessage('system', prefixText, sessionId))
 
   if (cacheHit) {
     // 增量：复用缓存前缀 + 只渲染新增尾部 core，并把尾部并入缓存供下一轮继续命中
@@ -1238,11 +1480,14 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 等于没挪 —— 它会回到前缀，本方案的收益归零。只有 OpenAI 保持原序，不能指望它。
   const nudge = res.nudge
   const needTailManual =
+    !suppressHints &&
     deps.explicitSystemPrompt !== true &&
     deps.manualInjection !== 'always' &&
     occupancy >= manualThreshold
   const tailParts = [
-    nudge?.shouldInject ? renderNudgeText(nudge, deps.prompts).text : '',
+    // nudge 与手册同源，说的都是“该压了”。用不了 compress 的 Agent 收到它只会困惑，
+    // 所以与手册同一判据一起静默（自动分层压缩不受影响 —— 那是引擎行为，不依赖模型配合）。
+    nudge?.shouldInject && !suppressHints ? renderNudgeText(nudge, deps.prompts).text : '',
     needTailManual ? deps.makeSystemPrompt() : '',
     // B2-3：本会话已丢过参数 ⇒ 尾部常驻一行提醒（尾部翻转不伤前缀缓存）
     ctx.needsArgsReminder ? TOOL_ARGS_REMINDER : '',

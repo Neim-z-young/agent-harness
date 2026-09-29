@@ -30,6 +30,7 @@ import {
   COMPRESS_MANUAL_HINT,
   COMPRESS_TOOL_DOC,
   TOOL_ARGS_REMINDER,
+  agentCanUseCompress,
 } from './index'
 import { toCores, compactHistory, idBase, baseId, estimateTokens, chars4CountTokens } from './adapter'
 import { loadPromptFiles } from './prompts'
@@ -953,6 +954,231 @@ test('createAcpContextPlugin：manualInjection always，低占用也注入完整
   const sysText = (messages[0]!.parts[0] as any).text
   expect(sysText).toInclude('All compression serves the primary task') // 完整内核压缩手册正文
   expect(sysText).not.toBe(COMPRESS_MANUAL_HINT)
+})
+
+// ===== 作用域档位 + 「提示按能力边界注入」=====
+//
+// 背景（会诊 s_1790685043685_1p8sw 取证）：压缩手册过去是**无条件下发**的 —— 子 Agent 的白名单里
+// 只有 read_file/list_dir/glob/grep_file，却照着手册拼出了字段完整的 `compress` 调用，12 次全部撞
+// `TOOL_NOT_ALLOWED`（模型自己都只能打断 "isn't actually available despite the philosophy text"）。
+// 相关性是 100%：占用率越 31.5% 的 4/4 子会话全调过，未越的 0/5 一次没调。
+// 两处修：① 提示按**能力边界**注入 —— core 把该 Agent 的最终工具清单（agentTools）透传下来；
+//          ② 压缩配置可按「子会话 / 具体 Agent」两个作用域叠加。
+
+/** 完整内核手册的标识句（区别于一行极简提示 COMPRESS_MANUAL_HINT） */
+const MANUAL_MARK = 'All compression serves the primary task'
+
+/** 尾部临时块（`tempMessage` 的 id 前缀即 `acp_user_`）的正文；无尾部块时为空串 */
+function tailText(messages: Message[]): string {
+  const last = messages.at(-1)
+  if (!last || last.role !== 'user' || !last.id.startsWith('acp_user_')) return ''
+  return String((last.parts[0] as { text?: string } | undefined)?.text ?? '')
+}
+
+/**
+ * 安装插件并按指定判别符驱动 preModel。
+ *
+ * 与 `preModelFromPlugin` 的区别：那个不传 agentId/agentTools（即"判别符缺失"的宿主），
+ * 正是 fail-open 路径；这里要把三个判别符都拿在手里才能测作用域与能力判据。
+ */
+async function preModelWithScope(
+  options: Parameters<typeof createAcpContextPlugin>[0],
+  input: {
+    agentId?: string
+    agentTools?: readonly string[]
+    parentSessionId?: string
+    sessionId?: string
+  } = {},
+): Promise<(raw: Message[]) => Promise<void>> {
+  const plugin = createAcpContextPlugin(options)
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+  const handler = hooks['core.session.preModel']!
+  const sessionId = input.sessionId ?? 's'
+  // hook 的返回类型是 `Awaitable<void>`（可能是同步 void），这里显式 await 把它收敛成
+  // `Promise<void>` —— 否则 `await preModel(...)` 会漏掉同步 handler 的完成时机，
+  // 断言读到的是半成品消息。
+  return async (raw: Message[]) => {
+    await handler(
+      {
+        sessionId,
+        agentId: input.agentId ?? 'lead',
+        ...(input.agentTools ? { agentTools: input.agentTools } : {}),
+        ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+        meta: { read: async () => undefined, patch: async () => {} },
+        blocksPatch: [],
+      } as any,
+      raw,
+    )
+  }
+}
+
+test('agentCanUseCompress：三态（有 / 无 / 未知）', () => {
+  expect(agentCanUseCompress(['read_file', 'compress'])).toBe(true)
+  expect(agentCanUseCompress(['read_file'])).toBe(false)
+  expect(agentCanUseCompress([])).toBe(false)
+  // 未知 ≠ 空集：非 core 宿主（单测直调）根本没有判别符，必须让调用方 fail-open。
+  // 两者判错的代价不对称 —— 未知时注入只是多付一份说明书，误判成空集会**静默关掉**提示。
+  expect(agentCanUseCompress(undefined)).toBeUndefined()
+})
+
+test('能力判据：白名单里没有 compress ⇒ 极简提示 / 完整手册 / nudge 全部不注入', async () => {
+  const preModel = await preModelWithScope(
+    { modelContextLimit: 2000, config: onDemandConfig(0.5) },
+    { agentId: 'reader', agentTools: ['read_file', 'list_dir', 'glob', 'grep_file'] },
+  )
+  // 占用率 ≈ 1600/2000 = 0.8，远超 0.5×0.9=0.45 —— 改造前这里会注入完整手册
+  const messages = history(100)
+  await preModel(messages)
+  const all = JSON.stringify(messages)
+  expect(all).not.toContain(COMPRESS_MANUAL_HINT)
+  expect(all).not.toContain(MANUAL_MARK)
+  // 关掉的只是"给模型看的提示"：历史原样、自动分层压缩照跑
+  expect(messages.filter((m) => m.id.startsWith('m')).length).toBe(100)
+  expect(messages.some((m) => m.role === 'system')).toBe(false)
+})
+
+test('能力判据：判别符缺失（非 core 宿主）⇒ fail-open，仍按旧行为注入极简提示', async () => {
+  const preModel = await preModelWithScope(
+    { modelContextLimit: 2000, config: onDemandConfig(0.5) },
+    { agentId: 'lead' }, // 不传 agentTools = 未知
+  )
+  const messages = history(3)
+  await preModel(messages)
+  const sys = messages.find((m) => m.role === 'system')!
+  expect((sys.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+})
+
+test('档位：perAgent 命中生效，未列出的 Agent 回落顶层', async () => {
+  const options = {
+    modelContextLimit: 2000,
+    config: onDemandConfig(0.5),
+    perAgent: { reader: { manualInjection: 'off' as const } },
+  }
+  // reader：档位显式关掉提示 —— 即使它**确实**能用 compress（能力判据与档位是两条独立开关）
+  const asReader = await preModelWithScope(options, { agentId: 'reader', agentTools: ['read_file', 'compress'] })
+  const m1 = history(3)
+  await asReader(m1)
+  expect(JSON.stringify(m1)).not.toContain(COMPRESS_MANUAL_HINT)
+  // 未列档位的 agent：仍按顶层 on-demand
+  const asLead = await preModelWithScope(options, { agentId: 'lead', agentTools: ['read_file', 'compress'] })
+  const m2 = history(3)
+  await asLead(m2)
+  expect((m2.find((m) => m.role === 'system')!.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+})
+
+test('档位：subagent 按 parentSessionId 生效，且 perAgent 优先级更高', async () => {
+  const options = {
+    modelContextLimit: 2000,
+    config: onDemandConfig(0.5),
+    subagent: { manualInjection: 'off' as const },
+    perAgent: { reviewer: { manualInjection: 'always' as const } },
+  }
+  // ① 子会话 + 未列档位的 agent ⇒ 落到 subagent 档（off）
+  const childCoder = await preModelWithScope(options, {
+    agentId: 'coder',
+    parentSessionId: 'p1',
+    agentTools: ['compress'],
+  })
+  const m1 = history(3)
+  await childCoder(m1)
+  expect(JSON.stringify(m1)).not.toContain(COMPRESS_MANUAL_HINT)
+
+  // ② 子会话 + perAgent 命中 ⇒ perAgent 覆盖 subagent（'always' ⇒ 前缀注入完整手册）
+  const childReviewer = await preModelWithScope(options, {
+    agentId: 'reviewer',
+    parentSessionId: 'p2',
+    agentTools: ['compress'],
+  })
+  const m2 = history(3)
+  await childReviewer(m2)
+  expect((m2.find((m) => m.role === 'system')!.parts[0] as any).text).toContain(MANUAL_MARK)
+
+  // ③ 顶层会话（无 parentSessionId）⇒ subagent 档不适用，回落顶层 on-demand
+  const rootCoder = await preModelWithScope(options, { agentId: 'coder', agentTools: ['compress'] })
+  const m3 = history(3)
+  await rootCoder(m3)
+  expect((m3.find((m) => m.role === 'system')!.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+})
+
+test('档位：perAgent 的窗口同时改注入决策与 acp_status 报表（两处同源）', async () => {
+  const plugin = createAcpContextPlugin({
+    modelContextLimit: 2000,
+    config: onDemandConfig(0.5),
+    perAgent: { reader: { modelContextLimit: 100_000 } },
+  })
+  const tools = new Map<string, any>()
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+  await hooks['core.tool.pool.assemble']!(
+    { agentId: 'reader' } as any,
+    // ToolPool 是完整接口（add/addAll/addIfMissing/remove/list），只给 add 一个不够用 ——
+    // `add` 的返回类型是 void，`=> tools.set(...)` 会把 Map 当返回值，类型上也不兼容。
+    {
+      add: (t: any) => void tools.set(t.id, t),
+      addAll: () => {},
+      addIfMissing: () => {},
+      remove: () => {},
+      list: () => [...tools.values()],
+    },
+  )
+  const run = (sessionId: string, agentId: string, raw: Message[]) =>
+    hooks['core.session.preModel']!(
+      {
+        sessionId,
+        agentId,
+        agentTools: ['compress'],
+        meta: { read: async () => undefined, patch: async () => {} },
+        blocksPatch: [],
+      } as any,
+      raw,
+    )
+
+  // reader：窗口被档位放大到 100000 ⇒ 同样 100 条历史只占 ≈0.016 ⇒ 只该给极简提示
+  const r = history(100)
+  await run('s-reader', 'reader', r)
+  expect((r.find((m) => m.role === 'system')!.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+  expect(tailText(r)).not.toContain(MANUAL_MARK)
+  // 工具报表必须报**同一份**窗口 —— 否则"决策用一套参数、报表用另一套"（本仓忌讳形态）
+  const stR = await tools.get('acp_status')!.call({}, { sessionId: 's-reader', agentId: 'reader' } as any)
+  expect(stR.ok).toBe(true)
+  expect(stR.output.modelContextLimit).toBe(100_000)
+
+  // 未列档位的 agent：窗口仍是 2000 ⇒ 占 0.8 ⇒ 尾部注入完整手册
+  const c = history(100)
+  await run('s-lead', 'lead', c)
+  expect((c.find((m) => m.role === 'system')!.parts[0] as any).text).toBe(COMPRESS_MANUAL_HINT)
+  expect(tailText(c)).toContain(MANUAL_MARK)
+  const stL = await tools.get('acp_status')!.call({}, { sessionId: 's-lead', agentId: 'lead' } as any)
+  expect(stL.output.modelContextLimit).toBe(2000)
+})
+
+test('core.harness.start：perAgent 里写错的 agent id 会告警（而不是静默无效）', async () => {
+  const warns: string[] = []
+  const plugin = createAcpContextPlugin({
+    modelContextLimit: 2000,
+    perAgent: { readerr: { manualInjection: 'off' }, lead: { manualInjection: 'off' } },
+  })
+  const hooks = (await plugin.install({
+    log: { info: () => {}, warn: (m: string) => warns.push(m) },
+  } as any)) as Hooks
+  await hooks['core.harness.start']!(
+    { harness: { agent: { list: () => [{ id: 'reader' }, { id: 'lead' }] } } } as any,
+    { started: false } as any,
+  )
+  expect(warns).toHaveLength(1)
+  expect(warns[0]).toContain('readerr')
+  expect(warns[0]).toContain('reader') // 告警里要给出可用 id，否则用户还得自己去翻目录
+})
+
+test('core.harness.start：拿不到 agent 注册表时不猜、不告警（避免噪音）', async () => {
+  const warns: string[] = []
+  const plugin = createAcpContextPlugin({ modelContextLimit: 2000, perAgent: { x: { manualInjection: 'off' } } })
+  const hooks = (await plugin.install({
+    log: { info: () => {}, warn: (m: string) => warns.push(m) },
+  } as any)) as Hooks
+  // 不抛即通过（若抛，本测试自身会失败，与 not.toThrow 等价）；await 掉以求断言时序确定
+  await hooks['core.harness.start']!({ harness: {} } as any, { started: false } as any)
+  await hooks['core.harness.start']!({} as any, { started: false } as any)
+  expect(warns).toHaveLength(0)
 })
 
 // ── B2-3：工具入参完整性提醒（触发条件是"真丢过参数"，不是占用率）──
