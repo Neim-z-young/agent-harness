@@ -105,13 +105,7 @@ export function withJsonSchema<T>(
 
 // ===== 由 JSON Schema 派生的运行时校验 =====
 
-/**
- * 单个校验问题。
- *
- * `message` 会被 {@link ToolSchemaError} 拼进错误文本，是模型「入参自愈」时能拿到的**全部**信息 ——
- * 必须写清"哪个参数、要什么、收到什么"，而不是只说"校验失败"。
- */
-/** 校验失败的**规则类别**（见 {@link JsonSchemaIssue.rule}） */
+/** 校验失败的**规则类别** —— 工具内的守卫据此按"哪类问题"分流错误码（见 {@link JsonSchemaIssue.rule}） */
 export type JsonSchemaRule =
   | 'required' // 缺必填
   | 'type' // 类型不符
@@ -122,6 +116,12 @@ export type JsonSchemaRule =
   | 'length' // 字符串长度越界
   | 'range' // 数值越界
 
+/**
+ * 单个校验问题。
+ *
+ * `message` 会被 {@link ToolSchemaError} 拼进错误文本，是模型「入参自愈」时能拿到的**全部**信息 ——
+ * 必须写清"哪个参数、要什么、收到什么"，而不是只说"校验失败"。
+ */
 export interface JsonSchemaIssue {
   /** 出问题的入参路径（点号分隔，数组下标用 `[i]`；根为 `(root)`） */
   path: string
