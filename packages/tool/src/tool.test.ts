@@ -16,6 +16,7 @@ import {
   defineTool,
   withJsonSchema,
   fromJsonSchema,
+  JsonSchemaFor,
   JsonSchemaValidationError,
   formatSchemaError,
   schemaIssues,
@@ -981,8 +982,14 @@ describe('withJsonSchema', () => {
 // 这是反向验证能逐条归因的前提。
 
 describe('fromJsonSchema', () => {
-  /** 形如 bash 的 schema：一个必填串 + 一个可选数字 + additionalProperties:false */
-  const bashLike = {
+  /**
+   * 形如 bash 的 schema：一个必填串 + 一个可选数字 + additionalProperties:false。
+   *
+   * 显式标注 `JsonSchemaFor<BashLikeInput>`：守卫要求 properties 逐个覆盖入参字段，而独立 const
+   * 没有上下文类型时 `required: ['command']` 会被推成 `string[]`（不是 `('command'|'timeoutMs')[]`）。
+   */
+  type BashLikeInput = { command: string; timeoutMs?: number }
+  const bashLike: JsonSchemaFor<BashLikeInput> = {
     type: 'object' as const,
     properties: {
       command: { type: 'string', description: '要执行的 shell 命令' },
@@ -993,7 +1000,7 @@ describe('fromJsonSchema', () => {
   }
 
   it('合规入参通过，data 原样返回（既不剥离多余字段，也不另造对象）', () => {
-    const s = fromJsonSchema<{ command: string }>(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     const input = { command: 'ls' }
     const r = s.safeParse(input)
     expect(r.success).toBe(true)
@@ -1002,12 +1009,12 @@ describe('fromJsonSchema', () => {
   })
 
   it('__jsonSchema 与传入的是同一个对象（单一取源，模型侧 tools 载荷零变化）', () => {
-    const s = fromJsonSchema(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     expect(s.__jsonSchema).toBe(bashLike)
   })
 
   it('缺必填 ⇒ 拒，且 message 指出参数名与期望类型（模型自愈所需的全部信息）', () => {
-    const s = fromJsonSchema(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     const r = s.safeParse({ timeoutMs: 100 })
     expect(r.success).toBe(false)
     if (r.success) return
@@ -1020,7 +1027,7 @@ describe('fromJsonSchema', () => {
   })
 
   it('类型不符 ⇒ 拒，message 写成「应为 X，收到 Y」', () => {
-    const s = fromJsonSchema(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     const r = s.safeParse({ command: 'ls', timeoutMs: 'soon' })
     expect(r.success).toBe(false)
     if (r.success) return
@@ -1031,7 +1038,7 @@ describe('fromJsonSchema', () => {
   })
 
   it('多余字段默认容忍，且原样保留（模型的无害冗余不该造出新失败类）', () => {
-    const s = fromJsonSchema<{ command: string }>(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     const r = s.safeParse({ command: 'ls', recursive: true })
     expect(r.success).toBe(true)
     if (!r.success) return
@@ -1039,7 +1046,7 @@ describe('fromJsonSchema', () => {
   })
 
   it('strictProperties:true 时才拒绝未声明字段（声明与运行期一致性按需开启）', () => {
-    const s = fromJsonSchema(bashLike, { strictProperties: true })
+    const s = fromJsonSchema<BashLikeInput>(bashLike, { strictProperties: true })
     const r = s.safeParse({ command: 'ls', recursive: true })
     expect(r.success).toBe(false)
     if (r.success) return
@@ -1141,7 +1148,7 @@ describe('fromJsonSchema', () => {
   })
 
   it('parse 失败抛 JsonSchemaValidationError（带结构化 issues）', () => {
-    const s = fromJsonSchema(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     let caught: unknown
     try {
       s.parse({})
@@ -1153,7 +1160,7 @@ describe('fromJsonSchema', () => {
   })
 
   it('formatSchemaError 与 message 同源（工具内守卫复用同一份 schema 时才不会有两套措辞）', () => {
-    const s = fromJsonSchema(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     const r = s.safeParse({})
     if (r.success) throw new Error('应当失败')
     expect(formatSchemaError(r.error)).toContain('缺少必填参数')
@@ -1161,7 +1168,7 @@ describe('fromJsonSchema', () => {
   })
 
   it('schemaIssues 取到结构化 issues；非本校验器的错误返回空数组', () => {
-    const s = fromJsonSchema(bashLike)
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
     const r = s.safeParse({})
     if (r.success) throw new Error('应当失败')
     expect(schemaIssues(r.error).map((i) => i.path)).toEqual(['command'])
@@ -1172,7 +1179,7 @@ describe('fromJsonSchema', () => {
     const tool = defineTool({
       id: 'fake_bash',
       description: '桩',
-      inputSchema: fromJsonSchema<{ command: string }>(bashLike),
+      inputSchema: fromJsonSchema<BashLikeInput>(bashLike),
       async call() {
         return { ok: true as const, output: 'ran' }
       },
@@ -1193,7 +1200,7 @@ describe('fromJsonSchema', () => {
     const tool = defineTool({
       id: 'fake_bash_ok',
       description: '桩',
-      inputSchema: fromJsonSchema<{ command: string }>(bashLike),
+      inputSchema: fromJsonSchema<BashLikeInput>(bashLike),
       async call(input) {
         called = true
         return { ok: true as const, output: input.command }
@@ -1202,5 +1209,32 @@ describe('fromJsonSchema', () => {
     const res = await new ToolPipeline().execute(tool, { command: 'ls' }, makeCtx())
     expect(called).toBe(true)
     expect(res.ok).toBe(true)
+  })
+
+  // ===== 编译期守卫：JsonSchemaFor<T> =====
+  //
+  // 这两条不测运行时行为，测的是**类型层面**的守卫：接口字段是运行时拿不到的东西，
+  // 漏声明一个参数的后果（模型看不到它）也只在类型层面可判。断言由 tsc 执行 ——
+  // `bun run typecheck` 红了才算数，测试体本身只是让"守卫存在"这件事有个落点。
+
+  it('properties 漏写一个入参字段 ⇒ 编译期即报错（本 assert 由 tsc 执行）', () => {
+    // @ts-expect-error BashLikeInput 有 command 与 timeoutMs，这里只声明了 command
+    const broken = fromJsonSchema<BashLikeInput>({ type: 'object', properties: { command: { type: 'string' } } })
+    expect(typeof broken.safeParse).toBe('function')
+  })
+
+  it('required 列了入参接口里没有的键 ⇒ 编译期即报错', () => {
+    // @ts-expect-error 'nope' 不是 keyof BashLikeInput
+    const broken = fromJsonSchema<BashLikeInput>({ type: 'object', properties: { command: { type: 'string' }, timeoutMs: { type: 'number' } }, required: ['nope'] })
+    expect(typeof broken.safeParse).toBe('function')
+  })
+
+  it('oneOf 多模式豁免对齐检查（顶层无 properties 也能构造，且运行期仍按各模式校验）', () => {
+    const s = fromJsonSchema<{ mode: string }>({
+      type: 'object',
+      oneOf: [{ properties: { mode: { type: 'string', enum: ['rename'] } }, required: ['mode'] }],
+    })
+    expect(s.safeParse({ mode: 'rename' }).success).toBe(true)
+    expect(s.safeParse({ mode: 'nope' }).success).toBe(false)
   })
 })

@@ -33,6 +33,37 @@ export interface JsonSchemaObject {
 }
 
 /**
+ * {@link fromJsonSchema} 的入参类型：**强制 schema 的 `properties` 逐个覆盖入参接口的字段**。
+ *
+ * 为什么把"对齐"这件事放在类型上：
+ * - 接口字段是**类型层面**的东西，运行时拿不到 ⇒ 写不出运行时断言；
+ * - 而漏声明的后果恰好只在类型层面可判 —— 模型看不到那个参数，运行期却照收。
+ *   实测漏过：glob 少了 `exclude` / `minSizeBytes` / `maxSizeBytes` / `maxDepth`（4 个），
+ *   web_fetch 少了 `followRedirects` / `maxResponseBytes` / `allowPrivateNetwork`（3 个）——
+ *   这 7 个参数都是"能传、但模型不知道能传"，表现为能力凭空消失且无任何报错。
+ * - 放在类型上 ⇒ 与 `bun run typecheck` 同一道闸，零运行时成本、零新增基建。
+ *
+ * 两种合法形态：
+ * - **单模式**：`properties` 必须逐个列出 `keyof T`（少一个、多一个都编译不过），
+ *   `required` 也只能取 `keyof T` 里的键；
+ * - **多模式**（顶层 `oneOf`，如 `code_semantic_edit`）：顶层无 `properties`，
+ *   各模式在 `oneOf[].properties` 里各自声明 —— 自动豁免对齐检查。
+ *
+ * ⚠️ 要"**故意**不暴露"某个入参字段时，正确做法是给该工具一个更窄的入参类型
+ * （范例：`bash_ro` 用 `Omit<BashInput,'env'>` 表达"不接受 env"），
+ * 而不是让 schema 与类型各说各话 —— 后者会退化成"模型传了但被静默忽略"。
+ */
+export type JsonSchemaFor<T> =
+  | {
+      type: 'object'
+      properties: { [K in keyof T & string]: unknown }
+      required?: Array<keyof T & string>
+      additionalProperties?: boolean
+      [k: string]: unknown
+    }
+  | { type: 'object'; oneOf: unknown[]; [k: string]: unknown }
+
+/**
  * 通用 Schema 接口（抽象层，兼容 zod / valibot / 自定义校验）
  * 用于 Tool 的 inputSchema / outputSchema 硬校验
  */
@@ -320,16 +351,26 @@ function validateNode(
  * 默认严格度：缺必填 ⇒ 拒；类型不符、枚举越界 ⇒ 拒；**多余字段 ⇒ 容忍**
  * （理由见 {@link FromJsonSchemaOptions.strictProperties}）。
  *
+ * 入参形态见 {@link JsonSchemaFor}：它同时把"`properties` 必须覆盖 `keyof T`"变成编译期约束，
+ * 漏声明一个入参字段就过不了 `tsc`。
+ *
  * @example
+ * // BashInput = { command: string; cwd?: string; timeoutMs?: number; env?: ... }
+ * // ⇒ properties 必须把四个都列出来，少一个 typecheck 就报错
  * inputSchema: fromJsonSchema<BashInput>({
  *   type: 'object',
- *   properties: { command: { type: 'string', description: '要执行的 shell 命令' } },
+ *   properties: {
+ *     command: { type: 'string', description: '要执行的 shell 命令' },
+ *     cwd: { type: 'string' },
+ *     timeoutMs: { type: 'number' },
+ *     env: { type: 'object' },
+ *   },
  *   required: ['command'],
  *   additionalProperties: false,
  * })
  */
 export function fromJsonSchema<T>(
-  schema: JsonSchemaObject,
+  schema: JsonSchemaFor<T>,
   options: FromJsonSchemaOptions = {},
 ): Schema<T> & { __jsonSchema: JsonSchemaObject } {
   const strictProperties = options.strictProperties ?? false
@@ -353,7 +394,9 @@ export function fromJsonSchema<T>(
       }
       return { success: true as const, data: value as T }
     },
-    __jsonSchema: schema,
+    // 校验已经由入参类型 JsonSchemaFor<T> 在编译期把关，这里存的就是**同一份**声明对象
+    // （provider 生成 tools 载荷读的就是它 ⇒ 模型看到什么与运行期接受什么必然同源）。
+    __jsonSchema: schema as JsonSchemaObject,
   }
 }
 
