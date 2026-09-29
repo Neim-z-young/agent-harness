@@ -5,6 +5,11 @@
 > 「⬇ = 高级透传（`compression.config`）」标注的是本项目暴露的配置入口。
 >
 > **如何评估/调参？** 见 [ACP 压测与离线分析脚本使用参考](./acp-context-benchmark.md)（仿真压测 + 运行时遥测 + 参数组合分析）。
+>
+> **能不能给子 Agent 单独设一套？** 能 —— 用 `compression.subagent`（全部子 Agent）/ `compression.perAgent.<id>`
+> （指定 Agent），见 **§11**。本文 §1~§8 的键在档位段里**同名可用**。
+> 设计取舍、业内对照（Claude Code / Codex / OpenCode / Gemini CLI / Aider / Anthropic API）见
+> [子 Agent 压缩配置调研](./subagent-compression-config-research.md)。
 
 ## 0. 启用与入口
 
@@ -976,6 +981,8 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 | `truncate.threshold` | 0.95 |
 | `protectedTools` | [] |
 | `absorb.enabled` | false |
+| `manualInjection` | **`"on-demand"`**（`"always"` / `"off"` 见 §11②） |
+| `subagent` / `perAgent[*]` | 未配 —— 即全部会话逐位沿用顶层，**零行为变更**（见 §11①） |
 
 ## 10. 校验规则
 
@@ -1002,8 +1009,92 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 ```
 
 - **校验范围**：`compression` 顶层 / `tiers` / `nudge` / `telemetry` / `prompts`，
+  作用域档位 `subagent` 与 `perAgent[*]`（含各档位自己的 `manualInjection` / `tiers` / `nudge` / `config`），
   以及高级透传 `config` 的 `config.tiers` / `config.nudge` / `config.compress` / `config.truncate` / `config.absorb`。
+  档位里写错键的告警带**作用域路径**，例如 `compression.perAgent.reader.preserveRecentToken 未被识别，该档位不会生效`。
 - **不阻断**：这是告警不是错误，`--check-config` 的退出码不受影响（只有 providers 的错误才返回 1）。
 - **白名单不过期**：用 `Record<keyof 内核类型, true>` 书写，内核增删/改名时**编译期即报错**。
 - ⚠️ 最典型的踩法：照抄 §7.5 参数表时把 `preserveRecentTokens` 写成单数、把 `tokenCalibration: "chars4"`
   写成 `"chars/4"` —— 前者完全不生效，后者会把 A-B 对照实验跑成"两组都是 auto"（实测差 ≈ 0 ⇒ 结论反向）。
+
+---
+
+## 11. 按作用域覆盖：子 Agent 档 / 指定 Agent 档
+
+**要解决什么**：压缩引擎**只有一个实例**，同时服务主 Agent 与全部子 Agent —— 子 Agent 不是子进程，
+而是同一 Harness 上 `session.create({ parentId })` 出来的**会话**。默认它们逐位共用顶层配置，但两类会话的
+**信息密度**常不同：只读检索型子 Agent 的上下文涨得快、汇报完的原文就再也不会被引用，而主会话每一轮都要保真。
+
+### ① 两个档位
+
+| 配置项 | 作用于 | 判据 |
+|--------|--------|------|
+| 🔧 `compression.subagent` | **全部子 Agent 会话** | `Session.parentId` 非空（顶层字段，由 `session.create({ parentId })` 写入） |
+| 🔧 `compression.perAgent.<agentId>` | **指定的那一类 Agent**（主 / 子 / coordinator 都算） | 该轮 `agentId` 精确相等 |
+
+**优先级：`perAgent[agentId]` > `subagent` > 顶层。** 两者回答的是不同问题
+（"凡是派生出来的会话该怎么压" vs "这一种 Agent 该怎么压"），所以都保留。
+两者都不写 = 逐位沿用顶层（**缺省零行为变更**）。
+
+```jsonc
+{
+  "compression": {
+    "enabled": true,
+    "modelContextLimit": 200000,
+    "preserveRecentTokens": 50000,
+    "subagent": {
+      // 子 Agent 会话：保底部更短 ⇒ 更早折叠（检索型子会话不需要长保真尾部）
+      "preserveRecentTokens": 15000
+    },
+    "perAgent": {
+      "reader": { "modelContextLimit": 131072, "preserveRecentTokens": 12000 },
+      "coordinator": { "manualInjection": "off" }
+    }
+  }
+}
+```
+
+档位段里能写的键 = **与顶层同一套键名**：`modelContextLimit` / `manualInjection` /
+`preserveRecentMessages` / `preserveRecentTokens` / `promotionThreshold` / `tiers` / `nudge` / `config`。
+刻意不做"顶层一种语法、档位另一种语法"（那种不一致正是"配了却不生效"的温床）。
+
+**唯一不允许写进档位的是 `tokenCalibration` / `tokenCalibrationScale`**：折算口径与 `createCore` 注入的
+`countTokens` 是**同一个函数**，全进程只能有一把尺子；否则会退化成"决策用一把尺、报表用另一把"（本仓反复
+得过的病：占用率显示 26% 实际 103%）。
+
+> **窗口同源**：档位改了 `modelContextLimit` 后，**注入决策与 `acp_status` 报表读的是同一份** config
+> （会话上下文里存着本次解析出的 scope）。不会出现"按 100k 判该压、报表却按 200k 显示"。
+
+### ② `manualInjection`（压缩手册怎么给）
+
+| 取值 | 行为 |
+|------|------|
+| `"on-demand"` | **默认**。尾部常驻一行极简提示；真到该压的时候（占用过 `nudge` 档）才注入完整手册 |
+| `"always"` | 每轮都注入完整手册（= 改造前的旧行为；调试 / "强制模型手压"场景） |
+| `"off"` | **完全不给**任何压缩提示（含 nudge 文案） |
+
+`"always"` 是**显式**要求，优先于下节的自动抑制 —— 显式配置不该被自动推断悄悄推翻。
+
+### ③ 能力边界：白名单里没有 `compress` 就不给手册
+
+手册的内容是"邀请你调用 `compress`"。若该 Agent 的工具白名单里**根本没有** `compress`，这份邀请只会
+诱导它去撞 `TOOL_NOT_ALLOWED`（真机证据：某只读子 Agent 12 次调用 100% 被拒）。所以：
+
+- 白名单里没有 `compress` ⇒ 极简提示 / 完整手册 / nudge 文案**全部不注入**；
+- **判别符缺失**（非 core 宿主 / 单测直调，拿不到"这个 Agent 能用哪些工具"）⇒ **fail-open**，按旧行为注入。
+  两种判错的代价不对称：未知时只是多付一份说明书的 token，而误判成空集会**静默关掉**一个本来能用压缩的
+  Agent 的全部提示。
+
+**想让只读子 Agent 也能压缩，正确做法是把压缩工具加进它的白名单**（改 agent md 的 `tools:`），
+而不是绕过这条抑制。四个都只动本会话上下文、不碰文件系统：
+`compress` / `decompress` / `search_context` / `acp_status`。
+
+> ⚠️ 往 `tools:` 块里加行时**别在序列中间插注释**——`parseBlock` 的列表分支遇到注释行会 `break`，
+> 后面的项**静默消失**（frontmatter 逐字段白名单解析，列表被截断后依旧"解析成功"）。
+> 该缺陷已修（注释行现在跳过而非终止），但改动配置后仍建议用 `agentFromMarkdown` 复验一遍实际拿到的工具集。
+
+### ④ `perAgent` 的 agent id 写错了怎么办
+
+`perAgent` 的 key 是 agent id，写错**没有任何自然反馈**（档位就是不生效）。所以启动时会核对 `perAgent`
+的 key 是否都在 Agent 注册表里：未知的打印 `warn`（附**可用 id 列表**）但**不阻断启动**；
+宿主拿不到注册表时安静跳过（不猜、也不制造噪音）。

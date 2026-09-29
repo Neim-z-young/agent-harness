@@ -1,5 +1,132 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 220）子 Agent / 指定 Agent 的压缩配置分化（方案 B′ 落地）
+
+### 起因
+
+承续 219 的调研（结论：本仓原本**不能**按子 Agent 单独配压缩，且原因是架构性的 —— `AgentDefinition` 是 typed
+schema + 逐字段白名单解析、插件在工厂期闭包冻结配置、子 Agent 不是子进程而是同 Harness 上的会话）。
+用户拍板：**按推荐方案（B′），同时考虑只读 Agent 也支持压缩工具**。
+
+### 落地形态（与原推荐方案 B′ 的差异）
+
+原 B′ 是「加一个 `subagent` 档位，用 `toolIds: []` 把压缩工具**从**只读子 Agent 拿掉」。用户要求「只读 Agent
+也要能压」后**形态反转**，变成两条**互补**的修复：
+
+| # | 层次 | 改动 |
+|---|---|---|
+| ① | 配置层 | 给 `reader` / `reviewer` 的 `tools:` **真的授予** 4 个压缩工具（`compress` / `decompress` / `search_context` / `acp_status`，与 `coordinator.md` 既有口径一致） |
+| ② | 代码层 | 把「手册按能力边界注入」做成**通用机制**：任何白名单里没有 `compress` 的 Agent 都不再被诱导。这是**治本**，且自动覆盖将来新增的只读 Agent |
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `plugin/src/index.ts` | `SessionPreModelInput` 新增 `agentTools`（该 Agent 最终可用工具 id，已过白名单 + MCP 供给）与 `parentSessionId`（子会话**可靠**判据） |
+| `core/src/index.ts` | `PreparedQuery` 新增 `agentToolIds`（`allowedTools` 的 id 投影，每轮算一次）；`_buildStepMessages` 的 preModel hook 透传两个判别符 |
+| `acp-context/src/index.ts` | 新增 `AcpScopeOverride` / `AcpResolvedScope` / `mergeScopeConfig` / `stripWindow` / `agentCanUseCompress` / `scopeFor()`（带缓存）；`manualInjection` 增 `'off'` 档；`runPreModel` 增 `canCompress` 与 `'off'` 两条抑制；`core.harness.start` 新增 `perAgent` key 校验 |
+| `cli/src/index.ts` | `compression` 段新增 `manualInjection` / `subagent` / `perAgent`；`checkCompressionScope` 与顶层走同一套校验 |
+| `agent/src/index.ts` | **顺带修**（见下"坑 1 / 坑 2"）：`parseBlock` 两分支遇注释行改为跳过；抽 `parseInlineList` 补空保护 |
+| `~/.harness/agents/reader.md` `reviewer.md` | tools 白名单 + 正文引导（已备份 `*.bak-20260929-232714`） |
+
+### 关键设计取舍
+
+1. **两个档位都留**：`perAgent[agentId]` > `subagent`（按 `parentSessionId`）> 顶层。二者回答不同问题
+   （「凡是派生出来的会话该怎么压」vs「这一种 Agent 该怎么压」）。
+2. **判据用 `parentSessionId` 而非 `agent.mode`**：`Session.parentId` 是顶层字段（由 `session.create({ parentId })`
+   写入），`meta.parentId` 为 null；按 mode 反推会把"被当子 Agent 派出的 coordinator"误判。
+3. **`canCompress === undefined` ⇒ fail-open**：判别符缺失（非 core 宿主 / 单测直调）不抑制。判错代价不对称 ——
+   未知时只是多付一份说明书的 token，误判成空集会**静默关掉**一个本来能用压缩的 Agent 的全部提示。
+4. **窗口必须由调用方独占**：`defaultConfig(modelContextLimit, overrides)` 里 overrides 的 `modelContextLimit`
+   会**盖掉**第一个参数 ⇒ 引入 `stripWindow()` 在 `resolveAcpConfig` 前抹掉。
+5. **档位不允许写 `tokenCalibration`**：与 `createCore` 注入的 `countTokens` 是同一把尺子，全进程只能有一份。
+6. **`manualInjection: 'always'` 优先于自动抑制**：显式要求不该被自动推断悄悄推翻。
+
+### 两个真实踩坑（都已补回归用例）
+
+**坑 1：注释插在 YAML 序列中间 ⇒ tools 白名单静默截断。** 改完 `reader.md` 后用仓库自身 `agentFromMarkdown`
+复验，得到 `tools=["read_file","list_dir","glob","grep_file"]` —— 4 个新工具**全丢**，且无任何告警。
+根因是 `parseBlock` 列表分支遇注释行 `break`。修后复验得到全部 8 个。
+**这是"改配置后必须用仓库自身解析器验证"的实证。**
+
+**坑 2：`mcpServers: []` 被解析成 `[""]`。** 由坑 1 的新用例顺带炸出来的（断言 `mcpServers: []` 时变红）。
+根因：`value.slice(1,-1).split(',')` 在空串上返回 `['']`；而 `parseInlineObject` 当初有 `if (!inner) return {}`
+—— 两处内联列表调用点漏了同一保护。长期没浮出水面是因为下游 `parseStringArr` 有 `.filter(Boolean)` 把它抹平。
+已抽 `parseInlineList` 补空保护（两处调用点共用）。
+
+### 验证（三段式）
+
+| 段 | 命令 | 结果 |
+|---|---|---|
+| ① typecheck | `bun run typecheck` | **39 包 0 error** |
+| ② 全量测试 | `bun run test` | **39 包全部 `0 fail`**（acp-context 91 / core 181 / cli 407 / agent 39） |
+| ③ 反向验证 | 见下 | 3 个实验各按预期变红，恢复后全绿（94 pass / 0 fail） |
+
+反向验证明细（"回退后变红"是断言有效性的唯一证据）：
+
+| 实验 | 摘掉什么 | 变红用例 |
+|---|---|---|
+| A | `agentCanUseCompress` 恒返 `undefined` | 三态 1 条 + 能力判据抑制 1 条（fail-open 那条**仍绿** —— 正是它测的路径） |
+| B | `scopeFor` 的 `layers` 置空 | 档位 3 条（perAgent 生效 / subagent + 优先级 / 窗口两处同源） |
+| C | `parseInlineList` 的空保护 | 空数组 1 条 |
+
+### 遗留
+
+- 219 调研指出的**另一处隐性错配**（子 Agent 换到不同窗口的模型时，occupancy 分母仍是默认 Provider 的窗口）
+  与本轮无关，**未动**，待独立处理。
+- `perAgent` 的 agent id 写错只告警、不阻断（刻意）；若将来要让"配了却完全不命中"成为硬错误，需另议。
+
+## 2026-09-29（续 219）调研：子 Agent 的压缩配置能否单独设（**只写文档，未改代码**）
+
+### 起因
+
+问：`@harness/acp-context` 的压缩方法 / 压缩率能否按子 Agent 单独配置？业界其它 harness 怎么做？
+
+### 核查结论（本仓）
+
+**不能。** 而且不是漏了一个配置项，是形态决定的：
+
+| 事实 | 位置 |
+|---|---|
+| `compression` 是**全局扁平段**，无 agent 维度 | `packages/cli/src/index.ts:360-432` |
+| 插件在 `createAcpContextPlugin()` 期把 `config` / `modelContextLimit` / `countTokens` / `manualInjection` / `systemPrompt` **闭包冻结** | `acp-context/src/index.ts:424-453` |
+| 子 Agent **非子进程**（全包无 spawn/fork），与主 Agent 共用同一 Harness、同一份 `internalPlugins` | `subagent/src/index.ts:1107-1112` |
+| per-session 只隔离**状态**（`sessions: Map<sessionId,…>`），不隔离**配置** | `acp-context/src/index.ts:463` |
+
+**关键落差**：`SessionPreModelInput` **本来就带 `agentId` / `providerId` / `modelId`**（`plugin/src/index.ts:215-223`），
+但 ACP 的 `runPreModel` 只传 `sessionId`，把这三个丢了（`acp-context/src/index.ts:781-801`）⇒ 想按 agent 分支，
+**信息全在手边，缺的只是一个 resolver**。工具侧同理：`ToolContext.agentId` 存在，但 `acp_status` 等仍用闭包 `config`。
+
+**顺带查出一处既有隐性错配**：模型可 per-agent / per-spawn 覆盖（`core/src/index.ts:2539-2540`），
+但压缩窗口只认**默认 Provider**（`cli/src/index.ts:2717` → `resolveWindowTokens`，`:1530-1533`）⇒ 子 Agent 换到
+不同窗口的模型时，occupancy 分母仍是主会话的 ⇒ 阈值整体偏早/偏晚，**无症状**。此项与 per-agent 无关，应独立修。
+
+**一个必避的坑**：`agentFromMarkdown` 是**逐字段白名单解析**，未知 frontmatter 键**静默忽略**
+（`agent/src/index.ts:445-560`；唯一的例外是已删字段 `subagents` 保留了告警，`:507-519`）
+⇒ 任何"直接在 `reader.md` 写 `compression:`"的方案，不改解析器就是造下一个幽灵配置。
+
+### 调研结论（业内）
+
+- **主流是"上下文隔离 + 摘要回传"**：子 Agent 开新窗口，干完只回摘要 ⇒ 父级手上没有子级原始上下文，
+  "谁来压子 Agent"这个问题**不成立**（Claude Code / OpenAI Agents SDK / LangGraph / CrewAI / Google ADK / Manus）。
+- **真支持 per-subagent 压缩配置的只有 Codex CLI**，且原因是**架构性**的：它的自定义 agent 文件是
+  「spawn 会话的**配置层**」，与 session config **同一套键** ⇒ `model_auto_compact_token_limit` /
+  `model_context_window` / `tool_output_token_limit` 天然可按 agent 覆盖。Claude Code 的 agent 定义是
+  **固定字段 schema**，压缩键在另一个命名空间（settings.json / env）⇒ 官方明确写"用与主对话相同的逻辑与触发条件"。
+  **本仓 `AgentDefinition` 属前者**，所以想加必须显式设计。
+- 其余：OpenCode `compaction.{auto,prune,reserved}` 顶层全局；Gemini CLI `model.compressionThreshold` 全局（需重启）；
+  Aider 是**按模型**配置（`--map-tokens` / `--max-chat-history-tokens` / `--weak-model` 摘要专用模型）；
+  Anthropic API 的 `context_management` 是 **per-request**，天然可按 agent 换策略（含 `compact_20260112` 的
+  `instructions` / `pause_after_compaction`）；LangGraph 的 `SummarizationNode` 挂在子图上 ⇒ 天然 per-agent。
+
+### 产出
+
+- 新增 `docs/subagent-compression-config-research.md`：现状核查（含行号级证据）/ 业内总表 + 三种"谁压谁"模式 /
+  「为什么 Codex 能而 Claude Code 不能」架构对照 / 四个方案（A per-agent、B frontmatter、**B′ 子 Agent 档位（推荐）**、C 不做）+
+  取舍表 / B′ 的三段式验证要点 / 三条未决项。
+- `docs/acp-context-config.md` 顶部加一行交叉引用（明确"本文所有配置项都是全局的"）。
+- **未改任何代码**；方案 B′ 的判据（`parentId` vs `agentId`）、默认值、`toolIds: []` 是否误伤属产品口径，建议先议后动。
+
 ## 2026-09-29（续 218）`guardInput` 跨包共用：glob 的守卫收拢（"口径决策"被证伪）
 
 ### 起因
