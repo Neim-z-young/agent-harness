@@ -22,8 +22,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, ToolContext, PermissionRequest, fromJsonSchema, formatSchemaError, schemaIssues } from '@harness/tool'
-import type { Schema } from '@harness/tool'
+import { defineTool, Tool, ToolResult, ToolContext, PermissionRequest, fromJsonSchema, guardInput } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
@@ -47,55 +46,6 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
-}
-
-/** 结构守卫的结果：成功给解析后的入参，失败给可直接塞进 `ToolResult` 的错误 */
-type InputGuardResult<T> =
-  | { ok: true; data: T }
-  | { ok: false; error: { message: string; code: string } }
-
-/**
- * 直调入参结构守卫（`read_file` / `write_file` / `edit_file` / `bash` 共用）。
- *
- * 管道内 Step 1 已经用同一份 schema 拦过一次；这段是**"越过管道直接调 `tool.call()`"**
- * 那条路径的兜底（测试正是直接调的）。规则只留一份 —— 复用的就是喂给模型的那份 schema。
- *
- * **为什么必须有**：这些工具的 `call()` 第一行就会用入参 —— `resolvePath(input.path, ctx.cwd)`
- * 内部先做 `isAbsolute(inputPath)`，传 `undefined` / `null` / 数字 / 对象都会抛
- * `TypeError: The "path" property must be of type string`；bash 则会把 `undefined` 一路送进
- * spawn，由 shell 报出 `bash: undefined: command not found`（真机会话里连撞 6 次）。
- * 更要命的是 `resolvePath` 那行在 `try` **之外**，异常不会被下面的 catch 收敛，会直接冒泡给
- * 调用方（权限引擎的 `extractPatterns` 在此之前还会先拿到 `[undefined]`）。
- *
- * 错误码分两档：缺 `requiredField` ⇒ `requiredCode`（模型从码名就能读出少了哪个参数），
- * 其余结构问题 ⇒ `INVALID_INPUT`。
- *
- * 注意这把守卫只管**结构**。JSON Schema 表达不了的语义判据（如 bash 的"纯空白 command"）
- * 仍留在各自的 `call()` 里 —— 别为了收口把语义塞进来。
- *
- * @param requiredField 必填字段名 —— 缺它才算"缺参数"
- * @param requiredCode  缺 `requiredField` 时的对外错误码（如 `PATH_REQUIRED`）
- */
-function guardInput<T>(
-  schema: Schema<T>,
-  input: unknown,
-  requiredField: string,
-  requiredCode: string,
-): InputGuardResult<T> {
-  const parsed = schema.safeParse(input)
-  if (parsed.success) return { ok: true, data: parsed.data }
-  // 判据必须是 rule，不能只看 path：缺必填与"该字段类型不符"的 path 完全相同（都是字段名），
-  // 只看 path 会把 `command: 123` 也报成 COMMAND_REQUIRED（码说"缺"、消息说"应为 字符串"）。
-  const missing = schemaIssues(parsed.error).some(
-    (i) => i.rule === 'required' && i.path === requiredField,
-  )
-  return {
-    ok: false,
-    error: {
-      message: formatSchemaError(parsed.error),
-      code: missing ? requiredCode : 'INVALID_INPUT',
-    },
-  }
 }
 
 // ========================================================================
