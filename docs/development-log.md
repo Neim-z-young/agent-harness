@@ -1,5 +1,66 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 211）会话恢复后工具输出不显示：历史渲染压根没读 tool part
+
+用户报："会话恢复后，工具输出就不显示了"。
+
+### 根因：恢复通道把 `tool` part 整个丢掉了（与上一轮无关，是更早就有的漏）
+
+`messagesToBlocks`（TUI 铺历史的唯一入口，启动自动恢复与 `/resume` 共用）走
+`messageToBlock → messageText`，而 `messageText` 只拼 `text` / `reasoning`：
+
+```ts
+for (const p of msg.parts) {
+  if (p.type === 'text' && ...) out += p.text
+  else if (p.type === 'reasoning' && ...) out += '\n💭' + p.text   // ← tool part 无声跳过
+}
+```
+
+真机会话文件（`~/.harness/sessions/*.json`）里的形状是：**tool part 挂在 assistant 消息上**
+（不是独立的 role:`tool` 消息），带 `toolUseId` / `toolId` / `input` / `result` / `isError`：
+
+```
+('user','text') 1   ('assistant','reasoning') 3   ('assistant','tool') 2   ('assistant','text') 1
+```
+
+⇒ 恢复出来的会话只剩「提问 + 结论」，中间每一步工具干什么全不见。一个 40 步的任务恢复后
+看起来像一气呵成。之所以现在才被报出来：`0fb36a7` 加了**启动自动恢复**，一进来就铺历史，
+这个缺失从"偶尔 `/resume` 才遇到"变成"每次启动都在眼前"。
+
+### 取证（真机帧，`createTestRenderer` + `captureCharFrame()`）
+
+| 场景 | `contains('🔧')` | 画面 |
+|---|---|---|
+| 修复前 · 自动恢复含 tool part 的会话 | **false** | 只有 `❯ 跑一下 ls` / `我执行了。`，`ls -la` 与 `a.txt` 都搜不到 |
+| 修复后 · 同场景 | **true** | `🔧  bash {"command":"ls -la"}` + `│ ✅  → a.txt` + `└ b.txt` |
+| 修复后 · 恢复后再跑一轮（实时通道） | **true** | 新工具行照常出现 ⇒ 只有历史那一半有问题 |
+
+### 改法：按 part 顺序切块，形状与实时输出逐字一致
+
+`messageToBlocks(m, idStart)` 取代原来的单块 `messageToBlock`，按 part 出现顺序切：
+
+- `text` / `reasoning` → 角色对应的正文块（markdown）；`tool` → `tool` 块（等宽树状）
+- 正文与工具**不能合进一个块**：正文走 markdown、工具行走树状渲染，混在一起必然有一方被当错的语法渲染
+- 连续多个 tool part 并成一个块（与实时输出"一步里多条工具并到一个块"一致）；正文与工具交替时按序 flush
+- 行文本复用 `formatToolInput` / `formatToolResult` —— 与 REPL/TUI 实时通道**同一对函数**，
+  所以历史里看到的入参/结果与当时实时看到的是同一份文本，也保证 `windowToolText` 的 `🔧` 分段照常生效
+- `result === undefined` 的 tool part（被中断 / 崩在工具里就落盘）只留 `🔧` 行，不补空结果行假装跑过
+- id 由调用方从 `nextId` 起顺排（一条消息可能产出多块），保证不与 `pushConsole` 追加的实时块撞号
+
+### 验证
+
+- 反向验证**逐条归因**（不是一次全回退）：① 摘掉 `tool` 分支 ⇒ 4 条守卫全红、其余 131 条全绿；
+  ② 摘掉结果行 ⇒ 只红 3 条（第 4 条只断言分块顺序、本就不涉及结果内容）⇒ 归因准确
+- `typecheck` 39 包 0 error；全量 `bun test` 39 包 0 fail（cli 403 pass / +4）
+- 新增守卫：纯函数 3 条（tool part → 工具块形状 / 连续合并 + ❌ + 无 result / 正文工具交替切块与 id）+ 真实帧 1 条
+
+### 顺带一条方法论：`<markdown>` 不是首帧就绘制的
+
+探针里 `waitFrame(..., f => f.includes('❯'))` 一命中就取样，结果恢复出来的助手正文
+**看起来全是空白**，一度以为"恢复后正文也看不见"。真相是 `<markdown>` 要再跑几十帧才绘制
+（工具行/用户行是 `<text>`，首帧即出）。多 pump 60 拍后一切正常。
+⇒ **断言前先确认东西已经画出来了**，否则会把"还没画"误判成"画不出来"。
+
 ## 2026-09-28（续 210）工具块改「首尾窗口」：完整打印把工具调用行挤出了对话框
 
 用户报："现在对话框里没有工具调用信息了"。**根因就是续 209 那轮**：结果的两处 `slice()` 一起拿掉后，
