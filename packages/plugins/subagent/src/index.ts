@@ -32,7 +32,7 @@
  * })
  */
 
-import { defineTool, withJsonSchema, Tool, ToolResult, Schema, ToolContext, formatToolWhitelist, READONLY_TOOLS_SENTINEL } from '@harness/tool'
+import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext, formatToolWhitelist, READONLY_TOOLS_SENTINEL } from '@harness/tool'
 import type { AgentPlugin, Hooks, CliCommandInput, SubagentCapability } from '@harness/plugin'
 import type { AgentDefinition, AgentPermissionConfig } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
@@ -413,19 +413,6 @@ interface HarnessLike {
   cwd?: string
   /** 工具注册表（可选）：把只读哨兵白名单解析成实际工具 id，供 /subagents 展示 */
   tools?: { filterByWhitelist(whitelist: string[] | ['*']): Array<{ id: string }> }
-}
-
-// ===== Schema helper（自包含，避免跨包依赖）=====
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
 }
 
 // ===== 从 Message 提取文本 =====
@@ -982,7 +969,7 @@ export function createSubagentTool(
     isDestructive: () => false,       // 工具本身不破坏，但子 Agent 内部可能
     requiresUserInteraction: false,
 
-    inputSchema: withJsonSchema(makeSchema<SubagentToolInput>(), {
+    inputSchema: fromJsonSchema<SubagentToolInput>({
       type: 'object',
       properties: {
         agentId: { type: 'string', description: '子 Agent ID（必须已注册且 mode === subagent）' },

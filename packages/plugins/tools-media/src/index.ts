@@ -9,7 +9,7 @@
  * 通过 core.tool.pool.assemble Hook 注入到 Harness 工具池。
  */
 
-import { defineTool, withJsonSchema, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative } from 'node:path'
@@ -24,13 +24,6 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
-}
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T { return value as T },
-    safeParse(value: unknown) { return { success: true, data: value as T } },
-  }
 }
 
 /** 从文件头识别 MIME 类型（已知格式） */
@@ -130,7 +123,7 @@ const DEFAULT_MAX_IMG_BYTES = 8 * 1024 * 1024
 export const viewImageTool = defineTool<ViewImageInput, ViewImageOutput>({
   id: 'view_image',
   description: '读取本地图像文件，返回 base64 data URI 与尺寸/格式信息，供多模态 LLM 识别。支持 PNG/JPEG/GIF/WebP/BMP 自动识别。',
-  inputSchema: withJsonSchema(makeSchema<ViewImageInput>(), {
+  inputSchema: fromJsonSchema<ViewImageInput>({
     type: 'object',
     properties: {
       path: { type: 'string', description: '图像路径（相对 cwd 或绝对路径）' },

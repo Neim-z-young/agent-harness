@@ -17,7 +17,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext, withJsonSchema } from '@harness/tool'
+import { defineTool, Tool, ToolResult, ToolContext, fromJsonSchema } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative, join } from 'node:path'
@@ -32,17 +32,6 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
-}
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
 }
 
 /** glob 匹配（* → 任意字符，? → 单个字符） */
@@ -84,7 +73,7 @@ const MAX_DIR_ENTRIES = 500
 export const listDirTool = defineTool<ListDirInput, ListDirOutput>({
   id: 'list_dir',
   description: '列出目录内容。支持递归、隐藏文件显示。返回文件名、类型和大小。',
-  inputSchema: withJsonSchema(makeSchema<ListDirInput>(), {
+  inputSchema: fromJsonSchema<ListDirInput>({
     type: 'object',
     properties: {
       path: { type: 'string', description: '要列出的目录（相对 cwd 或绝对路径，默认 "."）' },
@@ -238,7 +227,7 @@ export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
   description:
     '在文件或目录中搜索文本。pattern 默认按**正则**解释；编译失败会自动退化为字面量搜索并在结果里注明。' +
     '要搜纯文本（如 `](`、`![`、`.*` 这类符号）请显式传 literal:true。支持 glob 过滤、大小写、递归。',
-  inputSchema: withJsonSchema(makeSchema<GrepFileInput>(), {
+  inputSchema: fromJsonSchema<GrepFileInput>({
     type: 'object',
     properties: {
       // ⚠️ 这条描述曾经写的是「要搜索的文本（字面量）」，与实现（按正则编译）矛盾 ——

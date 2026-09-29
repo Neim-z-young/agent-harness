@@ -16,7 +16,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext, withJsonSchema } from '@harness/tool'
+import { defineTool, Tool, ToolResult, ToolContext, fromJsonSchema, formatSchemaError } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative, join } from 'node:path'
@@ -31,17 +31,6 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
-}
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
 }
 
 /**
@@ -139,20 +128,28 @@ const FALLBACK_MAX_RESULTS = 200
  */
 const MAX_GLOB_OUTPUT_CHARS = 20_000
 
+/**
+ * glob 的入参 schema。
+ *
+ * 提到模块级是为了让 `call()` 内的守卫复用**同一份**：schema 是"模型看到什么"与"运行期接受什么"
+ * 的唯一取源，守卫只补 JSON Schema 表达不了的那部分（全空白 / 空数组）。
+ */
+const globInputSchema = fromJsonSchema<GlobInput>({
+  type: 'object',
+  properties: {
+    pattern: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }], description: '匹配模式（如 "*.ts"、["src/**/*.ts","!src/dist/**"]，"!" 开头表示排除）' },
+    path: { type: 'string', description: '搜索根目录（相对 cwd 或绝对路径，默认 "."）' },
+    maxResults: { type: 'number', description: '最大结果数量（默认 500）' },
+    includeHidden: { type: 'boolean', description: '是否包含隐藏文件（默认 false）' },
+  },
+  required: ['pattern'],
+  additionalProperties: false,
+})
+
 export const globTool = defineTool<GlobInput, GlobOutput>({
   id: 'glob',
   description: '按模式（glob，支持 **/*/? 通配符，! 取反）递归搜索文件，支持排除、大小过滤、深度限制。',
-  inputSchema: withJsonSchema(makeSchema<GlobInput>(), {
-    type: 'object',
-    properties: {
-      pattern: { oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }], description: '匹配模式（如 "*.ts"、["src/**/*.ts","!src/dist/**"]，"!" 开头表示排除）' },
-      path: { type: 'string', description: '搜索根目录（相对 cwd 或绝对路径，默认 "."）' },
-      maxResults: { type: 'number', description: '最大结果数量（默认 500）' },
-      includeHidden: { type: 'boolean', description: '是否包含隐藏文件（默认 false）' },
-    },
-    required: ['pattern'],
-    additionalProperties: false,
-  }),
+  inputSchema: globInputSchema,
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
   permission: {
@@ -160,6 +157,17 @@ export const globTool = defineTool<GlobInput, GlobOutput>({
     extractPatterns: (input) => [input.path ?? '.'],
   },
   async call(input, ctx): Promise<ToolResult<GlobOutput>> {
+    // 入参守卫（结构）：管道内 Step 1 已由 globInputSchema 拦过一次，这里是"越过管道直接调
+    // tool.call()"那条路径的兜底（测试就是直接调的）。错误码沿用 GLOB_PATTERN_MISSING，
+    // 让既有消费方不必区分"从管道来的"还是"从守卫来的"。
+    const parsedInput = globInputSchema.safeParse(input)
+    if (!parsedInput.success) {
+      return {
+        ok: false,
+        error: { message: formatSchemaError(parsedInput.error), code: 'GLOB_PATTERN_MISSING' },
+      }
+    }
+
     const relRoot = input.path ?? '.'
     const absRoot = resolvePath(relRoot, ctx.cwd)
 
@@ -191,10 +199,11 @@ export const globTool = defineTool<GlobInput, GlobOutput>({
       }
     }
 
-    // ⚠️ 拒绝「静默退化成全仓遍历」：pattern 缺失 / 全为空值时**直接报错**，不再兜底。
-    // schema 里 `pattern` 是 `required`，但内置工具的 Step 1 是 no-op（`makeSchema` 的
-    // safeParse 恒通过）⇒ 运行期必须自己拦。明确报错让模型走「入参自愈」补齐参数，
-    // 代价远小于把整个仓库灌进上下文。
+    // ⚠️ 拒绝「静默退化成全仓遍历」：pattern 语义为空时**直接报错**，不再兜底。
+    // `pattern` 缺失、或类型不是 string/string[] 的形态，已由上面的 globInputSchema 守卫拦下；
+    // 这里只剩 JSON Schema 表达不了的那几种（`''` / `'   '` / `[]` / `['', '  ']`）——
+    // 都属"语法合法但语义为空"，正是当初退化成全仓遍历的入口。
+    // 明确报错让模型走「入参自愈」补齐参数，代价远小于把整个仓库灌进上下文。
     if (rawPatterns.filter(isUsable).length === 0) {
       return {
         ok: false,

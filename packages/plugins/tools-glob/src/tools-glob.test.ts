@@ -161,6 +161,14 @@ describe('globTool', () => {
     }
   })
 
+  it('结构不合法 ⇒ 错误来自 schema 守卫（message 是 schema 派生的，不再是兜底过滤的措辞）', async () => {
+    const res = await globTool.call!({ pattern: { nope: 1 } } as any, ctx)
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('GLOB_PATTERN_MISSING')
+    expect(res.error!.message).toContain('形态不受支持')
+  })
+
   it('全是排除项时兜底仍可用，但规模被压制（FALLBACK 上限 + 输出字符预算）', async () => {
     // 300 个 .txt + 300 个 .md + 1 个 .keep：够触发 FALLBACK_MAX_RESULTS(200) 与字符预算(20_000) 两道闸
     for (let i = 0; i < 300; i++) {

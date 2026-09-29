@@ -18,6 +18,7 @@ import {
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
 import type { ToolContext } from '@harness/tool'
+import { ToolPipeline, ToolSchemaError } from '@harness/tool'
 
 // ===== 测试用临时目录 =====
 
@@ -208,6 +209,36 @@ describe('@harness/tools-builtin', () => {
         expect(res.ok).toBe(false)
         expect(res.error!.code).toBe('COMMAND_REQUIRED')
       }
+    })
+
+    it('类型不符 ⇒ INVALID_INPUT（守卫复用同一份 schema，而不是只判"有没有 command"）', async () => {
+      const res = await bashTool.call({ command: 'echo hi', timeoutMs: 'soon' } as never, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('INVALID_INPUT')
+      expect(res.error!.message).toContain('timeoutMs')
+      expect(res.error!.message).toContain('应为 数字')
+    })
+
+    it('多带未声明字段仍能执行（默认容忍多余字段，控制组）', async () => {
+      const res = await bashTool.call({ command: 'echo tolerate', recursive: true } as never, makeCtx())
+      expect(res.ok).toBe(true)
+      expect(res.output!.stdout.trim()).toBe('tolerate')
+    })
+  })
+
+  // ===== read_file：入参由 schema 在管道口拦下 =====
+
+  describe('read_file 空入参经管道被 schema 拦下', () => {
+    it('不再靠 path.resolve(undefined) 抛 TypeError，而是 ToolSchemaError(stage=input) 且指出缺 path', async () => {
+      let caught: unknown
+      try {
+        await new ToolPipeline().execute(readFileTool, {}, makeCtx())
+      } catch (err) {
+        caught = err
+      }
+      expect(caught).toBeInstanceOf(ToolSchemaError)
+      expect((caught as ToolSchemaError).stage).toBe('input')
+      expect((caught as Error).message).toContain('path')
     })
   })
 

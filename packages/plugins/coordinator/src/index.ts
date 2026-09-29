@@ -35,7 +35,7 @@
  * })
  */
 
-import { defineTool, withJsonSchema, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
+import { defineTool, fromJsonSchema, type Tool, type ToolResult, type ToolContext } from '@harness/tool'
 import type { AgentPlugin } from '@harness/plugin'
 import type { AgentDefinition } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
@@ -303,11 +303,6 @@ interface HarnessLike {
   bus?: Bus
 }
 
-/** Schema helper（自包含，避免跨包依赖） */
-function makeSchema<T>(): Schema<T> {
-  return { parse: (v) => v as T, safeParse: (v) => ({ success: true, data: v as T }) }
-}
-
 /** 从 Message 提取最终文本 */
 function extractText(msg: Message): string {
   return msg.parts.filter((p) => p.type === 'text').map((p) => (p as { text: string }).text).join('')
@@ -357,7 +352,7 @@ export function createSendMessageTool(
     isDestructive: () => false,
     requiresUserInteraction: false,
 
-    inputSchema: withJsonSchema(makeSchema<SendMessageInput>(), {
+    inputSchema: fromJsonSchema<SendMessageInput>({
       type: 'object',
       properties: {
         taskId: { type: 'string', description: '本地续跑路由：已派出的后台任务 ID（subagent runInBackground 返回），延续其会话执行' },

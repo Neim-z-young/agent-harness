@@ -22,7 +22,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, Schema, ToolContext, PermissionRequest, withJsonSchema } from '@harness/tool'
+import { defineTool, Tool, ToolResult, ToolContext, PermissionRequest, fromJsonSchema, formatSchemaError, schemaIssues } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
@@ -46,19 +46,6 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
-}
-
-// ===== 通用 Schema 工厂（轻量级，不依赖 zod）=====
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
 }
 
 // ========================================================================
@@ -122,7 +109,7 @@ export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
     + '调用示例：read_file({"path":"src/index.ts"})、read_file({"path":"src/index.ts","offset":1,"limit":80})；'
     + 'path 是必填项，只给路径即可，不要省略 arguments。',
   documentation: readFileDoc.trim(),
-  inputSchema: withJsonSchema(makeSchema<ReadFileInput>(), {
+  inputSchema: fromJsonSchema<ReadFileInput>({
     type: 'object',
     properties: {
       path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
@@ -257,7 +244,7 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
   id: 'write_file',
   description: '写入本地文件。支持覆盖、追加和仅新建模式。只能在工目录内写入。',
   documentation: writeFileDoc.trim(),
-  inputSchema: withJsonSchema(makeSchema<WriteFileInput>(), {
+  inputSchema: fromJsonSchema<WriteFileInput>({
     type: 'object',
     properties: {
       path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
@@ -485,21 +472,24 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
   const allowlist = config.allowlist
   const keepEnv = config.keepEnv ?? []
 
+  // 提到外面是为了让 call() 内的守卫复用**同一份** schema（见 call() 里的守卫注释）
+  const bashInputSchema = fromJsonSchema<BashInput>({
+    type: 'object',
+    properties: {
+      command: { type: 'string', description: '要执行的 shell 命令' },
+      cwd: { type: 'string', description: '工作目录（默认使用当前会话 cwd）' },
+      timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 30000）' },
+      env: { type: 'object', description: '附加环境变量', additionalProperties: { type: 'string' } },
+    },
+    required: ['command'],
+    additionalProperties: false,
+  })
+
   return defineTool<BashInput, BashOutput>({
     id: 'bash',
     description: '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
     documentation: bashDoc.trim(),
-    inputSchema: withJsonSchema(makeSchema<BashInput>(), {
-      type: 'object',
-      properties: {
-        command: { type: 'string', description: '要执行的 shell 命令' },
-        cwd: { type: 'string', description: '工作目录（默认使用当前会话 cwd）' },
-        timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 30000）' },
-        env: { type: 'object', description: '附加环境变量', additionalProperties: { type: 'string' } },
-      },
-      required: ['command'],
-      additionalProperties: false,
-    }),
+    inputSchema: bashInputSchema,
     isReadOnly: () => false,
     isDestructive: () => true,
     isConcurrencySafe: () => false,
@@ -510,10 +500,25 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
 
-      // 必填校验（评审/真机修复）：缺 command 时此前会把 undefined 一路传进 spawn，
-      // 由 shell 报出 `bash: undefined: command not found`（exit 127）—— 模型看到的是
-      // 一句和"你漏了参数"毫无关系的 shell 错误（真机会话里连撞 6 次）。
-      if (typeof input?.command !== 'string' || input.command.trim() === '') {
+      // 入参守卫（分两段，避免与 schema 各说各话）：
+      //  - 结构（缺必填 / 类型不符）交 bashInputSchema 统一裁决。管道内 Step 1 已经拦过一次，
+      //    这段是"越过管道直接调 tool.call()"那条路径的兜底（测试正是直接调的）。
+      //  - 语义（纯空白串）JSON Schema 表达不了，留在下面手判。
+      // 历史（评审/真机修复）：缺 command 时曾把 undefined 一路传进 spawn，shell 报出
+      // `bash: undefined: command not found`（exit 127）—— 模型看到的是一句和"你漏了参数"
+      // 毫无关系的错误（真机会话里连撞 6 次）。
+      const parsedInput = bashInputSchema.safeParse(input)
+      if (!parsedInput.success) {
+        const missingCommand = schemaIssues(parsedInput.error).some((i) => i.path === 'command')
+        return {
+          ok: false,
+          error: {
+            message: formatSchemaError(parsedInput.error),
+            code: missingCommand ? 'COMMAND_REQUIRED' : 'INVALID_INPUT',
+          },
+        }
+      }
+      if (parsedInput.data.command.trim() === '') {
         return {
           ok: false,
           error: { message: '缺少 command：请在入参 `command` 里给出要执行的 shell 命令', code: 'COMMAND_REQUIRED' },
@@ -906,7 +911,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Ba
     description:
       '执行**只读** shell 命令（白名单受限：cat/head/tail/wc/grep/sed/awk/find/ls/stat/du/git log/python3 -c 等）。'
       + '拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。',
-    inputSchema: withJsonSchema(makeSchema<BashInput>(), {
+    inputSchema: fromJsonSchema<BashInput>({
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的只读命令（不得含 >、$()、反引号、heredoc）' },
@@ -1139,7 +1144,7 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
   id: 'edit_file',
   description: '编辑文件：精确查找并替换文本片段。默认只替换第一个匹配，支持 replaceAll。需要 oldString 在文件中唯一匹配。',
   documentation: editFileDoc.trim(),
-  inputSchema: withJsonSchema(makeSchema<EditFileInput>(), {
+  inputSchema: fromJsonSchema<EditFileInput>({
     type: 'object',
     properties: {
       path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },

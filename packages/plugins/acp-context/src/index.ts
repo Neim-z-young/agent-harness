@@ -23,7 +23,7 @@
  * })
  */
 
-import { defineTool, Schema, ToolResult, ToolContext, withJsonSchema } from '@harness/tool'
+import { defineTool, ToolResult, ToolContext, fromJsonSchema } from '@harness/tool'
 import type { AgentPlugin, Hooks, CompactionContext } from '@harness/plugin'
 import type { Message } from '@harness/session'
 import {
@@ -73,18 +73,6 @@ import {
 export const ACP_META_KEY = 'acp.v1'
 /** session.meta 中存储"被 session 压缩折叠窗口的原文归档"的键（跨重启回溯用） */
 export const ACP_ARCHIVE_KEY = 'acp.archive.v1'
-
-// ===== 轻量 Schema 工厂（不依赖 zod）=====
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
-}
 
 /**
  * 脱敏内核压缩系统提示里的**字面示例标签**。
@@ -508,7 +496,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         description:
           '压缩历史消息：把指定 ref 范围内的旧消息折叠成一段摘要，换回上下文空间。模型写摘要、内核做编排。',
         documentation: COMPRESS_TOOL_DOC,
-        inputSchema: withJsonSchema(makeSchema<CompressInput>(), {
+        inputSchema: fromJsonSchema<CompressInput>({
           type: 'object',
           properties: {
             topic: { type: 'string', description: '本次压缩的主题（可选，便于日后检索）' },
@@ -620,7 +608,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     ? defineTool<DecompressInput, DecompressOutput>({
         id: 'decompress',
         description: '按 blockId 查看某个已压缩上下文块的摘要，可了解被压缩掉的内容梗概。',
-        inputSchema: withJsonSchema(makeSchema<DecompressInput>(), {
+        inputSchema: fromJsonSchema<DecompressInput>({
           type: 'object',
           properties: {
             blockId: { type: 'string', description: '要展开的压缩块 id' },
@@ -671,7 +659,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     ? defineTool<SearchInput, SearchOutput>({
         id: 'search_context',
         description: '按 query 对已压缩的历史上下文块做相关性检索，找到对话主题对应的摘要。',
-        inputSchema: withJsonSchema(makeSchema<SearchInput>(), {
+        inputSchema: fromJsonSchema<SearchInput>({
           type: 'object',
           properties: {
             query: { type: 'string', description: '检索关键词（在已压缩块中查找）' },
@@ -709,7 +697,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     ? defineTool<AcpStatusInput, AcpStatusOutput>({
         id: 'acp_status',
         description: '查看当前上下文压缩状态：上下文占用、已压缩块数、已回收 token 数。',
-        inputSchema: withJsonSchema(makeSchema<AcpStatusInput>(), {
+        inputSchema: fromJsonSchema<AcpStatusInput>({
           type: 'object',
           properties: {},
           additionalProperties: false,

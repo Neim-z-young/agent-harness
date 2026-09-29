@@ -7,7 +7,7 @@
  */
 
 import { resolve, isAbsolute } from 'node:path'
-import { defineTool, withJsonSchema, Schema, Tool, ToolResult, ToolContext } from '@harness/tool'
+import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import {
   CodeIntelIndex,
   execSemanticEdit,
@@ -26,17 +26,6 @@ import codeDefinitionPrompt from './prompts/code-definition.txt'
 import codeSemanticEditPrompt from './prompts/code-semantic-edit.txt'
 
 // ===== 共享 helper =====
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
-}
 
 function resolvePath(inputPath: string, cwd: string): string {
   return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
@@ -58,7 +47,7 @@ export const codeSymbolsTool = (index: CodeIntelIndex): Tool<CodeSymbolsInput, C
   defineTool<CodeSymbolsInput, CodeSymbolsOutput>({
     id: 'code_symbols',
     description: codeSymbolsPrompt.trim(),
-    inputSchema: withJsonSchema(makeSchema<CodeSymbolsInput>(), {
+    inputSchema: fromJsonSchema<CodeSymbolsInput>({
       type: 'object',
       properties: {
         path: { type: 'string', description: '要扫描的文件或目录（相对 cwd 或绝对路径，默认 cwd）' },
@@ -113,7 +102,7 @@ export const codeReferenceTool = (index: CodeIntelIndex): Tool<CodeReferenceInpu
   defineTool<CodeReferenceInput, CodeReferenceOutput>({
     id: 'code_reference',
     description: codeReferencePrompt.trim(),
-    inputSchema: withJsonSchema(makeSchema<CodeReferenceInput>(), {
+    inputSchema: fromJsonSchema<CodeReferenceInput>({
       type: 'object',
       properties: {
         symbol: { type: 'string', description: '要查找引用的符号名' },
@@ -171,7 +160,7 @@ export const codeDefinitionTool = (index: CodeIntelIndex): Tool<CodeDefinitionIn
   defineTool<CodeDefinitionInput, CodeDefinitionOutput>({
     id: 'code_definition',
     description: codeDefinitionPrompt.trim(),
-    inputSchema: withJsonSchema(makeSchema<CodeDefinitionInput>(), {
+    inputSchema: fromJsonSchema<CodeDefinitionInput>({
       type: 'object',
       properties: {
         symbol: { type: 'string', description: '要查找定义的符号名' },
@@ -218,7 +207,7 @@ export const codeSemanticEditTool = (
   defineTool<CodeSemanticEditInput, CodeSemanticEditOutput>({
     id: 'code_semantic_edit',
     description: codeSemanticEditPrompt.trim(),
-    inputSchema: withJsonSchema(makeSchema<CodeSemanticEditInput>(), {
+    inputSchema: fromJsonSchema<CodeSemanticEditInput>({
       type: 'object',
       description: '三选一模式：rename / replace_node / replace_subtree，按 mode 字段区分',
       oneOf: [

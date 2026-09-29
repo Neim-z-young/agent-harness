@@ -38,7 +38,7 @@ import { homedir } from 'node:os'
 import path from 'node:path'
 import type { AgentPlugin, SwarmCapability } from '@harness/plugin'
 import type { AgentRuntime, SessionManager } from '@harness/core'
-import { defineTool, withJsonSchema, type Tool, type ToolResult, type Schema, type ToolContext } from '@harness/tool'
+import { defineTool, fromJsonSchema, type Tool, type ToolResult, type ToolContext } from '@harness/tool'
 
 // ===== 基础类型与错误 =====
 
@@ -90,11 +90,6 @@ function genId(prefix: string): string {
 /** 默认团队存储根：~/.harness/teams */
 function defaultTeamsDir(): string {
   return path.join(homedir(), '.harness', 'teams')
-}
-
-/** Schema helper（自包含，避免跨包依赖） */
-function makeSchema<T>(): Schema<T> {
-  return { parse: (v) => v as T, safeParse: (v) => ({ success: true, data: v as T }) }
 }
 
 /**
@@ -1607,7 +1602,7 @@ export function createTeamCreateTool(getTeamManager: () => TeamManager): Tool<Te
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TeamCreateInput>(), {
+    inputSchema: fromJsonSchema<TeamCreateInput>({
       type: 'object',
       properties: {
         name: { type: 'string', description: '团队名（唯一，作为目录名会做 sanitize）；与 team 等价，二选一' },
@@ -1671,7 +1666,7 @@ export function createTeamDeleteTool(getTeamManager: () => TeamManager): Tool<Te
     isConcurrencySafe: () => false,
     isDestructive: () => true,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TeamDeleteInput>(), {
+    inputSchema: fromJsonSchema<TeamDeleteInput>({
       type: 'object',
       properties: {
         name: { type: 'string', description: '要删除的团队名；与 team 等价，二选一' },
@@ -1726,7 +1721,7 @@ export function createTeamStatusTool(
     isConcurrencySafe: () => true,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TeamStatusInput>(), {
+    inputSchema: fromJsonSchema<TeamStatusInput>({
       type: 'object',
       properties: {
         name: { type: 'string', description: '团队名；与 team 等价，二选一' },
@@ -1792,7 +1787,7 @@ export function createSendTeammateMessageTool(getMailbox: () => TeammateMailbox)
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<SendTeammateMessageInput>(), {
+    inputSchema: fromJsonSchema<SendTeammateMessageInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },
@@ -1867,7 +1862,7 @@ export function createShutdownDecisionTool(
     isConcurrencySafe: () => false,
     isDestructive: () => decision === 'approved',
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<ShutdownDecisionInput>(), {
+    inputSchema: fromJsonSchema<ShutdownDecisionInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },
@@ -1918,7 +1913,7 @@ export function createTaskCreateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TaskCreateInput>(), {
+    inputSchema: fromJsonSchema<TaskCreateInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },
@@ -1960,7 +1955,7 @@ export function createTaskListTool(getTaskPlane: () => TaskListPlane): Tool<Task
     isConcurrencySafe: () => true,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TaskListInput>(), {
+    inputSchema: fromJsonSchema<TaskListInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },
@@ -2003,7 +1998,7 @@ export function createTaskClaimTool(getTaskPlane: () => TaskListPlane): Tool<Tas
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TaskClaimInput>(), {
+    inputSchema: fromJsonSchema<TaskClaimInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },
@@ -2047,7 +2042,7 @@ export function createTaskUpdateTool(getTaskPlane: () => TaskListPlane): Tool<Ta
     isConcurrencySafe: () => false,
     isDestructive: () => false,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TaskUpdateInput>(), {
+    inputSchema: fromJsonSchema<TaskUpdateInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },
@@ -2095,7 +2090,7 @@ export function createTaskStopTool(getTaskPlane: () => TaskListPlane): Tool<Task
     isConcurrencySafe: () => false,
     isDestructive: () => true,
     requiresUserInteraction: false,
-    inputSchema: withJsonSchema(makeSchema<TaskStopInput>(), {
+    inputSchema: fromJsonSchema<TaskStopInput>({
       type: 'object',
       properties: {
         team: { type: 'string', description: '团队名' },

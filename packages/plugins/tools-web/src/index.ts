@@ -12,20 +12,9 @@
  * - isReadOnly：逻辑上不写本地，但涉及网络，声明为非只读但非破坏性
  */
 
-import { defineTool, withJsonSchema, Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
+import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import { isIP } from 'node:net'
-
-function makeSchema<T>(): Schema<T> {
-  return {
-    parse(value: unknown): T {
-      return value as T
-    },
-    safeParse(value: unknown) {
-      return { success: true, data: value as T }
-    },
-  }
-}
 
 // ========================================================================
 // SSRF 防护
@@ -101,7 +90,7 @@ const DEFAULT_MAX_BYTES = 2 * 1024 * 1024
 export const webFetchTool = defineTool<WebFetchInput, WebFetchOutput>({
   id: 'web_fetch',
   description: '通过 HTTP(S) 抓取 URL 内容。支持自定义方法/头/体，返回 text / json / base64。默认禁止访问私有网络（SSRF 防护）。',
-  inputSchema: withJsonSchema(makeSchema<WebFetchInput>(), {
+  inputSchema: fromJsonSchema<WebFetchInput>({
     type: 'object',
     properties: {
       url: { type: 'string', description: '要抓取的 URL（仅 http/https；私有网络被 SSRF 防护拒绝）' },
