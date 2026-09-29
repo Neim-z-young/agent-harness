@@ -145,7 +145,7 @@ export type {
 import { createHash } from 'node:crypto'
 
 // ===== 内部依赖 =====
-import { createBus, InMemoryBus, Bus, BusEvent, BusEventRecord, Awaitable } from '@harness/bus'
+import { createBus, InMemoryBus, Bus, BusEvent, BusEventRecord, Awaitable, EventPayload } from '@harness/bus'
 import {
   AgentPlugin,
   createPluginManager,
@@ -755,7 +755,14 @@ export interface AgentStreamEvent {
 /**
  * LLM Provider 接口
  * Harness 层通过此接口与具体模型提供商解耦。
- * Provider 插件通过 plugin.install → ctx.context.register('chat.provider', xxx) 注入。
+ *
+ * 注入路径（推荐程度从高到低）：
+ * 1. `harness.providers.register(id, provider, meta)` —— 运行期注册，**键由调用方给**（推荐）
+ * 2. `harness.providers.setDefault(id)` —— 显式指定默认（不再靠注册顺序）
+ * 3. `ctx.context.register('chat.provider', xxx)` —— 老路径，只当作 resolve() 链的最后一环
+ *
+ * ⚠️ `id` 是**类型标识**（"我是 anthropic 类型"），**不是**装配实例的唯一键 ——
+ * 同一份 config 数组里可以有两个 anthropic 端点。实例键必须由调用方从 `ProviderConfig.id` 传入。
  */
 export interface ChatProvider {
   /** Provider ID，如 "anthropic" / "openai" */
@@ -804,6 +811,88 @@ class MissingChatProvider implements ChatProvider {
     )
   }
 }
+
+// ========================================================================
+// 3b. Provider 实例注册表（运行期可增删；与类型层 ProviderTypeRegistry 正交）
+// ========================================================================
+
+/**
+ * Provider 实例的来源备注（归因 / 告警文案用；**不参与路由**）。
+ *
+ * 与 `ProviderConfig.type` 的区别：`type` 说「这是什么类型」，`source` 说「这个实例是怎么来的」。
+ * 同一 type 可以有多个实例（同一模型挂多个端点），所以「某个 providerId 是谁注册的」
+ * 只能靠 source 回答。
+ */
+export interface ProviderInstanceMeta {
+  /** 来源：`config`（config.json）/ `options`（构造参数）/ `legacy`（旧 _setChatProvider）/ `runtime`（运行期注册） */
+  source: string
+  /** 该实例对应的 ProviderConfig.type，仅作展示 */
+  type?: string
+}
+
+/** 已注册 Provider 实例的对外信息（`ProviderRuntime.list()` 的元素） */
+export interface ProviderInstanceInfo {
+  /** 实例 id —— 路由键（= ProviderConfig.id） */
+  id: string
+  /** 来源备注 */
+  source: string
+  /** 该实例对应的 ProviderConfig.type（未知时 undefined） */
+  type?: string
+  /** 是否为当前默认 */
+  isDefault: boolean
+}
+
+/**
+ * Provider 实例注册表（**运行期**可增删；与 `ProviderTypeRegistry` 的类型层正交）。
+ *
+ * 与类型层的关系：`ProviderTypeRegistry`（@harness/plugin）管 `type → 工厂`，
+ * 本接口管 `实例 id → ChatProvider 实例`。前者回答「有哪些类型可用」，后者回答「这次装配了哪些端点」。
+ *
+ * **第一原则：注册键由调用方给，不由被注册对象自报。**
+ * 被注册对象只知道自己「是什么类型」，不知道「这次装配的实例叫什么」——
+ * `AnthropicChatProvider` 里 `id = 'anthropic'` 是类型标识，把它当装配实例的唯一键，
+ * 就会让「同一模型挂多个端点」互相覆盖（P2 缺陷的根因）。
+ */
+export interface ProviderRuntime {
+  /**
+   * 注册（或替换）一个 Provider 实例。
+   * @param id 实例 id —— 必须是 `ProviderConfig.id`（宿主派生/显式给出的唯一键），不得为空
+   * @param provider ChatProvider 实例
+   * @param meta 来源备注（归因/告警文案用；缺省 `runtime`）
+   */
+  register(id: string, provider: ChatProvider, meta?: ProviderInstanceMeta): void
+  /**
+   * 反注册；返回是否真的摘掉了。
+   * 若摘掉的是当前默认，默认**回落到「首个已注册」**（无实例则回到构造期 Provider），
+   * 并发布 `provider.defaultChanged`。
+   */
+  unregister(id: string): boolean
+  /** 显式指定默认 Provider；**未注册则抛错**（默认这件事不接受静默失败） */
+  setDefault(id: string): void
+  /**
+   * 解析：显式 id 命中 → 显式默认 → 首个已注册 → 构造期 Provider。
+   * 显式 id 未命中时发布 `provider.resolveMiss` —— 静默回退就此可见。
+   */
+  resolve(id?: string): ChatProvider
+  /** 按 id 取实例（不存在返回 undefined；**不**触发回退与事件） */
+  get(id: string): ChatProvider | undefined
+  /** 列出全部实例（含来源与是否默认） */
+  list(): ProviderInstanceInfo[]
+}
+
+/**
+ * Provider 实例注册事实（bus 事件，**只读广播**）。
+ *
+ * 为什么是 bus 而不是管道 hook：注册是**配置事实**（谁在这次装配里注册了什么），
+ * 不是「可改写管道」。给它加 `(input, output)` 式 hook，等于允许两个插件静默抢注册同一个 id；
+ * 要观测用 bus，要干预请改配置（见 docs/runtime-registration-plan.md §2.5）。
+ */
+export const ProviderEvents = {
+  registered:     BusEvent.define<{ id: string; source: string; type?: string }>('provider.registered'),
+  unregistered:   BusEvent.define<{ id: string; source?: string }>('provider.unregistered'),
+  defaultChanged: BusEvent.define<{ id?: string; previous?: string; reason: 'set' | 'unregister' }>('provider.defaultChanged'),
+  resolveMiss:    BusEvent.define<{ requested: string; fallbackId?: string }>('provider.resolveMiss'),
+} as const
 
 // ========================================================================
 // 4. ToolPool 实现（组装阶段，支持 hook 注入工具）
@@ -3402,6 +3491,14 @@ export interface Harness {
   readonly tools: ToolRegistry
   readonly toolPipeline: ToolPipeline
   readonly permission: PermissionEngine
+  /**
+   * Provider 实例注册表（运行期可增删）。
+   *
+   * 此前实例层只有 `HarnessImpl._setChatProvider`（@internal、不在本接口里、被各 provider 插件
+   * 跨包 cast 调用），且「注册」与「设默认」被绑成同一件事 ⇒ **想只追加一个实例、不动默认做不到**。
+   * 本访问器把「注册 / 反注册 / 设默认 / 解析」四件事拆开。
+   */
+  readonly providers: ProviderRuntime
   /** Skill 管理器（加载/查询/禁用/重载技能；插件可在 core.harness.init 中通过此注册 plugin 来源技能） */
   readonly skillManager?: SkillManager
   /** 用量审计（引擎层唯一累加者；宿主只读，见 `UsageAccessor`） */
@@ -3791,6 +3888,119 @@ export const AgentEvents = {
   stepGate: BusEvent.define<AgentStepGateRecord>('agent.step.gate'),
 } as const
 
+/**
+ * {@link ProviderRuntime} 的默认实现。
+ *
+ * 持有实例表与「显式默认」，并发布注册事实事件。
+ *
+ * 构造期 Provider（`options.chatProvider`）与 `ctx.context.register('chat.provider', p)`
+ * 这条老注入路径**不进实例表** —— 它们是 resolve() 链的最后一环（显式 id → 显式默认 →
+ * 首个已注册 → 构造期 Provider）；混进表里会让 list() 出现「来源不明的实例」，
+ * 也会让「首个已注册」这个语义变得不可解释。
+ */
+class ProviderRuntimeImpl implements ProviderRuntime {
+  private readonly instances = new Map<string, { provider: ChatProvider; meta: ProviderInstanceMeta }>()
+  /** 显式默认实例 id（未显式指定时为 undefined ⇒ resolve 回落到「首个已注册」） */
+  private defaultId: string | undefined
+
+  constructor(
+    private readonly deps: {
+      readonly bus: Bus
+      /** 最后一环：构造期 Provider（或经 context 注入的那一份） */
+      readonly fallback: () => ChatProvider
+    },
+  ) {}
+
+  register(id: string, provider: ChatProvider, meta?: ProviderInstanceMeta): void {
+    if (!id) {
+      throw new Error(
+        'providers.register: id 不能为空 —— 注册键由调用方给（应传 ProviderConfig.id），' +
+          '不由被注册对象自报；见 docs/runtime-registration-plan.md §2.1',
+      )
+    }
+    const info: ProviderInstanceMeta = meta ?? { source: 'runtime' }
+    // 同 id 覆盖：Map.set 对已存在的键保序 ⇒ 「首个已注册」的语义不会被覆盖扰动
+    this.instances.set(id, { provider, meta: info })
+    this._publish(ProviderEvents.registered, { id, source: info.source, ...(info.type ? { type: info.type } : {}) })
+  }
+
+  unregister(id: string): boolean {
+    const hit = this.instances.get(id)
+    if (!hit) return false
+    this.instances.delete(id)
+    this._publish(ProviderEvents.unregistered, { id, source: hit.meta.source })
+    if (this.defaultId === id) {
+      const next = this._firstId()
+      this.defaultId = next
+      this._publish(ProviderEvents.defaultChanged, {
+        ...(next ? { id: next } : {}),
+        previous: id,
+        reason: 'unregister',
+      })
+    }
+    return true
+  }
+
+  setDefault(id: string): void {
+    if (!this.instances.has(id)) {
+      throw new Error(
+        `providers.setDefault: Provider "${id}" 未注册（已注册：${[...this.instances.keys()].join(', ') || '（无）'}）`,
+      )
+    }
+    const previous = this.defaultId
+    this.defaultId = id
+    if (previous !== id) {
+      this._publish(ProviderEvents.defaultChanged, { id, ...(previous ? { previous } : {}), reason: 'set' })
+    }
+  }
+
+  resolve(id?: string): ChatProvider {
+    if (id && id !== 'default') {
+      const hit = this.instances.get(id)
+      if (hit) return hit.provider
+      const fallbackId = this._effectiveDefaultId()
+      this._publish(ProviderEvents.resolveMiss, { requested: id, ...(fallbackId ? { fallbackId } : {}) })
+      return this._default()
+    }
+    return this._default()
+  }
+
+  get(id: string): ChatProvider | undefined {
+    return this.instances.get(id)?.provider
+  }
+
+  list(): ProviderInstanceInfo[] {
+    const def = this._effectiveDefaultId()
+    return [...this.instances.entries()].map(([id, e]) => ({
+      id,
+      source: e.meta.source,
+      ...(e.meta.type ? { type: e.meta.type } : {}),
+      isDefault: id === def,
+    }))
+  }
+
+  /** 显式默认若仍有效则用它，否则回落到「首个已注册」（Map 保序 = 注册顺序） */
+  private _effectiveDefaultId(): string | undefined {
+    if (this.defaultId && this.instances.has(this.defaultId)) return this.defaultId
+    return this._firstId()
+  }
+
+  private _firstId(): string | undefined {
+    const it = this.instances.keys().next()
+    return it.done ? undefined : it.value
+  }
+
+  private _default(): ChatProvider {
+    const id = this._effectiveDefaultId()
+    return id ? this.instances.get(id)!.provider : this.deps.fallback()
+  }
+
+  /** 事实广播：fire-and-forget + 吞错（上报绝不能顶掉主语义，见 `_publishStepGate` 的同源理由） */
+  private _publish<E extends BusEvent>(event: E, payload: EventPayload<E>): void {
+    void this.deps.bus.publish(event, payload, { source: 'provider' }).catch(() => undefined)
+  }
+}
+
 export class HarnessImpl implements Harness {
   public readonly bus: Bus
   public readonly context: ContextProvider
@@ -3800,6 +4010,8 @@ export class HarnessImpl implements Harness {
   public readonly plugin: PluginManager
   public readonly session: SessionManager
   public readonly agent: AgentRuntime
+  /** Provider 实例注册表（运行期可增删；见 {@link ProviderRuntime}） */
+  public readonly providers: ProviderRuntime
   /** 用量审计（引擎层唯一累加者） */
   public readonly usage: UsageAccessor
   /** Skill 管理器（从 skillDirs 加载，通过 core.prompt.system.transform 注入） */
@@ -3830,6 +4042,12 @@ export class HarnessImpl implements Harness {
     // ChatProvider（支持后替换，给插件注入留入口）
     this.chatProvider = options.chatProvider ?? new MissingChatProvider()
     this.context.register('chat.provider', this.chatProvider)
+    // Provider 实例注册表：构造期 Provider 不进实例表 —— 它是 resolve() 链的最后一环
+    // （fallback），混进表里会让 list() 出现「来源不明的实例」。
+    this.providers = new ProviderRuntimeImpl({
+      bus: this.bus,
+      fallback: () => this.context.resolve<ChatProvider>('chat.provider') ?? this.chatProvider,
+    })
 
     // PluginManager
     this.plugin = createPluginManager({
@@ -4113,27 +4331,35 @@ export class HarnessImpl implements Harness {
   async suspend(): Promise<void> { /* MVP: placeholder */ }
   async resume(): Promise<void> { /* MVP: placeholder */ }
 
-  // ----- Provider 注册表：支持多 Provider，按 providerId 分发 -----
+  // ----- Provider 解析：委托给 ProviderRuntime（见 §3b） -----
 
-  /** 已注册的 ChatProvider（key = provider.id）。支持多 Provider 自由切换。 */
-  private readonly chatProviders = new Map<string, ChatProvider>()
-
-  /** 按 providerId 解析 ChatProvider：命中注册表返回之，否则回退默认 Provider。 */
+  /**
+   * 按 providerId 解析 ChatProvider。
+   *
+   * 委托给 {@link ProviderRuntime.resolve}：显式 id 命中 → 显式默认 → 首个已注册 →
+   * 构造期 Provider。**未命中会发 `provider.resolveMiss`**（此前是静默回退默认）。
+   */
   resolveChatProvider(providerId?: string): ChatProvider {
-    // 上下文可能记录了最新的默认 provider（_setChatProvider / 插件注册）
-    const ctxProvider = this.context.resolve<ChatProvider>('chat.provider')
-    if (providerId && providerId !== 'default' && this.chatProviders.has(providerId)) {
-      return this.chatProviders.get(providerId)!
-    }
-    return ctxProvider ?? this.chatProvider
+    return this.providers.resolve(providerId)
   }
 
-  // ----- 内部工具：替换 ChatProvider（供 Plugin 使用） -----
-  /** @internal 替换默认 ChatProvider（Provider 插件 install 时调用）；同时按 Provider.id 注册到注册表 */
+  // ----- 兼容层：旧注入路径（供尚未迁移的 Provider 插件使用） -----
+
+  /**
+   * @deprecated 用 `harness.providers.register(id, p, meta)` + `harness.providers.setDefault(id)`。
+   *
+   * 保留仅因为各 provider 插件此前跨包 cast 调用它；语义等价于「按 `p.id` 注册 + 设为默认」。
+   *
+   * ⚠️ **语义变化（有意）**：旧实现是「最后调用者赢」（既改默认又改注册表），
+   * 新实现是「注册 + 显式设默认」——`p.id` 作为键仍是对象自报，这正是 P2 缺陷的口径；
+   * 迁移完成的插件应改用 `providers.register(ProviderConfig.id, p)`，键由调用方给。
+   * 同时保留 `context['chat.provider']` 写入：那条老注入路径仍在 resolve() 链的最后一环。
+   */
   _setChatProvider(p: ChatProvider): void {
     this.chatProvider = p
     this.context.register('chat.provider', p)
-    if (p?.id) this.chatProviders.set(p.id, p)
+    this.providers.register(p.id, p, { source: 'legacy' })
+    this.providers.setDefault(p.id)
   }
 }
 

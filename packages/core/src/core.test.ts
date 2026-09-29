@@ -17,9 +17,10 @@ import {
   stableStringify,
   shortHash,
   resultPayload,
+  ProviderEvents,
 } from './index'
 import { defineTool, Tool, ToolResult, Schema } from './index'
-import type { AgentPlugin, Hooks, Message } from './index'
+import type { AgentPlugin, Hooks, Message, ProviderRuntime } from './index'
 import { InMemoryBus } from '@harness/bus'
 
 // ===== helpers =====
@@ -1202,6 +1203,184 @@ describe('@harness/core', () => {
       expect(impl.resolveChatProvider('default')).toBe(pBeta)
       expect(impl.resolveChatProvider('nonexistent')).toBe(pBeta)
       expect(impl.resolveChatProvider(undefined)).toBe(pBeta)
+    })
+
+    // ---- 运行期注册表（ProviderRuntime）：键由调用方给 / 默认显式 / 可反注册 ----
+
+    /** 造一个"只做注册"的 Provider 插件（模拟 provider-* 插件的 core.harness.init 那一段） */
+    function registrarPlugin(id: string, fn: (p: ProviderRuntime) => void): AgentPlugin {
+      return {
+        id,
+        version: '0.0.0',
+        name: id,
+        async install() {
+          return {
+            async 'core.harness.init'(_input: unknown, output: unknown) {
+              const harness = (output as { harness?: { providers?: ProviderRuntime } }).harness
+              if (harness?.providers) fn(harness.providers)
+            },
+          } as unknown as Hooks
+        },
+      }
+    }
+
+    /** 带独立计数的替身：`selfId` 是它**自报**的 id（可能就是错的），`tag` 用于分辨谁被调到 */
+    function spyProvider(selfId: string): { provider: ChatProvider; count: () => number } {
+      let n = 0
+      const provider: ChatProvider = {
+        id: selfId,
+        async complete() {
+          n++
+          return { content: `${selfId}#${n}`, model: `${selfId}-v1`, tokenUsage: { input: 1, output: 1 } }
+        },
+      }
+      return { provider, count: () => n }
+    }
+
+    it('providers.register 用**调用方给的 id** 作键：两个自报同一 id 的实例不互相覆盖（P2 修复）', async () => {
+      // 两个实例**自报同一个 id** —— 正是修前 anthropic / gemini / mock 的形状
+      const a1 = spyProvider('anthropic')
+      const a2 = spyProvider('anthropic')
+      const h = await createHarness({
+        chatProvider: spyProvider('legacy').provider,
+        agents: [
+          makeAgent({ id: 'use-a2', model: { providerId: 'a2', modelId: 'm' } }),
+          makeAgent({ id: 'use-default', model: { modelId: 'm' } }),
+        ],
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            p.register('a1', a1.provider, { source: 'config', type: 'anthropic' })
+            p.register('a2', a2.provider, { source: 'config', type: 'anthropic' })
+            p.setDefault('a1')
+          }),
+        ],
+      })
+
+      // 两个实例各占一个键（旧实现按 p.id 入表 ⇒ 只会剩最后一个）
+      expect(h.providers.get('a1')).toBe(a1.provider)
+      expect(h.providers.get('a2')).toBe(a2.provider)
+      expect(h.providers.list().map((p) => p.id).sort()).toEqual(['a1', 'a2'])
+      // 自报 id 不作键：'anthropic' 必须**未命中**（旧实现下这里会命中，且是最后一个实例）
+      expect(h.providers.get('anthropic')).toBeUndefined()
+
+      // 路由：agent.model.providerId='a2' 命中 a2（不再静默回退默认）
+      expect(h.providers.resolve('a2')).toBe(a2.provider)
+      await h.start()
+      const sess = await h.session.create()
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-a2', message: 'hi' })
+      // 默认 = a1（显式 setDefault），无 providerId 的 agent 走它
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-default', message: 'hi' })
+      await h.stop()
+      expect(a2.count()).toBe(1)
+      expect(a1.count()).toBe(1)
+    })
+
+    it('默认由显式 setDefault 决定，不由注册顺序决定（Q2）', async () => {
+      const second = spyProvider('second')
+      const first = spyProvider('first')
+      const h = await createHarness({
+        chatProvider: spyProvider('legacy').provider,
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            // 注册顺序刻意把 second 放前面：若默认还按「首个已注册」算，得到的就是 second
+            p.register('second', second.provider)
+            p.register('first', first.provider)
+            p.setDefault('first')
+          }),
+        ],
+      })
+      expect(h.providers.resolve()).toBe(first.provider)
+      expect(h.providers.resolve('default')).toBe(first.provider)
+      expect(h.providers.list().find((p) => p.isDefault)?.id).toBe('first')
+      // 老名字仍在（委托同一实现）—— CLI 至今靠 duck typing 调 `resolveChatProvider`
+      expect((h as unknown as HarnessImpl).resolveChatProvider()).toBe(first.provider)
+    })
+
+    it('unregister：摘掉当前默认 ⇒ 默认回落「首个已注册」（Q3）；未注册 id 返回 false', async () => {
+      const a1 = spyProvider('a1')
+      const a2 = spyProvider('a2')
+      const h = await createHarness({
+        chatProvider: spyProvider('legacy').provider,
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            p.register('a1', a1.provider)
+            p.register('a2', a2.provider)
+            p.setDefault('a2')
+          }),
+        ],
+      })
+      expect(h.providers.resolve()).toBe(a2.provider)
+
+      expect(h.providers.unregister('a2')).toBe(true)
+      expect(h.providers.get('a2')).toBeUndefined()
+      // 默认回落「首个已注册」而不是保留一个已消失的 id
+      expect(h.providers.resolve()).toBe(a1.provider)
+      expect(h.providers.list().map((p) => p.id)).toEqual(['a1'])
+      // 未注册的 id：false，且不抛
+      expect(h.providers.unregister('ghost')).toBe(false)
+    })
+
+    it('setDefault 指向未注册的 id ⇒ 抛错（默认不接受静默失败）', async () => {
+      const h = await createHarness({ chatProvider: spyProvider('legacy').provider })
+      expect(() => h.providers.setDefault('ghost')).toThrow(/未注册/)
+    })
+
+    it('显式 id 未命中 ⇒ 发 provider.resolveMiss（静默回退可见），并回退默认', async () => {
+      const bus = new InMemoryBus()
+      const misses: Array<{ requested: string; fallbackId?: string }> = []
+      bus.subscribe(ProviderEvents.resolveMiss, (e) => {
+        misses.push(e.payload as { requested: string; fallbackId?: string })
+      })
+      const a1 = spyProvider('a1')
+      const h = await createHarness({
+        bus,
+        chatProvider: spyProvider('legacy').provider,
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            p.register('a1', a1.provider, { source: 'config' })
+            p.setDefault('a1')
+          }),
+        ],
+      })
+
+      expect(h.providers.resolve('ghost')).toBe(a1.provider)
+      // bus.publish 是 fire-and-forget（不 await），刷一轮微任务再断言
+      await new Promise((r) => setTimeout(r, 0))
+      expect(misses).toEqual([{ requested: 'ghost', fallbackId: 'a1' }])
+
+      // 命中时**不发** miss（否则事件本身就成了噪音）
+      expect(h.providers.resolve('a1')).toBe(a1.provider)
+      await new Promise((r) => setTimeout(r, 0))
+      expect(misses).toHaveLength(1)
+    })
+
+    it('provider.registered / defaultChanged 事实可观测，且带来源', async () => {
+      const bus = new InMemoryBus()
+      const registered: Array<{ id: string; source: string; type?: string }> = []
+      const defaults: Array<{ id?: string; previous?: string; reason: string }> = []
+      bus.subscribe(ProviderEvents.registered, (e) => {
+        registered.push(e.payload as { id: string; source: string; type?: string })
+      })
+      bus.subscribe(ProviderEvents.defaultChanged, (e) => {
+        defaults.push(e.payload as { id?: string; previous?: string; reason: string })
+      })
+      await createHarness({
+        bus,
+        chatProvider: spyProvider('legacy').provider,
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            p.register('a1', spyProvider('a1').provider, { source: 'plugin:provider.anthropic', type: 'anthropic' })
+            p.register('a2', spyProvider('a2').provider, { source: 'config' })
+            p.setDefault('a1')
+          }),
+        ],
+      })
+      await new Promise((r) => setTimeout(r, 0))
+      expect(registered).toEqual([
+        { id: 'a1', source: 'plugin:provider.anthropic', type: 'anthropic' },
+        { id: 'a2', source: 'config' },
+      ])
+      expect(defaults).toEqual([{ id: 'a1', reason: 'set' }])
     })
   })
 

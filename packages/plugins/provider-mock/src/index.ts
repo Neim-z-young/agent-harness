@@ -27,7 +27,7 @@
  * })
  */
 
-import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
+import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk, ProviderRuntime } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message } from '@harness/session'
 
@@ -91,6 +91,12 @@ export interface MockProviderConfig {
   recordCalls?: boolean
   /** 自定义延迟（ms，模拟网络延迟，默认 0） */
   delayMs?: number
+  /**
+   * 装配实例 id（**路由键**，默认 `'mock'`）。
+   *
+   * 由 `providerTypeFactory.createPlugin` 从 `ProviderConfig.id` 透传（唯一权威来源）。
+   */
+  providerId?: string
 }
 
 // ===== MockChatProvider 实现 =====
@@ -102,7 +108,12 @@ export interface MockProviderConfig {
  * 也可通过 providerMockPlugin 自动注入。
  */
 export class MockChatProvider implements ChatProvider {
-  readonly id = 'mock'
+  /**
+   * 装配实例 id —— **路由键**（= ProviderConfig.id），默认 `'mock'`。
+   *
+   * 不再是硬编码常量：硬编码会让多实例自报同一个 id，在注册表里互相覆盖。
+   */
+  readonly id: string
   /** 调用历史（每次 complete 的 params） */
   readonly calls: Array<{
     providerId: string
@@ -133,6 +144,7 @@ export class MockChatProvider implements ChatProvider {
   }
 
   constructor(config: MockProviderConfig = {}) {
+    this.id = config.providerId ?? 'mock'
     this.config = {
       defaultResponse: config.defaultResponse ?? 'This is a mock response.',
       defaultReasoning: config.defaultReasoning ?? '',
@@ -348,29 +360,43 @@ export function createProviderMockPlugin(config?: MockProviderConfig): AgentPlug
 } {
   let provider: MockChatProvider | undefined
 
+  // 插件 id 随 providerId 派生，使多个 Mock 端点可在同一进程内各自注册而不冲突
+  const providerId = config?.providerId ?? 'mock'
+  const pluginId = `provider.${providerId}`
+
   const plugin: AgentPlugin & { readonly provider: MockChatProvider } = {
-    id: 'provider.mock',
+    id: pluginId,
     version: '0.1.0',
     name: 'Mock Provider',
     description: '可配置的 Mock LLM Provider，用于测试和开发',
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
       // 优先用直接传入的 config，否则从 config store 读取
-      const cfg = config ?? (ctx.config.get<MockProviderConfig>('provider.mock') ?? {})
+      const cfg = config ?? (ctx.config.get<MockProviderConfig>(pluginId) ?? {})
       provider = new MockChatProvider(cfg)
 
-      ctx.log.info('Mock Provider installed', { model: provider.id })
+      ctx.log.info('Mock Provider installed', { model: provider.id, providerId })
 
       return {
         async 'core.harness.init'(_input, output) {
           // 从 core.harness.init 的 output 拿到 harness 实例，注入 provider
           const harness = (output as { harness?: unknown }).harness as
-            | { _setChatProvider?: (p: ChatProvider) => void }
+            | {
+                providers?: ProviderRuntime
+                _setChatProvider?: (p: ChatProvider) => void
+              }
             | undefined
-          if (harness?._setChatProvider) {
-            harness._setChatProvider(provider!)
+          if (!provider) return
+          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id。**不设默认**。
+          if (harness?.providers) {
+            harness.providers.register(providerId, provider, {
+              source: `plugin:${pluginId}`,
+              type: 'mock',
+            })
+          } else if (harness?._setChatProvider) {
+            harness._setChatProvider(provider)
           } else {
-            ctx.log.warn('Harness._setChatProvider not found, Mock Provider may not be registered')
+            ctx.log.warn('Harness.providers not found, Mock Provider may not be registered')
           }
         },
       }
@@ -403,6 +429,8 @@ export const providerTypeFactory: ProviderTypeFactory = {
     const defaultResponse = config.defaultResponse as string | undefined
     return createProviderMockPlugin({
       ...(config as MockProviderConfig),
+      // 装配实例键：ProviderConfig.id 是唯一权威来源（缺省时退回 'mock'）
+      providerId: config.id,
       // 未指定默认响应（且未绑定具体模型）时给一个兜底文案，与 CLI 旧行为保持一致
       defaultResponse: defaultResponse ?? (config.model ? undefined : '(Mock Provider) 你好，我是测试助手。'),
     })

@@ -1723,6 +1723,41 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('同 type=anthropic 的两个端点：各按自己的 ProviderConfig.id 注册 / 分发（P2：不再互相覆盖）', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'claude-a',
+      permissionMode: 'allow-all', stdout,
+      mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'claude-a', type: 'anthropic', baseUrl: 'https://a.example.com', apiKey: 'key-a', model: 'claude-3-5-sonnet' },
+        { id: 'claude-b', type: 'anthropic', baseUrl: 'https://b.example.com', apiKey: 'key-b', model: 'claude-3-5-sonnet' },
+      ],
+    })
+    const { harness } = await app.boot()
+    const h = harness as unknown as {
+      resolveChatProvider: (id?: string) => { id?: string; config?: { apiKey?: string; baseUrl?: string } } | undefined
+      providers: { list(): Array<{ id: string; source: string; type?: string; isDefault: boolean }> }
+    }
+    // 两个实例各占一个注册键。修前它们都自报 id='anthropic' ⇒ 只剩最后一个（claude-b 覆盖 claude-a）
+    expect(h.providers.list().map((p) => p.id).sort()).toEqual(['claude-a', 'claude-b'])
+    // 来源与类型随实例带出来（/model 的来源列可用）
+    expect(h.providers.list().every((p) => p.type === 'anthropic')).toBe(true)
+
+    const a = h.resolveChatProvider('claude-a')
+    const b = h.resolveChatProvider('claude-b')
+    expect(a?.id).toBe('claude-a')
+    expect(a?.config?.apiKey).toBe('key-a')
+    expect(a?.config?.baseUrl).toContain('a.example.com')
+    expect(b?.id).toBe('claude-b')
+    expect(b?.config?.apiKey).toBe('key-b')
+    expect(b?.config?.baseUrl).toContain('b.example.com')
+    // 默认 = claude-a（CLI 显式 setDefault，不再靠「最后注册赢」）；未注册 id 回退它
+    expect(h.providers.list().find((p) => p.isDefault)?.id).toBe('claude-a')
+    expect(h.resolveChatProvider('nope')).toBe(a)
+    await app.shutdown()
+  })
+
   it('boot 显式校验：重复 id / 未知 type / 默认 provider 未定义 → ConfigValidationError', async () => {
     const stdout = { write: () => {} }
     // 重复 id

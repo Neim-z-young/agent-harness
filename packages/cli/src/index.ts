@@ -2477,7 +2477,8 @@ export class HarnessApp {
     // ------------------------------------------------------------------
     // Provider 装配：支持多 Provider 自由切换
     // 1) 优先安装 config.providers 里显式定义的多 Provider（按顺序注册到注册表，供跨 Provider 分发）
-    // 2) 默认 Provider 最后注册 —— 作为无 provider 前缀模型的兜底（也是运行时 /model 落盘的默认 provider）
+    // 2) 默认 Provider 的**实例只构造一次**（放在这一段的末尾，见下方 `chosenProvider`）。
+    // 默认由谁担当**不再由注册顺序决定** —— 构造完所有实例后显式 `providers.setDefault(...)`。
     // ------------------------------------------------------------------
     const cfg = await this.configStore.load()
     const rawProviderConfigs = this.options.providers?.length ? this.options.providers : (cfg.providers ?? [])
@@ -2527,6 +2528,15 @@ export class HarnessApp {
 
     const providerPlugins: AgentPlugin[] = []
     let chosenProvider: AgentPlugin & { provider: ChatProvider & { calls?: unknown[] } }
+    /**
+     * 实际装配为默认的**实例 id**（= 注册键）—— 供下面显式 `providers.setDefault` 用。
+     *
+     * 刻意不复用展示用的 `cpId`：两者口径不同 ——
+     * `cpId` 说的是**配置意图**（config.json → provider），这里说的是**实际装配的事实**。
+     * 无 ANTHROPIC_API_KEY 时配置意图是 anthropic、实际装配的是 mock；此时若拿意图去
+     * `setDefault('anthropic')` 会抛「未注册」——正是要避免的静默/误导。
+     */
+    let chosenProviderId: string
 
     // 1) 其他（非默认）Provider
     const builtIds = new Set<string>()
@@ -2536,11 +2546,12 @@ export class HarnessApp {
       providerPlugins.push(plugin)
     }
     for (const pc of providerConfigs) {
-      if (defaultPc && pc.id === defaultPc.id) continue // 默认放到最后
+      // 默认实例只在下面构造一次（避免同一 id 出现两个实例、互相覆盖注册键）
+      if (defaultPc && pc.id === defaultPc.id) continue
       pushBuilt(await this.buildProviderPlugin(pc), pc.id)
     }
 
-    // 2) 默认 Provider（最后注册 → 作为无前缀模型的兜底）
+    // 2) 默认 Provider 的实例
     if (defaultPc) {
       // 默认 Provider 的默认模型优先取 --model / config.model 指定的模型（去 provider 前缀）
       const defaultModel = parseModelSpec(this.options.model ?? '').modelId || defaultPc.model
@@ -2551,14 +2562,17 @@ export class HarnessApp {
           defaultResponse: '(Mock Provider) 你好，我是测试助手。',
           ...(this.options.mockProviderConfig ?? {}),
         })
+        chosenProviderId = 'mock'
       } else {
         chosenProvider = plugin as any
+        chosenProviderId = defaultPc.id
       }
     } else if (defaultProviderId === 'mock') {
       chosenProvider = await lazyMockProvider({
         defaultResponse: '(Mock Provider) 你好，我是测试助手。',
         ...(this.options.mockProviderConfig ?? {}),
       })
+      chosenProviderId = 'mock'
     } else {
       // anthropic（或无 key 时 fallback mock）
       const envKey = typeof process !== 'undefined' ? process.env.ANTHROPIC_API_KEY : undefined
@@ -2577,6 +2591,7 @@ export class HarnessApp {
       const hasKey = !!mergedAnthropic.apiKey
       if (hasKey && (defaultProviderId === 'anthropic' || this.options.provider === undefined)) {
         chosenProvider = await lazyAnthropicProvider(mergedAnthropic)
+        chosenProviderId = 'anthropic'
       } else if (hasKey && defaultProviderId !== 'anthropic') {
         // 默认 provider 是自定义 id 但未在 providers 中配置 → 提示并 fallback mock
         this.options.stdout?.write?.(
@@ -2588,6 +2603,7 @@ export class HarnessApp {
           defaultResponse: '(Mock Provider) 你好，我是测试助手。',
           ...(this.options.mockProviderConfig ?? {}),
         })
+        chosenProviderId = 'mock'
       } else {
         this.options.stdout?.write?.(
           'ℹ️  未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider。\n' +
@@ -2597,6 +2613,7 @@ export class HarnessApp {
           defaultResponse: '(Mock Provider) 你好，我是测试助手。',
           ...(this.options.mockProviderConfig ?? {}),
         })
+        chosenProviderId = 'mock'
       }
     }
     providerPlugins.push(chosenProvider)
@@ -2797,6 +2814,18 @@ export class HarnessApp {
           : undefined,
       },
     })
+    // 显式指定默认 Provider —— 不再依赖「最后注册赢」的注册顺序。
+    // 各 Provider 插件在 core.harness.init 里只 register、不 setDefault（默认是组合根的决定），
+    // 这样「只追加一个实例、不动默认」才成为可能。见 docs/runtime-registration-plan.md §2.1/§2.2。
+    if (harness.providers.get(chosenProviderId)) {
+      harness.providers.setDefault(chosenProviderId)
+    } else {
+      // 不静默：setDefault 是唯一入口，落空说明「装配」与「预期默认」不一致
+      this.options.stdout?.write?.(
+        `[WARN] 默认 Provider "${chosenProviderId}" 未注册为实例；已回退 resolve() 默认链` +
+        `（首个已注册 → 构造期 Provider）。\n`,
+      )
+    }
     // 回读 config.json 的 agents[] 覆盖（tools 白名单 + mcpServers/excludeMcpServers）到已注册 Agent（createHarness 全部组装完成后、query 前）
     await this.applyConfigAgentOverrides(harness)
     // 把 config.json 的 mcpServers 注入 mcp-server-registry 插件（在 start 前建立配置态，

@@ -27,7 +27,7 @@
  * 3. 环境变量 GEMINI_API_KEY / GEMINI_BASE_URL
  */
 
-import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
+import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk, ProviderRuntime } from '@harness/core'
 import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
@@ -76,6 +76,14 @@ export interface GeminiProviderConfig {
   completeTimeoutFactor?: number
   /** 当模型输出空时是否报错（默认 false 返回空 content） */
   strictEmptyContent?: boolean
+  /**
+   * 装配实例 id（**路由键**，默认 `'gemini'`）。
+   *
+   * 同一份 config 数组里可以有两个 gemini 端点（如 id="g1" / id="g2"），
+   * 必须各自带自己的 providerId，否则会互相覆盖同一注册键。
+   * 由 `providerTypeFactory.createPlugin` 从 `ProviderConfig.id` 透传（唯一权威来源）。
+   */
+  providerId?: string
 }
 
 // ===== Gemini API 类型（精简子集）=====
@@ -280,7 +288,13 @@ function toolToGeminiDecl(tool: Tool): GeminiFunctionDeclaration {
 // ========================================================================
 
 export class GeminiChatProvider implements ChatProvider {
-  readonly id = 'gemini'
+  /**
+   * 装配实例 id —— **路由键**（= ProviderConfig.id），默认 `'gemini'`。
+   *
+   * 不再是硬编码常量：硬编码会让「同一模型挂多个端点」的两个实例自报同一个 id，
+   * 从而在注册表里互相覆盖（`agent.model.providerId='g2'` 会静默回退默认）。
+   */
+  readonly id: string
   readonly calls: Array<{
     body: GeminiRequestBody
     response?: GeminiResponseBody
@@ -301,6 +315,7 @@ export class GeminiChatProvider implements ChatProvider {
     toolsGetter: () => Tool[] = () => [],
   ) {
     this.toolsGetter = toolsGetter
+    this.id = config.providerId ?? 'gemini'
     const envKey = typeof process !== 'undefined' ? process.env.GEMINI_API_KEY : undefined
     const envBase = typeof process !== 'undefined' ? process.env.GEMINI_BASE_URL : undefined
     this.config = {
@@ -732,14 +747,18 @@ export function createProviderGeminiPlugin(
 ): AgentPlugin & { readonly provider: GeminiChatProvider } {
   let provider: GeminiChatProvider | undefined
 
+  // 插件 id 随 providerId 派生，使多个 Gemini 端点可在同一进程内各自注册而不冲突
+  const providerId = config?.providerId ?? 'gemini'
+  const pluginId = `provider.${providerId}`
+
   const plugin: AgentPlugin & { readonly provider: GeminiChatProvider } = {
-    id: 'provider.gemini',
+    id: pluginId,
     version: '0.1.0',
     name: 'Gemini Provider',
     description: '对接 Google Gemini Generative Language API 的 Provider 插件',
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<GeminiProviderConfig>('provider.gemini')
+      const storeCfg = ctx.config.get<GeminiProviderConfig>(pluginId)
       const merged: GeminiProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
 
       provider = new GeminiChatProvider(merged, () => [])
@@ -747,12 +766,14 @@ export function createProviderGeminiPlugin(
       ctx.log.info('Gemini Provider 已安装', {
         baseUrl: provider['config'].baseUrl,
         defaultModel: provider['config'].defaultModel,
+        providerId,
       })
 
       return {
         async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | {
+                providers?: ProviderRuntime
                 _setChatProvider?: (p: ChatProvider) => void
                 tools?: { list?: () => Tool[] }
               }
@@ -760,10 +781,16 @@ export function createProviderGeminiPlugin(
 
           if (!provider) return
 
-          if (harness?._setChatProvider) {
+          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id。**不设默认**。
+          if (harness?.providers) {
+            harness.providers.register(providerId, provider, {
+              source: `plugin:${pluginId}`,
+              type: 'gemini',
+            })
+          } else if (harness?._setChatProvider) {
             harness._setChatProvider(provider)
           } else {
-            ctx.log.warn('Harness._setChatProvider 未找到，Gemini Provider 可能未注册')
+            ctx.log.warn('Harness.providers 未找到，Gemini Provider 可能未注册')
           }
 
           provider.setToolsGetter(() => harness?.tools?.list?.() ?? [])
@@ -806,5 +833,7 @@ export const providerTypeFactory: ProviderTypeFactory = {
       completeTimeoutFactor: typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
         ? config.completeTimeoutFactor
         : undefined,
+      // 装配实例键：ProviderConfig.id 是唯一权威来源（缺省时退回 'gemini'）
+      providerId: config.id,
     }),
 }

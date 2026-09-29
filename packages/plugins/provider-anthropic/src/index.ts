@@ -22,7 +22,7 @@
  * 3. 环境变量 ANTHROPIC_API_KEY / ANTHROPIC_BASE_URL
  */
 
-import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk } from '@harness/core'
+import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk, ProviderRuntime } from '@harness/core'
 import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
@@ -87,6 +87,14 @@ export interface AnthropicProviderConfig {
    * 第二次命中即回本（命中 ≈ 0.1x）。
    */
   promptCache?: boolean
+  /**
+   * 装配实例 id（**路由键**，默认 `'anthropic'`）。
+   *
+   * 与 `id` 作为类型标识不同：同一份 config 数组里可以有两个 anthropic 端点
+   * （如 id="a1" / id="a2"），此时必须各自带自己的 providerId，否则会互相覆盖同一注册键。
+   * 由 `providerTypeFactory.createPlugin` 从 `ProviderConfig.id` 透传（这是唯一权威来源）。
+   */
+  providerId?: string
 }
 
 // ===== Anthropic API 类型（精简子集）=====
@@ -357,7 +365,13 @@ function toolToAnthropicDef(tool: Tool): AnthropicToolDef {
 // ========================================================================
 
 export class AnthropicChatProvider implements ChatProvider {
-  readonly id = 'anthropic'
+  /**
+   * 装配实例 id —— **路由键**（= ProviderConfig.id），默认 `'anthropic'`。
+   *
+   * 不再是硬编码常量：硬编码会让「同一模型挂多个端点」的两个实例自报同一个 id，
+   * 从而在注册表里互相覆盖（`agent.model.providerId='a2'` 会静默回退默认）。
+   */
+  readonly id: string
   readonly calls: Array<{ body: AnthropicRequestBody; response?: AnthropicResponseBody; error?: unknown }> = []
 
   private readonly config: Required<
@@ -375,6 +389,7 @@ export class AnthropicChatProvider implements ChatProvider {
     toolsGetter: () => Tool[] = () => []
   ) {
     this.toolsGetter = toolsGetter
+    this.id = config.providerId ?? 'anthropic'
     const envKey = typeof process !== 'undefined' ? process.env.ANTHROPIC_API_KEY : undefined
     const envBase = typeof process !== 'undefined' ? process.env.ANTHROPIC_BASE_URL : undefined
     this.config = {
@@ -779,15 +794,20 @@ export function createProviderAnthropicPlugin(config?: AnthropicProviderConfig):
 } {
   let provider: AnthropicChatProvider | undefined
 
+  // 插件 id 随 providerId 派生，使多个 anthropic 端点可在同一进程内各自注册而不冲突。
+  // 此前它们都是 'provider.anthropic'，多实例会被 pushBuilt 的 builtIds **静默去重丢掉**。
+  const providerId = config?.providerId ?? 'anthropic'
+  const pluginId = `provider.${providerId}`
+
   const plugin: AgentPlugin & { readonly provider: AnthropicChatProvider } = {
-    id: 'provider.anthropic',
+    id: pluginId,
     version: '0.1.0',
     name: 'Anthropic Provider',
     description: '对接 Anthropic Claude Messages API 的 Provider 插件',
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
-      // 配置来源：直接传入 > config store
-      const storeCfg = ctx.config.get<AnthropicProviderConfig>('provider.anthropic')
+      // 配置来源：直接传入 > config store（store 键随 providerId 派生，缺省仍是 'provider.anthropic'）
+      const storeCfg = ctx.config.get<AnthropicProviderConfig>(pluginId)
       const merged: AnthropicProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
 
       provider = new AnthropicChatProvider(merged, () => [])
@@ -795,12 +815,14 @@ export function createProviderAnthropicPlugin(config?: AnthropicProviderConfig):
       ctx.log.info('Anthropic Provider 已安装', {
         baseUrl: provider['config'].baseUrl,
         defaultModel: provider['config'].defaultModel,
+        providerId,
       })
 
       return {
         async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | {
+                providers?: ProviderRuntime
                 _setChatProvider?: (p: ChatProvider) => void
                 tools?: { list?: () => Tool[] }
               }
@@ -808,11 +830,18 @@ export function createProviderAnthropicPlugin(config?: AnthropicProviderConfig):
 
           if (!provider) return
 
-          // 注入 ChatProvider
-          if (harness?._setChatProvider) {
+          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id —— 见
+          // docs/runtime-registration-plan.md §2.1。**不设默认**：默认由宿主显式 setDefault。
+          if (harness?.providers) {
+            harness.providers.register(providerId, provider, {
+              source: `plugin:${pluginId}`,
+              type: 'anthropic',
+            })
+          } else if (harness?._setChatProvider) {
+            // 老宿主回退（渐进迁移）
             harness._setChatProvider(provider)
           } else {
-            ctx.log.warn('Harness._setChatProvider 未找到，Anthropic Provider 可能未注册')
+            ctx.log.warn('Harness.providers 未找到，Anthropic Provider 可能未注册')
           }
 
           // 绑定工具池 getter（harness.tools.list() 实时取）
@@ -852,6 +881,9 @@ export const providerTypeFactory: ProviderTypeFactory = {
       defaultModel: config.model,
       maxTokens: config.maxTokens,
       timeoutMs: config.timeoutMs,
+      // 装配实例键：ProviderConfig.id 是唯一权威来源（normalizeProviderConfigs 保证非空）。
+      // 不传 ⇒ 本例会退回默认 'anthropic'，同类多实例就会互相覆盖同一个注册键。
+      providerId: config.id,
       // 非流式总时长系数：ProviderConfig 有 index signature，这里的取值校验是唯一闸门
       completeTimeoutFactor: typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
         ? config.completeTimeoutFactor
