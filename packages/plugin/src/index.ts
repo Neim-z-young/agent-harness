@@ -518,6 +518,17 @@ export interface LlmUsageSignal {
   sessionId: string
   agentId?: string
   model?: string
+  /**
+   * 本次调用实际命中的 Provider 实例 id（= `ProviderConfig.id`）。
+   *
+   * 为什么必须带上：`model` 回答「用了哪个模型」，但在「同一模型挂多个端点」这个
+   * **被明确支持**的场景下（见 `ProviderConfig` 注释），两个端点的 model 名一模一样 ⇒
+   * 只看 model 无法归因到端点。多实例启用后，用量/缓存归因都要靠这个维度才分得开。
+   *
+   * 缺省（undefined）= 本次走的是**默认** Provider（引擎的 `'default'` 哨兵会被归一掉，
+   * 因为注册表里没有这个键，带上去等于造一个假端点）。
+   */
+  providerId?: string
   /** 引擎的步序号（从 1 起） */
   step?: number
   /** 本次调用的输入 token（provider 口径，含缓存部分） */

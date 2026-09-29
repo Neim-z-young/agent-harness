@@ -1047,7 +1047,7 @@ test('core.llm.usage：把引擎广播的缓存命中/写入落成 providerCache
   // 先跑一轮 preModel：会话上下文（含遥测 writer）在那里按 sessionId 建立
   await runPreModelOnce(hooks, history(3))
 
-  hooks['core.llm.usage']!({ sessionId: 's', input: 1000, output: 50, cacheRead: 900, cacheWrite: 0 })
+  hooks['core.llm.usage']!({ sessionId: 's', input: 1000, output: 50, cacheRead: 900, cacheWrite: 0, providerId: 'ep2' })
   // writer 有 500ms debounce：等一拍再读
   await new Promise((r) => setTimeout(r, 600))
 
@@ -1057,6 +1057,23 @@ test('core.llm.usage：把引擎广播的缓存命中/写入落成 providerCache
   expect(pc[0].sessionId).toBe('s')
   expect(pc[0].cacheRead).toBe(900)
   expect(pc[0].cacheWrite).toBe(0)
+  // 端点维度：同一模型挂多个 Provider 实例时，仅有它能区分这行属于哪个端点
+  expect(pc[0].providerId).toBe('ep2')
+})
+
+test('providerCache 行：引擎未给端点则记 null（键存在，不是缺字段）', async () => {
+  const { hooks, path } = await pluginWithTelemetry()
+  await runPreModelOnce(hooks, history(3))
+
+  hooks['core.llm.usage']!({ sessionId: 's', input: 1000, output: 50, cacheRead: 900, cacheWrite: 0 })
+  await new Promise((r) => setTimeout(r, 600))
+
+  const rows = readFileSync(path, 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+  const pc = rows.filter((r) => r.kind === 'providerCache')
+  expect(pc).toHaveLength(1)
+  // null 与「字段不存在」是两种意思：后者会让消费方怀疑是采集漏了
+  expect('providerId' in pc[0]).toBe(true)
+  expect(pc[0].providerId).toBeNull()
 })
 
 test('core.llm.usage：无缓存字段不写行（避免噪声）；未知会话静默跳过（不抛）', async () => {

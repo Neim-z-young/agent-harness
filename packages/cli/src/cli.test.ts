@@ -1505,6 +1505,10 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     expect(output).toInclude('deepseek/deepseek-chat')
     expect(output).toInclude('baseUrl=https://api.deepseek.com')
     expect(output).toInclude('local/qwen2.5')
+    // 来源列读的是**运行期注册表**的 source（谁把它装上去的），不是配置意图：
+    // 这两个实例由 openai 类型插件按自己的 id 注册，所以是 plugin:provider.<id>
+    expect(output).toInclude('来源=plugin:provider.deepseek')
+    expect(output).toInclude('来源=plugin:provider.local')
     await app.shutdown()
   })
 
@@ -1746,6 +1750,11 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     expect(h.providers.list().map((p) => p.id).sort()).toEqual(['claude-a', 'claude-b'])
     // 来源与类型随实例带出来（/model 的来源列可用）
     expect(h.providers.list().every((p) => p.type === 'anthropic')).toBe(true)
+    // 来源是插件注册键（不是 legacy）—— 迁移完成的标志
+    expect(h.providers.list().map((p) => p.source).sort()).toEqual([
+      'plugin:provider.claude-a',
+      'plugin:provider.claude-b',
+    ])
 
     const a = h.resolveChatProvider('claude-a')
     const b = h.resolveChatProvider('claude-b')
@@ -1827,6 +1836,32 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     await app.shutdown()
   })
 
+  it('内置 Provider 类型全部走运行期注册表（source=plugin:*），不再依赖 @internal 的 _setChatProvider', async () => {
+    const stdout = { write: () => {} }
+    const app = new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'oai',
+      permissionMode: 'allow-all', stdout, mockProviderConfig: { defaultResponse: 'hi' },
+      providers: [
+        { id: 'oai', type: 'openai', baseUrl: 'http://x', apiKey: 'k' },
+        { id: 'g', type: 'glm', apiKey: 'k' },
+        { id: 'q', type: 'qwen', apiKey: 'k' },
+        { id: 'c', type: 'anthropic', apiKey: 'k' },
+        { id: 'gem', type: 'gemini', apiKey: 'k' },
+      ],
+    })
+    const { harness } = await app.boot()
+    const list = (harness as unknown as {
+      providers: { list(): Array<{ id: string; source: string; type?: string }> }
+    }).providers.list()
+    const byId = new Map(list.map((p) => [p.id, p]))
+    // 五个实例，各占一个注册键、各带自己的 source
+    expect([...byId.keys()].sort()).toEqual(['c', 'g', 'gem', 'oai', 'q'])
+    for (const [id, type] of [['oai', 'openai'], ['g', 'glm'], ['q', 'qwen'], ['c', 'anthropic'], ['gem', 'gemini']] as const) {
+      expect(byId.get(id)).toMatchObject({ source: `plugin:provider.${id}`, type })
+    }
+    await app.shutdown()
+  })
+
   it('apiKey 支持 ${ENV_VAR} 引用：boot 时展开', async () => {
     const prev = process.env.HARNESS_TEST_OPENAI_KEY
     try {
@@ -1883,8 +1918,15 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     })
     const { harness } = await app.boot()
     expect(app.listProviders()).toContain('my-gw')
-    const h = harness as unknown as { resolveChatProvider: (id?: string) => { id?: string } }
+    const h = harness as unknown as {
+      resolveChatProvider: (id?: string) => { id?: string }
+      providers: { list(): Array<{ id: string; source: string }> }
+    }
     expect(h.resolveChatProvider('my-gw')?.id).toBe('my-gw')
+    // 老路径对照：这个桩走 `_setChatProvider` ⇒ source 记 legacy。
+    // 「内置包已全部迁到 providers.register」与「第三方桩仍可走老路径」两件事同时成立，
+    // 也说明回退分支不是死代码。
+    expect(h.providers.list().map((p) => p.source)).toEqual(['legacy'])
     await app.shutdown()
   })
 
@@ -2670,6 +2712,9 @@ describe('/plugins 插件管理', () => {
     const out = chunks.join('')
     expect(out).toInclude('provider.mock')
     expect(out).toInclude('可管理')
+    // 注册实例数：装了什么插件 与 注册了什么实例 是两个维度；默认实例带 (默认) 标记
+    expect(out).toInclude('已注册 Provider 实例 1：mock(默认)')
+    expect(out).toInclude('已注册 Agent 1：default')
     expect(out).toInclude('用法：/plugins')
     await app.shutdown()
   })

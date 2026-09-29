@@ -853,6 +853,8 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
             const ev = buildProviderCacheEvent({
               sessionId: signal.sessionId,
               round: sctx.round ?? 0,
+              // 端点维度：同一模型挂多个 Provider 实例时，model 名重复，只有它能区分端点
+              providerId: signal.providerId,
               cacheRead: signal.cacheRead,
               cacheWrite: signal.cacheWrite,
               requestTok: sctx.lastTokens,

@@ -15,7 +15,7 @@
  * 3. 环境变量 DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL
  */
 
-import type { ChatProvider } from '@harness/core'
+import type { ChatProvider, ProviderRuntime } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Tool } from '@harness/tool'
 import { OpenAIChatProvider, type OpenAIProviderConfig } from '@harness/provider-openai'
@@ -90,6 +90,7 @@ export function createProviderQwenPlugin(config?: QwenProviderConfig): AgentPlug
         async 'core.harness.init'(_input, output) {
           const harness = (output as { harness?: unknown }).harness as
             | {
+                providers?: ProviderRuntime
                 _setChatProvider?: (p: ChatProvider) => void
                 tools?: { list?: () => Tool[] }
               }
@@ -97,10 +98,18 @@ export function createProviderQwenPlugin(config?: QwenProviderConfig): AgentPlug
 
           if (!provider) return
 
-          if (harness?._setChatProvider) {
+          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id —— 见
+          // docs/runtime-registration-plan.md §2.1。**不设默认**：默认由宿主显式 setDefault。
+          if (harness?.providers) {
+            harness.providers.register(providerId, provider, {
+              source: `plugin:${pluginId}`,
+              type: 'qwen',
+            })
+          } else if (harness?._setChatProvider) {
+            // 老宿主回退（渐进迁移）
             harness._setChatProvider(provider)
           } else {
-            ctx.log.warn('Harness._setChatProvider 未找到，Qwen Provider 可能未注册')
+            ctx.log.warn('Harness.providers 未找到，Qwen Provider 可能未注册')
           }
 
           provider.setToolsGetter(() => harness?.tools?.list?.() ?? [])

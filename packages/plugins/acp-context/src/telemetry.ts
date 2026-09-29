@@ -83,6 +83,15 @@ export interface ProviderCacheEvent {
   ts: number
   sessionId: string
   round: number
+  /**
+   * 本轮实际命中的 Provider 实例 id（= `ProviderConfig.id`；引擎未给时为 null）。
+   *
+   * 为什么这行必须能指认端点：`model` 名在「同一模型挂多个端点」下是**重复**的
+   * （`ProviderConfig` 注释明确支持这个场景），只按模型看这行分不出走的是哪个 key/端点 ⇒
+   * 多实例启用后「哪条端点的缓存掉了」无从归因。null 而不是 undefined：与本节其它
+   * 可空字段同形（JSON 里 null 与"字段不存在"是两种意思，这里要的是前者）。
+   */
+  providerId: string | null
   cacheRead: number      // 命中缓存的输入 token
   cacheWrite: number     // 写入缓存（未命中但计入）的输入 token
   requestTok: number     // 本轮发往模型的 token（preModel 估算值，用于计算 provider 侧命中率）
@@ -365,6 +374,8 @@ export function buildCompressEvent(inp: CompressBuildInput): CompressEvent {
 export interface ProviderCacheBuildInput {
   sessionId: string
   round: number
+  /** 本轮实际命中的 Provider 实例 id（来自 `core.llm.usage` 的 providerId）；引擎未给则 null */
+  providerId?: string | undefined
   cacheRead: number | undefined
   cacheWrite: number | undefined
   requestTok: number | undefined
@@ -415,6 +426,7 @@ export function buildProviderCacheEvent(inp: ProviderCacheBuildInput): ProviderC
     ts: Date.now(),
     sessionId: inp.sessionId,
     round: inp.round,
+    providerId: inp.providerId ?? null,
     cacheRead,
     cacheWrite: inp.cacheWrite ?? 0,
     requestTok: inp.requestTok ?? 0,

@@ -32,6 +32,17 @@ interface HarnessView {
     hotReload(pluginId: string): Promise<void>
   }
   bus: Bus
+  /**
+   * 注册表视图（可选）：`/plugins` 顺带报「注册了多少实例」。
+   *
+   * 为什么值得单独报：**装了什么插件**与**注册了什么实例**是两个问题 —— 插件装了可能
+   * 一个实例都没注册（optIn 未触发 / 装配失败），反过来一个插件也能注册多个实例
+   * （同一类型的多个端点）。只列插件时这两类偏差都不可见。
+   *
+   * 可选是因为老宿主 / 测试桩只注入 plugin + bus，缺了就不报这一行（而不是报 0 条）。
+   */
+  providers?: { list(): Array<{ id: string; source?: string; isDefault?: boolean }> }
+  agent?: { list(): Array<{ id: string }> }
 }
 
 type PluginsCtx = Omit<CliCommandInput, 'harness'> & {
@@ -115,6 +126,17 @@ export function createPluginManagerPlugin(): AgentPlugin {
             const state = lp ? '已加载' : '已禁用'
             out(`  ${id.padEnd(28)}${meta.name}  v${meta.version}  来源=${lp?.source ?? '未加载'}  [${manage}·${state}]\n`)
           }
+        }
+        // 已注册实例（视图存在才报）：与插件清单是两个维度，见 HarnessView.providers 注释
+        const provs = inp.harness.providers?.list?.()
+        if (provs) {
+          const def = provs.find((p) => p.isDefault)?.id
+          const items = provs.map((p) => (p.id === def ? `${p.id}(默认)` : p.id)).join(' / ')
+          out(`已注册 Provider 实例 ${provs.length}${items ? `：${items}` : ''}\n`)
+        }
+        const agents = inp.harness.agent?.list?.()
+        if (agents) {
+          out(`已注册 Agent ${agents.length}${agents.length ? `：${agents.map((a) => a.id).join(' / ')}` : ''}\n`)
         }
         out('用法：/plugins <enable|disable|reload> <pluginId>\n')
         input.result = 'continue'

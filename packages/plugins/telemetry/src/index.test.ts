@@ -105,6 +105,33 @@ describe('mapBusEvent', () => {
     expect(ev.kind).toBe('telemetry.error')
     expect(ev.attrs.stage).toBe('start')
   })
+
+  test('provider.resolveMiss → telemetry.provider.resolveMiss（错误状态独占 kind），并填标准 provider 维度', () => {
+    const rec = {
+      name: 'provider.resolveMiss',
+      payload: { requested: 'hy3', fallbackId: 'anthropic', sessionId: 's_9', agentId: 'coder' },
+      timestamp: 11,
+      source: 'core',
+    }
+    const ev = mapBusEvent(rec)
+    expect(ev.kind).toBe('telemetry.provider.resolveMiss')
+    // 标准 provider 维度 = 「哪个实例没命中」；消费方按它聚合才不必知道载荷的原键名
+    expect(ev.attrs.provider).toBe('hy3')
+    // 原名保留（只加不改）
+    expect(ev.attrs.requested).toBe('hy3')
+    expect(ev.attrs.fallbackId).toBe('anthropic')
+    // 会话归属决定落哪个文件：有 sessionId 才进会话文件
+    expect(ev.attrs.sessionId).toBe('s_9')
+    expect(ev.attrs.agentId).toBe('coder')
+  })
+
+  test('provider.registered 仍走通用 kind（注册是正常事实，不该占错误事件的检索通道）', () => {
+    const ev = mapBusEvent({ name: 'provider.registered', payload: { id: 'a1', source: 'config' }, timestamp: 1 })
+    expect(ev.kind).toBe('telemetry.bus.provider.registered')
+    // 语义化不扩散：只有错误状态才提 provider 维度，正常事实保持原样
+    expect(ev.attrs.provider).toBeUndefined()
+    expect(ev.attrs.id).toBe('a1')
+  })
 })
 
 describe('createTelemetryService', () => {
@@ -129,6 +156,35 @@ describe('createTelemetryService', () => {
     expect(line.attrs.sessionId).toBe('sessA')
     expect(typeof line.attrs.userID).toBe('string')
     expect(line.attrs.userID).toHaveLength(24)
+  })
+
+  test('provider.resolveMiss 经 bus 落进会话文件（带 sessionId）；无归属才落 run 级', async () => {
+    const ResolveMiss = BusEvent.define<{ requested: string; fallbackId?: string; sessionId?: string }>(
+      'provider.resolveMiss',
+    )
+    const svc = createTelemetryService({ enabled: true, dataDir: dir, pathBuilder, crash: false })
+    const b = new InMemoryBus()
+    await svc.plugin.install({ bus: b } as never)
+
+    await b.publish(ResolveMiss, { requested: 'hy3', fallbackId: 'anthropic', sessionId: 'sessProv' })
+    await b.publish(ResolveMiss, { requested: 'hy4', fallbackId: 'anthropic' })
+    svc.telemetry.flush()
+
+    const sessLines = readFileSync(pathBuilder('sessProv'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as { kind: string; attrs: Record<string, unknown> })
+    expect(sessLines.map((l) => l.kind)).toEqual(['telemetry.provider.resolveMiss'])
+    expect(sessLines[0].attrs.sessionId).toBe('sessProv')
+    expect(sessLines[0].attrs.provider).toBe('hy3')
+
+    // 对照组：没有会话归属的那条不落会话文件，而是落 run 级 ——
+    // 这**正是修复前所有 resolveMiss 的归宿**，也是「按会话取证看不到静默回退」的成因
+    const runLines = readFileSync(pathBuilder(undefined), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => JSON.parse(l) as { attrs: Record<string, unknown> })
+    expect(runLines.map((l) => l.attrs.requested)).toEqual(['hy4'])
   })
 
   test('关闭时 record 为 no-op（不写盘）', () => {

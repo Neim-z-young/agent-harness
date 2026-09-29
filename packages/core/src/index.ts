@@ -830,6 +830,18 @@ export interface ProviderInstanceMeta {
   type?: string
 }
 
+/**
+ * 解析 Provider 时的**归属上下文**（只影响事件落点，不影响解析结果）。
+ *
+ * 与注册侧 `ProviderInstanceMeta` 的区别：那一个是「实例怎么来的」（写进注册表、长期有效），
+ * 这一个说「这次解析是谁发起的」（只进当次事件的载荷）。合在一起会污染注册表 ——
+ * 同一次注册会被不同会话的解析反复改写归属。
+ */
+export interface ProviderResolveCtx {
+  sessionId?: string
+  agentId?: string
+}
+
 /** 已注册 Provider 实例的对外信息（`ProviderRuntime.list()` 的元素） */
 export interface ProviderInstanceInfo {
   /** 实例 id —— 路由键（= ProviderConfig.id） */
@@ -872,8 +884,13 @@ export interface ProviderRuntime {
   /**
    * 解析：显式 id 命中 → 显式默认 → 首个已注册 → 构造期 Provider。
    * 显式 id 未命中时发布 `provider.resolveMiss` —— 静默回退就此可见。
+   *
+   * `ctx` 只影响**事件的归属**（sessionId/agentId 落进载荷），不参与选谁。
+   * 为什么必须给：解析失败发生在**轮内**（`_runStep` 有 sessionId），若事件不带
+   * 会话归属，遥测会把它写进 run 级文件 ⇒ 按会话取证时「静默回退」永远看不到，
+   * 与 `telemetry.tool.fail` 曾丢掉 sessionId 是同一个坑。
    */
-  resolve(id?: string): ChatProvider
+  resolve(id?: string, ctx?: ProviderResolveCtx): ChatProvider
   /** 按 id 取实例（不存在返回 undefined；**不**触发回退与事件） */
   get(id: string): ChatProvider | undefined
   /** 列出全部实例（含来源与是否默认） */
@@ -2192,7 +2209,7 @@ export class AgentRuntimeImpl implements AgentRuntime {
       readonly session: SessionManager
       readonly toolRegistry: ToolRegistry
       readonly toolPipeline: ToolPipeline
-      readonly chatProvider: (providerId?: string) => ChatProvider
+      readonly chatProvider: (providerId?: string, ctx?: ProviderResolveCtx) => ChatProvider
       readonly permission: PermissionEngine
       readonly triggerPlugin: <N extends keyof Hooks>(
         name: N,
@@ -2994,7 +3011,9 @@ export class AgentRuntimeImpl implements AgentRuntime {
     priorStepSigs: readonly string[] = [],
   ): AsyncGenerator<AgentStreamEvent, StepOutcome, unknown> {
     const { agentId, sessionId, allowedTools, providerId, modelId } = prepared
-    const provider = this.deps.chatProvider(providerId)
+    // 归属随解析一起给：providerId 未命中时 core 会发 `provider.resolveMiss`，
+    // 不带会话归属的话那条事件会落进 run 级遥测文件，按会话取证时看不到（见 ProviderResolveCtx）。
+    const provider = this.deps.chatProvider(providerId, { sessionId, agentId })
 
     // 每轮重建：会话已被上一轮写回（assistant + 工具结果），ACP 也可能刚折叠过消息
     const { messages: finalMessages, params, headers } = await this._buildStepMessages(prepared)
@@ -3406,6 +3425,11 @@ export class AgentRuntimeImpl implements AgentRuntime {
         sessionId,
         ...(agentId ? { agentId } : {}),
         ...(model ? { model } : {}),
+        // 端点维度：同一模型挂多个 Provider 实例时，只有 providerId 能区分是哪个端点。
+        // `'default'` 是「未指定 ⇒ 走默认 Provider」的**哨兵**（`prepared.providerId` 的兜底值，
+        // 见 `_prepareQueryOnce`），注册表里并没有这个键 —— 原样带上去等于凭空造出一个假端点，
+        // 所以归一为「不带」：缺省本身就表达"这次走默认"。
+        ...(providerId && providerId !== 'default' ? { providerId } : {}),
         step,
         input: tokenUsage.input,
         output: tokenUsage.output,
@@ -4039,12 +4063,19 @@ class ProviderRuntimeImpl implements ProviderRuntime {
     }
   }
 
-  resolve(id?: string): ChatProvider {
+  resolve(id?: string, ctx?: ProviderResolveCtx): ChatProvider {
     if (id && id !== 'default') {
       const hit = this.instances.get(id)
       if (hit) return hit.provider
       const fallbackId = this._effectiveDefaultId()
-      this._publish(ProviderEvents.resolveMiss, { requested: id, ...(fallbackId ? { fallbackId } : {}) })
+      // 带上会话归属：这一条是「配置指向了不存在的实例」的唯一线上证据，
+      // 落在 run 级文件里就等于按会话取证时看不见（见 ProviderResolveCtx 注释）。
+      this._publish(ProviderEvents.resolveMiss, {
+        requested: id,
+        ...(fallbackId ? { fallbackId } : {}),
+        ...(ctx?.sessionId ? { sessionId: ctx.sessionId } : {}),
+        ...(ctx?.agentId ? { agentId: ctx.agentId } : {}),
+      })
       return this._default()
     }
     return this._default()
@@ -4221,7 +4252,7 @@ export class HarnessImpl implements Harness {
       session: this.session,
       toolRegistry: this.tools,
       toolPipeline: this.toolPipeline,
-      chatProvider: (providerId?: string) => this.resolveChatProvider(providerId),
+      chatProvider: (providerId?: string, ctx?: ProviderResolveCtx) => this.resolveChatProvider(providerId, ctx),
       permission: this.permission,
       triggerPlugin: (n, ...args) => (this.plugin as any).trigger(n, ...args),
       // 复用 pipeline 的那份派发逻辑（同一个 postHook 闭包），别开第二条实现路径
@@ -4427,8 +4458,8 @@ export class HarnessImpl implements Harness {
    * 委托给 {@link ProviderRuntime.resolve}：显式 id 命中 → 显式默认 → 首个已注册 →
    * 构造期 Provider。**未命中会发 `provider.resolveMiss`**（此前是静默回退默认）。
    */
-  resolveChatProvider(providerId?: string): ChatProvider {
-    return this.providers.resolve(providerId)
+  resolveChatProvider(providerId?: string, ctx?: ProviderResolveCtx): ChatProvider {
+    return this.providers.resolve(providerId, ctx)
   }
 
   // ----- 兼容层：旧注入路径（供尚未迁移的 Provider 插件使用） -----

@@ -2428,6 +2428,11 @@ export class HarnessApp {
    *
    * `keyTag`：apiKey 展示标签。**仅当该实例与别的实例「type+baseUrl+model 全同」时才附指纹**
    * （`已配置(…AB12)`），因为只有这种情况下列表行会完全一样、只能靠 token 区分；其余场景保持简洁。
+   *
+   * `source`：实例在**运行期注册表**里的来源（`plugin:provider.anthropic` / `legacy` / `runtime` …）。
+   * 与 config 侧的配置意图是两件事：配置说「我想要这个端点」，source 说「谁把它装了上去」——
+   * 只有后者能区分「配置写了但压根没装配」（`未注册`）。
+   * boot 前（harness 未建）不做交叉，此时不带 source（展示层也就不会有来源列）。
    */
   listConfiguredProviders(): Array<{
     index: number
@@ -2437,8 +2442,12 @@ export class HarnessApp {
     apiPath?: string
     type?: string
     keyTag?: string
+    source?: string
   }> {
     const dupIds = new Set(findTokenOnlyDuplicates(this.loadedProviders).flatMap((g) => g.members.map((m) => m.id)))
+    // 老宿主 / 测试桩可能没有 providers 视图 ⇒ 可选链，取不到就不交叉（等于 boot 前的行为）
+    const runtime = (this.harness as Harness | undefined)?.providers?.list?.()
+    const sourceById = new Map((runtime ?? []).map((p) => [p.id, p.source]))
     return this.loadedProviders.map((p, i) => ({
       index: i + 1,
       id: p.id,
@@ -2446,6 +2455,7 @@ export class HarnessApp {
       baseUrl: p.baseUrl,
       apiPath: p.apiPath,
       type: p.type,
+      ...(runtime ? { source: sourceById.get(p.id) ?? '未注册' } : {}),
       ...(dupIds.has(p.id) ? { keyTag: formatApiKeyTag(p.apiKey, { fingerprint: true }) } : {}),
     }))
   }
@@ -3851,6 +3861,9 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
                   p.baseUrl ? `baseUrl=${p.baseUrl}` : '',
                   p.apiPath ? `apiPath=${p.apiPath}` : '',
                   p.type ? `type=${p.type}` : '',
+                  // 来源 = 运行期注册表里的 source（谁把它装上去的），不是配置意图 ——
+                  // 「配置写了却没装配」在这里表现为 来源=未注册
+                  p.source ? `来源=${p.source}` : '',
                   p.keyTag ? `key=${p.keyTag}` : '',
                 ].filter(Boolean).join(' · ')
                 out(`  ${p.index}) ${model}${extra ? `  (${extra})` : ''}\n`)

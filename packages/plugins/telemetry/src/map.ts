@@ -7,10 +7,23 @@
  */
 
 import type { BusEventRecord } from '@harness/bus'
-import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity, type TelemetryEnvelope } from './envelope.js'
+import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
 
-/** 需要单独语义化 kind 的特殊事件（其余走 telemetry.bus.<name>） */
-const ERROR_NAMES = new Set(['harness.error'])
+/**
+ * 需要单独语义化 kind 的特殊事件（其余走 telemetry.bus.<name>）。
+ *
+ * 判据不是「重要与否」，而是**它是错误状态还是正常事实**：正常事实（注册 / 反注册 /
+ * 默认变更）落通用 kind 就够，它们本就该按时间线读；错误状态必须能被独立检索，
+ * 否则会被同类正常事实淹没。
+ */
+const SEMANTIC_KINDS: Record<string, string> = {
+  'harness.error': 'telemetry.error',
+  // `provider.resolveMiss`：「配置指向了一个不存在的 Provider 实例」——
+  // 它是**错误状态**而不是注册事实：模型请求会**悄悄换一个 Provider 去发**，
+  // 表面上完全正常。落 `telemetry.bus.provider.resolveMiss` 的话，与
+  // registered / defaultChanged 这些每次都发生的正常事实挤在一起，检索时拉不出来。
+  'provider.resolveMiss': 'telemetry.provider.resolveMiss',
+}
 /** 当作"会话边界"的事件（仅用于更新 lastKnown，不强依赖） */
 const LIFECYCLE_NAMES = new Set(['harness.initialized', 'harness.started', 'harness.stopped'])
 
@@ -19,16 +32,30 @@ const LIFECYCLE_NAMES = new Set(['harness.initialized', 'harness.started', 'harn
  * 返回 null 表示该事件不落盘（极端脱敏场景专用，默认恒非 null）。
  */
 export function mapBusEvent(ev: BusEventRecord): TelemetryEnvelope {
-  const kind = ERROR_NAMES.has(ev.name) ? 'telemetry.error' : `telemetry.bus.${ev.name}`
+  const kind = SEMANTIC_KINDS[ev.name] ?? `telemetry.bus.${ev.name}`
   const identity = extractIdentity(ev.payload)
   const attrs = {
     ...pickAttrs(ev.payload),
+    ...semanticAttrs(ev.name, ev.payload),
     source: ev.source,
     sessionId: identity.sessionId,
     agentId: identity.agentId,
     round: pickRound(ev.payload),
   }
   return makeEnvelope(kind, attrs, pickMetrics(ev.payload), ev.timestamp)
+}
+
+/**
+ * 语义化事件的专项 attrs：把载荷里的近义键提到 `TelemetryAttrs` 的**标准维度**上。
+ *
+ * 为什么值得多这一步：标准键（`provider`）才能与其它事件的同一维度一起 group by；
+ * 载荷原名一律保留（`pickAttrs` 已落），所以这步只做**加**、不做改名。
+ */
+function semanticAttrs(name: string, payload: unknown): TelemetryAttrs {
+  if (name !== 'provider.resolveMiss' || payload === null || typeof payload !== 'object') return {}
+  const v = (payload as Record<string, unknown>)['requested']
+  // provider 维度 = 「哪个实例没命中」，这也是消费方唯一想聚合的那个问题
+  return typeof v === 'string' && v.length > 0 ? { provider: v } : {}
 }
 
 function pickRound(payload: unknown): number | undefined {

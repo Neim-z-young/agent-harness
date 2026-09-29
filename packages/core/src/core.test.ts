@@ -1354,6 +1354,56 @@ describe('@harness/core', () => {
       expect(misses).toHaveLength(1)
     })
 
+    it('resolveMiss 带会话归属：显式给 ctx 才有，不给就不凭空编造', async () => {
+      const bus = new InMemoryBus()
+      const misses: Array<Record<string, unknown>> = []
+      bus.subscribe(ProviderEvents.resolveMiss, (e) => {
+        misses.push(e.payload as Record<string, unknown>)
+      })
+      const a1 = spyProvider('a1')
+      const h = await createHarness({
+        bus,
+        chatProvider: spyProvider('legacy').provider,
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            p.register('a1', a1.provider, { source: 'config' })
+            p.setDefault('a1')
+          }),
+        ],
+      })
+
+      expect(h.providers.resolve('ghost', { sessionId: 's-1', agentId: 'coder' })).toBe(a1.provider)
+      await new Promise((r) => setTimeout(r, 0))
+      expect(misses[0]).toEqual({ requested: 'ghost', fallbackId: 'a1', sessionId: 's-1', agentId: 'coder' })
+
+      // 无会话上下文的解析（装配期 / 探针调用）：不编造 sessionId —— 编造会让事件落进错误的会话文件
+      expect(h.providers.resolve('ghost2')).toBe(a1.provider)
+      await new Promise((r) => setTimeout(r, 0))
+      expect(misses[1]).toEqual({ requested: 'ghost2', fallbackId: 'a1' })
+    })
+
+    it('轮内 providerId 未命中 ⇒ 事件带 sessionId（否则遥测落 run 级文件，按会话取证看不见）', async () => {
+      const bus = new InMemoryBus()
+      const misses: Array<Record<string, unknown>> = []
+      bus.subscribe(ProviderEvents.resolveMiss, (e) => {
+        misses.push(e.payload as Record<string, unknown>)
+      })
+      const h = await createHarness({
+        bus,
+        chatProvider: spyProvider('legacy').provider,
+        agents: [makeAgent({ id: 'use-ghost', model: { providerId: 'ghost', modelId: 'm' } })],
+      })
+      await h.start()
+      const sess = await h.session.create()
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-ghost', message: 'hi' })
+      await h.stop()
+
+      // 这一条盯的是 `_runStep` 里 `deps.chatProvider(providerId, { sessionId, agentId })` 那个调用点：
+      // 只在 ProviderRuntime 层支持 ctx 是不够的 —— 轮内不传就白搭
+      expect(misses).toHaveLength(1)
+      expect(misses[0]).toMatchObject({ requested: 'ghost', sessionId: sess.id, agentId: 'use-ghost' })
+    })
+
     it('provider.registered / defaultChanged 事实可观测，且带来源', async () => {
       const bus = new InMemoryBus()
       const registered: Array<{ id: string; source: string; type?: string }> = []
@@ -1381,6 +1431,48 @@ describe('@harness/core', () => {
         { id: 'a2', source: 'config' },
       ])
       expect(defaults).toEqual([{ id: 'a1', reason: 'set' }])
+    })
+
+    it('core.llm.usage 带 providerId：同一模型挂多个端点时，用量才分得清是哪个端点', async () => {
+      const seen: Array<{ model?: string; providerId?: string }> = []
+      const usagePlugin: AgentPlugin = {
+        id: 'test.usage',
+        version: '0.0.0',
+        name: 'test.usage',
+        async install() {
+          return {
+            'core.llm.usage'(sig: unknown) {
+              seen.push(sig as { model?: string; providerId?: string })
+            },
+          } as unknown as Hooks
+        },
+      }
+      const h = await createHarness({
+        chatProvider: spyProvider('legacy').provider,
+        agents: [
+          makeAgent({ id: 'use-ep', model: { providerId: 'ep2', modelId: 'claude-3-5-sonnet' } }),
+          makeAgent({ id: 'use-bare', model: { modelId: 'claude-3-5-sonnet' } }),
+        ],
+        internalPlugins: [
+          registrarPlugin('test.reg', (p) => {
+            p.register('ep1', spyProvider('ep1').provider, { source: 'config' })
+            p.register('ep2', spyProvider('ep2').provider, { source: 'config' })
+            p.setDefault('ep1')
+          }),
+          usagePlugin,
+        ],
+      })
+      await h.start()
+      const sess = await h.session.create()
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-ep', message: 'hi' })
+      await h.agent.query({ sessionId: sess.id, agentId: 'use-bare', message: 'hi' })
+      await h.stop()
+
+      expect(seen).toHaveLength(2)
+      // 两个 agent 的 modelId 完全一样，唯一的区别就是这个维度 —— 没有它，两条端点不可区分
+      expect(seen[0]).toMatchObject({ providerId: 'ep2', model: 'ep2-v1' })
+      // 未绑定 providerId 的 agent：不凭空编造端点（编造会让用量归到错误的一端）
+      expect(seen[1].providerId).toBeUndefined()
     })
   })
 
