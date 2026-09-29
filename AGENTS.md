@@ -271,6 +271,8 @@
 
 - **运行时默认容忍 schema 未声明的字段**：`additionalProperties:false` 是**给模型的声明**，不等于运行期拒收。两条理由：模型偶尔带无害冗余（拒它等于凭空造一类新失败），且 `oneOf` 多模式的 schema **刻意省略 `properties`**（一律拒会误伤合法入参）。要真拒用 `strictProperties: true` 显式开。反向验证时这条被证明不是想当然：把默认改成拒绝 ⇒ `glob` 的 `exclude` / 文件大小过滤两条既有用例直接红 —— 因为 `GlobInput` 有 8 个字段而 glob 的 schema 只声明了 4 个（**输入接口字段 ↔ schema properties 必须对齐**，否则模型发现不了那些参数）
 
+- **入参接口的每个字段都必须在 `schema.properties` 里出现，否则 `tsc` 直接报错**：`fromJsonSchema<T>` 的入参类型是 `JsonSchemaFor<T>`，它把 `properties` 约束成 `{ [K in keyof T & string]: unknown }`、`required` 约束成 `Array<keyof T & string>`，多一个少一个都过不了 `bun run typecheck`。为什么把这件事放在**类型**上而不是写运行时断言：接口字段是**类型层面**的东西，运行时拿不到；而漏声明的后果恰好只在类型层面可判 —— 模型看不到那个参数、运行期却照收，表现为"能力凭空消失且**没有任何报错**"。实测漏过 7 个：`glob` 的 `exclude` / `minSizeBytes` / `maxSizeBytes` / `maxDepth`，`web_fetch` 的 `followRedirects` / `maxResponseBytes` / `allowPrivateNetwork`。**要"故意"不暴露某个字段，就给该工具一个更窄的入参类型**（范例：`bash_ro` 用 `Omit<BashInput,'env'>` 表达"不接受 env —— ENV 是绕过只读的后门"），而不是让 schema 与类型各说各话（那会退化成"模型传了、被静默忽略"）。`oneOf` 多模式（`code_semantic_edit`）走豁免分支：顶层不写 `properties`，各模式在 `oneOf[].properties` 里各自声明
+
 ## 6. 安全与协作
 
 - 子代理工具调用 `isConcurrencySafe` 必须为 `false`，防止并发写冲突

@@ -1,5 +1,98 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 215）入参字段 ↔ schema properties：全量核对 + 编译期守卫
+
+### 起因：上一轮那条"意外收获"
+
+续 214 的 E3 实验暴露出 glob 的 schema 少了 4 个字段，当时留作遗留第 1 项：**运行期容忍所以不断功能，
+但模型发现不了这些参数**。本轮把它做成全量核对，并设法让这类漂移不可能再发生。
+
+### 核对方法
+
+写脚本解析每个 `fromJsonSchema<T>({...})` 的 `properties` 顶层键与对应 `interface XInput` 的字段，
+双向比对（缺 / 多 / required 越界）。两个必须处理的解析坑：
+
+- **`required` 只能取顶层的**：`compress` 的 schema 在数组 `items` 里还有一层
+  `required: ['startId','endId','summary']`，正则取第一个命中会误报 4 处"假不对齐"；
+- **同一个类型名会出现两次**：`bash` 与 `bash_ro` 都用 `BashInput`，按类型名建字典会互相覆盖，
+  必须按出现次序编号 —— 正是这次覆盖把 `bash_ro` 少 `env` 那一处藏了起来。
+
+### 结论：29 个 schema、3 处不对齐
+
+| 工具 | 性质 | 缺的字段 |
+|---|---|---|
+| `glob` | **真漏** | `exclude` / `minSizeBytes` / `maxSizeBytes` / `maxDepth` |
+| `web_fetch` | **真漏** | `followRedirects` / `maxResponseBytes` / `allowPrivateNetwork` |
+| `bash_ro` | **刻意**，但类型比契约宽 | `env` —— 只读工具不接受入参覆盖环境变量 |
+
+其余 26 个（含 4 处 ACP、10 处 swarm、4 处 code-intel）字段与 properties 一一对应，`required` 无一越界。
+
+`bash_ro` 那处不是 bug 而是**表达问题**：注释写明"ENV 是绕过只读的常见后门（`PYTHONSTARTUP` /
+`NODE_OPTIONS` 都能让只读命令执行任意代码）"，所以 schema 少 `env` 是对的；错的是它的入参类型仍声明
+`BashInput`（含 `env?`）—— 后果是模型传 `env` 会被**静默忽略**，且没有任何机制能表达"这里少一个字段是故意的"。
+
+### 形态：把对齐做成**编译期**约束
+
+三个选项：
+
+| 方案 | 判定 |
+|---|---|
+| 运行时断言 | **写不出来** —— 接口字段是类型层面的东西，运行期拿不到 |
+| 独立审计脚本进 CI | 可行，但要为 Bun/TS 仓引入 Python 依赖与一份"自己解析 TS"的脆弱代码，且与 typecheck 分属两道闸 |
+| **入参类型约束（选用）** | 漏声明恰好只在类型层面可判 ⇒ 与 `bun run typecheck` 同一道闸，零运行时成本、零新增基建 |
+
+新增 `JsonSchemaFor<T>` 作为 `fromJsonSchema` 的入参类型，两个分支：
+
+```ts
+export type JsonSchemaFor<T> =
+  | { type: 'object'
+      properties: { [K in keyof T & string]: unknown }   // 逐个覆盖 keyof T，多一个少一个都编译不过
+      required?: Array<keyof T & string>                 // required 也不能列接口外的键
+      additionalProperties?: boolean
+      [k: string]: unknown }
+  | { type: 'object'; oneOf: unknown[]; [k: string]: unknown }   // 多模式豁免（code_semantic_edit 顶层无 properties）
+```
+
+**"故意不暴露某字段"的正解不是删 schema 字段，而是收窄入参类型** —— `bash_ro` 改用
+`export type ReadOnlyBashInput = Omit<BashInput, 'env'>`，把这个安全决定写进类型，schema 与类型才一致。
+
+### 反向验证：5 组实验逐条归因
+
+| 实验 | 期望 | 实际 | 报错包 | 码 |
+|---|---|---|---|---|
+| E1 摘掉 glob 的 `maxDepth` | error | error ✓ | `@harness/tools-glob` | TS2345 |
+| E2 守卫退回松散 `JsonSchemaObject`（负向用例一并摘掉） | **no-error** | no-error ✓ | 无 | 无 |
+| E3 `bash_ro` 入参改回 `BashInput` | error | error ✓ | `@harness/tools-builtin` + `@harness/core` | TS2345 |
+| E4 摘掉 web_fetch 的 `allowPrivateNetwork` | error | error ✓ | `@harness/tools-web` | TS2345 |
+| E5 `required` 约束放松成 `string[]` | error | error ✓ | `@harness/tool` | TS2578 |
+
+两条值得单说：
+
+- **E2 是最关键的一条**：守卫一旦退回松散形态，那个漏字段**完全没人拦**（连 TS2345 都没有）——
+  证明抓到它的确实是守卫本身，而不是别的什么。若只做 E1 不做 E2，"是守卫在拦"这个结论其实没有证据。
+- **E3 的报错跨了两个包**：`@harness/core` 也红，因为 root `tsconfig` 用 paths 直接映射到
+  tools-builtin 的**源码**（非 dist）⇒ 一处类型不符会顺着路径映射往上传染。这是好事（改错立刻可见），
+  但也意味着**工具包的类型改动会让无关包一起变红**，归因时要认得出来。
+
+### 脚本自身的两个坑（值得记）
+
+1. **macOS 的 BSD grep 不支持 `\|` 交替**：`grep "a\|b"` 会当成字面量，静默返回空 ——
+   一度误判"type 定义被删了"。跨模式搜索一律用 ERE（`grep -E`）或专用工具。
+2. **反向验证脚本在同一文件打多处补丁时，第二轮备份会覆盖第一轮** ⇒ 还原时留下"补丁一已生效、
+   补丁二未生效"的中间态。危险在于**这个中间态仍然能编译通过**，只看末尾 typecheck 的 exit code 抓不到。
+   修法：同文件只记**最初**快照，并在末尾对全部被触碰文件做一次"与快照逐字节一致"的断言。
+
+### 验收
+
+`typecheck` 39 包 0 error；全量 `test` 39 包 0 fail，2022 → **2025** pass（tool +3：两条 `@ts-expect-error`
+负向用例 + 一条 oneOf 豁免的正向对照）。审计脚本**未入库**：编译期守卫已覆盖全部静态工具的**双向**对齐，
+脚本只剩"跨文件接口 + 动态工具"的报告价值，为此在 Bun/TS 仓里长期养一份 Python 不划算（方法记录在本文）。
+
+### 遗留
+
+1. `read_file` 的**直接调用**仍是裸 `resolvePath(input.path)`（生产路径已被管道 Step 1 保护）—— 承续 214。
+2. `UsageStats` 的 provider 维度、`unregister` 级联、`_setChatProvider` 最终删除 —— 承续 213。
+
 ## 2026-09-29（续 214）工具入参运行时校验：从 JSON Schema 派生 + 30 个工具迁移
 
 ### 起因：三层落差
