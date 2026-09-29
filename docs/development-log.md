@@ -1,5 +1,61 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 217）入参守卫收拢：三份形态 → 一份 `guardInput`
+
+### 起因
+
+续 216 的遗留：bash 的守卫当时**内联**着写，形态与 `guardPathInput` 一致、代码却各有一份。
+`glob` 因错误码口径不同（`GLOB_PATTERN_MISSING` 只对应 pattern 缺失）不参与收拢。
+
+### 改动
+
+| 位置 | 收拢前 | 收拢后 |
+|---|---|---|
+| `read_file` / `write_file` / `edit_file` | `guardPathInput(schema, input, 'PATH_REQUIRED')` | `guardInput(schema, input, 'path', 'PATH_REQUIRED')` |
+| `bash` | 内联（`safeParse` + `rule` 判据 + 两档码，约 15 行） | 同一个助手，`'command'` / `'COMMAND_REQUIRED'` |
+| `bashInputSchema` | 工厂函数体内（只为让 `call()` 复用） | 模块级常量（与三兄弟同形） |
+| `glob` | 自带一份（码口径不同） | 不变 |
+
+签名 `guardInput<T>(schema: Schema<T>, input: unknown, requiredField: string, requiredCode: string)`。
+把"字段名"与"错误码"都提成参数、而不是让助手写死 `'path'` —— 因为"缺哪个字段""对外报哪个码"是**工具自己的契约**，
+助手只负责"怎么判"。这也让 bash 与三兄弟的调用点长得完全一样。
+
+**`bash_ro` 仍不接**：它的 `call()` 第一行是 `checkReadOnlyCommand(input?.command, allowlist)`，
+内部 `String(command ?? '')` 已把缺失/非字符串归一成空串并返回 `COMMAND_REQUIRED` —— "非空"是那个语义校验器
+契约的一部分，与 schema 不重复。
+
+### 顺手修掉一处注释错位
+
+续 216 插入 `JsonSchemaRule` 时，把它放在了 `JsonSchemaIssue` 的 JSDoc 与 `interface` 之间 ⇒
+"单个校验问题。`message` 会被 `ToolSchemaError` 拼进错误文本…"这段文档挂到了 `JsonSchemaRule` 头上，
+而 `JsonSchemaIssue` 反而失去了自己的文档。已各归其位。
+
+### 反向验证：4 组，全部按预期命中
+
+| 实验 | 摘掉什么 | 变红 |
+|---|---|---|
+| E1 | bash 的结构守卫（退回历史手写 `typeof` 形态） | 3（两条类型错 + 新用例） |
+| E2 | 助手的 `rule === 'required'` 判据（退回只看 `path`） | 2（bash **与** read_file，跨工具） |
+| E3 | bash 的语义判据（纯空白 command） | 2（既有空串用例 + 新用例） |
+| E4 | `requiredCode` 写死成 `INVALID_INPUT` | 5（四个工具的"缺必填码"全红） |
+
+两点归因要写清楚：
+- **E1 里"缺 command ⇒ COMMAND_REQUIRED"仍然绿是对的** —— 历史手写守卫也拦得住它。这条实验证明的是
+  "结构判据（性质分流 + 消息来源）由 `guardInput` 提供"，不是"缺必填只有它拦得住"。
+- **E2 / E4 的红都是跨工具同时红** —— 判据与码各只有一份，改一处必影响多处，这正是收拢想要的效果。
+
+### 验收
+
+`typecheck` 39 包 0 error；全量 `test` 2033 → **2034** pass / 0 fail。
+新增 1 条用例锁的是**两段式的边界**：同一个码 `COMMAND_REQUIRED` 有两个来源 ——
+缺 command 由 schema 派生（message 含"缺少必填参数"），纯空白由 `call()` 内手判（message 是手写的）。
+既有 92 条一字未改即全绿，是"重构未改行为"的控制组。
+
+### 遗留
+
+- `glob` 的守卫仍是自带一份 —— 要收拢得先决定"非 pattern 的结构错该报什么码"（口径决策，不是机械改动）
+- `UsageStats` 的 provider 维度、`unregister` 级联、`_setChatProvider` 最终删除（承续 213）
+
 ## 2026-09-29（续 216）直调入参守卫 + 守卫判据的结构化（rule）
 
 ### 起因
