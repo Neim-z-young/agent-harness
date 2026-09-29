@@ -15,6 +15,10 @@ import {
   ToolValidationError,
   defineTool,
   withJsonSchema,
+  fromJsonSchema,
+  JsonSchemaValidationError,
+  formatSchemaError,
+  schemaIssues,
   partitionToolCalls,
   parseMcpToolId,
   filterMcpTools,
@@ -967,5 +971,236 @@ describe('withJsonSchema', () => {
     // 运行时校验行为不变（仍委托原 schema）
     expect(s.parse({ a: 'x' })).toEqual({ a: 'x' })
     expect(s.safeParse({ a: 'x' })).toEqual({ success: true, data: { a: 'x' } })
+  })
+})
+
+// ===== fromJsonSchema：由 JSON Schema 派生的运行时校验 =====
+//
+// 这组用例的每条断言都单独锁定一个行为（缺必填 / 类型 / 多余字段 / union / enum / items /
+// 边界 / 放行未知关键字 / 管道出口），目的是让"摘掉某一项检查 ⇒ 只有对应用例变红"成立 ——
+// 这是反向验证能逐条归因的前提。
+
+describe('fromJsonSchema', () => {
+  /** 形如 bash 的 schema：一个必填串 + 一个可选数字 + additionalProperties:false */
+  const bashLike = {
+    type: 'object' as const,
+    properties: {
+      command: { type: 'string', description: '要执行的 shell 命令' },
+      timeoutMs: { type: 'number', description: '超时（毫秒）' },
+    },
+    required: ['command'],
+    additionalProperties: false,
+  }
+
+  it('合规入参通过，data 原样返回（既不剥离多余字段，也不另造对象）', () => {
+    const s = fromJsonSchema<{ command: string }>(bashLike)
+    const input = { command: 'ls' }
+    const r = s.safeParse(input)
+    expect(r.success).toBe(true)
+    if (!r.success) return
+    expect(r.data).toBe(input)
+  })
+
+  it('__jsonSchema 与传入的是同一个对象（单一取源，模型侧 tools 载荷零变化）', () => {
+    const s = fromJsonSchema(bashLike)
+    expect(s.__jsonSchema).toBe(bashLike)
+  })
+
+  it('缺必填 ⇒ 拒，且 message 指出参数名与期望类型（模型自愈所需的全部信息）', () => {
+    const s = fromJsonSchema(bashLike)
+    const r = s.safeParse({ timeoutMs: 100 })
+    expect(r.success).toBe(false)
+    if (r.success) return
+    const err = r.error as JsonSchemaValidationError
+    expect(err).toBeInstanceOf(JsonSchemaValidationError)
+    expect(err.issues).toHaveLength(1)
+    expect(err.issues[0]!.path).toBe('command')
+    expect(err.issues[0]!.message).toContain('缺少必填参数')
+    expect(err.issues[0]!.message).toContain('字符串')
+  })
+
+  it('类型不符 ⇒ 拒，message 写成「应为 X，收到 Y」', () => {
+    const s = fromJsonSchema(bashLike)
+    const r = s.safeParse({ command: 'ls', timeoutMs: 'soon' })
+    expect(r.success).toBe(false)
+    if (r.success) return
+    const err = r.error as JsonSchemaValidationError
+    expect(err.issues[0]!.path).toBe('timeoutMs')
+    expect(err.issues[0]!.message).toContain('应为 数字')
+    expect(err.issues[0]!.message).toContain('收到 字符串')
+  })
+
+  it('多余字段默认容忍，且原样保留（模型的无害冗余不该造出新失败类）', () => {
+    const s = fromJsonSchema<{ command: string }>(bashLike)
+    const r = s.safeParse({ command: 'ls', recursive: true })
+    expect(r.success).toBe(true)
+    if (!r.success) return
+    expect((r.data as Record<string, unknown>).recursive).toBe(true)
+  })
+
+  it('strictProperties:true 时才拒绝未声明字段（声明与运行期一致性按需开启）', () => {
+    const s = fromJsonSchema(bashLike, { strictProperties: true })
+    const r = s.safeParse({ command: 'ls', recursive: true })
+    expect(r.success).toBe(false)
+    if (r.success) return
+    const err = r.error as JsonSchemaValidationError
+    expect(err.issues[0]!.path).toBe('recursive')
+    expect(err.issues[0]!.message).toContain('未声明')
+  })
+
+  it('oneOf 多模式且不声明 properties ⇒ 合法形态不误伤（带额外字段也算合法）', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      oneOf: [
+        { properties: { path: { type: 'string' } }, required: ['path'] },
+        { properties: { content: { type: 'string' } }, required: ['content'] },
+      ],
+    } as never)
+    expect(s.safeParse({ path: 'a.ts', extra: 1 }).success).toBe(true)
+    expect(s.safeParse({ content: 'x' }).success).toBe(true)
+  })
+
+  it('oneOf 两条分支都不满足 ⇒ 拒', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      oneOf: [
+        { properties: { path: { type: 'string' } }, required: ['path'] },
+        { properties: { content: { type: 'string' } }, required: ['content'] },
+      ],
+    } as never)
+    const r = s.safeParse({ nothing: 1 })
+    expect(r.success).toBe(false)
+    if (r.success) return
+    expect((r.error as JsonSchemaValidationError).issues[0]!.message).toContain('形态不受支持')
+  })
+
+  it('enum 越界 ⇒ 拒；命中枚举值仍通过（控制组）', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      properties: { type: { type: 'string', enum: ['message', 'task'] } },
+    } as never)
+    const bad = s.safeParse({ type: 'nope' })
+    expect(bad.success).toBe(false)
+    if (!bad.success) {
+      expect((bad.error as JsonSchemaValidationError).issues[0]!.message).toContain('只能是')
+    }
+    expect(s.safeParse({ type: 'message' }).success).toBe(true)
+  })
+
+  it('数组 items 逐项校验，路径带到下标', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      properties: { argv: { type: 'array', items: { type: 'string' } } },
+    } as never)
+    const r = s.safeParse({ argv: ['a', 1] })
+    expect(r.success).toBe(false)
+    if (r.success) return
+    const issue = (r.error as JsonSchemaValidationError).issues[0]!
+    expect(issue.path).toBe('argv[1]')
+    expect(issue.message).toContain('应为 字符串')
+  })
+
+  it('数值与长度边界生效（minimum / maximum / minLength / minItems）', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      properties: {
+        n: { type: 'number', minimum: 1, maximum: 10 },
+        text: { type: 'string', minLength: 2 },
+        list: { type: 'array', items: { type: 'string' }, minItems: 1 },
+      },
+    } as never)
+    const r = s.safeParse({ n: 0, text: 'a', list: [] })
+    expect(r.success).toBe(false)
+    if (r.success) return
+    const paths = (r.error as JsonSchemaValidationError).issues.map((i) => i.path).sort()
+    expect(paths).toEqual(['list', 'n', 'text'])
+  })
+
+  it('未识别的关键字一律放行（pattern / format 不参与运行期校验）', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      properties: { p: { type: 'string', pattern: '^a', format: 'uri' } },
+    } as never)
+    expect(s.safeParse({ p: 'zzz' }).success).toBe(true)
+  })
+
+  it('additionalProperties 为 schema 对象时逐值校验（env 那种形态）', () => {
+    const s = fromJsonSchema({
+      type: 'object' as const,
+      properties: {
+        env: { type: 'object', description: '附加环境变量', additionalProperties: { type: 'string' } },
+      },
+    } as never)
+    const bad = s.safeParse({ env: { A: 1 } })
+    expect(bad.success).toBe(false)
+    if (!bad.success) {
+      const issue = (bad.error as JsonSchemaValidationError).issues[0]!
+      expect(issue.path).toBe('env.A')
+    }
+    expect(s.safeParse({ env: { A: '1' } }).success).toBe(true)
+  })
+
+  it('parse 失败抛 JsonSchemaValidationError（带结构化 issues）', () => {
+    const s = fromJsonSchema(bashLike)
+    let caught: unknown
+    try {
+      s.parse({})
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(JsonSchemaValidationError)
+    expect((caught as JsonSchemaValidationError).issues[0]!.path).toBe('command')
+  })
+
+  it('formatSchemaError 与 message 同源（工具内守卫复用同一份 schema 时才不会有两套措辞）', () => {
+    const s = fromJsonSchema(bashLike)
+    const r = s.safeParse({})
+    if (r.success) throw new Error('应当失败')
+    expect(formatSchemaError(r.error)).toContain('缺少必填参数')
+    expect(formatSchemaError(new Error('别的错'))).toBe('别的错')
+  })
+
+  it('schemaIssues 取到结构化 issues；非本校验器的错误返回空数组', () => {
+    const s = fromJsonSchema(bashLike)
+    const r = s.safeParse({})
+    if (r.success) throw new Error('应当失败')
+    expect(schemaIssues(r.error).map((i) => i.path)).toEqual(['command'])
+    expect(schemaIssues(new Error('别的错'))).toEqual([])
+  })
+
+  it('接进 ToolPipeline：缺必填 ⇒ 抛 ToolSchemaError(stage=input)，cause 是本校验器', async () => {
+    const tool = defineTool({
+      id: 'fake_bash',
+      description: '桩',
+      inputSchema: fromJsonSchema<{ command: string }>(bashLike),
+      async call() {
+        return { ok: true as const, output: 'ran' }
+      },
+    })
+    let caught: unknown
+    try {
+      await new ToolPipeline().execute(tool, {}, makeCtx())
+    } catch (err) {
+      caught = err
+    }
+    expect(caught).toBeInstanceOf(ToolSchemaError)
+    expect((caught as ToolSchemaError).stage).toBe('input')
+    expect((caught as ToolSchemaError).cause).toBeInstanceOf(JsonSchemaValidationError)
+  })
+
+  it('接进 ToolPipeline：合规入参仍能走到 call（控制组，证明不是"一律拒绝"）', async () => {
+    let called = false
+    const tool = defineTool({
+      id: 'fake_bash_ok',
+      description: '桩',
+      inputSchema: fromJsonSchema<{ command: string }>(bashLike),
+      async call(input) {
+        called = true
+        return { ok: true as const, output: input.command }
+      },
+    })
+    const res = await new ToolPipeline().execute(tool, { command: 'ls' }, makeCtx())
+    expect(called).toBe(true)
+    expect(res.ok).toBe(true)
   })
 })

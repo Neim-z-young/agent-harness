@@ -42,20 +42,23 @@ export interface Schema<T> {
   /** 安全解析，返回结果对象 */
   safeParse(value: unknown): { success: true; data: T } | { success: false; error: unknown }
   /**
-   * 可选：入参的 JSON Schema（声明式描述，给模型阅读；运行时校验仍走 parse/safeParse）。
+   * 可选：入参的 JSON Schema（声明式描述，给模型阅读）。
    *
    * ⚠️ 这是 provider 生成 tools 载荷时的**唯一**参数来源（openai / anthropic / gemini 三个适配器
    * 都读它），缺失时工具会以空对象 schema 发出 —— 模型看不到任何参数名/类型/必填项。
-   * 新工具请务必通过 {@link withJsonSchema}（或 zod 适配）提供。
+   * 新工具请用 {@link fromJsonSchema} 提供：一份声明同时充当"给模型读的描述"与"运行期校验规则"。
    */
   __jsonSchema?: JsonSchemaObject
 }
 
 /**
- * 给已有 schema 补 JSON Schema（不改变运行时校验行为，只追加模型可读的入参描述）。
+ * 给**已有** schema 补 JSON Schema（不改变运行时校验行为，只追加模型可读的入参描述）。
+ *
+ * 新工具请直接用 {@link fromJsonSchema} —— 一份声明同时管"模型读到什么"与"运行期接受什么"。
+ * 本函数保留给"已自带 safeParse 实现、只想补一份模型可读描述"的场合（如 MCP 透传服务端 schema）。
  *
  * @example
- * inputSchema: withJsonSchema(makeSchema<BashInput>(), {
+ * inputSchema: withJsonSchema(myOwnSchema(), {
  *   type: 'object',
  *   properties: { command: { type: 'string', description: '要执行的 shell 命令' } },
  *   required: ['command'],
@@ -67,6 +70,314 @@ export function withJsonSchema<T>(
   jsonSchema: JsonSchemaObject,
 ): Schema<T> & { __jsonSchema: JsonSchemaObject } {
   return Object.assign(schema, { __jsonSchema: jsonSchema })
+}
+
+// ===== 由 JSON Schema 派生的运行时校验 =====
+
+/**
+ * 单个校验问题。
+ *
+ * `message` 会被 {@link ToolSchemaError} 拼进错误文本，是模型「入参自愈」时能拿到的**全部**信息 ——
+ * 必须写清"哪个参数、要什么、收到什么"，而不是只说"校验失败"。
+ */
+export interface JsonSchemaIssue {
+  /** 出问题的入参路径（点号分隔，数组下标用 `[i]`；根为 `(root)`） */
+  path: string
+  /** 可读说明 */
+  message: string
+}
+
+/** `fromJsonSchema` 校验失败 —— 带结构化 issues，`message` 已可直接给模型看 */
+export class JsonSchemaValidationError extends Error {
+  readonly issues: JsonSchemaIssue[]
+
+  constructor(issues: JsonSchemaIssue[]) {
+    super(
+      issues.length === 1
+        ? `入参不符合工具声明的 schema：${issues[0]!.message}`
+        : `入参不符合工具声明的 schema（${issues.length} 处）：${issues.map((i) => i.message).join('；')}`,
+    )
+    this.name = 'JsonSchemaValidationError'
+    this.issues = issues
+  }
+}
+
+/** {@link fromJsonSchema} 选项 */
+export interface FromJsonSchemaOptions {
+  /**
+   * 是否拒绝 schema 未声明的字段，默认 `false`（容忍）。
+   *
+   * 默认容忍的两个理由：
+   * 1. 模型偶尔带无害冗余（多一个 `timeout` / `recursive` 之类）。为此拒掉整次调用等于凭空造出
+   *    一类新失败，代价高于收益 —— 拒绝权的收益只在"模型反复瞎填参数"时才兑现。
+   * 2. `oneOf` 多模式的 schema（如 code_semantic_edit）**刻意省略 `properties`**（见
+   *    {@link JsonSchemaObject}），此时"未声明字段"是合法入参，一律拒绝会误伤。
+   *
+   * 需要与给模型看的声明完全一致（让 `additionalProperties:false` 真正生效）时显式打开。
+   */
+  strictProperties?: boolean
+}
+
+/** 内部：把 schema 节点当普通记录读（JsonSchemaObject 只声明了顶层字段） */
+type JsonSchemaNode = Record<string, unknown>
+
+const TYPE_LABELS: Record<string, string> = {
+  string: '字符串',
+  number: '数字',
+  integer: '整数',
+  boolean: '布尔值',
+  object: '对象',
+  array: '数组',
+  null: 'null',
+}
+
+function jsonTypeOf(value: unknown): string {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  return typeof value
+}
+
+function describeTypes(want: unknown): string {
+  const list = Array.isArray(want) ? want : [want]
+  return list.map((t) => TYPE_LABELS[String(t)] ?? String(t)).join(' 或 ')
+}
+
+/** 实际收到的类型（与 describeTypes 同一套中文标签，让"应为 X，收到 Y"读起来对称） */
+function describeActual(value: unknown): string {
+  const actual = jsonTypeOf(value)
+  return TYPE_LABELS[actual] ?? actual
+}
+
+function typeMatches(value: unknown, want: string): boolean {
+  const actual = jsonTypeOf(value)
+  switch (want) {
+    case 'string':
+      return actual === 'string'
+    case 'number':
+      return actual === 'number'
+    case 'integer':
+      return actual === 'number' && Number.isInteger(value)
+    case 'boolean':
+      return actual === 'boolean'
+    case 'object':
+      return actual === 'object'
+    case 'array':
+      return actual === 'array'
+    case 'null':
+      return actual === 'null'
+    // 未识别的类型名放行：宁可漏拦，不可误杀
+    default:
+      return true
+  }
+}
+
+function childPath(at: string, key: string): string {
+  return at === '(root)' ? key : `${at}.${key}`
+}
+
+function validateNode(
+  value: unknown,
+  node: JsonSchemaNode,
+  at: string,
+  issues: JsonSchemaIssue[],
+  strictProperties: boolean,
+): void {
+  // oneOf / anyOf：任一分支通过即可（union）。命中即返回 —— 分支内部细节不再逐条比对。
+  for (const unionKey of ['oneOf', 'anyOf'] as const) {
+    const branches = node[unionKey]
+    if (Array.isArray(branches) && branches.length > 0) {
+      const passed = branches.some((branch) => {
+        const sub: JsonSchemaIssue[] = []
+        validateNode(value, branch as JsonSchemaNode, at, sub, strictProperties)
+        return sub.length === 0
+      })
+      if (!passed) {
+        issues.push({
+          path: at,
+          message: `${at} 的形态不受支持（需满足 ${unionKey} 中的一种，收到 ${describeActual(value)}）`,
+        })
+      }
+      return
+    }
+  }
+
+  if (Array.isArray(node.enum) && !node.enum.includes(value)) {
+    issues.push({
+      path: at,
+      message: `${at} 只能是 ${node.enum.map((v) => JSON.stringify(v)).join(' / ')}，收到 ${JSON.stringify(value)}`,
+    })
+    return
+  }
+
+  const want = node.type
+  if (typeof want === 'string' || Array.isArray(want)) {
+    const wants = Array.isArray(want) ? want.map(String) : [want]
+    if (!wants.some((w) => typeMatches(value, w))) {
+      issues.push({ path: at, message: `${at} 应为 ${describeTypes(want)}，收到 ${describeActual(value)}` })
+      return
+    }
+  }
+
+  const actual = jsonTypeOf(value)
+
+  if (actual === 'object') {
+    const obj = value as Record<string, unknown>
+    const properties = node.properties as Record<string, JsonSchemaNode> | undefined
+
+    if (Array.isArray(node.required)) {
+      for (const key of node.required.map(String)) {
+        if (obj[key] === undefined) {
+          const decl = properties?.[key]
+          const hint = decl && decl.type !== undefined ? `（${describeTypes(decl.type)}）` : ''
+          issues.push({ path: childPath(at, key), message: `缺少必填参数 ${JSON.stringify(key)}${hint}` })
+        }
+      }
+    }
+
+    if (properties) {
+      for (const [key, sub] of Object.entries(properties)) {
+        if (obj[key] !== undefined) {
+          validateNode(obj[key], sub, childPath(at, key), issues, strictProperties)
+        }
+      }
+    }
+
+    // 未声明字段：additionalProperties 为 false 时按 strictProperties 决定拒/容忍；
+    // 为「schema 对象」时逐个校验（形如 env: { additionalProperties: { type:'string' } }）。
+    const additional = node.additionalProperties
+    if (additional !== undefined && additional !== true) {
+      const declared = new Set(properties ? Object.keys(properties) : [])
+      for (const key of Object.keys(obj)) {
+        if (declared.has(key) || obj[key] === undefined) continue
+        if (additional === false) {
+          if (strictProperties) {
+            issues.push({ path: childPath(at, key), message: `不接受未声明的参数 ${JSON.stringify(key)}` })
+          }
+        } else if (typeof additional === 'object' && additional !== null) {
+          validateNode(obj[key], additional as JsonSchemaNode, childPath(at, key), issues, strictProperties)
+        }
+      }
+    }
+    return
+  }
+
+  if (actual === 'array') {
+    const arr = value as unknown[]
+    const minItems = node.minItems
+    const maxItems = node.maxItems
+    if (typeof minItems === 'number' && arr.length < minItems) {
+      issues.push({ path: at, message: `${at} 至少需要 ${minItems} 项，收到 ${arr.length} 项` })
+    }
+    if (typeof maxItems === 'number' && arr.length > maxItems) {
+      issues.push({ path: at, message: `${at} 最多允许 ${maxItems} 项，收到 ${arr.length} 项` })
+    }
+    const items = node.items
+    if (items && typeof items === 'object' && !Array.isArray(items)) {
+      arr.forEach((item, i) => {
+        validateNode(item, items as JsonSchemaNode, `${at}[${i}]`, issues, strictProperties)
+      })
+    }
+    return
+  }
+
+  if (actual === 'string') {
+    const len = (value as string).length
+    const minLength = node.minLength
+    const maxLength = node.maxLength
+    if (typeof minLength === 'number' && len < minLength) {
+      issues.push({ path: at, message: `${at} 至少 ${minLength} 个字符，收到 ${len} 个` })
+    }
+    if (typeof maxLength === 'number' && len > maxLength) {
+      issues.push({ path: at, message: `${at} 最多 ${maxLength} 个字符，收到 ${len} 个` })
+    }
+    return
+  }
+
+  if (actual === 'number') {
+    const num = value as number
+    const minimum = node.minimum
+    const maximum = node.maximum
+    if (typeof minimum === 'number' && num < minimum) {
+      issues.push({ path: at, message: `${at} 不得小于 ${minimum}，收到 ${num}` })
+    }
+    if (typeof maximum === 'number' && num > maximum) {
+      issues.push({ path: at, message: `${at} 不得大于 ${maximum}，收到 ${num}` })
+    }
+  }
+}
+
+/**
+ * 从 **JSON Schema 派生**运行时校验，返回一个 `Schema<T>`。
+ *
+ * 为什么是"派生"而不是另写一套字段 DSL：`__jsonSchema` 已经是给模型看的唯一参数来源，
+ * 再声明一份运行时规则就有**两份真值**会漂移。派生之后，一处声明同时决定"模型看到什么"
+ * 与"运行期接受什么"，而且模型侧 tools 载荷**字节级不变**。
+ *
+ * 覆盖的关键字（= 现网工具实际用到的全集）：`type` / `properties` / `required` /
+ * `additionalProperties` / `items` / `oneOf` / `anyOf` / `enum` / `minimum` / `maximum` /
+ * `minLength` / `maxLength` / `minItems` / `maxItems`。未识别的关键字一律放行。
+ *
+ * 默认严格度：缺必填 ⇒ 拒；类型不符、枚举越界 ⇒ 拒；**多余字段 ⇒ 容忍**
+ * （理由见 {@link FromJsonSchemaOptions.strictProperties}）。
+ *
+ * @example
+ * inputSchema: fromJsonSchema<BashInput>({
+ *   type: 'object',
+ *   properties: { command: { type: 'string', description: '要执行的 shell 命令' } },
+ *   required: ['command'],
+ *   additionalProperties: false,
+ * })
+ */
+export function fromJsonSchema<T>(
+  schema: JsonSchemaObject,
+  options: FromJsonSchemaOptions = {},
+): Schema<T> & { __jsonSchema: JsonSchemaObject } {
+  const strictProperties = options.strictProperties ?? false
+
+  const collect = (value: unknown): JsonSchemaIssue[] => {
+    const issues: JsonSchemaIssue[] = []
+    validateNode(value, schema as unknown as JsonSchemaNode, '(root)', issues, strictProperties)
+    return issues
+  }
+
+  return {
+    parse(value: unknown): T {
+      const issues = collect(value)
+      if (issues.length > 0) throw new JsonSchemaValidationError(issues)
+      return value as T
+    },
+    safeParse(value: unknown) {
+      const issues = collect(value)
+      if (issues.length > 0) {
+        return { success: false as const, error: new JsonSchemaValidationError(issues) }
+      }
+      return { success: true as const, data: value as T }
+    },
+    __jsonSchema: schema,
+  }
+}
+
+/**
+ * 把 `safeParse` 的失败原因压成一行可读文本。
+ *
+ * 给"工具内守卫"复用同一份 schema 用（bash / glob）：那些守卫的返回值不走 ToolSchemaError，
+ * 但错误文本必须与管道内**同源**，否则同一个问题会有两套措辞。
+ */
+export function formatSchemaError(error: unknown): string {
+  if (error instanceof JsonSchemaValidationError) {
+    return error.issues.map((i) => i.message).join('；')
+  }
+  return error instanceof Error ? error.message : String(error)
+}
+
+/**
+ * 取 `safeParse` 失败的结构化 issues（非本校验器产生的错误返回空数组）。
+ *
+ * 存在的理由：`Schema.safeParse` 的 `error` 契约是 `unknown`，工具内守卫想按"哪个字段出的问题"
+ * 分流错误码（如 command 缺失 ⇒ COMMAND_REQUIRED）时，需要一个类型安全的取值口。
+ */
+export function schemaIssues(error: unknown): JsonSchemaIssue[] {
+  return error instanceof JsonSchemaValidationError ? error.issues : []
 }
 
 // ===== ToolContext =====
@@ -180,7 +491,7 @@ export interface Tool<Input = any, Output = any, Progress = any> {
   requiresUserInteraction?: boolean
 
   // === Schema ===
-  /** 输入 schema（zod / 自定义，硬校验） */
+  /** 输入 schema（推荐 {@link fromJsonSchema}；zod / 自定义亦可，硬校验） */
   inputSchema: Schema<Input>
   /** 输出 schema（可选，校验结果） */
   outputSchema?: Schema<Output>
