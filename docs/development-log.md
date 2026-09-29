@@ -1,5 +1,95 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 216）直调入参守卫 + 守卫判据的结构化（rule）
+
+### 起因
+
+续 215 遗留第 2 项：`read_file` 的**直接调用**仍是裸 `resolvePath(input.path)` —— 生产路径已被管道
+Step 1 保护，但"越过管道直调 `tool.call()`"仍会抛 `TypeError`。核对发现 `write_file` / `edit_file`
+完全同构（用户裁决：**三兄弟一起修**）。
+
+### 根因：三处一行代码，叠了三个条件
+
+| 工具 | 位置 | 现状 |
+|---|---|---|
+| `read_file` | `call()` 第一行 | `resolvePath(input.path, ctx.cwd)` |
+| `write_file` | 同上 | 同上 |
+| `edit_file` | 同上 | 同上 |
+
+叠了三个条件才成为真问题：
+
+1. `resolvePath` 内部先做 `isAbsolute(inputPath)` —— `undefined` / `null` / 数字 / 对象全抛
+   `TypeError: The "path" property must be of type string`（实测四种全抛）；
+2. 那行在 `try` **之外**（`try` 要到 `stat` 才开），异常不被下面的 catch 收敛 ⇒ **直接冒泡**给调用方；
+3. 权限引擎的 `permission.extractPatterns: (input) => [input.path]` 排在 `call()` 之前 ⇒ 先拿到 `[undefined]`。
+
+管道路径不受影响（Step 1 用 `readFileInputSchema` 拦了，`tools-builtin.test.ts:231` 有用例锁定）。
+
+### 形态：一个共用助手，而不是三份守卫
+
+三处同构 ⇒ 抽 `guardPathInput(schema, input, requiredCode)`（`tools-builtin/src/index.ts`）。
+三个工具的 `inputSchema` 因此从内联提到模块级常量（`readFileInputSchema` / `writeFileInputSchema` /
+`editFileInputSchema`）—— `call()` 复用的就是**喂给模型的那一份**，规则只留一份。
+错误码：缺 `path` ⇒ `PATH_REQUIRED`（与 `COMMAND_REQUIRED` / `GLOB_PATTERN_MISSING` 同构，
+模型从码名就能读出少了哪个参数），其余结构问题 ⇒ `INVALID_INPUT`。
+
+`bash` 的内联守卫形态与此完全一致，**本次未动**（它有自己成型的历史注释与两段式结构），
+可后续收拢 —— 属可选改动。
+
+### 实施中发现的新缺陷：判据分不清"缺"与"类型错"
+
+写测试时实测发现：`read_file.call({ path: 123 })` 得到 `PATH_REQUIRED`，而消息写着
+`path 应为 字符串，收到 数字` —— **码说"缺"、消息说"类型错"，自相矛盾**。
+
+根因：`JsonSchemaIssue` 只有 `{ path, message }`，而"缺必填"（`childPath(at,key)`）与
+"类型不符"（`properties` 循环里 `at` 已降级为 `key`）的 `path` **完全相同**。
+上一轮的 bash 守卫用的是 `i.path === 'command'`，同一个缺陷 —— 只是那条用例恰好错在
+**另一个字段**（`timeoutMs: 'soon'`，`command` 本身合法）而绕过了它。
+
+修法（用户裁决：**加结构化判据**）：`JsonSchemaIssue` 增可选 `rule`，取值
+`required | type | enum | union | additional | items | length | range`，11 个 `issues.push` 点全部标注。
+三处守卫改判 `i.rule === 'required' && i.path === X`。**不判 `message`** —— 文案会改，判据会静默失效。
+
+顺带修正 `glob` 的过宽判据：它原来是"任何结构错 ⇒ `GLOB_PATTERN_MISSING`"，现在缺 `pattern` ⇒
+`GLOB_PATTERN_MISSING`、其它字段错 ⇒ `INVALID_INPUT`。这条改了既有测试的一条期望 ——
+原用例把"`pattern: {}` 类型错"和"缺 pattern"混在一起断言同一个码。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `packages/tool/src/index.ts` | `JsonSchemaRule` 类型 + `JsonSchemaIssue.rule?` + 11 个 push 点标注 |
+| `packages/plugins/tools-builtin/src/index.ts` | `guardPathInput` 助手；三处 schema 提模块级；三处 `call()` 接守卫；bash 判据改 rule |
+| `packages/plugins/tools-glob/src/index.ts` | 结构守卫判据改 rule，错误码按性质分流 |
+| 三个包的测试 | tool +2、tools-builtin +6、tools-glob 重构 1 组断言 |
+
+### 反向验证：5 组实验
+
+| 实验 | 摘掉什么 | 变红的用例 |
+|---|---|---|
+| E1 | `read_file` 的守卫调用 | `read_file 缺 path ⇒ PATH_REQUIRED（不再是 TypeError）` + `path 类型不符` |
+| E2 | `guardPathInput` 里的 `rule === 'required'` | `read_file 的 path 类型不符 ⇒ INVALID_INPUT` |
+| E3 | bash 守卫的 `rule === 'required'` | `bashTool：必填字段**本身**类型不符 ⇒ INVALID_INPUT` |
+| E4 | glob 的码分流（退回一律 `GLOB_PATTERN_MISSING`） | `结构不合法 ⇒ 码反映失败的性质` |
+| E5 | `required` 那条 issue 的 `rule` 标注 | `fromJsonSchema：缺必填 ⇒ rule=required` |
+
+E1 的红是**必须**的：那条用例的措辞就是"不再是 TypeError"，摘掉守卫即回到 `TypeError`。
+E2/E3 证明 `rule` 判据真的在起作用（不是碰巧）；E5 证明 `rule` 字段本身是判据的依据。
+
+脚本仍用"基线快照 + 每轮从快照重写"的还原方式，并断言结束时四个文件与快照**逐字节一致**
+（续 215 的教训：同文件多补丁互相覆盖备份，会留下**仍能编译通过**的中间态）。
+
+### 验收
+
+- `bun run typecheck`：39 包 0 error
+- `bun run test`：39 包 0 fail，2025 → **2033** pass（tool +2、tools-builtin +6）
+- 反向验证 5 组全部命中预期；还原复验三包全绿
+
+### 遗留
+
+- `bash` 的内联守卫可收拢进 `guardPathInput`（形态已一致，属可选改动，按惯例先不动）
+- `UsageStats` 的 provider 维度、`unregister` 级联、`_setChatProvider` 最终删除（承续 213）
+
 ## 2026-09-29（续 215）入参字段 ↔ schema properties：全量核对 + 编译期守卫
 
 ### 起因：上一轮那条"意外收获"

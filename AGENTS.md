@@ -273,6 +273,10 @@
 
 - **入参接口的每个字段都必须在 `schema.properties` 里出现，否则 `tsc` 直接报错**：`fromJsonSchema<T>` 的入参类型是 `JsonSchemaFor<T>`，它把 `properties` 约束成 `{ [K in keyof T & string]: unknown }`、`required` 约束成 `Array<keyof T & string>`，多一个少一个都过不了 `bun run typecheck`。为什么把这件事放在**类型**上而不是写运行时断言：接口字段是**类型层面**的东西，运行时拿不到；而漏声明的后果恰好只在类型层面可判 —— 模型看不到那个参数、运行期却照收，表现为"能力凭空消失且**没有任何报错**"。实测漏过 7 个：`glob` 的 `exclude` / `minSizeBytes` / `maxSizeBytes` / `maxDepth`，`web_fetch` 的 `followRedirects` / `maxResponseBytes` / `allowPrivateNetwork`。**要"故意"不暴露某个字段，就给该工具一个更窄的入参类型**（范例：`bash_ro` 用 `Omit<BashInput,'env'>` 表达"不接受 env —— ENV 是绕过只读的后门"），而不是让 schema 与类型各说各话（那会退化成"模型传了、被静默忽略"）。`oneOf` 多模式（`code_semantic_edit`）走豁免分支：顶层不写 `properties`，各模式在 `oneOf[].properties` 里各自声明
 
+- **守卫判"失败的**性质**"要判 `issue.rule`，不要判 `message`，也不要只看 `issue.path`**：同一个字段可能出不同性质的错，而"缺必填"与"类型不符"在 `path` 上长得**一模一样**（都是 `'path'` / `'command'` / `'pattern'`）。只看 `path` 的判据会把 `command: 123` 冒充成 `COMMAND_REQUIRED` —— 码说"缺"、消息却说"应为 字符串，收到 数字"，两者打架。这条是被一个真实漏网抓出来的：上一轮 bash 那条用例恰好错在**另一个**字段（`timeoutMs: 'soon'`，`command` 本身合法），把缺陷绕过去了。`JsonSchemaIssue.rule` 有 8 档（`required` / `type` / `enum` / `union` / `additional` / `items` / `length` / `range`），11 个 `issues.push` 点已全部标注；判 `message` 则会在文案改动时**静默失效**。三处守卫（`guardPathInput` / bash / glob）已统一按 `rule === 'required'` 分流"缺参数"与"其它结构问题"
+
+- **凡 `call()` 第一行做路径解析的工具，结构守卫必须排在它之前**：`read_file` / `write_file` / `edit_file` 的开头都是 `resolvePath(input.path, ctx.cwd)`，而 `resolvePath` 内部先做 `isAbsolute(inputPath)` —— 传 `undefined` / `null` / 数字 / 对象都会抛 `TypeError: The "path" property must be of type string`，**且那行在 `try` 之外**，异常不会被下面的 catch 收敛，会直接冒泡给调用方（权限引擎的 `extractPatterns` 在此之前还会先拿到 `[undefined]`）。三处共用 `guardPathInput(schema, input, 'PATH_REQUIRED')`：缺 `path` ⇒ `PATH_REQUIRED`，其余结构问题 ⇒ `INVALID_INPUT`；三个工具的 `inputSchema` 也因之提到模块级常量，`call()` 复用的就是喂给模型的那一份
+
 ## 6. 安全与协作
 
 - 子代理工具调用 `isConcurrencySafe` 必须为 `false`，防止并发写冲突
