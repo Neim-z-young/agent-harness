@@ -36,7 +36,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
-import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy, TOOL_CONT_MARK } from './index'
+import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy, formatToolInput, formatToolResult, TOOL_CONT_MARK } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
@@ -649,10 +649,12 @@ export function splitBgTasks(tasks: readonly BackgroundTaskViewLike[]): {
 // 会话历史渲染（模块 B：会话切换时把消息历史转成对话块）
 // ------------------------------------------------------------------------
 // 切换会话（/resume）后，TuiApp 用 setSession 回调把新会话的 messages
-// 还原为指定字体的块，重新展示历史对话。text / reasoning part 拼为正文，
-// 空消息、工具调用 part 跳过。
+// 还原为对话块，重新展示历史对话。text / reasoning part 拼为正文，
+// **tool part 还原成工具块**（`toolPartLines`）—— 少了后者，恢复出来的会话只剩
+// 「提问 + 结论」，中间干了什么全不见：一个 40 步的任务恢复后看起来像一气呵成，
+// 而实时跑同一条任务时工具输出是看得见的。同一份历史，两条通道看到的东西不该不同。
 
-/** 提取一条消息的纯文本（text part 拼接 + reasoning 追加，工具/文件/图片跳过） */
+/** 提取一条消息的正文文本（text part 拼接 + reasoning 追加，工具/文件/图片跳过） */
 export function messageText(msg: Message): string {
   let out = ''
   for (const p of msg.parts) {
@@ -670,15 +672,76 @@ export function roleToKind(role: Message['role']): ChatBlockKind {
   return 'system'
 }
 
+/**
+ * 工具 part → 回显行。形状与实时输出**逐字一致**：`createProcessLine` 打的是
+ * `🔧  <id> <完整入参>` / `✅|❌  → <完整结果>`，`windowToolText` 又按 `🔧` 分段做首尾窗口 ——
+ * 形状一致，历史块与实时块才共用同一套渲染（首行加粗 + `│ `/`└ ` 树状缩进）与同一套窗口化。
+ * 序列化复用 `formatToolInput/formatToolResult`（REPL/TUI 实时通道用的就是它们），
+ * 所以历史里看到的入参与结果，与当时实时看到的是同一份文本。
+ */
+export function toolPartLines(p: {
+  toolId?: string
+  input?: unknown
+  result?: unknown
+  isError?: boolean
+}): string[] {
+  const lines = [`🔧  ${p.toolId ?? 'tool'} ${formatToolInput(p.input)}`]
+  // 无 result ⇒ 这一步没跑完就落盘了（被中断 / 崩在工具里）：只留「调用了什么」，
+  // 不补一个空的结果行假装它跑过。
+  if (p.result !== undefined) lines.push(`${p.isError ? '❌' : '✅'}  → ${formatToolResult(p.result)}`)
+  return lines
+}
+
 /** 阶段四·按需渲染：单页渲染的历史消息条数上限（超出显示"更早省略"提示块） */
 export const HISTORY_PAGE = 100
 
 
-/** 把一条消息转成对话块（消息转块的公共入口；空消息返回 undefined） */
-function messageToBlock(m: Message, id: number): ChatBlock | undefined {
-  const text = messageText(m)
-  if (!text.trim()) return undefined
-  return { id, kind: roleToKind(m.role), text, msgId: m.id }
+/**
+ * 一条消息 → 对话块。**可能是多个**：一条 assistant 消息里既可能有序正文、也可能有工具调用
+ * （真机会话实测：`parts` 就是 `[reasoning, tool, tool, ...]` 这样的序列），
+ * 按 part 出现顺序切成「正文块 + 工具块」。全空 part 不产出块。
+ *
+ * 为什么正文与工具要分成**不同 kind 的块**：正文走 markdown 渲染，工具行走等宽树状渲染，
+ * 混一个块里要么工具行被 markdown 吃掉缩进、要么正文被当成控制台文本（不解析 markdown）。
+ *
+ * 多块带来的 id 递增由调用方负责（`idStart` 起顺排），保证与 `pushConsole` 追加的实时块不撞 id。
+ */
+function messageToBlocks(m: Message, idStart: number): ChatBlock[] {
+  const out: ChatBlock[] = []
+  let nextId = idStart
+  const textKind = roleToKind(m.role)
+  let text = ''
+  let tools: string[] = []
+  const flushText = (): void => {
+    if (!text.trim()) {
+      text = ''
+      return
+    }
+    out.push({ id: nextId++, kind: textKind, text, msgId: m.id })
+    text = ''
+  }
+  const flushTools = (): void => {
+    if (tools.length === 0) return
+    out.push({ id: nextId++, kind: 'tool', text: tools.join('\n'), msgId: m.id })
+    tools = []
+  }
+  for (const p of m.parts) {
+    const t = (p as { text?: string }).text
+    // 正文与工具交替出现时按出现顺序切开：`flushTools()` 保证工具块不被后一段正文"吞掉"
+    if (p.type === 'text' && t) {
+      flushTools()
+      text += t
+    } else if (p.type === 'reasoning' && t) {
+      flushTools()
+      text += '\n💭' + t
+    } else if (p.type === 'tool') {
+      flushText()
+      tools.push(...toolPartLines(p as { toolId?: string; input?: unknown; result?: unknown; isError?: boolean }))
+    }
+  }
+  flushText()
+  flushTools()
+  return out
 }
 
 /** 压缩块 → 提示行文本（只展示元信息，不渲染 summary 内容，符合"仅提示自动压缩过"） */
@@ -710,6 +773,14 @@ export function messagesToBlocks(
     }
   }
 
+  /** 一条消息可能产出多个块（正文 + 工具），id 从 `nextId` 起顺排 */
+  const pushMsg = (m: Message): void => {
+    for (const b of messageToBlocks(m, nextId)) {
+      out.push(b)
+      nextId++
+    }
+  }
+
   if (blocks && blocks.length > 0) {
     for (const b of [...blocks].sort((x, y) => (x.at ?? 0) - (y.at ?? 0))) {
       push({ id: nextId, kind: 'compact', text: compactBlockText(b), blockId: b.id })
@@ -723,7 +794,7 @@ export function messagesToBlocks(
     push({ id: nextId, kind: 'loadmore', text: `▲ 更早 ${hidden} 条消息已省略（点击加载更多）` })
   }
 
-  for (const m of visible) push(messageToBlock(m, nextId))
+  for (const m of visible) pushMsg(m)
 
   return { blocks: out, nextId, thinkingIdx: -1, assistantIdx: -1 }
 }
@@ -738,8 +809,7 @@ export function expandCompactBlocks(state: ChatState, blockId: string, originals
   const inserted: ChatBlock[] = []
   let nextId = state.nextId
   for (const m of originals) {
-    const b = messageToBlock(m, nextId)
-    if (b) {
+    for (const b of messageToBlocks(m, nextId)) {
       inserted.push(b)
       nextId++
     }
@@ -760,8 +830,7 @@ export function loadOlderBlocks(state: ChatState, older: Message[], page = HISTO
   const inserted: ChatBlock[] = []
   let nextId = state.nextId
   for (const m of older) {
-    const b = messageToBlock(m, nextId)
-    if (b) {
+    for (const b of messageToBlocks(m, nextId)) {
       inserted.push(b)
       nextId++
     }

@@ -463,6 +463,63 @@ describe('会话历史渲染（模块 B）', () => {
     expect(cs.nextId).toBe(4)
   })
 
+  // ----------------------------------------------------------------------
+  // 会话恢复后工具输出必须可见（回归：恢复出来的会话只剩「提问 + 结论」）
+  // ----------------------------------------------------------------------
+  // 真机会话的 assistant 消息里，`parts` 是 `[reasoning, tool, tool, ...]` 这样的序列
+  // （见 ~/.harness/sessions/*.json）。旧的 messageText 只拼 text/reasoning，
+  // tool part 直接跳过 ⇒ 恢复 40 步的任务只看到提问和结论，中间干了什么全不见。
+  // 断言盯的是**块文本里的 🔧/✅ 行本身**：形状必须与实时输出逐字一致
+  // （`formatToolInput`/`formatToolResult`），否则历史块与实时块会走两套渲染。
+
+  /** 直接构造带 tool part 的消息（真机持久化形状） */
+  const pm = (id: string, role: Message['role'], parts: unknown[]): Message =>
+    ({ id, role, createdAt: 0, parts }) as unknown as Message
+
+  it('messagesToBlocks：tool part 还原成工具块（🔧 入参 / ✅ 结果 与实时同形状）', () => {
+    const cs = messagesToBlocks([
+      pm('m1', 'user', [{ type: 'text', text: '看一下' }]),
+      pm('m2', 'assistant', [
+        { type: 'text', text: '我来执行。' },
+        { type: 'tool', toolUseId: 'u1', toolId: 'bash', input: { command: 'ls' }, result: 'a.txt\nb.txt', isError: false },
+      ]),
+    ])
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['user', 'assistant', 'tool'])
+    const tool = cs.blocks[2]
+    expect(tool.text).toBe('🔧  bash {"command":"ls"}\n✅  → a.txt\nb.txt')
+    expect(tool.msgId).toBe('m2')
+  })
+
+  it('messagesToBlocks：连续 tool part 并成一个块；失败用 ❌；没跑完的只留 🔧 行', () => {
+    const cs = messagesToBlocks([
+      pm('m1', 'assistant', [
+        { type: 'tool', toolUseId: 'u1', toolId: 'a', input: {}, result: 'ok', isError: false },
+        { type: 'tool', toolUseId: 'u2', toolId: 'b', input: { x: 1 }, result: { code: 'BOOM' }, isError: true },
+        // 无 result：中断 / 崩在工具里就落盘的会话 —— 不能补一个空结果行假装它跑过
+        { type: 'tool', toolUseId: 'u3', toolId: 'c', input: { y: 2 } },
+      ]),
+    ])
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['tool'])
+    expect(cs.blocks[0].text).toBe(
+      '🔧  a {}\n✅  → ok\n🔧  b {"x":1}\n❌  → {"code":"BOOM"}\n🔧  c {"y":2}',
+    )
+  })
+
+  it('messagesToBlocks：正文与工具交替时按 part 顺序切块，id 顺排不撞号', () => {
+    const cs = messagesToBlocks([
+      pm('m1', 'assistant', [
+        { type: 'text', text: '先看' },
+        { type: 'tool', toolUseId: 'u1', toolId: 'a', input: {}, result: 'ok', isError: false },
+        { type: 'text', text: '再看' },
+      ]),
+    ])
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['assistant', 'tool', 'assistant'])
+    expect(cs.blocks.map((b) => b.id)).toEqual([1, 2, 3])
+    expect(cs.nextId).toBe(4)
+    expect(cs.blocks[0].text).toBe('先看')
+    expect(cs.blocks[2].text).toBe('再看')
+  })
+
   it('toSessionRows：title 缺失用 id 兜底', () => {
     const rows = toSessionRows([
       { id: 'a', updatedAt: 10, messageCount: 2 },
@@ -765,6 +822,11 @@ async function mountTui(
      * - `'other-cwd'`：会话落在另一个工作目录 → 不该恢复，但要说明「为什么没接着上次」
      */
     resume?: boolean | 'other-cwd'
+    /**
+     * 配合 `resume`：在上次会话里再补一条**带工具调用**的 assistant 消息
+     * （真机形状：`parts: [reasoning, tool]`），用于验证恢复后工具输出是否可见。
+     */
+    resumeWithTool?: boolean
     /** 渲染器尺寸（缺省 80×24）。侧栏滚动条这类**溢出才有**的行为需要更矮的窗口来触发 */
     size?: { width: number; height: number }
     /**
@@ -799,6 +861,15 @@ async function mountTui(
     await first.harness.session.addMessage(first.session.id, {
       id: 'seed1', role: 'user', parts: [{ type: 'text', text: '上次的提问' }], createdAt: 1,
     })
+    if (extra.resumeWithTool) {
+      await first.harness.session.addMessage(first.session.id, {
+        id: 'seed2', role: 'assistant', createdAt: 2,
+        parts: [
+          { type: 'reasoning', text: '先看目录' },
+          { type: 'tool', toolUseId: 't1', toolId: 'bash', input: { command: 'ls -la' }, result: 'a.txt\nb.txt', isError: false },
+        ],
+      })
+    }
     await seed.sessionStore.save((await first.harness.session.get(first.session.id))!)
     await seed.shutdown()
   }
@@ -1038,6 +1109,19 @@ describe('TuiApp 集成（mock provider）', () => {
     // 恢复的是磁盘上那个会话（不是新建的），且已带历史
     expect(f.app.sessionRestore.source).toBe('auto')
     expect(f.currentSession().messages.length).toBe(1)
+    await f.cleanup()
+  })
+
+  it('自动恢复也要把上次的工具输出铺出来（不能只剩提问与结论）', async () => {
+    const f = await mountTui({ resume: true, resumeWithTool: true })
+    // 真机帧上盯**工具行本身**：只看"整段输出里有没有 ls -la"会被别处的回显蒙混过关
+    // （上一轮的教训），而 🔧 行是这次改动唯一负责的那一行。
+    const frame = await waitFrame(f.setup, (fr) => fr.includes('🔧'))
+    expect(frame).toContain('🔧  bash {"command":"ls -la"}')
+    // 结果行也要在（渲染器给结果行补 `│ `/`└ ` 树状前缀，所以断言内容而不是整行）
+    const done = await waitFrame(f.setup, (fr) => fr.includes('a.txt') && fr.includes('b.txt'))
+    expect(done).toContain('a.txt')
+    expect(done).toContain('b.txt')
     await f.cleanup()
   })
 
