@@ -427,6 +427,17 @@ export interface BashInput {
   env?: Record<string, string>
 }
 
+/**
+ * 只读 bash 的入参：与 {@link BashInput} 的唯一差别是**没有 `env`**。
+ *
+ * 为什么用一个单独的类型、而不是在 schema 里悄悄省掉 `env`：
+ * 只读工具**刻意**不接受入参覆盖环境变量 —— ENV 是绕过只读的常见后门（`PYTHONSTARTUP` /
+ * `NODE_OPTIONS` 都能让"只读命令"执行任意代码，见 {@link createReadOnlyBashTool} 内说明）。
+ * 用 `Omit` 把这个决定写进类型，schema 与类型才是一致的；否则模型传 `env` 会被静默忽略，
+ * 而编译期守卫（`JsonSchemaFor<T>`）也没法表达"这里少一个字段是故意的"。
+ */
+export type ReadOnlyBashInput = Omit<BashInput, 'env'>
+
 /** bash 输出 */
 export interface BashOutput {
   /** 标准输出 */
@@ -902,16 +913,16 @@ export interface ReadOnlyBashConfig {
  * - 不做宿主回退（回退等于绕过只读约束）
  * - **协作式只读**：挡的是"顺手写一下"，不是恶意绕过；硬边界仍由 permission 引擎与宿主沙箱负责
  */
-export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<BashInput, BashOutput> {
+export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<ReadOnlyBashInput, BashOutput> {
   const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
   const timeoutDefault = config.timeoutMs ?? 15_000
 
-  return defineTool<BashInput, BashOutput>({
+  return defineTool<ReadOnlyBashInput, BashOutput>({
     id: 'bash_ro',
     description:
       '执行**只读** shell 命令（白名单受限：cat/head/tail/wc/grep/sed/awk/find/ls/stat/du/git log/python3 -c 等）。'
       + '拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。',
-    inputSchema: fromJsonSchema<BashInput>({
+    inputSchema: fromJsonSchema<ReadOnlyBashInput>({
       type: 'object',
       properties: {
         command: { type: 'string', description: '要执行的只读命令（不得含 >、$()、反引号、heredoc）' },
@@ -957,7 +968,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Ba
 }
 
 /** 默认只读 bash 工具（只读哨兵用） */
-export const readOnlyBashTool: Tool<BashInput, BashOutput> = createReadOnlyBashTool()
+export const readOnlyBashTool: Tool<ReadOnlyBashInput, BashOutput> = createReadOnlyBashTool()
 
 /** 执行一条 bash 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
  * viaHost=true 时在返回的 BashOutput 上标注，表示这次是宿主 bash 回退执行（放开白名单与 env 隔离）。
