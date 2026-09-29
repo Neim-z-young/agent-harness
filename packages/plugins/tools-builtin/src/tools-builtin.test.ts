@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import {
   readFileTool,
   writeFileTool,
+  editFileTool,
   bashTool,
   createBashTool,
   createToolsBuiltinPlugin,
@@ -219,6 +220,15 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.message).toContain('应为 数字')
     })
 
+    it('必填字段**本身**类型不符 ⇒ INVALID_INPUT（判据看 rule，不看 path）', async () => {
+      // 只看 `path === 'command'` 是不够的：`command: 123` 的 issue path 也是 'command'
+      // —— 那种判据会把类型错误冒充成 COMMAND_REQUIRED（码说"缺"、消息说"应为 字符串"）。
+      const res = await bashTool.call({ command: 123 } as never, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('INVALID_INPUT')
+      expect(res.error!.message).toContain('应为 字符串')
+    })
+
     it('多带未声明字段仍能执行（默认容忍多余字段，控制组）', async () => {
       const res = await bashTool.call({ command: 'echo tolerate', recursive: true } as never, makeCtx())
       expect(res.ok).toBe(true)
@@ -239,6 +249,56 @@ describe('@harness/tools-builtin', () => {
       expect(caught).toBeInstanceOf(ToolSchemaError)
       expect((caught as ToolSchemaError).stage).toBe('input')
       expect((caught as Error).message).toContain('path')
+    })
+  })
+
+  // ===== 直调路径的入参守卫（read_file / write_file / edit_file 共用 guardPathInput） =====
+
+  /**
+   * 上一条测的是**管道路径**（Step 1 用 schema 拦）。这里测的是**绕过管道直接调
+   * `tool.call()`** 那条路径：三个工具的 `call()` 第一行都是
+   * `resolvePath(input.path, ctx.cwd)`，而 `resolvePath` 内部先做 `isAbsolute(inputPath)`
+   * —— 且那行在 `try` **之外**，入参非法时会抛出**未被捕获**的
+   * `TypeError: The "path" property must be of type string`。
+   */
+  describe('直调路径：结构守卫在 resolvePath 之前拦下非法入参', () => {
+    it('read_file 缺 path ⇒ PATH_REQUIRED（不再是 TypeError）', async () => {
+      const res = await readFileTool.call({} as never, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('PATH_REQUIRED')
+      expect(res.error!.message).toContain('path')
+    })
+
+    it('read_file 的 path 类型不符 ⇒ INVALID_INPUT（不冒充"缺参数"）', async () => {
+      const res = await readFileTool.call({ path: 123 } as never, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('INVALID_INPUT')
+      expect(res.error!.message).toContain('应为 字符串')
+    })
+
+    it('write_file 缺 path ⇒ PATH_REQUIRED；缺 content ⇒ INVALID_INPUT', async () => {
+      const noPath = await writeFileTool.call({ content: 'x' } as never, makeCtx())
+      expect(noPath.ok).toBe(false)
+      expect(noPath.error!.code).toBe('PATH_REQUIRED')
+
+      const noContent = await writeFileTool.call({ path: 'guard.txt' } as never, makeCtx())
+      expect(noContent.ok).toBe(false)
+      expect(noContent.error!.code).toBe('INVALID_INPUT')
+      expect(noContent.error!.message).toContain('content')
+    })
+
+    it('edit_file 缺 path ⇒ PATH_REQUIRED', async () => {
+      const res = await editFileTool.call({ oldString: 'a', newString: 'b' } as never, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('PATH_REQUIRED')
+    })
+
+    it('控制组：合法入参不被守卫误伤（守卫是前置，不是替代）', async () => {
+      const path = join(TMP_DIR, 'guard-ok.txt')
+      await writeFile(path, 'ok\n')
+      const res = await readFileTool.call({ path }, makeCtx())
+      expect(res.ok).toBe(true)
+      expect(res.output!.content).toBe('ok\n')
     })
   })
 

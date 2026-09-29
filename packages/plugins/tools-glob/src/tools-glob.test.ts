@@ -139,21 +139,22 @@ describe('globTool', () => {
    * 真机教训（会话 `s_1790592617954_axqkk`）：`pattern` 在 schema 里是 required，但内置工具的
    * Step 1 是 no-op ⇒ 运行期收不到任何校验。模型丢参数时旧实现走 `if (!pat) continue`
    * 静默跳过 → `includes` 为空 → 兜底成全匹配 ⇒ 一次扫回 215,562 字符（约 1,937 个文件）。
-   * 这三条断言是"拒绝静默降级"的守卫：任何形态的空 pattern 都必须**明确报错**，
+   * 这些断言是"拒绝静默降级"的守卫：任何形态的空 pattern 都必须**明确报错**，
    * 让模型走「入参自愈」补参数，而不是拿到一份全仓清单。
    */
   it('pattern 缺失 / 全为空 ⇒ 拒绝退化成全仓遍历（GLOB_PATTERN_MISSING）', async () => {
     writeFileSync(join(dir, 'a.ts'), '')
     writeFileSync(join(dir, 'b.ts'), '')
 
-    const cases: Array<{ label: string; input: unknown }> = [
+    // 这四种是「参数在、但空到不可用」⇒ 与语义守卫同码。
+    // 「参数类型不对」性质不同，单独在下面一条断言。
+    const emptyCases: Array<{ label: string; input: unknown }> = [
       { label: '完全缺失', input: {} },
       { label: '空串', input: { pattern: '' } },
       { label: '纯空白', input: { pattern: '   ' } },
       { label: '数组全空', input: { pattern: ['', '  '] } },
-      { label: '非法类型', input: { pattern: {} } },
     ]
-    for (const c of cases) {
+    for (const c of emptyCases) {
       const res = await globTool.call!(c.input as any, ctx)
       expect(res.ok, c.label).toBe(false)
       if (res.ok) continue
@@ -161,12 +162,21 @@ describe('globTool', () => {
     }
   })
 
-  it('结构不合法 ⇒ 错误来自 schema 守卫（message 是 schema 派生的，不再是兜底过滤的措辞）', async () => {
-    const res = await globTool.call!({ pattern: { nope: 1 } } as any, ctx)
-    expect(res.ok).toBe(false)
-    if (res.ok) return
-    expect(res.error!.code).toBe('GLOB_PATTERN_MISSING')
-    expect(res.error!.message).toContain('形态不受支持')
+  it('结构不合法 ⇒ 错误来自 schema 守卫，且码反映失败的**性质**', async () => {
+    // pattern 类型不对：不是"缺参数"，是"类型不符" ⇒ INVALID_INPUT，与消息自洽。
+    const wrongType = await globTool.call!({ pattern: { nope: 1 } } as any, ctx)
+    expect(wrongType.ok).toBe(false)
+    if (wrongType.ok) return
+    expect(wrongType.error!.code).toBe('INVALID_INPUT')
+    expect(wrongType.error!.message).toContain('形态不受支持')
+
+    // 非 pattern 字段出错同理 —— 旧判据（只看 path 是不是 pattern）之外的场景，
+    // 早先的实现会把任何结构错都报成 GLOB_PATTERN_MISSING（过宽）。
+    const otherField = await globTool.call!({ pattern: '*.ts', maxResults: 'many' } as any, ctx)
+    expect(otherField.ok).toBe(false)
+    if (otherField.ok) return
+    expect(otherField.error!.code).toBe('INVALID_INPUT')
+    expect(otherField.error!.message).toContain('maxResults')
   })
 
   it('全是排除项时兜底仍可用，但规模被压制（FALLBACK 上限 + 输出字符预算）', async () => {

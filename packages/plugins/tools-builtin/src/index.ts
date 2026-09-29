@@ -23,6 +23,7 @@
  */
 
 import { defineTool, Tool, ToolResult, ToolContext, PermissionRequest, fromJsonSchema, formatSchemaError, schemaIssues } from '@harness/tool'
+import type { Schema } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
@@ -46,6 +47,38 @@ function resolvePath(inputPath: string, cwd: string): string {
 function isWithinCwd(filePath: string, cwd: string): boolean {
   const rel = relative(cwd, filePath)
   return !rel.startsWith('..') && !isAbsolute(rel)
+}
+
+/**
+ * 直调入参结构守卫（`read_file` / `write_file` / `edit_file` 共用）。
+ *
+ * 管道内 Step 1 已经用同一份 schema 拦过一次；这段是**"越过管道直接调 `tool.call()`"**
+ * 那条路径的兜底（测试正是直接调的）。规则只留一份 —— 复用的就是喂给模型的那份 schema。
+ *
+ * **为什么必须有**：这三个工具的 `call()` 第一行都是 `resolvePath(input.path, ctx.cwd)`，
+ * 而 `resolvePath` 内部先做 `isAbsolute(inputPath)` —— 传 `undefined` / `null` / 数字 / 对象
+ * 都会抛 `TypeError: The "path" property must be of type string`。更要命的是那行在 `try`
+ * **之外**，异常不会被下面的 catch 收敛，会直接冒泡给调用方（权限引擎的
+ * `extractPatterns` 在此之前还会先拿到 `[undefined]`）。
+ *
+ * 与 bash 的守卫同构（那边内联着写），错误码分两档：缺 `path` ⇒ `requiredCode`
+ * （模型从码名就能读出少了哪个参数），其余结构问题 ⇒ `INVALID_INPUT`。
+ */
+function guardPathInput<T>(
+  schema: Schema<T>,
+  input: unknown,
+  requiredCode: string,
+): { ok: true; data: T } | { ok: false; error: { message: string; code: string } } {
+  const parsed = schema.safeParse(input)
+  if (parsed.success) return { ok: true, data: parsed.data }
+  const missingPath = schemaIssues(parsed.error).some((i) => i.rule === 'required' && i.path === 'path')
+  return {
+    ok: false,
+    error: {
+      message: formatSchemaError(parsed.error),
+      code: missingPath ? requiredCode : 'INVALID_INPUT',
+    },
+  }
 }
 
 // ========================================================================
@@ -85,6 +118,19 @@ const MAX_READ_LINES = 10000
 /** 最大内容字符数（截断阈值） */
 const MAX_CONTENT_CHARS = 256 * 1024 // 256KB
 
+/** read_file 的入参 schema（提到模块级，供 `call()` 里的直调守卫复用同一份） */
+const readFileInputSchema = fromJsonSchema<ReadFileInput>({
+  type: 'object',
+  properties: {
+    path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
+    offset: { type: 'number', description: '起始行号（1-based，默认 1）' },
+    limit: { type: 'number', description: '读取行数（默认全部）' },
+    showLineNumbers: { type: 'boolean', description: '是否添加行号前缀（默认 false）' },
+  },
+  required: ['path'],
+  additionalProperties: false,
+})
+
 /**
  * read_file 工具：读取文件内容
  *
@@ -109,17 +155,7 @@ export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
     + '调用示例：read_file({"path":"src/index.ts"})、read_file({"path":"src/index.ts","offset":1,"limit":80})；'
     + 'path 是必填项，只给路径即可，不要省略 arguments。',
   documentation: readFileDoc.trim(),
-  inputSchema: fromJsonSchema<ReadFileInput>({
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
-      offset: { type: 'number', description: '起始行号（1-based，默认 1）' },
-      limit: { type: 'number', description: '读取行数（默认全部）' },
-      showLineNumbers: { type: 'boolean', description: '是否添加行号前缀（默认 false）' },
-    },
-    required: ['path'],
-    additionalProperties: false,
-  }),
+  inputSchema: readFileInputSchema,
   isReadOnly: () => true,
   isConcurrencySafe: () => true,
   permission: {
@@ -127,6 +163,9 @@ export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
     extractPatterns: (input) => [input.path],
   },
   async call(input, ctx): Promise<ToolResult<ReadFileOutput>> {
+    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardPathInput 的文档
+    const guard = guardPathInput(readFileInputSchema, input, 'PATH_REQUIRED')
+    if (!guard.ok) return { ok: false, error: guard.error }
     const absPath = resolvePath(input.path, ctx.cwd)
 
     // 路径安全检查
@@ -231,6 +270,19 @@ export interface WriteFileOutput {
   created: boolean
 }
 
+/** write_file 的入参 schema（提到模块级，供 `call()` 里的直调守卫复用同一份） */
+const writeFileInputSchema = fromJsonSchema<WriteFileInput>({
+  type: 'object',
+  properties: {
+    path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
+    content: { type: 'string', description: '写入内容' },
+    mode: { type: 'string', enum: ['overwrite', 'append', 'create'], description: 'overwrite=覆盖/创建，append=追加，create=仅新建' },
+    createDirs: { type: 'boolean', description: '是否自动创建父目录（默认 true）' },
+  },
+  required: ['path', 'content'],
+  additionalProperties: false,
+})
+
 /**
  * write_file 工具：写入文件
  *
@@ -244,17 +296,7 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
   id: 'write_file',
   description: '写入本地文件。支持覆盖、追加和仅新建模式。只能在工目录内写入。',
   documentation: writeFileDoc.trim(),
-  inputSchema: fromJsonSchema<WriteFileInput>({
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
-      content: { type: 'string', description: '写入内容' },
-      mode: { type: 'string', enum: ['overwrite', 'append', 'create'], description: 'overwrite=覆盖/创建，append=追加，create=仅新建' },
-      createDirs: { type: 'boolean', description: '是否自动创建父目录（默认 true）' },
-    },
-    required: ['path', 'content'],
-    additionalProperties: false,
-  }),
+  inputSchema: writeFileInputSchema,
   isReadOnly: () => false,
   isDestructive: (input) => input?.mode === 'overwrite',
   isConcurrencySafe: () => false,
@@ -263,6 +305,9 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
     extractPatterns: (input) => [input.path],
   },
   async call(input, ctx): Promise<ToolResult<WriteFileOutput>> {
+    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardPathInput 的文档
+    const guard = guardPathInput(writeFileInputSchema, input, 'PATH_REQUIRED')
+    if (!guard.ok) return { ok: false, error: guard.error }
     const absPath = resolvePath(input.path, ctx.cwd)
     const mode = input.mode ?? 'overwrite'
 
@@ -520,7 +565,11 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       // 毫无关系的错误（真机会话里连撞 6 次）。
       const parsedInput = bashInputSchema.safeParse(input)
       if (!parsedInput.success) {
-        const missingCommand = schemaIssues(parsedInput.error).some((i) => i.path === 'command')
+        // 判据必须是 rule：缺 command 与 command 类型不符的 path 都是 'command'，
+        // 只看 path 会把 `command: 123` 也报成 COMMAND_REQUIRED（码说"缺"、消息说"应为 字符串"）。
+        const missingCommand = schemaIssues(parsedInput.error).some(
+          (i) => i.rule === 'required' && i.path === 'command',
+        )
         return {
           ok: false,
           error: {
@@ -1133,6 +1182,19 @@ function findActualString(fileContent: string, search: string): string | null {
   return fileContent.substring(idx, idx + search.length)
 }
 
+/** edit_file 的入参 schema（提到模块级，供 `call()` 里的直调守卫复用同一份） */
+const editFileInputSchema = fromJsonSchema<EditFileInput>({
+  type: 'object',
+  properties: {
+    path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
+    oldString: { type: 'string', description: '要替换的旧文本（必须精确匹配，含缩进/换行）' },
+    newString: { type: 'string', description: '替换为的新文本' },
+    replaceAll: { type: 'boolean', description: '是否替换所有匹配（默认 false，仅替换第一个）' },
+  },
+  required: ['path', 'oldString', 'newString'],
+  additionalProperties: false,
+})
+
 /**
  * edit_file 工具：编辑文件（old_string → new_string 替换）
  *
@@ -1155,17 +1217,7 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
   id: 'edit_file',
   description: '编辑文件：精确查找并替换文本片段。默认只替换第一个匹配，支持 replaceAll。需要 oldString 在文件中唯一匹配。',
   documentation: editFileDoc.trim(),
-  inputSchema: fromJsonSchema<EditFileInput>({
-    type: 'object',
-    properties: {
-      path: { type: 'string', description: '文件路径（相对 cwd 或绝对路径）' },
-      oldString: { type: 'string', description: '要替换的旧文本（必须精确匹配，含缩进/换行）' },
-      newString: { type: 'string', description: '替换为的新文本' },
-      replaceAll: { type: 'boolean', description: '是否替换所有匹配（默认 false，仅替换第一个）' },
-    },
-    required: ['path', 'oldString', 'newString'],
-    additionalProperties: false,
-  }),
+  inputSchema: editFileInputSchema,
   isReadOnly: () => false,
   isDestructive: () => false,
   isConcurrencySafe: () => false,
@@ -1174,6 +1226,9 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
     extractPatterns: (input) => [input.path],
   },
   async call(input, ctx): Promise<ToolResult<EditFileOutput>> {
+    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardPathInput 的文档
+    const guard = guardPathInput(editFileInputSchema, input, 'PATH_REQUIRED')
+    if (!guard.ok) return { ok: false, error: guard.error }
     const absPath = resolvePath(input.path, ctx.cwd)
 
     if (!isWithinCwd(absPath, ctx.cwd)) {

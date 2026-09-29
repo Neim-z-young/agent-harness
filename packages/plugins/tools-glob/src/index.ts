@@ -16,7 +16,7 @@
  * })
  */
 
-import { defineTool, Tool, ToolResult, ToolContext, fromJsonSchema, formatSchemaError } from '@harness/tool'
+import { defineTool, Tool, ToolResult, ToolContext, fromJsonSchema, formatSchemaError, schemaIssues } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 import { resolve, isAbsolute, relative, join } from 'node:path'
@@ -162,13 +162,21 @@ export const globTool = defineTool<GlobInput, GlobOutput>({
   },
   async call(input, ctx): Promise<ToolResult<GlobOutput>> {
     // 入参守卫（结构）：管道内 Step 1 已由 globInputSchema 拦过一次，这里是"越过管道直接调
-    // tool.call()"那条路径的兜底（测试就是直接调的）。错误码沿用 GLOB_PATTERN_MISSING，
-    // 让既有消费方不必区分"从管道来的"还是"从守卫来的"。
+    // tool.call()"那条路径的兜底（测试就是直接调的）。
+    // 错误码按失败**性质**分流：缺 pattern ⇒ GLOB_PATTERN_MISSING（与下面的语义守卫同码，
+    // 消费方不必区分"从管道来的"还是"从守卫来的"）；其它字段的结构问题 ⇒ INVALID_INPUT。
+    // 判据必须是 rule（不能只看 path）——"缺必填"与"类型不符"的 path 都是 'pattern'。
     const parsedInput = globInputSchema.safeParse(input)
     if (!parsedInput.success) {
+      const missingPattern = schemaIssues(parsedInput.error).some(
+        (i) => i.rule === 'required' && i.path === 'pattern',
+      )
       return {
         ok: false,
-        error: { message: formatSchemaError(parsedInput.error), code: 'GLOB_PATTERN_MISSING' },
+        error: {
+          message: formatSchemaError(parsedInput.error),
+          code: missingPattern ? 'GLOB_PATTERN_MISSING' : 'INVALID_INPUT',
+        },
       }
     }
 
