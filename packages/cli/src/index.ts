@@ -2184,7 +2184,9 @@ export class HarnessApp {
       if (tools) merged.tools = [...tools]
       if (mcpServers) merged.mcpServers = [...mcpServers]
       if (excludeMcpServers) merged.excludeMcpServers = [...excludeMcpServers]
-      harness.agent.register(merged)
+      // source=config + overlay：这是文档化覆盖链的最后一环（会覆盖 options / dir 来源的同名定义），
+      // 属于正常路径 ⇒ 只发 agent.reregistered（from/to 带来源）不打 WARN。
+      harness.agent.register(merged, { source: 'config', overlay: true })
     }
   }
 
@@ -2208,8 +2210,10 @@ export class HarnessApp {
     else agents.push(entry)
     await this.configStore.save({ ...cfg, agents })
     // 即时覆盖运行时同名 Agent（query 时实时 filterByWhitelist(agent.tools)）
+    // source=cli.tools：与启动回读（source=config）区分开，归因时能看出"这次是 /tools 干的"；
+    // overlay：用户显式操作，只发事件不打 WARN。
     const existing = this.harness?.agent?.get?.(agentId)
-    if (existing) this.harness!.agent.register({ ...existing, tools: [...tools] })
+    if (existing) this.harness!.agent.register({ ...existing, tools: [...tools] }, { source: 'cli.tools', overlay: true })
   }
 
   /** 读取 config.json 的 mcpServers 列表（缺省 []） */

@@ -1715,9 +1715,40 @@ export interface AgentQueryInput {
   preferComplete?: boolean
 }
 
+/**
+ * Agent 注册的元信息（来源归因 + 覆盖策略）。
+ *
+ * `source` 只用于归因（日志 / 事件），**不进 `AgentDefinition`** —— 它是"这次是谁注册的"，
+ * 不是 Agent 自身的属性；加字段会跟着 md 序列化 / 快照一起落盘。
+ */
+export interface AgentRegisterMeta {
+  /** 来源：`options` / `dir:user` / `dir:project` / `config` / `cli.tools` / `plugin:<id>` / `runtime` */
+  source: string
+  /**
+   * 同 id 覆盖是否允许（缺省 true）。
+   * `false` 时**直接抛错**（调用方显式表达"这个 id 不许被悄悄换掉"）。
+   */
+  overwrite?: boolean
+  /**
+   * 本次覆盖属于**文档化的覆盖链或用户显式操作**（options → dir:user → dir:project → config；
+   * `/tools` 落盘），据此**只发事件不打 WARN**。
+   *
+   * 为什么需要这一位：覆盖必须可见（否则同名抢 id 是静默的），但"配置覆盖默认定义"是
+   * 正常路径，每次启动都打一条 WARN 就是噪音 —— 噪音会把真正异常的那条淹掉。
+   */
+  overlay?: boolean
+}
+
 export interface AgentRuntime {
-  /** 注册 Agent 定义 */
-  register(def: AgentDefinition): void
+  /**
+   * 注册 Agent 定义（同 id 覆盖；`meta` 用于来源归因与覆盖策略，缺省 source='runtime'）。
+   *
+   * 工具池**不需要**为此做任何事：`_prepareQueryOnce` 每轮都重新组装工具池，
+   * 所以运行期注册的 Agent **下一轮 query 立刻有工具**（有回归测试锁住这一点）。
+   */
+  register(def: AgentDefinition, meta?: AgentRegisterMeta): void
+  /** 反注册；返回是否真的摘掉了。**不级联**：不动会话里已引用它的历史（见方案 §7） */
+  unregister(id: string): boolean
   /** 获取 Agent 定义 */
   get(agentId: string): AgentDefinition | undefined
   /** 列出所有 Agent */
@@ -2135,6 +2166,14 @@ function shouldContinueStep(o: StepOutcome): boolean {
 
 export class AgentRuntimeImpl implements AgentRuntime {
   private readonly agents = new Map<string, AgentDefinition>()
+  /**
+   * Agent 定义的**注册来源**（`source`）。
+   *
+   * 用 WeakMap 而不是在 `AgentDefinition` 上加字段：来源是"注册这件事"的属性，不是 Agent
+   * 自身的属性。加字段会污染契约（跟着 md 序列化 / 快照落盘）、并在每次覆盖时把旧对象上的
+   * 来源带进新对象。WeakMap 不阻止 GC，也不会被任何序列化路径看见。
+   */
+  private readonly agentSource = new WeakMap<AgentDefinition, string>()
   private readonly defaultAgentId: string
   /** 惰性创建的快照服务实例 */
   private snapshotSvc: SnapshotService | undefined
@@ -2327,14 +2366,49 @@ export class AgentRuntimeImpl implements AgentRuntime {
     }
   }
 
-  register(def: AgentDefinition): void {
+  register(def: AgentDefinition, meta?: AgentRegisterMeta): void {
+    const prev = this.agents.get(def.id)
+    const source = meta?.source ?? 'runtime'
+    if (prev && meta?.overwrite === false) {
+      throw new Error(
+        `Agent "${def.id}" 已注册（source=${this.agentSource.get(prev) ?? 'unknown'}），overwrite=false 拒绝覆盖`,
+      )
+    }
     this.agents.set(def.id, def)
+    // WeakMap 而不是给 AgentDefinition 加字段：来源是「注册这件事」的属性，不是 Agent 的属性。
+    // 加字段会让它跟着 md 序列化 / 快照落盘，还会在每次覆盖时被旧对象带进新对象。
+    this.agentSource.set(def, source)
+    if (prev) {
+      const from = this.agentSource.get(prev) ?? 'unknown'
+      // 覆盖必须可见（同名抢 id 最难自查的形态就是无声）。文档化的覆盖链 / 用户显式操作
+      // 用 overlay 标记豁免 WARN —— 否则每次启动都刷一条，真异常那条会被淹掉。
+      if (!meta?.overlay) {
+        this.deps.logger?.warn?.(`Agent "${def.id}" 被重新注册：source ${from} → ${source}`)
+      }
+      this._publish(AgentEvents.reregistered, { id: def.id, from, to: source })
+    } else {
+      this._publish(AgentEvents.registered, { id: def.id, source })
+    }
+  }
+  unregister(id: string): boolean {
+    if (!this.agents.delete(id)) return false
+    this._publish(AgentEvents.unregistered, { id })
+    return true
   }
   get(agentId: string): AgentDefinition | undefined {
     return this.agents.get(agentId)
   }
   list(): AgentDefinition[] {
     return Array.from(this.agents.values())
+  }
+
+  /**
+   * 事实广播：fire-and-forget + 吞错。
+   * 理由同 {@link _publishStepGate}：`bus.publish` 会把订阅者失败收成 AggregateError **抛给调用方**，
+   * 上报类事件不能把 agent 主循环带下水；也不该 await（订阅者慢 ⇒ 注册白等一档）。
+   */
+  private _publish<E extends BusEvent>(event: E, payload: EventPayload<E>): void {
+    void this.deps.bus.publish(event, payload, { source: 'agent' }).catch(() => undefined)
   }
 
   /**
@@ -3886,6 +3960,17 @@ export interface AgentStepGateRecord {
  */
 export const AgentEvents = {
   stepGate: BusEvent.define<AgentStepGateRecord>('agent.step.gate'),
+  /**
+   * Agent 注册事实。与 `ProviderEvents` 同属"配置事实"而非"可改写管道" ——
+   * 注册不该有管道 hook（否则两个插件可以静默抢同一个 id），要观测用 bus、要干预请改配置。
+   */
+  registered:   BusEvent.define<{ id: string; source: string }>('agent.registered'),
+  unregistered: BusEvent.define<{ id: string }>('agent.unregistered'),
+  /**
+   * 同 id 被重新注册（**覆盖**）。`from` / `to` 是注册来源 —— 覆盖最需要看见的正是
+   * "改动前是谁注册的、改动后是谁"，只有 id 的话归因不了。
+   */
+  reregistered: BusEvent.define<{ id: string; from: string; to: string }>('agent.reregistered'),
 } as const
 
 /**
@@ -4148,7 +4233,8 @@ export class HarnessImpl implements Harness {
       stepGate: options.stepGate,
       logger: options.logger,
     })
-    ;(options.agents ?? []).forEach((a) => agentImpl.register(a))
+    // 来源标注：构造参数（options.agents）是覆盖链的第一环，后续 agentDirs / config 会覆盖它
+    ;(options.agents ?? []).forEach((a) => agentImpl.register(a, { source: 'options' }))
 
     // 从配置文件目录加载 Agent（支持多级来源：user → project，后加载覆盖先加载）
     // 参考 Claude Code loadAgentsDir 和 OpenCode config.ts loadAgent 逻辑
@@ -4168,7 +4254,9 @@ export class HarnessImpl implements Harness {
         const def = agentFromMarkdown(content, basename(item.name, '.md'), {
           onWarn: (msg) => (warnAgent ? warnAgent(msg) : console.warn(msg)),
         })
-        agentImpl.register(def)
+        // overlay: 文档化的覆盖链（options → dir:user → dir:project → config）里靠后的来源
+        // 覆盖靠前的是**正常路径**，只发 agent.reregistered 不打 WARN；来源本身进事件的 from/to
+        agentImpl.register(def, { source: `dir:${item.source}`, overlay: true })
       } catch (err) {
         this.options.logger?.warn?.(`Agent 配置文件加载失败: ${item.full}: ${(err as Error)?.message ?? err}`)
       }

@@ -1232,6 +1232,9 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
     })
     const { harness } = await app.boot()
     expect(harness.agent.get('default')?.tools).toEqual(['bash', 'echo'])
+    // overlay 覆盖（文档化的配置覆盖链）**不打**「被重新注册」WARN：这是正常路径，
+    // 每次启动刷一条会把真正异常的那条淹掉。覆盖事实仍进 agent.reregistered（from/to 带来源）。
+    expect(chunks.join('')).not.toInclude('被重新注册')
     await app.shutdown()
   })
 

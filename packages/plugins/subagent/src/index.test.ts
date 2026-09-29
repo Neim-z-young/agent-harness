@@ -52,6 +52,7 @@ function createMockAgentRuntime(
   const agentMap = new Map(agents.map((a) => [a.id, a]))
   return {
     register: (def: AgentDefinition) => { agentMap.set(def.id, def) },
+    unregister: (id: string) => agentMap.delete(id),
     get: (id: string) => agentMap.get(id),
     list: () => Array.from(agentMap.values()),
     query: queryImpl ?? (async () => makeMessage('assistant', 'mock response')),

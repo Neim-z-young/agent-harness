@@ -1384,6 +1384,112 @@ describe('@harness/core', () => {
     })
   })
 
+  describe('Agent 运行期注册（来源 / 覆盖 / 反注册 / 工具池）', () => {
+    function makeBusLogger2(bus: InMemoryBus) {
+      const events: BusEventRecord[] = []
+      ;(bus as any).subscribeAll((e: BusEventRecord) => events.push(e))
+      return events
+    }
+
+    it('同 id 二次注册 ⇒ 发 agent.reregistered（带 from/to 来源）且打 WARN', async () => {
+      const bus = new InMemoryBus()
+      const events = makeBusLogger2(bus)
+      const warns: string[] = []
+      const h = await createHarness({
+        bus,
+        chatProvider: mockChatProvider(),
+        logger: { warn: (m: string) => warns.push(m), info: () => {}, error: () => {}, debug: () => {} } as any,
+      })
+      h.agent.register(makeAgent({ id: 'dup' }), { source: 'plugin:x' })
+      h.agent.register(makeAgent({ id: 'dup' }), { source: 'runtime' })
+      await new Promise((r) => setTimeout(r, 0))
+
+      const reReg = events.filter((e) => e.name === 'agent.reregistered')
+      expect(reReg).toHaveLength(1)
+      // from/to 是**来源**而不是同一个 id —— 覆盖最需要看见的正是"改动前后各是谁注册的"
+      expect(reReg[0].payload).toEqual({ id: 'dup', from: 'plugin:x', to: 'runtime' })
+      expect(warns.some((w) => w.includes('dup') && w.includes('plugin:x') && w.includes('runtime'))).toBe(true)
+    })
+
+    it('overlay 覆盖只发事件不打 WARN（文档化覆盖链不打噪音）', async () => {
+      const bus = new InMemoryBus()
+      const events = makeBusLogger2(bus)
+      const warns: string[] = []
+      const h = await createHarness({
+        bus,
+        chatProvider: mockChatProvider(),
+        logger: { warn: (m: string) => warns.push(m), info: () => {}, error: () => {}, debug: () => {} } as any,
+      })
+      h.agent.register(makeAgent({ id: 'x' }), { source: 'options' })
+      h.agent.register(makeAgent({ id: 'x' }), { source: 'config', overlay: true })
+      await new Promise((r) => setTimeout(r, 0))
+      expect(events.filter((e) => e.name === 'agent.reregistered')).toHaveLength(1)
+      expect(warns).toHaveLength(0)
+    })
+
+    it('overwrite:false ⇒ 抛错（调用方显式表达"这个 id 不许被换掉"）', async () => {
+      const h = await createHarness({ chatProvider: mockChatProvider() })
+      h.agent.register(makeAgent({ id: 'locked' }), { source: 'options' })
+      expect(() => h.agent.register(makeAgent({ id: 'locked' }), { source: 'runtime', overwrite: false }))
+        .toThrow(/locked.*overwrite=false/)
+      // 抛错时**不动**已有定义（否则"拒绝覆盖"反而把旧定义弄丢了）
+      expect(h.agent.get('locked')).toBeDefined()
+    })
+
+    it('unregister：摘掉返回 true 且不再可查，未注册 id 返回 false（不级联删历史）', async () => {
+      const h = await createHarness({ chatProvider: mockChatProvider() })
+      h.agent.register(makeAgent({ id: 'temp' }), { source: 'runtime' })
+      expect(h.agent.get('temp')?.id).toBe('temp')
+      expect(h.agent.unregister('temp')).toBe(true)
+      expect(h.agent.get('temp')).toBeUndefined()
+      expect(h.agent.list().some((a) => a.id === 'temp')).toBe(false)
+      expect(h.agent.unregister('temp')).toBe(false)
+    })
+
+    it('运行期注册的 Agent：下一轮 query 立刻有工具（工具池每轮重算，不能被挪回装配期）', async () => {
+      const seenTools: string[][] = []
+      const provider: ChatProvider = {
+        id: 'spy',
+        async complete(params) {
+          seenTools.push((params.tools ?? []).map((t) => t.id))
+          return { content: 'ok', model: 'spy-1', tokenUsage: { input: 1, output: 1 } }
+        },
+      }
+      // 工具注入**按 agentId 分流**：只有 'late' 这个 Agent 触发才加 echo。
+      // 这样若有人把工具池组装挪回装配期（或不再每轮 trigger），本用例必红 ——
+      // 全局注册表里预先有 echo 的实现骗不过这条断言。
+      const LateToolsPlugin: AgentPlugin = {
+        id: 'late-tools',
+        version: '1',
+        name: 'LateTools',
+        async install() {
+          return {
+            async 'core.tool.pool.assemble'(input: any, pool: any) {
+              if (input?.agentId === 'late') pool.add(createEchoTool())
+            },
+          } as Hooks
+        },
+      }
+      const h = await createHarness({
+        chatProvider: provider,
+        agents: [makeAgent({ id: 'default' })],
+        internalPlugins: [LateToolsPlugin],
+      })
+      await h.start()
+      const sess = await h.session.create()
+
+      // 控制组：先跑默认 Agent —— 它不该看到 echo
+      await h.agent.query({ sessionId: sess.id, message: 'hi' })
+      expect(seenTools[0]).not.toContain('echo')
+
+      // 运行期注册一个**构造期不存在**的 Agent，下一轮 query 立刻拿到按 agentId 注入的工具
+      h.agent.register(makeAgent({ id: 'late', tools: ['echo'] }), { source: 'runtime' })
+      await h.agent.query({ sessionId: sess.id, agentId: 'late', message: 'hi' })
+      expect(seenTools[1]).toContain('echo')
+      await h.stop()
+    })
+  })
+
   describe('SessionManager.setId 重命名会话', () => {
     it('setId 同步更新内部索引，按新 id 可查得同一会话', async () => {
       const h = await createHarness({ chatProvider: mockChatProvider() })
