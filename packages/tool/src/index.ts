@@ -111,11 +111,32 @@ export function withJsonSchema<T>(
  * `message` 会被 {@link ToolSchemaError} 拼进错误文本，是模型「入参自愈」时能拿到的**全部**信息 ——
  * 必须写清"哪个参数、要什么、收到什么"，而不是只说"校验失败"。
  */
+/** 校验失败的**规则类别**（见 {@link JsonSchemaIssue.rule}） */
+export type JsonSchemaRule =
+  | 'required' // 缺必填
+  | 'type' // 类型不符
+  | 'enum' // 枚举越界
+  | 'union' // oneOf / anyOf 各分支均不匹配
+  | 'additional' // 未声明的字段（strictProperties 下）
+  | 'items' // 数组元素个数越界
+  | 'length' // 字符串长度越界
+  | 'range' // 数值越界
+
 export interface JsonSchemaIssue {
   /** 出问题的入参路径（点号分隔，数组下标用 `[i]`；根为 `(root)`） */
   path: string
   /** 可读说明 */
   message: string
+  /**
+   * 规则类别 —— 给工具内的守卫按"**哪类问题**"分流错误码用。
+   *
+   * 存在的理由：同一个字段可能出**不同性质**的错，而"缺必填"与"类型不符"在 {@link path}
+   * 上长得一模一样（都是 `'path'` / `'command'`）。只看 path 会把类型错也归成「缺参数」——
+   * 码说"缺"，消息说"应为 字符串，收到 数字"，两者打架。
+   *
+   * 守卫**判它，不要判 `message`**（文案会改，判据会静默失效）。
+   */
+  rule?: JsonSchemaRule
 }
 
 /** `fromJsonSchema` 校验失败 —— 带结构化 issues，`message` 已可直接给模型看 */
@@ -225,6 +246,7 @@ function validateNode(
       if (!passed) {
         issues.push({
           path: at,
+          rule: 'union',
           message: `${at} 的形态不受支持（需满足 ${unionKey} 中的一种，收到 ${describeActual(value)}）`,
         })
       }
@@ -235,6 +257,7 @@ function validateNode(
   if (Array.isArray(node.enum) && !node.enum.includes(value)) {
     issues.push({
       path: at,
+      rule: 'enum',
       message: `${at} 只能是 ${node.enum.map((v) => JSON.stringify(v)).join(' / ')}，收到 ${JSON.stringify(value)}`,
     })
     return
@@ -244,7 +267,7 @@ function validateNode(
   if (typeof want === 'string' || Array.isArray(want)) {
     const wants = Array.isArray(want) ? want.map(String) : [want]
     if (!wants.some((w) => typeMatches(value, w))) {
-      issues.push({ path: at, message: `${at} 应为 ${describeTypes(want)}，收到 ${describeActual(value)}` })
+      issues.push({ path: at, rule: 'type', message: `${at} 应为 ${describeTypes(want)}，收到 ${describeActual(value)}` })
       return
     }
   }
@@ -260,7 +283,7 @@ function validateNode(
         if (obj[key] === undefined) {
           const decl = properties?.[key]
           const hint = decl && decl.type !== undefined ? `（${describeTypes(decl.type)}）` : ''
-          issues.push({ path: childPath(at, key), message: `缺少必填参数 ${JSON.stringify(key)}${hint}` })
+          issues.push({ path: childPath(at, key), rule: 'required', message: `缺少必填参数 ${JSON.stringify(key)}${hint}` })
         }
       }
     }
@@ -282,7 +305,7 @@ function validateNode(
         if (declared.has(key) || obj[key] === undefined) continue
         if (additional === false) {
           if (strictProperties) {
-            issues.push({ path: childPath(at, key), message: `不接受未声明的参数 ${JSON.stringify(key)}` })
+            issues.push({ path: childPath(at, key), rule: 'additional', message: `不接受未声明的参数 ${JSON.stringify(key)}` })
           }
         } else if (typeof additional === 'object' && additional !== null) {
           validateNode(obj[key], additional as JsonSchemaNode, childPath(at, key), issues, strictProperties)
@@ -297,10 +320,10 @@ function validateNode(
     const minItems = node.minItems
     const maxItems = node.maxItems
     if (typeof minItems === 'number' && arr.length < minItems) {
-      issues.push({ path: at, message: `${at} 至少需要 ${minItems} 项，收到 ${arr.length} 项` })
+      issues.push({ path: at, rule: 'items', message: `${at} 至少需要 ${minItems} 项，收到 ${arr.length} 项` })
     }
     if (typeof maxItems === 'number' && arr.length > maxItems) {
-      issues.push({ path: at, message: `${at} 最多允许 ${maxItems} 项，收到 ${arr.length} 项` })
+      issues.push({ path: at, rule: 'items', message: `${at} 最多允许 ${maxItems} 项，收到 ${arr.length} 项` })
     }
     const items = node.items
     if (items && typeof items === 'object' && !Array.isArray(items)) {
@@ -316,10 +339,10 @@ function validateNode(
     const minLength = node.minLength
     const maxLength = node.maxLength
     if (typeof minLength === 'number' && len < minLength) {
-      issues.push({ path: at, message: `${at} 至少 ${minLength} 个字符，收到 ${len} 个` })
+      issues.push({ path: at, rule: 'length', message: `${at} 至少 ${minLength} 个字符，收到 ${len} 个` })
     }
     if (typeof maxLength === 'number' && len > maxLength) {
-      issues.push({ path: at, message: `${at} 最多 ${maxLength} 个字符，收到 ${len} 个` })
+      issues.push({ path: at, rule: 'length', message: `${at} 最多 ${maxLength} 个字符，收到 ${len} 个` })
     }
     return
   }
@@ -329,10 +352,10 @@ function validateNode(
     const minimum = node.minimum
     const maximum = node.maximum
     if (typeof minimum === 'number' && num < minimum) {
-      issues.push({ path: at, message: `${at} 不得小于 ${minimum}，收到 ${num}` })
+      issues.push({ path: at, rule: 'range', message: `${at} 不得小于 ${minimum}，收到 ${num}` })
     }
     if (typeof maximum === 'number' && num > maximum) {
-      issues.push({ path: at, message: `${at} 不得大于 ${maximum}，收到 ${num}` })
+      issues.push({ path: at, rule: 'range', message: `${at} 不得大于 ${maximum}，收到 ${num}` })
     }
   }
 }

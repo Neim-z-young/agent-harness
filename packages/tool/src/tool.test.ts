@@ -1211,6 +1211,53 @@ describe('fromJsonSchema', () => {
     expect(res.ok).toBe(true)
   })
 
+  // ===== issue 的结构化判据：rule =====
+  //
+  // 工具内的守卫要按失败的**性质**分流错误码（缺参数 vs 类型不符），而两者在 `path` 上
+  // 长得一模一样。判 `message` 会随文案改动静默失效 ⇒ 必须有一个结构化的判据。
+
+  it('缺必填 ⇒ rule=required；类型不符 ⇒ rule=type（两者的 path 完全相同）', () => {
+    const s = fromJsonSchema<BashLikeInput>(bashLike)
+
+    const miss = s.safeParse({ timeoutMs: 100 })
+    if (miss.success) throw new Error('应当失败')
+    expect(schemaIssues(miss.error)[0]).toMatchObject({ path: 'command', rule: 'required' })
+
+    const wrongType = s.safeParse({ command: 123 })
+    if (wrongType.success) throw new Error('应当失败')
+    const issue = schemaIssues(wrongType.error)[0]!
+    expect(issue.path).toBe('command') // 与"缺失"同 path —— 只看 path 区分不了
+    expect(issue.rule).toBe('type') // rule 才能区分
+  })
+
+  it('其余关键字各自归类（enum / union / additional / items / length / range）', () => {
+    type Loose = JsonSchemaFor<Record<string, unknown>>
+    const obj = (props: Record<string, unknown>, required: string[] = []): Loose => ({
+      type: 'object',
+      properties: props,
+      required,
+    })
+    const ruleOf = (schema: Loose, value: unknown, opts?: { strictProperties?: boolean }) => {
+      const parsed = fromJsonSchema<Record<string, unknown>>(schema, opts).safeParse(value)
+      if (parsed.success) throw new Error('应当失败')
+      return schemaIssues(parsed.error).map((i) => i.rule)
+    }
+
+    expect(ruleOf(obj({ mode: { type: 'string', enum: ['a'] } }), { mode: 'b' })).toContain('enum')
+    expect(ruleOf(obj({ p: { oneOf: [{ type: 'string' }] } }), { p: {} })).toContain('union')
+    expect(ruleOf(obj({ xs: { type: 'array', minItems: 2 } }), { xs: ['1'] })).toContain('items')
+    expect(ruleOf(obj({ s: { type: 'string', minLength: 3 } }), { s: 'ab' })).toContain('length')
+    expect(ruleOf(obj({ n: { type: 'number', minimum: 10 } }), { n: 1 })).toContain('range')
+
+    // additionalProperties:false 的**拒绝**只在 strictProperties 下发生（默认容忍多余字段）
+    const strict = ruleOf(
+      { type: 'object', properties: { a: { type: 'string' } }, additionalProperties: false },
+      { a: 'x', b: 1 },
+      { strictProperties: true },
+    )
+    expect(strict).toContain('additional')
+  })
+
   // ===== 编译期守卫：JsonSchemaFor<T> =====
   //
   // 这两条不测运行时行为，测的是**类型层面**的守卫：接口字段是运行时拿不到的东西，
