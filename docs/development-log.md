@@ -1,5 +1,120 @@
 # Agent Harness 开发日志
 
+## 2026-09-29（续 214）工具入参运行时校验：从 JSON Schema 派生 + 30 个工具迁移
+
+### 起因：三层落差
+
+核对"工具定义有没有类似 zod 的运行时校验"，答案是**有拟 zod 的接口、有真实执行点，但没有字段级校验**：
+
+| 层 | 事实 | 判定 |
+|---|---|---|
+| 接口层 | `Schema<T> = { parse, safeParse, __jsonSchema? }`（`packages/tool/src/index.ts`），注释写"兼容 zod / valibot / 自定义校验" | zod 只是**形状目标**：全仓无 zod（`bun.lock` 零命中、`node_modules/zod` 不存在、`acp-kernel` 的 `safeParse` 只是它自己 5 行 `JSON.parse` 帮手） |
+| 执行层 | `ToolPipeline.execute` Step 1 真调 `inputSchema.safeParse(rawInput)` → 失败抛 `ToolSchemaError(stage='input')`；Step 6 校 outputSchema | **真的会抛**，且经 `_throwToolFailureWithHooks` 归一化后喂 PostHook ⇒ 遥测 `tool.fail` 看得到 |
+| 内容层 | 10 个包各自抄了一份 `makeSchema<T>()`，`safeParse` **恒返回 `success: true`** | 对内置工具 Step 1 就是 **no-op**。`tool.validateInput` 接口在，但**全仓零实现** |
+
+结果：字段级把关其实没人做，全靠工具 `call()` 里手写守卫（`COMMAND_REQUIRED` / `GLOB_PATTERN_MISSING`），
+而 `read_file` 连守卫都没有 —— 缺 `path` 时 `resolvePath(undefined)` 在 `call()` 里抛 TypeError。
+
+三类失败三种表现，正是这次要收掉的。
+
+### 形态：从 JSON Schema **派生**，而不是另写一套 DSL
+
+新增 `fromJsonSchema<T>(schema, opts?)`：走一遍已有 JSON Schema 做运行时校验，并把它挂成 `__jsonSchema`。
+
+选它而不是字段 DSL / zod 的理由：
+
+- **单一取源**：`__jsonSchema` 本来就是"给模型看的唯一参数来源"（openai / anthropic / gemini 三个适配器都读它）。
+  再声明一份运行时规则就是**两份真值会漂移**；派生之后一处声明同时决定"模型看到什么"与"运行期接受什么"。
+- **模型侧载荷字节级不变**（`__jsonSchema` 就是传入的那个对象，测试锁 `toBe`），provider 适配层零回归风险。
+- **逐工具改动只有一行**：`withJsonSchema(makeSchema<X>(), {` → `fromJsonSchema<X>({`（收尾的 `}),` 都不用动）。
+- 沿用仓里"不依赖 zod"的一贯约定。
+
+覆盖关键字 = 现网工具实际用到的**全集**（`type`/`properties`/`required`/`additionalProperties`/`items`/
+`oneOf`/`anyOf`/`enum`/`minimum`/`maximum`/`minLength`/`maxLength`/`minItems`/`maxItems`）；
+**未识别的关键字一律放行**（宁可漏拦，不可误杀 —— `pattern`/`format` 不参与运行期校验）。
+
+### 严格度的三档取舍（用户裁决）
+
+| 项 | 取值 | 理由 |
+|---|---|---|
+| 缺必填 / 类型不符 / 枚举越界 | **拒** | 真机的主要失败形态（`read_file` 发过 14 次 `input:{}`） |
+| 多余字段 | **容忍**（默认） | ① 模型偶尔带无害冗余，拒它等于凭空造一类新失败；② `oneOf` 多模式的 schema **刻意省略 `properties`**（`JsonSchemaObject` 注释明写），一律拒会误伤合法入参 |
+| `additionalProperties:false` 真生效 | `strictProperties: true` 显式开 | 需要与"给模型看的声明"完全一致时才付这个代价 |
+
+**第 2 条不是想当然 —— 是 E3 实验打出来的**：把默认改成拒绝后，`glob` 的
+`exclude 参数便捷字段` 与 `文件大小过滤` 两条既有用例直接变红。查下来是 `GlobInput` 有 8 个字段、
+而 glob 的 JSON Schema 只声明了 4 个 —— **`exclude` / `minSizeBytes` / `maxSizeBytes` / `maxDepth`
+是"工具接受、但没告诉模型"的**。若当初选了"多余字段也拒"，这个功能当场断掉。
+
+### 30 个工具迁移（10 个包）
+
+tools-builtin 5、swarm 10、code-intel 4、acp-context 4、tools-search 2、tools-glob 1、tools-web 1、
+tools-media 1、subagent 1、coordinator 1。同时删掉各包本地重复的 `makeSchema`（三种变体：多行 /
+单行返回 / 紧凑单行方法）与随之失效的 `withJsonSchema` / `Schema` 导入。
+
+> `withJsonSchema` 本身**保留**（`tool.test.ts` 有用例锁定它"只追加 `__jsonSchema`、不改变
+> parse/safeParse 行为"）。它的定位收窄为"已自带 safeParse、只想补一份模型可读描述"，如
+> mcp-client 透传服务端 schema；mcp-client 不在本次 30 个之内（动态工具，schema 来自 server）。
+
+### 守卫**没有删**，而是改成由同一份 schema 派生
+
+原计划是"删掉重复守卫"，核对后发现删不得：`tools-builtin.test.ts:198` 与 `tools-glob.test.ts:157`
+都是**直接调 `tool.call()`**，绕过管道 —— 守卫是"越过管道那条路径"的防线，删掉会红测试，
+并把 `bash: undefined: command not found` 的真机 bug 放回来。
+
+于是改成**两段式**，规则只留一份：
+
+```ts
+const parsedInput = bashInputSchema.safeParse(input)   // 结构：与管道 Step 1 同一份 schema
+if (!parsedInput.success) {
+  const missingCommand = schemaIssues(parsedInput.error).some((i) => i.path === 'command')
+  return { ok: false, error: {
+    message: formatSchemaError(parsedInput.error),
+    code: missingCommand ? 'COMMAND_REQUIRED' : 'INVALID_INPUT',
+  } }
+}
+if (parsedInput.data.command.trim() === '') { /* 语义：JSON Schema 表达不了，留手判 */ }
+```
+
+- 对外错误码不变（`COMMAND_REQUIRED` / `GLOB_PATTERN_MISSING`），既有用例与消费方零改动；
+- schema 因此被提到模块级（glob）或工厂函数局部（bash），`call()` 复用的就是喂给模型的那一份；
+- glob 的"全空白 / 空数组"判断保留 —— 那是 `if (!pat) continue` 静默跳过 ⇒ 兜底成全仓遍历的入口，
+  JSON Schema 表达不了"非空白"。
+- `bash_ro` 未动：它的 `checkReadOnlyCommand` 是**语义**校验器（白名单 + 写通道检测），
+  非空判断只是它自己契约的一部分，不算 schema 的重复。
+
+### 反向验证：4 组实验逐条归因
+
+| 实验 | `@harness/tool` | tools-builtin | tools-glob |
+|---|---|---|---|
+| **E1** 摘掉 `required` | 6 红：缺必填 / oneOf 两分支 / parse 抛出 / formatSchemaError / schemaIssues / Pipeline 缺必填 | 2 红：bash 缺 command、read_file 空入参 | **0 红** |
+| **E2** 摘掉类型检查 | 3 红：类型不符 / 数组 items / `additionalProperties` 为对象 | 1 红：类型不符 ⇒ INVALID_INPUT | 1 红：结构不合法（message 断言） |
+| **E3** 多余字段改成默认拒 | 1 红：多余字段容忍 | 1 红：控制组 | **2 红**：exclude 便捷字段、文件大小过滤 |
+| **E4** 回到恒过 schema | 12 红 | 3 红 | 1 红 |
+
+两条值得单独记：
+
+- **E1 的 glob 0 红不是遗漏，是真实归因**：`pattern` 缺失时 schema 虽放行，但 `rawPatterns` 过滤后为空
+  ⇒ 仍走语义守卫返回 `GLOB_PATTERN_MISSING`。那条断言测的是"**拒绝静默退化**"，不是"required 生效"，
+  所以对 required 不敏感是正确的。
+- **E4 是迁移有效性的总证据**：把校验器还原成恒过，三个包合计 16 条用例变红 ⇒ `fromJsonSchema`
+  确实接在了执行路径上，不是装饰。
+
+### 验收
+
+`typecheck` 39 包 0 error；全量 `test` 39 包 **0 fail**，2000 → **2022** pass（+22：tool +19、
+tools-builtin +3、tools-glob +1）。反向验证后源码已还原并复测三包全绿。
+
+### 遗留（未做，等发话）
+
+- **glob 的 schema 不完整**（上表 E3 暴露）：`GlobInput` 8 字段 vs schema 4 字段，
+  `additionalProperties:false` 等于在告诉模型"没有 exclude / minSizeBytes / maxSizeBytes / maxDepth"。
+  运行期容忍所以不断功能，但**模型发现不了这 4 个参数**。建议按"tool schemas 补全"主线做一次
+  全量核对（input 接口字段 ↔ schema properties），本次只确证了 glob 一处。
+- `read_file` 的**直接调用**仍是裸 `resolvePath(input.path)`：生产路径已被 Step 1 保护，
+  但越过管道直调仍会抛 TypeError。是否补守卫未定（倾向先不动，与 bash/glob 的处理保持一致需要评估）。
+- `UsageStats` 的 provider 维度、`unregister` 级联、`_setChatProvider` 最终删除（承续 213）。
+
 ## 2026-09-29（续 213）运行期注册 S3：事件归属、来源列、实例数、端点维度
 
 S1+S2 把「运行期注册」的能力与守卫补齐之后，S3 收口在**可观测与展示**：把已经存在的

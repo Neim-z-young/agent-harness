@@ -263,6 +263,14 @@
 
 - **哨兵值不是实体 id，别让它落进事实载荷**：`prepared.providerId` 的兜底是 `'default'`（`_runStep` 与 `providers.resolve` 都拿它当"未指定 ⇒ 走默认"的哨兵，而注册表里**没有**这个键）。把哨兵原样写进 `core.llm.usage` / `providerCache` 等于凭空造出一个叫 `default` 的端点，消费方按 providerId 聚合时会多出一个假分组。判据：**凡是要落进事实载荷的 id，先确认它在对应的注册表里真能查到**；查不到就归一为"不带"（缺省本身就表达"这次走默认"）
 
+- **新工具的入参用 `fromJsonSchema`：一份声明同时管"模型读到什么"与"运行期接受什么"**：`__jsonSchema` 是 provider 生成 tools 载荷的**唯一**参数来源，另写一套字段 DSL 做校验就是两份真值会漂移。`withJsonSchema` 收窄为"已自带 `safeParse`、只想补一份模型可读描述"的场合（如 mcp-client 透传服务端 schema）。这条针对的是一个真实历史状态：内置工具的 `inputSchema` 曾全是恒过的 `makeSchema`（`safeParse` 恒 `success:true`）⇒ `ToolPipeline` Step 1 形同 no-op，字段级校验**实际上没人做**
+
+- **校验失败的文本就是模型「入参自愈」能拿到的全部信息**：必须写清"哪个参数、要什么、收到什么"（`缺少必填参数 "command"（字符串）` / `timeoutMs 应为 数字，收到 字符串`），不能只说"校验失败"。真机代价可量化：`read_file` 被发出 **14 次 `input:{}`**，每轮自愈都是一次完整 prompt（全 run 约 0.68M token ≈ 10%）—— 措辞直接决定能不能一次补对
+
+- **工具内的入参守卫是"越过管道直调 `tool.call()`"那条路径的兜底，不是 schema 的重复**：管道 Step 1 已用同一份 schema 拦结构，守卫必须**复用同一份**（`xInputSchema.safeParse` + `formatSchemaError` / `schemaIssues`）并保持对外错误码不变，不得另写一份规则；JSON Schema 表达不了的部分（纯空白串、空数组）才留在守卫里。判据有两个：① **测试直接调 `tool.call()` 时守卫必须仍然生效**（`tools-builtin.test.ts` / `tools-glob.test.ts` 就是直调的，删守卫除红测试外还会把 `bash: undefined: command not found` 放回来）；② 反向验证时"摘掉 schema 检查"要让守卫相关的用例也变红
+
+- **运行时默认容忍 schema 未声明的字段**：`additionalProperties:false` 是**给模型的声明**，不等于运行期拒收。两条理由：模型偶尔带无害冗余（拒它等于凭空造一类新失败），且 `oneOf` 多模式的 schema **刻意省略 `properties`**（一律拒会误伤合法入参）。要真拒用 `strictProperties: true` 显式开。反向验证时这条被证明不是想当然：把默认改成拒绝 ⇒ `glob` 的 `exclude` / 文件大小过滤两条既有用例直接红 —— 因为 `GlobInput` 有 8 个字段而 glob 的 schema 只声明了 4 个（**输入接口字段 ↔ schema properties 必须对齐**，否则模型发现不了那些参数）
+
 ## 6. 安全与协作
 
 - 子代理工具调用 `isConcurrencySafe` 必须为 `false`，防止并发写冲突
