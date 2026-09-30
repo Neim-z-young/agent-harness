@@ -100,6 +100,16 @@
 | 🔧 `compression.nudge.emergencyThresholdPct` | **0.95** | 溢出线：`usage ≥ 该比例` 无条件强提醒（提示词为 `⚠️ Context limit reached`）。 |
 | ⬇ `compression.config.nudge.*` | 见下 | 高级字段全量透传（见 §7 默认值汇总）。 |
 
+> ⚠️ **写法（本文最容易踩的一处）**：上表的 `nudge.X` 是**字段名**，不等于**能写的路径**。
+> 结构化口 `compression.nudge` **只收上面那三个百分比键**；内核 `NudgeConfig` 的其余 10 个 ——
+> `growthRatio` / `growthFloor` / `growthCap` / `minGrowthFloor` / `minGrowthRatio` / `frequency` /
+> `force` / `iterationThreshold` / `tier2GrowthMultiplier` / `minPressureBenefitTokens` ——
+> **必须**写成 `compression.config.nudge.X`，写在 `compression.nudge` 里**不会生效**。
+> （校验器会告警，而且会直接指出该写到哪；见 §10。）本文正文为简洁统一记作 `nudge.X`，读到时请按本注还原成路径。
+> 同理：`compression.tiers` 只收 `tier2Trigger` / `tier3Trigger`，内核的 `enabled` 要写 `config.tiers.enabled`。
+> 作用域档位（`subagent` / `perAgent[*]`）**同一套规则**，透传口就是 `config` 前面多一层档位，例如
+> `compression.subagent.config.nudge.growthFloor`。
+
 > kernel 校验：`minContextLimitPct ≤ maxContextLimitPct`，且 `maxContextLimitPct ≤ emergencyThresholdPct`。
 
 ---
@@ -128,6 +138,11 @@
 未入上面结构化字段的其它 kernel 配置可经 `compression.config` 透传（键与 kernel `Partial<Config>` 一致）。
 下方是这些项的默认值（含本插件已结构的层级默认，供对齐）。
 
+> **两个口可以同时用、会合并**：结构化口（`nudge` / `tiers`）与 `config.*` 透传口描述同一棵子树时按
+> **深合并**处理、**结构化口优先**。§7.5 的推荐配置就是这么用的 —— 三个百分比键走结构化口、growth 系列走
+> `config.nudge`，两边都活着。**特例：`config` 与结构化字段是同名标量时以结构化字段为准**
+> （如 `preserveRecentTokens`）。
+
 | 键 | 默认 | 说明 |
 |----|------|------|
 | `compress.minCompressRange` | **5000** | 一个折叠范围原文 chars ≥ 该值才允许压缩（0=不设门槛）。 |
@@ -147,8 +162,10 @@
 
 ## 7.1 nudge 增长阈值详解（`growthFloor` / `growthCap` / `growthRatio` / `minGrowthFloor` / `minGrowthRatio`）
 
-§5 的 `*ContextLimitPct` 是**占用率**门槛；这里的 growth 系列是**token 增量**门槛，两者**并列**触发。都写
-在 `compression.nudge.*`（结构化）或 `compression.config.nudge.*`（透传），以 token 计。
+§5 的 `*ContextLimitPct` 是**占用率**门槛；这里的 growth 系列是**token 增量**门槛，两者**并列**触发。
+
+⚠️ 与 §5 那三个百分比键不同，growth 系列**只能**写在 `compression.config.nudge.*`（透传口）——
+结构化口 `compression.nudge` 只收百分比键，写进去不会生效（见 §5 的写法注），以 token 计。
 
 **① 触发门槛 `nudgeGrowthTokens`：需要攒够多少「可压缩内容」才会提醒**
 
@@ -734,11 +751,12 @@ cd packages/plugins/acp-context
   "preserveRecentMessages": 5,
   "promotionThreshold": 10,
   "tiers": { "tier2Trigger": 5, "tier3Trigger": 18 },
-  "nudge": {
-    "growthRatio": 0, "minGrowthRatio": 0,          // 让 nudgeGrowthTokens ≡ cadenceFloor ≡ GF
-    "maxContextLimitPct": 0.65, "minContextLimitPct": 0.35, "emergencyThresholdPct": 0.80
-  },
-  "config": { "compress": { "maxSummaryLength": 10000, "minSummaryLength": 1000 } }
+  "nudge": { "maxContextLimitPct": 0.65, "minContextLimitPct": 0.35, "emergencyThresholdPct": 0.80 },
+  "config": {
+    // 内核 NudgeConfig 的其余字段只能走透传口（结构化口只收上面那三个百分比键，见 §5 写法注）
+    "nudge": { "growthRatio": 0, "minGrowthRatio": 0 },   // 让 nudgeGrowthTokens ≡ cadenceFloor ≡ GF
+    "compress": { "maxSummaryLength": 10000, "minSummaryLength": 1000 }
+  }
 }
 ```
 
@@ -753,17 +771,20 @@ cd packages/plugins/acp-context
     "preserveRecentTokens": 50000,
     "promotionThreshold": 10,
     "tiers": { "tier2Trigger": 5, "tier3Trigger": 18 },
-    "nudge": {
-      "growthFloor": 75000, "growthCap": 75000, "minGrowthFloor": 75000,
-      "growthRatio": 0, "minGrowthRatio": 0,
-      "maxContextLimitPct": 0.65, "minContextLimitPct": 0.35, "emergencyThresholdPct": 0.80
-    },
-    "config": { "compress": { "minCompressRange": 200000, "maxSummaryLength": 10000, "minSummaryLength": 1000 } }
+    "nudge": { "maxContextLimitPct": 0.65, "minContextLimitPct": 0.35, "emergencyThresholdPct": 0.80 },
+    "config": {
+      // GF 三键 = 内核 NudgeConfig 字段，只能写透传口（写进 "nudge" 不生效）
+      "nudge": {
+        "growthFloor": 75000, "growthCap": 75000, "minGrowthFloor": 75000,
+        "growthRatio": 0, "minGrowthRatio": 0
+      },
+      "compress": { "minCompressRange": 200000, "maxSummaryLength": 10000, "minSummaryLength": 1000 }
+    }
   }
 }
 ```
 
-200K / 1M 把 `modelContextLimit`、`preserveRecentTokens`、`nudge.growth*`、`minCompressRange`
+200K / 1M 把 `modelContextLimit`、`preserveRecentTokens`、`config.nudge.growth*`、`minCompressRange`
 四处换成表里的值即可（其余键三档相同）。
 
 ### ② 这三组值是怎么选出来的（每档都验过）
@@ -965,8 +986,8 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 | `nudge.maxContextLimitPct` | **0.75** |
 | `nudge.minContextLimitPct` | **0.45** |
 | `nudge.emergencyThresholdPct` | **0.95** |
-| `nudge.growthRatio` / `growthFloor` / `growthCap` | **0.05 / 50000 / 50000**（合成 `nudgeGrowthTokens`，见 §7.1） |
-| `nudge.minGrowthFloor` / `minGrowthRatio` | **20000 / 0.45**（折叠节奏，见 §7.1） |
+| `nudge.growthRatio` / `growthFloor` / `growthCap` | **0.05 / 50000 / 50000**（合成 `nudgeGrowthTokens`，见 §7.1）<br>⚠️ 都是内核字段 ⇒ 写 `config.nudge.*`（见 §5 写法注） |
+| `nudge.minGrowthFloor` / `minGrowthRatio` | **20000 / 0.45**（折叠节奏，见 §7.1）<br>⚠️ 同上，写 `config.nudge.*` |
 | 窗口缩放推荐 `preserveRecentTokens` | 手工/成本口径版：`R(W) = 30000 + 28600×log10(W/200000)`，夹 [15000,150000]：200k→**30k**、300k→**35k**、1m→**50k**（见 §7.2）<br>**自动适配版（锚定保真值）**：三锚点 `(200k,35k) (300k,50k) (1m,100k)` 在 `log10(W)` 上分段插值、两端延伸，夹 [15000,150000]（见 §7.5③） |
 | **最优参数表（200K/300K/1M）** | 200K → `R=35000 / GF=52500 / MC=140000`；300K → **`50000 / 75000 / 200000`**；1M → **`100000 / 150000 / 400000`**（见 §7.5①） |
 | `autoTune: true` 的推导组合 | `preserveRecentTokens=R(W)`；`nudge.growthFloor = growthCap = minGrowthFloor = round500(1.5R)`；`compress.minCompressRange = clamp(4R, 8000, 2×(W−R))`；`growthRatio=minGrowthRatio=0`（见 §7.4②/§7.5③） |
@@ -1007,6 +1028,22 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
        - compression.tokenCalibration 取值 "chars/4" 未知（可选：auto / chars4），已按默认 auto 处理
        - compression.nudge.growthFloar 未被识别，该配置不会生效
 ```
+
+**告警会指路（"写错了口"与"拼错了键"分开处理）**：
+
+- **写错了口**（键确实是内核字段，只是写进了只收常用键的结构化口）⇒ 直接给出**能生效的那条路径**：
+
+  ```
+  [WARN] config.json → compression 有以下未生效项：
+         - compression.subagent.nudge.growthFloor 未被识别（.subagent.nudge 结构化口只收
+           maxContextLimitPct / minContextLimitPct / emergencyThresholdPct）—— 该键是内核字段，
+           请写到 compression.subagent.config.nudge.growthFloor 才生效
+  ```
+
+- **拼错了键**（`growthFloar` 这类内核里**也不存在**的写法）⇒ 维持朴素文案，**不指路**。
+  指路只认内核真实字段名；否则用户会照着告警抄一条同样无效的路径，比不指路更糟。
+- `telemetry` 段没有压缩那样的高级透传口可兜底，写错的键在本段没有别的去处 ⇒ 告警附**可用键清单**，
+  例如 `telemetry.store 未被识别，该配置不会生效（可用键：enabled / path / debounceMs / crash / userId / otlp）`。
 
 - **校验范围**：`compression` 顶层 / `tiers` / `nudge` / `telemetry` / `prompts`，
   作用域档位 `subagent` 与 `perAgent[*]`（含各档位自己的 `manualInjection` / `tiers` / `nudge` / `config`），
@@ -1056,7 +1093,21 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 
 档位段里能写的键 = **与顶层同一套键名**：`modelContextLimit` / `manualInjection` /
 `preserveRecentMessages` / `preserveRecentTokens` / `promotionThreshold` / `tiers` / `nudge` / `config`。
-刻意不做"顶层一种语法、档位另一种语法"（那种不一致正是"配了却不生效"的温床）。
+刻意不做"顶层一种语法、档位另一种语法"（那种不一致正是"配了却不生效"的温床）。翻译代码也只有**一份**
+（`toAcpConfig`），顶层与档位共用 —— 想改语法就得同时改到两边，没有漂移的余地。
+
+⚠️ **`nudge` / `tiers` 的"字段名 ≠ 可写路径"规则在档位里同样适用**（见 §5 写法注）：档位里的结构化口
+也只收常用的那几个键，内核字段要写进**档位的 `config`**。例如给子 Agent 单独设折叠块大小：
+
+```jsonc
+{ "compression": { "subagent": {
+  "preserveRecentTokens": 50000,
+  "tiers": { "tier2Trigger": 10 },
+  "config": { "nudge": { "growthFloor": 70000 } }   // ← 不是 "nudge": { "growthFloor": ... }
+} } }
+```
+
+（写在 `subagent.nudge.growthFloor` 会告警，并直接提示该写到 `subagent.config.nudge.growthFloor`。）
 
 **唯一不允许写进档位的是 `tokenCalibration` / `tokenCalibrationScale`**：折算口径与 `createCore` 注入的
 `countTokens` 是**同一个函数**，全进程只能有一把尺子；否则会退化成"决策用一把尺、报表用另一把"（本仓反复

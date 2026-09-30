@@ -9,6 +9,12 @@
 >
 > 实测口径：同会话长度 500k/700k/1M 原文、`perTurn=5000`、`sysTok=13000`、仅 nudge 触发折叠；
 > 有效成本 = `均请求 tok × [(1−命中) + 命中 × 1/25]`。
+>
+> ⚠️ **写之前先看一眼（本页最容易抄错的地方）**：下表里的 `nudge.X` 是**字段名**，不是**可写路径**。
+> `compression.nudge` **只收三个百分比键**（`maxContextLimitPct` / `minContextLimitPct` /
+> `emergencyThresholdPct`）；`growthFloor` / `growthCap` / `minGrowthFloor` / `growthRatio` /
+> `minGrowthRatio` 这些**内核字段必须写 `compression.config.nudge.X`**，写在 `compression.nudge` 里不生效
+> （校验器会告警并指出该写到哪里）。下文第二节的「直接抄」已按正确写法给出。
 
 ## 一、最优参数表
 
@@ -25,7 +31,7 @@
 | `preserveRecentMessages` | `5` |
 | `promotionThreshold` | `10` |
 | `tiers.tier2Trigger` / `tiers.tier3Trigger` | `5` / `18` |
-| `nudge.growthRatio` / `nudge.minGrowthRatio` | `0` / `0`（让折叠节奏恒等于 `growthFloor`） |
+| `config.nudge.growthRatio` / `config.nudge.minGrowthRatio` | `0` / `0`（让折叠节奏恒等于 `growthFloor`） |
 | `nudge.maxContextLimitPct` / `minContextLimitPct` / `emergencyThresholdPct` | `0.65` / `0.35` / `0.80` |
 | `config.compress.maxSummaryLength` / `minSummaryLength` | `10000` / `1000` |
 
@@ -40,25 +46,21 @@
     "preserveRecentTokens": 50000,
     "promotionThreshold": 10,
     "tiers": { "tier2Trigger": 5, "tier3Trigger": 18 },
-    "nudge": {
-      "growthFloor": 75000,
-      "growthCap": 75000,
-      "minGrowthFloor": 75000,
-      "growthRatio": 0,
-      "minGrowthRatio": 0,
-      "maxContextLimitPct": 0.65,
-      "minContextLimitPct": 0.35,
-      "emergencyThresholdPct": 0.80
-    },
+    "nudge": { "maxContextLimitPct": 0.65, "minContextLimitPct": 0.35, "emergencyThresholdPct": 0.80 },
     "config": {
+      // GF 三键与两个 ratio 都是内核 NudgeConfig 字段 ⇒ 只能走透传口（见页首⚠️）
+      "nudge": {
+        "growthFloor": 75000, "growthCap": 75000, "minGrowthFloor": 75000,
+        "growthRatio": 0, "minGrowthRatio": 0
+      },
       "compress": { "minCompressRange": 200000, "maxSummaryLength": 10000, "minSummaryLength": 1000 }
     }
   }
 }
 ```
 
-200K / 1M 只改四处：`modelContextLimit`、`preserveRecentTokens`、`nudge.growthFloor`+`growthCap`+`minGrowthFloor`、
-`config.compress.minCompressRange`。
+200K / 1M 只改四处：`modelContextLimit`、`preserveRecentTokens`、
+`config.nudge.growthFloor`+`growthCap`+`minGrowthFloor`、`config.compress.minCompressRange`。
 
 ## 三、其它窗口 → 开 `autoTune`
 

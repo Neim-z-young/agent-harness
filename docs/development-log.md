@@ -1,5 +1,75 @@
 # Agent Harness 开发日志
 
+## 2026-09-30（续 221）压缩配置的两条真机告警：告警可执行化 + 双口深合并 + 文档修正
+
+### 起因：启动时的两条告警（用户实机贴出）
+
+```
+[WARN] config.json → compression 有以下未生效项：
+       - compression.subagent.nudge.growthFloor 未被识别，该配置不会生效
+[WARN] config.json → telemetry 有以下问题：
+       - telemetry.store 未被识别，该配置不会生效
+```
+
+### 判定：两条告警不是同一个性质
+
+| 告警 | 判定 | 依据 |
+|---|---|---|
+| `compression.subagent.nudge.growthFloor` | **位置写错**（字段名对、口写错） | `COMPRESSION_NUDGE_KEYS` 只开放 3 个占用率百分比键（`cli/src/index.ts:1499`）；`growthFloor` 是内核 `NudgeConfig` 字段（`acp-kernel/dist/types.d.ts:126`），按文档 §6 须写 `config.nudge.*` |
+| `telemetry.store` | **字段不存在** | `TelemetryOptions`（`plugins/telemetry/src/index.ts:40-58`）只有 `enabled` / `dataDir` / `pathBuilder` / `debounceMs` / `crash` / `userID` / `otlp`；`directory: "sessions"` 本就是默认目录且不可单独配 |
+
+**但第一条的根因在文档侧**：`docs/acp-context-config.md` §7.5① 两段标着"直接抄用"的示例，**自己**就把
+`growthFloor` / `growthCap` / `minGrowthFloor` / `growthRatio` / `minGrowthRatio` 写在了结构化 `nudge` 里
+（`:737-739` / `:756-760`）—— 照抄会各报 3~5 条同类告警。正文另有 40 余处把**字段名**记作 `nudge.growthFloor`，
+读者按字面还原成路径就必然踩中；速查卡 `acp-context-param-table.md` 的「直接抄」块同病（本轮扫文档时才发现）。
+
+### 决策：为什么不动契约
+
+给了三条路并请用户定：① 把 `nudge` 加宽到收内核 `NudgeConfig` 全部字段；② 五棵子树全部加宽、统一
+"结构化口收全 + `config.*` 兜底"；③ **契约不动**，改告警文案与文档。**用户选 ③** —— 理由是"结构化口只收常用键、
+其余走 `config.*`"这条规则与 `compress` / `truncate` / `absorb`（本来就只有 `config.*` 一条路）**本来就是同一套**，
+单独加宽 `nudge` 会让它变成特例。于是技术债**记在文档里**（§5 写法警示）而不是藏进代码。
+
+### 改动清单
+
+| 文件 | 改动 |
+|---|---|
+| `cli/src/index.ts` | ① 抽 `toAcpConfig()`：顶层与档位**共用同一份翻译**（此前 boot 内联一份、`toAcpScope` 一份）；② `tiers` / `nudge` 由**整体替换**改为**深合并**（结构化口优先）；③ 新增 `checkSubtreeUnknown()`：结构化口的未知键**若是内核字段** ⇒ 告警直接给出能生效的路径 `…config.<subtree>.<key>`，**拼错的键**维持朴素文案；④ `telemetry` 未知键附可用键清单 |
+| `cli/src/index.ts`（类型注释） | `compression.nudge` / `compression.tiers`（顶层与档位两处）补"只收这几个键、其余写 `config.*`" |
+| `cli/src/cli.test.ts` | 新增 5 条：指路告警（顶层 / 档位 / perAgent）、拼错不指路、telemetry 可用键、`toAcpConfig` 深合并、**docs 全部 jsonc 片段过校验器**（带"片段数 > 10"守门断言） |
+| `docs/acp-context-config.md` | §5 新增"写法"警示（**字段名 ≠ 可写路径**）；§6 说明两口会深合并、结构化口优先；§7.1 修正"growth 系列可写结构化口"的错述；§7.5① 两段示例改为合法写法；§10 补"告警会指路"与两类错误的区别；§11① 补档位的两口规则与 `subagent.config.nudge.growthFloor` 示例；§9 两行补口径提醒 |
+| `docs/acp-context-param-table.md` | 页首新增 ⚠️ 写法提醒；「直接抄」示例改为合法写法 |
+| `~/.harness/config.json`（仓库外） | `subagent.nudge.growthFloor` → `subagent.config.nudge.growthFloor`；`telemetry.store` 拍平为顶层 `debounceMs`（`directory: "sessions"` 本就是默认，删掉即可）。已备份 `*.bak-20260930-083140` |
+| `AGENTS.md` | 新增"结构化口 + 透传口"三条纪律 + 文档示例受检这一条 |
+
+### 两个设计取舍
+
+- **告警指路只认内核真实字段名**：`growthFloar` 这类拼错的键**在内核里也不存在** ⇒ 保持朴素文案。
+  若把"长得像"的键也指路，用户会照着告警抄一条**同样无效**的路径 —— 比不指路更糟。
+  （既有用例恰好用的是拼错键，所以"两类错误分开处理"这件事被两边同时钉住了。）
+- **`telemetry` 附可用键清单、`compression` 不附**：前者段内**没有**透传口可兜底，写错的键没有别的去处；
+  后者有 `config` 兜底，且顶层合法键有 17 个，列出来只是噪音。
+
+### 验证（三段式）
+
+- typecheck：**39 包 0 error**
+- `bun run test`：**39 包全部 `0 fail`**（cli 163）
+- **反向验证**（"回退后变红"）：
+  - 摘掉深合并（`carried()` 恒返回 `{}`）⇒ `toAcpConfig` 用例红；
+  - `checkSubtreeUnknown` 恒走朴素文案 ⇒ 指路用例红（**拼错那条仍绿**，正是它测的路径）；
+  - 把速查卡示例改回 `nudge.growthFloor` ⇒ docs 扫描用例红；
+  - 去掉 telemetry 可用键 ⇒ telemetry 用例红；
+  - 恢复后 `grep 反向验证临时` 无残留，cli 163 pass / 0 fail。
+- **用户 config 复验**：用仓库自身 `checkCompressionConfig` / `checkTelemetryConfig` 跑其 `~/.harness/config.json`
+  ⇒ 两条告警均清零；并打印翻译结果确认 `subagent` 段确实产出 `{"nudge":{"growthFloor":70000},...}`
+  （而不是"配了却不生效"）。
+- **文档示例复验**：扫 `docs/*.md` 全部 `jsonc` 片段（22 个）跑校验器 ⇒ 零告警。
+
+### 遗留
+
+- `compaction` 段的未知键告警仍是朴素文案（该段也没有透传口，同属"写错的键没有别的去处"）。
+  要不要一并附可用键清单，另议 —— 它现有 2 条用例钉着精确文案，改动要连带更新。
+
 ## 2026-09-29（续 220）子 Agent / 指定 Agent 的压缩配置分化（方案 B′ 落地）
 
 ### 起因
