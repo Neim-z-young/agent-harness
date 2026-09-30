@@ -31,6 +31,7 @@ import {
   COMPRESS_TOOL_DOC,
   TOOL_ARGS_REMINDER,
   agentCanUseCompress,
+  lookupProviderWindow,
 } from './index'
 import { toCores, compactHistory, idBase, baseId, estimateTokens, chars4CountTokens } from './adapter'
 import { loadPromptFiles } from './prompts'
@@ -988,6 +989,9 @@ async function preModelWithScope(
     agentTools?: readonly string[]
     parentSessionId?: string
     sessionId?: string
+    /** 本轮实际打到的端点 / 模型（占用率分母按它解析）；缺省 = 宿主没给判别符 */
+    providerId?: string
+    modelId?: string
   } = {},
 ): Promise<(raw: Message[]) => Promise<void>> {
   const plugin = createAcpContextPlugin(options)
@@ -1004,6 +1008,8 @@ async function preModelWithScope(
         agentId: input.agentId ?? 'lead',
         ...(input.agentTools ? { agentTools: input.agentTools } : {}),
         ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+        ...(input.providerId ? { providerId: input.providerId } : {}),
+        ...(input.modelId ? { modelId: input.modelId } : {}),
         meta: { read: async () => undefined, patch: async () => {} },
         blocksPatch: [],
       } as any,
@@ -1011,6 +1017,120 @@ async function preModelWithScope(
     )
   }
 }
+
+/**
+ * 安装插件 + 取 `acp_status`：按 (会话, Agent, 端点判别符) 问「本会话的占用率分母是多少」。
+ *
+ * 刻意**问工具**而不是直接读 `scopeFor`（后者没导出）：工具报表就是用户/模型看得见的那一个数，
+ * 「决策用一套分母、报表用另一套」是本仓反复得过的病，从这里断言才钉得住两处同源。
+ */
+async function probeWindow(
+  options: Parameters<typeof createAcpContextPlugin>[0],
+): Promise<
+  (
+    sessionId: string,
+    agentId: string,
+    discrim?: { providerId?: string; modelId?: string },
+  ) => Promise<number>
+> {
+  const plugin = createAcpContextPlugin(options)
+  const tools = new Map<string, any>()
+  const hooks = (await plugin.install({ log: { info: () => {}, warn: () => {} } } as any)) as Hooks
+  await hooks['core.tool.pool.assemble']!(
+    { agentId: 'reader' } as any,
+    // ToolPool 是完整接口（add/addAll/addIfMissing/remove/list），只给 add 一个不够用 ——
+    // `add` 的返回类型是 void，`=> tools.set(...)` 会把 Map 当返回值，类型上也不兼容。
+    {
+      add: (t: any) => void tools.set(t.id, t),
+      addAll: () => {},
+      addIfMissing: () => {},
+      remove: () => {},
+      list: () => [...tools.values()],
+    },
+  )
+  return async (sessionId, agentId, discrim = {}) => {
+    // 先跑一轮 preModel：它既建立会话上下文，也把解析好的档位绑到会话上（工具读的是那一份）
+    await hooks['core.session.preModel']!(
+      {
+        sessionId,
+        agentId,
+        agentTools: ['compress'],
+        ...discrim,
+        meta: { read: async () => undefined, patch: async () => {} },
+        blocksPatch: [],
+      } as any,
+      history(100),
+    )
+    const st = await tools.get('acp_status')!.call({}, { sessionId, agentId } as any)
+    return st.output.modelContextLimit as number
+  }
+}
+
+test('lookupProviderWindow：Provider 维度优先于模型维度，非法值一律当查不到', () => {
+  const table = { byProvider: { a: 100_000 }, byModel: { m: 200_000 }, fallback: 300_000 }
+  // 实例维度比模型名更具体：同一模型名挂多个端点时，只有 providerId 分得开
+  expect(lookupProviderWindow(table, 'a', 'm')).toBe(100_000)
+  // providerId 是 'default' 哨兵（agent 没指定端点）或压根没传 ⇒ 退到模型维度
+  expect(lookupProviderWindow(table, 'nope', 'm')).toBe(200_000)
+  expect(lookupProviderWindow(table, undefined, 'm')).toBe(200_000)
+  // 两个维度都没有 ⇒ undefined，由调用方兜底（不是在这里拍一个 200000 出来）
+  expect(lookupProviderWindow(table, 'nope', 'nope2')).toBeUndefined()
+  expect(lookupProviderWindow(undefined, 'a', 'm')).toBeUndefined()
+  // 0 / NaN / 负数当分母会算出 Infinity / NaN：视作"没配"，继续往下查
+  expect(lookupProviderWindow({ byProvider: { a: 0 }, byModel: { m: 200_000 } }, 'a', 'm')).toBe(200_000)
+  expect(lookupProviderWindow({ byProvider: { a: Number.NaN } }, 'a')).toBeUndefined()
+})
+
+test('窗口按会话实际端点解析：子 Agent 走小窗口端点时分母跟着走', async () => {
+  const windowOf = await probeWindow({
+    // 装配期只给得出「默认 Provider 的窗口」（fallback = 400K）—— 改造前**所有**会话都拿它当分母。
+    // 刻意**不传 config**：`onDemandConfig` 这类 helper 会把窗口写进 `config.modelContextLimit`，
+    // 而那一级属于"显式指定"（见下一条用例），会把要测的按端点解析整条腿遮住。
+    providerWindows: {
+      byProvider: { big: 400_000, small: 100_000 },
+      byModel: { hy3: 200_000 },
+      fallback: 400_000,
+    },
+  })
+
+  // ① 主会话跑 big 端点
+  expect(await windowOf('s1', 'lead', { providerId: 'big' })).toBe(400_000)
+  // ② 子 Agent 被派到小窗口端点 ⇒ 分母必须跟着走（改造前这里恒为 400000，占用率虚低 4 倍）
+  expect(await windowOf('s2', 'reader', { providerId: 'small', modelId: 'hy3' })).toBe(100_000)
+  // ③ providerId 是 'default' 哨兵（agent 只写了 model）⇒ 靠模型维度命中
+  expect(await windowOf('s3', 'reader', { providerId: 'default', modelId: 'hy3' })).toBe(200_000)
+  // ④ 两个维度都查不到 ⇒ fallback（= 默认 Provider 的窗口，即改造前唯一的那个分母）
+  expect(await windowOf('s4', 'reader', { providerId: 'nope', modelId: 'nope2' })).toBe(400_000)
+  // ⑤ 宿主没给端点判别符（单测直调 / 非 CLI 宿主）⇒ 同样落 fallback，而不是 200000 硬默认
+  expect(await windowOf('s5', 'reader')).toBe(400_000)
+
+  // ⑥ 同一实例**换端点**也要跟着换分母：缓存 key 漏掉 providerId 时这里会返回 400000
+  expect(await windowOf('s6', 'lead', { providerId: 'small' })).toBe(100_000)
+  expect(await windowOf('s7', 'lead', { providerId: 'big' })).toBe(400_000)
+})
+
+test('窗口：显式窗口压过按端点的解析，providerWindows 缺省时口径不变', async () => {
+  // ① 插件选项的显式窗口是"我不管端点是什么就按这个数算"，必须压过查表（否则用户写了不生效）
+  const explicit = await probeWindow({
+    modelContextLimit: 50_000,
+    providerWindows: { byProvider: { small: 100_000 }, fallback: 400_000 },
+  })
+  expect(await explicit('s1', 'lead', { providerId: 'small' })).toBe(50_000)
+
+  // ② `config.modelContextLimit`（= 用户的 `compression.config.modelContextLimit`）同样算显式，
+  //    且历史行为就是它压过插件选项 —— 这一级必须留在查表之前，否则老配置会静默换分母。
+  const viaConfig = await probeWindow({
+    modelContextLimit: 50_000,
+    config: { ...onDemandConfig(0.5), modelContextLimit: 20_000 },
+    providerWindows: { byProvider: { small: 100_000 }, fallback: 400_000 },
+  })
+  expect(await viaConfig('s1', 'lead', { providerId: 'small' })).toBe(20_000)
+
+  // ③ 不传 providerWindows = 改造前的形态：窗口恒等于装配期那个数，判别符不参与解析
+  const legacy = await probeWindow({ modelContextLimit: 30_000 })
+  expect(await legacy('s1', 'lead', { providerId: 'small' })).toBe(30_000)
+  expect(await legacy('s2', 'reader', { providerId: 'big' })).toBe(30_000)
+})
 
 test('agentCanUseCompress：三态（有 / 无 / 未知）', () => {
   expect(agentCanUseCompress(['read_file', 'compress'])).toBe(true)

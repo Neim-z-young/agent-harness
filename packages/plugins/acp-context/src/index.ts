@@ -291,9 +291,49 @@ export interface AcpResolvedScope {
   manualInjection: ManualInjectionMode
 }
 
+/**
+ * 「Provider / 模型 → 上下文窗口」表 —— 供**按本会话实际使用的端点**解析占用率分母。
+ *
+ * 为什么不能只给一个 `modelContextLimit`：它是装配期按**默认** Provider 算出的**单个**数，
+ * 而 Provider / 模型是**按 Agent 解析、且每次派工都可覆盖**的
+ * （core：`input.model?.providerId ?? agent.model?.providerId ?? 'default'`）。
+ * 子 Agent 被派到另一个端点上时，两端窗口不同 ⇒ 分母错：**分母偏大 = 占用率虚低 = 压缩永不触发**，
+ * 且全程没有任何症状（工具照常报数、只是报的是别人的分母）。真机形态：默认 Provider 1M，
+ * 子 Agent 走 200K 端点 ⇒ 报 20% 时实际已 100%。
+ *
+ * 由装配方（CLI，它才拿得到 config）构造后传入；插件不查注册表（`PluginContext` 里没有）。
+ */
+export interface ProviderWindowTable {
+  /** `ProviderConfig.id` → 窗口（实例维度，最具体） */
+  byProvider?: Record<string, number>
+  /**
+   * 模型名 → 窗口（模型维度）。
+   *
+   * 为什么两个维度都要：`providerId` 缺省时 core 传的是 `'default'` 哨兵（不是真实端点），
+   * 此时唯一线索是 `modelId`；而 `agent md` 里写 `model: { modelId: 'hy3' }` 比写派生出的
+   * provider id 自然得多。**同名模型挂多个端点**时由装配方取**最小**窗口 —— 保守方向是
+   * 「宁可早压」，取最大会让分母虚高、压缩不触发。
+   */
+  byModel?: Record<string, number>
+  /** 两个维度都查不到时的兜底（= 默认 Provider 的窗口）。缺省由插件补 200_000。 */
+  fallback?: number
+}
+
 export interface AcpContextPluginOptions {
-  /** 模型上下文窗口（tokens）。默认 200_000。 */
+  /**
+   * 模型上下文窗口（tokens）—— **显式覆盖**，压过按 Provider 的推导。默认 200_000。
+   *
+   * ⚠️ 只该传「用户明确指定的窗口」（CLI 的 `compression.modelContextLimit`）。把
+   * 「默认 Provider 推导出来的窗口」塞进这里，会让所有会话都用同一个分母 —— 那正是
+   * 本选项旁边的 `providerWindows` 要修的病。推导值应放进 `providerWindows.fallback`。
+   */
   modelContextLimit?: number
+  /**
+   * 按本会话**实际**使用的 Provider / 模型解析窗口（见 {@link ProviderWindowTable}）。
+   *
+   * 缺省（undefined）= 不按端点分化，行为与改造前逐位一致 —— 单测直调、非 CLI 宿主都落这条路。
+   */
+  providerWindows?: ProviderWindowTable
   /** 覆盖 kernel 的默认 config（tiers / nudge / protectedTools 等）。嵌套对象可只给部分字段。 */
   config?: LooseAcpConfig
   /**
@@ -535,12 +575,44 @@ export function agentCanUseCompress(agentTools: readonly string[] | undefined): 
   return agentTools.includes('compress')
 }
 
+/** 窗口得是个能当分母的正有限数 —— 表里混进 `0` / `NaN` / 负数时按「查不到」处理，别拿去算占用率 */
+function isUsableWindow(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0
+}
+
+/**
+ * 按「本会话**实际**使用的 Provider / 模型」查上下文窗口（见 {@link ProviderWindowTable}）。
+ *
+ * 查表顺序：`providerId`（实例维度，最具体）→ `modelId`（模型维度）。
+ * 两者都可能缺：`providerId` 缺省时 core 传 `'default'` 哨兵（表里没有这个键 ⇒ 落 fallback，
+ * 而 fallback 恰是默认 Provider 的窗口，正是想要的那个值）；`modelId` 缺省表示用端点默认模型。
+ *
+ * 刻意不按 `providerId + '/' + modelId` 组组合键：`contextWindowTokens` 挂在 **Provider 实例**
+ * 上（config 里没有「模型级窗口」这一层），组合键查不出更细的答案，只会多一个永远 miss 的分支。
+ */
+export function lookupProviderWindow(
+  table: ProviderWindowTable | undefined,
+  providerId?: string,
+  modelId?: string,
+): number | undefined {
+  if (!table) return undefined
+  const byProvider = providerId ? table.byProvider?.[providerId] : undefined
+  if (isUsableWindow(byProvider)) return byProvider
+  const byModel = modelId ? table.byModel?.[modelId] : undefined
+  if (isUsableWindow(byModel)) return byModel
+  return undefined
+}
+
 /**
  * 创建 ACP 上下文压缩插件。
  * 每轮通过 core.session.preModel 运行 acp-kernel 的 processTurn，并注入 4 个模型驱动工具。
  */
 export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): AgentPlugin {
-  const modelContextLimit = options.modelContextLimit ?? 200_000
+  // 「调用方显式给的窗口」保持 undefined 原样 —— 一旦在这里 `?? 200_000`，窗口解析链上的
+  // 「按 Provider 查表」就永远轮不到（恒被这个默认值截胡），那正是本选项要修的 bug。
+  // 单独留一个 modelContextLimit 常量只作**诊断口径**（install 日志 / autoTune 摘要 = 默认档位）。
+  const optionWindow = options.modelContextLimit
+  const modelContextLimit = optionWindow ?? 200_000
   const baseManualInjection: ManualInjectionMode = options.manualInjection ?? 'on-demand'
 
   /**
@@ -553,18 +625,34 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
    * （`reader` 是短命只读 worker，保留量该小些；`reviewer` 又要留多些原文）。
    * 两者可以叠，`perAgent` 更具体所以优先级更高。
    *
-   * 结果是纯函数（输入只有 agentId + 是否子会话），所以按 key 缓存 —— 这个解析每轮都走，
-   * 但一个进程里的档位就那么几个。
+   * 结果是纯函数（输入只有判别符），所以按 key 缓存 —— 这个解析每轮都走，
+   * 但一个进程里的档位 × 端点的组合就那么几个。
    */
   const scopeCache = new Map<string, AcpResolvedScope>()
-  function scopeFor(agentId?: string, parentSessionId?: string): AcpResolvedScope {
-    const key = `${parentSessionId ? 'child' : 'root'}\u0000${agentId ?? ''}`
+  function scopeFor(
+    agentId?: string,
+    parentSessionId?: string,
+    providerId?: string,
+    modelId?: string,
+  ): AcpResolvedScope {
+    // 缓存 key 必须带 `providerId` / `modelId`：窗口是**跟着端点走**的，漏了它就会拿先到者的
+    // 窗口去算后来者的占用率（子 Agent 被派到小窗口端点上时正是这个形态）。
+    const key = `${parentSessionId ? 'child' : 'root'}\u0000${agentId ?? ''}\u0000${providerId ?? ''}\u0000${modelId ?? ''}`
     const cached = scopeCache.get(key)
     if (cached) return cached
     let loose: LooseAcpConfig | undefined = options.config
     let manual = baseManualInjection
-    // 顶层 `config.modelContextLimit` 也是一处窗口来源（历史行为：它会盖掉插件选项传进来的那个）
-    let window = loose?.modelContextLimit ?? modelContextLimit
+    // 窗口解析链 —— 前两级是「用户显式指定」，压过一切推导；第三级才按本会话**实际**用的
+    // 端点查表；最后两级兜底（默认 Provider 的窗口 → 插件默认）。
+    //
+    // 为什么显式要排在推导之前：`compression.modelContextLimit` 的文档语义就是「我不管端点
+    // 是什么，就按这个数算」。它排后面等于让用户写了也不生效。
+    let window =
+      loose?.modelContextLimit ??
+      optionWindow ??
+      lookupProviderWindow(options.providerWindows, providerId, modelId) ??
+      options.providerWindows?.fallback ??
+      200_000
     // 数组顺序即优先级顺序：越具体的越靠后写
     const layers: (AcpScopeOverride | undefined)[] = [
       parentSessionId ? options.subagent : undefined,
@@ -917,6 +1005,15 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
     async install(plgCtx) {
       plgCtx.log.info('ACP 上下文压缩插件已加载', {
         modelContextLimit,
+        // 按端点分化的窗口表（占用率分母）—— 配了就点名条目数；缺省说明所有会话共用同一个分母
+        // （单测直调 / 非 CLI 宿主），此时行为与改造前逐位一致。
+        providerWindows: options.providerWindows
+          ? {
+              byProvider: Object.keys(options.providerWindows.byProvider ?? {}).length,
+              byModel: Object.keys(options.providerWindows.byModel ?? {}).length,
+              fallback: options.providerWindows.fallback,
+            }
+          : undefined,
         autoTune: options.autoTune === true,
         // autoTune 关闭时为 undefined，日志里不会出现该键
         autoTuneParams: options.autoTune ? describeAutoTune(modelContextLimit) : undefined,
@@ -980,10 +1077,11 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         async 'core.session.preModel'(input, rawMessages) {
           const messages = rawMessages as Message[]
           try {
-            // 判别符全在 input 里（core 透传）：这是哪个 Agent 的会话、是不是子会话、以及它
-            // **实际能用哪些工具**。三者共同决定本会话走哪个档位、提示该不该注入。
-            // 不让插件自己去查 agent 注册表：`PluginContext` 里根本没有它（拿不到就只能猜）。
-            const scope = scopeFor(input.agentId, input.parentSessionId)
+            // 判别符全在 input 里（core 透传）：这是哪个 Agent 的会话、是不是子会话、它
+            // **实际能用哪些工具**、以及本轮**实际打到哪个端点/模型**（占用率分母按它解析）。
+            // 三者共同决定本会话走哪个档位、提示该不该注入。不让插件自己去查 agent 注册表：
+            // `PluginContext` 里根本没有它（拿不到就只能猜）。
+            const scope = scopeFor(input.agentId, input.parentSessionId, input.providerId, input.modelId)
             const sctx = getOrCreateCtx(input.sessionId)
             // 把档位绑到会话上：随后的 `compress` / `acp_status` 工具必须读**同一份** config，
             // 否则 hook 按档位决策、工具按全局报表 —— 两处口径分裂。
