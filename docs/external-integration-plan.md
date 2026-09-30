@@ -3,12 +3,13 @@
 > 状态：**方案待评审**（仅设计，未实现）
 > 日期：2026-09-30
 > 范围：让 agent-harness（下称 harness）① 作为 A2A 服务被其他 Agent/系统调用；② 以 VSCode 作为人机 UI。
+> 修订：2026-09-30 评审后修订 —— §3.1 协议口径重写为 v1.0（原稿整体是 v0.3 写法）；§2 修正 MCP 基建方向、补 `harness teammate`；§3.2 改为基于官方 SDK 骨架；新增 §3.4 挂起与唤醒、§3.5 并发幂等隔离；B1 降级为"需自建 MCP server"；P0 补接口清单与搬迁清单、新增 P0.5 spike。
 
 ---
 
 ## 1. 背景与目标
 
-harness 当前的人机界面是 CLI/REPL/TUI（OpenTUI 终端），对外只有 `harness run` 一次性 headless 调用。两类新诉求：
+harness 当前的人机界面是 CLI/REPL/TUI（OpenTUI 终端），对外的非交互方式只有 `harness run`（一次性 headless）与 `harness teammate`（长驻 out-of-process 成员，走共享目录 mailbox 协作）。两类新诉求：
 
 1. **A2A（机器对机器）**：harness 被 agent 生态发现与调用——其他框架/厂商的 Agent 能通过标准协议发起任务、拿流式结果、取消、续接会话。
 2. **VSCode（人）**：用户不离开编辑器即可使用 harness，并逐步把 TUI 的多块渲染、会话/任务/统计侧栏搬进 IDE。
@@ -19,98 +20,134 @@ harness 当前的人机界面是 CLI/REPL/TUI（OpenTUI 终端），对外只有
 - **一份装配、多个宿主**：CLI / A2A server / VSCode sidecar 共用同一套 harness 装配逻辑，不允许各壳复制一份再分叉。
 - **不发明私有协议**：机器侧直接采用 A2A v1.0（Linux Foundation）；IDE 侧优先利用 VSCode 原生 Chat API，终态才上自研 webview。
 
+**边界申明（对齐 AGENTS.md「业务能力一律通过插件注入」）**：`@harness/host` 与 `@harness/a2a-server` 定位为**宿主/适配器层**（与 `@harness/cli` 同级），不是业务能力插件；它们只做装配与协议翻译，不内置任何业务决策。反之，**把 harness 工具对外暴露（B1）属于"能力"**，按纪律应做成插件（详见 §4.1）。
+
 ---
 
 ## 2. 现状盘点：已具备的接入面
 
 | 能力 | 现状 | 接入意义 |
 |---|---|---|
-| 统一入口 | `createHarness(options): Promise<Harness>`（`packages/core`） | 任意宿主可直接装配，无需 CLI |
-| 流式会话 | `session.promptStream(sessionId, text, maxSteps?, signal?) → AsyncGenerator<AgentStreamEvent>` | A2A SSE / VSCode 流的同一数据源 |
-| 事件完备性 | `text_delta` / `reasoning_delta` / `tool_call_start` / `tool_call_result` / `done`（每步）/ `turn_end`（整轮终态）/ `step_gate`（等待心跳，含 `overBudget`） | 协议映射所需语义齐全，无需引擎补事件 |
+| 统一入口 | `createHarness(options: AgentHarnessOptions): Promise<Harness>`（`packages/core` 4511 行） | 任意宿主可直接装配，无需 CLI |
+| 流式会话 | `session.promptStream(sessionId, text, maxSteps?, signal?) → AsyncGenerator<AgentStreamEvent>`（`core:1095`） | A2A SSE / VSCode 流的同一数据源 |
+| 事件完备性 | `text_delta` / `reasoning_delta` / `tool_call_start` / `tool_call_result` / `done`（每步）/ `turn_end`（整轮终态，含 `aborted`）/ `step_gate`（等待心跳，含 `overBudget`）；定义见 `core:651` | 协议映射所需语义齐全，无需引擎补事件 |
 | 会话持久化 | `create/get/list/search`，会话与消息落盘在 dataDir，跨进程可恢复 | A2A `contextId` 天然映射 sessionId；断线重连/历史查询零额外存储 |
-| 权限接口 | `PermissionEngine.ask(req)` 为异步可插拔接口，无交互器时默认 deny | 远程 UI 实现一个 ask 回问前端即可，check→ask 两步语义不变 |
+| 权限接口 | `PermissionEngine.ask(req)` 为异步可插拔接口；`CliPermissionEngine extends DefaultPermissionEngine` 只覆盖 ask 实现 | 远程 UI 只需换一个实现，check→ask 两步语义不变，**core 无需改动** |
 | 事件总线 | `AgentEvents.stepGate`、`SubagentEvents.*`、`LifecycleEvents.*`、barrier | 外部 UI 订阅 bus 即可呈现后台任务面板/终态 |
 | headless | `harness run "prompt"`（stdout 纯结果，用量走 stderr） | 最粗粒度的零开发远程调用方式 |
-| MCP 基建 | `mcp-server-registry` + `mcp-client`（stdio/SSE transport、OAuth） | harness 当 MCP server 被 IDE 调用的现成地基 |
+| 跨进程先例 | `harness teammate`：长驻 out-of-process 进程，经**共享目录 mailbox** + 任务面协作（`packages/plugins/swarm`） | 已有"一条 harness 进程被外部驱动"的现成形态，sidecar 设计应先说明为何不复用它 |
+| MCP **客户端**基建 | `mcp-client`（stdio/http/sse transport、OAuth2 PKCE、token 加密持久化）+ `mcp-server-registry`（**注册"要连的" server**，`McpClient` + `convertMcpToolToHarnessTool` 把**对方**工具转成 harness 工具；computer-use 的"进程内 server"也是 harness 自连自） | ⚠️ **方向是 client，不是 server**：它让 harness 会**用** MCP，不提供"被 IDE 当 MCP server 调"的能力。仓库内无 server 端实现，也无 `@modelcontextprotocol/sdk` 依赖 ⇒ B1 是**从零写 MCP server**，不是复用（见 §4.1） |
 
-**两个需要正视的现状：**
+**三个需要正视的现状：**
 
-1. **装配逻辑集中在 CLI**：config.json 读取、provider 归一化与密钥解析（`SecretCipher`，明文/`${ENV}`/`enc:v1:`）、两级插件目录加载（user `~/.harness` + project `.harness`）、`CliPermissionEngine`、内置工具 L1 元信息+L2 惰性加载，目前都在 CLI 的 `HarnessApp.boot()` 中，约数百行，与 stdout/REPL 有少量缠绕。这是三个宿主共同的复用前提，必须先抽出（见 §6 P0）。
-2. **运行时是 Bun**：各包直接导出 TS 源码（`exports → ./src/index.ts`，无 dist），由 Bun 消费。非测试源码中仅 `@harness/snapshot` 的 git 调用使用 `Bun.spawn`，其余均为 `node:*` API。这决定 VSCode 侧 v1 应走 sidecar 子进程而非进程内嵌入 Node host（见 §5）。
+1. **装配逻辑集中在 CLI**：config.json 读取、provider 归一化与密钥解析（`SecretCipher`，明文/`${ENV}`/`enc:v1:`）、两级插件目录加载（user `~/.harness` + project `.harness`）、`CliPermissionEngine`、内置工具 L1 元信息+L2 惰性加载，目前都在 CLI 的 `HarnessApp.boot()` 中（`packages/cli/src/index.ts:2896`–`3325`，约 **430 行**，内含 **16 处 `stdout?.write`**）。这是三个宿主共同的复用前提，必须先抽出（见 §6 P0）。
+2. **要搬迁的不止 boot 的方法体**：`BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` / `loadPluginDirs` / `buildProviderWindowTable` 等装配符号**全部定义在 `packages/cli/src/index.ts`**（不在 core），且 `cli.test.ts` 直接 import 它们 ⇒ "抽 host"实际是把上千行从 cli 搬到新包并保持 re-export 兼容，不是"把 boot 参数化"就算完（见 §6 P0）。
+3. **运行时是 Bun**：各包直接导出 TS 源码（`exports → ./src/index.ts`，无 dist），由 Bun 消费。非测试源码中仅 `@harness/snapshot` 使用 `Bun.spawn` / `Bun.spawnSync`（3 处），其余均为 `node:*` API —— 这是 fork 结论，但**不代表 sidecar 可以无脑 `--compile`**（见 §8）。
 
 ---
 
 ## 3. 方案 A：A2A Server
 
-### 3.1 协议选型（外部事实）
+### 3.1 协议口径（**以 `@a2a-js/sdk` 导出常量为唯一事实源**）
 
-A2A 当前 **v1.0，已捐赠 Linux Foundation**。TS 侧有官方 `@a2a-js/sdk`。
+A2A 当前 **v1.0，已捐赠 Linux Foundation**（原 Google 贡献）。TS 官方 SDK `@a2a-js/sdk` 的 1.0 **GA 于 2026-07-22**，实现规范 v1.0.0，并带一层 opt-in 的 v0.3 兼容（`@a2a-js/sdk/compat/v0_3`）。
 
-- 绑定：JSON-RPC 2.0 over HTTP；流式为 SSE；另有 gRPC / HTTP-REST binding（本期不选）。
-- 发现：`/.well-known/agent-card.json` 返回 **AgentCard**（身份、能力、skills、输入输出 MIME、认证方案）。
+> ⚠️ **纪律**：v0.3 → v1.0 是 **breaking 变更**（方法名、枚举名、Part 结构都改过），网上大量示例仍是 v0.3。本方案所有方法名/枚举名/路径**一律取自 SDK 常量**（`AGENT_CARD_PATH`、`A2A_PROTOCOL_VERSION`、`A2A_VERSION_HEADER`、SDK 生成的 `TaskState` 类型），不照抄博客与旧文档。**开工前钉死 SDK 版本号**。
+
+- 绑定：JSON-RPC 2.0 over HTTP（`Content-Type: application/json`）；流式为 SSE（`text/event-stream`）；另有 HTTP+REST（`application/a2a+json`）与 gRPC binding（本期不选）。
+- **每个请求须带服务参数头**：`A2A-Version: 1.0`（Bun 侧同时是版本协商入口，SDK 有 `validateVersion` / `VersionNotSupportedError`）；`A2A-Extensions` 用于扩展。
+- 发现：`AGENT_CARD_PATH` = `/.well-known/agent-card.json` 返回 **AgentCard**。
 - 核心对象：
   - **Task**：`id` + `contextId` + `status` + `artifacts` + `history` + `metadata`。
-  - **TaskState**：`SUBMITTED / WORKING / COMPLETED / FAILED / CANCELED / REJECTED`（终态）与 `INPUT_REQUIRED / AUTH_REQUIRED`（中断态）。
-  - **Message / Part**：role=USER/AGENT，Part 为 text/raw/url/data；**Artifact** 为任务产出（一个或多个 Part）。
-- 方法：
+  - **TaskState**（v1.0 为 protobuf 生成，**枚举名带前缀**，共 9 个）：`TASK_STATE_UNSPECIFIED` / `TASK_STATE_SUBMITTED` / `TASK_STATE_WORKING` / `TASK_STATE_COMPLETED`（终态）/ `TASK_STATE_FAILED`（终态）/ `TASK_STATE_CANCELED`（终态）/ `TASK_STATE_REJECTED`（终态）/ `TASK_STATE_INPUT_REQUIRED`（中断态）/ `TASK_STATE_AUTH_REQUIRED`（中断态）。`ListTasks` 过滤示例即 `status=TASK_STATE_WORKING`。
+  - **Message / Part**：`role` 取 `ROLE_USER` / `ROLE_AGENT`（带前缀），`SendMessage` **必填 `messageId`**；Part 是 oneOf，v1.0 **已删除 v0.3 的 `kind` 判别符**，改为按存在字段判定 `text` / `raw` / `url` / `data`（另有可选 `metadata` / `filename` / `mediaType`）。**Artifact** 为任务产出（一个或多个 Part）。
+- 方法映射（v1.0，JSON-RPC 方法名为 **PascalCase**）：
 
-| 方法 | 说明 | 本期 |
-|---|---|---|
-| `message/send` | 发起/续接任务（非流式） | ✅ 一期 |
-| `message/stream` | 发起任务，SSE 实时更新 | ✅ 一期 |
-| `tasks/get` | 取任务当前状态 | ✅ 一期 |
-| `tasks/{id}:cancel` | 取消任务 | ✅ 一期 |
-| `tasks/list` | 过滤分页列出 | ⏳ 二期（映射 session.list） |
-| `tasks/{id}:subscribe` | 订阅既有任务的 SSE 更新（断线重连） | ⏳ 二期（文件持久化天然支持） |
-| push notification / extended card / 多租户 | webhook、认证后详细卡片、mTLS | ❌ 附录 |
+| 操作 | JSON-RPC 方法 | REST 端点 | 本期 |
+|---|---|---|---|
+| 发送消息（非流式） | `SendMessage` | `POST /message:send` | ✅ 一期 |
+| 发送消息（流式 SSE） | `SendStreamingMessage` | `POST /message:stream` | ✅ 一期 |
+| 取任务 | `GetTask` | `GET /tasks/{id}` | ✅ 一期 |
+| 取消任务 | `CancelTask` | `POST /tasks/{id}:cancel` | ✅ 一期 |
+| 订阅既有任务（断线重连） | `SubscribeToTask` | `POST /tasks/{id}:subscribe` | ⏳ 二期（文件持久化天然支持） |
+| 列出任务 | `ListTasks` | `GET /tasks` | ⏳ 二期（**必须映射 task 而非 session**，见 §3.5） |
+| 推送通知配置 | `CreateTaskPushNotificationConfig` 等 | `POST /tasks/{id}/pushNotificationConfigs` | ❌ 附录 |
+| 扩展卡片 | `GetExtendedAgentCard` | `GET /extendedAgentCard` | ❌ 附录 |
 
-### 3.2 架构
+> 注意：`/tasks/{id}:cancel`、`/tasks/{id}:subscribe` 是 **REST 端点**，不是 JSON-RPC 方法名；原稿把两者混进同一列。
 
-新增包 `packages/a2a-server`（核心宿主类，非业务插件；仅负责协议壳与映射）：
+### 3.2 架构：**基于 SDK 骨架，不自建协议壳**
+
+`@a2a-js/sdk` 已提供 `AgentExecutor`（`execute` / `cancelTask`）、`DefaultRequestHandler`（请求路由、任务存储、版本校验、取消、推送）+ `ExecutionEventBus` + `TaskStore`（含 `InMemoryTaskStore`）与三种 transport handler。**自建"任务表 + 事件映射 + 取消桥"等于重做一遍 SDK 的活**，且更容易违反"不发明私有协议"。
+
+新增包 `packages/a2a-server`（宿主/适配器层，非业务插件）：
 
 ```
 A2A Client（其他 Agent）
-   │  HTTP JSON-RPC + SSE（Bearer 认证）
+   │  HTTP JSON-RPC（SendMessage / SendStreamingMessage / GetTask / CancelTask）
+   │  + A2A-Version: 1.0 头 + Bearer 认证
    ▼
-A2A 协议壳（Bun.serve + @a2a-js/sdk，薄层）
-   ├─ AgentCard 生成器   ← harness.agent 注册表（AgentDefinition → skills）
-   ├─ 消息映射层          A2A Message/Part ↔ harness Message
-   ├─ 事件映射层          AgentStreamEvent → SSE StreamEvent
-   ├─ 任务表（进程内）    taskId → { sessionId(contextId), AbortController }
-   ├─ 权限回问通道        engine.ask() → TaskState.INPUT_REQUIRED
-   └─ 取消桥              tasks/:cancel → AbortController.abort()
+@a2a-js/sdk 骨架（DefaultRequestHandler + transport handler，挂在 Bun.serve 上）
+   ├─ AgentCard 生成器     ← harness.agent 注册表（AgentDefinition → skills + supportedInterfaces.protocolVersion）
+   ├─ AgentExecutor         ← 我实现：execute() 消费 session.promptStream；cancelTask() abort
+   ├─ TaskStore             ← 我实现：task 记录（含 state / artifacts）落盘或由会话派生
+   ├─ 消息映射层            A2A Message/Part ↔ harness Message
+   ├─ 事件映射层            AgentStreamEvent → SDK StreamResponse（Task/StatusUpdate/ArtifactUpdate）
+   ├─ 权限回问通道          engine.ask() → TASK_STATE_INPUT_REQUIRED + 挂起任务表（§3.4）
    ▼
 @harness/host（§6 P0 抽出的装配层）→ createHarness
 ```
 
-定位约束：协议壳**只做翻译**，不内置任何业务决策、不绕过权限、不直接调工具。
+定位约束：只做翻译与装配，**不内置任何业务决策、不绕过权限、不直接调工具**。需先 spike 确认 SDK 的**无框架** server 入口能与 `Bun.serve`（web 标准 Request/Response）对接——不要走需要 `express` peer dep 的那条集成路径。
 
-### 3.3 事件映射（最小语义映射）
+### 3.3 事件映射（含**必要的合并**，不是逐条转发）
 
-原则：**逐条转发 + 结束事件归一为终态**，不在中间层引入聚合状态机。
+原则：**终态归一、可合并的按块合并、不引入业务状态机**。原稿"逐条转发"在 token 级事件上不成立（见下表说明）。
 
 | harness 侧 | A2A 侧 |
 |---|---|
-| 请求带 `contextId` 且会话存在 | `session.get(contextId)` 恢复；否则 `session.create()`（contextId 取新 sessionId） |
-| 收到请求 | Task `SUBMITTED` → `WORKING` |
-| `text_delta` | artifact 追加更新；整轮结束后输出最终文本 Artifact |
-| `reasoning_delta` | `status-update(WORKING, final=false)`，内容放 message 摘要或 metadata |
+| 请求带 `contextId` 且会话存在 | `session.get(contextId)` 恢复；否则 `session.create()`（新 sessionId 即新 contextId） |
+| 请求到达 | Task `TASK_STATE_SUBMITTED` → `TASK_STATE_WORKING` |
+| `text_delta` | **按块合并**后发 `artifact-update`（`append: true`）；整轮结束输出最终文本 Artifact。⚠️ 不得每个 delta 发一条 |
+| `reasoning_delta` | **合并**后周期性发 `status-update(WORKING, final=false)`，或降为 message/artifact 的 `metadata` 摘要。⚠️ 不得逐 token 发状态 |
 | `tool_call_start/result` | `status-update(WORKING)` + metadata（工具名/入参摘要/成败），不作为 Artifact 正文 |
-| `step_gate`（含 overBudget） | `status-update(WORKING)` 心跳；超预算时在 message 注明"等待异常偏久" |
-| `turn_end`（正常） | `status-update(final=true, state=COMPLETED)` + 最终 Artifact |
-| `turn_end.aborted` | `CANCELED` |
-| 异常 / DOOM_LOOP / 权限硬拒 | `FAILED`（结构化 code + message，不泄露堆栈） |
-| 权限 `ask()` | **`INPUT_REQUIRED`**：A2A 原生中断态；客户端答复后以同一 contextId 续接 |
-| `tasks/:cancel` | `AbortController.abort()`（harness 在步边界/工具前生效，保留已完成部分） |
+| `step_gate`（含 `overBudget`） | `status-update(WORKING)` 心跳；超预算时在 message 注明"等待异常偏久" |
+| `turn_end`（正常） | `status-update(final=true, state=TASK_STATE_COMPLETED)` + 最终 Artifact |
+| `turn_end.aborted` | `TASK_STATE_CANCELED` |
+| 异常 / DOOM_LOOP / 权限硬拒 | `TASK_STATE_FAILED`（结构化 code + message，不泄露堆栈） |
+| 权限 `ask()` | **`TASK_STATE_INPUT_REQUIRED`**（A2A 原生中断态）+ 结构化待决描述；客户端答复后**以同一 taskId 续接**（见 §3.4） |
+| `CancelTask` | `AbortController.abort()`（harness 在步边界/工具前生效，保留已完成部分） |
 
-### 3.4 关键设计点
+> **为什么必须合并**：`text_delta` / `reasoning_delta` 是**分片级**（每几十 token 一次），而 A2A 事件是**任务生命周期级**。逐条转 `status-update` 会产生上千条状态更新（客户端 UI 抖动 + 流量浪费），与原稿"不引入聚合状态机"的自设原则直接冲突。合并只发生在**展示粒度**上，不改引擎语义。
 
-- **会话与任务两个 id 不混用**：`contextId = sessionId`（多轮归属），`taskId = 单次请求 id`（取消/查询单元）。进程内 Map 维护映射；任务结束后保留摘要供 `tasks/get`，历史落盘靠会话文件。
-- **流式与非流式同源**：`message/send` 内部消费同一个 AsyncGenerator，只是聚合到终态后一次性返回，避免两条执行路径行为分叉。
-- **认证**：一期单一 Bearer token / API key（AgentCard 声明 `securitySchemes`，支持 `${ENV_VAR}` 引用）；不做 OAuth/mTLS。
+### 3.4 挂起与唤醒：`INPUT_REQUIRED` 怎么跨请求持有
+
+这是远程权限设计的**核心机制**，原稿缺失。要点：
+
+1. 权限询问发生在 `session.promptStream` 生成器**内部**，而答复会从**另一条 HTTP 请求**到达（`SendMessage` 带同一 `taskId`）。因此任务必须能被"停在 ask 上"并跨请求持有：
+   - 进程内维护 **挂起任务表** `taskId → { generator, pendingAsk, resolve, deadline }`；
+   - `ask()` 返回一个 Promise，**由挂起任务表持有其 resolver**，同时向 SSE 流推一条 `TASK_STATE_INPUT_REQUIRED` 状态更新；
+   - 后续 `SendMessage`/答复请求按 `taskId` 找回 resolver → resolve → 生成器继续跑。
+2. **不能"聚合到终态才返回"**：非流式 `SendMessage` 也必须能返回 `INPUT_REQUIRED`（以及在工作开始时返回 `WORKING` 的前置状态），否则挂起语义永远到不了客户端。⇒ 原稿 §3.4"message/send 内部聚合到终态后一次性返回"作废，改为"**返回首个非 `WORKING` 的稳定状态，或首个中断/终态**"。
+3. **幂等唤醒**：重复答复、答复迟到于超时之后、答复里带旧 `messageId`，都必须被安全忽略（见 §3.5）。
+4. **超时与回收**：挂起任务需有 TTL；超时转 `TASK_STATE_FAILED`（或按配置取消），并释放生成器，避免泄漏。
+5. **待决描述要结构化**：`INPUT_REQUIRED` 的 message/metadata 必须带工具名、入参摘要、可选项（允许一次 / 本会话始终允许 / 拒绝）——否则标准客户端只看到"需要输入"却不知道该答什么。选项映射进 `CliPermissionEngine` 已有的规则持久化模型（permissions.json）。
+
+### 3.5 并发、幂等与隔离
+
+| 问题 | 现状缺口 | 对策 |
+|---|---|---|
+| **并发** | 同一 `contextId`（= sessionId）并行两条消息，会让两个 loop **交错写同一会话** | per-session 串行队列；或在检出进行中任务时显式拒绝（返回结构化错误）。二者择一，不能默认并行 |
+| **幂等** | 客户端重试同一条 `SendMessage`（网络抖动）会**重复执行、重复计费** | 按 `messageId` 去重（已处理过的 messageId 直接回放其结果/状态） |
+| **隔离** | 单一 Bearer 之下，任一持 token 者可 `GetTask`/续接**任意** `contextId`，读到别人的会话 | 多租户可延后，但"**contextId 绑定调用方**"不能延后：至少做 token 维度的命名空间校验 |
+| **`ListTasks` 语义** | 原稿把 `tasks/list` 映射到 `session.list` —— 而本方案自己定义了"**一 session 多 task**"（taskId = 单次请求） | 二选一：① 落盘 **task 索引**，`ListTasks` 列 task（推荐，v1.0 新加 ListTasks 正是为解决"丢 taskId 就丢工作"）；② 显式降级为不支持。**不可**用 session.list 顶替 |
+
+### 3.6 关键设计点
+
+- **会话与任务两个 id 不混用**：`contextId = sessionId`（多轮归属），`taskId = 单次请求 id`（取消/查询单位）。**续接一律按 taskId**（含权限答复），contextId 只用于归属与历史。
+- **认证**：一期单一 Bearer token / API key（AgentCard `securitySchemes` 声明，支持 `${ENV_VAR}` 引用）；不做 OAuth/mTLS。
 - **安全默认**：服务默认仅监听 `127.0.0.1`；暴露到网络需显式配置并同时要求认证。工具写操作仍全部经过 harness 权限引擎，协议层不加旁路。
-- **AgentCard.skills 映射**：由 `AgentDefinition`（id/name/description/mode）生成；`mode: 'subagent'` 的 agent 是否暴露为独立 card 由配置开关决定（默认只暴露 primary）。
+- **AgentCard 生成**：由 `AgentDefinition`（id/name/description/mode）生成 skills；顶层 `version` = **harness/agent 自身版本**，协议版本写在 `supportedInterfaces[].protocolVersion = "1.0"`；`capabilities.streaming = true`。`mode: 'subagent'` 的 agent 是否暴露为独立 card 由配置开关决定（默认只暴露 primary）。
 - **与 MCP 的分工**：A2A 暴露的是"自治 Agent（带会话与任务生命周期）"；MCP 暴露的是"工具集"。同一 harness 可同时开两种服务，不互相替代。
 
 ---
@@ -119,12 +156,14 @@ A2A 协议壳（Bun.serve + @a2a-js/sdk，薄层）
 
 三条路径，投入与体验不同，按阶段采用而非三选一。
 
-### 4.1 B1：MCP Server（最轻，旁路快速交付）
+### 4.1 B1：MCP Server（**需自建，非复用**）
 
-把 harness 的工具经 `mcp-server-registry` 暴露为 MCP server（stdio），VSCode 侧由已支持 MCP 的聊天客户端（Copilot Chat / Continue / Cline 等）挂载。
+把 harness 的工具暴露为 MCP **server**（stdio），VSCode 侧由支持 MCP 的聊天客户端（Copilot Chat / Continue / Cline 等）挂载。
 
-- 优点：**零自研 UI**，工具调用、确认、流式输出全部复用客户端；约一周级交付。
+- ⚠️ **工作量修正**：仓库现有的 `mcp-client` + `mcp-server-registry` 全是**客户端**方向（harness 去连别人的 server）。要做 B1 必须**从零实现 server 端**：`initialize` / `tools/list` / `tools/call` 三组方法 + stdio transport（newline-delimited JSON-RPC）+ 把 harness `Tool` 转成 MCP tool 描述 + 写操作的权限桥。仓内无 `@modelcontextprotocol/sdk` 依赖，可自行实现或引入 SDK。
+- 优点：**零自研 UI**，工具调用、确认、流式输出全部复用客户端。
 - 局限：MCP 是"工具集"语义，无法呈现 harness 的自主多步 loop、多 agent roster、子 agent 面板、会话压缩与统计；体验完全受客户端约束。
+- 纪律：按 AGENTS.md"业务能力一律通过插件注入"，本项应做成**插件**（如 `plugins/mcp-server`），而不是宿主包。
 - 定位：**快速验证"在 IDE 里被调用"**，不是终态。
 
 ### 4.2 B2：Chat Participant（中等，原生聊天体验）
@@ -144,7 +183,7 @@ VSCode Chat 面板 ──► extension host（Node，薄）
 
 ### 4.3 B3：独立扩展 + Webview（终态，完整复刻 TUI）
 
-Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。这是同类自主编程 Agent 插件（如 Opico Agent）已验证的架构：host 侧跑 agent 调度/工具/权限，webview 渲染 reasoning 折叠块、工具块、diff 预览、会话与任务侧栏。
+Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。这是同类自主编程 Agent 插件已验证的架构：host 侧跑 agent 调度/工具/权限，webview 渲染 reasoning 折叠块、工具块、diff 预览、会话与任务侧栏。
 
 - 优点：UI 完全自主；现有 TUI 的 ChatBlock 块模型、选区、侧栏纯函数（`applyStreamEvent` / `pushConsole` / `computeTuiStats` 等）可直接平移为 web 组件与 reducer。
 - 难点：**harness 是 Bun 运行时，VSCode extension host 是 Node**（见下表）。
@@ -154,13 +193,13 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 | 运行时适配 | **零适配**，harness 原样运行 | 需 esbuild bundle 全部 TS 源码；`@harness/snapshot` 的 `Bun.spawn` 改为 `node:child_process`（仅此一处），其余天然 Node 兼容 |
 | 生命周期 | 扩展负责子进程启停、端口/stdio 协商 | 与扩展同生命周期，调试简单 |
 | 传输 | stdio JSON-RPC（最简）或本地 HTTP+SSE（复用 A2A） | 函数调用 + bus 订阅（仍需消息桥到 webview） |
-| 分发 | 用 `bun build --compile` 产出单文件二进制随扩展分发，免去用户安装 bun | 纯 npm 扩展，无外部依赖 |
+| 分发 | 用 `bun build --compile` 产出单文件二进制随扩展分发，免去用户安装 bun —— ⚠️ **需先验证**（见 §8 第 1 条） | 纯 npm 扩展，无外部依赖 |
 | 结论 | **v1 采用** | v2 收敛目标 |
 
 ### 4.4 VSCode 侧的权限与取消
 
-- **权限**：host 收到 harness 的 ask 请求 → webview 授权卡（允许一次/本会话始终允许/拒绝）→ 回传决策；映射进 `CliPermissionEngine` 已有的规则持久化模型（permissions.json）。
-- **取消**：webview "■ 终止" → extension 调取消 → sidecar abort（stdio 发 cancel / HTTP 调 tasks:cancel）→ harness 在步边界生效，保留已完成部分。
+- **权限**：host 收到 harness 的 ask 请求 → webview 授权卡（允许一次/本会话始终允许/拒绝）→ 回传决策；映射进 `CliPermissionEngine` 已有的规则持久化模型（permissions.json）。**与 §3.4 是同一机制的两个壳**。
+- **取消**：webview "■ 终止" → extension 调取消 → sidecar abort（stdio 发 cancel / HTTP 调 `CancelTask`）→ harness 在步边界生效，保留已完成部分。
 - **工作区**：扩展以当前 workspace folder 作为 harness `cwd`；dataDir 仍走 user/project 两级目录约定。
 
 ---
@@ -174,11 +213,11 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
                     │        host ↔ sidecar：stdio JSON-RPC 或本地 SSE
                     │
 @harness/host ◄─────┤  （从 HarnessApp.boot 抽出的装配层：
- （P0 新建核心包）    │    config / provider / 密钥 / 两级插件目录 /
+ （P0 新建包）        │    config / provider / 密钥 / 两级插件目录 /
                     │    权限 / 内置工具 L1+L2 / 会话恢复）
                     │
-                    └─ A2A Server（Bun.serve + @a2a-js/sdk）
-                          └─ AgentCard / message:send / message:stream(SSE) / tasks:cancel
+                    └─ A2A Server（SDK DefaultRequestHandler + AgentExecutor，Bun.serve 承载）
+                          └─ AgentCard / SendMessage / SendStreamingMessage / GetTask / CancelTask
                                         │
                           createHarness + session.promptStream + bus（core 零改动）
 ```
@@ -188,8 +227,10 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 | 宿主 | 输入 | 流式输出 | ask 实现 |
 |---|---|---|---|
 | CLI（现状） | stdin/REPL | stdout/TUI | 终端询问 |
-| A2A server | JSON-RPC HTTP | SSE | INPUT_REQUIRED 状态回问 |
+| A2A server | JSON-RPC HTTP | SSE | `TASK_STATE_INPUT_REQUIRED` + 挂起任务表（§3.4） |
 | VSCode sidecar | stdio JSON-RPC / SSE | 消息桥 → webview | webview 授权卡 |
+
+> **`@harness/host` 的依赖面要显式接受**：它会 import 内置插件与工具包（tools-builtin / tools-manager / manage-plugin / workspace-shell / revert / snapshot / subagent / swarm / coordinator …）以及 `core`/`plugin`/`workspace`/`permission`，因此必然成为新的"巨型组合根"。这是"一份装配、多个宿主"的代价；方案接受它，但要求 host **只做装配与注入**，不承载任何业务逻辑，依赖清单在实现时写进包的 README。
 
 ---
 
@@ -197,24 +238,47 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 
 | 阶段 | 内容 | 交付物 | 验收口径（预期行为，非执行步骤） |
 |---|---|---|---|
-| **P0** | 抽出 `@harness/host`：把 `HarnessApp.boot` 中与 stdout 无关的装配参数化为 `createHost({ cwd, dataDir, permissionAsk?, logSink? })`；CLI 改为消费它 | 新包 + CLI 行为不变 | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器 |
-| **P1** | A2A 一期：AgentCard + send + stream(SSE) + get + cancel + Bearer + INPUT_REQUIRED 权限；默认 127.0.0.1 | `@harness/a2a-server` 与 `harness a2a` 启动方式 | 任意标准 A2A 客户端可：取到 agent-card；发消息后收到 task→artifact/状态更新→final COMPLETED 的事件序列；取消后任务转 CANCELED；权限点转 INPUT_REQUIRED 且答复后续接 |
+| **P0.5（先做，两个 spike）** | ① SDK **无框架** server 入口 + `Bun.serve` 最小可跑（回一个 `SendMessage` + 一张 agent-card）；② `bun build --compile` 产出的二进制**能否加载用户目录的动态 TS 插件** | spike 结论（可/不可 + 绕法） | ① 用官方 `a2a-inspector` 能拉到卡片并完成一次 `SendMessage`；② 明确 `--compile` 与 `loadPluginDirs` 是否兼容，P3 分发路径据此定案 |
+| **P0** | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器 |
+| **P1** | A2A 一期：AgentCard + SendMessage + SendStreamingMessage(SSE) + GetTask + CancelTask + Bearer + `A2A-Version` 校验 + `INPUT_REQUIRED` 权限（含 §3.4 挂起机制、§3.5 并发/幂等）；默认 127.0.0.1 | `@harness/a2a-server` 与 `harness a2a` 启动方式 | 用官方 `a2a-inspector` / `a2a-tck` 跑通：取到 agent-card；发消息后收到 task→artifact/状态更新→`TASK_STATE_COMPLETED` 的事件序列；取消后转 `TASK_STATE_CANCELED`；权限点转 `TASK_STATE_INPUT_REQUIRED` 且答复后续接；同 session 并发请求被串行化或结构化拒绝；重复 `messageId` 不重复执行 |
 | **P2** | VSCode Chat Participant（B2）：spawn sidecar（stdio）或连本地 A2A，转发流到 ResponseStream，含取消与权限弹窗 | VSIX 扩展（不发布 Marketplace） | 在 VSCode 中 `@harness` 提问可看到流式回答、工具进度、斜杠命令；终止按钮可中断；权限请求弹窗可决策 |
-| **P3** | VSCode Webview（B3）：平移块模型与侧栏（会话/后台任务/文件引用/统计）；sidecar 用 `--compile` 二进制分发 | VSIX 完整版 | 终端 TUI 的核心信息结构在 IDE 内等价呈现；无需用户自行安装 bun |
-| **旁路** | B1 MCP server 暴露核心工具（若要优先满足"Copilot 无 UI 调用"） | MCP server 配置 | 支持 MCP 的 IDE 客户端能列出并调用 harness 工具，写操作触发权限 |
+| **P3** | VSCode Webview（B3）：平移块模型与侧栏（会话/后台任务/文件引用/统计）；sidecar 分发（`--compile` 或随扩展带 bun，取决于 P0.5 结论） | VSIX 完整版 | 终端 TUI 的核心信息结构在 IDE 内等价呈现 |
+| **旁路** | B1 MCP server（**需自建 server 端**，见 §4.1），做成插件 | 插件包 + MCP server 配置 | 支持 MCP 的 IDE 客户端能列出并调用 harness 工具，写操作触发权限 |
 
-依赖顺序：**P0 是 P1/P2/P3 的共同前置**；P1 的 server 可直接充当 P2 的 sidecar 传输层；旁路 B1 与主线并行、互不阻塞。
+依赖顺序：**P0.5 是 P1/P3 的前置结论**（协议口径与分发路径都靠它定案）；**P0 是 P1/P2/P3 的共同前置**；P1 的 server 可直接充当 P2 的 sidecar 传输层；旁路 B1 与主线并行、互不阻塞。
+
+**P0 的 `createHost` 接口清单（必须覆盖 `boot()` 现状，原稿只写 4 个字段远不够）**：
+
+```ts
+createHost({
+  cwd, dataDir,                       // 工作区与数据目录（由 resolveWorkspace 统一解析）
+  provider?, model?,                  // 默认端点覆盖（原 CLI 的 --provider / --model）
+  providers?,                         // config.json → providers 的覆盖
+  anthropicProviderConfig?, mockProviderConfig?,
+  permissionMode?, askPrompt?,        // 权限档位
+  permissionAsk?,                     // 远程 ask 回调（A2A / VSCode 注入）
+  allowPluginCode?,                   // 外部插件目录代码注入闸门
+  agents?, agentDirs?,                // Agent 定义与两级目录
+  plugins?,                           // config.json → plugins 声明式启用
+  snapshot?,                          // 文件快照服务
+  logSink?, stdout?,                  // 日志/诊断出口（见下方分级要求）
+})
+```
+
+**P0 的搬迁清单（定义在 `packages/cli/src/index.ts`，不在 core）**：`BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` / `loadPluginDirs` / `buildProviderWindowTable`。搬走后 `@harness/cli` 必须继续 re-export 这些符号（`cli.test.ts` 直接 import），否则等于制造一次无谓的测试翻修。
+
+**P0 的 stdout 分级要求**：boot 内 16 处 `stdout?.write` 混着三类语义 —— ① 用户可见诊断（如"未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider"）② 告警 ③ 日志。抽 host 时必须先分级：A2A 宿主若把 ① 也塞进 `logSink`，远程调用方会**静默拿到 mock 回答**。① 应升格为**可观测事件**（P1 落进任务 metadata / 服务日志 / 启动自检输出）。
 
 ---
 
 ## 7. 共性难点与对策
 
-1. **权限 ask 远程化**：新增 `RemotePermissionEngine`（或对 host 注入 `permissionAsk` 回调），ask 向 UI 发请求并 await 决策；两种宿主各自落地交互（A2A=INPUT_REQUIRED，VSCode=授权卡）。check→ask 两步、`ToolPermissionDeniedError` 判定、规则持久化全部沿用，不改语义。
-2. **会话/任务映射**：contextId=sessionId、taskId=请求 id（Map → AbortController）；VSCode 侧直接消费会话列表 API。
+1. **权限 ask 远程化**：新增 `RemotePermissionEngine`（实现 `PermissionEngine`，与 `CliPermissionEngine` 一样只覆盖 `ask`），ask 向 UI 发请求并 await 决策。**真正的难点不是换实现，而是 §3.4 的挂起/唤醒机制**——两种宿主只是它的两个壳（A2A=`INPUT_REQUIRED`，VSCode=授权卡）。check→ask 两步、`ToolPermissionDeniedError` 判定、规则持久化全部沿用，不改语义。
+2. **会话/任务映射**：`contextId=sessionId`、`taskId=请求 id`；**续接按 taskId**；`ListTasks` 走 task 索引而非 session（§3.5）。
 3. **长等待心跳**：`step_gate` 一个事件两种壳——A2A 转 WORKING 状态更新，VSCode 转 progress；不在各壳另做超时猜测（预算语义已在引擎内：超预算继续等待但标 `overBudget`）。
-4. **日志通道**：复用已落地的 `setLogSink` 机制——A2A server 把 warn/error 收进任务 metadata/服务日志，绝不直写共享 stdout；VSCode 侧经消息桥进 webview console 块。
+4. **日志通道**：复用 `HarnessApp` 上已落地的 `setLogSink` / `emitLog` **模式**（注意：它在 CLI 宿主层，**不在 core**），P0 抽 host 时一并上移到 `@harness/host`。A2A server 把 warn/error 收进任务 metadata/服务日志，绝不直写共享 stdout；VSCode 侧经消息桥进 webview console 块。
 5. **后台任务可见性**：外部 UI 统一订阅 bus（`SubagentEvents.*`、单任务完成与 barrier 两条事件不合并），不新建轮询通道。
-6. **版本兼容**：AgentCard 声明 `protocol_version`；host 装配层接口稳定后，CLI/server/扩展各自独立发版。
+6. **版本兼容**：AgentCard 的 `supportedInterfaces[].protocolVersion` 声明协议版本（顶层 `version` 是 agent 自身版本，**不要**写成 `protocol_version`）；每个请求校验 `A2A-Version` 头。host 装配层接口稳定后，CLI/server/扩展各自独立发版。
 
 ---
 
@@ -222,12 +286,17 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 
 | 风险/取舍 | 说明 | 对策 |
 |---|---|---|
-| A2A 规范仍在演进（v0.x→v1.0 有 breaking 调整） | 字段与 binding 可能再变 | 协议壳严格隔离；优先用官方 SDK 的类型；映射表集中一处维护 |
-| sidecar 分发体积/启动延迟 | `--compile` 二进制数十 MB，冷启动有成本 | 扩展激活时懒启动、单实例复用；v2 评估进程内化（Node 兼容成本已确认很低：仅 1 处 Bun.spawn） |
-| A2A 与现有 MCP 能力边界被混淆 | 一个是自治 Agent、一个是工具集 | 文档与配置中明确两个开关；默认都只监听本机 |
-| 远程化放大权限风险 | 网络可达意味着写工具可能被远程触发 | 默认 127.0.0.1 + 强制认证 + 权限引擎不旁路 + deny-all 缺省 |
+| **`bun build --compile` 与动态插件目录冲突** | harness 既 lazy `import()` 包名，也经 `loadPluginDirs` **运行期 import 用户目录里的 `.ts`/`.js`**。`--compile` 对运行期发现的动态导入与 TS 转译支持有限，很可能产不出"仍能加载用户 TS 插件"的单文件二进制 | **P0.5 spike 先验证**；不可行则 P3 分发退化为"随扩展带 bun"或"扩展内 Node 嵌入（v2 路线）" |
+| A2A v0.3→v1.0 breaking + 网上示例过时 | 方法名/枚举/Part 结构都改过；原稿 §3.1 即照抄 v0.3 示例 | 口径**一律取自 SDK 常量**；开工前钉死 SDK 版本；映射表集中一处维护；验收用官方 `a2a-inspector` / `a2a-tck` |
+| SDK 成熟度 | JS SDK 1.0 GA 于 2026-07-22（距今约两个月），仍在快速迭代 | 钉版本 + 协议壳严格隔离 + 优先用 SDK 类型；升级按 minor 走回归 |
+| sidecar 分发体积/启动延迟 | `--compile` 二进制数十 MB，冷启动有成本 | 扩展激活时懒启动、单实例复用；v2 评估进程内化（Node 兼容成本已确认很低：仅 3 处 `Bun.*`） |
+| A2A 与现有 MCP 能力边界被混淆 | 一个是自治 Agent、一个是工具集；且现有 MCP 基建**只是 client** | 文档与配置中明确两个开关；默认都只监听本机；B1 单独标注"需自建 server 端" |
+| 远程化放大权限风险 | 网络可达意味着写工具可能被远程触发 | 默认 127.0.0.1 + 强制认证 + 权限引擎不旁路 + deny-all 缺省 + **contextId 绑定调用方**（§3.5） |
+| 挂起任务泄漏 | `INPUT_REQUIRED` 的活生成器若无人答复会常驻内存 | 挂起表带 TTL + 超时转 `TASK_STATE_FAILED` 并释放（§3.4） |
 | 双端漂移（server 与 CLI 行为不一致） | 两份装配必然分叉 | P0 强制收口到 `@harness/host`；协议层禁止内嵌业务规则 |
+| host 变成"巨型组合根" | 依赖 ≈10 个插件包 | 接受之（"一份装配"的代价），但要求 host 只做装配与注入、依赖清单写进 README |
 | VSCode Chat API 依赖 Copilot Chat | 未装 Copilot Chat 的环境不可用 | B2 为 v1、B3 webview 为终态兜底；sidecar+webview 不依赖 Copilot |
+| 新包登记遗漏 | AGENTS.md 要求新包同步登记 root `tsconfig.json` paths + 相关 `package.json` dependencies + `bun install` | P0/P1 的完成定义里加这一条 |
 
 ---
 
@@ -246,3 +315,5 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 2. A2A 服务是否随 CLI 发布为子命令（`harness a2a --port`），还是独立可执行包？建议前者（复用 host 装配与配置）。
 3. subagent 类 agent 是否对外暴露为独立 AgentCard？建议默认不暴露、配置开启。
 4. VSCode 扩展代码放主 monorepo（`adapters/`）还是独立仓库？建议独立仓库，避免 `@types/vscode` 与 webview 构建链污染主包。
+5. **挂起任务的 TTL 与超时行为**：超时后是 `TASK_STATE_FAILED` 还是自动取消？建议默认 `FAILED` 并保留已完成部分，可配。
+6. **并发策略**：同 session 并发请求是**排队**还是**直接拒绝**？建议一期直接拒绝（语义简单、无隐藏积压），二期再评估排队。
