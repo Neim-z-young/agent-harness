@@ -1,5 +1,103 @@
 # Agent Harness 开发日志
 
+## 2026-09-30（续 225）回合结束闸门：模型收尾 ≠ 本轮结束（引擎级等待 + 反抢活提示词）
+
+### 缺口：步间闸门挂在"续轮"上，覆盖不到最常见的收尾形态
+
+`shouldContinueStep()` 的判据是 `toolCallCount > 0`；模型给出**最终答复**时循环直接 `break`，
+挂在循环顶部的步间闸门（续 196/198/203）**根本不会被触达** —— 而"派完工、报一句、收尾"恰恰是
+coordinator/lead 最常见的形态。真机 `s_1790756963376_7r3x8`：
+
+| 时刻 | 事件 |
+|---|---|
+| +26.1s | 派 4 个后台 reader（`runInBackground: true`） |
+| +33.0s | 播报一句后给最终答复 ⇒ 本轮结束 |
+| +33.0s ~ +67.4s | **引擎完全空闲 34.4s** |
+| +67.4s 起 | 4 个 worker 分批完成 ⇒ 宿主各注入一次 `<continue/>` ⇒ **3 次"只收通知"的完整模型调用** |
+
+三块代价互相独立：① 空档 34.4s 界面无事发生；② 每 worker 一次整轮重放；③ 送达依赖**宿主约定**
+（没订 `worker.completed` / `barrier.completed` 的宿主会让已跑完的结果滞留 —— `axqkk` 实测
+barrier `+527s` 完成、结果 `+2816s` 才送达）。
+
+### 改动：`waitAtTurnEnd`（宿主开关）＋ 插件**声明位**
+
+| 环节 | 行为 |
+|---|---|
+| 武装 | 插件在步间探测（`phase: 'step'`）里置 `AgentStepGateDecision.waitAtTurnEnd` ⇒ 本轮武装；subagent 插件的条件是"本会话仍有存活后台任务" |
+| 触发 | 模型收尾（`!shouldContinueStep`）且已武装 ⇒ break 前再问一次（`phase: 'turn_end'`） |
+| 等待 | 仍报存活 ⇒ 原地等（切片 500ms 重探），**等待期间一次模型都不调**；静默即收工 |
+| 送达 | `drainNotifications` ⇒ 通知作为 user 消息入对话；**有结果才 `continue`**，模型在同一条 query 内处理 |
+| 兜底 | `STEP_GATE_TURN_END_MAX_WAIT_MS`（默认 5 分钟）**入口**归零 ⇒ 不探测不 drain，交还宿主 auto-continue |
+
+三条边界（每条都有理由，不是默认值堆出来的）：
+
+1. **声明制而非无条件探测** —— 无条件探测会让没有后台任务概念的插件也在回合末多挨一次询问，
+   且一句顺口的"存活"就能让引擎真的等下去。谁有能力产生"需要等的任务"，谁负责声明。
+2. **预算是真终止条件** —— 步间闸门的 `maxTotalMs` 刻意只是**提醒阈值**（续 203）；这一条不同：
+   它等的是"任务全跑完"，没终止条件时一个卡住的后台任务会让**整条 query 永不返回**。
+3. **预算见底不 ping-pong** —— 等待**途中**见底仍 drain 一次（已到达的结果值得处理），
+   但下一次回合末等待在**入口**就返回 ⇒ 最多多一次模型调用。
+
+### 提示词：把"等"写死，否则模型会用重复劳动/空转填时间
+
+引擎给了等待能力还不够 —— 模型不知道"系统会替我等"时，会拿**重复劳动**（自己把子 Agent 的活
+再做一遍）或**空转**（反复 `read_file` / `bash` 查状态）填满空档。三个落点：
+`coordinator.txt`「等待：有依赖的活别抢着干」、`subagent-tool-documentation.txt`「派工后：等结果，
+别抢活」、`renderRoster()` 末行；`inputSchema.prompt` 描述同步补一句。核心一句可判定的动作：
+**「你下一步依赖它 ⇒ 停手，系统替你等；不依赖的独立活可以并行做」**，并明说"等待期间不调用模型、
+不烧步数"—— 不写这句，模型不会信任"停手"是安全的。同步补了 `~/.harness/agents/lead.md`。
+
+### 契约变化：CLI `<continue/>` 从"送达通道"退化为"兜底"
+
+`barrier-integration.test.ts` 实测到引擎在轮内把通知 drain 进对话，随后注入的 `<continue/>`
+读队列为空 ⇒ 正确跳过。该用例据此改为断言"**结果进了对话**"（比旧版"队列里还有、等着被取走"更强）。
+CLI 的跳过提示同步改准确：`无待处理的后台结果（已处理或未就绪），跳过本次自动续轮` ——
+措辞要同时覆盖"引擎已接管"与"理论上尚未就绪"两种来源。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `bun run typecheck` | 39 包 **exit 0** |
+| `bun test ./packages` | **2126 pass / 0 fail**（89 文件） |
+| `step-gate.test.ts` | 新增 4 条回合结束闸门用例 + 3 条 `normalizeTurnEndWaitMs` + 1 条常量守卫，**37 pass** |
+| `barrier-integration.test.ts` | 契约更新后 **2 pass**（真实插件链端到端） |
+
+新增可观测：`step_gate` 流事件与 `agent.step.gate` bus 事件都带 `phase: 'step' | 'turn_end'`
+（两者 `waitMs` 语义不同，不可直接比较）；流事件**必须由调用方 yield**（等待在普通 async
+私有方法里）—— 这正是"长等待期间界面安静"那个观感问题的解。
+
+## 2026-09-30（续 224）派工提示词三项收敛：先算账（要不要派 / 派几路）+ 多路范围互斥
+
+从两会话取证（`s_1790756296342_9yvoc` 未派工 / `s_1790756963376_7r3x8` 派 4 路，同一句 prompt、同一 cwd）得到
+**成本侧结论**：派工开销**随路数线性增长** —— 4 路总输入 `6.32M`，是主会话自己做的 `5.67×`，
+其中 `4.82M` 全在子会话（每个子 Agent 是一份独立上下文，彼此不共享前缀缓存）；
+并行的墙钟收益（`77.3s` vs 串行 `225.2s`）会被等待损耗（gate 空转 34.3s + 通知延迟 20.7s）吃掉。
+于是给派工提示词补三条硬约束：
+
+| 约束 | 落点 |
+|---|---|
+| **派工前先评估复杂度**：门槛 = 可切分 ＋ 每块够重（≥10 步或 ≥30s）＋ 至少 2 块；达不到就自己做 | `subagent-tool-documentation.txt` 新增「派工前先算账」；`coordinator.txt` 派工规则首条 |
+| **默认 2–3 路、最多 4 路**（路数是成本第一乘数，宁可每路大一点，不要切碎） | 同上 ＋ `renderRoster()` ＋ `inputSchema.prompt` 描述 |
+| **多路范围必须两两互斥**（逐路写文件集声明；公共文件只让一路读，或父 Agent 先读完写进 prompt） | 新增「多路派工：先划界，再派」；`renderRoster()`；`coordinator.txt` |
+
+- `documentation` 是**每次请求都随 tools 发送**的（provider 侧把 `tool.documentation` 合并进 `description`），
+  所以新增文本按"能否改变下一步决策"逐句筛过；两条新约束同时写进 `description` / `documentation` /
+  `inputSchema.prompt` / `renderRoster()` **四个入口**（沿用 §18.2 的"少一处就漏"约定）。
+- `coordinator.txt` 走 `core.prompt.system.transform`，对 `mode === 'coordinator'` **无条件注入**
+  （`lead.md` 自带正文也照收）⇒ 改它同时覆盖 lead 与空正文 coordinator。
+- 提交 `93bf480`；`~/.harness/agents/lead.md`（用户级、不在仓库）同步补同一套判定。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `bun run typecheck` | 30 包 **exit 0** |
+| `bun test packages/plugins/subagent` | **159 pass / 0 fail** |
+| `bun test packages/plugins/coordinator` | **33 pass / 0 fail**（含 `COORDINATOR_SYSTEM_PROMPT 包含四阶段与反模式`） |
+
+未改任何代码逻辑，只改提示词文本 ＋ `renderRoster()` 的两行字符串。
+
 ## 2026-09-30（续 223）`compaction` 的窗口同样按会话端点解析（续 222 遗留的"同源未修"项）
 
 ### 起因：续 222 只修了 ACP 一侧，`compaction` 一侧仍在
@@ -1253,36 +1351,6 @@ const tool = resolved !== undefined && allowedTools.includes(resolved) ? resolve
   而不是看 hook 有没有被触发。
 - 端到端脚本里，**工具桩的 `safeParse` 必须真的失败**才能走到"入参自愈" —— 恒成功的桩会让
   工具"执行成功"，看着像功能没生效，其实是场景没造出来。
-
-## 2026-09-30（续 207）派工提示词三项收敛：先算账（要不要派 / 派几路）+ 多路范围互斥
-
-从两会话取证（`s_1790756296342_9yvoc` 未派工 / `s_1790756963376_7r3x8` 派 4 路，同一句 prompt、同一 cwd）得到
-**成本侧结论**：派工开销**随路数线性增长** —— 4 路总输入 `6.32M`，是主会话自己做的 `5.67×`，
-其中 `4.82M` 全在子会话（每个子 Agent 是一份独立上下文，彼此不共享前缀缓存）；
-并行的墙钟收益（`77.3s` vs 串行 `225.2s`）会被等待损耗（gate 空转 34.3s + 通知延迟 20.7s）吃掉。
-于是给派工提示词补三条硬约束：
-
-| 约束 | 落点 |
-|---|---|
-| **派工前先评估复杂度**：门槛 = 可切分 ＋ 每块够重（≥10 步或 ≥30s）＋ 至少 2 块；达不到就自己做 | `subagent-tool-documentation.txt` 新增「派工前先算账」；`coordinator.txt` 派工规则首条 |
-| **默认 2–3 路、最多 4 路**（路数是成本第一乘数，宁可每路大一点，不要切碎） | 同上 ＋ `renderRoster()` ＋ `inputSchema.prompt` 描述 |
-| **多路范围必须两两互斥**（逐路写文件集声明；公共文件只让一路读，或父 Agent 先读完写进 prompt） | 新增「多路派工：先划界，再派」；`renderRoster()`；`coordinator.txt` |
-
-- `documentation` 是**每次请求都随 tools 发送**的（provider 侧把 `tool.documentation` 合并进 `description`），
-  所以新增文本按"能否改变下一步决策"逐句筛过；两条新约束同时写进 `description` / `documentation` /
-  `inputSchema.prompt` / `renderRoster()` **四个入口**（沿用 §18.2 的"少一处就漏"约定）。
-- `coordinator.txt` 走 `core.prompt.system.transform`，对 `mode === 'coordinator'` **无条件注入**
-  （`lead.md` 自带正文也照收）⇒ 改它同时覆盖 lead 与空正文 coordinator。
-
-### 验证
-
-| 项 | 结果 |
-|---|---|
-| `bun run typecheck` | 30 包 **exit 0** |
-| `bun test packages/plugins/subagent` | **159 pass / 0 fail** |
-| `bun test packages/plugins/coordinator` | **33 pass / 0 fail**（含 `COORDINATOR_SYSTEM_PROMPT 包含四阶段与反模式`） |
-
-未改任何代码逻辑，只改提示词文本 ＋ `renderRoster()` 的两行字符串。
 
 ## 2026-09-28（续 206）结果滞留的真机根因是 TUI 没挂自动续轮（不是退避不够）
 
