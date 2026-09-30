@@ -12,6 +12,8 @@ import {
   formatApiKeyTag,
   findTokenOnlyDuplicates,
   startRepl,
+  resolveCompactionWindow,
+  buildCompactionOptions,
 } from './index'
 import type { ProviderConfig } from '@harness/plugin'
 
@@ -443,5 +445,56 @@ describe('同配置不同 token 的集成：可区分 + 必须消歧', () => {
     expect(failed).toInclude('默认 provider "hy3-2" 未在 providers 数组中定义')
     expect(chunks.join('')).toInclude('配置错误（config.json → providers）')
     rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+// ==========================================================================
+// 占用率分母按会话端点解析（会话压缩 / 上下文占用展示）
+// ==========================================================================
+// 背景：Provider / 模型是「按 Agent 解析 + 会话内可用 /model 覆盖」的，所以**同一份 config 下
+// 不同会话的窗口本来就不一样**。此前会话压缩恒用默认 Provider 的窗口当分母，小窗口会话的阈值
+// 会算到自身窗口之外 ⇒ 自动压缩永不触发，且全程没有症状。`resolveSessionEndpoint` 把「本会话
+// 实际端点」交给查表（`resolveCompactionWindow`），这里把这条链在真实 boot 上串一遍。
+
+describe('resolveSessionEndpoint：窗口跟着本会话端点走', () => {
+  const twoWindowProviders = [
+    { id: 'big', type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'm-big', contextWindowTokens: 300_000 },
+    { id: 'small', type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', apiKey: 'sk-x', model: 'm-small', contextWindowTokens: 200_000 },
+  ]
+
+  it('/model 切到小窗口端点后，会话压缩/占用展示的分母跟着变小（按默认 Provider 则阈值越界）', async () => {
+    const m = mount(twoWindowProviders, 'big')
+    const { harness, session } = await m.app.boot()
+    const cfg = await m.app.configStore.load()
+    const def = cfg.provider ?? 'anthropic'
+
+    // 未切换：默认 Agent 没绑模型 ⇒ 端点为空，窗口 = 默认 Provider 的窗口（= 改造前行为）
+    expect(m.app.resolveSessionEndpoint(session)).toEqual({})
+    expect(buildCompactionOptions(cfg, def, m.app.resolveSessionEndpoint(session)).contextWindowTokens).toBe(300_000)
+
+    const r = await startRepl({
+      app: m.app, harness, session, stdout: m.stdout,
+      scriptedStdin: ['/model small', '/exit'],
+    })
+    expect(r).toBe('exit')
+
+    // 切换后：覆盖落在 Session.meta.model，端点解析出的就是它自己 —— 分母 200000 而不是 300000
+    expect(m.app.resolveSessionEndpoint(session)).toEqual({ providerId: 'small', modelId: 'm-small' })
+    const opt = buildCompactionOptions(cfg, def, m.app.resolveSessionEndpoint(session))
+    expect(opt.contextWindowTokens).toBe(200_000)
+    expect(resolveCompactionWindow(cfg, def, { providerId: 'small' })).toBe(200_000)
+
+    // 分母错会怎样（这就是修掉的 bug）：按默认 Provider 的 300000 算阈值 = 80% × 270000 = 216000，
+    // 已经**超过本会话真实窗口 200000** ⇒ 自动压缩永远不可能触发，而概览/工具全都在报正常。
+    const threshold = (window: number) =>
+      Math.floor((window - (opt.reservedTokens ?? 30_000)) * ((opt.autoCompactThresholdPct ?? 80) / 100))
+    expect(threshold(300_000)).toBeGreaterThan(200_000)
+    expect(threshold(opt.contextWindowTokens!)).toBeLessThan(opt.contextWindowTokens!)
+
+    // 不传端点仍是默认 Provider 口径 —— 老调用点不会被静默改掉分母
+    expect(buildCompactionOptions(cfg, def).contextWindowTokens).toBe(300_000)
+
+    await m.app.shutdown()
+    m.cleanup()
   })
 })

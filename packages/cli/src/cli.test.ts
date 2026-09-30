@@ -25,6 +25,7 @@ import {
   toAcpConfig,
   resolveContextWindowTokens,
   buildProviderWindowTable,
+  resolveCompactionWindow,
   buildCompactionOptions,
   checkCompactionConfig,
   checkCompactionReachability,
@@ -665,6 +666,15 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(resolveContextWindowTokens({ providers }, 'hy3')).toBe(102_400)
     expect(resolveContextWindowTokens({ providers }, 'other')).toBe(1_000_000)
     expect(resolveContextWindowTokens({}, 'mock')).toBe(200_000)
+    // 窗口字段不是能当分母的数（0 / 负数 / NaN）⇒ 按"没配"处理、回落 200000。
+    // 原样当选的后果：占用率 = est/0 = Infinity、阈值 = (0−30000)×pct% 为负 —— 两个都伪装成"正常显示"。
+    const broken = [
+      { id: 'zero', type: 'openai', contextWindowTokens: 0 },
+      { id: 'neg', type: 'openai', contextWindowTokens: -1 },
+    ] as HarnessConfig['providers']
+    expect(resolveContextWindowTokens({ providers: broken }, 'zero')).toBe(200_000)
+    expect(resolveContextWindowTokens({ providers: broken }, 'neg')).toBe(200_000)
+    expect(resolveContextWindowTokens({ providers: broken, compression: { modelContextLimit: 0 } }, 'zero')).toBe(200_000)
   })
 
   it('buildProviderWindowTable：按端点/模型建表，同模型多实例取最小窗口，fallback 沿用原推导', () => {
@@ -701,6 +711,63 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(t2.fallback).toBe(300_000)
     // 没有任何 provider 时只剩 fallback，与改造前一致（200000）
     expect(buildProviderWindowTable({}, 'mock')).toEqual({ byProvider: {}, byModel: {}, fallback: 200_000 })
+  })
+
+  it('resolveCompactionWindow：分母跟着本会话端点走；显式值压过推导，缺省逐位等于改造前', () => {
+    const providers = [
+      { id: 'online', type: 'openai', model: 'deepseek-flash', contextWindowTokens: 300_000 },
+      { id: 'hy3', type: 'openai', model: 'hy3', contextWindowTokens: 200_000 },
+    ] as HarnessConfig['providers']
+    const cfg = { providers }
+    // 同一份 config、两条会话、两个分母 —— 这正是要修的 bug 形态：此前恒为默认 Provider 的 300000。
+    // 真机后果：阈值 = 95% × (300000 − 30000) = 256500 > 200000 ⇒ 自动压缩**永不触发**且无任何症状。
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'hy3' })).toBe(200_000)
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'online' })).toBe(300_000)
+    // 只给 modelId 也能命中（agent md 里写 modelId 比写派生出的 provider id 自然）
+    expect(resolveCompactionWindow(cfg, 'online', { modelId: 'hy3' })).toBe(200_000)
+    // 两个维度都给时按实例维度（更具体）
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'online', modelId: 'hy3' })).toBe(300_000)
+    // 查不到 / 没给端点 ⇒ fallback，逐位等于改造前的推导（"缺省零行为变更"的保证点）
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'ghost' })).toBe(300_000)
+    expect(resolveCompactionWindow(cfg, 'online', {})).toBe(300_000)
+    expect(resolveCompactionWindow(cfg, 'online')).toBe(resolveContextWindowTokens(cfg, 'online'))
+    // 显式值排在最前（写了就得生效）：compaction 段专用键优先于 compression 的全局键
+    expect(resolveCompactionWindow({ ...cfg, compaction: { contextWindowTokens: 50_000 } }, 'online', { providerId: 'hy3' }))
+      .toBe(50_000)
+    expect(resolveCompactionWindow({ ...cfg, compression: { modelContextLimit: 60_000 } }, 'online', { providerId: 'hy3' }))
+      .toBe(60_000)
+    // 表里混进非法窗口（0 / 负数）时不当分母、也不算出 NaN/Infinity
+    const dirty = [{ id: 'zero', type: 'openai', model: 'z', contextWindowTokens: 0 }] as HarnessConfig['providers']
+    expect(resolveCompactionWindow({ providers: dirty }, 'zero', { providerId: 'zero' })).toBe(200_000)
+    expect(resolveCompactionWindow({}, 'mock', { providerId: 'x', modelId: 'y' })).toBe(200_000)
+  })
+
+  it('查表顺序与 acp-context 的 lookupProviderWindow 一致（守卫：两份实现不许各说各话）', async () => {
+    // 为什么要有这条：CLI 侧刻意**没有**复用 acp-context 的实现 —— 那会连带 acp-kernel 上启动
+    // 路径（为 6 行查表加载整棵内核不划算）。于是"ACP 与 compaction 同一把尺子"这件事只能靠
+    // 这条用例钉住：谁改了取小 / 判空 / 优先级规则而另一边没跟上，这里就红。
+    const { lookupProviderWindow } = await import('@harness/acp-context')
+    const providers = [
+      { id: 'big', type: 'openai', model: 'gpt-4o', contextWindowTokens: 1_000_000 },
+      { id: 'small-a', type: 'openai', model: 'hy3', contextWindowTokens: 200_000 },
+      { id: 'small-b', type: 'openai', model: 'hy3', contextWindowTokens: 102_400 },
+      { id: 'no-win', type: 'openai', model: 'm1' },
+      { id: 'zero', type: 'openai', model: 'm2', contextWindowTokens: 0 },
+    ] as HarnessConfig['providers']
+    const cfg = { providers }
+    const table = buildProviderWindowTable(cfg, 'big')
+    const cases: Array<{ providerId?: string; modelId?: string }> = [
+      {}, { providerId: 'big' }, { providerId: 'small-b' }, { providerId: 'no-win' }, { providerId: 'zero' },
+      { modelId: 'hy3' }, { modelId: 'm1' }, { providerId: 'ghost' },
+      { providerId: 'no-win', modelId: 'hy3' }, { providerId: 'ghost', modelId: 'm2' },
+    ]
+    for (const ep of cases) {
+      const viaAcp = lookupProviderWindow(table, ep.providerId, ep.modelId) ?? table.fallback
+      expect(resolveCompactionWindow(cfg, 'big', ep)).toBe(viaAcp)
+    }
+    // 同名模型多端点取最小（宁可早压；分母虚高会漏压）——两边都得是 102400
+    expect(lookupProviderWindow(table, undefined, 'hy3')).toBe(102_400)
+    expect(resolveCompactionWindow(cfg, 'big', { modelId: 'hy3' })).toBe(102_400)
   })
 
   it('ACP 装配：窗口只传"显式值"，默认 Provider 的窗口走 providerWindows.fallback（防回归）', () => {
@@ -747,6 +814,15 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     // compaction.contextWindowTokens 是本段专用覆盖，优先级高于 Provider
     expect(buildCompactionOptions({ providers, compaction: { contextWindowTokens: 60_000 } }, 'hy3').contextWindowTokens)
       .toBe(60_000)
+    // 传了端点 ⇒ 窗口按该端点取：同一份 config 下两条会话可以有两个分母
+    const two = [
+      { id: 'big', type: 'openai', model: 'm-big', contextWindowTokens: 300_000 },
+      { id: 'small', type: 'openai', model: 'm-small', contextWindowTokens: 200_000 },
+    ] as HarnessConfig['providers']
+    expect(buildCompactionOptions({ providers: two }, 'big', { providerId: 'small' }).contextWindowTokens).toBe(200_000)
+    expect(buildCompactionOptions({ providers: two }, 'big', { providerId: 'big' }).contextWindowTokens).toBe(300_000)
+    // 不传端点 ⇒ 仍按默认 Provider（老调用点不被静默改掉分母）
+    expect(buildCompactionOptions({ providers: two }, 'big').contextWindowTokens).toBe(300_000)
   })
 
   it('checkCompactionConfig：拼错键与非法取值都能被点名', () => {
@@ -800,6 +876,23 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     // 拼错键也一并点名（必须绕开结构类型：多余键正是本用例要模拟的脏数据）
     const typo = { compaction: { keepRecentMessage: 20 } } as unknown as HarnessConfig
     expect(buildConfigOverview(typo, 'mock')).toInclude('compaction.keepRecentMessage 未被识别')
+  })
+
+  it('buildConfigOverview：providers 窗口不一致时注明"这个窗口只对默认 Provider 成立"', () => {
+    // 不注明就会被读成"我的会话就是这个分母"：默认端点 300K、会话切到 200K 的模型后，
+    // 阈值按 300K 算出来 256500 > 200000 —— 概览看着一切正常，压缩却永不触发。
+    const providers: NonNullable<HarnessConfig['providers']> = [
+      { id: 'big', type: 'openai', model: 'm-big', contextWindowTokens: 300_000 },
+      { id: 'small', type: 'openai', model: 'm-small', contextWindowTokens: 200_000 },
+    ]
+    expect(buildConfigOverview({ providers }, 'big'))
+      .toInclude('会话压缩（/compact）：窗口 300000（默认 Provider 口径；各会话按自身端点解析）')
+    // 只有一个窗口 ⇒ 无分化可标注（保持改造前的输出，不制造噪音）
+    expect(buildConfigOverview({ providers: [providers[0]!] }, 'big'))
+      .not.toInclude('各会话按自身端点解析')
+    // 显式配了窗口 ⇒ 所有会话都按它算，同样没有分化可标注
+    expect(buildConfigOverview({ providers, compaction: { contextWindowTokens: 123_456 } }, 'big'))
+      .not.toInclude('各会话按自身端点解析')
   })
 })
 

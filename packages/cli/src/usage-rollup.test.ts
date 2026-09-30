@@ -20,6 +20,8 @@ const fakeHarness = (children: string[], usage: Record<string, ReturnType<typeof
     },
     session: {
       estimateTokens: async (id: string) => est?.[id] ?? 0,
+      // 供 renderContextOccupancy 回源取「最新一份」会话（它据此解析各会话自己的窗口）
+      get: async (id: string) => ({ id }),
     },
   }) as never
 
@@ -70,5 +72,29 @@ describe('renderContextOccupancy', () => {
   it('子会话估算失败（0）⇒ 不占版面', async () => {
     const line = await renderContextOccupancy(fakeHarness(['c1'], {}, { s1: 45_000 }), { id: 's1' } as never, compactOpts)
     expect(line).not.toContain('子会话 c1')
+  })
+
+  it('子会话分母按自身端点解析：子 Agent 换了窗口就不再沿用父会话的', async () => {
+    // 父会话 300K / 子会话 200K、占用 150K：按子会话自己的分母是 75%，沿用父会话的会报成 50%
+    // —— 前者才是"该不该压"的依据（虚低会让压缩永不触发）。
+    const line = await renderContextOccupancy(
+      fakeHarness(['c1'], {}, { s1: 45_000, c1: 150_000 }),
+      { id: 's1' } as never,
+      { ...compactOpts, contextWindowTokens: 300_000 } as CompactOptions,
+      (s) => (s?.id === 'c1' ? 200_000 : 300_000),
+    )
+    expect(line).toContain('上下文占用：45,000 / 300,000 tokens（15.0%）')
+    expect(line).toContain('子会话 c1：占用 150,000 / 200,000 tokens（75.0%）')
+  })
+
+  it('端点解析不出来（宿主没有 config / 会话查不到）⇒ 回落父会话窗口，与改造前一致', async () => {
+    const line = await renderContextOccupancy(
+      fakeHarness(['c1'], {}, { s1: 45_000, c1: 20_000 }),
+      { id: 's1' } as never,
+      compactOpts,
+      () => compactOpts.contextWindowTokens!,
+    )
+    expect(line).toContain('上下文占用：45,000 / 200,000 tokens（22.5%）')
+    expect(line).toContain('子会话 c1：占用 20,000 / 200,000 tokens（10.0%）')
   })
 })

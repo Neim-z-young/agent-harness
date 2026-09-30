@@ -533,9 +533,10 @@ export interface HarnessConfig {
      * 自动压缩的触发阈值（估算 token 占「可用窗口 = 窗口 − reservedTokens」的百分比，默认 80）。
      *
      * 注意：窗口**不在本段配置**，按 `compaction.contextWindowTokens → compression.modelContextLimit
-     * → 默认 Provider 的 contextWindowTokens → 200000` 推导。早些版本 core 内硬编码 200000，
-     * 于是 providers 写 102400 时阈值算成 136000 > 窗口本身 ⇒ 永远压不到；
-     * 想临时指定窗口可用 `contextWindowTokens` 覆盖。
+     * → 本会话实际端点（Provider / 模型）的窗口 → 默认 Provider 的窗口 → 200000` 推导
+     * （见 resolveCompactionWindow）。早些版本 core 内硬编码 200000，于是 providers 写 102400 时
+     * 阈值算成 136000 > 窗口本身 ⇒ 永远压不到；再往后是"只按默认 Provider 算"—— 会话用 `/model`
+     * 切到小窗口模型后阈值同样落到真实窗口之外。想临时指定窗口可用 `contextWindowTokens` 覆盖。
      */
     autoCompactThresholdPct?: number
     /** 给摘要生成预留的 tokens（默认 30000，参考 Claude Code 的 20K max output + 13K buffer） */
@@ -1805,11 +1806,16 @@ const COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['prune', 'summary', 
  * 各写一份、会话压缩干脆硬编码 200000，于是同一份 config 能同时得出 200000 和 102400
  * 两个窗口 —— 按概览做的判断全部落空，会话压缩则因阈值 136000 > 真实窗口而从不触发。
  * 默认 provider 的 id 可能省略（由 model 派生），故同样走 normalizeProviderConfigs。
+ *
+ * 各级都要求窗口是**能当分母的正有限数**（见 isUsableWindow）：`contextWindowTokens: 0` 这种
+ * 笔误若原样当选，占用率会算出 Infinity、阈值会算成负数 —— 两个都伪装成"正常显示"。
  */
 export function resolveContextWindowTokens(cfg: HarnessConfig, defaultProviderId: string): number {
   const { providers } = normalizeProviderConfigs(cfg.providers ?? [])
-  const defaultPc = providers.find((p) => p.id === defaultProviderId)
-  return cfg.compression?.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000
+  const explicit = cfg.compression?.modelContextLimit
+  if (isUsableWindow(explicit)) return explicit
+  const derived = providers.find((p) => p.id === defaultProviderId)?.contextWindowTokens
+  return isUsableWindow(derived) ? derived : 200_000
 }
 
 /**
@@ -1829,18 +1835,75 @@ export function resolveContextWindowTokens(cfg: HarnessConfig, defaultProviderId
  * `byModel` 对同名多实例取**最小**窗口：模型名相同而端点窗口不同时无从分辨到底走哪个，
  * 取最小 = 宁可早压。反方向（取最大）会让分母虚高，正是要避免的那个。
  */
-export function buildProviderWindowTable(cfg: HarnessConfig, defaultProviderId: string): ProviderWindowTable {
+export function buildProviderWindowTable(
+  cfg: HarnessConfig,
+  defaultProviderId: string,
+): ProviderWindowTable & { fallback: number } {
   const { providers } = normalizeProviderConfigs(cfg.providers ?? [])
   const byProvider: Record<string, number> = {}
   const byModel: Record<string, number> = {}
   for (const p of providers) {
     const w = p.contextWindowTokens
     // 窗口得是能当分母的正有限数；`0` / 负数 / `NaN` 只当"没配"（否则占用率会算出 Infinity/NaN）
-    if (typeof w !== 'number' || !Number.isFinite(w) || w <= 0) continue
+    if (!isUsableWindow(w)) continue
     byProvider[p.id] = w
     if (p.model) byModel[p.model] = Math.min(byModel[p.model] ?? Number.POSITIVE_INFINITY, w)
   }
   return { byProvider, byModel, fallback: resolveContextWindowTokens(cfg, defaultProviderId) }
+}
+
+/**
+ * 某个会话**实际**使用的端点（`providerId` / `modelId`）。
+ *
+ * 两者都可能缺：只绑了 Provider 没绑模型时 `modelId` 为空（用端点默认模型）；都没绑时两个都空
+ * —— 查表侧把空字段当"未指定"处理，落回默认 Provider 的窗口。
+ */
+export interface SessionEndpoint {
+  providerId?: string
+  modelId?: string
+}
+
+/** 窗口得是个能当分母的正有限数 —— `0` / 负数 / `NaN` 一律按「没配」处理（否则占用率会算出 Infinity/NaN） */
+function isUsableWindow(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v > 0
+}
+
+/**
+ * 按**本会话实际端点**解析上下文窗口 —— 会话压缩（compaction）全链的唯一入口：
+ * `/compact`、启动时的自动压缩判定、`/stats` 与 TUI 的占用率展示都从这里取分母。
+ *
+ * 优先级（与 ACP 侧 `resolveContextWindowTokens` / acp-context 的 `scopeFor` 保持同一把尺子）：
+ * `compaction.contextWindowTokens`（本段专用显式）→ `compression.modelContextLimit`（全局显式）
+ * → 按本会话端点查表（`byProvider` → `byModel`）→ 默认 Provider 的窗口 → 200000。
+ *
+ * 为什么窗口不能只有一个数：Provider / 模型是**按 Agent 解析、会话内还能用 `/model` 切换**的
+ * （core：`input.model?.providerId ?? agent.model?.providerId ?? 'default'`）。同一份 config 下
+ * 不同会话的窗口**本来就不一样** —— 拿默认 Provider 的窗口当分母，会让小窗口会话的阈值算到
+ * 自身窗口之外：真机形态（默认端点 300K、会话切到 hy3 200K）下阈值 = 95% × (300000 − 30000)
+ * = 256500 > 200000，**自动压缩永远不触发**，而且没有任何症状（工具照常报数，只是分母不是本会话的）。
+ *
+ * 显式值排在推导前面是刻意的：`compaction.contextWindowTokens` / `compression.modelContextLimit`
+ * 的文档语义就是"我不管端点是什么，就按这个数算"，排在后面等于让用户写了也不生效。
+ *
+ * `endpoint` 缺省（undefined）时逐位回到改造前的行为：查表落 `fallback`，而 fallback 就是
+ * 默认 Provider 的窗口 —— 这是「缺省零行为变更」的保证点。
+ */
+export function resolveCompactionWindow(
+  cfg: HarnessConfig,
+  defaultProviderId: string,
+  endpoint?: SessionEndpoint,
+): number {
+  const explicit = cfg.compaction?.contextWindowTokens ?? cfg.compression?.modelContextLimit
+  if (explicit !== undefined) return explicit
+  // 查表顺序与 acp-context 的 lookupProviderWindow 一致：实例维度（byProvider）最具体，先查。
+  // 刻意不复用那份实现：acp-context 连带 acp-kernel，为 6 行代码在 CLI 启动路径上加载整棵内核
+  // 不划算（同 lazyImport 的理由）。两者一致性由 cli.test.ts 的守卫用例对照钉住。
+  const table = buildProviderWindowTable(cfg, defaultProviderId)
+  const byProvider = endpoint?.providerId ? table.byProvider?.[endpoint.providerId] : undefined
+  if (isUsableWindow(byProvider)) return byProvider
+  const byModel = endpoint?.modelId ? table.byModel?.[endpoint.modelId] : undefined
+  if (isUsableWindow(byModel)) return byModel
+  return table.fallback
 }
 
 /** 校验 `config.json → compaction`：未知键 + `strategy` / `tokenCalibration` 非法取值 */
@@ -1863,11 +1926,21 @@ export function checkCompactionConfig(c: unknown): string[] {
   return out
 }
 
-/** 会话压缩的 `CompactOptions`：配置 → core 的入参。**窗口按统一优先级推导**（见 resolveContextWindowTokens） */
-export function buildCompactionOptions(cfg: HarnessConfig, defaultProviderId: string): CompactOptions {
+/**
+ * 会话压缩的 `CompactOptions`：配置 → core 的入参。
+ *
+ * 窗口**按会话实际端点解析**（见 {@link resolveCompactionWindow}），不是"一个全局数"：
+ * `endpoint` 传本会话的端点；缺省时逐位回到「默认 Provider 口径」。调用方一律应该传 ——
+ * 不传就等于把会话切过的模型/子 Agent 的端点一起忽略掉，分母错而无声。
+ */
+export function buildCompactionOptions(
+  cfg: HarnessConfig,
+  defaultProviderId: string,
+  endpoint?: SessionEndpoint,
+): CompactOptions {
   const k = cfg.compaction
   return {
-    contextWindowTokens: k?.contextWindowTokens ?? resolveContextWindowTokens(cfg, defaultProviderId),
+    contextWindowTokens: resolveCompactionWindow(cfg, defaultProviderId, endpoint),
     ...(k?.strategy != null ? { strategy: k.strategy } : {}),
     ...(k?.keepRecentMessages != null ? { keepRecentMessages: k.keepRecentMessages } : {}),
     ...(k?.summaryMaxChars != null ? { summaryMaxChars: k.summaryMaxChars } : {}),
@@ -1884,6 +1957,10 @@ export function buildCompactionOptions(cfg: HarnessConfig, defaultProviderId: st
  *
  * 这条必须由配置算出而不是靠人记住：窗口来自 Provider，阈值来自本段配置，两边任一改动
  * 都可能悄悄越过这条线。返回 undefined 表示可达。
+ *
+ * 口径是**默认 Provider 的窗口**（这里拿不到会话，只能做配置级检查）。会话实际按自身端点解析
+ * （见 {@link resolveCompactionWindow}），所以这条告警只保证「即使按默认口径也不可达」，
+ * 不保证反过来：默认端点可达、而会话切到更小窗口端点后依然不可达。
  */
 export function checkCompactionReachability(cfg: HarnessConfig, defaultProviderId: string): string | undefined {
   const opt = buildCompactionOptions(cfg, defaultProviderId)
@@ -2093,8 +2170,21 @@ export function buildConfigOverview(cfg: HarnessConfig, defaultProviderId: strin
     const reserved = opt.reservedTokens ?? 30_000
     const pct = opt.autoCompactThresholdPct ?? 80
     const threshold = Math.floor((window - reserved) * (pct / 100))
+    // 端点分化提示：providers 里窗口不一致时，"概览上这个窗口"只对**默认 Provider** 成立。
+    // 不写出来就会被读成"我的会话就是这个分母"——真机形态：默认端点 300K、会话切到 hy3（200K），
+    // 阈值按 300K 算成 256500 > 200000 ⇒ 概览看着一切正常，自动压缩却永不触发。
+    // 显式配了窗口（compaction / compression.modelContextLimit）就没有分化可言，不提示。
+    const winTable = buildProviderWindowTable(cfg, defaultProviderId)
+    const distinctWindows = new Set([
+      ...Object.values(winTable.byProvider ?? {}),
+      ...Object.values(winTable.byModel ?? {}),
+    ])
+    const endpointNote =
+      k?.contextWindowTokens === undefined && c?.modelContextLimit === undefined && distinctWindows.size > 1
+        ? '（默认 Provider 口径；各会话按自身端点解析）'
+        : ''
     lines.push(
-      `会话压缩（/compact）：窗口 ${window} · 阈值 ${threshold} tokens（${pct}% ×（窗口−${reserved}））· ` +
+      `会话压缩（/compact）：窗口 ${window}${endpointNote} · 阈值 ${threshold} tokens（${pct}% ×（窗口−${reserved}））· ` +
         `策略 ${opt.strategy ?? 'summary'} · 保留最近 ${opt.keepRecentMessages ?? 10} 条 · ` +
         `token 口径 ${opt.tokenCalibration === 'chars4' ? 'chars/4（旧）' : '自动（CJK 感知）'}`
         + (typeof c?.tokenCalibrationScale === 'number' && c.tokenCalibrationScale !== 1
@@ -2581,6 +2671,25 @@ export class HarnessApp {
       return ov.modelId
     }
     return this.getModel(session?.agentId ?? this.options.agentId)
+  }
+
+  /**
+   * 本会话**实际端点**（`providerId` / `modelId`）—— `resolveSessionModel` 的 id 版。
+   *
+   * 为什么另开一个而不是复用展示标签：标签是 `provider/model` 的合串（还可能带
+   * `/(provider 默认模型)` 这类文案），拿它去查窗口表只会永远 miss；这里给的是查表要的原始字段。
+   *
+   * 解析链与 core `_prepareQueryOnce` 严格一致（`input.model?.providerId ?? agent.model?.providerId`）：
+   * 会话级覆盖（`Session.meta.model`）> Agent 定义 model。**注意**：覆盖里只写了 modelId 时
+   * providerId 仍回落到 Agent 定义，与 core 同；两边都解析不出就返回空对象，由查表侧落
+   * fallback（= 默认 Provider 的窗口），与改造前逐位相同。
+   */
+  resolveSessionEndpoint(session: Pick<Session, 'agentId' | 'meta'> | undefined): SessionEndpoint {
+    const ov = getSessionModelOverride(session)
+    const a = this.harness?.agent?.get?.(session?.agentId ?? this.options.agentId)
+    const providerId = ov?.providerId ?? a?.model?.providerId
+    const modelId = ov?.modelId ?? a?.model?.modelId
+    return { ...(providerId ? { providerId } : {}), ...(modelId ? { modelId } : {}) }
   }
 
   /** 当前会话的模型覆盖（undefined = 未覆盖，跟随 Agent 定义与全局默认） */
@@ -3843,32 +3952,55 @@ export async function renderChildAgentRollup(harness: Harness, sessionId: string
  * - 窗口 / 阈值 / 保留 / 口径一律取 `/compact` 同一套推导（`buildCompactionOptions`），
  *   避免同一份 config 又算出两个窗口（历史教训：三处各算一次 ⇒ 阈值判据失效）；
  * - 占用 token 用 `session.estimateTokens`（与会话压缩同口径，含 CJK 感知）；
- * - 子会话占用逐行列出（父 `/stats` 之前完全看不到子会话的上下文压力）。
+ * - 子会话占用逐行列出，且**分母各自解析**（见下方 resolveWindow）—— 子 Agent 常被派到
+ *   另一个窗口的端点上，沿用父会话的分母会让小窗口子会话的占用率虚低（"报 40% 其实已满"）。
  */
 export async function renderContextOccupancy(
   harness: Harness,
   session: Session,
   compactOpts: CompactOptions,
+  /**
+   * 「会话 → 该会话**实际**该用的窗口」，走 {@link resolveCompactionWindow}。
+   * 不传 = 全部用 `compactOpts.contextWindowTokens`（= 改造前行为）：拿不到 config / Provider
+   * 注册表的宿主（如测试替身）走这条路，行为不变。
+   */
+  resolveWindow?: (session: Session | undefined) => number,
 ): Promise<string> {
-  const window = compactOpts.contextWindowTokens ?? 200_000
   const reserved = compactOpts.reservedTokens ?? 30_000
   const pct = compactOpts.autoCompactThresholdPct ?? 80
-  const threshold = Math.floor((window - reserved) * (pct / 100))
   const calibration = compactOpts.tokenCalibration
-  const pct1 = (n: number) => (window > 0 ? (n / window) * 100 : 0).toFixed(1)
+  const pctOf = (n: number, w: number) => (w > 0 ? (n / w) * 100 : 0).toFixed(1)
+  /**
+   * 回源取最新一份会话：调用方（尤其 TUI）手里那个对象可能是**调用时的快照**，
+   * 而 `/model` 切过后窗口就变了。取不到（测试替身没有 session.get / 会话已删）就用手上这份。
+   */
+  const liveSession = async (fallback: Session | undefined, id: string): Promise<Session | undefined> => {
+    const get = (harness as { session?: { get?: (id: string) => Promise<Session | undefined> } }).session?.get
+    if (!get) return fallback
+    try { return (await get.call(harness.session, id)) ?? fallback } catch { return fallback }
+  }
+  const window = resolveWindow
+    ? resolveWindow(await liveSession(session, session.id))
+    : (compactOpts.contextWindowTokens ?? 200_000)
+  const threshold = Math.floor((window - reserved) * (pct / 100))
 
   const est = await harness.session.estimateTokens(session.id, calibration).catch(() => 0)
   const lines = [
-    `上下文占用：${est.toLocaleString()} / ${window.toLocaleString()} tokens（${pct1(est)}%）` +
+    `上下文占用：${est.toLocaleString()} / ${window.toLocaleString()} tokens（${pctOf(est, window)}%）` +
       ` · 自动压缩阈值 ${threshold.toLocaleString()}（${pct}% ×（窗口−保留 ${reserved.toLocaleString()}））`,
   ]
-  // 子 agent 上下文：每个子会话单独一行（同窗口近似；子会话量小则不可见 —— 有值才列）
+  // 子 agent 上下文：每个子会话单独一行（分母按该子会话自身端点解析 —— 解析不出才回落父会话的窗口；
+  // 子会话量小则不可见 —— 有值才列）
   const usageApi = (harness as { usage?: Harness['usage'] }).usage
   if (usageApi) {
     const ids = await usageApi.children(session.id).catch(() => [] as string[])
     for (const id of ids) {
       const childEst = await harness.session.estimateTokens(id, calibration).catch(() => 0)
-      if (childEst > 0) lines.push(`  子会话 ${id}：占用 ${childEst.toLocaleString()} / ${window.toLocaleString()} tokens（${pct1(childEst)}%）`)
+      if (childEst <= 0) continue
+      const childWindow = resolveWindow ? resolveWindow(await liveSession(undefined, id)) : window
+      lines.push(
+        `  子会话 ${id}：占用 ${childEst.toLocaleString()} / ${childWindow.toLocaleString()} tokens（${pctOf(childEst, childWindow)}%）`,
+      )
     }
   }
   return lines.join('\n') + '\n'
@@ -4295,11 +4427,15 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         }
         case '/compact': {
           const curSessionId = current.id
-          // 会话压缩参数统一取自 config.json → compaction（窗口按 Provider 推导）。
+          // 会话压缩参数统一取自 config.json → compaction（窗口按**本会话实际端点**推导）。
           // 此前 core 内硬编码 200000，小窗口模型（如 102400）的阈值算成 136000 > 窗口本身，
           // 于是「配了却在正常会话下永远不触发」，且跳过的提示里也没有任何线索。
+          //
+          // `current` 是调用方手里的会话快照，而 `/model` 切过模型后窗口就变了 —— 回源取最新一份，
+          // 否则会按"切之前的模型"算阈值（300K 端点上切到 200K 模型 ⇒ 阈值 256500 > 200000）。
+          const curSess = (await harness.session.get(curSessionId)) ?? current
           const cfg = await app.configStore.load()
-          const compactOpts = buildCompactionOptions(cfg, cfg.provider ?? 'anthropic')
+          const compactOpts = buildCompactionOptions(cfg, cfg.provider ?? 'anthropic', app.resolveSessionEndpoint(curSess))
           if (arg === 'auto' || arg === 'ifneeded') {
             const did = await harness.session.compactIfNeeded(curSessionId, compactOpts)
             const info = await harness.session.getCompactionInfo(curSessionId)
@@ -4330,8 +4466,12 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           out(await renderChildAgentRollup(harness, current.id))
           // 上下文占用区：窗口/阈值取 /compact 同一套推导；子会话占用逐行列（无值不占版面）
           const statsCfg = await app.configStore.load()
-          const statsCompactOpts = buildCompactionOptions(statsCfg, statsCfg.provider ?? 'anthropic')
-          out(await renderContextOccupancy(harness, current, statsCompactOpts))
+          const statsProvider = statsCfg.provider ?? 'anthropic'
+          const statsCompactOpts = buildCompactionOptions(statsCfg, statsProvider)
+          // 本会话与各子会话的分母**各自**按自身端点解析：子 Agent 常被派到另一个窗口的端点上，
+          // 沿用父会话的分母会让小窗口子会话的占用率虚低（"报 40% 其实已满"）。
+          out(await renderContextOccupancy(harness, current, statsCompactOpts, (s) =>
+            resolveCompactionWindow(statsCfg, statsProvider, app.resolveSessionEndpoint(s))))
           out(`\n${todayUsageLine(t)}（全部会话·当日）\n`)
           return 'continue'
         }
@@ -5122,9 +5262,10 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
 
     // repl / resume / start → REPL（--tui 时进入 alt-screen 全屏 TUI）
     {
-      // 窗口按统一优先级推导后显式传入（此前走 core 内的硬编码 200000，
-      // providers 写 102400 时阈值 136000 > 窗口 ⇒ 这次判定恒为 false）
-      const did = await harness.session.compactIfNeeded(session.id, buildCompactionOptions(cfg, provider))
+      // 窗口按本会话**实际端点**推导后显式传入（此前走 core 内的硬编码 200000，
+      // providers 写 102400 时阈值 136000 > 窗口 ⇒ 这次判定恒为 false；
+      // 会话切过模型时同理：分母得是它自己的窗口，不是默认 Provider 的）
+      const did = await harness.session.compactIfNeeded(session.id, buildCompactionOptions(cfg, provider, app.resolveSessionEndpoint(session)))
       if (did) {
         const info = await harness.session.getCompactionInfo(session.id)
         write(`[会话] 自动压缩：策略=${info.meta?.lastStrategy}，前=${info.meta?.lastMessagesBefore} 后=${info.meta?.lastMessagesAfter}\n`)

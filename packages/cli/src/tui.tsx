@@ -36,7 +36,7 @@ import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
-import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, renderContextOccupancy, formatToolInput, formatToolResult, TOOL_CONT_MARK } from './index'
+import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, resolveCompactionWindow, renderContextOccupancy, formatToolInput, formatToolResult, TOOL_CONT_MARK } from './index'
 import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
@@ -1258,10 +1258,18 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [sidebarTab, setSidebarTab] = useState<SidebarTabId>('context')
   // 统计面板「上下文占用」：窗口/阈值取与 /compact、/stats 同一套推导（config 加载一次即可）
   const [ctxOccOpts, setCtxOccOpts] = useState<CompactOptions | undefined>(undefined)
+  // 分母**按会话端点解析**（本会话 + 各子会话各自一份）。闭包只捕获 config，会话对象在渲染时
+  // 由 renderContextOccupancy 回源取最新一份 —— 因此会话内 /model 切模型不必重建这个闭包。
+  const [ctxWindowFor, setCtxWindowFor] = useState<((s: Session | undefined) => number) | undefined>(undefined)
   useEffect(() => {
     options.app.configStore
       .load()
-      .then((cfg) => setCtxOccOpts(buildCompactionOptions(cfg, cfg.provider ?? 'anthropic')))
+      .then((cfg) => {
+        const def = cfg.provider ?? 'anthropic'
+        setCtxOccOpts(buildCompactionOptions(cfg, def))
+        setCtxWindowFor(() => (s: Session | undefined) =>
+          resolveCompactionWindow(cfg, def, options.app.resolveSessionEndpoint(s)))
+      })
       .catch(() => {})
   }, [options.app])
   // 运行中强制终止（点击「■ 终止」按钮 / Ctrl-C 共用）：abort 当前查询，已完成的步骤保留
@@ -2429,7 +2437,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                     </>
                   )}
                   {/* 上下文占用（本会话 + 子会话）：与 /stats、/compact 同一套窗口/阈值推导 */}
-                  <ContextOccupancyLine harness={options.harness} sessionId={options.session.id} compactOpts={ctxOccOpts} />
+                  <ContextOccupancyLine harness={options.harness} sessionId={options.session.id} compactOpts={ctxOccOpts} resolveWindow={ctxWindowFor} />
                   <text attributes={createTextAttributes({ dim: true })} wrapMode="word">── /stats 详情 · /stats-export 报告 ──</text>
                 </>
               )}
@@ -2618,22 +2626,29 @@ export function buildEditorCommand(path: string, line?: number, base?: string): 
 
 /**
  * 统计面板「上下文占用」行：本会话 + 各子会话占用率（复用 /stats 的 renderContextOccupancy，
- * 窗口/阈值取 buildCompactionOptions 同一套推导）。每 3s 刷新一次（执行中占用会变化）。
+ * 窗口/阈值取 buildCompactionOptions 同一套推导，分母则按各会话自身端点解析）。每 3s 刷新一次
+ * （执行中占用会变化）。
  */
-function ContextOccupancyLine(props: { harness: Harness; sessionId: string; compactOpts?: CompactOptions }) {
+function ContextOccupancyLine(props: {
+  harness: Harness
+  sessionId: string
+  compactOpts?: CompactOptions
+  /** 会话 → 该会话实际该用的窗口（见 resolveCompactionWindow）；不传则退回单一窗口 */
+  resolveWindow?: (s: Session | undefined) => number
+}) {
   const [text, setText] = useState('')
   useEffect(() => {
     if (!props.compactOpts) return
     let alive = true
     const refresh = () => {
-      renderContextOccupancy(props.harness, { id: props.sessionId } as never, props.compactOpts!)
+      renderContextOccupancy(props.harness, { id: props.sessionId } as never, props.compactOpts!, props.resolveWindow)
         .then((t) => { if (alive) setText(t.trim()) })
         .catch(() => {})
     }
     refresh()
     const iv = setInterval(refresh, 3000)
     return () => { alive = false; clearInterval(iv) }
-  }, [props.compactOpts, props.sessionId])
+  }, [props.compactOpts, props.sessionId, props.resolveWindow])
   if (!text) return null
   return <text attributes={createTextAttributes({ dim: true })} wrapMode="word">{text}</text>
 }
