@@ -1104,11 +1104,29 @@ export function createSubagentTool(
           const title = input.description
             ?? (input.prompt.length > 60 ? input.prompt.slice(0, 60) + '...' : input.prompt)
           const wcwd = await worktree?.resolve(undefined)
+          // 派工时的模型覆盖**落到子会话记录里**（key 与 @harness/session 的
+          // `SESSION_MODEL_META_KEY` / `getSessionModelOverride` 同一约定）。
+          //
+          // 为什么必须记：这个覆盖此前只作为 `agent.query({ model })` 的入参传一次，会话上不留痕
+          // ⇒ 事后任何"这个子会话跑的是哪个端点"的推断都只能退回默认 Provider。窗口是跟着端点走的，
+          // 于是小窗口子会话被按宽窗口算：占用率**虚低**、压缩不触发，全程没有症状
+          // （reporter：真机形态 300K → 200K，报 66% 时其实已 100%）。
+          // 记下来之后，占用率展示 / 会话压缩 / 事后审计都能拿到它自己的分母。
+          // 只在显式传了 model 时才写；不传 = 跟随子 Agent 定义与默认端点，不制造多余的覆盖。
+          const modelMeta = input.model?.providerId ?? input.model?.modelId
+            ? {
+                model: {
+                  ...(input.model.providerId ? { providerId: input.model.providerId } : {}),
+                  ...(input.model.modelId ? { modelId: input.model.modelId } : {}),
+                },
+              }
+            : {}
+          const meta = { ...(wcwd ? { worktreeDir: wcwd } : {}), ...modelMeta }
           const subSession = await session.create({
             title,
             parentId: ctx.sessionId,
             cwd: wcwd,
-            meta: wcwd ? { worktreeDir: wcwd } : undefined,
+            meta: Object.keys(meta).length ? meta : undefined,
           })
           subSessionId = subSession.id
         } catch (err) {

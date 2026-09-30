@@ -27,7 +27,7 @@ import { createBus } from '@harness/bus'
 import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
 import type { AgentDefinition } from '@harness/agent'
 import type { AgentRuntime, AgentStreamEvent } from '@harness/core'
-import type { SessionManager, Session, Message } from '@harness/session'
+import { getSessionModelOverride, type SessionManager, type Session, type Message } from '@harness/session'
 import type { ToolContext, ToolResult } from '@harness/tool'
 import { partitionToolCalls, type ToolUse } from '@harness/tool'
 
@@ -449,6 +449,39 @@ describe('SubagentTool', () => {
     expect(res.ok).toBe(true)
     const created = sessions.get(res.output!.sessionId)
     expect(created?.parentId).toBe('parent-session-123')
+  })
+
+  it('派工时的 model 覆盖落进子会话 meta.model（否则事后推不出它跑的是哪个端点）', async () => {
+    // 为什么必须记：窗口跟着端点走，而"这个子会话跑哪个端点"此前只活在一次 query 入参里。
+    // 落进 Session.meta.model 之后，占用率展示 / 会话压缩 / 事后审计才能拿到它自己的分母
+    // ——否则一律退回默认 Provider，小窗口子会话的占用率虚低、压缩不触发且毫无症状。
+    const sessions = new Map<string, Session>()
+    const agent = createMockAgentRuntime([coderAgent], async (input) => {
+      const s = sessions.get(input.sessionId)
+      if (s) { s.messages.push(makeMessage('assistant', 'done')) }
+      return makeMessage('assistant', 'done')
+    })
+    const session = createMockSessionManager(sessions)
+    const tool = createSubagentTool(() => ({ agent, session }), 5000, false)
+
+    const withModel = await tool.call(
+      { agentId: 'coder', prompt: 'test', model: { providerId: 'small', modelId: 'hy3' } },
+      makeToolContext(),
+    )
+    expect(withModel.ok).toBe(true)
+    expect(getSessionModelOverride(sessions.get(withModel.output!.sessionId)))
+      .toEqual({ providerId: 'small', modelId: 'hy3' })
+
+    // 只给 modelId 也照记（providerId 留空 = 跟随子 Agent 定义，不替它编一个）
+    const onlyModel = await tool.call(
+      { agentId: 'coder', prompt: 'test', model: { modelId: 'hy3' } },
+      makeToolContext(),
+    )
+    expect(getSessionModelOverride(sessions.get(onlyModel.output!.sessionId))).toEqual({ modelId: 'hy3' })
+
+    // 没传覆盖 ⇒ 不写任何 model 键（不制造多余的会话级覆盖）
+    const plain = await tool.call({ agentId: 'coder', prompt: 'test' }, makeToolContext())
+    expect(sessions.get(plain.output!.sessionId)?.meta?.model).toBeUndefined()
   })
 
   it('renderUse 包含 description/model/sessionId', () => {
