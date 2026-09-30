@@ -42,6 +42,7 @@ import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
 import { subagentCapability } from '@harness/subagent'
+import { detectKeyboardProtocol, shiftEnterHelpLine } from './keyboard'
 import {
   emptyUsage,
   recordCall,
@@ -118,9 +119,11 @@ const MAX_FILE_REFS = 8
 // ------------------------------------------------------------------------
 // 模块 D：帮助面板内容（Ctrl-/ 或 ? 弹出；/help 查看命令列表并在 REPL 层列出）
 // ------------------------------------------------------------------------
+/** 终端键盘协议能力（模块级探测一次：CLI 是单进程单终端，env 不会中途变） */
+const keyboardSupport = detectKeyboardProtocol()
+
 /** 帮助面板行：{ key: 键位, desc: 说明 } */
-export const HELP_LINES: Array<{ key: string; desc: string }> = [
-  { key: 'Ctrl-C', desc: '退出 TUI' },
+export const HELP_LINES: Array<{ key: string; desc: string }> = [  { key: 'Ctrl-C', desc: '退出 TUI' },
   { key: 'Ctrl-B', desc: '切换右侧面板' },
   { key: 'Ctrl-/ 或 ?', desc: '打开/关闭帮助面板' },
   { key: 'Ctrl-Y', desc: '复制鼠标选中的文字；无选区则复制最近回复' },
@@ -129,6 +132,7 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [
   { key: '◀ / ▶', desc: '侧栏模块切换（输入为空时）' },
   { key: 'Enter', desc: '提交输入；列表/菜单中确认选中' },
   { key: '\\ + Enter', desc: '输入框内换行（最可靠：行尾打反斜杠再回车，不依赖终端修饰键）' },
+  // Shift+Enter 行的 desc 渲染时按终端能力分级（见下方 helpLines），这里保留兜底文案占位
   { key: 'Shift+Enter', desc: '输入框内换行（需终端上报 Shift，如 Kitty 键盘协议）' },
   { key: 'Ctrl+J', desc: '提交输入（同 Enter；兼容把 Enter 上报为 LF 的终端）' },
   { key: 'Esc', desc: '关闭菜单或帮助' },
@@ -2456,7 +2460,9 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                 <box width={20}>
                   <text attributes={createTextAttributes({ dim: true })}>{l.key}</text>
                 </box>
-                <text attributes={createTextAttributes({ dim: true })} wrapMode="word">{l.desc}</text>
+                <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                  {l.key === 'Shift+Enter' ? shiftEnterHelpLine(keyboardSupport) : l.desc}
+                </text>
               </box>
             ))}
           </box>
@@ -2664,7 +2670,13 @@ function ContextOccupancyLine(props: {
  */
 export async function startTuiRepl(options: TuiReplOptions): Promise<TuiReplExit> {
   // useMouse：启用 SGR 鼠标协议，支持消息复制按钮点击
-  const renderer: CliRenderer = await createCliRenderer({ useMouse: true })
+  // useKittyKeyboard：显式声明开启 Kitty 键盘协议（disambiguate 修 ESC 歧义 + alternateKeys 跨键盘布局）。
+  // 2026-09-30 起不再依赖 OpenTUI 的默认值（升级改默认时这里是唯一保险）；
+  // 不支持的终端忽略未知 CSI 自然降级 legacy，能力探测与帮助文案见 keyboard.ts。
+  const renderer: CliRenderer = await createCliRenderer({
+    useMouse: true,
+    useKittyKeyboard: { disambiguate: true, alternateKeys: true },
+  })
   const root = createRoot(renderer)
   // 未显式提供 openFile 时，用本机编辑器在前台打开文件引用。
   // 关键：先 suspend() 释放终端 raw-mode 并退出 alt-screen，前台 spawn inherit 运行
