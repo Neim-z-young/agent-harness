@@ -96,6 +96,12 @@ export interface PermissionRequest {
   input: unknown
   /** 请求来源（如 agentId / pluginId） */
   from?: string
+  /**
+   * 仅参与 **deny** 判定的附加 pattern（可选，如 bash 的段级命令）。
+   * allow/ask 是任一 pattern 命中即生效，混入段级 pattern 会放宽它们；
+   * deny 是任一命中即拒绝 —— 本字段只进 deny 判定，只收紧不放宽。
+   */
+  denyPatterns?: string[]
 }
 
 // ===== PermissionEngine 接口 =====

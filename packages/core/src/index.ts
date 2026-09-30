@@ -446,7 +446,7 @@ export class DefaultPermissionEngine implements PermissionEngine {
   }
 
   async check(req: PermRequest): Promise<PermDecision> {
-    const { toolKey, patterns } = req
+    const { toolKey, patterns, denyPatterns } = req
     const toolRule = this.rules[toolKey]
     const globalRule = this.rules['*']
 
@@ -455,15 +455,24 @@ export class DefaultPermissionEngine implements PermissionEngine {
     let matched: PermDecision['matchedRule'] | undefined
     let matchedPattern: string | undefined
 
+    // deny 判定的目标 pattern：常规 patterns + denyPatterns（仅收紧不放宽 —— 见
+    // PermissionRequest.denyPatterns：allow/ask 是任一命中即生效，绝不能把段级
+    // pattern 混进 patterns，否则 `echo hi; rm -rf /` 会被 `echo*` 的 allow 放走）
+    const denyTargets = denyPatterns?.length ? [...patterns, ...denyPatterns] : patterns
+
     const applyPathRule = (pr: { allow?: string[]; deny?: string[]; ask?: string[] }) => {
-      for (const pat of patterns) {
-        if (pr.allow?.some((p) => defaultGlob(p, pat))) {
-          behavior = 'allow'; matched = 'glob'; matchedPattern = pat; return true
+      // deny 先于 allow（2026-09-30 调整）：deny 的语义是"命中即不可执行"，若 allow 先判，
+      // 全串级 allow 规则会短路 deny —— `allow: ['src/**']` + `deny: ['src/secrets/**']`
+      // 会让 secrets 被放走，denyPatterns（bash 段级命令）更会被整串 allow 完全架空。
+      // 收紧方向的判定先行，fail-closed。
+      for (const pat of denyTargets) {
+        if (pr.deny?.some((p) => defaultGlob(p, pat))) {
+          behavior = 'deny'; matched = 'glob'; matchedPattern = pat; return true
         }
       }
       for (const pat of patterns) {
-        if (pr.deny?.some((p) => defaultGlob(p, pat))) {
-          behavior = 'deny'; matched = 'glob'; matchedPattern = pat; return true
+        if (pr.allow?.some((p) => defaultGlob(p, pat))) {
+          behavior = 'allow'; matched = 'glob'; matchedPattern = pat; return true
         }
       }
       for (const pat of patterns) {

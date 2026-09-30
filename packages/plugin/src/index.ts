@@ -300,6 +300,8 @@ export interface PermissionRequestLike {
   patterns: string[]
   input: unknown
   from?: string
+  /** 仅参与 deny 判定的附加 pattern（可选；见 @harness/permission PermissionRequest.denyPatterns） */
+  denyPatterns?: string[]
 }
 
 export interface PermissionDecisionLike {

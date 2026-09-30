@@ -510,6 +510,16 @@ export interface PermissionRequest {
   patterns: string[]
   /** 原始输入 */
   input: unknown
+  /**
+   * 仅参与 **deny** 判定的附加 pattern（可选）。
+   *
+   * 为什么不让工具直接把它们混进 `patterns`：权限引擎的 allow / ask 是**任一 pattern
+   * 命中即生效**（任一命中 allow ⇒ 整条放行）—— 把 bash 的段级命令混进 patterns 会
+   * 放宽 allow（`echo hi; rm -rf /` 被 `echo*` 的 allow 规则整条放走）。deny 是任一
+   * 命中即拒绝，收紧无害：bash 用它上报段级命令，让 `deny: ['rm*']` 能拦住
+   * `echo hi; rm -rf /` 这类「恶意段藏在全串中」的形态。
+   */
+  denyPatterns?: string[]
 }
 
 /** 权限决策（由 PermissionEngine 返回） */
@@ -625,6 +635,8 @@ export interface Tool<Input = any, Output = any, Progress = any> {
     key: string
     /** 提取需要权限的路径或命令模板 */
     extractPatterns: (input: Input) => string[]
+    /** 提取仅参与 deny 判定的附加模式（可选；见 PermissionRequest.denyPatterns） */
+    extractDenyPatterns?: (input: Input) => string[]
   }
 
   // === 执行入口 ===
@@ -1320,6 +1332,7 @@ export class ToolPipeline {
           toolKey: tool.permission.key,
           patterns: tool.permission.extractPatterns(input as any),
           input,
+          denyPatterns: tool.permission.extractDenyPatterns?.(input as any),
         }
         const decision = await Promise.resolve(this.checkPermission(permReq))
         // 允许插件通过 updatedInput 重写输入（Claude Code 风格）
