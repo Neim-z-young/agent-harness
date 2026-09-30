@@ -258,12 +258,22 @@ export interface AcpScopeSection {
   preserveRecentTokens?: number
   /** 块"存活次数"达该值才升层 */
   promotionThreshold?: number
-  /** t1/t2/t3 各层压缩触发阈值 */
+  /**
+ * t1/t2/t3 各层压缩触发阈值。
+ * **只收这两个键** —— 内核 `TierConfig` 的 `enabled` 等其余字段写进 `config.tiers`
+ * （结构化口只暴露常用键，避免同一个东西两套写法）。
+ */
   tiers?: {
     tier2Trigger?: number
     tier3Trigger?: number
   }
-  /** 上下文压力档位（nudge 触发阈值） */
+  /**
+ * 上下文压力档位（nudge 触发阈值）。
+ * **只收这三个占用率百分比键** —— 内核 `NudgeConfig` 的其余 10 个字段（`growthFloor` /
+ * `growthCap` / `growthRatio` / `minGrowthFloor` / `minGrowthRatio` / `frequency` / `force` /
+ * `iterationThreshold` / `tier2GrowthMultiplier` / `minPressureBenefitTokens`）写进
+ * `config.nudge`。写在 `nudge` 里会被校验器抓出，告警会直接指明该写到哪。
+ */
   nudge?: {
     maxContextLimitPct?: number
     minContextLimitPct?: number
@@ -440,14 +450,24 @@ export interface HarnessConfig {
     preserveRecentTokens?: number
     /** 块"存活次数"达该值才升层（promotionThreshold，kernel 默认 5；设极大如 1e9 可选为不升层） */
     promotionThreshold?: number
-    /** t1/t2/t3 各层压缩触发阈值 */
+    /**
+ * t1/t2/t3 各层压缩触发阈值。
+ * **只收这两个键** —— 内核 `TierConfig` 的 `enabled` 等其余字段写进 `config.tiers`
+ * （结构化口只暴露常用键，避免同一个东西两套写法）。
+ */
     tiers?: {
       /** 活跃 t1 块数达到该值才把部分 t1 蒸馏为 t2（默认 5） */
       tier2Trigger?: number
       /** 活跃 t2 块数达到该值才把部分 t2 压缩为 t3（默认 10） */
       tier3Trigger?: number
     }
-    /** 上下文压力档位（nudge 触发阈值） */
+    /**
+ * 上下文压力档位（nudge 触发阈值）。
+ * **只收这三个占用率百分比键** —— 内核 `NudgeConfig` 的其余 10 个字段（`growthFloor` /
+ * `growthCap` / `growthRatio` / `minGrowthFloor` / `minGrowthRatio` / `frequency` / `force` /
+ * `iterationThreshold` / `tier2GrowthMultiplier` / `minPressureBenefitTokens`）写进
+ * `config.nudge`。写在 `nudge` 里会被校验器抓出，告警会直接指明该写到哪。
+ */
     nudge?: {
       /** 触发"效率型"压缩提醒的上下文占用下限（默认 0.2 = 20%） */
       maxContextLimitPct?: number
@@ -1519,6 +1539,41 @@ const COMPRESSION_SCOPE_KEYS: Record<keyof AcpScopeSection, true> = {
 }
 
 /**
+ * 校验一棵**子树的结构化口**（`.tiers` / `.nudge`；顶层与档位共用），并为"写错了口"指路。
+ *
+ * 本仓的压缩配置有**两条**通往同一棵内核子树的写法：结构化口（`nudge` / `tiers`）与透传口
+ * （`config.nudge` / `config.tiers`）。前者刻意只收少数常用键，内核字段的其余部分必须写后者 ——
+ * 但两个口名字相邻，文档正文里参数又统一记作 `nudge.growthFloor`（那是**字段名**，不是可写路径），
+ * 于是"把内核字段写进结构化口"成了最容易踩的错法（真机反馈正是
+ * `compression.subagent.nudge.growthFloor`）。
+ *
+ * 只说"未被识别"帮助有限：那个字段确实是内核的、也确实有地方能写 —— 用户只知道"没生效"，
+ * 不知道"该搬到哪"。故这里把**能生效的那条路径**直接写进告警。
+ * 拼错的键（如 `growthFloar`）不匹配内核字段名 ⇒ 维持朴素文案，不会被指到错误的路上去。
+ */
+function checkSubtreeUnknown(
+  obj: unknown,
+  allowed: readonly string[],
+  kernel: readonly string[],
+  path: string,
+  escapePrefix: string,
+  push: (paths: string[], tail: string) => void,
+): void {
+  if (!isPlainObject(obj)) return
+  const ok = new Set(allowed)
+  const isKernelKey = new Set(kernel)
+  for (const k of Object.keys(obj)) {
+    if (ok.has(k)) continue
+    push(
+      [`${path}.${k}`],
+      isKernelKey.has(k)
+        ? `未被识别（${path} 结构化口只收 ${allowed.join(' / ')}）—— 该键是内核字段，请写到 ${escapePrefix}.${k} 才生效`
+        : '未被识别，该配置不会生效',
+    )
+  }
+}
+
+/**
  * 校验一个作用域档位段（`compression.subagent` / `compression.perAgent[*]`）。
  *
  * 与顶层走**同一套**校验：只查顶层会让"顶层写错会告警、档位里写错静默"成为新的静默失效面，
@@ -1537,8 +1592,23 @@ function checkCompressionScope(
       `取值 ${JSON.stringify(scope.manualInjection)} 未知（可选：on-demand / always / off），已按 on-demand 处理`,
     )
   }
-  push(collectUnknown(scope.tiers, Object.keys(COMPRESSION_TIER_KEYS), `${path}.tiers`), '未被识别，该配置不会生效')
-  push(collectUnknown(scope.nudge, Object.keys(COMPRESSION_NUDGE_KEYS), `${path}.nudge`), '未被识别，该配置不会生效')
+  // 子树结构化口：只收少数常用键，其余内核字段要写 `config.*` —— 走带"指路"的校验
+  checkSubtreeUnknown(
+    scope.tiers,
+    Object.keys(COMPRESSION_TIER_KEYS),
+    Object.keys(KERNEL_TIER_KEYS),
+    `${path}.tiers`,
+    `compression${path}.config.tiers`,
+    push,
+  )
+  checkSubtreeUnknown(
+    scope.nudge,
+    Object.keys(COMPRESSION_NUDGE_KEYS),
+    Object.keys(KERNEL_NUDGE_KEYS),
+    `${path}.nudge`,
+    `compression${path}.config.nudge`,
+    push,
+  )
   if (isPlainObject(scope.config)) {
     push(collectUnknown(scope.config, Object.keys(KERNEL_CONFIG_KEYS), `${path}.config`), '内核 Config 无此字段，该配置不会生效')
     push(collectUnknown(scope.config.tiers, Object.keys(KERNEL_TIER_KEYS), `${path}.config.tiers`), '内核 TierConfig 无此字段，该配置不会生效')
@@ -1550,35 +1620,58 @@ function checkCompressionScope(
 }
 
 /**
- * 把 `compression.subagent` / `compression.perAgent[*]` 段翻成 ACP 插件选项的形状。
+ * 结构化口 → 内核 loose config 的**共用翻译**：顶层 `compression` 与档位段走同一份。
  *
- * 与顶层**同一套翻译**（结构化字段落进 `config`，`config` 透传铺在最下层、显式字段压在它上面）——
- * 否则顶层用 `preserveRecentTokens`、档位里得写 `config.preserveRecentTokens`，两处语法不一致，
- * 而这种“同一个东西两套写法”正是“配了却不生效”的温床。
+ * 为什么必须共用：此前顶层（boot 内联）与档位各写一份，两处一旦漂移就是"顶层这么写生效、
+ * 档位那样写不生效" —— 本仓最典型的"配了却不生效"。合成一处后漂移无处可生。
  *
- * 返回 `undefined` 表示“该段未配置” ⇒ 调用方不传该选项，插件侧不叠加（缺省零行为变更）。
+ * **子树的合并语义**：`config.tiers` / `config.nudge` 与结构化口 `tiers` / `nudge` 会同时
+ * 描述同一棵子树（文档 §6 的推荐用法正是"结构化口写常用的几个 + `config.*` 补其余"），
+ * 故按**深合并**处理、结构化口压在上面。曾经是整体替换（`out.nudge = {三个 pct 键}`），
+ * 于是 `config: { nudge: { growthFloor: 75000 } }` 遇上 `nudge: { maxContextLimitPct: 0.65 }`
+ * 会把 `growthFloor` **静默丢掉** —— 两个键都在"已配置"清单里，却只有一个活着。
  */
-function toAcpScope(section: AcpScopeSection | undefined): Record<string, unknown> | undefined {
-  if (!section) return undefined
-  const out: Record<string, unknown> = {
-    ...(section.config ?? {}),
-    ...(section.preserveRecentMessages != null ? { preserveRecentMessages: section.preserveRecentMessages } : {}),
-    ...(section.preserveRecentTokens != null ? { preserveRecentTokens: section.preserveRecentTokens } : {}),
-    ...(section.promotionThreshold != null ? { promotionThreshold: section.promotionThreshold } : {}),
-  }
+export function toAcpConfig(section: AcpScopeSection): Record<string, unknown> {
+  // `config` 铺在最下层（高级透传），显式结构化字段压在它上面
+  const out: Record<string, unknown> = { ...(section.config ?? {}) }
+  /** 同名透传子树（若有）—— 结构化口要合并在它**之上**，而不是把它整个replace掉 */
+  const carried = (key: string): Record<string, unknown> =>
+    isPlainObject(out[key]) ? (out[key] as Record<string, unknown>) : {}
+  if (section.preserveRecentMessages != null) out.preserveRecentMessages = section.preserveRecentMessages
+  if (section.preserveRecentTokens != null) out.preserveRecentTokens = section.preserveRecentTokens
+  if (section.promotionThreshold != null) out.promotionThreshold = section.promotionThreshold
   if (section.tiers) {
     out.tiers = {
+      ...carried('tiers'),
       ...(section.tiers.tier2Trigger != null ? { tier2Trigger: section.tiers.tier2Trigger } : {}),
       ...(section.tiers.tier3Trigger != null ? { tier3Trigger: section.tiers.tier3Trigger } : {}),
     }
   }
   if (section.nudge) {
     out.nudge = {
+      ...carried('nudge'),
       ...(section.nudge.maxContextLimitPct != null ? { maxContextLimitPct: section.nudge.maxContextLimitPct } : {}),
       ...(section.nudge.minContextLimitPct != null ? { minContextLimitPct: section.nudge.minContextLimitPct } : {}),
       ...(section.nudge.emergencyThresholdPct != null ? { emergencyThresholdPct: section.nudge.emergencyThresholdPct } : {}),
     }
   }
+  return out
+}
+
+/**
+ * 把 `compression.subagent` / `compression.perAgent[*]` 段翻成 ACP 插件选项的形状。
+ *
+ * 翻译本体与顶层共用 {@link toAcpConfig}（顶层用 `preserveRecentTokens`、档位里就得写
+ * `config.preserveRecentTokens` 这种"同一个东西两套写法"正是"配了却不生效"的温床）；
+ * 这里只补两个**仅档位需要单独传**的字段。
+ *
+ * 返回 `undefined` 表示"该段未配置" ⇒ 调用方不传该选项，插件侧不叠加（缺省零行为变更）。
+ */
+function toAcpScope(section: AcpScopeSection | undefined): Record<string, unknown> | undefined {
+  if (!section) return undefined
+  const out = toAcpConfig(section)
+  // 这两个不进内核 config：窗口由插件单独取用（`defaultConfig` 的 overrides 会盖掉第一个参数，
+  // 见 acp-context 的 `stripWindow`），`manualInjection` 是插件自己的键。
   if (section.modelContextLimit != null) out.modelContextLimit = section.modelContextLimit
   if (section.manualInjection != null) out.manualInjection = section.manualInjection
   return out
@@ -1644,8 +1737,23 @@ export function checkCompressionConfig(c: unknown): string[] {
       `compression.tokenCalibrationScale 取值 ${JSON.stringify(c.tokenCalibrationScale)} 非法（应为 > 0 的数），已按不校正（1）处理`,
     )
   }
-  push(collectUnknown(c.tiers, Object.keys(COMPRESSION_TIER_KEYS), '.tiers'), '未被识别，该配置不会生效')
-  push(collectUnknown(c.nudge, Object.keys(COMPRESSION_NUDGE_KEYS), '.nudge'), '未被识别，该配置不会生效')
+  // 子树结构化口：只收少数常用键，其余内核字段要写 `config.*` —— 走带"指路"的校验
+  checkSubtreeUnknown(
+    c.tiers,
+    Object.keys(COMPRESSION_TIER_KEYS),
+    Object.keys(KERNEL_TIER_KEYS),
+    '.tiers',
+    'compression.config.tiers',
+    push,
+  )
+  checkSubtreeUnknown(
+    c.nudge,
+    Object.keys(COMPRESSION_NUDGE_KEYS),
+    Object.keys(KERNEL_NUDGE_KEYS),
+    '.nudge',
+    'compression.config.nudge',
+    push,
+  )
   push(collectUnknown(c.telemetry, Object.keys(COMPRESSION_TELEMETRY_KEYS), '.telemetry'), '未被识别，该配置不会生效')
   push(collectUnknown(c.prompts, Object.keys(PROMPT_KEYS), '.prompts'), '不是 acp-kernel Prompts 的字段，该配置不会生效')
   if (c.manualInjection !== undefined && !MANUAL_INJECTION_MODES.has(c.manualInjection as string)) {
@@ -1875,8 +1983,12 @@ const TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['telemetry']>, true
 export function checkTelemetryConfig(c: unknown): string[] {
   if (!isPlainObject(c)) return []
   const out: string[] = []
+  // 附可用键清单：`telemetry` 段**没有**压缩那样的"高级透传口"可以兜底 —— 写错的键在本段
+  // 没有别的去处，只报"未被识别"会逼用户翻源码找合法键（真机反馈 `telemetry.store` 即此形态：
+  // 想配"目录 + debounce"，而目录本就是 `sessions`、debounce 是顶层键）。
+  const telKeys = Object.keys(TELEMETRY_KEYS).join(' / ')
   for (const k of collectUnknown(c, Object.keys(TELEMETRY_KEYS), 'telemetry')) {
-    out.push(`${k} 未被识别，该配置不会生效`)
+    out.push(`${k} 未被识别，该配置不会生效（可用键：${telKeys}）`)
   }
   if (c.enabled !== undefined && typeof c.enabled !== 'boolean') {
     out.push(`telemetry.enabled 应为布尔值，收到 ${JSON.stringify(c.enabled)} ⇒ 已忽略该项`)
@@ -1896,7 +2008,7 @@ export function checkTelemetryConfig(c: unknown): string[] {
   // otlp 子段（白名单里的 otlp 是被 type 保护的；这里只查子键）
   if (isPlainObject(c.otlp)) {
     for (const k of collectUnknown(c.otlp, Object.keys(TELEMETRY_OTLP_KEYS), 'telemetry.otlp')) {
-      out.push(`${k} 未被识别，该配置不会生效`)
+      out.push(`${k} 未被识别，该配置不会生效（可用键：${Object.keys(TELEMETRY_OTLP_KEYS).join(' / ')}）`)
     }
     if (c.otlp.enabled !== undefined && typeof c.otlp.enabled !== 'boolean') {
       out.push(`telemetry.otlp.enabled 应为布尔值，已忽略该项`)
@@ -2858,25 +2970,9 @@ export class HarnessApp {
     }
     if (compression?.enabled) {
       const acp = await lazyImport<{ createAcpContextPlugin: (o?: any) => AgentPlugin }>('@harness/acp-context')
-      const acpConfig: Record<string, unknown> = {
-        ...(compression.config ?? {}),
-        ...(compression.preserveRecentMessages != null ? { preserveRecentMessages: compression.preserveRecentMessages } : {}),
-        ...(compression.preserveRecentTokens != null ? { preserveRecentTokens: compression.preserveRecentTokens } : {}),
-        ...(compression.promotionThreshold != null ? { promotionThreshold: compression.promotionThreshold } : {}),
-      }
-      if (compression.tiers) {
-        acpConfig.tiers = {
-          ...(compression.tiers.tier2Trigger != null ? { tier2Trigger: compression.tiers.tier2Trigger } : {}),
-          ...(compression.tiers.tier3Trigger != null ? { tier3Trigger: compression.tiers.tier3Trigger } : {}),
-        }
-      }
-      if (compression.nudge) {
-        acpConfig.nudge = {
-          ...(compression.nudge.maxContextLimitPct != null ? { maxContextLimitPct: compression.nudge.maxContextLimitPct } : {}),
-          ...(compression.nudge.minContextLimitPct != null ? { minContextLimitPct: compression.nudge.minContextLimitPct } : {}),
-          ...(compression.nudge.emergencyThresholdPct != null ? { emergencyThresholdPct: compression.nudge.emergencyThresholdPct } : {}),
-        }
-      }
+      // 与档位段（`subagent` / `perAgent`）**共用同一份翻译**：此前顶层在这里内联写一遍、
+      // 档位那边再写一遍，两套语法一旦漂移就是"顶层这么写生效、档位那样写不生效"。
+      const acpConfig = toAcpConfig(compression)
       // 遥测默认开启：每轮 preModel 追加 dataDir/sessions/{sessionId}.telemetry.jsonl
       const telemetryEnabled = compression.telemetry?.enabled !== false
       const sessionsDir = join(this.workspace.dataDir, 'sessions')

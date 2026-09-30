@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveWorkspace, createWorkspaceOriginalStore } from '@harness/workspace'
@@ -21,6 +21,8 @@ import {
   buildConfigOverview,
   createProcessLine,
   checkCompressionConfig,
+  checkTelemetryConfig,
+  toAcpConfig,
   resolveContextWindowTokens,
   buildCompactionOptions,
   checkCompactionConfig,
@@ -498,7 +500,7 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     const issues = checkCompressionConfig({
       subagent: {
         preserveRecentToken: 30_000, // 少个 s —— 顶层会报，档位里同样要报
-        nudge: { minGrowthFloar: 1 }, // 档位 nudge 只认三个 pct，其余键在内核里本就不存在
+        nudge: { minGrowthFloar: 1 }, // 拼错的键（少个 o）：既不在结构化口、也不在内核字段表 ⇒ 朴素文案
         config: {
           preserveRecentToken: 30_000, // 高级透传里同样的错
           compress: { minSummaryLenght: 50 }, // 内核 CompressValidationConfig 拼错
@@ -518,6 +520,107 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(issues).toContain('compression.perAgent.reader.manualInjecton 未被识别，该档位不会生效')
     expect(issues).toContain('compression.perAgent.reviewer.tiers.tier2trigger 未被识别，该配置不会生效')
     expect(issues.length).toBe(6)
+  })
+
+  it('checkCompressionConfig：内核字段写进结构化口时，告警直接指出该写到哪（顶层与档位同一套）', () => {
+    // 这两个键**确实是内核字段**，只是写错了口 —— 结构化的 `nudge` / `tiers` 刻意只收常用键，
+    // 内核字段的其余部分必须写 `config.*`。只报"未被识别"会让人只知道没生效、不知道该搬到哪
+    //（真机反馈：`compression.subagent.nudge.growthFloor`，抄的就是文档正文里的字段名）。
+    const top = checkCompressionConfig({ nudge: { growthFloor: 75_000 }, tiers: { enabled: true } })
+    expect(top.join('\n')).toInclude('compression.nudge.growthFloor 未被识别')
+    expect(top.join('\n')).toInclude('请写到 compression.config.nudge.growthFloor 才生效')
+    expect(top.join('\n')).toInclude('compression.tiers.enabled 未被识别')
+    expect(top.join('\n')).toInclude('请写到 compression.config.tiers.enabled 才生效')
+    expect(top.length).toBe(2)
+
+    // 档位里同理，且路径要带作用域前缀（含 perAgent 的 agent id）
+    const scoped = checkCompressionConfig({
+      subagent: { nudge: { minGrowthRatio: 0.45 }, tiers: { enabled: false } },
+      perAgent: { reader: { nudge: { frequency: 5 } } },
+    })
+    expect(scoped.join('\n')).toInclude('请写到 compression.subagent.config.nudge.minGrowthRatio 才生效')
+    expect(scoped.join('\n')).toInclude('请写到 compression.subagent.config.tiers.enabled 才生效')
+    expect(scoped.join('\n')).toInclude('请写到 compression.perAgent.reader.config.nudge.frequency 才生效')
+    expect(scoped.length).toBe(3)
+  })
+
+  it('checkCompressionConfig：拼错的键不会被指到"内核字段"那条路上（指路只认内核真实字段名）', () => {
+    // 与上一条正交。若把"长得像"的键也指路，用户会照着告警抄一条**同样无效**的路径 ——
+    // 比不指路更糟。内核字段表里没有 `growthFloar` / `minGrowthFloar` ⇒ 只能朴素文案。
+    const issues = checkCompressionConfig({ nudge: { growthFloar: 1, minGrowthFloar: 2 } })
+    expect(issues).toContain('compression.nudge.growthFloar 未被识别，该配置不会生效')
+    expect(issues).toContain('compression.nudge.minGrowthFloar 未被识别，该配置不会生效')
+    expect(issues.length).toBe(2)
+  })
+
+  it('checkTelemetryConfig：未知键附可用键清单（该段没有透传口，写错的键没有别的去处）', () => {
+    // 真机反馈 `telemetry.store: { directory, debounceMs }` —— 想配"目录 + 防抖"，
+    // 而目录本就是 `sessions`（不可单独配）、`debounceMs` 是顶层键。段内没有兜底透传口，
+    // 所以必须把合法键直接列出来。
+    const issues = checkTelemetryConfig({ store: { directory: 'sessions', debounceMs: 500 } })
+    expect(issues.join('\n')).toInclude(
+      'telemetry.store 未被识别，该配置不会生效（可用键：enabled / path / debounceMs / crash / userId / otlp）',
+    )
+    expect(issues.length).toBe(1)
+    expect(checkTelemetryConfig({ otlp: { endpont: 'https://x' } }).join('\n')).toInclude(
+      'telemetry.otlp.endpont 未被识别，该配置不会生效（可用键：enabled / endpoint / headers）',
+    )
+  })
+
+  it('docs 里的 jsonc 示例必须通过 checkCompressionConfig（文档是规格，不该含"照抄就告警"的示例）', () => {
+    // 起因：正文把 `growthFloor` 这类**内核字段名**统一记作 `nudge.X`，而 §7.5 / 速查卡的"直接抄"
+    // 示例又把它写进了结构化口 `nudge:` —— 照抄就报"未被识别"，用户却以为自己写对了。
+    // 把"文档示例"变成受检对象：改了口径却漏改示例，这条立刻红。
+    const docsDir = join(import.meta.dir, '..', '..', '..', 'docs')
+    const stripComments = (s: string): string => s.replace(/(^|\s)\/\/.*$/gm, '$1')
+    const bad: string[] = []
+    let checked = 0
+    for (const file of readdirSync(docsDir).filter((f) => f.endsWith('.md'))) {
+      const md = readFileSync(join(docsDir, file), 'utf8')
+      for (const m of md.matchAll(/```jsonc\n([\s\S]*?)```/g)) {
+        // 片段里可能并列写多个候选对象（每行一个）：按行累积，能 parse 就收一个
+        let buf = ''
+        for (const line of stripComments(m[1]).split('\n')) {
+          buf += (buf ? '\n' : '') + line
+          try {
+            const obj = JSON.parse(buf.trim()) as Record<string, unknown>
+            buf = ''
+            const target = (obj.compression ?? obj) as Record<string, unknown>
+            if (typeof target !== 'object' || target === null || Array.isArray(target)) continue
+            if (!('tiers' in target || 'nudge' in target || 'config' in target || 'enabled' in target)) continue
+            checked++
+            const issues = checkCompressionConfig(target)
+            if (issues.length) bad.push(`${file} → ${issues.join(' / ')}`)
+          } catch {
+            /* 还没凑齐（或含占位符），继续吃下一行 */
+          }
+        }
+      }
+    }
+    // 守住"真的扫到了"：正则或目录一旦失配，不至于静默通过
+    expect(checked).toBeGreaterThan(10)
+    expect(bad).toEqual([])
+  })
+
+  it('toAcpConfig：结构化口与 config.* 描述同一棵子树时深合并（不再整体替换）', () => {
+    // 文档 §6 的推荐用法就是"结构化口写常用几个 + config.* 补其余"，两者必须共存。
+    // 旧实现是 `out.nudge = {三个 pct}`（整体替换），会把 `config.nudge.growthFloor` 静默丢掉 ——
+    // 两个键都在"已配置"清单里，却只有一个活着。
+    const out = toAcpConfig({
+      config: { nudge: { growthFloor: 75_000, growthCap: 75_000 }, tiers: { enabled: true }, compress: { minSummaryLength: 1_000 } },
+      nudge: { maxContextLimitPct: 0.65 },
+      tiers: { tier2Trigger: 5 },
+      preserveRecentTokens: 50_000,
+    })
+    expect(out.nudge).toEqual({ growthFloor: 75_000, growthCap: 75_000, maxContextLimitPct: 0.65 })
+    expect(out.tiers).toEqual({ enabled: true, tier2Trigger: 5 })
+    // 没有结构化口的子树（compress）原样透传，不受影响
+    expect(out.compress).toEqual({ minSummaryLength: 1_000 })
+    expect(out.preserveRecentTokens).toBe(50_000)
+    // 同键冲突时以结构化口为准（显式字段压在最上层）
+    expect(toAcpConfig({ config: { nudge: { maxContextLimitPct: 0.1 } }, nudge: { maxContextLimitPct: 0.9 } }).nudge).toEqual({
+      maxContextLimitPct: 0.9,
+    })
   })
 
   it('buildConfigOverview：窗口按 modelContextLimit → 默认 provider 的 contextWindowTokens → 200000 推导', () => {
