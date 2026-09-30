@@ -1254,6 +1254,36 @@ const tool = resolved !== undefined && allowedTools.includes(resolved) ? resolve
 - 端到端脚本里，**工具桩的 `safeParse` 必须真的失败**才能走到"入参自愈" —— 恒成功的桩会让
   工具"执行成功"，看着像功能没生效，其实是场景没造出来。
 
+## 2026-09-30（续 207）派工提示词三项收敛：先算账（要不要派 / 派几路）+ 多路范围互斥
+
+从两会话取证（`s_1790756296342_9yvoc` 未派工 / `s_1790756963376_7r3x8` 派 4 路，同一句 prompt、同一 cwd）得到
+**成本侧结论**：派工开销**随路数线性增长** —— 4 路总输入 `6.32M`，是主会话自己做的 `5.67×`，
+其中 `4.82M` 全在子会话（每个子 Agent 是一份独立上下文，彼此不共享前缀缓存）；
+并行的墙钟收益（`77.3s` vs 串行 `225.2s`）会被等待损耗（gate 空转 34.3s + 通知延迟 20.7s）吃掉。
+于是给派工提示词补三条硬约束：
+
+| 约束 | 落点 |
+|---|---|
+| **派工前先评估复杂度**：门槛 = 可切分 ＋ 每块够重（≥10 步或 ≥30s）＋ 至少 2 块；达不到就自己做 | `subagent-tool-documentation.txt` 新增「派工前先算账」；`coordinator.txt` 派工规则首条 |
+| **默认 2–3 路、最多 4 路**（路数是成本第一乘数，宁可每路大一点，不要切碎） | 同上 ＋ `renderRoster()` ＋ `inputSchema.prompt` 描述 |
+| **多路范围必须两两互斥**（逐路写文件集声明；公共文件只让一路读，或父 Agent 先读完写进 prompt） | 新增「多路派工：先划界，再派」；`renderRoster()`；`coordinator.txt` |
+
+- `documentation` 是**每次请求都随 tools 发送**的（provider 侧把 `tool.documentation` 合并进 `description`），
+  所以新增文本按"能否改变下一步决策"逐句筛过；两条新约束同时写进 `description` / `documentation` /
+  `inputSchema.prompt` / `renderRoster()` **四个入口**（沿用 §18.2 的"少一处就漏"约定）。
+- `coordinator.txt` 走 `core.prompt.system.transform`，对 `mode === 'coordinator'` **无条件注入**
+  （`lead.md` 自带正文也照收）⇒ 改它同时覆盖 lead 与空正文 coordinator。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `bun run typecheck` | 30 包 **exit 0** |
+| `bun test packages/plugins/subagent` | **159 pass / 0 fail** |
+| `bun test packages/plugins/coordinator` | **33 pass / 0 fail**（含 `COORDINATOR_SYSTEM_PROMPT 包含四阶段与反模式`） |
+
+未改任何代码逻辑，只改提示词文本 ＋ `renderRoster()` 的两行字符串。
+
 ## 2026-09-28（续 206）结果滞留的真机根因是 TUI 没挂自动续轮（不是退避不够）
 
 方案 A2 原本判断"barrier 事件与通知入队是两个独立分支，靠退避赌"，并建议再加退避/重投。
