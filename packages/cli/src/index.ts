@@ -36,6 +36,9 @@ import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugi
 // 运行时能力抽象契约（@harness/plugin）：cli 仅经下方面向 subagent / swarm 的抽象接口交互，
 // 不依赖具体实现类型。具体能力对象（subagentCapability / swarmCapability）由插件包导出并在组合根装配。
 import type { BackgroundTaskViewLike, ToolMetaEntry, ToolMetaLookup, ToolMetaRegistry, ToolMetaSource } from '@harness/plugin'
+// 仅类型（`import type` 被完全擦除，不会拖累启动）：ACP 的「Provider 窗口表」形状 ——
+// 装配处要按它构造，写内联结构体就会与插件侧两份定义漂移（本仓"同一个东西两套写法"的老病）。
+import type { ProviderWindowTable } from '@harness/acp-context'
 // 内置 Provider 模块与 tools-builtin 一律惰性加载（见 lazyImport / registerBuiltinProviderTypes）：
 // 这里只保留类型导入，运行时值经动态 import() 在真正用到时才加载，避免拖慢启动。
 // 例外：tools-builtin 的「静态元信息」（meta）为纯数据、无副作用，可提前加载（多级加载 L1，
@@ -1809,6 +1812,37 @@ export function resolveContextWindowTokens(cfg: HarnessConfig, defaultProviderId
   return cfg.compression?.modelContextLimit ?? defaultPc?.contextWindowTokens ?? 200_000
 }
 
+/**
+ * 构造「Provider / 模型 → 上下文窗口」表，供 ACP 按会话**实际**使用的端点解析占用率分母。
+ *
+ * 为什么必须按端点分化：`resolveContextWindowTokens` 只回答「**默认** Provider 的窗口是多少」，
+ * 而 Provider / 模型是**按 Agent 解析、且每次派工都能覆盖**的
+ * （core：`input.model?.providerId ?? agent.model?.providerId ?? 'default'`，见 SubagentTool 的
+ * `model` 入参）。子 Agent 被派到小窗口端点时，拿默认 Provider 的窗口当分母会让占用率**虚低** ——
+ * 真机形态：默认端点 300K、子 Agent 走 200K 端点 ⇒ 报 66% 时其实已 100%，压缩永不触发，
+ * 且全程无任何症状（`acp_status` 照常报数，只是分母不是本会话的）。
+ *
+ * `fallback` 取 `resolveContextWindowTokens` 的**原值**（不是另算一遍）：查不到端点时逐位回到
+ * 改造前的行为。这是「缺省零行为变更」的保证点 —— 换成别的推导就会在无 providers 的场景下
+ * 悄悄改掉分母。
+ *
+ * `byModel` 对同名多实例取**最小**窗口：模型名相同而端点窗口不同时无从分辨到底走哪个，
+ * 取最小 = 宁可早压。反方向（取最大）会让分母虚高，正是要避免的那个。
+ */
+export function buildProviderWindowTable(cfg: HarnessConfig, defaultProviderId: string): ProviderWindowTable {
+  const { providers } = normalizeProviderConfigs(cfg.providers ?? [])
+  const byProvider: Record<string, number> = {}
+  const byModel: Record<string, number> = {}
+  for (const p of providers) {
+    const w = p.contextWindowTokens
+    // 窗口得是能当分母的正有限数；`0` / 负数 / `NaN` 只当"没配"（否则占用率会算出 Infinity/NaN）
+    if (typeof w !== 'number' || !Number.isFinite(w) || w <= 0) continue
+    byProvider[p.id] = w
+    if (p.model) byModel[p.model] = Math.min(byModel[p.model] ?? Number.POSITIVE_INFINITY, w)
+  }
+  return { byProvider, byModel, fallback: resolveContextWindowTokens(cfg, defaultProviderId) }
+}
+
 /** 校验 `config.json → compaction`：未知键 + `strategy` / `tokenCalibration` 非法取值 */
 export function checkCompactionConfig(c: unknown): string[] {
   if (!isPlainObject(c)) return []
@@ -2977,8 +3011,14 @@ export class HarnessApp {
       const telemetryEnabled = compression.telemetry?.enabled !== false
       const sessionsDir = join(this.workspace.dataDir, 'sessions')
       providerPlugins.push(acp.createAcpContextPlugin({
-        // 与配置概览、会话压缩共用同一套窗口推导（此前三处各算一次，同份 config 能出两个值）
-        modelContextLimit: resolveContextWindowTokens(cfg, defaultProviderId),
+        // 只传「用户显式指定」的窗口（`compression.modelContextLimit`），压过按端点的推导。
+        // 缺省刻意留 undefined —— 若把默认 Provider 推导出的窗口塞进这里，它会在窗口解析链上
+        // 截胡，下面那条按端点分化的腿永远走不到（那正是本次要修的 bug）。
+        modelContextLimit: compression.modelContextLimit,
+        // 占用率分母按**本会话实际用的端点**解析：子 Agent 常被派到另一个 Provider（也可被
+        // `SubagentTool.model` 逐次覆盖），两端窗口不同时分母必须跟着走。都查不到时回落
+        // `fallback` = 改造前那个数，故缺省行为逐位不变。
+        providerWindows: buildProviderWindowTable(cfg, defaultProviderId),
         systemPrompt: compression.systemPrompt,
         prompts: compression.prompts as any,
         config: acpConfig as any,

@@ -24,6 +24,7 @@ import {
   checkTelemetryConfig,
   toAcpConfig,
   resolveContextWindowTokens,
+  buildProviderWindowTable,
   buildCompactionOptions,
   checkCompactionConfig,
   checkCompactionReachability,
@@ -664,6 +665,56 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(resolveContextWindowTokens({ providers }, 'hy3')).toBe(102_400)
     expect(resolveContextWindowTokens({ providers }, 'other')).toBe(1_000_000)
     expect(resolveContextWindowTokens({}, 'mock')).toBe(200_000)
+  })
+
+  it('buildProviderWindowTable：按端点/模型建表，同模型多实例取最小窗口，fallback 沿用原推导', () => {
+    const providers = [
+      { id: 'big', type: 'openai', model: 'gpt-4o', contextWindowTokens: 1_000_000 },
+      // 同一 model 名挂两个端点、窗口不同：无从分辨走哪个 ⇒ 取最小（宁可早压，分母虚高会漏压）
+      { id: 'small-a', type: 'openai', model: 'hy3', contextWindowTokens: 200_000 },
+      { id: 'small-b', type: 'openai', model: 'hy3', contextWindowTokens: 102_400 },
+      // 省略 id ⇒ 由 model 派生（normalizeProviderConfigs），表里必须能用派生出的 id 命中
+      { type: 'openai', model: 'hy4' },
+      // 没有窗口字段 / 非法窗口 ⇒ 不入表（0 当分母会算出 Infinity，落回 fallback 才是对的）
+      { id: 'no-win', type: 'openai', model: 'm1' },
+      { id: 'zero', type: 'openai', model: 'm2', contextWindowTokens: 0 },
+      { id: 'neg', type: 'openai', model: 'm3', contextWindowTokens: -1 },
+    ] as HarnessConfig['providers']
+
+    const t = buildProviderWindowTable({ providers }, 'big')
+    // 表的两棵子树在插件侧是可选字段（宿主可以只给一边）—— 这里取实际构造出来的那份
+    const byProvider = t.byProvider ?? {}
+    const byModel = t.byModel ?? {}
+    expect(byProvider.big).toBe(1_000_000)
+    expect(byProvider['small-a']).toBe(200_000)
+    expect(byProvider.hy4).toBeUndefined() // 该项没写窗口，只有模型名进 byModel
+    expect(byModel.hy3).toBe(102_400) // 同名取最小
+    expect(byModel['gpt-4o']).toBe(1_000_000)
+    expect(byModel.m1).toBeUndefined()
+    expect(byModel.m2).toBeUndefined()
+    expect(byModel.m3).toBeUndefined()
+    // fallback 必须与 resolveContextWindowTokens 同源：查不到端点时逐位回到改造前的分母
+    expect(t.fallback).toBe(1_000_000)
+    expect(t.fallback).toBe(resolveContextWindowTokens({ providers }, 'big'))
+    // 显式 `compression.modelContextLimit` 也在 fallback 里（它同时以插件选项传下去，两级同值）
+    const t2 = buildProviderWindowTable({ providers, compression: { modelContextLimit: 300_000 } }, 'big')
+    expect(t2.fallback).toBe(300_000)
+    // 没有任何 provider 时只剩 fallback，与改造前一致（200000）
+    expect(buildProviderWindowTable({}, 'mock')).toEqual({ byProvider: {}, byModel: {}, fallback: 200_000 })
+  })
+
+  it('ACP 装配：窗口只传"显式值"，默认 Provider 的窗口走 providerWindows.fallback（防回归）', () => {
+    // 为什么要读源码文本：这条装配行**没有**别的守卫能覆盖它 —— 插件侧用例无论收到什么选项都成立，
+    // 类型上也通不过检查（`modelContextLimit?: number` 收得下任何数字）。而把它写回
+    // `resolveContextWindowTokens(cfg, defaultProviderId)` 就等于**复活本轮修的 bug**：
+    // 所有会话（含子 Agent）共用默认 Provider 的分母，占用率虚低、压缩不触发且毫无症状。
+    // 两份文本断言都很短且唯一，失败时的信息直接指出"装配行写错了"。
+    const src = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+    const start = src.indexOf('acp.createAcpContextPlugin({')
+    expect(start).toBeGreaterThan(0)
+    const body = src.slice(start, src.indexOf('})', start))
+    expect(body).toInclude('modelContextLimit: compression.modelContextLimit')
+    expect(body).toInclude('providerWindows: buildProviderWindowTable(cfg, defaultProviderId)')
   })
 
   it('buildCompactionOptions：窗口按 Provider 推导，配置字段逐项透传', () => {
