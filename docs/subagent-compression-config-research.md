@@ -86,7 +86,7 @@ createAcpContextPlugin({ modelContextLimit, config, prompts, systemPrompt,
 模型可以按 Agent 换，**压缩窗口不跟着换**：
 
 - 模型解析（`packages/core/src/index.ts`）：`providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'`，`modelId` 同理 ⇒ **per-agent / per-spawn 覆盖是生效的**；
-- 但压缩窗口（`packages/cli/src/index.ts` → `resolveContextWindowTokens`）：`cfg.compression?.modelContextLimit ?? defaultProvider.contextWindowTokens ?? 200_000` ⇒ **只认"默认 Provider"，不认当前 Agent 的模型**。
+- 但压缩窗口（`packages/cli/src/index.ts` → `resolveContextWindowTokens`）：`cfg.compression?.modelContextLimit ?? defaultProvider.contextWindowTokens ?? 200_000` ⇒ **只认"默认 Provider"，不认当前 Agent 的模型**（✅ **2026-09-30 已修**：ACP 侧（续 222）与 `compaction` 侧（续 223）都改成按会话实际端点解析）。
 
 后果：一个被派到小窗口模型（或反过来 1M 窗口模型）的子 Agent，occupancy 分母仍是主会话的窗口数 ⇒ **阈值判断系统性偏早/偏晚**，而且没有任何症状。这类"配了却按另一套口径算"的形态，本仓已经栽过两次（`tokenCalibration` 的口径分裂、`compaction` 窗口推导）。
 

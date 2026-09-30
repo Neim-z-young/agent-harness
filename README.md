@@ -236,7 +236,7 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 | `contextWindowTokens` | number | 按 Provider 推导 | 本段专用覆盖，一般不填 |
 | `tokenCalibration` | `'auto'` \| `'chars4'` | `'auto'` | token 折算口径，与 `compression.tokenCalibration` 同义；**必须两边一致**，否则 ACP 判定已超窗、会话层却说远未到阈值 |
 
-**窗口不在本段硬填**：按 `compaction.contextWindowTokens → compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 200000` 推导。
+**窗口不在本段硬填**：按 `compaction.contextWindowTokens → compression.modelContextLimit → 本会话实际端点（Provider / 模型）的窗口 → 默认 Provider 的 contextWindowTokens → 200000` 推导。**窗口跟着会话走**：会话内用 `/model` 切到别的模型后，阈值按新端点的窗口重算（`/stats` 与本会话/各子会话的占用率也各用各自的窗口）—— 否则小窗口会话的阈值会落在真实窗口之外，自动压缩永远不触发且没有任何报错。
 
 **最隐蔽的一个坑：阈值 ≥ 窗口**。自动压缩的触发线是 `(窗口 − reservedTokens) × pct%`，一旦算出的阈值高于窗口本身，无论会话多长都不会触发，而且**没有任何报错**（`/compact auto` 只会回一句"未达阈值"）。常见成因是给了一个大 `reservedTokens` 或过高的 `pct`。`harness config check` 与 `/config` 会显式检查这一条并告警。
 

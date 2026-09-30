@@ -1,5 +1,47 @@
 # Agent Harness 开发日志
 
+## 2026-09-30（续 223）`compaction` 的窗口同样按会话端点解析（续 222 遗留的"同源未修"项）
+
+### 起因：续 222 只修了 ACP 一侧，`compaction` 一侧仍在
+
+`compaction`（core 自带的会话压缩：`/compact`、REPL 启动时的自动判定、headless `run`、`/stats`、TUI 统计面板）与 ACP 是**两套机制**，窗口却各自算一份：`buildCompactionOptions(cfg, defaultProviderId)` 里写着 `k?.contextWindowTokens ?? resolveContextWindowTokens(cfg, defaultProviderId)` —— **只认默认 Provider**。
+
+后果与续 222 同源，但落在另一条链上：默认端点 300K、会话用 `/model` 切到 hy3（200K）后，阈值 = 80% × (300000 − 30000) = 216000 已经**超过本会话真实窗口 200000** ⇒ 会话压缩永不触发，而 `/stats`、概览、`/compact auto` 全都"看起来正常"（同一份 config 下不同会话本来就该有两个分母）。`/stats` 更直白：子会话占用率**逐行列出**，却一律拿父会话的窗口当分母（代码里明写"同窗口近似"）。
+
+### 改动
+
+**`packages/cli/src/index.ts`**
+
+- 新增 `SessionEndpoint`（`providerId?` / `modelId?`）与 `resolveCompactionWindow(cfg, defaultProviderId, endpoint?)`：`compaction.contextWindowTokens` / `compression.modelContextLimit`（显式）→ 按端点查表（`byProvider` → `byModel`）→ `fallback` → 200000。`buildCompactionOptions` 加第三个参数并改用它。
+- 新增 `HarnessApp.resolveSessionEndpoint(session)`：解析链与 core `_prepareQueryOnce` 对齐（`Session.meta.model` 会话级覆盖 → Agent 定义 model）；解析不出返回 `{}` ⇒ 落 `fallback`（= 改造前逐位）。
+- 四个消费点改传各自会话的端点：`/compact`（并回源 `session.get` 取最新一份，避免拿"切模型前"的快照算阈值）、`/stats`（本会话 + 每个子会话**各自**解析）、启动自动判定（REPL/TUI 之前那道 `compactIfNeeded`）。
+- `renderContextOccupancy` 加第四个参数 `resolveWindow`：本会话与每个子会话分别取分母；不传 = 改造前行为（测试替身 / 拿不到 config 的宿主走这条）。
+- `resolveContextWindowTokens` 各级加"能当分母"甄别（`0` / 负数 / `NaN` 按"没配"处理）；`buildProviderWindowTable` 的内联判空改用同一个 `isUsableWindow`。
+- 概览的会话压缩行在 providers 窗口不一致时补注「（默认 Provider 口径；各会话按自身端点解析）」—— 不注明就会被读成"我的会话就是这个分母"。
+
+**`packages/cli/src/tui.tsx`**：统计面板的占用行透传 `resolveWindow`（闭包只捕获 config，会话对象由渲染层回源取最新一份）。
+
+**`packages/plugins/subagent/src/index.ts`**：创建子会话时把派工传入的 `model` 覆盖写进 `Session.meta.model`。
+
+### 设计取舍（5 条）
+
+1. **为什么必须补 `subagent` 落盘**：`SubagentTool.model` 原先只活在一次 `agent.query({ model })` 入参里，会话记录不留痕 ⇒ 子会话的端点**事后不可恢复**，占用率分母只能退回默认 Provider —— "修好了解析链却拿不到判别符"等于没修。写进 `Session.meta.model`（与「会话级模型覆盖」同一约定，`getSessionModelOverride` 直接可读），**只在显式传了 model 时才写**（不制造多余覆盖）。
+2. **显式值仍排最前**：`compaction.contextWindowTokens` > `compression.modelContextLimit` > 端点查表 > fallback。与 ACP 侧同一把尺子（`modelContextLimit` 两边都压过查表）；`compaction` 自己的键更具体，排最前是改造前就有的语义。
+3. **`endpoint` 缺省 = 逐位回到改造前**：查表落 `fallback`，而 `fallback` 就是默认 Provider 的窗口。所有"不做端点分化"的旧调用点（含既有测试）因此零行为变更。
+4. **刻意不复用 acp-context 的 `lookupProviderWindow`**：该模块连带 acp-kernel，为 6 行查表在 CLI 启动路径上加载整棵内核不划算（同 `lazyImport` 的理由）。改成**加一条对照用例**钉住两边一致（遍历一组端点在两处各算一次、断言相等）——"同一把尺子"由用例保证，而不是由 import 保证。
+5. **`renderContextOccupancy` 回源取会话**：调用方手里的会话对象是快照（TUI 只传得进 `sessionId`），`/model` 切过模型后快照上的 `meta.model` 已过期 ⇒ 由渲染层 `session.get(id)` 回源；取不到（测试替身没有 `get`）再用手上那份。
+
+### 顺带
+
+- `resolveContextWindowTokens` 之前会把 `contextWindowTokens: 0` 原样当选（占用率算成 `Infinity`、阈值算成负数，且都"显示正常"）—— 现在各级一律按"没配"处理、回落 200000。不改任何 sane 配置的行为。
+- README 的 compaction 段、调研文档 §1.5 的"尚**未**修"注记、`AGENTS.md` §5 的纪律条目、`harness-config-scope-audit` 技能（两处"未修" → 已修，并新增"逐个消费点过一遍""判别符要落盘"两条判据）同步更新。
+
+### 验证（三段式 + 5 个反向实验）
+
+- typecheck：**39 包 0 error**；`bun run test`：**39 包全部 `0 fail`**（EXIT=0；cli 420 pass、subagent 159 pass）。
+- 新增用例 7 条（cli 3 + cli 集成 1 + 占用展示 2 + subagent 1）+ 2 处既有用例扩展（`buildCompactionOptions` 的端点参数、`resolveContextWindowTokens` 的甄别）：端点分化 / 显式优先 / 缺省口径、与 acp-context 的对照守卫、概览注记、真实 boot 上 `/model` 切到小窗口端点后分母变 200000（并断言"按 300000 算阈值 216000 > 200000"）、子会话按自身端点（解析不出时回落）、`meta.model` 落地（只给 modelId / 不传覆盖时不写）。
+- 反向验证：① 摘掉端点查表 ⇒ 4 条红；② `resolveSessionEndpoint` 忽略会话级覆盖 ⇒ 集成那条红；③ 子会话沿用父会话窗口 ⇒ 显示层那条红（收到 50.0% 而非 75.0%）；④ subagent 不写 `meta.model` ⇒ 子会话端点那条红；⑤ 窗口不做"能当分母"甄别 ⇒ 2 条红。恢复后 `git diff` 与备份 patch 逐字一致、`grep 反向验证临时` 无残留。
+
 ## 2026-09-30（续 222）占用率分母按「本会话实际端点」解析（调研轮 §1.5 遗留项）
 
 ### 起因
