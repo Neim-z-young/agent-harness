@@ -36,6 +36,11 @@ import readFileDoc from './prompts/read-file.txt'
 import writeFileDoc from './prompts/write-file.txt'
 import editFileDoc from './prompts/edit-file.txt'
 import bashDoc from './prompts/bash.txt'
+import { analyzeBashCommand, type BashCommandFacts } from './bash-ast'
+
+/** bash 命令 AST 分析（公共 API；见 {@link analyzeBashCommand}） */
+export { analyzeBashCommand } from './bash-ast'
+export type { BashAstCommand, BashAstRedirect, BashCommandFacts } from './bash-ast'
 
 /** 将路径解析为绝对路径（相对 cwd），并返回归一化结果 */
 function resolvePath(inputPath: string, cwd: string): string {
@@ -361,7 +366,9 @@ export interface BashSandboxConfig {
 const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\(\)\s*\{[^{}]*\|[^{}]*\}/, // fork bomb（函数体启动即时递归 fork）
   /\brm\s+(?:-[a-z]*f[a-z]*\s+)*\/\s*(?:\*|$|--)/m, // rm -rf / 或 rm -rf /*
-  /\brm\s+(-[a-z]*f[a-z]*\s*)*~\s/, // rm -rf ~
+  // `~\s` 曾要求波浪号后必须有空白 —— `rm -rf ~`（行尾无空白）在原文上直接漏过。
+  // AST 归一化路径同样受此影响（normalized 行尾也没有空白），故锚点改为 `~(?:\s|$)`。
+  /\brm\s+(-[a-z]*f[a-z]*\s*)*~(?:\s|$)/m, // rm -rf ~
   /\bmkfs\.\w+/, // mkfs.*
   /\bdd\b.*\bof=\s*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/, // dd 写裸盘
   // 重定向裸设备。`>` 左侧允许**行首 / 空白 / fd 数字**三种形态，实测必须全覆盖：
@@ -399,6 +406,32 @@ const DEFAULT_SENSITIVE_ENV = [
 function detectDangerous(command: string, patterns: RegExp[]): RegExp | null {
   for (const re of patterns) {
     if (re.test(command)) return re
+  }
+  return null
+}
+
+/**
+ * AST 层危险判定（在解码字面量上重跑危险表 + 间接执行结构判定）。
+ *
+ * 为什么需要：原始正则对 `"r"m -rf /`、`'rm' -rf /` 这类**引号混淆**天然失明
+ * （字面上没有 `rm`），对 `R=rm; $R -rf /` 更是完全不可见（命令名在运行期才确定）。
+ * bash-ast 把引号/转义解码回运行期字面量、把展开标成 opaque，这里据此补两刀：
+ *   1. 任何命令的命令名含展开 → 拒（间接执行不可审计，fail-closed；
+ *      代价：`$(which docker) ps` 这类写法也被拒 —— 提示改用直接路径）；
+ *   2. 在**归一化文本**（全部命令解码拼接，展开处 OPAQUE 占位）上重跑危险表。
+ * 返回命中的描述（进错误消息），未命中 null。wasm 不可用（facts=null）或语法
+ * 有错（ok=false）时返回 null —— 调用方回落原始正则的结果，绝不因此放行。
+ */
+function detectAstDangerous(facts: BashCommandFacts, patterns: RegExp[]): string | null {
+  for (const cmd of facts.commands) {
+    // 放行例外：命令名展开仅为 `$(which x)` / `$(command -v x)` / `$(type -P x)`
+    // 路径解析惯用法（替换体已审计为纯字面量）—— 其余展开一律 fail-closed
+    if (cmd.nameOpaque && !cmd.namePathResolution) {
+      return `命令名含变量/命令替换展开，间接执行不可审计：「${cmd.raw}」`
+    }
+  }
+  for (const re of patterns) {
+    if (re.test(facts.normalized)) return `解码引号/转义后命中危险模式 ${re}`
   }
   return null
 }
@@ -524,6 +557,11 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     permission: {
       key: 'bash',
       extractPatterns: (input) => [input.command],
+      // 段级 deny（2026-09-30）：权限引擎的 allow/ask 是任一 pattern 命中即生效，
+      // 段级 pattern 绝不能混进 patterns（会放宽 allow）；deny 是任一命中即拒绝，
+      // 收紧无害 —— 让 `deny: ['shutdown*']` 能拦住 `echo hi; shutdown -h now` 这类
+      // 「恶意段藏在全串中」的形态。切段用引号感知的 splitSegments（与 bash_ro 同源）。
+      extractDenyPatterns: (input) => splitSegments(input.command),
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
@@ -543,9 +581,26 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       }
 
       // ---- 沙箱防护 2 前置：危险命令检测（无论是否回退都硬性拒绝，不可豁免） ----
+      // 两层：先对原始文本跑危险正则（历史行为，错误消息引用原文命中）；
+      // 再跑 AST 层（decode 后重跑危险表 + 间接执行判定，见 detectAstDangerous）。
+      // AST 层是**增强**而非替代：wasm 不可用/语法错误时回落原始正则结果。
       if (dangerousPatterns.length > 0) {
         const hit = detectDangerous(input.command, dangerousPatterns)
-        if (hit) {
+        if (!hit) {
+          const facts = await analyzeBashCommand(input.command)
+          if (facts?.ok) {
+            const astHit = detectAstDangerous(facts, dangerousPatterns)
+            if (astHit) {
+              return {
+                ok: false,
+                error: {
+                  message: `命令被沙箱判定为危险并拒绝执行（${astHit}）`,
+                  code: 'SANDBOX_DANGEROUS',
+                },
+              }
+            }
+          }
+        } else {
           return {
             ok: false,
             error: { message: `命令被沙箱判定为危险并拒绝执行（命中：${hit}）`, code: 'SANDBOX_DANGEROUS' },
@@ -570,12 +625,22 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       const sandboxEnv = { ...inherited, ...(input.env ?? {}) }
 
       // ---- 沙箱防护 3：命令白名单 ----
+      // 匹配语义（2026-09-30 修复）：allowlist 条目是「首命令名」或「完整命令片段」。
+      // 历史缺陷：旧判据含 `input.command.includes(a)` —— 子串命中即放行，等于白名单形同虚设：
+      //   allowlist=['git'] 时 `echo git && rm -rf /`（命令任意位置含 'git'）直接过闸。
+      // 现在只认两种形态：
+      //   1) 首命令名精确等于条目（含跳过前缀赋值后的首命令，extractFirstCommand）；
+      //   2) 整串以条目开头且条目后是空白/结尾（真「片段」）—— `github` 不会命中 `git`。
       let allowlisted = true
       if (allowlist && allowlist.length > 0) {
         const firstCmd = extractFirstCommand(input.command)
-        allowlisted = allowlist.some((a) =>
-          firstCmd === a || input.command.trim().startsWith(a) || input.command.includes(a),
-        )
+        const trimmedCommand = input.command.trim()
+        allowlisted = allowlist.some((a) => {
+          if (firstCmd === a) return true
+          if (!trimmedCommand.startsWith(a)) return false
+          const next = trimmedCommand[a.length]
+          return next === undefined || /\s/.test(next)
+        })
         if (!allowlisted) {
           // 白名单拦截但允许宿主回退：非破坏性命令提升到宿主 bash 执行
           if (config.fallbackToHost) {
@@ -891,6 +956,67 @@ export function checkReadOnlyCommand(
   return { ok: true }
 }
 
+/**
+ * 只读 AST 复核门（纯函数，可单测）。
+ *
+ * checkReadOnlyCommand 是手写解析（引号投影 + 分段），fail-closed 但不完整 ——
+ * 这里用语法树交叉复核，两道门取**交集**：本函数只会比手写门更严，不会放宽
+ * 既有用例的行为。复核内容（错误码与手写门对齐）：
+ * 1. 命令名含展开（含 `$(which x)` 惯用法 —— 只读哨兵用不上它，一律拒）→
+ *    `SANDBOX_RO_ALLOWLIST`（间接执行对只读哨兵同样不可审计）；
+ * 2. 全部命令（含替换体内的嵌套命令）的**解码后**命令名必须仍在白名单内 ——
+ *    手写门的分段基于去引号投影，语法树看到的是 bash 真正会执行的那条命令序列。
+ *
+ * @param facts   {@link analyzeBashCommand} 的产物（仅接受 ok=true 的 facts）
+ * @param allowlist 只读命令白名单（与 checkReadOnlyCommand 同一份）
+ */
+export function checkReadOnlyByAst(
+  facts: BashCommandFacts,
+  allowlist: readonly string[] = DEFAULT_READONLY_COMMANDS,
+): ReadOnlyVerdict {
+  for (const cmd of facts.commands) {
+    if (cmd.nameOpaque) {
+      return {
+        ok: false,
+        code: 'SANDBOX_RO_ALLOWLIST',
+        reason: `只读模式拒绝：命令名含变量/命令替换展开，间接执行不可审计（「${cmd.raw}」）。`,
+      }
+    }
+    if (cmd.name !== null && !allowlist.includes(cmd.name)) {
+      return {
+        ok: false,
+        code: 'SANDBOX_RO_ALLOWLIST',
+        reason:
+          `只读模式拒绝：「${cmd.name}」不在只读命令白名单内。`
+          + '允许的命令见工具说明；需要写/联网/构建请让主 Agent 用 bash。',
+      }
+    }
+    // git 子命令白名单（与手写门同一份表）：`git` 在白名单内但 `git push` 是写操作。
+    // 旗标带值（-C <dir> 等）跳过，取首个非旗标词为子命令 —— 与 checkReadOnlyCommand 同判据。
+    if (cmd.name === 'git') {
+      const decoded = cmd.args.map((a) => a.text).filter((t): t is string => t !== null)
+      const cleaned: string[] = []
+      for (let i = 0; i < decoded.length; i++) {
+        const a = decoded[i]!
+        if (a === '-C' || a === '--git-dir' || a === '--work-tree' || a === '-c') { i++; continue }
+        if (a.startsWith('--git-dir=') || a.startsWith('--work-tree=')) continue
+        cleaned.push(a)
+      }
+      const sub = cleaned.find((t) => !t.startsWith('-'))
+      if (sub !== undefined && !READONLY_GIT_SUBCOMMANDS.includes(sub)) {
+        return {
+          ok: false,
+          code: 'SANDBOX_RO_ALLOWLIST',
+          reason:
+            `只读模式拒绝：git 子命令「${sub}」不在只读白名单内`
+            + `（只读：${READONLY_GIT_SUBCOMMANDS.join(' / ')}）。需要提交/推送请让主 Agent 用 bash。`,
+        }
+      }
+    }
+  }
+  return { ok: true }
+}
+
 /** 只读 bash 配置 */
 export interface ReadOnlyBashConfig {
   /** 覆盖只读命令白名单（默认 {@link DEFAULT_READONLY_COMMANDS}） */
@@ -944,11 +1070,23 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
     permission: {
       key: 'bash_ro',
       extractPatterns: (input) => [input.command],
+      // 段级 deny：与 bash 同理（只进 deny 判定，不碰 allow/ask 语义）
+      extractDenyPatterns: (input) => splitSegments(input.command),
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const verdict = checkReadOnlyCommand(input?.command, allowlist)
       if (!verdict.ok) {
         return { ok: false, error: { message: verdict.reason, code: verdict.code } }
+      }
+      // AST 复核门（2026-09-30）：手写解析门之上再过一道语法树复核（见 checkReadOnlyByAst）。
+      // facts 为 null / ok=false（wasm 不可用 / 语法错误）时跳过 —— 手写门已放行的行为不变，
+      // 不因 AST 层缺失而拒绝；语法错误本身 bash 也会报错，无额外风险。
+      const facts = await analyzeBashCommand(input.command)
+      if (facts?.ok) {
+        const astVerdict = checkReadOnlyByAst(facts, allowlist)
+        if (!astVerdict.ok) {
+          return { ok: false, error: { message: astVerdict.reason, code: astVerdict.code } }
+        }
       }
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
       const requestedCwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : null

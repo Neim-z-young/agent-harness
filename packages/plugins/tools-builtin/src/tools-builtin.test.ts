@@ -14,6 +14,8 @@ import {
   readOnlyBashTool,
   createReadOnlyBashTool,
   checkReadOnlyCommand,
+  checkReadOnlyByAst,
+  analyzeBashCommand,
   DEFAULT_READONLY_COMMANDS,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
@@ -415,6 +417,52 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
     })
 
+    it('AST 层：引号混淆的破坏性命令被拒（原始正则对此失明）', async () => {
+      // 原文没有字面 `rm`（引号拆开），原始正则 \brm\b 不命中；AST 解码后归一化命中
+      const tool = createBashTool()
+      for (const command of ['"r"m -rf /', "'rm' -rf /", '"r"m -rf ~']) {
+        const res = await tool.call({ command }, makeCtx())
+        expect(res.ok).toBe(false)
+        expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+        expect(res.error!.message).toInclude('解码')
+      }
+    })
+
+    it('AST 层：命令名含展开的间接执行被拒（fail-closed）', async () => {
+      // $R 在运行期才解析，字面量不可审计 —— 结构性拒绝，不走危险表匹配
+      const tool = createBashTool()
+      for (const command of ['R=rm; $R -rf /', 'rm$IFS-rf$IFS/', '$(echo rm) -rf /']) {
+        const res = await tool.call({ command }, makeCtx())
+        expect(res.ok).toBe(false)
+        expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
+        expect(res.error!.message).toInclude('间接执行')
+      }
+    })
+
+    it('AST 层放行路径解析惯用法：$(which x) / $(command -v x)（输出语义固定为可执行路径）', async () => {
+      const tool = createBashTool()
+      for (const command of ['$(which definitely-not-exists-cmd) --help', '$(command -v also-not-exists) --help']) {
+        const res = await tool.call({ command, cwd: TMP_DIR }, makeCtx())
+        expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
+      }
+    })
+
+    it('AST 层不误伤：参数级展开 / 子 shell / fd 重定向等正常命令放行', async () => {
+      const tool = createBashTool()
+      const benign = [
+        'ls $HOME',
+        'echo "$USER"',
+        'ls $(pwd)',
+        'pwd 2>/dev/null',
+        'echo ok > /dev/null',
+        'fdisk -l /dev/sda',
+      ]
+      for (const command of benign) {
+        const res = await tool.call({ command, cwd: TMP_DIR }, makeCtx())
+        expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
+      }
+    })
+
     it('无害重定向不被误拦：`2>/dev/null` / `>/dev/null` 正常放行', async () => {
       // 回归：曾有一条 `>\s*\/dev\/null\b` 危险模式，把最常见的「丢弃输出」写法判为危险，
       // 实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 这类命令会被直接拒绝。
@@ -494,6 +542,46 @@ describe('@harness/tools-builtin', () => {
       const res = await tool.call({ command: 'ls', cwd: TMP_DIR }, makeCtx())
       expect(res.ok).toBe(false)
       expect(res.error!.code).toBe('SANDBOX_ALLOWLIST')
+    })
+
+    it('命令白名单：includes() 子串判据回归——命令含白名单子串不得放行', async () => {
+      // 回归（2026-09-30）：旧判据 `input.command.includes(a)` 子串命中即放行，
+      // allowlist=['git'] 时 `echo git && rm -rf /` 直接过闸（实际执行的是 rm，不是 git）。
+      const tool = createBashTool({ allowlist: ['git'] })
+      const res = await tool.call(
+        { command: 'echo git && rm -rf x', cwd: TMP_DIR },
+        makeCtx(),
+      )
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_ALLOWLIST')
+    })
+
+    it('命令白名单：前缀重叠命令名不得误命中（github ≠ git 片段）', async () => {
+      const tool = createBashTool({ allowlist: ['git'] })
+      const res = await tool.call({ command: 'github-cli --help', cwd: TMP_DIR }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('SANDBOX_ALLOWLIST')
+    })
+
+    it('命令白名单：多词片段须整词匹配（echo hi 命中 echo hi world，echo hello 不命中）', async () => {
+      const tool = createBashTool({ allowlist: ['echo hi'] })
+      // 片段后跟空白 → 命中，且实际执行无副作用命令
+      const ok = await tool.call({ command: 'echo hi world', cwd: TMP_DIR }, makeCtx())
+      expect(ok.ok).toBe(true)
+      expect(ok.output!.stdout.trim()).toBe('hi world')
+      // 片段不整词匹配（echo hello 不以 'echo hi' 开头）→ 拒绝
+      const no = await tool.call({ command: 'echo hello', cwd: TMP_DIR }, makeCtx())
+      expect(no.ok).toBe(false)
+      expect(no.error!.code).toBe('SANDBOX_ALLOWLIST')
+    })
+
+    it('权限 pattern：extractDenyPatterns 上报段级命令（只进 deny 判定）', () => {
+      const tool = createBashTool()
+      expect(tool.permission!.extractPatterns({ command: 'echo hi; rm -rf x' } as never))
+        .toEqual(['echo hi; rm -rf x'])
+      // 段级单独上报：让权限引擎的 deny 规则（如 shutdown*）能拦住藏在全串中的恶意段
+      expect(tool.permission!.extractDenyPatterns!({ command: 'echo hi; shutdown -h now' } as never))
+        .toEqual(['echo hi', 'shutdown -h now'])
     })
 
     it('sandbox 回退：fallbackToHost 时白名单外非破坏性命令提升到宿主 bash 执行', async () => {
@@ -940,6 +1028,31 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     expect(r.ok).toBe(true)
     expect(r.output?.exitCode).toBe(0)
     expect(String(r.output?.stdout)).toContain('3 sample.txt')
+  })
+
+  it('checkReadOnlyByAst（AST 复核门）：间接执行 / 白名单外解码命令名拒绝，码与手写门对齐', async () => {
+    // 命令名含展开（间接执行对只读哨兵一律不可审计 —— 与主 bash 不同，惯用法也不放行）
+    const f1 = await analyzeBashCommand('$(which docker) ps')
+    const v1 = checkReadOnlyByAst(f1!)
+    if (v1.ok) throw new Error('expected reject: nameOpaque')
+    expect(v1.code).toBe('SANDBOX_RO_ALLOWLIST')
+    expect(v1.reason).toContain('间接执行')
+    // 解码后命令名不在白名单（语法树看到的是 bash 真正执行的命令序列）
+    const f2 = await analyzeBashCommand('cat f && git push origin main')
+    const v2 = checkReadOnlyByAst(f2!)
+    if (v2.ok) throw new Error('expected reject: git push')
+    expect(v2.code).toBe('SANDBOX_RO_ALLOWLIST')
+    expect(v2.reason).toContain('push')
+    // 全部白名单内 → 放行
+    const f3 = await analyzeBashCommand('cat f && wc -l f')
+    expect(checkReadOnlyByAst(f3!).ok).toBe(true)
+  })
+
+  it('bash_ro AST 门不误伤：既有白名单命令在两道门下都放行', async () => {
+    const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
+    await writeFile(join(TMP_DIR, 'a.txt'), 'x\n', 'utf-8')
+    const r = await tool.call({ command: 'cat a.txt && wc -c a.txt' }, makeCtx())
+    expect(r.error?.code).not.toBe('SANDBOX_RO_ALLOWLIST')
   })
 
   it('bash_ro 拒绝写命令：文件根本没被创建（失败是"没执行"，不是"执行后报错"）', async () => {
