@@ -42,9 +42,23 @@
 
 | 配置项 | 默认值 | 说明 |
 |--------|--------|------|
-| 🔧 `compression.modelContextLimit` | —（缺省走推导） | 模型输入上下文窗口，ACP 据此算 `contextUsage`、判各层压缩触发。显式覆盖优先。 |
-| 🔧 `providers[].contextWindowTokens` | — | **模型上下文大小放模型配置**：默认 Provider 的窗口来源。 |
-| 推导优先级 | — | `compression.modelContextLimit` → 默认 Provider 的 `providers[].contextWindowTokens` → 插件默认 **200_000** |
+| 🔧 `compression.modelContextLimit` | —（缺省走推导） | 模型输入上下文窗口，ACP 据此算 `contextUsage`、判各层压缩触发。**显式覆盖优先**。 |
+| 🔧 `providers[].contextWindowTokens` | — | **模型上下文大小放模型配置**：该 Provider 实例的窗口。 |
+| 窗口解析优先级 | — | `compression.modelContextLimit` → `compression.config.modelContextLimit` → **本会话实际用的 Provider / 模型** → 默认 Provider 的窗口 → 插件默认 **200_000** |
+
+> **分母跟着会话走，不跟「默认 Provider」走。** 一个会话实际打到哪个端点，取决于该 Agent 的
+> `model` 偏好（agent md frontmatter）与派工时的 `SubagentTool.model` 覆盖 —— **逐会话可以不同**；
+> 而 `contextWindowTokens` 是**每个 Provider 实例**各自配的。所以占用率分母按**这一轮实际命中的端点**解析。
+>
+> 只认默认 Provider 的窗口会怎样：被派到小窗口端点的子 Agent，占用率**虚低**（默认端点 300K、
+> 子 Agent 走 200K ⇒ 报 66% 时其实已 100%），阈值判断系统性偏晚、压缩永不触发，且全程没有症状
+> （`acp_status` 照常报数，报的是别人的分母）。反方向（子 Agent 窗口更大）则偏早。
+>
+> 两个维度都查不到时回落「默认 Provider 的窗口 → 200000」，与单一窗口的老口径**逐位一致**。
+> 同名模型挂在多个端点上且窗口不同时按**最小**窗口算 —— 保守方向是宁可早压（分母虚高会漏压）。
+>
+> ⚠️ 显式写 `compression.modelContextLimit` = 「我不管端点是什么，就按这个数算」，它会压过按端点的
+> 解析。多端点混用时别写它，否则等于把分母又钉回了单一值。
 
 缺省 window 只在 `compression.enabled` 时生效。示例：
 
@@ -803,7 +817,8 @@ cd packages/plugins/acp-context
 { "compression": { "enabled": true, "autoTune": true } }
 ```
 
-窗口从 `providers[].contextWindowTokens`（或 `compression.modelContextLimit`）取，推导：
+窗口取**本会话实际用的那个端点**的 `providers[].contextWindowTokens`（或显式的 `compression.modelContextLimit`，
+见 §1）—— 多端点混用时各会话的 `R` / `GF` / `MC` 会**各自**推导，不会共用默认 Provider 的一套。推导：
 
 ```
 R  = clamp(round500(interp(W)), 15000, 150000)     // interp：log10(W) 上按上方三锚点分段线性插值，
@@ -977,7 +992,7 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 |--------|--------|
 | `compression.enabled` | **false** |
 | `compression.autoTune` | **false**（= 原始压缩参数控制；true = 按窗口自动推导，见 §7.4） |
-| 窗口推导：`modelContextLimit` → `providers[].contextWindowTokens` → 兜底 | — / — / **200000** |
+| 窗口解析（**按本会话实际端点**，见 §1）：显式 → `providers[].contextWindowTokens` → 兜底 | — / — / **200000** |
 | `preserveRecentMessages` | **5** |
 | `preserveRecentTokens` | **5000** |
 | `promotionThreshold` | **5** |
@@ -1115,6 +1130,7 @@ CJK 感知口径 `defaultCountTokens`（中日韩 1 token/字、其余 4 字符/
 
 > **窗口同源**：档位改了 `modelContextLimit` 后，**注入决策与 `acp_status` 报表读的是同一份** config
 > （会话上下文里存着本次解析出的 scope）。不会出现"按 100k 判该压、报表却按 200k 显示"。
+> 同理，**按实际端点解析出的窗口**（§1）也走这一份 —— 报表里的 `modelContextLimit` 就是本会话的分母。
 
 ### ② `manualInjection`（压缩手册怎么给）
 

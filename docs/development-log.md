@@ -1,5 +1,54 @@
 # Agent Harness 开发日志
 
+## 2026-09-30（续 222）占用率分母按「本会话实际端点」解析（调研轮 §1.5 遗留项）
+
+### 起因
+
+模型可以按 Agent 换（`packages/core/src/index.ts`：`providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'`，`modelId` 同理；agent md 的 `model:` 与 `SubagentTool.model` 都能覆盖，**逐会话可不同**），而压缩窗口**不跟着换** —— 装配期 `resolveContextWindowTokens(cfg, defaultProviderId)` 只认默认 Provider，一个数发给插件，此后所有会话（主 + 子）共用。
+
+后果：被派到小窗口端点的子 Agent 占用率**虚低**（默认端点 300K、子 Agent 走 200K ⇒ 报 66% 时其实已 100%），压缩阈值永不触发，且**没有任何症状** —— `acp_status` 照常报数，报的是别人的分母。
+
+### 改动
+
+**`packages/plugins/acp-context/src/index.ts`**
+
+- 新增选项 `providerWindows: ProviderWindowTable`（`byProvider?` / `byModel?` / `fallback?`）。
+- 新增纯函数 `lookupProviderWindow(table, providerId, modelId)`：实例维度优先于模型维度；`0` / `NaN` / 负数视作"没配"（当分母会算出 `Infinity`）。
+- `scopeFor(agentId, parentSessionId, providerId, modelId)` 的窗口解析链：
+  `config.modelContextLimit` → 插件选项 `modelContextLimit` → 查端点表 → `providerWindows.fallback` → `200_000`。
+- **缓存 key 补 `providerId` / `modelId`**：漏了会拿先到者的窗口去算后来者（同一 Agent 换端点时正是这个形态）。
+- 工厂内不再 `?? 200_000` 预先兜底（那会让查表那条腿恒被截胡）；保留一个 `modelContextLimit` 常量仅作**诊断口径**（install 日志 / autoTune 摘要）。
+- preModel hook 传 `input.providerId` / `input.modelId`；install 日志补 `providerWindows` 摘要。
+
+**`packages/cli/src/index.ts`**
+
+- 新增导出 `buildProviderWindowTable(cfg, defaultProviderId)`：`byProvider` 按实例 id、`byModel` 按模型名（**同名多实例取最小**）、`fallback = resolveContextWindowTokens(...)`。
+- 装配处改传 `modelContextLimit: compression.modelContextLimit`（**只传显式值**）+ `providerWindows: buildProviderWindowTable(cfg, defaultProviderId)`。
+
+### 设计取舍（6 条）
+
+1. **`fallback` 必须是原来那个数**：查不到端点时逐位回到旧行为 —— 这是"缺省零行为变更"的保证点。若另推一遍（如"默认 Provider 的窗口"重算），在没有 `providers` 的场景下会悄悄改掉分母。
+2. **显式与推导分两路**：旧代码把 `compression.modelContextLimit ?? 默认Provider窗口 ?? 200000` **合成一个数**传下去，于是"显式优先"与"按端点分化"挤在一条链上，必然有一条永远走不到。现在显式单列一路（排最前），推导单列一路。
+3. **`byProvider` 优先于 `byModel`**：`contextWindowTokens` 挂在 **Provider 实例**上（config 里没有"模型级窗口"这一层），实例信息更具体；而 `providerId` 缺省时 core 传 `'default'` 哨兵 —— 它不在表里 ⇒ 落 fallback，正好等于"默认 Provider 的窗口"。
+4. **不做组合键**（`providerId + '/' + modelId`）：查不出更细的答案，只会多一个永远 miss 的分支。
+5. **模型维度必须留**：agent md 里写 `model: { modelId: 'hy3' }` 比写"派生出的 provider id"自然得多，只做实例维度会漏掉这条真实路径。
+6. **同名多实例取最小**：分辨不出走哪个端点时取最小 = 宁可早压；取最大会让分母虚高，正是要避免的方向。
+
+### 顺带
+
+- 调研文档 §1.5「已存在的隐性错配」→ **✅ 已修**，并注明 `compaction`（另一套会话压缩机制）上的**同源问题尚未修**：`buildCompactionOptions` 仍只按默认 Provider 推导单一窗口，而它走 core 的 `compactIfNeeded`，没有按会话分化的入口，需单独评估。
+- 文档 §1 重写窗口解析（新优先级 + 为什么按端点 + 为什么显式会压过它）；§7.5③ / §9 / §11① 同步口径。
+
+### 验证（三段式 + 4 个反向实验）
+
+- typecheck：**39 包 0 error**；`bun run test`：**39 包全部 `0 fail`**。
+- 新增用例：acp-context 3 条（`lookupProviderWindow` 纯函数 / 按端点解析全链（含"同一实例换端点"）/ 显式压过查表 + 缺省口径不变）、cli 2 条（建表逻辑 / 装配行守卫）。
+- 反向验证：① 摘掉端点查表 ⇒ 2 条红；② 缓存 key 去掉 `providerId`/`modelId` ⇒ "同一实例换端点"那条红；③ 摘掉 `fallback` ⇒ 2 条断言红；④ 装配行改回 `resolveContextWindowTokens(...)` ⇒ 装配守卫红。恢复后 222 pass / 0 fail、`grep 反向验证临时` 无残留。
+
+### 一条新守卫的说明
+
+装配行**没有**别的守卫覆盖它：插件侧用例无论收到什么选项都成立，类型上 `modelContextLimit?: number` 也收得下任何数字 —— 而把它写回推导值就是**复活本轮修的 bug**。故加一条读源码文本的短断言（本仓已有"扫 docs 全部 jsonc 片段"这类文本守卫先例），失败信息直接指出"装配行写错了"。配套纪律写进 `AGENTS.md` §5：*凡"按某个东西算出来的分子/分母"，都要问一句「这个东西会不会在运行期变」* + 显式/推导分两路。
+
 ## 2026-09-30（续 221）压缩配置的两条真机告警：告警可执行化 + 双口深合并 + 文档修正
 
 ### 起因：启动时的两条告警（用户实机贴出）

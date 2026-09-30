@@ -81,14 +81,18 @@ createAcpContextPlugin({ modelContextLimit, config, prompts, systemPrompt,
 
 **这两组目前都只能全局一套。**
 
-### 1.5 顺带查出一处**已存在的隐性错配**（与 per-agent 无关，但同源）
+### 1.5 顺带查出一处**已存在的隐性错配**（与 per-agent 无关，但同源）—— ✅ 已修
 
 模型可以按 Agent 换，**压缩窗口不跟着换**：
 
-- 模型解析（`packages/core/src/index.ts:2539-2540`）：`providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'`，`modelId` 同理 ⇒ **per-agent / per-spawn 覆盖是生效的**；
-- 但压缩窗口（`packages/cli/src/index.ts:2717` → `resolveContextWindowTokens`，`:1530-1533`）：`cfg.compression?.modelContextLimit ?? defaultProvider.contextWindowTokens ?? 200_000` ⇒ **只认"默认 Provider"，不认当前 Agent 的模型**。
+- 模型解析（`packages/core/src/index.ts`）：`providerId = input.model?.providerId ?? agent.model?.providerId ?? 'default'`，`modelId` 同理 ⇒ **per-agent / per-spawn 覆盖是生效的**；
+- 但压缩窗口（`packages/cli/src/index.ts` → `resolveContextWindowTokens`）：`cfg.compression?.modelContextLimit ?? defaultProvider.contextWindowTokens ?? 200_000` ⇒ **只认"默认 Provider"，不认当前 Agent 的模型**。
 
 后果：一个被派到小窗口模型（或反过来 1M 窗口模型）的子 Agent，occupancy 分母仍是主会话的窗口数 ⇒ **阈值判断系统性偏早/偏晚**，而且没有任何症状。这类"配了却按另一套口径算"的形态，本仓已经栽过两次（`tokenCalibration` 的口径分裂、`compaction` 窗口推导）。
+
+**修法（本轮落地）**：装配时把「Provider 实例 / 模型 → 窗口」表（`buildProviderWindowTable`：`byProvider` / `byModel` / `fallback`）传给 ACP 插件，插件在 `core.session.preModel` hook 里按该轮**实际**的 `providerId` / `modelId` 解析窗口（`lookupProviderWindow`），解析结果存进会话上下文，`acp_status` 报表读同一份。两级都查不到时回落 `fallback` = 原来的默认 Provider 窗口 ⇒ 单一窗口场景**逐位不变**。显式 `compression.modelContextLimit` 仍压过一切（语义是"我不管端点是什么"）。
+
+> 注：**同类问题在 `compaction`（另一套会话压缩机制）上尚未修** —— `buildCompactionOptions` 仍只按默认 Provider 推导单一窗口。它与本条同源但走的是 core 的 `compactIfNeeded`，没有按会话分化的入口，需单独评估。
 
 ### 1.6 一个容易踩的坑：往 agent frontmatter 加字段是**静默失效**的
 
