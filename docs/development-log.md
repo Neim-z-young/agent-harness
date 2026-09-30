@@ -1,5 +1,60 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 226）A2A P0.5 两个 spike：**两条风险假设都被证伪**
+
+`docs/external-integration-plan.md` §6 的 P0.5 要求先用两个 spike 定案协议口径与分发路径。
+结果**两个都是"可行"**，原先写在 §8 风险表里的悲观预期不成立。可复现脚本在 `spikes/a2a/`。
+
+### Spike ①：SDK 无框架入口 + `Bun.serve`（`@a2a-js/sdk@1.3.0`，13 项自检全绿）
+
+`@a2a-js/sdk/server` 的 `JsonRpcTransportHandler.handle(body, ctx)` 只吃 JSON-RPC body
+（`string | Record`）、吐纯对象或 `AsyncGenerator` —— **完全不接触 HTTP Request/Response**。
+⇒ 直接挂 `Bun.serve`，**不需要 express 等任何框架 peer dep**；SSE 用 SDK 的
+`formatSSEEvent()` + `SSE_HEADERS` 自己写。自检覆盖：取卡 / 非流式 `SendMessage` / 流式 SSE /
+`GetTask` / `ListTasks` / `CancelTask` / **`INPUT_REQUIRED` 挂起与续接** / `A2A-Version` 校验 /
+executor 抛异常转 `FAILED`。
+
+三条**静默失败**的口径坑（读类型定义读不出来，只有跑起来才会撞）：
+
+1. **Part 有两套表示**：TS 侧 `content: { $case: 'text', value }`，线上 JSON 是 `{"text":"..."}`。
+   把内部表示直接 `JSON.stringify` 发出去，对端 `fromJSON` **静默丢弃、不报错**
+   （实测 `echo: hello` 退化成 `echo: `）⇒ 出参一律走 `MessageFns.toJSON()`。
+2. **`TaskState` 是数字 enum**（`TASK_STATE_COMPLETED === 3`）而线上是字符串 ⇒ 状态比较按字符串。
+3. **版本校验不归 transport 管**，宿主必须自己调 `validateVersion(v, card, 'JSONRPC')`
+   （它从 `@a2a-js/sdk/server` 导出，根入口没有）；头缺失按 `'0.3'` 处理。
+
+**挂起/续接实测可行，且比文档设想的简单一档**：走**模式 A** —— executor 在 `INPUT_REQUIRED`
+之后**不返回**（`await` 答复），挂起表只需 `taskId → resolver`，**不必跨请求保存/恢复生成器**。
+`ExecutionEventQueue` 在 `INPUT_REQUIRED` 处就终止 ⇒ 阻塞式 `SendMessage` 照样立即返回该状态；
+带同一 `taskId` 的下一条 `SendMessage` 会**再次调用 `execute`**，此时
+`requestContext.task.status.state === INPUT_REQUIRED`，用它把答复喂给 resolver 唤醒第一轮即可 ——
+第一轮补发 COMPLETED，**续接请求的调用方直接拿到最终 artifact**。代价：executor 的 Promise 会长期
+悬挂 ⇒ **TTL 从"锦上添花"变成必需项**（已回写 §10 第 5 条）。
+
+副作用观察：SDK 自己在 executor 抛异常时 `console.error` 打印**完整堆栈** ⇒ P0 抽 host 时
+日志出口要罩住 SDK 的 console，不只是 harness 自己那 16 处 `stdout.write`。
+
+### Spike ②：`bun build --compile` 与动态 TS 插件（**原风险假设被证伪**）
+
+单文件二进制**内嵌了转译器**，运行期 `await import(pathToFileURL(full).href)` 能直接加载用户目录的
+`.ts`（不只是 `.js`/`.mjs`）。实测通过：三种扩展名；插件的裸依赖按**插件文件所在目录向上**解析
+（与未编译时一致 —— 不是 `--compile` 引入的新限制）；绝对路径、相对 `.ts` 导入、`node:` 内置模块
+全部正常；**61MB / 冷启动 18ms** ⇒ **P3 sidecar 可走 `--compile` 单文件二进制**，"随扩展带 bun"
+降级为备选。唯一遗留是**既有问题、与 `--compile` 无关**：用户插件目录解析不到 `@harness/plugin`
+这类裸依赖（`loadPluginDirs` 现有提示文案已覆盖）。
+
+### 落档
+
+`spikes/a2a/`（两个 spike 脚本 + README，含跑法与结论）；计划文档新增 **§3.1.1**、§3.4 追加实测
+结论段、§6 P0.5 行改为结论并标注依赖解除、§8 风险表改两条（`--compile` 证伪 + 新增"SDK 自己写
+console"）、§10 第 5 条补 TTL 必要性；`AGENTS.md` §5 新增一条"protobuf SDK 两套表示"的纪律。
+**SDK 版本钉死 `@a2a-js/sdk@1.3.0`**（1.0 GA 于 2026-07-22，1.1/1.2/1.3 是 GA 后 minor 迭代）。
+
+下一步是 **P0：抽 `@harness/host`**（P1/P2/P3 的共同前置）：搬 `HarnessApp.boot` 与 6 个装配符号
+（`BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` /
+`loadPluginDirs` / `buildProviderWindowTable`），CLI 保持 re-export 兼容，并给 boot 内 16 处
+`stdout.write` 做三级分级（P0.5 后追加：还要罩住 SDK 的 console）。
+
 ## 2026-09-30（续 225）回合结束闸门：模型收尾 ≠ 本轮结束（引擎级等待 + 反抢活提示词）
 
 ### 缺口：步间闸门挂在"续轮"上，覆盖不到最常见的收尾形态

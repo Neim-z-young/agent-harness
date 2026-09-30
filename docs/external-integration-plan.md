@@ -76,6 +76,25 @@ A2A 当前 **v1.0，已捐赠 Linux Foundation**（原 Google 贡献）。TS 官
 
 > 注意：`/tasks/{id}:cancel`、`/tasks/{id}:subscribe` 是 **REST 端点**，不是 JSON-RPC 方法名；原稿把两者混进同一列。
 
+#### 3.1.1 spike 实测补充的三条口径（**都会静默失败**）
+
+`@a2a-js/sdk@1.3.0` 已**钉死并实测**（`spikes/a2a/`）。上面取自 SDK 常量的部分全部核对通过，
+另有三条是读类型定义读不出来、只有跑起来才会撞上的：
+
+1. **Part / Message 有两套表示，不能混用。** SDK 内部是 protobuf 对象：TS 侧写
+   `content: { $case: 'text', value }`，但**线上 JSON 是 `{"text":"...","mediaType":"..."}`**。
+   把 TS 内部表示直接 `JSON.stringify` 发出去，服务端 `fromJSON` 会**静默丢弃内容、不报错**
+   （实测回显 `echo: hello` 变成 `echo: `）。
+   ⇒ **出参一律走 SDK 导出的 `MessageFns.toJSON()`**（`Message` / `Task` / `AgentCard` 都有）；
+   入参若由我们构造也要 `toJSON`。**`Response.json()` 可以直接用**：protobuf 对象自带 `toJSON()`，
+   `JSON.stringify` 会自动调用 —— 已实测输出格式正确。
+2. **`TaskState` 是数字 enum，线上是字符串。** `TaskState.TASK_STATE_COMPLETED === 3`，而 JSON 里是
+   `"TASK_STATE_COMPLETED"`。事件映射表与状态比较**必须按字符串**（或用 `taskStateFromJSON`）。
+3. **版本校验不归 transport 管。** `JsonRpcTransportHandler` 不校验 `A2A-Version`，
+   **宿主必须自己调 `validateVersion(requestedVersion, card, 'JSONRPC')`**；头缺失时
+   `ServerCallContext.requestedVersion` 默认 `'0.3'`（卡片只声明 1.0 ⇒ 应拒绝）。
+   `validateVersion` 从 `@a2a-js/sdk/server` 导出，**根入口不导出**。
+
 ### 3.2 架构：**基于 SDK 骨架，不自建协议壳**
 
 `@a2a-js/sdk` 已提供 `AgentExecutor`（`execute` / `cancelTask`）、`DefaultRequestHandler`（请求路由、任务存储、版本校验、取消、推送）+ `ExecutionEventBus` + `TaskStore`（含 `InMemoryTaskStore`）与三种 transport handler。**自建"任务表 + 事件映射 + 取消桥"等于重做一遍 SDK 的活**，且更容易违反"不发明私有协议"。
@@ -128,6 +147,23 @@ A2A Client（其他 Agent）
    - 进程内维护 **挂起任务表** `taskId → { generator, pendingAsk, resolve, deadline }`；
    - `ask()` 返回一个 Promise，**由挂起任务表持有其 resolver**，同时向 SSE 流推一条 `TASK_STATE_INPUT_REQUIRED` 状态更新；
    - 后续 `SendMessage`/答复请求按 `taskId` 找回 resolver → resolve → 生成器继续跑。
+
+> ✅ **spike 实测（1.3.0）：可行，且比上面设想的"保存并恢复生成器"简单一档。** 走的是**模式 A**：
+> executor 在 `INPUT_REQUIRED` 之后**不返回**（`await` 答复），挂起表只需 `taskId → resolver`，
+> **不必跨请求保存/恢复 generator**：
+> - `ExecutionEventQueue.events()` 在 `message`、终态、**或 `INPUT_REQUIRED`** 时终止 ⇒
+>   **阻塞式 `SendMessage` 照样立即返回 `INPUT_REQUIRED`**，不必等终态（正好满足下方要点 2）；
+> - 后续带同一 `taskId` 的 `SendMessage` 会**再次调用 `execute`**，此时
+>   `requestContext.task.status.state === TASK_STATE_INPUT_REQUIRED` ⇒ 这一轮只负责把答复喂给
+>   resolver 唤醒第一轮，然后 **立即 return**（不再自己发事件）；
+> - 第一轮被唤醒后补发 artifact + `TASK_STATE_COMPLETED` ⇒ **续接请求的调用方直接拿到最终 artifact**
+>   （实测 6c/6d 两条断言即验此路径）。
+>
+> 代价与不变项：① executor 的 Promise 会长期悬挂，**TTL 与回收仍然要做**（要点 4 不变）；
+> ② 第一轮那条 SSE 连接会一直挂到答复到达 —— 客户端应自行断连后用 `SubscribeToTask` 重连；
+> ③ SDK 的 `DefaultRequestHandlerOptions.keepBusAliveStates` 默认已含
+> `INPUT_REQUIRED` / `AUTH_REQUIRED`，是为"executor 返回后仍保活"的模式 B 准备的 ——
+> 模式 A 下 executor 根本没返回，bus 天然存活，**这个默认值对我们是多余的保险，不必改**。
 2. **不能"聚合到终态才返回"**：非流式 `SendMessage` 也必须能返回 `INPUT_REQUIRED`（以及在工作开始时返回 `WORKING` 的前置状态），否则挂起语义永远到不了客户端。⇒ 原稿 §3.4"message/send 内部聚合到终态后一次性返回"作废，改为"**返回首个非 `WORKING` 的稳定状态，或首个中断/终态**"。
 3. **幂等唤醒**：重复答复、答复迟到于超时之后、答复里带旧 `messageId`，都必须被安全忽略（见 §3.5）。
 4. **超时与回收**：挂起任务需有 TTL；超时转 `TASK_STATE_FAILED`（或按配置取消），并释放生成器，避免泄漏。
@@ -238,14 +274,14 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 
 | 阶段 | 内容 | 交付物 | 验收口径（预期行为，非执行步骤） |
 |---|---|---|---|
-| **P0.5（先做，两个 spike）** | ① SDK **无框架** server 入口 + `Bun.serve` 最小可跑（回一个 `SendMessage` + 一张 agent-card）；② `bun build --compile` 产出的二进制**能否加载用户目录的动态 TS 插件** | spike 结论（可/不可 + 绕法） | ① 用官方 `a2a-inspector` 能拉到卡片并完成一次 `SendMessage`；② 明确 `--compile` 与 `loadPluginDirs` 是否兼容，P3 分发路径据此定案 |
+| **P0.5（✅ 已完成 2026-10-01）** | ① SDK **无框架** server 入口 + `Bun.serve` 最小可跑（回一个 `SendMessage` + 一张 agent-card）；② `bun build --compile` 产出的二进制**能否加载用户目录的动态 TS 插件** | `spikes/a2a/` 两个可复现脚本 + 结论已回写本文档（§3.1.1 / §3.4 / §8） | ① **可行**：`JsonRpcTransportHandler.handle(body, ctx)` 纯 JSON-RPC 进出、**完全不接触 HTTP**，直挂 `Bun.serve`，无需任何框架 peer dep；13 项自检全绿（取卡 / 非流式 / SSE / GetTask / ListTasks / CancelTask / **`INPUT_REQUIRED` 挂起与续接** / 版本校验 / 异常转 FAILED）。② **可行**：`--compile` 二进制**内嵌转译器**，能运行期加载用户目录 `.ts`（不只是 `.js`/`.mjs`），61MB / 冷启动 18ms ⇒ **P3 sidecar 可走单文件二进制**。SDK 版本**钉死 `@a2a-js/sdk@1.3.0`** |
 | **P0** | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器 |
 | **P1** | A2A 一期：AgentCard + SendMessage + SendStreamingMessage(SSE) + GetTask + CancelTask + Bearer + `A2A-Version` 校验 + `INPUT_REQUIRED` 权限（含 §3.4 挂起机制、§3.5 并发/幂等）；默认 127.0.0.1 | `@harness/a2a-server` 与 `harness a2a` 启动方式 | 用官方 `a2a-inspector` / `a2a-tck` 跑通：取到 agent-card；发消息后收到 task→artifact/状态更新→`TASK_STATE_COMPLETED` 的事件序列；取消后转 `TASK_STATE_CANCELED`；权限点转 `TASK_STATE_INPUT_REQUIRED` 且答复后续接；同 session 并发请求被串行化或结构化拒绝；重复 `messageId` 不重复执行 |
 | **P2** | VSCode Chat Participant（B2）：spawn sidecar（stdio）或连本地 A2A，转发流到 ResponseStream，含取消与权限弹窗 | VSIX 扩展（不发布 Marketplace） | 在 VSCode 中 `@harness` 提问可看到流式回答、工具进度、斜杠命令；终止按钮可中断；权限请求弹窗可决策 |
 | **P3** | VSCode Webview（B3）：平移块模型与侧栏（会话/后台任务/文件引用/统计）；sidecar 分发（`--compile` 或随扩展带 bun，取决于 P0.5 结论） | VSIX 完整版 | 终端 TUI 的核心信息结构在 IDE 内等价呈现 |
 | **旁路** | B1 MCP server（**需自建 server 端**，见 §4.1），做成插件 | 插件包 + MCP server 配置 | 支持 MCP 的 IDE 客户端能列出并调用 harness 工具，写操作触发权限 |
 
-依赖顺序：**P0.5 是 P1/P3 的前置结论**（协议口径与分发路径都靠它定案）；**P0 是 P1/P2/P3 的共同前置**；P1 的 server 可直接充当 P2 的 sidecar 传输层；旁路 B1 与主线并行、互不阻塞。
+依赖顺序：**P0.5 已出结论，P1/P3 的前置条件已解除**（协议口径与分发路径都定了）；**P0 是 P1/P2/P3 的共同前置**；P1 的 server 可直接充当 P2 的 sidecar 传输层；旁路 B1 与主线并行、互不阻塞。
 
 **P0 的 `createHost` 接口清单（必须覆盖 `boot()` 现状，原稿只写 4 个字段远不够）**：
 
@@ -286,7 +322,8 @@ createHost({
 
 | 风险/取舍 | 说明 | 对策 |
 |---|---|---|
-| **`bun build --compile` 与动态插件目录冲突** | harness 既 lazy `import()` 包名，也经 `loadPluginDirs` **运行期 import 用户目录里的 `.ts`/`.js`**。`--compile` 对运行期发现的动态导入与 TS 转译支持有限，很可能产不出"仍能加载用户 TS 插件"的单文件二进制 | **P0.5 spike 先验证**；不可行则 P3 分发退化为"随扩展带 bun"或"扩展内 Node 嵌入（v2 路线）" |
+| ~~`bun build --compile` 与动态插件目录冲突~~（**P0.5 已证伪**） | 原担心 `--compile` 对运行期发现的动态导入与 TS 转译支持有限，产不出"仍能加载用户 TS 插件"的单文件二进制 | **实测可行**：单文件二进制**内嵌转译器**，`.ts`/`.js`/`.mjs` 都能运行期 `import()`；插件的裸依赖按**插件文件所在目录向上**解析（与未编译时一致 —— 不是 `--compile` 引入的新限制）；绝对路径、相对 `.ts` 导入、`node:` 内置模块全部正常；**61MB / 冷启动 18ms** ⇒ **P3 sidecar 走 `--compile`**，"随扩展带 bun"降级为备选。**遗留的是既有问题、与 `--compile` 无关**：用户插件目录（如 `~/.harness/plugins/`）解析不到 `@harness/plugin` 这类裸依赖 —— `loadPluginDirs` 现有提示文案已覆盖 |
+| **SDK 自己写 `console`** | `DefaultRequestHandler` 在 executor 抛异常时会 `console.error` 打印**完整堆栈**（实测 "Agent execution failed for message …"） | 宿主日志出口必须能接管 stdout/stderr（P0 的 `logSink` 分级要求因此**比预想更强**：不只 harness 自己的 16 处 `stdout.write`，还要罩住 SDK 的 console）。对外响应仍只给结构化 code + message，不泄露堆栈（§3.3） |
 | A2A v0.3→v1.0 breaking + 网上示例过时 | 方法名/枚举/Part 结构都改过；原稿 §3.1 即照抄 v0.3 示例 | 口径**一律取自 SDK 常量**；开工前钉死 SDK 版本；映射表集中一处维护；验收用官方 `a2a-inspector` / `a2a-tck` |
 | SDK 成熟度 | JS SDK 1.0 GA 于 2026-07-22（距今约两个月），仍在快速迭代 | 钉版本 + 协议壳严格隔离 + 优先用 SDK 类型；升级按 minor 走回归 |
 | sidecar 分发体积/启动延迟 | `--compile` 二进制数十 MB，冷启动有成本 | 扩展激活时懒启动、单实例复用；v2 评估进程内化（Node 兼容成本已确认很低：仅 3 处 `Bun.*`） |
@@ -316,4 +353,7 @@ createHost({
 3. subagent 类 agent 是否对外暴露为独立 AgentCard？建议默认不暴露、配置开启。
 4. VSCode 扩展代码放主 monorepo（`adapters/`）还是独立仓库？建议独立仓库，避免 `@types/vscode` 与 webview 构建链污染主包。
 5. **挂起任务的 TTL 与超时行为**：超时后是 `TASK_STATE_FAILED` 还是自动取消？建议默认 `FAILED` 并保留已完成部分，可配。
+   *补充（P0.5 后）*：spike 走的是模式 A —— executor 在 `INPUT_REQUIRED` 处 `await` 不返回（§3.4），
+   因此 **TTL 不是"锦上添花"而是必需项**：没有 TTL 时 executor 的 Promise 会永久悬挂，
+   挂起表与 task 记录一起泄漏。TTL 到点必须主动 `resolve`（或 reject）并释放挂起表条目。
 6. **并发策略**：同 session 并发请求是**排队**还是**直接拒绝**？建议一期直接拒绝（语义简单、无隐藏积压），二期再评估排队。
