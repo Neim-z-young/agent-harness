@@ -1726,6 +1726,9 @@ export function renderRoster(list: readonly AgentDefinition[]): string {
     '多路派工时各路范围必须两两互斥（写明文件集，无交集）；公共文件只让一路读。',
     // 派工上下文提醒：子 Agent 看不到本会话，不给上下文的派工换回的是泛泛而谈
     '派工时 prompt 必须给足上下文：目标 + 路径/符号 + 已知结论与约束 + 验收标准 + 不要做什么。',
+    // 派工后别空转、也别抢活：有依赖就停手等（引擎在轮内替等，等待不烧步数），
+    // 自己先做一遍是重复劳动（双倍成本 + 结论可能打架），反复查状态是空转。
+    '派工后若下一步依赖它：停手等结果（引擎会在本轮内替你等，等待不烧步数），不要自己做一遍、也不要反复查状态。',
   ].join('\n')
 }
 
@@ -1947,6 +1950,12 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
             decision.pending = true
             decision.aliveCount = alive
             decision.reason = `${alive} 个后台子任务仍在运行`
+            // 认领"回合结束也该等我"：步间闸门只挂在"续轮"上，模型给出最终答复时循环直接
+            // break、闸门根本不会被触达 —— 派工方一句"已派出 N 路，等待结果"就收尾，
+            // 结果只能靠宿主续轮在下一轮 query 里补（真机 s_1790756963376_7r3x8：引擎空转
+            // 34.4s，且每个 worker 各触发一次"只收通知"的完整模型调用）。声明之后引擎会在
+            // 回合结束处原地等：不调用模型，等到这里报静默（任务全跑完）再继续本轮。
+            decision.waitAtTurnEnd = true
           }
         },
 

@@ -5,10 +5,12 @@ import {
   defineTool,
   mergeStepGateDecision,
   normalizeGateSliceMs,
+  normalizeTurnEndWaitMs,
   stepGateDelayMs,
   STEP_GATE_BACKOFF_MS,
   STEP_GATE_MAX_TOTAL_MS,
   STEP_GATE_SLICE_MS,
+  STEP_GATE_TURN_END_MAX_WAIT_MS,
   type AgentDefinition,
   type AgentPlugin,
   type AgentStepGateRecord,
@@ -25,20 +27,24 @@ import {
  * 把 30 步额度烧光（msg31 / msg66 两次撞顶；第一次撞顶时后台任务只做了一半），于是结果
  * 只能在**下一轮 query** 里才可能被看到 —— 要么用户自己敲键，要么等 barrier 续轮。
  *
- * 闸门要证的五件事：
+ * 闸门要证的六件事：
  * 1. 插件说"还有存活任务"时，下一步开跑前确实等了（且发 `step_gate` 事件）；
  * 2. 插件说"没了"时**这一步不再等**，但**每个步边界仍会重探**（阶梯归零，不是关闸门）；
  * 3. **档内分片重探**：任务中途跑完就不睡满整档（最多白等一个切片），`sliceMs=0` 能退回硬等；
  * 4. 没有任何插件实现时行为与改造前完全一致（不多等、不多发事件）；
  * 5. 每一步的**处置**都落一条 `agent.step.gate` 遥测 —— 其中"插件报存活、引擎却没等"
  *    （预算用尽 / 空阶梯 / 被中断）在改造前是**完全静默**的，见文件末尾那组用例。
+ * 6. **回合结束闸门**（2026-09-30 新增，见末尾那个 describe）：模型给出最终答复时
+ *    `shouldContinueStep()` 为假 ⇒ 循环直接 break，**步间闸门不会被触达**。若插件声明过
+ *    `waitAtTurnEnd`，引擎在 break 前再问一次（`phase: 'turn_end'`），仍报存活就**原地等**
+ *    （不调用模型），拿到通知后继续本轮 —— 补上"结果只能靠宿主下一轮 query 送达"的缺口。
  *
- * ⚠️ 闸门挂靠在**续轮**上，不是挂在"空转"上：`shouldContinueStep()` 的判据是
- * `toolCallCount > 0`，所以**能走到闸门的步边界，前提都是上一步调用了工具**；
- * 上一步没调工具（给最终答复）时本轮直接结束，闸门**根本不会被触达**。
+ * ⚠️ **步间**闸门挂靠在**续轮**上，不是挂在"空转"上：`shouldContinueStep()` 的判据是
+ * `toolCallCount > 0`，所以**能走到步间闸门的步边界，前提都是上一步调用了工具**；
+ * 上一步没调工具（给最终答复）时本轮直接结束 —— 那个出口由**回合结束闸门**负责（第 6 条）。
  * 因此"有 tool call 就不等"是错的 —— 恰恰是有 tool call 的步才续轮、下一步开跑前才经过闸门。
  * 真机语境里的"空转"指的是**有 tool call 但无进展**（反复 read_file/bash 查状态），
- * 这类步同样续轮、同样被闸门减速，那才是闸门要治的东西。
+ * 这类步同样续轮、同样被闸门减速，那才是步间闸门要治的东西。
  */
 
 // ===== L1：纯函数 =====
@@ -64,19 +70,29 @@ describe('stepGateDelayMs：退避阶梯', () => {
 
 describe('mergeStepGateDecision：多插件上报的合取与清洗', () => {
   it('未置 pending / 缺字段 ⇒ 不等', () => {
-    expect(mergeStepGateDecision(undefined)).toEqual({ pending: false })
-    expect(mergeStepGateDecision({})).toEqual({ pending: false })
-    expect(mergeStepGateDecision({ pending: false, aliveCount: 3 })).toEqual({ pending: false })
+    expect(mergeStepGateDecision(undefined)).toEqual({ pending: false, waitAtTurnEnd: false })
+    expect(mergeStepGateDecision({})).toEqual({ pending: false, waitAtTurnEnd: false })
+    expect(mergeStepGateDecision({ pending: false, aliveCount: 3 })).toEqual({ pending: false, waitAtTurnEnd: false })
     // 只认**严格 true**：插件写 'true'（字符串）这类脏值不该让引擎开始等
-    expect(mergeStepGateDecision({ pending: 'true' })).toEqual({ pending: false })
+    expect(mergeStepGateDecision({ pending: 'true' })).toEqual({ pending: false, waitAtTurnEnd: false })
   })
 
   it('pending=true 时透传合法 aliveCount / reason，脏值丢弃（不把引擎带下水）', () => {
     expect(mergeStepGateDecision({ pending: true, aliveCount: 4, reason: '4 个在跑' }))
-      .toEqual({ pending: true, aliveCount: 4, reason: '4 个在跑' })
-    expect(mergeStepGateDecision({ pending: true, aliveCount: Number.NaN })).toEqual({ pending: true })
-    expect(mergeStepGateDecision({ pending: true, aliveCount: '4' })).toEqual({ pending: true })
-    expect(mergeStepGateDecision({ pending: true, reason: '' })).toEqual({ pending: true })
+      .toEqual({ pending: true, waitAtTurnEnd: false, aliveCount: 4, reason: '4 个在跑' })
+    expect(mergeStepGateDecision({ pending: true, aliveCount: Number.NaN })).toEqual({ pending: true, waitAtTurnEnd: false })
+    expect(mergeStepGateDecision({ pending: true, aliveCount: '4' })).toEqual({ pending: true, waitAtTurnEnd: false })
+    expect(mergeStepGateDecision({ pending: true, reason: '' })).toEqual({ pending: true, waitAtTurnEnd: false })
+  })
+
+  it('waitAtTurnEnd 是**能力声明**，与本次 pending 解耦（报静默也可以声明参与）', () => {
+    // 场景：这回探测时任务刚好跑完（pending=false），但插件仍认领"回合结束也该等我"
+    // ⇒ 引擎必须武装本轮，否则"收尾那一步里任务刚好做完"的形态会被漏掉。
+    expect(mergeStepGateDecision({ waitAtTurnEnd: true })).toEqual({ pending: false, waitAtTurnEnd: true })
+    expect(mergeStepGateDecision({ pending: true, waitAtTurnEnd: true, aliveCount: 2 }))
+      .toEqual({ pending: true, waitAtTurnEnd: true, aliveCount: 2 })
+    // 同样只认严格 true
+    expect(mergeStepGateDecision({ waitAtTurnEnd: 1 })).toEqual({ pending: false, waitAtTurnEnd: false })
   })
 })
 
@@ -186,10 +202,19 @@ const flushBus = (): Promise<void> => new Promise((resolve) => setTimeout(resolv
  *
  * 额外的 `inputs` 记录每次调用看到的 `waitAttempt` / `waitedMs`：用来钉住
  * "片间重探不算新的一次等待"（这一档还没记账，插件看到的值不该变）。
+ *
+ * `opts.turnEnd` 置位后，报存活时**一并声明** `waitAtTurnEnd` —— 这是"参与回合结束等待"的
+ * 能力声明，引擎据此**才**会在回合末多探一次。默认不声明，所以既有用例的 `probes` 计数
+ * 不受新增的回合结束闸门影响（那正是我们要的：不声明就不该有额外询问）。
  */
-function gateProbe(aliveSeq: Array<number | undefined>): AgentPlugin & {
+function gateProbe(
+  aliveSeq: Array<number | undefined>,
+  opts: { turnEnd?: boolean } = {},
+): AgentPlugin & {
   probes: number
   inputs: Array<{ waitAttempt: number; waitedMs: number }>
+  /** 每次探测看到 `phase`（缺省记 `'step'`）—— 用来断言"回合结束到底探没探" */
+  phases: string[]
 } {
   const plugin = {
     id: 'gate-probe',
@@ -197,17 +222,20 @@ function gateProbe(aliveSeq: Array<number | undefined>): AgentPlugin & {
     name: 'GateProbe',
     probes: 0,
     inputs: [] as Array<{ waitAttempt: number; waitedMs: number }>,
+    phases: [] as string[],
     async install() {
       return {
-        'core.agent.step.gate'(input: unknown, decision: { pending?: boolean; aliveCount?: number; reason?: string }) {
-          const gi = (input ?? {}) as { waitAttempt?: number; waitedMs?: number }
+        'core.agent.step.gate'(input: unknown, decision: { pending?: boolean; aliveCount?: number; reason?: string; waitAtTurnEnd?: boolean }) {
+          const gi = (input ?? {}) as { waitAttempt?: number; waitedMs?: number; phase?: string }
           plugin.inputs.push({ waitAttempt: gi.waitAttempt ?? -1, waitedMs: gi.waitedMs ?? -1 })
+          plugin.phases.push(gi.phase ?? 'step')
           const alive = aliveSeq[Math.min(plugin.probes, aliveSeq.length - 1)]
           plugin.probes++
           if (alive !== undefined && alive > 0) {
             decision.pending = true
             decision.aliveCount = alive
             decision.reason = `${alive} 个后台子任务仍在运行`
+            if (opts.turnEnd) decision.waitAtTurnEnd = true
           }
         },
       } as Hooks
@@ -684,6 +712,213 @@ describe('闸门遥测：agent.step.gate（bus）', () => {
   })
 })
 
+// ===== 回合结束闸门：模型收尾 ≠ 本轮结束（后台任务还在跑）=====
+
+/**
+ * 真机背景（s_1790756963376_7r3x8）：lead 派完 4 个后台 reader 后播报一句就给了最终答复
+ * （`finish=stop`）⇒ `shouldContinueStep()` 为假 ⇒ 循环**直接 break**，挂在轮顶的步间闸门
+ * 根本没被触达。结果只能由宿主在下一轮 query 里补：中间 **34.4s** 引擎完全空闲，且每个
+ * worker 各触发一次"只收通知"的完整模型调用。
+ *
+ * 这一组钉住的是**引擎侧**那一半：等待发生在轮内、等待期间**不调用模型**、结果到达后
+ * 在**同一条 query** 里继续。宿主侧的 auto-continue 因此退化为兜底（只在预算见底时才用得上）。
+ *
+ * 为什么要有"声明"这一步（`waitAtTurnEnd`）：不做无条件探测，否则每个没有后台任务概念的
+ * 插件也会在回合末多挨一次询问，且一句顺口的"存活"就能让引擎真的等下去。
+ */
+describe('回合结束闸门：声明参与的插件报存活 ⇒ 轮内等到静默', () => {
+  /** 声明参与、并且可以演出"结果刚好入队"的探针 */
+  function turnEndProbe(opts: {
+    /** 第几次回合末探测开始报静默（默认第 2 次）；`0` = 从不报存活 */
+    silentFrom?: number
+    /** 第 N 次回合末探测时入队一条通知（模拟子 Agent 完成） */
+    notifyOn?: number
+    /** 第 1 次**步间**探测时入队该文本（用于验"引擎没 drain ⇒ 队列原样留给宿主"） */
+    notifyOnStep?: string
+    /** 是否声明参与回合结束等待（默认 true） */
+    declare?: boolean
+  } = {}) {
+    const silentFrom = opts.silentFrom ?? 2
+    const declare = opts.declare ?? true
+    const phases: string[] = []
+    let teProbes = 0
+    let stepProbes = 0
+    let hRef: Awaited<ReturnType<typeof createHarness>> | undefined
+    const plugin: AgentPlugin & { phases: string[]; teProbes: () => number } = {
+      id: 'turn-end-probe',
+      version: '1',
+      name: 'TurnEndProbe',
+      phases,
+      teProbes: () => teProbes,
+      async install() {
+        return {
+          'core.agent.step.gate'(
+            input: unknown,
+            decision: { pending?: boolean; aliveCount?: number; reason?: string; waitAtTurnEnd?: boolean },
+          ) {
+            const gi = (input ?? {}) as { phase?: string; sessionId?: string }
+            const phase = gi.phase ?? 'step'
+            phases.push(phase)
+            if (phase === 'step') {
+              stepProbes += 1
+              if (opts.notifyOnStep && stepProbes === 1 && hRef) {
+                hRef.session.enqueueNotification(gi.sessionId ?? '', opts.notifyOnStep)
+              }
+              if (!(silentFrom > 0)) return
+              decision.pending = true
+              decision.aliveCount = 1
+              decision.reason = '1 个后台子任务仍在运行'
+              if (declare) decision.waitAtTurnEnd = true
+              return
+            }
+            // 回合末探测：`silentFrom` 是"探测序号"，1 ⇒ 第一次就说静默（即不阻塞）
+            const alive = teProbes + 1 < silentFrom
+            teProbes += 1
+            if (!alive) return
+            if (opts.notifyOn === teProbes && hRef) {
+              hRef.session.enqueueNotification(gi.sessionId ?? '', '[task-notification] 后台任务已完成：结论 X')
+            }
+            decision.pending = true
+            decision.aliveCount = 1
+            decision.reason = '1 个后台子任务仍在运行'
+          },
+        } as Hooks
+      },
+    }
+    return { plugin, setHarness: (h: Awaited<ReturnType<typeof createHarness>>) => { hRef = h } }
+  }
+
+  /** 从会话里取出全部 text 片段（断言"通知真的进了对话"） */
+  async function sessionTexts(h: Awaited<ReturnType<typeof createHarness>>, sessionId: string): Promise<string[]> {
+    const stored = await h.session.get(sessionId)
+    return (stored?.messages ?? []).flatMap((m) =>
+      m.parts.map((p) => (p as { text?: string }).text ?? ''),
+    )
+  }
+
+  it('收尾后仍报存活 ⇒ 原地等到静默、把通知注入对话、在**同一条 query** 里继续', async () => {
+    // 剧本：step1 调工具（据此武装回合结束闸门）→ step2 收尾 → 引擎等到结果后继续 ⇒ step3 再收一次尾
+    const provider = scriptedProvider([stepChunks('a'), finalChunks, finalChunks])
+    const { plugin, setHarness } = turnEndProbe({ silentFrom: 2, notifyOn: 1 })
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [plugin],
+      stepGate: { ladderMs: [5], sliceMs: 5, turnEndMaxWaitMs: 2_000 },
+    })
+    setHarness(h)
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 6))
+    await flushBus()
+
+    // 步数语义：step1 工具、step2 收尾、step3 = **处理到达的通知**（同一轮内又调了一次模型）
+    expect(provider.calls).toBe(3)
+    expect(events.filter((e) => e.type === 'done')).toHaveLength(3)
+    // 相位序列：轮顶步间探测 → 回合末探测 ×2（第 2 次静默收工）→ 继续本轮后轮顶再探一次
+    // → 收尾时再探一次（第 3 次回合末探测已静默 ⇒ 不等待、不落遥测，但**探测本身**会发生）
+    expect(plugin.phases).toEqual(['step', 'turn_end', 'turn_end', 'step', 'turn_end'])
+    // 回合末等待只落一条遥测（第 2 次没等 ⇒ 不落），且 waitMs 是**实际**等的那一片
+    const tail = events.filter((e) => e.type === 'step_gate' && e.gate?.phase === 'turn_end')
+    expect(tail).toHaveLength(1)
+    expect(tail[0].gate?.waitMs).toBe(5)
+    expect(tail[0].gate?.aliveCount).toBe(1)
+    expect(records.filter((r) => r.phase === 'turn_end').map((r) => r.waitMs)).toEqual([5])
+    // 结果真的进了对话（user 消息）且队列已被消费 —— 宿主那套续轮不再需要了
+    const texts = await sessionTexts(h, sess.id)
+    expect(texts.some((t) => t.includes('后台任务已完成：结论 X'))).toBe(true)
+    expect(h.session.peekNotifications(sess.id)).toEqual([])
+    await h.stop()
+  })
+
+  it('预算=0（显式关闭）⇒ 不探测、不等待、**不 drain**：结果留给宿主兜底', async () => {
+    const provider = scriptedProvider([stepChunks('a'), finalChunks])
+    const { plugin, setHarness } = turnEndProbe({ silentFrom: 0 })
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [plugin],
+      stepGate: { ladderMs: [5], turnEndMaxWaitMs: 0 },
+    })
+    setHarness(h)
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+
+    expect(provider.calls).toBe(2) // 不多调一次模型
+    expect(plugin.phases).toEqual(['step']) // 回合末**一次都没探**
+    expect(events.filter((e) => e.type === 'step_gate' && e.gate?.phase === 'turn_end')).toHaveLength(0)
+    await h.stop()
+  })
+
+  it('未声明 ⇒ 回合末**不探测、不 drain**：既有语义一字不变（回归闸门）', async () => {
+    const provider = scriptedProvider([stepChunks('a'), finalChunks])
+    const { plugin, setHarness } = turnEndProbe({
+      silentFrom: 9,
+      declare: false,
+      notifyOnStep: '[task-notification] 中途就绪',
+    })
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [plugin],
+      stepGate: { ladderMs: [5] },
+    })
+    setHarness(h)
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+
+    const events = await collect(h.session.promptStream(sess.id, 'go', 5))
+
+    expect(provider.calls).toBe(2)
+    expect(plugin.phases).toEqual(['step']) // 只有轮顶那一次，没有 'turn_end'
+    expect(plugin.teProbes()).toBe(0)
+    expect(events.filter((e) => e.type === 'step_gate' && e.gate?.phase === 'turn_end')).toHaveLength(0)
+    // 不声明 ⇒ 引擎不接管送达：队列原样留着，交给宿主（CLI 的 attachAutoContinue）
+    expect(h.session.peekNotifications(sess.id)).toEqual(['[task-notification] 中途就绪'])
+    await h.stop()
+  })
+
+  it('等待途中预算见底 ⇒ 停止等待（不无限等），但已到达的结果照样 drain 进对话', async () => {
+    // 预算 20ms、切片 10ms、插件永远报存活 ⇒ 最多等 20ms（不是 2000ms），随后照常收工。
+    // 这条同时钉住"不会 ping-pong"：下一次回合末因预算已归零而直接返回（不再 drain、不再多调模型）。
+    const provider = scriptedProvider([stepChunks('a'), finalChunks, finalChunks])
+    const { plugin, setHarness } = turnEndProbe({ silentFrom: 99, notifyOn: 1 })
+    const h = await createHarness({
+      agents: [agent],
+      chatProvider: provider,
+      internalPlugins: [plugin],
+      stepGate: { ladderMs: [5], sliceMs: 10, turnEndMaxWaitMs: 20 },
+    })
+    setHarness(h)
+    h.tools.register(echoTool)
+    const records = watchGateBus(h)
+    const sess = await h.session.create()
+
+    const started = Date.now()
+    const events = await collect(h.session.promptStream(sess.id, 'go', 6))
+    const elapsed = Date.now() - started
+    await flushBus()
+
+    // 等满预算就收手（20ms），远小于"任务永不结束"会带来的时长
+    expect(elapsed).toBeLessThan(1_000)
+    expect(records.filter((r) => r.phase === 'turn_end').map((r) => r.waitMs)).toEqual([20])
+    const tail = events.filter((e) => e.type === 'step_gate' && e.gate?.phase === 'turn_end')
+    expect(tail).toHaveLength(1)
+    expect(tail[0].gate?.aliveCount).toBe(1)
+    // 已到达的结果仍然被处理（drain 进了对话）⇒ 多一次模型调用，但只有这一次
+    expect(provider.calls).toBe(3)
+    const texts = await sessionTexts(h, sess.id)
+    expect(texts.some((t) => t.includes('后台任务已完成：结论 X'))).toBe(true)
+    // 预算已归零 ⇒ 第二次回合末只探到"预算没了"就返回，不再产生 turn_end 探测
+    expect(plugin.phases.filter((p) => p === 'turn_end')).toHaveLength(3)
+    await h.stop()
+  })
+})
+
 describe('步间闸门常量', () => {
   it('阶梯末档（60s）必须 ≤ 等待总预算，否则末档永远取不到', () => {
     expect(Math.max(...STEP_GATE_BACKOFF_MS)).toBeLessThanOrEqual(STEP_GATE_MAX_TOTAL_MS)
@@ -692,5 +927,32 @@ describe('步间闸门常量', () => {
   it('总预算是有限值：闸门终止条件依赖插件上报，引擎必须有兜底', () => {
     expect(Number.isFinite(STEP_GATE_MAX_TOTAL_MS)).toBe(true)
     expect(STEP_GATE_MAX_TOTAL_MS).toBeLessThanOrEqual(600_000)
+  })
+
+  it('回合结束预算必须**有限且足够大**：它是真终止条件，且要盖住子 Agent 的默认超时', () => {
+    // 有限：一个卡住的后台任务不能让 query 永不返回（步间闸门那个是"提醒阈值"，两者不要混）
+    expect(Number.isFinite(STEP_GATE_TURN_END_MAX_WAIT_MS)).toBe(true)
+    expect(STEP_GATE_TURN_END_MAX_WAIT_MS).toBeGreaterThan(0)
+    // 足够大：子 Agent 默认超时 120s，实测 4 路真机派工 44~77s ⇒ 至少要留出这个量级的余量
+    expect(STEP_GATE_TURN_END_MAX_WAIT_MS).toBeGreaterThanOrEqual(120_000)
+    expect(STEP_GATE_TURN_END_MAX_WAIT_MS).toBeLessThanOrEqual(600_000)
+  })
+})
+
+describe('normalizeTurnEndWaitMs：回合结束预算的归一化', () => {
+  it('未指定 ⇒ 默认值', () => {
+    expect(normalizeTurnEndWaitMs(undefined)).toBe(STEP_GATE_TURN_END_MAX_WAIT_MS)
+  })
+
+  it('脏值（NaN / ±Infinity）回落**默认值**而不是"关闭" —— 安全阀不能被一个写错的数字拆掉', () => {
+    expect(normalizeTurnEndWaitMs(Number.NaN)).toBe(STEP_GATE_TURN_END_MAX_WAIT_MS)
+    expect(normalizeTurnEndWaitMs(Number.POSITIVE_INFINITY)).toBe(STEP_GATE_TURN_END_MAX_WAIT_MS)
+    expect(normalizeTurnEndWaitMs(Number.NEGATIVE_INFINITY)).toBe(STEP_GATE_TURN_END_MAX_WAIT_MS)
+  })
+
+  it('0 / 负数 ⇒ 0（显式关闭等待），正数下取整', () => {
+    expect(normalizeTurnEndWaitMs(0)).toBe(0)
+    expect(normalizeTurnEndWaitMs(-1)).toBe(0)
+    expect(normalizeTurnEndWaitMs(12.9)).toBe(12)
   })
 })

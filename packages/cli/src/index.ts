@@ -4636,7 +4636,11 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
       // 改成退避重试若干次，总预算约 1s，远小于误判空转的代价。
       const pending = await waitForPendingNotifications(harness.session, current.id)
       if (pending === 0) {
-        out('ℹ️  无待处理的后台任务结果，跳过本次自动续轮\n')
+        // 两个来源都会走到这里，措辞要同时覆盖：
+        // ① **引擎已在轮内送达**（subagent 声明了 `waitAtTurnEnd` ⇒ 回合结束闸门把通知 drain 进
+        //   了对话）—— 这是 2026-09-30 之后的常态，此时注入 `<continue/>` 已是空转；
+        // ② 结果尚未就绪（barrier 由异步的 `bus.publish` 驱动，理论上可能与入队错开）。
+        out('ℹ️  无待处理的后台结果（已处理或未就绪），跳过本次自动续轮\n')
         return 'continue'
       }
     } else {

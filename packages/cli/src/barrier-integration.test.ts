@@ -17,6 +17,12 @@
  *   真机上因此把已经跑完的结果滞留了 3 分 03 秒（s_1790082671456_82ikm：4 个 reader 21:22:15
  *   全部完成，通知 21:25:16 才随用户敲「?」进入对话）。续 191 修的就是这条，本断言现在是
  *   **回归闸门**：一旦有人把顺序换回去，这里会立刻失败。
+ *
+ * ⚠️ 2026-09-30 起本用例的**后半段语义变了**：引擎新增「回合结束闸门」（subagent 插件声明
+ *   `waitAtTurnEnd` ⇒ 模型收尾时若还有后台任务，引擎在轮内等到结果到达、drain 进对话后继续
+ *   本轮）。于是结果**不再需要**靠这一行 `<continue/>` 送达 —— 注入照常发生（事件源没变），
+ *   但走到内核时队列已空，`<continue/>` 退化为一次空转。本用例据此改为断言"**结果进了对话**"
+ *   这一更强的事实（旧版只能断言"队列里还有、等着被取走"）。
  */
 import { describe, it, expect } from 'bun:test'
 import { mkdtempSync, rmSync } from 'node:fs'
@@ -48,7 +54,7 @@ const researcher: AgentDefinition = {
 }
 
 describe('真实 barrier 场景（subagent 后台 → coordinator → <continue/> → 续轮）', () => {
-  it('后台任务集齐后真实注入 <continue/>，空转识别不吞通知', async () => {
+  it('后台任务集齐后真实注入 <continue/>；结果已由引擎在轮内送达', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'harness-barrier-'))
     try {
       const app = new HarnessApp({
@@ -109,14 +115,24 @@ describe('真实 barrier 场景（subagent 后台 → coordinator → <continue/
       expect(injected).toEqual(['<continue/>'])
       expect(peekAtBarrier ?? []).toHaveLength(1)
 
+      // ── 引擎已接管送达：结果在**同一条 query 内**被 drain 进对话 ──
+      //
+      // 2026-09-30「回合结束闸门」之后的契约：subagent 插件声明 `waitAtTurnEnd` ⇒ lead 给出
+      // 最终答复（无工具调用）时，引擎**原地等**后台结果（等待期间不调用模型），拿到通知后
+      // 继续本轮。所以走到 `processLine('<continue/>')` 时队列已空 —— 这不是"吞了结果"，
+      // 而是结果早已用掉（下面两条断言就是"没丢"的证据：它进了对话）。
+      const stored = await harness.session.get(sess.id)
+      const texts = (stored?.messages ?? []).flatMap((m) =>
+        m.parts.map((p) => (p as { text?: string }).text ?? ''),
+      )
+      expect(texts.some((t) => t.includes('task-notification'))).toBe(true)
+
       // ── 真实续轮（等价 REPL 的 rl.emit('line', '<continue/>')）──
+      // 现在是一次**空转**：注入照常发生（事件源不变），但内核读到空队列就跳过，不再多跑一轮。
       const r = await processLine('<continue/>')
       expect(r).toBe('continue')
-
-      // 空转识别没有误吞：没有「跳过」提示，模型真的被续轮调用（defaultResponse 渲染进输出）
-      expect(out.join('')).not.toContain('跳过本次自动续轮')
-      expect(out.join('')).toContain('等待后台任务完成')
-      // 通知已被本轮 drain 消费（即：确实作为上下文送进了这一轮推理）
+      expect(out.join('')).toContain('跳过本次自动续轮')
+      expect(out.join('')).toContain('等待后台任务完成') // 确认第一轮真的跑过（defaultResponse 渲染）
       expect(harness.session.peekNotifications(sess.id)).toEqual([])
 
       detachProbe()

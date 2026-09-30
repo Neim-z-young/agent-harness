@@ -752,6 +752,15 @@ export interface AgentStreamEvent {
     /** 等待原因（插件的说明，缺省时引擎拼一句） */
     reason?: string
     /**
+     * 这次等待发生在哪个阶段（缺省 `'step'`）。
+     *
+     * `'turn_end'` = **回合结束闸门**：模型已给出最终答复、本轮本来要结束，但仍有存活的后台
+     * 任务，于是引擎在轮内等它们跑完（等待期间不调用模型）。语义差别见
+     * `AgentStepGateRecord.phase` —— `'step'` 的 `waitMs` 是"一档退避"，
+     * `'turn_end'` 的是"这次收尾等待实际花掉的时间"。
+     */
+    phase?: 'step' | 'turn_end'
+    /**
      * 本次等待已经**超过**本轮等待总预算（`maxTotalMs`，默认 5 分钟）。
      *
      * `true` 表示"后台任务比预期久得多，可能卡死/异常"—— 引擎**不会**因超预算而停止
@@ -1996,6 +2005,22 @@ export const STEP_GATE_MAX_TOTAL_MS = 300_000
 export const STEP_GATE_SLICE_MS = 500
 
 /**
+ * **回合结束闸门**的等待预算（毫秒），默认 5 分钟。
+ *
+ * 与 {@link STEP_GATE_MAX_TOTAL_MS}（步间闸门的**提醒阈值**，不拦等待）不同，这个是**真的终止条件**：
+ * 累计超过它，本轮就不再原地等，直接把回合结束交还宿主（宿主侧还有 auto-continue 兜底）。
+ *
+ * 为什么必须给回合结束等待一个**真**终止条件：步间闸门等的是"下一步开跑前让一会"，
+ * 一次最多一档（≤60s）；而回合结束闸门是"等到任务全跑完为止"，没有终止条件的话，
+ * 一个卡住的后台任务会让**整条 query 永不返回**（连"我已停手"都报不出来）。
+ *
+ * 取值理由：子 Agent 的默认超时是 120s、可放宽到 600s，且超时由插件侧硬掐（`alive` 必然归零）。
+ * 5 分钟覆盖了绝大多数真机派工（实测 4 路 44~77s），同时保证"任务真卡住"时用户不用等太久
+ * 就能拿回控制权（界面有心跳，Ctrl-C 立即可中断）。
+ */
+export const STEP_GATE_TURN_END_MAX_WAIT_MS = 300_000
+
+/**
  * 取第 `attempt` 次等待的时长（毫秒）。`attempt` 从 0 起，超出阶梯长度后**保持末档**
  * （即 60s 起封顶），而不是重置或线性延长 —— 阶梯只负责"尽量早出声"，封顶负责"别太久"。
  */
@@ -2023,6 +2048,20 @@ export function normalizeGateSliceMs(sliceMs: number | undefined): number {
   return Math.floor(sliceMs)
 }
 
+/**
+ * 把宿主的 `turnEndMaxWaitMs` 归一成回合结束等待的预算（毫秒）；`0` 表示"不等"。
+ *
+ * 与 {@link normalizeGateSliceMs} 的差别只有一处、但是**故意**的：脏值（`NaN` / `±Infinity`）
+ * 回落**默认值**，而不是像切片那样回落"关闭"。切片是性能参数（关掉只是回退到硬等，
+ * 语义没错），预算是**安全阀**（关掉 ⇒ 一个卡住的后台任务能让 query 永不返回）。
+ * 一个写错的数字不该静默拆掉安全阀；要关就显式写 `0` 或 `waitAtTurnEnd: false`。
+ */
+export function normalizeTurnEndWaitMs(ms: number | undefined): number {
+  if (ms === undefined) return STEP_GATE_TURN_END_MAX_WAIT_MS
+  if (!Number.isFinite(ms)) return STEP_GATE_TURN_END_MAX_WAIT_MS
+  return ms > 0 ? Math.floor(ms) : 0
+}
+
 /** 步间闸门的可调参数（宿主注入；缺省即本模块导出的阶梯与预算） */
 export interface StepGateOptions {
   /** 关掉闸门（完全不在步间等待） */
@@ -2037,6 +2076,31 @@ export interface StepGateOptions {
    * 不小于档位时也等价于硬等（睡一片就够，不值得为一片加一次探测）。
    */
   sliceMs?: number
+  /**
+   * **回合结束闸门**是否启用（默认 `true`）。
+   *
+   * 语义：模型这一步**没有工具调用**（本来要结束本轮）、但插件仍报"有存活的后台任务"时，
+   * 引擎**在轮内原地等**（只做内存探测，**不调用模型**），等插件静默（任务全跑完）后把
+   * 待处理通知注入对话、并**继续本轮**让模型处理。
+   *
+   * 为什么默认开：结果怎么送达本来是**宿主职责**（CLI 订 `worker.completed` / `barrier.completed`
+   * 注入一行 `<continue/>`）—— 没有这套订阅的宿主（内嵌库、ACP、headless）会让**已经跑完的结果
+   * 滞留**到用户下一次发话（真机 s_1790592617954_axqkk：barrier +527s 完成，结果到 +2816s
+   * 才随用户敲键进入对话，中间 38 分钟界面停在等待中）。把它落进引擎，等于把"结果必须送达"
+   * 从**宿主约定**升级为**引擎保证**；宿主那套订阅退化为兜底（预算耗尽时才需要它）。
+   *
+   * 关掉它（`false`）就会回到"回合结束即交还控制权、结果靠宿主续轮"的旧语义 —— 需要让用户
+   * 在后台任务运行期间**能继续打字**的宿主可以这么配。
+   */
+  waitAtTurnEnd?: boolean
+  /**
+   * 回合结束等待的**预算**（毫秒，默认 {@link STEP_GATE_TURN_END_MAX_WAIT_MS}）。
+   *
+   * `<= 0` 关闭等待（等价于 `waitAtTurnEnd: false`）；`NaN` / `±Infinity` 回落默认值。
+   * 是**每轮 query 累计**上限，不是单次等待上限 —— 同一轮里反复"等到静默 → 模型又派一批"
+   * 也不会把总等待叠加到无限。超预算则结束本轮，把剩下的交给宿主兜底。
+   */
+  turnEndMaxWaitMs?: number
 }
 
 /**
@@ -2048,11 +2112,16 @@ export interface StepGateOptions {
  */
 export function mergeStepGateDecision(
   decision: AgentStepGateDecisionLike | undefined,
-): { pending: boolean; aliveCount?: number; reason?: string } {
-  if (!decision || decision.pending !== true) return { pending: false }
+): { pending: boolean; aliveCount?: number; reason?: string; waitAtTurnEnd: boolean } {
+  if (!decision) return { pending: false, waitAtTurnEnd: false }
+  // 「参与回合结束等待」是**能力声明**，与本次 `pending` 解耦：插件可以在这次报静默
+  // （任务刚好跑完）但仍然声明参与 —— 引擎据此武装本轮、并在回合结束再问一次。
+  const waitAtTurnEnd = decision.waitAtTurnEnd === true
+  if (decision.pending !== true) return { pending: false, waitAtTurnEnd }
   const alive = decision.aliveCount
   return {
     pending: true,
+    waitAtTurnEnd,
     ...(typeof alive === 'number' && Number.isFinite(alive) ? { aliveCount: alive } : {}),
     ...(typeof decision.reason === 'string' && decision.reason ? { reason: decision.reason } : {}),
   }
@@ -2063,6 +2132,7 @@ interface AgentStepGateDecisionLike {
   pending?: unknown
   aliveCount?: unknown
   reason?: unknown
+  waitAtTurnEnd?: unknown
 }
 
 /**
@@ -2275,6 +2345,154 @@ export class AgentRuntimeImpl implements AgentRuntime {
     void this.deps.bus
       .publish(AgentEvents.stepGate, payload, { source: 'agent' })
       .catch(() => undefined)
+  }
+
+  /**
+   * ── 回合结束闸门 ──
+   *
+   * 模型这一步**没有工具调用**（本轮本来要结束）、但插件仍报"有存活的后台任务"时，
+   * **在本轮内**原地等它们出结果，再把待处理通知注入对话，返回 `gotResult: true` 让调用方
+   * `continue` 本轮 —— 结果于是由**引擎**保证送达，而不是交给宿主在下一轮 query 里补。
+   *
+   * 与步间闸门（循环顶部那段）的三点分工，别把两者当同一条逻辑：
+   * - **不同时机**：步间闸门只在"上一步要求续轮"时被问到；这里只在"本轮要结束"时被问到。
+   *   两个出口互斥且互补。
+   * - **不同等待量**：步间闸门每个步边界**最多等一档退避**（避免单步阻塞数分钟）；这里是
+   *   "本来就没别的活可干"，等到**插件静默**（任务全跑完）为止，只受预算
+   *   {@link STEP_GATE_TURN_END_MAX_WAIT_MS} 与中断约束。
+   * - **不同代价**：步间闸门等待期间模型仍会在下一步被调用；这里**一次模型都不调** ——
+   *   等待不烧步数、不烧 token，"为了撑住回合而反复 read_file/bash 查状态"这类空转被堵死。
+   *
+   * 两个容易被写错的边界：
+   * - **无论有没有等到东西，结束前都要 drain 一次**：任务可能在"模型写最终答复"的那一步里
+   *   就跑完了（此时 `alive = 0` 但通知已在队列里），那一份也该在同一条 query 内被看到。
+   * - **预算在入口就已见底（`<= 0`）⇒ 直接返回，不探测、不 drain**：这是"这一轮的等待额度已经
+   *   花完"的信号，交还宿主兜底（宿主侧的 auto-continue 订阅仍在，见 `attachAutoContinue`）。
+   *   否则"任务仍在跑 + 通知陆续到达"会让 `continue` 反复发生，每次都是一次完整模型调用 ——
+   *   预算就形同虚设。等待**途中**见底则不同：那时已到达的结果照样 drain（见下一条）。
+   * - **等完（或等待途中预算见底）仍要 drain 一次**：部分 worker 可能已经回来了，把已经拿到的
+   *   结果处理掉是纯赚。之所以不会 ping-pong —— 下一回合结束时预算已归零，会走上面那条直接返回，
+   *   所以最多**多一次**模型调用。
+   *
+   * @returns `gotResult` 为 `true` ⇒ 调用方应 `continue` 本轮（对话里已经多了通知消息）；
+   *          `waitedMs` 是本次实际等待毫秒（调用方计入本轮累计与遥测）；
+   *          `gate` 非空 ⇒ 调用方要 `yield` 一条 `step_gate` 流事件 —— 界面靠它显示
+   *          "等待后台任务"的心跳。**必须由调用方 yield**：本方法是普通 async 私有方法，
+   *          不在生成器里，自己发不出流事件（这正是"长等待期间界面一片安静"那个观感问题的解）。
+   */
+  private async _waitForPendingTasksAtTurnEnd(opts: {
+    sessionId: string
+    agentId: string
+    step: number
+    gateAttempt: number
+    gateWaitedMs: number
+    /** 本轮此前已在"回合结束等待"上花掉的毫秒（预算按轮累计，不是按次） */
+    alreadyWaitedMs: number
+    signal?: AbortSignal
+  }): Promise<{
+    gotResult: boolean
+    waitedMs: number
+    /** 非空 ⇒ 调用方 `yield` 一条 `step_gate` 流事件（界面心跳） */
+    gate?: {
+      waitMs: number
+      waitedMs: number
+      attempt: number
+      slices?: number
+      aliveCount?: number
+      reason?: string
+      phase?: 'step' | 'turn_end'
+    }
+  }> {
+    const noResult = { gotResult: false, waitedMs: 0 } as const
+    const cfg = this.deps.stepGate
+    // 宿主总开关：`enabled === false`（整体关闸门）或 `waitAtTurnEnd === false`（只关这一条）
+    if (cfg?.enabled === false || cfg?.waitAtTurnEnd === false) return noResult
+    const budgetLeft = normalizeTurnEndWaitMs(cfg?.turnEndMaxWaitMs) - opts.alreadyWaitedMs
+    if (budgetLeft <= 0) return noResult
+
+    const sliceMs = normalizeGateSliceMs(cfg?.sliceMs) || STEP_GATE_SLICE_MS
+    let waitedMs = 0
+    let slices = 0
+    let aliveCount: number | undefined
+    let reason: string | undefined
+    while (!opts.signal?.aborted) {
+      const decision: AgentStepGateDecision = {}
+      await this.deps.triggerPlugin(
+        'core.agent.step.gate',
+        {
+          sessionId: opts.sessionId,
+          nextStep: opts.step + 1,
+          agentId: opts.agentId,
+          // 回合结束等待不参与退避阶梯（不是"下一次尝试"，而是"还没干完"）：
+          // 原样透传本轮已累计的档位与等待量，插件看到的仍是它自己那条时间线。
+          waitAttempt: opts.gateAttempt,
+          waitedMs: opts.gateWaitedMs + waitedMs,
+          step: opts.step,
+          phase: 'turn_end',
+        },
+        decision,
+      )
+      const merged = mergeStepGateDecision(decision)
+      if (!merged.pending) break // 静默 ⇒ 任务全跑完（或没有任务），可以收工
+      if (merged.aliveCount !== undefined) aliveCount = merged.aliveCount
+      if (merged.reason) reason = merged.reason
+      if (waitedMs + sliceMs > budgetLeft) break // 预算见底 ⇒ 不再等，交还宿主兜底
+      await sleepAbortable(sliceMs, opts.signal)
+      if (opts.signal?.aborted) break
+      waitedMs += sliceMs
+      slices += 1
+    }
+
+    let gate: {
+      waitMs: number
+      waitedMs: number
+      attempt: number
+      slices?: number
+      aliveCount?: number
+      reason?: string
+      phase?: 'step' | 'turn_end'
+    } | undefined
+    if (waitedMs > 0 && !opts.signal?.aborted) {
+      const why = reason ?? '等后台任务出结果'
+      const cumulative = opts.gateWaitedMs + waitedMs
+      gate = {
+        waitMs: waitedMs,
+        waitedMs: cumulative,
+        attempt: opts.gateAttempt,
+        slices,
+        ...(aliveCount !== undefined ? { aliveCount } : {}),
+        reason: why,
+        phase: 'turn_end',
+      }
+      this._publishStepGate({
+        sessionId: opts.sessionId,
+        agentId: opts.agentId,
+        step: opts.step,
+        nextStep: opts.step + 1,
+        attempt: opts.gateAttempt,
+        waitedMs: cumulative,
+        outcome: 'waited',
+        phase: 'turn_end',
+        waitMs: waitedMs,
+        slices,
+        sliceMs,
+        ...(aliveCount !== undefined ? { aliveCount } : {}),
+        reason: why,
+      })
+    }
+
+    // 结束前 drain 一次（理由见方法头注释）。中断时也 drain：结果已经在那儿了，
+    // 丢掉它只会让用户白等一次；反正本轮马上结束，多一条 user 消息不会再多一次模型调用。
+    const notifications = this.deps.session.drainNotifications(opts.sessionId)
+    for (const notif of notifications) {
+      await this.deps.session.addMessage(opts.sessionId, {
+        id: `notif_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        role: 'user',
+        parts: [{ type: 'text', text: notif }],
+        createdAt: Date.now(),
+      })
+    }
+    return { gotResult: notifications.length > 0, waitedMs, ...(gate ? { gate } : {}) }
   }
 
   /**
@@ -2724,6 +2942,17 @@ export class AgentRuntimeImpl implements AgentRuntime {
     // 探测到"没有存活任务"即归零），`gateWaitedMs` = 本轮累计等待（对总预算兜底）。
     let gateAttempt = 0
     let gateWaitedMs = 0
+    /**
+     * 本轮是否**武装**了回合结束闸门 —— 由插件在步间探测里显式声明
+     * （`AgentStepGateDecision.waitAtTurnEnd`）后置位，整轮单向、不重置。
+     *
+     * 为什么用"武装"而不是每轮无条件在回合末探测：无条件探测会让**没有后台任务概念的插件**
+     * 也在每个回合末多挨一次询问；更糟的是只要它顺口报个存活，引擎就会真的等到预算耗尽。
+     * 让"能产生需要等的任务"的那个插件显式认领，语义边界才清楚。
+     */
+    let turnEndWaitArmed = false
+    /** 本轮"回合结束等待"累计已花掉的毫秒（预算按**轮**计，不是按次计 —— 防反复续轮叠加） */
+    let turnEndWaitedMs = 0
     let wrapUpInjected = false
     const signal = input.signal
     // 最近若干次工具调用签名（跨步累积，供 doom-loop 检测）。保持 threshold-1 个即可：
@@ -2779,6 +3008,8 @@ export class AgentRuntimeImpl implements AgentRuntime {
             decision,
           )
           const merged = mergeStepGateDecision(decision)
+          // 能力声明：插件认领"回合结束也该等我" ⇒ 武装本轮的回合结束闸门（见 break 处那段说明）
+          if (merged.waitAtTurnEnd) turnEndWaitArmed = true
           if (!merged.pending) {
             // 静默：这一波任务已经没有了 ⇒ 阶梯归零（下一波从最小档起）。
             //
@@ -2828,7 +3059,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
                   },
                   probe,
                 )
-                if (!mergeStepGateDecision(probe).pending) break
+                // 片间重探也认一次声明（插件通常在"报存活"的那次里一并置位，这里只是兜底）
+                const probed = mergeStepGateDecision(probe)
+                if (probed.waitAtTurnEnd) turnEndWaitArmed = true
+                if (!probed.pending) break
               }
             } else {
               // 切片关掉（sliceMs=0）或本来就只有一片 ⇒ 整档硬等，与改造前逐字一致
@@ -2929,7 +3163,44 @@ export class AgentRuntimeImpl implements AgentRuntime {
 
         // doom-loop 被拒 / 被中断 ⇒ 立刻收手，不再续轮
         if (outcome.doomLoopTripped || outcome.aborted) break
-        if (!shouldContinueStep(outcome)) break
+        if (!shouldContinueStep(outcome)) {
+          // ── 回合结束闸门（"该等却没等"的那个出口）──
+          //
+          // 走到这里说明模型这一步**没有工具调用**（给了最终答复），本轮本来要结束。
+          // 但若本轮有插件声明过"回合结束也该等我"（`waitAtTurnEnd`），就先问一次
+          // `phase: 'turn_end'`：它仍报存活 ⇒ **在原地等它们出结果**（等待期间一次模型都不调），
+          // 拿到通知后注入对话并 `continue` 本轮，让模型在同一条 query 里处理。
+          //
+          // 为什么必须在**这个**出口补：步间闸门挂在"上一步要求续轮"上（循环顶部），
+          // 而模型给最终答复时循环**直接 break** —— 闸门根本不会被触达。真机
+          // s_1790756963376_7r3x8 正是这个形态：lead 派完 4 个 reader 后播报一句就收尾，
+          // 结果只能由宿主在**下一轮 query** 里送达（中间 34.4s 引擎完全空闲，且每个 worker
+          // 各触发一次完整模型调用 = 3 次"只收通知"的轮）。
+          //
+          // ⚠️ 只对**声明过**的插件生效（`turnEndWaitArmed`）：不做无条件探测，否则每个
+          // 没有后台任务概念的插件也会在回合末多挨一次询问，且一句顺口的"存活"就能让引擎等下去。
+          if (turnEndWaitArmed) {
+            const tail = await this._waitForPendingTasksAtTurnEnd({
+              sessionId,
+              agentId: prepared.agentId,
+              step,
+              gateAttempt,
+              gateWaitedMs,
+              alreadyWaitedMs: turnEndWaitedMs,
+              ...(signal ? { signal } : {}),
+            })
+            turnEndWaitedMs += tail.waitedMs
+            gateWaitedMs += tail.waitedMs
+            // 界面心跳：长等待期间不能一片安静（否则用户分不清"在等"还是"卡住了"）
+            if (tail.gate) yield { type: 'step_gate', gate: tail.gate }
+            if (tail.gotResult) {
+              // 有新结果进了对话 ⇒ 从最小档重新起步（与"探测为静默时阶梯归零"同一道理）
+              gateAttempt = 0
+              continue
+            }
+          }
+          break
+        }
 
         if (billedSteps >= maxSteps) {
           // 到顶但模型仍想继续：给一次收尾机会（追加提示再跑一步），而非硬截断。
@@ -3975,6 +4246,15 @@ export interface AgentStepGateRecord {
   waitedMs: number
   /** 真的等了 / 该等却没等 */
   outcome: 'waited' | 'skipped'
+  /**
+   * 这次处置属于哪个阶段（缺省 `'step'`）。
+   *
+   * `'turn_end'` = **回合结束闸门**：模型已给出最终答复（无工具调用）、本轮本来要结束，
+   * 但仍有存活的后台任务，于是引擎在轮内等它们跑完（不调用模型），拿到通知后继续本轮。
+   * 消费方要注意语义差别：`'step'` 的 `waitMs` 是"一档退避"，`'turn_end'` 的 `waitMs`
+   * 是"这一轮结束等待实际花掉的时间"，两者不可直接相加比较。
+   */
+  phase?: 'step' | 'turn_end'
   /** 本次**实际**等待毫秒（`'waited'` 时有值；与 `plannedMs` 不等即被切片提前结束） */
   waitMs?: number
   /** 本档**原定**毫秒（`'skipped'` 时是"没能等的那一档"） */
