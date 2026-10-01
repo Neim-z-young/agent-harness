@@ -1,8 +1,9 @@
 # VSCode 接入设计稿（P2 / P3）
 
 > 状态：**设计稿（§10 推荐项已按"案 A + 控制面 `POST /harness/rpc`"开工）** · 2026-10-01
-> 落地进度：**P2-A 控制通道已实现**（`packages/a2a-server/src/control.ts`，见 `docs/development-log.md` 续 240）；
-> 扩展骨架（P2-B）待做。下表 §9 的分期仍按本稿口径。
+> 落地进度：**P2-A 控制通道已实现**（`packages/a2a-server/src/control.ts`，续 240）；
+> **P2-B 扩展骨架已实现**（`adapters/vscode/`，含真 sidecar 端到端 + VSIX 实装，续 241）。
+> 下表 §9 的分期已更新。§5 的 reasoning 映射与 §3.2 的守卫**按实测订正**（见各节内的订正框）。
 > 上游：`docs/external-integration-plan.md` §4（方案 B）/ §5（总体架构）/ §6（P2/P3）
 > 前置：`docs/host-extraction-design.md`（P0，已落地）、`packages/a2a-server`（P1，已落地 + 官方 TCK 外部验收）
 >
@@ -170,6 +171,13 @@ agent-harness/                      # 主 monorepo（41 包，bun workspace）
 | `@types/vscode` / vsce / webview 链 | ✅ 天然隔离 | ✅ 只要独立 `package.json` |
 
 > ⚠️ **落地时必须验证**：`adapters/vscode/` 不能落进 root `tsconfig.json` 的 `include`，也不能出现在 `package.json` 的 `workspaces` 里 —— 否则 `bun run typecheck`（`bun --filter=* run typecheck`）会把它算进去，而它依赖 `@types/vscode`（需要 VSCode 引擎版本，主仓 CI 没有）。**这条要有一个守卫测试**（类似 P0 里读源码文本的那种防线）。
+>
+> ✅ **已落地（P2-B，2026-10-01）**：守卫在 `packages/a2a-server/src/adapters-isolation.test.ts`（5 条）——
+> ① `workspaces` 不含 adapters；② root `tsconfig.include` 不含 adapters；
+> ③ 扩展 `package.json` 不依赖 `@harness/*`；④ 扩展源码不 `import @harness/*`（跨进程只讲协议）；
+> ⑤ VSCode 引擎下限 ≥ 1.138。反向验证：把 `adapters/*` 塞进 workspaces ⇒ 第 ①条变红。
+> 另：隔离是**天然成立**的（workspaces 只含 packages 下的一层，tsconfig include 只含 packages 下各包的 src），
+> 守卫的作用是把"天然"变成"被断言"。
 
 ### 3.3 `package.json` 贡献点
 
@@ -264,15 +272,31 @@ export interface ChatResponseStream {
 
 ---
 
-## 5. 事件映射：`AgentStreamEvent` → `ChatResponseStream`
+## 5. 事件映射：跨进程事件 → `ChatResponseStream`
+
+> **⚠️ 原稿订正（P2-B 实测，2026-10-01）**
+>
+> 本节原稿写成"`AgentStreamEvent` → `ChatResponseStream`"，**在案 A 下是错的**：
+>
+> 1. **消费的不是 `AgentStreamEvent`** —— 跨进程之后扩展拿到的是 **A2A 的线上 JSON**
+>    （`{task}` / `{statusUpdate}` / `{artifactUpdate}` / `{message}`）。`AgentStreamEvent`
+>    在 sidecar 进程内就被 `StreamAdapter` 吃掉了，扩展根本看不见。
+>    实现在 `adapters/vscode/src/map/render.ts`，映射表按**实测抓帧**写。
+> 2. **`reasoning_delta` 拿不到内容** —— `mapping.ts` 的 `reasoning_delta` 分支
+>    **只累计字符数、不发事件**（`this.reasoningChars += ...; return []`）。
+>    所以"推理折叠块"在案 A 下**无从渲染**，只能显示"在思考"。
+>    设计稿 §10 第 5 项（reasoning 默认渲染）在案 A 下实际不可实现 —— 见下面订正后的表。
+>
+> 结论：下表"harness 侧事件"一列应读作**"语义来源"**，真正的输入是它经 `StreamAdapter`
+> 转成的 A2A 表示（`metadata.phase`：`tool-start` / `tool-result` / `gate` / `step`）。
 
 harness 侧事件源：`host.sendStream(sessionId, text, signal): AsyncGenerator<AgentStreamEvent>`（`packages/host/src/host.ts:1307`），
 事件联合定义在 `packages/core/src/index.ts:660`。
 
-| AgentStreamEvent | ChatResponseStream | 说明 |
-|---|---|---|
-| `text_delta` | `markdown(ev.text)` | **逐 delta 直通**（与 VSCode 官方教程一致）。VSCode 的 markdown 本就是增量追加，不需要像 A2A 那样攒成 400 字块 —— A2A 攒块是因为**它的粒度是任务生命周期**，不是性能 |
-| `reasoning_delta` | `markdown` 折叠块（增量） | 无稳定 reasoning part ⇒ 用 `<details><summary>思考</summary>` 包裹，逐 delta 追加。**默认折叠、可配关闭**（有些 Provider 的 reasoning 很长） |
+| AgentStreamEvent（语义来源） | 案 A 下的实际输入 | ChatResponseStream | 说明 |
+|---|---|---|---|
+| `text_delta` | `artifactUpdate.artifact.parts[*].text` | `markdown(...)` | 服务端按 `DEFAULT_CHUNK_CHARS` 攒块后**增量**推（`append` + `lastChunk`），不是逐字。注意与 A2A 侧一致：攒块是**任务生命周期粒度**的选择，不是性能 |
+| `reasoning_delta` | **无对应事件** | —— | ❌ **订正**：只累计字符数进终态 metadata，**内容不发**。案 A 下无法渲染推理块（§10 第 5 项作废，除非改 `StreamAdapter` 让它发出来） |
 | `tool_call_start` | `progress(...)` + `markdown` 工具块头 | 工具块头形如 `\`\`\`\n▸ <toolId> <input 摘要>\n\`\`\``，与 TUI 的 ChatBlock 观感对齐 |
 | `tool_call_result` | `markdown` 结果摘要 | `isError === true` ⇒ 前置 `⚠️`（无稳定 warning part）。长结果截断，完整结果走 `reference` 或折入折叠块 |
 | `step_gate` | `progress(\`等待后台任务（已等 ${waitMs/1000}s）…\`)` | AGENTS.md 的心跳约定（>15s 必须有可见反馈）；`waitMs` 是**实际**等待值，别用 `plannedMs` |
@@ -459,7 +483,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | **P2-A（✅ 已落地）** | **控制通道**：`POST /harness/rpc` + 14 个 `harness/*` 方法（`packages/a2a-server/src/control.ts`） | `@harness/a2a-server` 70 → **104 pass / 0 fail**；与协议面互不串线（同一方法名打到 `/a2a` ⇒ `MethodNotFound`）；卡片不含控制路径 |
-| **P2-B（骨架 / P2-v0）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答（非流式也先跑通） | 在 VSCode 里提问有回答 |
+| **P2-B（骨架 / P2-v0）（✅ 已落地 2026-10-01，续 241）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答 | **无头可验的部分全绿**：`adapters/vscode` 57 pass / 0 fail（含 6 条真 sidecar 端到端：握手 / 取卡 / 版本头陷阱 / 控制面 / 流式管道 / dispose 无残留）；VSIX 打包并用 `code --install-extension` 实装成功。**仍需人手点验**：在 Chat 视图里 `@harness` 提问（本机未装 Copilot，Chat 视图无模型提供方时不显示参与者） |
 | **P2-v1（对齐 plan 口径）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`）；启动自检提示 | plan §6 的 P2 验收全绿 |
 | **P2-v2** | 全部 18 命令；follow-ups；`reference`/`filetree` 呈现（文件引用、diff 预览） | — |
 | **P3** | webview 平移块模型与侧栏；`--compile` 单文件二进制随扩展分发 | plan §6 的 P3 验收 |
@@ -479,7 +503,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | 2 | 扩展位置 | **仓内 `adapters/vscode/`，但不入 workspace**（§3.2） |
 | 3 | 控制面路径 | **`POST /harness/rpc`**，不进 AgentCard（§6.3） |
 | 4 | 权限 asker 跨进程 | **复用 A2A 的 `INPUT_REQUIRED` 挂起**（§7.1 方案 a） |
-| 5 | `reasoning_delta` 默认渲染？ | 默认**折叠**渲染，可配关闭（§5） |
+| 5 | `reasoning_delta` 默认渲染？ | ❌ **案 A 下不可实现**（§5 订正）：`StreamAdapter` 只累计字符数、不发事件，扩展拿不到内容。要么改 `StreamAdapter` 让它发出来（会污染 A2A 产物语义），要么**放弃**该项。当前实现：只显示"在思考"级别的提示 |
 | 6 | 要不要同时把 harness 工具注册成 `languageModelTools`（让 Copilot agent mode 直接调）？ | **另开一条线**（即 plan 的 B1 变体），**不混进 P2** —— 二者是"harness 自主"与"Copilot 编排"两种世界观 |
 | 7 | 无 Copilot Chat 的环境怎么办？ | P2 只要求 Copilot Chat 存在（plan 已明示该局限）；P3 的 webview 是不依赖 Copilot 的兜底 |
 

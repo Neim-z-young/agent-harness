@@ -1,5 +1,124 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 241）P2-B：VSCode 扩展骨架 `adapters/vscode/` —— 案 A 传输 + 真 sidecar 端到端
+
+### 做什么
+
+按设计稿 §10 的推荐项（案 A 传输、`adapters/vscode/` 不入 workspace、控制面 `POST /harness/rpc`、
+权限复用 `INPUT_REQUIRED` 挂起）落 **P2-B 扩展骨架**。两块：
+
+1. **CLI 结构化握手** `harness a2a --json`（`packages/cli`）
+2. **扩展本体** `adapters/vscode/`（manifest + sidecar + 传输 + 映射 + 参与者）
+
+### 为什么先做握手，而不是先写扩展
+
+扩展要连 sidecar 就得知道端口，而 `--port 0` 时端口由内核分配 —— **只能从进程输出拿**。
+原稿 §9 已点出这个风险：解析带中文标签的多行启动横幅是"文案改一个字就静默崩掉"的耦合面。
+故先把 CLI 侧改成**单行 JSON 契约**（带 `v` 字段可演进），再让扩展去读它。
+
+实测握手（`--port 0`，0.21s）：
+
+```json
+{"v":1,"pid":82400,"port":65184,"protocolVersion":"1.0",
+ "rpcUrl":"http://127.0.0.1:65184/a2a",
+ "cardUrl":"http://127.0.0.1:65184/.well-known/agent-card.json",
+ "controlUrl":"http://127.0.0.1:65184/harness/rpc",
+ "auth":"anonymous","permissionMode":"ask","cwd":"…"}
+```
+
+json 模式下 **stdout 只有这一行**，装配期 notice（如"无 key 回落到 Mock"）改走 stderr
+—— 否则调用方"只读一行就停"会把降级事实吞掉（这正是 plan §6 挂着的那格）。
+
+### 一个实测出来的硬坑：版本头
+
+第一次探测流式，`SendStreamingMessage` 直接回：
+
+```
+-32009 The requested A2A protocol version '0.3' is not supported. Supported versions: 1.0
+```
+
+根因：SDK 的 `validateVersion` 在**头缺失时默认按 `'0.3'`** 校验，而本仓卡片只声明 `1.0`。
+⇒ **扩展必须显式带 `A2A-Version: 1.0`**。这不是兼容性细节，是能否通信的分水岭。
+已固化成用例（`a2a.test.ts` 第一条）与端到端复现用例（`e2e.test.ts`：缺头 ⇒ `-32009`）。
+
+### 扩展结构
+
+```
+adapters/vscode/           （不进 workspaces、不进 root tsconfig.include）
+├── package.json           chatParticipants: harness.agent；engines ^1.138.0
+├── tsconfig.json          独立；types = [vscode, node]；排除 *.test.ts
+└── src/
+    ├── types.ts           HarnessTransport 接口 + 握手 + 渲染算子
+    ├── sidecar.ts         spawn + 握手解析（纯函数可单测）+ 优雅停止
+    ├── protocol/sse.ts    SSE 解帧（按实测格式，不依赖 SDK 的 fetch 绑定版）
+    ├── protocol/jsonrpc.ts 信封 + 版本头常量
+    ├── transport/a2a.ts   案 A 实现（注入 fetchImpl 可假测）
+    ├── map/render.ts      A2A 事件 → 渲染算子（纯，不 import vscode）
+    ├── participant.ts     **唯一**碰 vscode 的地方
+    └── extension.ts       装配
+```
+
+三条分层纪律：**映射层与协议层不 import `vscode`**（可脱离 VSCode 单测）；
+**扩展不依赖任何 `@harness/*`**（跨进程只讲 A2A）；**只产出稳定版 `ChatResponseStream`
+表达得出来的算子**（稳定版只有 7 个方法，`thinkingProgress`/`warning` 在 proposed）。
+
+### 按实测订正了设计稿 §5（原稿有一处错）
+
+| 原稿 | 实测 |
+|---|---|
+| 扩展消费 `AgentStreamEvent` | ❌ 跨进程后拿到的是 **A2A 线上 JSON**（`{task}` / `{statusUpdate}` / `{artifactUpdate}`）；`AgentStreamEvent` 在 sidecar 内就被 `StreamAdapter` 吃掉了 |
+| `reasoning_delta` → markdown 折叠块 | ❌ `mapping.ts` 的该分支**只累计字符数、不发事件**（`return []`）⇒ 案 A 下**拿不到推理内容**。§10 第 5 项作废 |
+
+实测帧序列（真机）：`task(SUBMITTED)` → `statusUpdate(WORKING, phase=step)` →
+`artifactUpdate(name=answer, lastChunk=true)` → `statusUpdate(COMPLETED)`。
+相位 vocabulary 取自 `StreamAdapter`：`tool-start` / `tool-result` / `gate` / `step`。
+权限挂起：`statusUpdate(INPUT_REQUIRED)` + `metadata.kind='permission-request'`（四态在
+`metadata.options`），人话在 `status.message.parts[0].text`。
+
+### 两处刻意的判断
+
+1. **权限弹窗用 `showInformationMessage({modal:true})` 四按钮**，不用 `lm.registerTool` 的
+   `prepareInvocation`/`confirmationMessages` —— 后者是"Copilot 编排器调你的工具"的路径，
+   harness 是自己调自己的工具，编排器**不在链路上**，那个弹窗永远不会被触发。
+2. **跨轮状态走 `ChatResult.metadata`** —— `ChatContext` **只有 `history`，没有 session id**
+   （vscode.d.ts 实测）。写 `metadata`，下轮从 `ChatResponseTurn.result` 读回。
+
+### 无头环境下的验收口径
+
+本机 VSCode 1.139.1 + `code` CLI 可用，但**没装 Copilot** —— Chat 视图没有模型提供方时
+`@harness` 不会出现在参与者列表，所以"在窗口里手点"这条路走不通。能自动化的部分：
+
+- `bun test`（adapters 内）**57 pass / 0 fail / 5 文件**，其中 **6 条是真 sidecar 端到端**：
+  握手取真端口 / 取卡（且断言卡片不含 `/harness`）/ 缺版本头 ⇒ `-32009` /
+  控制面 `harness/notice.list` / 流式管道拿到 `contextId` 并可取消 / dispose 后进程真的没了。
+- `npx @vscode/vsce package` ⇒ `harness-vscode-0.1.0.vsix`（36 文件），
+  `code --install-extension` **实装成功**（`harness.harness-vscode` 已注册）——
+  这一步证明 manifest 的 `chatParticipants` 贡献点被 VSCode 接受。
+- 流式用例**只断言协议管道**（拿到 task 帧 + contextId），**不**断言模型回答 ——
+  否则用例会依赖外网与 Provider，变成 flaky。
+
+改动文件：新增 `adapters/vscode/`（11 源 + 4 测试 + manifest/tsconfig/README）、
+`packages/a2a-server/src/adapters-isolation.test.ts`（5 条守卫）；
+改 `packages/cli/src/index.ts`（`--json` 握手 + help）、`packages/cli/src/cli.test.ts`（+1）、
+`packages/a2a-server/src/index.ts`（导出 `A2A_PROTOCOL_VERSION`）。
+
+### 验证
+
+- 扩展：`tsc -p tsconfig.json`（真 `@types/vscode` 1.138）**exit 0**；`bun test` **57 pass / 0 fail**
+- 主仓：`bun run typecheck` **41 包 exit 0**（0 行 `error TS`）；`bun run test` **2305 pass / 0 fail / 41 包 exit 0 / 100 文件**（较 P2-A 的 2299 增 6：守卫 5 + CLI 1）
+- **反向验证 5 处，每处都变红**：
+  ① 摘 `A2A-Version` 头 ⇒1F；② 去掉"空 data 不产出帧"守卫 ⇒1F；
+  ③ 把 `INPUT_REQUIRED` 塞进终态集合 ⇒1F；④ 摘掉权限分支 ⇒4F；
+  ⑤ 把 `adapters/*` 塞进 workspaces ⇒1F。还原后 sha256 与实验前逐字一致。
+  （注：②的第一次尝试——不忽略注释行——**没有**变红，说明那条用例当时不敏感，已换成真正敏感的破坏点。）
+
+### 明确未做
+
+- **人手点验**：`@harness` 在 Chat 视图里提问（需装 Copilot）。
+- `harness/stats.get`（要先把 `resolveCurrentUsage` 等纯函数从 `@harness/cli` 上移，P2-A 已记边界）。
+- 全部 18 命令 / follow-ups / `reference`/`filetree` 呈现（P2-v1/v2）。
+- 案 B（stdio）实现 —— `HarnessTransport` 接口已抽出，将来是"加实现"不是"改一遍"。
+
 ## 2026-10-01（续 240）P2-A：控制通道 `POST /harness/rpc` —— 把协议之外的管理面补上
 
 ### 做什么

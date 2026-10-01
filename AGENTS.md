@@ -18,6 +18,16 @@
 
 - 新包必须同步在根 `tsconfig.json` 的 `paths` 与相关 `package.json` 的 `dependencies` 注册，然后 `bun install`
 
+- **`adapters/` 是例外，刻意不进 workspace**（`adapters/vscode/`：VSCode Chat Participant，P2）：
+
+  - 它带 `@types/vscode` 与 webview 构建链，进 workspace 会污染主包的类型面与依赖树；独立 `package.json` / `tsconfig.json`（`types: ["vscode","node"]`）
+
+  - **不依赖任何 `@harness/*`、源码也不 `import @harness/*`** —— 它是纯协议客户端，跨进程只讲 A2A（+ 控制面 `/harness/rpc`）
+
+  - 隔离由守卫测试断言（`packages/a2a-server/src/adapters-isolation.test.ts` 5 条）：`workspaces` 与 root `tsconfig.include` 都不含 adapters、扩展不依赖 `@harness/*`、引擎下限 ≥ 1.138
+
+  - 验证走自己的口径：`adapters/vscode` 下 `npm run typecheck`（真 `@types/vscode`）与 `bun test`（含真 sidecar 端到端）；主仓 `bun run typecheck` / `bun run test` **不覆盖**它
+
 ## 2. 运行命令（本机 bun 在 `/opt/homebrew/bin/bun`）
 
 - 安装依赖：`bun install`
