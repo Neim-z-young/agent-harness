@@ -76,7 +76,7 @@ describe('renderNotice：逐条字节快照（S2 的逐字不变判据）', () =
     expect(r('config.secret-unresolved', { message: '密钥解密失败' })).toBe('配置错误：密钥解密失败\n')
   })
 
-  it('config.plugins-inactive：未生效项 + 可用清单两行（cli.test.ts:1939 钉的就是这条）', () => {
+  it('config.plugins-inactive：未生效项 + 可用清单两行（cli.test.ts 的 boot「未登记 id 只告警」钉的就是这条）', () => {
     expect(r('config.plugins-inactive', { unknown: ['no-such-plugin'], available: ['memory', 'code-intel'] })).toBe(
       '[WARN] config.json → plugins 有未生效项：no-such-plugin\n' +
         '       可用内置插件：memory / code-intel\n',

@@ -1,10 +1,14 @@
 /**
  * @harness/host 配置归一化与窗口推导（P0 第三步 B 档）的归属测试。
  *
- * ## 与 cli 侧测试的关系
- * `cli.test.ts` / `provider-model.test.ts` 里原有用例保留原样（它们测的是「符号还能从
- * `@harness/cli` 拿到 + 行为不变」）。本文件测能力本身，且**不经过 cli** —— 将来 A2A server /
- * 编辑器扩展也吃这份实现，不该只被 cli 的测试间接覆盖。
+ * ## 与 cli 侧测试的关系（P0 收尾 S4 已收口）
+ * 搬迁期 `cli.test.ts` / `provider-model.test.ts` 里原样保留了一份同能力用例（"re-export 兼容"
+ * 口径）。S4 收口时按「**能力归 host，兼容归 cli**」去重：
+ *   - 本文件是**唯一**的能力测试 —— 覆盖实现本身，且**不经过 cli**（将来 A2A server / 编辑器扩展
+ *     也吃这份实现，不该只被 cli 的测试间接覆盖）；
+ *   - cli 侧的重复行为用例已删除，只留一条 re-export 兼容断言（见 `cli.test.ts`）；
+ *   - 曾经**只有 cli 覆盖**的 `resolveCompactionWindow` / `buildCompactionOptions` 已移入本文件
+ *     （它们是 host 拥有的推导，cli 侧只保留"与 acp-context 同一把尺子"的跨包守卫）。
  *
  * ## 为什么这几条值得钉住
  * 窗口是**占用率的分母**：显示、压缩阈值、ACP 三处若各算一遍，就会得到
@@ -19,9 +23,12 @@ import {
   formatModel,
   sanitizeProviderId,
   normalizeProviderConfigs,
+  checkProviderConfigs,
   isUsableWindow,
   resolveContextWindowTokens,
+  resolveCompactionWindow,
   buildProviderWindowTable,
+  buildCompactionOptions,
 } from './index'
 
 describe('parseModelSpec / formatModel：provider/model 规格解析', () => {
@@ -85,6 +92,49 @@ describe('normalizeProviderConfigs：id 缺省由 model 派生', () => {
     expect(providers).toEqual([])
     expect(issues).toHaveLength(1)
     expect(issues[0]!.message).toContain('无法派生')
+  })
+
+  it('同 model 多实例：派生 id 递增，但各自 baseUrl 原样保留（同模型多端点仍可区分）', () => {
+    const { providers } = normalizeProviderConfigs([
+      { type: 'openai', baseUrl: 'http://a', model: 'gpt-4o' },
+      { type: 'openai', baseUrl: 'http://b', model: 'gpt-4o' },
+      { type: 'openai', baseUrl: 'http://c', model: 'gpt-4o' },
+    ] as ProviderConfig[])
+    expect(providers.map((p) => p.id)).toEqual(['gpt-4o', 'gpt-4o-2', 'gpt-4o-3'])
+    expect(providers.map((p) => p.baseUrl)).toEqual(['http://a', 'http://b', 'http://c'])
+  })
+
+  it('显式 id 与派生 id 不冲突（显式优先，派生让位）', () => {
+    const { providers } = normalizeProviderConfigs([
+      { id: 'gw-a', type: 'openai', baseUrl: 'http://a', model: 'gpt-4o' },
+      { type: 'openai', baseUrl: 'http://b', model: 'gpt-4o' },
+    ] as ProviderConfig[])
+    expect(providers.map((p) => p.id)).toEqual(['gw-a', 'gpt-4o'])
+  })
+})
+
+describe('checkProviderConfigs：校验也按派生 id 判定（概览与校验不许各说各话）', () => {
+  it('省略 id 的配置校验通过，且默认 provider 可引用派生 id', () => {
+    // 概览按派生 id 展示、校验也须按派生 id 判定，否则会出现「概览正常但报 id 缺失」的自相矛盾
+    const { providers, issues } = checkProviderConfigs(
+      [
+        { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', model: 'hy4-preview-f' },
+        { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', model: 'hy3' },
+      ],
+      'hy3',
+      ['openai', 'anthropic'],
+    )
+    expect(issues).toHaveLength(0)
+    expect(providers.map((p) => p.id)).toEqual(['hy4-preview-f', 'hy3'])
+  })
+
+  it('默认 provider 指向不存在的 id 仍报错', () => {
+    const { issues } = checkProviderConfigs(
+      [{ type: 'openai', baseUrl: 'http://x', model: 'hy3' }],
+      'local-hy3',
+      ['openai'],
+    )
+    expect(issues.some((s) => s.includes('未在 providers'))).toBe(true)
   })
 })
 
@@ -176,5 +226,92 @@ describe('buildProviderWindowTable：按端点建表（ACP 的分母来源）', 
     }
     expect(resolveContextWindowTokens(wide, 'big')).toBe(300_000)
     expect(buildProviderWindowTable(wide, 'big').fallback).toBe(300_000)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 会话压缩分母：`resolveCompactionWindow` / `buildCompactionOptions`
+// ---------------------------------------------------------------------------
+// 从 `cli.test.ts` 移入（S4 收口）：这两个是 host 拥有的推导，此前**只有 cli 侧**覆盖。
+// 它们把「窗口表 + 本会话端点」翻译成会话压缩实际使用的分母 —— 分母算错就是那条
+// 「阈值算到真实窗口之外 ⇒ 自动压缩永不触发且无任何症状」的故障形态。
+
+describe('resolveCompactionWindow：分母跟着本会话端点走', () => {
+  const providers = [
+    { id: 'online', type: 'openai', model: 'deepseek-flash', contextWindowTokens: 300_000 },
+    { id: 'hy3', type: 'openai', model: 'hy3', contextWindowTokens: 200_000 },
+  ] as ProviderConfig[]
+  const cfg = { providers }
+
+  it('同一份 config、两条会话、两个分母；查不到端点则逐位回到改造前的推导', () => {
+    // 这正是要修的 bug 形态：此前恒为默认 Provider 的 300000。
+    // 真机后果：阈值 = 95% × (300000 − 30000) = 256500 > 200000 ⇒ 自动压缩**永不触发**且无任何症状。
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'hy3' })).toBe(200_000)
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'online' })).toBe(300_000)
+    // 只给 modelId 也能命中（agent md 里写 modelId 比写派生出的 provider id 自然）
+    expect(resolveCompactionWindow(cfg, 'online', { modelId: 'hy3' })).toBe(200_000)
+    // 两个维度都给时按实例维度（更具体）
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'online', modelId: 'hy3' })).toBe(300_000)
+    // 查不到 / 没给端点 ⇒ fallback，逐位等于改造前的推导（"缺省零行为变更"的保证点）
+    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'ghost' })).toBe(300_000)
+    expect(resolveCompactionWindow(cfg, 'online', {})).toBe(300_000)
+    expect(resolveCompactionWindow(cfg, 'online')).toBe(resolveContextWindowTokens(cfg, 'online'))
+  })
+
+  it('显式值排在最前（写了就得生效）：compaction 段专用键优先于 compression 的全局键', () => {
+    expect(resolveCompactionWindow({ ...cfg, compaction: { contextWindowTokens: 50_000 } }, 'online', { providerId: 'hy3' }))
+      .toBe(50_000)
+    expect(resolveCompactionWindow({ ...cfg, compression: { modelContextLimit: 60_000 } }, 'online', { providerId: 'hy3' }))
+      .toBe(60_000)
+  })
+
+  it('表里混进非法窗口（0 / 负数）时不当分母、也不算出 NaN/Infinity', () => {
+    const dirty = [{ id: 'zero', type: 'openai', model: 'z', contextWindowTokens: 0 }] as ProviderConfig[]
+    expect(resolveCompactionWindow({ providers: dirty }, 'zero', { providerId: 'zero' })).toBe(200_000)
+    expect(resolveCompactionWindow({}, 'mock', { providerId: 'x', modelId: 'y' })).toBe(200_000)
+  })
+})
+
+describe('buildCompactionOptions：窗口按 Provider 推导，配置字段逐项透传', () => {
+  it('缺省只带推导出的窗口；compaction 段字段逐项透传；显式窗口压过 Provider', () => {
+    const providers = [{ type: 'openai', model: 'hy3', contextWindowTokens: 102_400 }] as ProviderConfig[]
+    // 缺省：只带推导出的窗口（102400，而不是 core 内那个硬编码的 200000）
+    expect(buildCompactionOptions({ providers }, 'hy3')).toEqual({ contextWindowTokens: 102_400 })
+    const opt = buildCompactionOptions(
+      {
+        providers,
+        compaction: {
+          strategy: 'prune',
+          keepRecentMessages: 20,
+          summaryMaxChars: 5_000,
+          autoCompactThresholdPct: 70,
+          reservedTokens: 10_000,
+          tokenCalibration: 'chars4',
+        },
+      },
+      'hy3',
+    )
+    expect(opt).toEqual({
+      contextWindowTokens: 102_400,
+      strategy: 'prune',
+      keepRecentMessages: 20,
+      summaryMaxChars: 5_000,
+      autoCompactThresholdPct: 70,
+      reservedTokens: 10_000,
+      tokenCalibration: 'chars4',
+    })
+    // compaction.contextWindowTokens 是本段专用覆盖，优先级高于 Provider
+    expect(buildCompactionOptions({ providers, compaction: { contextWindowTokens: 60_000 } }, 'hy3').contextWindowTokens)
+      .toBe(60_000)
+  })
+
+  it('传了端点 ⇒ 窗口按该端点取；不传 ⇒ 仍按默认 Provider（老调用点分母不被静默改掉）', () => {
+    const two = [
+      { id: 'big', type: 'openai', model: 'm-big', contextWindowTokens: 300_000 },
+      { id: 'small', type: 'openai', model: 'm-small', contextWindowTokens: 200_000 },
+    ] as ProviderConfig[]
+    expect(buildCompactionOptions({ providers: two }, 'big', { providerId: 'small' }).contextWindowTokens).toBe(200_000)
+    expect(buildCompactionOptions({ providers: two }, 'big', { providerId: 'big' }).contextWindowTokens).toBe(300_000)
+    expect(buildCompactionOptions({ providers: two }, 'big').contextWindowTokens).toBe(300_000)
   })
 })

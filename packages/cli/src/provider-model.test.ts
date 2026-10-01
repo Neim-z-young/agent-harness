@@ -5,10 +5,8 @@ import { tmpdir } from 'node:os'
 import {
   HarnessApp,
   normalizeProviderConfigs,
-  checkProviderConfigs,
   resolveModelArg,
   formatResolutionRef,
-  sanitizeProviderId,
   formatApiKeyTag,
   findTokenOnlyDuplicates,
   startRepl,
@@ -16,85 +14,6 @@ import {
   buildCompactionOptions,
 } from './index'
 import type { ProviderConfig } from '@harness/plugin'
-
-// ==========================================================================
-// 归一化：id 不再必须冗长/手写
-// ==========================================================================
-
-describe('normalizeProviderConfigs：id 缺省由 model 派生', () => {
-  it('省略 id 时按 model 命名（去 provider/ 前缀、规整非法字符）', () => {
-    const { providers, issues } = normalizeProviderConfigs([
-      { type: 'openai', baseUrl: 'http://x', model: 'hy3' },
-      { type: 'openai', baseUrl: 'http://x', model: 'deepseek-v4.1-flash' },
-      { type: 'anthropic', model: 'anthropic/claude-3-5-sonnet' },
-    ])
-    expect(issues).toHaveLength(0)
-    expect(providers.map((p) => p.id)).toEqual(['hy3', 'deepseek-v4.1-flash', 'claude-3-5-sonnet'])
-  })
-
-  it('同 model 重复出现时按数组顺序追加 -2/-3（确定性，无需人工起名）', () => {
-    const { providers } = normalizeProviderConfigs([
-      { type: 'openai', baseUrl: 'http://a', model: 'gpt-4o' },
-      { type: 'openai', baseUrl: 'http://b', model: 'gpt-4o' },
-      { type: 'openai', baseUrl: 'http://c', model: 'gpt-4o' },
-    ])
-    expect(providers.map((p) => p.id)).toEqual(['gpt-4o', 'gpt-4o-2', 'gpt-4o-3'])
-    // baseUrl 各自保留 —— 同模型多端点仍能区分
-    expect(providers.map((p) => p.baseUrl)).toEqual(['http://a', 'http://b', 'http://c'])
-  })
-
-  it('显式 id 原样保留，且与派生 id 不冲突', () => {
-    const { providers } = normalizeProviderConfigs([
-      { id: 'gw-a', type: 'openai', baseUrl: 'http://a', model: 'gpt-4o' },
-      { type: 'openai', baseUrl: 'http://b', model: 'gpt-4o' },
-    ])
-    expect(providers.map((p) => p.id)).toEqual(['gw-a', 'gpt-4o'])
-  })
-
-  it('显式 id 重复 → 报错（沿用旧语义，避免静默覆盖注册）', () => {
-    const { issues } = normalizeProviderConfigs([
-      { id: 'openai', type: 'openai' },
-      { id: 'openai', type: 'openai' },
-    ])
-    expect(issues).toHaveLength(1)
-    expect(issues[0].message).toContain('重复')
-    expect(issues[0].index).toBe(1)
-  })
-
-  it('id 与 model 都缺失 → 报错（无从派生）', () => {
-    const { issues } = normalizeProviderConfigs([{ type: 'openai', baseUrl: 'http://x' } as ProviderConfig])
-    expect(issues).toHaveLength(1)
-    expect(issues[0].message).toContain('既未写 id 也未写 model')
-  })
-
-  it('sanitizeProviderId 规整非法字符并去首尾连字符', () => {
-    expect(sanitizeProviderId('Qwen2.5 7B')).toBe('Qwen2.5-7B')
-    expect(sanitizeProviderId('  /foo//bar/  ')).toBe('foo-bar')
-  })
-
-  it('checkProviderConfigs：省略 id 的配置校验通过，且默认 provider 可引用派生 id', () => {
-    // 概览按派生 id 展示、校验也须按派生 id 判定，否则会出现「概览正常但报 id 缺失」的自相矛盾
-    const { providers, issues } = checkProviderConfigs(
-      [
-        { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', model: 'hy4-preview-f' },
-        { type: 'openai', baseUrl: 'http://127.0.0.1:8787/v1', model: 'hy3' },
-      ],
-      'hy3',
-      ['openai', 'anthropic'],
-    )
-    expect(issues).toHaveLength(0)
-    expect(providers.map((p) => p.id)).toEqual(['hy4-preview-f', 'hy3'])
-  })
-
-  it('checkProviderConfigs：默认 provider 指向不存在的 id 仍报错', () => {
-    const { issues } = checkProviderConfigs(
-      [{ type: 'openai', baseUrl: 'http://x', model: 'hy3' }],
-      'local-hy3',
-      ['openai'],
-    )
-    expect(issues.some((s) => s.includes('未在 providers'))).toBe(true)
-  })
-})
 
 // ==========================================================================
 // 解析：/model 支持序号 / 实例 id / 模型名 / provider/model

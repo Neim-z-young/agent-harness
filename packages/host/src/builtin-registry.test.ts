@@ -1,15 +1,14 @@
 /**
  * @harness/host 内置注册表三节（P0 第二步搬迁）的归属测试。
  *
- * ## 与 cli.test.ts 的关系：有意重叠，但口径不同
- * 搬迁前这些用例住在 `packages/cli/src/cli.test.ts`（那里仍原样保留着）。
- * 两边同时存在不是冗余，而是各测一件事：
+ * ## 与 cli.test.ts 的关系：S4 已收口为「能力归 host，兼容归 cli」
+ * 搬迁前这些用例住在 `packages/cli/src/cli.test.ts`，搬迁期两边同时存在、各测一件事：
  *   - **cli 侧**测「re-export 兼容」—— 符号还能从 `@harness/cli` 拿到、行为不变；
  *   - **本文件**测「能力本身」—— 注册/解析/惰性加载的语义在 host 这一层成立，
- *     且**不经过 cli**（将来 A2A server / 编辑器扩展也吃这份实现，它们不该被 cli 的
+ *     且**不经过 cli**（将来 A2A server / 编辑器扩展也吃这份实现，不该只被 cli 的
  *     测试间接覆盖）。
- * 待 P0 第二步收口（`HarnessApp.boot` 搬完）再决定哪边留下：现在删任何一边都会要么
- * 丢兼容保护、要么丢能力覆盖。
+ * P0 收尾 S4 把 cli 侧的**重复行为用例删除**，只留一条 re-export 兼容断言；本文件成为唯一
+ * 的能力测试。这样"符号仍可从 `@harness/cli` 取得"这条约定由断言钉住，而能力覆盖不再有两份。
  */
 
 import { describe, it, expect } from 'bun:test'

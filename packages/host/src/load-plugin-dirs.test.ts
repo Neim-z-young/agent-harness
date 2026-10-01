@@ -1,9 +1,11 @@
 /**
  * `loadPluginDirs` 簇的归属测试（从 `cli.test.ts` 迁出后的新家）。
  *
- * 这些行为此前由 `cli.test.ts` 覆盖（9 条）。搬迁后 CLI 侧仍保留原用例作为
- * **re-export 兼容回归**（它们保证 `@harness/cli` 的既有导出面不变），本文件则按
- * "能力归属"覆盖实现本身 —— 待 P0 第二步把 `boot` 也搬进 host 时，再统一收口去重。
+ * ## 与 cli 侧测试的关系（P0 收尾 S4 已收口）
+ * 搬迁期 `cli.test.ts` 原样保留了一份同能力用例（"re-export 兼容"口径，9 条）。S4 收口按
+ * 「**能力归 host，兼容归 cli**」去重：cli 侧重复的行为用例已删除，只留一条 re-export
+ * 兼容断言（见 `cli.test.ts`）；本文件是**唯一**的能力测试 —— 覆盖实现本身，且不经过 cli。
+ * 其中「相对路径导入失败按原样告警」原先只在 cli 侧有覆盖，已一并移入本文件。
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs'
@@ -154,6 +156,21 @@ describe('loadPluginDirs：失败隔离', () => {
     const text = logs.join('')
     expect(text).toContain('插件加载失败')
     expect(text).toContain('config.json → "plugins"')
+  })
+
+  it('相对路径导入失败按原样告警（不再有补锚点逻辑）', async () => {
+    const pluginDir = join(dir, 'relative-plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    // 用上导入的绑定，避免被 Bun 当死代码消除而根本不解析
+    writeFileSync(join(pluginDir, 'bad.ts'), `
+      import { x } from './nowhere'
+      export const plugins = [{ id: 'ext.bad', version: '1', name: String(x), async install() { return {} } }]
+    `)
+    const logs: string[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s), { allowCode: true })
+    expect(result.plugins).toEqual([])
+    expect(logs.some((l) => l.includes('插件加载失败'))).toBe(true)
+    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(false)
   })
 
   it('log 回调缺省时退化写 stderr（不抛错）', async () => {

@@ -23,20 +23,13 @@ import {
   checkCompressionConfig,
   checkTelemetryConfig,
   toAcpConfig,
-  resolveContextWindowTokens,
   buildProviderWindowTable,
   resolveCompactionWindow,
-  buildCompactionOptions,
   checkCompactionConfig,
   checkCompactionReachability,
   registerBuiltinProviderTypes,
   getBuiltinRegistry,
-  getBuiltinToolRegistry,
-  preloadBuiltinToolMetas,
   resolveBuiltinPlugins,
-  unknownBuiltinPluginIds,
-  BuiltinToolRegistry,
-  loadPluginDirs,
   startRepl,
   attachBackgroundTaskPanel,
   attachAutoContinue,
@@ -54,6 +47,47 @@ import { defineTool } from '@harness/tool'
 import type { PermissionDecision } from '@harness/permission'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 import { ProviderTypeRegistry, resolveProviderTypeFactory } from '@harness/plugin'
+
+// ==========================================================================
+// re-export 兼容（P0 收尾 S4 收口）
+// ==========================================================================
+// P0 把装配原语 / 配置层 / 权限接缝 / 装配主体上移到 `@harness/host` 后，`@harness/cli` 继续
+// re-export 这些符号（外部与既有调用点都直接 `import` 它们）。搬迁期 cli 侧还留了一份同能力的
+// **行为**用例作双保险；S4 收口删掉了这份重复，只留下面这一条：**导出面不变 —— 从 `@harness/cli`
+// 取到的名字与从 `@harness/host` 取到的是同一个**。这样"符号仍可从 `@harness/cli` 取得"这条约定
+// 仍被钉住，而能力覆盖只有 host 一份（见各 host 测试文件）。
+describe('@harness/cli re-export 兼容（上移符号与 @harness/host 同源）', () => {
+  it('每个上移符号都 === 从 @harness/host 取到的那个（导出面逐字不变）', async () => {
+    const cli = await import('./index') as Record<string, unknown>
+    const host = await import('@harness/host') as Record<string, unknown>
+    const MOVED = [
+      // A 档：外部插件目录加载
+      'loadPluginDirs', 'collectAgentPlugins', 'registerProviderTypeFactory',
+      // C 档：内置注册表三节 + 共用惰性加载入口
+      'lazyImport', 'registerBuiltinProviderTypes', 'getBuiltinRegistry', 'unknownBuiltinPluginIds',
+      'resolveBuiltinPlugins', 'getBuiltinToolRegistry', 'preloadBuiltinToolMetas',
+      'BuiltinPluginRegistry', 'BuiltinToolRegistry',
+      // B 档：配置归一化与上下文窗口推导
+      'parseModelSpec', 'formatModel', 'sanitizeProviderId', 'normalizeProviderConfigs',
+      'resolveContextWindowTokens', 'buildProviderWindowTable', 'isUsableWindow',
+      // 配置层（S2-①）
+      'resolveModelArg', 'formatResolutionRef', 'validateProviderConfigs', 'checkProviderConfigs',
+      'formatApiKeyTag', 'findTokenOnlyDuplicates', 'toAcpConfig', 'checkCompressionConfig',
+      'resolveCompactionWindow', 'checkCompactionConfig', 'buildCompactionOptions',
+      'checkCompactionReachability', 'checkTelemetryConfig', 'buildConfigOverview',
+      // 权限接缝（S2-②）
+      'InteractivePermissionEngine',
+      // 装配主体（S2-③）
+      'HarnessHost', 'createHost',
+    ]
+    for (const name of MOVED) {
+      const h = host[name]
+      if (h === undefined) throw new Error(`@harness/host 未导出 ${name}（导出面被改动）`)
+      if (cli[name] !== h) throw new Error(`@harness/cli 的 ${name} 与 @harness/host 不同源（re-export 被改动）`)
+      expect(cli[name]).toBe(h)
+    }
+  })
+})
 
 describe('parseCliArgs 命令解析', () => {
   it('默认 repl 命令', () => {
@@ -656,92 +690,6 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     expect(clean).not.toContain('配置告警')
   })
 
-  it('resolveContextWindowTokens：与 ACP 装配、概览共用同一套三级推导', () => {
-    const providers = [
-      { id: 'other', type: 'openai', model: 'gpt-4o', contextWindowTokens: 1_000_000 },
-      { type: 'openai', model: 'hy3', contextWindowTokens: 102_400 },
-    ] as HarnessConfig['providers']
-    expect(resolveContextWindowTokens({ providers, compression: { modelContextLimit: 300_000 } }, 'hy3')).toBe(300_000)
-    // 默认 provider 省略 id（按 model 派生）时同样命中，而不是漏过去落兜底
-    expect(resolveContextWindowTokens({ providers }, 'hy3')).toBe(102_400)
-    expect(resolveContextWindowTokens({ providers }, 'other')).toBe(1_000_000)
-    expect(resolveContextWindowTokens({}, 'mock')).toBe(200_000)
-    // 窗口字段不是能当分母的数（0 / 负数 / NaN）⇒ 按"没配"处理、回落 200000。
-    // 原样当选的后果：占用率 = est/0 = Infinity、阈值 = (0−30000)×pct% 为负 —— 两个都伪装成"正常显示"。
-    const broken = [
-      { id: 'zero', type: 'openai', contextWindowTokens: 0 },
-      { id: 'neg', type: 'openai', contextWindowTokens: -1 },
-    ] as HarnessConfig['providers']
-    expect(resolveContextWindowTokens({ providers: broken }, 'zero')).toBe(200_000)
-    expect(resolveContextWindowTokens({ providers: broken }, 'neg')).toBe(200_000)
-    expect(resolveContextWindowTokens({ providers: broken, compression: { modelContextLimit: 0 } }, 'zero')).toBe(200_000)
-  })
-
-  it('buildProviderWindowTable：按端点/模型建表，同模型多实例取最小窗口，fallback 沿用原推导', () => {
-    const providers = [
-      { id: 'big', type: 'openai', model: 'gpt-4o', contextWindowTokens: 1_000_000 },
-      // 同一 model 名挂两个端点、窗口不同：无从分辨走哪个 ⇒ 取最小（宁可早压，分母虚高会漏压）
-      { id: 'small-a', type: 'openai', model: 'hy3', contextWindowTokens: 200_000 },
-      { id: 'small-b', type: 'openai', model: 'hy3', contextWindowTokens: 102_400 },
-      // 省略 id ⇒ 由 model 派生（normalizeProviderConfigs），表里必须能用派生出的 id 命中
-      { type: 'openai', model: 'hy4' },
-      // 没有窗口字段 / 非法窗口 ⇒ 不入表（0 当分母会算出 Infinity，落回 fallback 才是对的）
-      { id: 'no-win', type: 'openai', model: 'm1' },
-      { id: 'zero', type: 'openai', model: 'm2', contextWindowTokens: 0 },
-      { id: 'neg', type: 'openai', model: 'm3', contextWindowTokens: -1 },
-    ] as HarnessConfig['providers']
-
-    const t = buildProviderWindowTable({ providers }, 'big')
-    // 表的两棵子树在插件侧是可选字段（宿主可以只给一边）—— 这里取实际构造出来的那份
-    const byProvider = t.byProvider ?? {}
-    const byModel = t.byModel ?? {}
-    expect(byProvider.big).toBe(1_000_000)
-    expect(byProvider['small-a']).toBe(200_000)
-    expect(byProvider.hy4).toBeUndefined() // 该项没写窗口，只有模型名进 byModel
-    expect(byModel.hy3).toBe(102_400) // 同名取最小
-    expect(byModel['gpt-4o']).toBe(1_000_000)
-    expect(byModel.m1).toBeUndefined()
-    expect(byModel.m2).toBeUndefined()
-    expect(byModel.m3).toBeUndefined()
-    // fallback 必须与 resolveContextWindowTokens 同源：查不到端点时逐位回到改造前的分母
-    expect(t.fallback).toBe(1_000_000)
-    expect(t.fallback).toBe(resolveContextWindowTokens({ providers }, 'big'))
-    // 显式 `compression.modelContextLimit` 也在 fallback 里（它同时以插件选项传下去，两级同值）
-    const t2 = buildProviderWindowTable({ providers, compression: { modelContextLimit: 300_000 } }, 'big')
-    expect(t2.fallback).toBe(300_000)
-    // 没有任何 provider 时只剩 fallback，与改造前一致（200000）
-    expect(buildProviderWindowTable({}, 'mock')).toEqual({ byProvider: {}, byModel: {}, fallback: 200_000 })
-  })
-
-  it('resolveCompactionWindow：分母跟着本会话端点走；显式值压过推导，缺省逐位等于改造前', () => {
-    const providers = [
-      { id: 'online', type: 'openai', model: 'deepseek-flash', contextWindowTokens: 300_000 },
-      { id: 'hy3', type: 'openai', model: 'hy3', contextWindowTokens: 200_000 },
-    ] as HarnessConfig['providers']
-    const cfg = { providers }
-    // 同一份 config、两条会话、两个分母 —— 这正是要修的 bug 形态：此前恒为默认 Provider 的 300000。
-    // 真机后果：阈值 = 95% × (300000 − 30000) = 256500 > 200000 ⇒ 自动压缩**永不触发**且无任何症状。
-    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'hy3' })).toBe(200_000)
-    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'online' })).toBe(300_000)
-    // 只给 modelId 也能命中（agent md 里写 modelId 比写派生出的 provider id 自然）
-    expect(resolveCompactionWindow(cfg, 'online', { modelId: 'hy3' })).toBe(200_000)
-    // 两个维度都给时按实例维度（更具体）
-    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'online', modelId: 'hy3' })).toBe(300_000)
-    // 查不到 / 没给端点 ⇒ fallback，逐位等于改造前的推导（"缺省零行为变更"的保证点）
-    expect(resolveCompactionWindow(cfg, 'online', { providerId: 'ghost' })).toBe(300_000)
-    expect(resolveCompactionWindow(cfg, 'online', {})).toBe(300_000)
-    expect(resolveCompactionWindow(cfg, 'online')).toBe(resolveContextWindowTokens(cfg, 'online'))
-    // 显式值排在最前（写了就得生效）：compaction 段专用键优先于 compression 的全局键
-    expect(resolveCompactionWindow({ ...cfg, compaction: { contextWindowTokens: 50_000 } }, 'online', { providerId: 'hy3' }))
-      .toBe(50_000)
-    expect(resolveCompactionWindow({ ...cfg, compression: { modelContextLimit: 60_000 } }, 'online', { providerId: 'hy3' }))
-      .toBe(60_000)
-    // 表里混进非法窗口（0 / 负数）时不当分母、也不算出 NaN/Infinity
-    const dirty = [{ id: 'zero', type: 'openai', model: 'z', contextWindowTokens: 0 }] as HarnessConfig['providers']
-    expect(resolveCompactionWindow({ providers: dirty }, 'zero', { providerId: 'zero' })).toBe(200_000)
-    expect(resolveCompactionWindow({}, 'mock', { providerId: 'x', modelId: 'y' })).toBe(200_000)
-  })
-
   it('查表顺序与 acp-context 的 lookupProviderWindow 一致（守卫：两份实现不许各说各话）', async () => {
     // 为什么要有这条：CLI 侧刻意**没有**复用 acp-context 的实现 —— 那会连带 acp-kernel 上启动
     // 路径（为 6 行查表加载整棵内核不划算）。于是"ACP 与 compaction 同一把尺子"这件事只能靠
@@ -786,47 +734,6 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     const body = src.slice(start, src.indexOf('})', start))
     expect(body).toInclude('modelContextLimit: compression.modelContextLimit')
     expect(body).toInclude('providerWindows: buildProviderWindowTable(cfg, defaultProviderId)')
-  })
-
-  it('buildCompactionOptions：窗口按 Provider 推导，配置字段逐项透传', () => {
-    const providers = [{ type: 'openai', model: 'hy3', contextWindowTokens: 102_400 }] as HarnessConfig['providers']
-    // 缺省：只带推导出的窗口（102400，而不是 core 内那个硬编码的 200000）
-    expect(buildCompactionOptions({ providers }, 'hy3')).toEqual({ contextWindowTokens: 102_400 })
-    const opt = buildCompactionOptions(
-      {
-        providers,
-        compaction: {
-          strategy: 'prune',
-          keepRecentMessages: 20,
-          summaryMaxChars: 5_000,
-          autoCompactThresholdPct: 70,
-          reservedTokens: 10_000,
-          tokenCalibration: 'chars4',
-        },
-      },
-      'hy3',
-    )
-    expect(opt).toEqual({
-      contextWindowTokens: 102_400,
-      strategy: 'prune',
-      keepRecentMessages: 20,
-      summaryMaxChars: 5_000,
-      autoCompactThresholdPct: 70,
-      reservedTokens: 10_000,
-      tokenCalibration: 'chars4',
-    })
-    // compaction.contextWindowTokens 是本段专用覆盖，优先级高于 Provider
-    expect(buildCompactionOptions({ providers, compaction: { contextWindowTokens: 60_000 } }, 'hy3').contextWindowTokens)
-      .toBe(60_000)
-    // 传了端点 ⇒ 窗口按该端点取：同一份 config 下两条会话可以有两个分母
-    const two = [
-      { id: 'big', type: 'openai', model: 'm-big', contextWindowTokens: 300_000 },
-      { id: 'small', type: 'openai', model: 'm-small', contextWindowTokens: 200_000 },
-    ] as HarnessConfig['providers']
-    expect(buildCompactionOptions({ providers: two }, 'big', { providerId: 'small' }).contextWindowTokens).toBe(200_000)
-    expect(buildCompactionOptions({ providers: two }, 'big', { providerId: 'big' }).contextWindowTokens).toBe(300_000)
-    // 不传端点 ⇒ 仍按默认 Provider（老调用点不被静默改掉分母）
-    expect(buildCompactionOptions({ providers: two }, 'big').contextWindowTokens).toBe(300_000)
   })
 
   it('checkCompactionConfig：拼错键与非法取值都能被点名', () => {
@@ -917,26 +824,6 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     expect(reg.resolve('a')).toBeDefined()
   })
 
-  it('registerBuiltinProviderTypes：内置 6 类型齐全', () => {
-    const reg = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(reg)
-    expect(reg.list().sort()).toEqual(['anthropic', 'gemini', 'glm', 'mock', 'openai', 'qwen'])
-  })
-
-  it('惰性展示元信息：同步注册后 listMeta 即可列出，无需加载任何 Provider 模块', () => {
-    const reg = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(reg)
-    const metas = reg.listMeta()
-    expect(metas).toHaveLength(6)
-    const openai = metas.find((m) => m.type === 'openai')!
-    // 未触发 createPlugin / 未 import 模块时也有描述与用法提示（人机交互友好）
-    expect(openai.description).toContain('OpenAI')
-    expect(openai.usage).toContain('/model openai/')
-    expect(openai.builtin).toBe(true)
-    expect(reg.meta('mock')?.requiresApiKey).toBe(false)
-    expect(reg.meta('anthropic')?.requiresApiKey).toBe(true)
-  })
-
   it('formatProviderTypeList / buildProviderTypesSection：展示友好清单并提示自动加载', () => {
     const reg = new ProviderTypeRegistry()
     registerBuiltinProviderTypes(reg)
@@ -973,54 +860,6 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
       const plugin = factory.createPlugin({ id: type, type })
       expect(plugin).toBeDefined()
     }
-  })
-
-  it('BuiltinPluginRegistry：内置通用插件统一登记并惰性加载（tools-builtin 可解析出真实插件）', async () => {
-    const reg = getBuiltinRegistry()
-    expect(reg.get('tools-builtin')?.source).toBe('builtin')
-    expect(reg.has('missing'))    .toBe(false)
-    const p = await reg.get('tools-builtin')!.load()
-    expect(p.id).toBeDefined()
-    expect(typeof p.install).toBe('function')
-  })
-
-  it('BuiltinToolRegistry（多级加载 L1）：preload 后登记内置工具元信息，无需加载运行时模块即可描述', async () => {
-    await preloadBuiltinToolMetas()
-    const reg = getBuiltinToolRegistry()
-    expect(reg instanceof BuiltinToolRegistry).toBe(true)
-    // 覆盖全部内置原语工具
-    for (const id of ['read_file', 'write_file', 'bash', 'edit_file']) {
-      expect(reg.has(id)).toBe(true)
-    }
-    // 覆盖随应用打包的场景化工具插件元信息（search/glob/web/media）+ 进程内 MCP server 插件（computer-use / code-intel）
-    for (const id of ['list_dir', 'grep_file', 'glob', 'web_fetch', 'view_image', 'mcp__computer-use__list_apps', 'mcp__code-intel__code_symbols']) {
-      expect(reg.has(id)).toBe(true)
-    }
-    // optIn 插件（computer-use / code-intel）仅登记元信息，不参与后台预加载实例化
-    const cuEntry = getBuiltinRegistry().get('computer-use')!
-    expect(cuEntry.optIn).toBe(true)
-    const ciEntry = getBuiltinRegistry().get('code-intel')!
-    expect(ciEntry.optIn).toBe(true)
-    const permByTool: Record<string, string> = {
-      web_fetch: 'network', list_dir: 'read', glob: 'read', view_image: 'read',
-    }
-    for (const [id, k] of Object.entries(permByTool)) {
-      expect(reg.get(id)?.permissionKey).toBe(k)
-    }
-    // 描述可提前取得（运行时模块是否加载都无关）
-    const bash = reg.get('bash')!
-    expect(bash.description).toContain('shell')
-    expect(bash.permissionKey).toBe('bash')
-    expect(bash.isDestructive).toBe(true)
-    // 别名在未加载时也能查到
-    const reg2 = new BuiltinToolRegistry()
-    reg2.register({ id: 'x_file', aliases: ['xf'], description: 'x' })
-    expect(reg2.get('xf')?.id).toBe('x_file')
-    // ToolMetaSource 抽象契约：registerSource 合并来源 list() 元信息
-    const reg3 = new BuiltinToolRegistry()
-    reg3.registerSource({ id: 'src-a', description: 'a', list: () => [{ id: 'y_file', description: 'y' }] })
-    expect(reg3.has('y_file')).toBe(true)
-    expect(reg3.get('y_file')?.description).toBe('y')
   })
 
   it('boot 末尾后台静默预加载（fire-and-forget）：不阻塞 boot，verbose 下预热有日志、关闭开关则无', async () => {
@@ -1100,146 +939,6 @@ describe('ProviderTypeRegistry / 插件化扩展', () => {
     await app.shutdown()
     rmSync(dir3, { recursive: true, force: true })
   })
-
-  it('loadPluginDirs：从 plugins 目录加载 Provider 类型工厂（providerType + createProviderPlugin 约定）', async () => {
-    const pluginDir = join(dir, 'plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'my-gw.ts'), `
-      export const providerType = 'my-gw'
-      export function createProviderPlugin(config) {
-        return { id: 'provider.my-gw', version: '1.0.0', name: 'MyGW Provider', async install() { return {} } }
-      }
-    `)
-    const reg = new ProviderTypeRegistry()
-    registerBuiltinProviderTypes(reg)
-    const result = await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
-    expect(reg.list()).toContain('my-gw')
-    const plugin = (await reg.resolve('my-gw')!.createPlugin({ id: 'gw', type: 'my-gw', baseUrl: 'http://x', apiKey: 'k' }))!
-    expect(plugin.id).toBe('provider.my-gw')
-    // Provider 类型工厂不产生通用插件
-    expect(result.plugins).toEqual([])
-  })
-
-  it('loadPluginDirs：providerTypeFactory 形态同样可加载', async () => {
-    const pluginDir = join(dir, 'plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'factory.ts'), `
-      export const providerTypeFactory = {
-        type: 'local-gw',
-        createPlugin: (c) => ({ id: 'provider.local-gw', version: '1.0.0', name: 'LocalGW', async install() { return {} } }),
-      }
-    `)
-    const reg = new ProviderTypeRegistry()
-    await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
-    expect((await reg.resolve('local-gw')?.createPlugin({ id: 'x', type: 'local-gw' }))?.id).toBe('provider.local-gw')
-  })
-
-  it('loadPluginDirs：plugins 目录同时加载通用 AgentPlugin（default/plugin/plugins）', async () => {
-    const pluginDir = join(dir, 'plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'gen.ts'), `
-      export const statusPlugin = { id: 'ext.status', version: '1', name: 'Status', async install() { return {} } }
-      export const helloPlugin = { id: 'ext.hello', version: '1', name: 'Hello', async install() { return {} } }
-      export default { id: 'ext.default', version: '1', name: 'Default', async install() { return {} } }
-      export const plugin = { id: 'ext.named', version: '1', name: 'Named', async install() { return {} } }
-      export const plugins = [ { id: 'ext.arr', version: '1', name: 'Arr', async install() { return {} } } ]
-    `)
-    const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
-    const ids = result.plugins.map((p) => p.id).sort()
-    expect(ids).toEqual(['ext.arr', 'ext.default', 'ext.named'])
-  })
-
-  it('loadPluginDirs：project 目录后加载覆盖 user（多级插件化，通用插件按 id 去重）', async () => {
-    const userDir = join(dir, 'user-plugins')
-    const projDir = join(dir, 'proj-plugins')
-    mkdirSync(userDir, { recursive: true })
-    mkdirSync(projDir, { recursive: true })
-    writeFileSync(join(userDir, 'p.ts'), `export const providerType = 'dup'; export function createProviderPlugin(c){ return { id: 'provider.dup.user', version: '1', name: 'user', async install(){} } }`)
-    writeFileSync(join(projDir, 'p.ts'), `export const providerType = 'dup'; export function createProviderPlugin(c){ return { id: 'provider.dup.proj', version: '1', name: 'proj', async install(){} } }`)
-    writeFileSync(join(userDir, 'gen.ts'), `export default { id: 'ext.same', version: '1', name: 'user', async install(){} }`)
-    writeFileSync(join(projDir, 'gen.ts'), `export default { id: 'ext.same', version: '2', name: 'proj', async install(){} }`)
-    const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [userDir, projDir], undefined, { allowCode: true })
-    expect((await reg.resolve('dup')!.createPlugin({ id: 'x', type: 'dup' }))!.id).toBe('provider.dup.proj')
-    // 通用插件：project 覆盖 user（name=proj，且只保留一份）
-    expect(result.plugins).toHaveLength(1)
-    expect(result.plugins[0].name).toBe('proj')
-  })
-
-  it('loadPluginDirs：无有效导出的坏文件被忽略并告警', async () => {
-    const pluginDir = join(dir, 'plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'bad.ts'), `export const foo = 1`)
-    const warns: string[] = []
-    const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [pluginDir], (s) => warns.push(s), { allowCode: true })
-    expect(warns.some((w) => w.includes('已忽略'))).toBe(true)
-    expect(result.plugins).toEqual([])
-  })
-
-  it('loadPluginDirs：默认不加载插件代码（防代码注入），且绝不补 node_modules 软链', async () => {
-    // 插件目录里的 .ts 是可执行代码：克隆来的仓库只要带一个 .harness/plugins/*.ts，
-    // 在该目录跑一次 harness 就会被 import 执行 —— 默认必须挡住。
-    const pluginDir = join(dir, 'injected', 'plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'mcp.ts'), `
-      import { READONLY_TOOLS_SENTINEL } from '@harness/tool'
-      export const plugins = [
-        { id: 'ext.injected', version: '1', name: READONLY_TOOLS_SENTINEL, async install() { return {} } },
-      ]
-    `)
-    const logs: string[] = []
-    const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [pluginDir], (s) => logs.push(s))
-    expect(result.plugins).toEqual([])
-    const text = logs.join('')
-    expect(text).toContain('已跳过')
-    expect(text).toContain('防止代码注入')
-    // 绝不为插件目录创建任何 node_modules 软链 / .gitignore（不允许软链关联 harness 内核文件）
-    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(false)
-    expect(existsSync(join(pluginDir, '.gitignore'))).toBe(false)
-  })
-
-  it('loadPluginDirs：allowCode: true 时才真正加载插件代码', async () => {
-    const pluginDir = join(dir, 'optin', 'plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'mcp.ts'), `
-      export const plugins = [{ id: 'ext.optin', version: '1', name: 'OptIn', async install() { return {} } }]
-    `)
-    const reg = new ProviderTypeRegistry()
-    const result = await loadPluginDirs(reg, [pluginDir], undefined, { allowCode: true })
-    expect(result.plugins.map((p) => p.id)).toEqual(['ext.optin'])
-  })
-
-  it('loadPluginDirs：相对路径导入失败按原样告警（不再有补锚点逻辑）', async () => {
-    const pluginDir = join(dir, 'relative-plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    // 用上导入的绑定，避免被 Bun 当死代码消除而根本不解析
-    writeFileSync(join(pluginDir, 'bad.ts'), `
-      import { x } from './nowhere'
-      export const plugins = [{ id: 'ext.bad', version: '1', name: String(x), async install() { return {} } }]
-    `)
-    const logs: string[] = []
-    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s), { allowCode: true })
-    expect(result.plugins).toEqual([])
-    expect(logs.some((l) => l.includes('插件加载失败'))).toBe(true)
-    expect(existsSync(join(pluginDir, 'node_modules'))).toBe(false)
-  })
-
-  it('loadPluginDirs：裸依赖确实无法解析时，告警附带「改用 config.json → plugins」提示', async () => {
-    const pluginDir = join(dir, 'missing-dep-plugins')
-    mkdirSync(pluginDir, { recursive: true })
-    writeFileSync(join(pluginDir, 'bad.ts'), `
-      import { y } from 'definitely-not-installed-xyz'
-      export const plugins = [{ id: 'ext.bad2', version: '1', name: String(y), async install() { return {} } }]
-    `)
-    const logs: string[] = []
-    await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], (s) => logs.push(s), { allowCode: true })
-    const text = logs.join('')
-    expect(text).toContain('插件加载失败')
-    expect(text).toContain('config.json → "plugins"')
-  })
 })
 
 describe('内置插件声明式启用（config.json → plugins）', () => {
@@ -1249,23 +948,6 @@ describe('内置插件声明式启用（config.json → plugins）', () => {
     expect(entry.source).toBe('builtin')
     // 宿主插件自身不提供工具，无需 metaSource
     expect(entry.metaSource).toBeUndefined()
-  })
-
-  it('resolveBuiltinPlugins：按 id 实例化，并用 dependsOn 自动补齐依赖闭包', async () => {
-    const { plugins, unknown } = await resolveBuiltinPlugins(['code-intel'])
-    expect(plugins.map((p) => p.id)).toEqual(['code-intel', 'mcp.server-registry'])
-    expect(unknown).toEqual([])
-  })
-
-  it('resolveBuiltinPlugins：未登记 id 与重复项只记入 unknown/去重，不抛错', async () => {
-    const { plugins, unknown } = await resolveBuiltinPlugins(['no-such-plugin', 'code-intel', 'code-intel'])
-    expect(unknown).toEqual(['no-such-plugin'])
-    expect(plugins.map((p) => p.id)).toEqual(['code-intel', 'mcp.server-registry'])
-  })
-
-  it('unknownBuiltinPluginIds：只查表不加载模块', () => {
-    expect(unknownBuiltinPluginIds(undefined)).toEqual([])
-    expect(unknownBuiltinPluginIds(['code-intel', ' nope '])).toEqual(['nope'])
   })
 
   it('BuiltinPluginRegistry 登记 Agent 编排类插件 subagent / coordinator / swarm', () => {
@@ -1288,12 +970,6 @@ describe('内置插件声明式启用（config.json → plugins）', () => {
     // 无参默认：coordinator 只认注册表里的依赖，不自带 subagents/forceAsync 等组合根参数
     const coordinator = plugins.find((p) => p.id === 'coordinator')!
     expect(coordinator.dependsOn).toContain('subagent')
-  })
-
-  it('resolveBuiltinPlugins：只声明 coordinator 时经 dependsOn 自动补上 subagent', async () => {
-    const { plugins, unknown } = await resolveBuiltinPlugins(['coordinator'])
-    expect(unknown).toEqual([])
-    expect(plugins.map((p) => p.id)).toEqual(['coordinator', 'subagent'])
   })
 })
 
@@ -1389,32 +1065,10 @@ describe('findResumeTarget 自动恢复目标选择（含跨目录串台防护�
   })
 })
 
-describe('CliPermissionEngine', () => {
-  it('mode=allow-all 直接放行', async () => {
-    const e = new CliPermissionEngine({}, { mode: 'allow-all' })
-    const d = await e.ask({ toolKey: 'read', patterns: [] }) as PermissionDecision
-    expect(d.behavior).toBe('allow')
-    expect(d.matchedRule).toBe('global')
-  })
-
-  it('mode=deny-all 一律拒绝', async () => {
-    const e = new CliPermissionEngine({}, { mode: 'deny-all' })
-    const d = await e.ask({ toolKey: 'read', patterns: [] }) as PermissionDecision
-    expect(d.behavior).toBe('deny')
-    expect(d.matchedRule).toBe('global')
-  })
-
-  it('getMode/setMode 切换交互模式（含 deny-all）', async () => {
-    const e = new CliPermissionEngine({}, { mode: 'ask' })
-    expect(e.getMode()).toBe('ask')
-    e.setMode('allow-all')
-    expect(e.getMode()).toBe('allow-all')
-    expect((await e.ask({ toolKey: 'x', patterns: [] })).behavior).toBe('allow')
-    e.setMode('deny-all')
-    expect(e.getMode()).toBe('deny-all')
-    expect((await e.ask({ toolKey: 'x', patterns: [] })).behavior).toBe('deny')
-  })
-
+// 四态语义 / 模式短路 / 规则写回已上移到 `@harness/host`（`permission.test.ts` 是那份能力测试）。
+// 这里只留 **CLI 适配器**该管的两件事：`askPrompt` 文本 → 四态的映射（'a'/'d'/'A'/'D'），
+// 以及 `--permission` 的解析。S4 收口时删掉了与 host 重复的 allow-all / deny-all / getMode 用例。
+describe('CliPermissionEngine（CLI 适配器：文本提问 → 四态）', () => {
   it('parseCliArgs 识别 deny-all', () => {
     expect(parseCliArgs(['--permission', 'deny-all'])).toMatchObject({ permissionMode: 'deny-all' })
     expect(parseCliArgs(['--permission', 'ask'])).toMatchObject({ permissionMode: 'ask' })
