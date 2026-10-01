@@ -1,5 +1,72 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 234）A2A P1-B：`HarnessAgentExecutor` + 挂起表 + 权限桥 —— 权限链路的触发条件是个坑
+
+### 做什么
+
+P1 的第二步：把 `@harness/host` 的流式会话翻译成 A2A 的**任务生命周期**，并落地远程权限的挂起/续接机制。
+
+- `executor.ts` — `HarnessAgentExecutor implements AgentExecutor`。`execute(ctx, bus)`：续接轮（`task.status.state === INPUT_REQUIRED`）直接走 `resume` 并 return；新任务则发 `task(SUBMITTED)` → `statusUpdate(WORKING)` → 在 `AsyncLocalStorage.run({taskId,contextId,bus,running})` 里 `ensureSession` + 遍历 `host.harness.session.promptStream(...)`，把流事件喂给 `StreamAdapter` 合并成 A2A 事件。`cancelTask` 走 `controller.abort()` + `suspendTable.cancel()`。终态裁决 `finalize`：`canceled > expired > aborted > COMPLETED`。
+- `suspend.ts` — `SuspendTable`：`taskId → resolver` 的挂起表，带 TTL（默认 5 分钟）+ `onSuspend`（登记后**同步**发 `INPUT_REQUIRED`）+ `onExpire`。`answer()`/`cancel()` 命中不存在时返回 `false`，调用方据**安全忽略**（幂等，plan §3.4 要点 3）。
+- `errors.ts` — `A2aServerError`（带 `code` / `detail` / `jsonRpcCode` / `toJsonRpc()`）+ `ConcurrentTaskError` / `UnauthorizedError`（-32001）/ `ContextForbiddenError`。
+
+### 为什么权限桥必须用 `AsyncLocalStorage`
+
+`ask()` 发生在 `promptStream` 生成器**内部**，它只认得 `toolKey`/`patterns` —— 不知道自己是哪个 task、往哪条 bus 发 `INPUT_REQUIRED`。模块级可变变量在**并发两条任务**下必然串话（两条生成器的 `await` 交错）。`AsyncLocalStorage`（`node:async_hooks`）按**异步调用链**隔离：实测（`/tmp/als-probe.ts`）跨 `await` 保持，并发任务互不串话（`A: ["task-A","task-A"] B: ["task-B","task-B"]`）。
+
+### 模式 A：`INPUT_REQUIRED` 之后**不返回**
+
+executor 在挂起时**不 return**，`await` 答复 ⇒ 挂起表只需 `taskId → resolver`，**不必跨请求保存/恢复 generator**。后续带同一 `taskId` 的 `SendMessage` 会**再次调用 `execute`**（此时 `ctx.task.status.state === INPUT_REQUIRED`），把答复喂给 resolver 后**立即 return**，第一轮被唤醒后补发 artifact + 终态。代价：executor 的 Promise 长期悬挂 ⇒ **TTL 是必需项，不是锦上添花**（无 TTL 时挂起表与 task 记录一起泄漏）。
+
+### ⚠️ 最大的坑：权限询问的**触发条件**
+
+12 条测试初跑 **3 pass / 9 fail**，6 条 `waitUntil 超时`（`suspend.size === 1` 从未成立）。根因不是 executor、也不是挂起表 —— 是**权限点根本没被触达**：
+
+权限询问**不是"工具一执行就自动弹"**。`ToolPipeline.execute` 只在**工具声明了 `permission: { key, extractPatterns }` 且 pipeline 有 `checkPermission`** 时才构造 `PermissionRequest` 去问引擎（`packages/tool/src/index.ts:1330`）。测试夹具的 `echo` 工具**没声明 `permission`** ⇒ `check → ask → asker → 挂起` 整条链路**根本不启动**，任务直接 COMPLETED。
+
+修法：给夹具工具补上与真实工具同形的 `permission: { key: 'echo', extractPatterns: (input) => [input.msg] }`。`isReadOnly` **不影响**权限（它只参与白名单展开），所以只读工具照样要声明 `permission`。
+
+### 另一处断言修正：`SUBMITTED` 挂在 `task` 事件本体上
+
+`statuses(events)[0]` 期望 `SUBMITTED` 实收 `WORKING` —— 因为 `SUBMITTED` 在 **`task` 事件本体**的 `data.status.state` 里（SDK 的 `ResultManager` 据此建任务记录），不是一条独立 `statusUpdate`。断言改为 `events[0].data.status.state === SUBMITTED` + `statuses(events)[0] === WORKING`。
+
+### 产物与验证
+
+改动文件：`packages/a2a-server/src/{executor,suspend,errors}.ts`（新建）、`packages/a2a-server/src/executor.test.ts`（新建 12 条）、`packages/a2a-server/src/index.ts`（barrel 补 errors/suspend/executor 导出）。
+
+验证：`bun run typecheck` **41 包 exit 0**；`bun test ./packages` **2239 pass / 0 fail / 98 文件**（2227 + 12）。**P1-B 完成。**
+
+## 2026-10-01（续 233）A2A P1-A：新包 `@harness/a2a-server` 骨架 + AgentCard + 协议映射层
+
+### 做什么
+
+按 `docs/external-integration-plan.md` §6 的依赖顺序开工 P1 第一步。新包定位是**宿主/适配器层**（与 `@harness/cli` 同级，**不是**业务能力插件）—— 只做协议翻译与装配，不内置业务决策、不绕过权限、不直接调工具。
+
+- `mapping.ts`（约 400 行，纯映射、零 IO）——`Part`/`Message` 双向构造与解析、`stateName`/`stateFromName`（**不写状态字面量**）、四态权限词汇表（**直接复用 host 的 `PermissionAnswer`，不做第二套翻译**）、`buildPermissionMetadata`/`buildPermissionQuestion`，以及 `StreamAdapter`（`text_delta`/`reasoning_delta` 按块合并；`reasoning_delta` 不进 artifact；tool/gate → `WORKING` + metadata）。
+- `card.ts`（约 170 行）——`buildAgentCard`（顶层 `version` = agent 自身版本；协议版本只写 `supportedInterfaces[].protocolVersion`；默认只暴露 `mode:'primary'`；配 token 才同时给 `securitySchemes` + `securityRequirements`）+ `cardToJSON`。
+- `errors.ts` 的结构化错误码（本步先落盘，P1-B 用）。
+
+### 三个静默失败坑（P0.5 spike 实测 + 本步复核）
+
+1. **Part/Message 有两套表示**：TS 内部是 `content: {$case:'text', value}`，线上是 `{"text":"..."}`。出参必须走 `MessageFns.toJSON()`，裸 `JSON.stringify` 会让对端 `fromJSON` **静默丢掉内容**。
+2. **`TaskState` 是数字 enum**：`TASK_STATE_COMPLETED === 3`，线上是 `"TASK_STATE_COMPLETED"` ⇒ 比较一律走 `taskStateToJSON`，不写字面量。
+3. **`Role` 也是数字 enum**（本步新发现）：`ROLE_USER === 1`，线上才是 `"ROLE_USER"`。
+4. **`AgentCard` 必须走 `AgentCard.toJSON()`**（本步新发现）：`securitySchemes[*].scheme` 是判别式联合 `{$case, value}`，裸序列化输出 `{$case,value}` 而线上是 `{httpAuthSecurityScheme:{…}}` ⇒ 客户端 `fromJSON` **静默丢掉整个安全方案**。P0.5 spike 用 `securitySchemes: {}` 恰好绕过，故此前没暴露。新增 `cardToJSON()` 并加反向守卫用例（同时断言裸序列化**确实**丢掉 `httpAuthSecurityScheme`）。
+
+### 权限接缝的一处补漏
+
+`mapping.ts` 需要 `PermissionAskInput`，但 `@harness/host` 的权限接缝 type 转出块**只导出了 `PermissionAsker`** ⇒ 补上 `PermissionAskInput`。
+
+### 新包登记（AGENTS.md 硬约定，逐项齐）
+
+root `tsconfig.json` paths（`"@harness/a2a-server": ["./packages/a2a-server/src"]`）、root `package.json` dependencies、`packages/cli/package.json` dependencies、`bun install`（`@a2a-js/sdk@1.3.0` 钉死，已在 bun 缓存，离线可装）。
+
+### 产物与验证
+
+改动文件：`packages/a2a-server/{package.json,tsconfig.json,src/{index,mapping,card,errors}.ts}`（新建）、`packages/host/src/index.ts`（补 `PermissionAskInput` 转出）、root `tsconfig.json` / `package.json`、`packages/cli/package.json`、`bun.lock`。测试：`mapping.test.ts`（20 条）+ `card.test.ts`（13 条）。
+
+验证：`bun run typecheck` **41 包 exit 0**；`bun test ./packages` **2227 pass / 0 fail / 97 文件**。commit `7590abc`。
+
 ## 2026-10-01（续 232）P0 收尾 S4：测试收口「能力归 host，兼容归 cli」—— 顺带补齐 host 自测缺口
 
 ### 背景：这份「有意重叠」本来就登记着要收
