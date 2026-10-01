@@ -43,6 +43,8 @@ export {
   skillOf,
 } from './card'
 export type { BuildAgentCardOptions } from './card'
+// 卡路由路径（协议常量，取自 SDK）—— 消费方（CLI / 文档）不必直接依赖 SDK
+export { AGENT_CARD_PATH } from '@a2a-js/sdk'
 
 // 3. 认证与调用方隔离（plan §3.5）
 export { CallerRegistry, LOCAL_CALLER, callerKey, extractBearer, verifyBearer } from './auth'

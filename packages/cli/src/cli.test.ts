@@ -135,6 +135,18 @@ describe('parseCliArgs 命令解析', () => {
     expect(a.dataDir).toBe('/x')
   })
 
+  it('a2a 子命令 + --port/--token', () => {
+    expect(parseCliArgs(['a2a']).command).toBe('a2a')
+    expect(parseCliArgs(['a2a']).a2aPort).toBeUndefined()
+    const a = parseCliArgs(['a2a', '--port', '5000', '--token', 'secret', '--cwd', '/x'])
+    expect(a.command).toBe('a2a')
+    expect(a.a2aPort).toBe(5000)
+    expect(a.a2aToken).toBe('secret')
+    expect(a.cwd).toBe('/x')
+    // 不传 token ⇒ undefined（匿名，仅本机可达）
+    expect(parseCliArgs(['a2a', '--port', '0']).a2aToken).toBeUndefined()
+  })
+
   it('--snapshot 布尔标记', () => {
     expect(parseCliArgs(['--snapshot']).snapshot).toBe(true)
     expect(parseCliArgs(['repl', '--snapshot', '-v'])).toMatchObject({ snapshot: true, verbose: true })
@@ -1940,6 +1952,8 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
       const code = await main(['--help'])
       expect(code).toBe(0)
       expect(chunks.join('')).toInclude(HELP_TEXT.slice(0, 20))
+      // P1-D：a2a 子命令必须在帮助里可发现（否则等于没入口）
+      expect(HELP_TEXT).toInclude('harness a2a')
     } finally {
       process.stdout.write = originalWrite
     }

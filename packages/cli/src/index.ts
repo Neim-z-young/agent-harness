@@ -122,6 +122,9 @@ export { InteractivePermissionEngine } from '@harness/host'
 // 宿主装配主体（P0 收尾 S2 第三步）：`HarnessHost` 连同 `HostOptions` / `SessionRestoreInfo` / 装配期
 // 诊断渲染器一并自本文件上移。CLI 只留薄子类 `HarnessApp`（见本文件 §4）与文本提问适配。
 import { HarnessHost, renderNotice } from '@harness/host'
+import { createHost } from '@harness/host'
+// A2A 服务端宿主（宿主/适配器层）。只做协议翻译与装配 —— 复用 host 的同一份装配。
+import { AGENT_CARD_PATH, DEFAULT_A2A_PORT, createA2aServer } from '@harness/a2a-server'
 import type { HostOptions, SessionRestoreInfo } from '@harness/host'
 export type { HostOptions, SessionRestoreInfo } from '@harness/host'
 export { HarnessHost, createHost } from '@harness/host'
@@ -148,8 +151,8 @@ import { inspect } from 'node:util'
 // ========================================================================
 
 export interface CliArgs {
-  /** 子命令：repl / start / list-sessions / resume / run / teammate / config */
-  command: 'repl' | 'list-sessions' | 'resume' | 'run' | 'teammate' | 'config' | 'help'
+  /** 子命令：repl / start / list-sessions / resume / run / teammate / config / a2a */
+  command: 'repl' | 'list-sessions' | 'resume' | 'run' | 'teammate' | 'config' | 'a2a' | 'help'
   /** resume / run / config 的参数（config 为子命令如 set-key / get-key / check） */
   arg?: string
   /** config 子命令的剩余参数（如 set-key 后的 <providerId> <apiKey>） */
@@ -184,6 +187,10 @@ export interface CliArgs {
   showHelp?: boolean
   /** 允许加载外部插件目录里的代码（默认 false，防代码注入；等价于 config.json 的 allowPluginCode） */
   allowPluginCode?: boolean
+  /** a2a 子命令：监听端口（默认 4321） */
+  a2aPort?: number
+  /** a2a 子命令：Bearer token（配了才校验 + 卡片声明安全方案） */
+  a2aToken?: string
 }
 
 /**
@@ -206,6 +213,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     else if (cmd === 'run') command = 'run'
     else if (cmd === 'config') command = 'config'
     else if (cmd === 'teammate') command = 'teammate'
+    else if (cmd === 'a2a') command = 'a2a'
     else if (cmd === 'help' || cmd === '--help' || cmd === '-h') { out.showHelp = true; command = 'help' }
     else { arg = cmd } // 非标准：直接填 arg 用于 run 无命令场景
     if ((command === 'resume' || command === 'run') && args.length > 0 && !args[0].startsWith('-')) {
@@ -262,6 +270,8 @@ export function parseCliArgs(raw: string[]): CliArgs {
       case 'm': case 'model': out.model = value; break
       case 's': case 'session': out.sessionId = value; break
       case 'd': case 'data-dir': out.dataDir = value; break
+      case 'port': out.a2aPort = value === undefined ? undefined : Number(value); break
+      case 'token': out.a2aToken = value || undefined; break
       case 'permission':
         out.permissionMode = value === 'allow-all' ? 'allow-all' : value === 'deny-all' ? 'deny-all' : 'ask'; break
       case 'run': // "harness --run xxx" 场景
@@ -1773,11 +1783,17 @@ export const HELP_TEXT = `harness — Agent Harness CLI
   harness config set-key <providerId> <apiKey>   加密写入 provider 的 apiKey（enc:v1 密文）
   harness config get-key <providerId>            解密查看 provider 的 apiKey
   harness config check [options]       校验 config.json 并打印 Provider/模型概览
+  harness a2a [--port <n>] [--token <t>]   以 A2A（Agent2Agent）服务启动（默认仅监听 127.0.0.1）
   harness help | -h | --help            显示帮助
 
 teammate 选项:
       --team <team>           所属团队名（sanitize 后）
       --name <name>           成员名（sanitize 后）
+
+a2a 选项:
+      --port <n>              JSON-RPC 端点端口（默认 4321；监听地址恒为 127.0.0.1）
+      --token <t>             Bearer token：配了则校验并在卡片声明安全方案；不配则匿名（仅本机）
+                              取卡：GET http://127.0.0.1:<port>/.well-known/agent-card.json
 
 选项:
   -c, --cwd <dir>            工作目录（启动时传入即以此为准；不传才取当前目录）。
@@ -1883,6 +1899,96 @@ export async function runTeammateCli(options: {
   await loop.stop()
   try { await app.shutdown() } catch {}
   write('[teammate] 已退出\n')
+  return 0
+}
+
+/**
+ * `harness a2a` 子命令：以 A2A（Agent2Agent）服务端启动。
+ *
+ * ## 为什么复用 `createHost` 而不是 `HarnessApp`
+ * A2A 是**无终端**宿主：`HarnessApp` 多带的两个终端适配面（`stdout → onNotice`、
+ * `askPrompt → asker`）在这里没意义，反而会把"装配"与"终端形态"重新绑回一起。
+ * `createHost` 是 host 暴露的"一步装配 + 启动"，与 VSCode 扩展将来要走的路同一条。
+ *
+ * ## 权限模式的取舍（值得写下来）
+ * 默认 `ask`：远程权限点应转 `INPUT_REQUIRED` 挂起、等客户端答复（P1 的核心机制）。
+ * 传 `--permission allow-all` 会让引擎直接放行、**完全不挂起** —— 那是"信任调用方"的
+ * 主动选择，不是默认；help 里已标明。`deny-all` 同理（一律拒绝、也不挂起）。
+ *
+ * ## 为什么这里不自己装 asker
+ * `createA2aServer` 会把 executor 的 asker 装回 host 的权限引擎（那一步只有它做得到，
+ * 因为 executor 是它建的）。CLI 侧**不要**再传 `asker`，否则就是两份装配在抢同一个接缝。
+ */
+export async function runA2aCli(options: {
+  args: CliArgs
+  cwd: string
+  dataDir: string
+  provider: string
+  model: string | undefined
+  agentId: string
+  providers?: ProviderConfig[]
+  anthropicApiKey?: string
+  snapshot: boolean
+  permissionMode: 'allow-all' | 'ask' | 'deny-all'
+  write: (s: string) => void
+}): Promise<number> {
+  const { args, cwd, dataDir, provider, model, agentId, providers, anthropicApiKey, snapshot, permissionMode, write } =
+    options
+
+  const port = args.a2aPort ?? DEFAULT_A2A_PORT
+  if (!Number.isInteger(port) || port < 0 || port > 65535) {
+    write(`无效端口: ${String(args.a2aPort)}（应为 0~65535 的整数）\n`)
+    return 1
+  }
+
+  const host = await createHost({
+    cwd,
+    dataDir,
+    agentId,
+    provider,
+    ...(model !== undefined ? { model } : {}),
+    ...(providers ? { providers } : {}),
+    ...(anthropicApiKey ? { anthropicProviderConfig: { apiKey: anthropicApiKey } } : {}),
+    permissionMode,
+    verbose: args.verbose,
+    snapshot,
+    allowPluginCode: args.allowPluginCode ?? false,
+    // A2A 是服务端：不该"恢复上次会话"（会话由 contextId 显式寻址），也不该在 boot 末尾
+    // 静默预加载 —— 启动提示应当是确定性的。
+    autoResume: false,
+    backgroundPreload: false,
+    // 装配期诊断（"无 key 回落到 Mock"这类**必须让调用方知道**的事实）走 stderr，
+    // 不混进 stdout（那是给服务启动信息用的）。
+    onNotice: (n) => process.stderr.write(renderNotice(n)),
+  })
+
+  const server = createA2aServer({
+    host,
+    port,
+    ...(args.a2aToken ? { token: args.a2aToken } : {}),
+    logger: {
+      info: (m, meta) => process.stderr.write(`[a2a] ${m} ${meta ? JSON.stringify(meta) : ''}\n`),
+      warn: (m, meta) => process.stderr.write(`[a2a] ${m} ${meta ? JSON.stringify(meta) : ''}\n`),
+    },
+  })
+
+  const origin = new URL(server.url).origin
+  write(`A2A 服务已启动\n`)
+  write(`  JSON-RPC 端点: ${server.url}\n`)
+  write(`  AgentCard:     ${origin}/${AGENT_CARD_PATH}\n`)
+  write(`  认证:          ${args.a2aToken ? 'Bearer（已配置）' : '匿名（仅 127.0.0.1 可达）'}\n`)
+  write(`  权限模式:      ${permissionMode}${permissionMode === 'ask' ? '' : '（不会产生 INPUT_REQUIRED 挂起）'}\n`)
+  write(`  Ctrl-C 退出\n`)
+
+  await new Promise<void>((resolve) => {
+    const bye = () => {
+      write('\n[a2a] 正在停止...\n')
+      server.stop(true)
+      resolve()
+    }
+    process.once('SIGINT', bye)
+    process.once('SIGTERM', bye)
+  })
   return 0
 }
 
@@ -2032,6 +2138,22 @@ export async function main(rawArgs: string[] = process.argv.slice(2)): Promise<n
 
   if (args.command === 'teammate') {
     return runTeammateCli({ args, cwd, dataDir, provider, agentId, permissionMode })
+  }
+
+  if (args.command === 'a2a') {
+    return runA2aCli({
+      args,
+      cwd,
+      dataDir,
+      provider,
+      model,
+      agentId,
+      providers: cfg.providers,
+      anthropicApiKey,
+      snapshot,
+      permissionMode,
+      write,
+    })
   }
 
   const app = new HarnessApp({
