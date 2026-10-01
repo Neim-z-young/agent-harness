@@ -1,0 +1,74 @@
+{
+  "name": "harness-vscode",
+  "displayName": "Agent Harness",
+  "description": "在 VSCode Chat 里使用 Agent Harness（A2A v1.0 + 本地 sidecar）",
+  "version": "0.1.0",
+  "publisher": "harness",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.138.0"
+  },
+  "categories": [
+    "AI",
+    "Chat"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "harness.agent",
+        "name": "harness",
+        "fullName": "Agent Harness",
+        "description": "用本仓 Agent Harness 对话（自带 Provider 与 agentic loop，不使用 Chat 视图的模型）",
+        "isSticky": true
+      }
+    ],
+    "commands": [
+      {
+        "command": "harness.showStatus",
+        "title": "Agent Harness: 显示 sidecar 状态"
+      },
+      {
+        "command": "harness.restartSidecar",
+        "title": "Agent Harness: 重启 sidecar"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Harness",
+      "properties": {
+        "harness.cliPath": {
+          "type": "string",
+          "default": "",
+          "description": "harness CLI 入口（src/index.ts 或已编译的 harness）。留空则自动探测仓库内路径。"
+        },
+        "harness.token": {
+          "type": "string",
+          "default": "",
+          "description": "sidecar 的 Bearer token。留空则匿名（仅 127.0.0.1 可达）。"
+        },
+        "harness.showReasoning": {
+          "type": "boolean",
+          "default": false,
+          "description": "是否渲染推理过程。注意：案 A 下 sidecar 只上报推理规模、不上报内容，本项当前仅影响是否显示“在思考”提示。"
+        },
+        "harness.trace": {
+          "type": "boolean",
+          "default": false,
+          "description": "把 A2A 事件原样输出到 “Agent Harness” 输出通道，便于排查。"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "bun test",
+    "package": "vsce package --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.138.0",
+    "@vscode/vsce": "^3.2.2",
+    "typescript": "^5.7.2"
+  }
+}
