@@ -18,13 +18,16 @@
  * 3. **并发/幂等/隔离**：SDK 只管"一条任务怎么跑"，不管"同一会话能不能并行两条"、
  *    "同一 messageId 重复发会怎样"、"这个 contextId 是不是你的"。
  */
+import { createHash } from 'node:crypto'
 import {
   AGENT_CARD_PATH,
   A2A_VERSION_HEADER,
   SSE_HEADERS,
+  TaskState,
+  formatSSEErrorEvent,
   formatSSEEvent,
+  taskStateToJSON,
   type AgentCard,
-  type TaskState,
 } from '@a2a-js/sdk'
 import {
   DefaultExecutionEventBusManager,
@@ -43,7 +46,9 @@ import {
   A2aServerError,
   ConcurrentTaskError,
   ContextForbiddenError,
+  ContextTaskMismatchError,
   DuplicateMessageError,
+  TaskTerminalError,
   TooManyTasksError,
   UnauthorizedError,
 } from './errors'
@@ -57,6 +62,34 @@ export const DEFAULT_JSONRPC_PATH = '/a2a'
 export const DEFAULT_A2A_HOSTNAME = '127.0.0.1'
 /** 默认单进程并发上限 */
 export const DEFAULT_MAX_CONCURRENT_TASKS = 16
+
+/**
+ * 卡片路由的 `Cache-Control: max-age`（秒）。
+ *
+ * 卡片在**进程生命周期内是固定的**（`cardJson` 只算一次），故可放心给缓存头。
+ * 规范 §8.6.1 要求卡片端点带 `Cache-Control` / `ETag`（SHOULD）、`Last-Modified`（MAY），
+ * 并支持条件请求回 `304` —— 轮询卡片注册表的行为者直接受益（官方 a2a-tck 的
+ * CARD-CACHE-001/002/003 即测这三条）。
+ */
+export const DEFAULT_CARD_CACHE_MAX_AGE_SECONDS = 300
+
+/**
+ * 路径归一：**容忍尾斜杠**（`/a2a` 与 `/a2a/` 等价）。
+ *
+ * 这不是"顺手加的宽容"，而是一处实测出来的互操作缺陷：官方 `a2a-tck` 的 JSON-RPC
+ * 客户端用 `httpx.Client(base_url=interface.url)` 建客户端、再用 `post("/")` 发请求 ——
+ * httpx 会把 `base_url` 规范成**带尾斜杠**的形式（`/a2a` → `/a2a/`），实际请求因此落到
+ * `/a2a/`。只匹配精确路径会返回 404，而 404 体是 `not found`（非 JSON）⇒ 客户端
+ * `response.json()` 抛 `JSONDecodeError`、**不落进它的 `except httpx.HTTPError`** ⇒
+ * 一个尾斜杠被放大成整轮验收崩盘（实测 254 条 error）。
+ *
+ * 根路径 `/` 不剥（剥完是空串，反而匹配不上）。
+ */
+export function normalizePath(pathname: string): string {
+  if (pathname.length <= 1) return pathname
+  const stripped = pathname.replace(/\/+$/, '')
+  return stripped === '' ? '/' : stripped
+}
 
 export interface A2aServerOptions {
   /** 已启动的宿主（`await createHost({…})`） */
@@ -135,13 +168,29 @@ function isAsyncGenerator(v: unknown): v is AsyncGenerator<unknown> {
   )
 }
 
-/** 把一个异步事件流写进 SSE 响应体 */
-function sseBody(gen: AsyncGenerator<unknown>): ReadableStream<Uint8Array> {
+/**
+ * 把一个异步事件流写进 SSE 响应体。
+ *
+ * 中途出错时**必须补一帧 `event: error`**（SDK 的 `formatSSEErrorEvent`）：SSE 一旦
+ * 提交了响应头就无法再回 JSON-RPC error，若只是 `finally { close() }`，客户端只会看到
+ * 一段**正常结束的流**——错误被吞掉。SDK 自带的 express 宿主用的是同一策略。
+ */
+function sseBody(gen: AsyncGenerator<unknown>, requestId?: unknown): ReadableStream<Uint8Array> {
   const enc = new TextEncoder()
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       try {
         for await (const chunk of gen) controller.enqueue(enc.encode(formatSSEEvent(chunk as never)))
+      } catch (e) {
+        controller.enqueue(
+          enc.encode(
+            formatSSEErrorEvent({
+              jsonrpc: '2.0',
+              id: requestId ?? null,
+              error: JsonRpcTransportHandler.mapToJSONRPCError(e),
+            }),
+          ),
+        )
       } finally {
         controller.close()
       }
@@ -149,8 +198,27 @@ function sseBody(gen: AsyncGenerator<unknown>): ReadableStream<Uint8Array> {
   })
 }
 
+/** 把单个值包成只产一个 chunk 的异步流（幂等回放的流式分支用） */
+async function* once<T>(v: T): AsyncGenerator<T> {
+  yield v
+}
+
 const SEND_METHOD = 'SendMessage'
 const SEND_STREAM_METHOD = 'SendStreamingMessage'
+
+/**
+ * 终态判定（协议 §3）：终态 = completed / failed / canceled / rejected。
+ * `input_required` / `auth_required` 是**中断态**（interrupted），不是终态 ——
+ * 它们正是"还能继续对话"的状态，判错会把正常续接挡在门外。
+ */
+function isTerminalState(state: TaskState | undefined): boolean {
+  return (
+    state === TaskState.TASK_STATE_COMPLETED ||
+    state === TaskState.TASK_STATE_FAILED ||
+    state === TaskState.TASK_STATE_CANCELED ||
+    state === TaskState.TASK_STATE_REJECTED
+  )
+}
 
 /**
  * 事件总线管理器：**接管"续接请求"那条共享 bus 的结算**。
@@ -192,7 +260,8 @@ class HarnessEventBusManager extends DefaultExecutionEventBusManager {
 
 export function createA2aServer(opts: A2aServerOptions): A2aServer {
   const host = opts.host
-  const jsonRpcPath = opts.path ?? DEFAULT_JSONRPC_PATH
+  const jsonRpcPath = normalizePath(opts.path ?? DEFAULT_JSONRPC_PATH)
+  const agentCardPath = normalizePath(`/${AGENT_CARD_PATH}`)
   const hostname = opts.hostname ?? DEFAULT_A2A_HOSTNAME
   const token = opts.token
   const maxConcurrent = opts.maxConcurrentTasks ?? DEFAULT_MAX_CONCURRENT_TASKS
@@ -230,6 +299,9 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
   const callers = new CallerRegistry()
 
   let card!: AgentCard
+  /** 卡片的**线上字节**（与 `ETag` 一一对应：ETag 就是对它取的哈希） */
+  let cardBody = ''
+  let cardHeaders: Record<string, string> = {}
   let transport!: JsonRpcTransportHandler
   let requestHandler!: DefaultRequestHandler
 
@@ -252,15 +324,34 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
       requestedVersion: req.headers.get(A2A_VERSION_HEADER) ?? undefined,
     })
 
-  /** 回放：把一个已执行过的 `messageId` 映射到任务快照（**不重复执行**，plan §3.5） */
+  /**
+   * 幂等回放：把一个已执行过的 `messageId` 映射到任务快照（**不重复执行**，plan §3.5）。
+   *
+   * ## 为什么不能直接透传 `GetTask` 的 result
+   * `GetTask` 的 result 是**裸 Task**（SDK 里是 `Task.toJSON(...)`），而回放要冒充的是
+   * `SendMessage` / `SendStreamingMessage` —— 它们的 result 是 `SendMessageResponse` /
+   * `StreamResponse`，形态必须是 `{ task }`。直接透传会让线上出参变成"result 直接是
+   * Task 字段"，对端按 `SendMessageResponse` 校验即报 `additional properties are not
+   * allowed ('artifacts','contextId','history','id','metadata','status' were unexpected)`。
+   * 官方 a2a-tck 据此判 CORE-EXECUTION-MODE-001/002 与 JSONRPC-SSE-001 失败（TCK 的多个
+   * 需求共用同一个 `messageId`，第 2 条起必然走回放路径）—— 是一个真实的协议形态缺陷，
+   * 不是 TCK 苛刻。
+   */
   const replay = async (taskId: string, id: unknown, ctx: ServerCallContext, stream: boolean): Promise<Response> => {
-    const snapshot = await transport.handle(
+    const snapshot = (await transport.handle(
       { jsonrpc: '2.0', id, method: 'GetTask', params: { id: taskId } },
       ctx,
-    )
-    if (!stream) return Response.json(snapshot)
-    // 流式客户端期待 `StreamResponse` 事件；GetTask 的 `{task}` 与 StreamResponse 同形
-    return new Response(sseBody((async function* () { yield snapshot })()), { headers: SSE_HEADERS })
+    )) as { error?: unknown; result?: unknown }
+
+    // 回放时任务已不在了（被清理 / 重启）⇒ 如实回错误，**不要伪造成功**
+    const payload =
+      snapshot.error !== undefined
+        ? { jsonrpc: '2.0', id, error: snapshot.error }
+        : { jsonrpc: '2.0', id, result: { task: snapshot.result } }
+
+    if (!stream) return Response.json(payload)
+    // 流式：单个 `{task}` 事件即合法的 `StreamResponse`
+    return new Response(sseBody(once(payload), id), { headers: SSE_HEADERS })
   }
 
   const handleJsonRpc = async (req: Request): Promise<Response> => {
@@ -316,11 +407,31 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
       // 幂等：仍在处理中 ⇒ 结构化拒绝（等它跑完再来查）
       if (inflight.has(messageId)) return serverErrorResponse(new DuplicateMessageError(messageId), body['id'])
 
-      // 续接请求（带 taskId）：**只在确实挂着一个待决询问时**才放行进 executor。
-      // 否则就是迟到 / 重复的答复（任务已收尾，或已被前一条答复唤醒）——放行只会得到
-      // "executor 不发任何事件"的悬挂（见 `HarnessEventBusManager` 的说明），
-      // 故改为回放任务快照：安全忽略、不重复执行、也不报错（plan §3.4 要点 3）。
-      if (taskId && !executor.suspend.has(taskId)) return replay(taskId, body['id'], ctx, isStream)
+      // 带 `taskId` 但挂起表里没有该任务 ⇒ **不是续接**，是"给一个已有的任务发消息"。
+      // 这里必须按协议判定（官方 a2a-tck CORE-MULTI-006 / CORE-SEND-002，都是 MUST）：
+      //   · `contextId` 与任务所属会话不一致 ⇒ 拒绝
+      //   · 任务已终态                     ⇒ 拒绝（不能再给终态任务发消息）
+      // 只有既不是上面两种、又查不到终态原因的情况才回放快照兜底。
+      //
+      // 反面教训：早先这里是一句"一律回放且不报错"（plan §3.4 要点 3 的"安全忽略"）。
+      // 那条只对**迟到的权限答复**成立；对普通用法，静默返回旧快照等于把错误掩盖成成功
+      // —— TCK 的 CORE-SEND-002 / CORE-MULTI-006 就是这么被"通过"的。**正常续接不受影响**：
+      // 真续接时 `suspend.has(taskId)` 为真，在上面就已放行。
+      if (taskId && !executor.suspend.has(taskId)) {
+        const existing = await taskStore.load(taskId, ctx)
+        if (existing) {
+          if (contextId && existing.contextId && contextId !== existing.contextId) {
+            return serverErrorResponse(new ContextTaskMismatchError(taskId, contextId), body['id'])
+          }
+          if (isTerminalState(existing.status?.state)) {
+            return serverErrorResponse(
+              new TaskTerminalError(taskId, taskStateToJSON(existing.status?.state ?? 0)),
+              body['id'],
+            )
+          }
+        }
+        return replay(taskId, body['id'], ctx, isStream)
+      }
 
       // 并发：同一会话已有活跃任务 ⇒ 直接拒绝（续接轮：taskId 命中自己，不算并发）。
       // 挂起中的任务也算活跃（它仍在 executor.running 里）—— 正是我们要的：同一会话
@@ -344,25 +455,39 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
       const result = await transport.handle(body, ctx)
 
       if (isAsyncGenerator(result)) {
-        // 流式：从首个带 task 的 chunk 记下 taskId（供后续重复 messageId 回放）
-        let recorded = false
+        // ---- 预热首值：**在提交 SSE 响应之前**先拉一次 ----
+        //
+        // SDK 的流是惰性的：`sendMessageStream` / `resubscribe` 返回的是生成器，参数或
+        // 任务不合法时异常要到第一次 `next()` 才抛出。不预热就直接回 `text/event-stream`，
+        // 这个异常会落在 SSE 的写出逻辑里 —— 客户端只会收到一个 **200 空体**，错误被吞掉。
+        // 官方 a2a-tck 的 STREAM-SUB-004（订阅不存在的任务必须回 `TaskNotFoundError`）
+        // 正是这么判失败的。
+        //
+        // 与 SDK 自带 express 宿主同一策略：预流错误走普通 JSON-RPC error
+        // （`application/json`），只有已经开出 SSE 之后的中途错误才补 `event: error` 帧。
+        const iterator = result[Symbol.asyncIterator]()
+        let first: IteratorResult<unknown>
+        try {
+          first = await iterator.next()
+        } catch (e) {
+          inflight.delete(messageId)
+          if (e instanceof A2aServerError) return serverErrorResponse(e, body['id'])
+          return rpcError(body['id'], JsonRpcTransportHandler.mapToJSONRPCError(e))
+        }
+
+        // 从首个带 task 的 chunk 记下 taskId（供后续重复 messageId 回放）
+        const firstTaskId = (first.value as { result?: { task?: { id?: string } } })?.result?.task?.id
+        if (typeof firstTaskId === 'string' && firstTaskId) messageIndex.set(messageId, firstTaskId)
+
         const wrapped = (async function* () {
           try {
-            for await (const chunk of result) {
-              if (!recorded) {
-                const id = (chunk as { result?: { task?: { id?: string } } })?.result?.task?.id
-                if (typeof id === 'string' && id) {
-                  messageIndex.set(messageId, id)
-                  recorded = true
-                }
-              }
-              yield chunk
-            }
+            if (!first.done) yield first.value
+            for await (const chunk of iterator) yield chunk
           } finally {
             inflight.delete(messageId)
           }
         })()
-        return new Response(sseBody(wrapped), { headers: SSE_HEADERS })
+        return new Response(sseBody(wrapped, body['id']), { headers: SSE_HEADERS })
       }
 
       inflight.delete(messageId)
@@ -377,13 +502,32 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
     }
   }
 
+  /**
+   * 卡片响应（含缓存头 + 条件请求）。
+   *
+   * 规范 §8.6.1 的三条（官方 a2a-tck CARD-CACHE-001/002/003）：卡片端点应带
+   * `Cache-Control`（含 `max-age`）、`ETag`，并且可以带 `Last-Modified`。
+   * 卡在进程生命周期内固定 ⇒ 三个校验子**只算一次**，且 `ETag` 取自**实际响应的字节**，
+   * 保证 `If-None-Match` 命中时不是"看起来一样"而是**逐字节一样**。
+   */
+  const cardResponse = (req: Request): Response => {
+    const inm = req.headers.get('if-none-match')
+    const ims = req.headers.get('if-modified-since')
+    const etagHit = inm !== null && inm.split(',').some((t) => t.trim() === cardHeaders['etag'])
+    const imsMs = ims === null ? NaN : Date.parse(ims)
+    const sinceHit = !Number.isNaN(imsMs) && imsMs >= Date.parse(cardHeaders['last-modified'] ?? '')
+    if (etagHit || sinceHit) return new Response(null, { status: 304, headers: cardHeaders })
+    return new Response(cardBody, { status: 200, headers: cardHeaders })
+  }
+
   const handle = async (req: Request): Promise<Response> => {
     const url = new URL(req.url)
+    const path = normalizePath(url.pathname)
     // 卡路由：客户端据此发现协议版本与安全方案
-    if (req.method === 'GET' && url.pathname === `/${AGENT_CARD_PATH}`) {
-      return Response.json(cardJson)
+    if (req.method === 'GET' && path === agentCardPath) {
+      return cardResponse(req)
     }
-    if (url.pathname === jsonRpcPath) return handleJsonRpc(req)
+    if (path === jsonRpcPath) return handleJsonRpc(req)
     return new Response('not found', { status: 404 })
   }
 
@@ -406,6 +550,14 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
     transport = new JsonRpcTransportHandler(requestHandler)
   }
   const cardJson = cardToJSON(card)
+  // 缓存校验子：卡片固定 ⇒ 只算一次；`ETag` 取自实际响应的字节（base64url(sha256) 截断）
+  cardBody = JSON.stringify(cardJson)
+  cardHeaders = {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': `public, max-age=${DEFAULT_CARD_CACHE_MAX_AGE_SECONDS}`,
+    etag: `"${createHash('sha256').update(cardBody).digest('base64url').slice(0, 27)}"`,
+    'last-modified': new Date().toUTCString(),
+  }
 
   logger?.info?.('a2a: 服务已启动', { url, port: actualPort, auth: Boolean(token) })
 

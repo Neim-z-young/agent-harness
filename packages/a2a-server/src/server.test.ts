@@ -8,6 +8,7 @@
  * 能测路由逻辑，但测不到分帧与 Content-Type。
  */
 import { describe, it, expect, afterEach } from 'bun:test'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -231,8 +232,60 @@ describe('A2aServer：卡路由', () => {
     expect((await fetch(server.url)).status).toBe(405)
   })
 
+  // 回归：官方 a2a-tck 的 JSON-RPC 客户端用 `httpx.Client(base_url=interface.url)` 后
+  // `post("/")`，而 httpx 会把 base_url 规范成带尾斜杠的 `/a2a/`（实测 raw_path === b'/a2a/'）。
+  // 只匹配精确路径 ⇒ 404 + 非 JSON 体 ⇒ 客户端 `response.json()` 崩（不落进它的
+  // `except httpx.HTTPError`）⇒ 一个尾斜杠被放大成整轮验收崩盘。故 `/a2a` 与 `/a2a/` 必须等价。
+  it('JSON-RPC 端点与卡路由都容忍尾斜杠（官方 tck 客户端会打到 /a2a/）', async () => {
+    const { server } = await makeServer({ mock: { defaultResponse: '尾斜杠也通' } })
+    const res = await fetch(`${server.url}/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [A2A_VERSION_HEADER]: '1.0' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'req-slash',
+        method: 'SendMessage',
+        params: { message: userMsg('hi', { contextId: 'c-slash' }) },
+      }),
+    })
+    expect(res.status).toBe(200)
+    const body = (await res.json()) as RpcResult['body'] & { result?: { task?: { status?: { state?: string } } } }
+    expect(body.result?.task?.status?.state).toBe('TASK_STATE_COMPLETED')
+    // 取卡路径同样等价（`/.well-known/agent-card.json/`）
+    const card = await fetch(`${new URL(server.url).origin}/${AGENT_CARD_PATH}/`)
+    expect(card.status).toBe(200)
+  })
+
   it('默认只监听 127.0.0.1', () => {
     expect(DEFAULT_A2A_HOSTNAME).toBe('127.0.0.1')
+  })
+
+  // 规范 §8.6.1（官方 a2a-tck CARD-CACHE-001/002/003）：卡片端点要带
+  // Cache-Control(含 max-age) / ETag / Last-Modified，并支持条件请求回 304。
+  it('卡片响应带缓存校验子，且 If-None-Match 命中时回 304', async () => {
+    const { server } = await makeServer({})
+    const cardUrl = `${new URL(server.url).origin}/${AGENT_CARD_PATH}`
+    const res = await fetch(cardUrl)
+    const cc = res.headers.get('cache-control') ?? ''
+    expect(cc).toContain('max-age')
+    const etag = res.headers.get('etag')
+    expect(etag).toBeTruthy()
+    expect(res.headers.get('last-modified')).toBeTruthy()
+
+    // ETag 必须对应**实际响应的字节**
+    const body = await res.text()
+    const expected = `"${createHash('sha256').update(body).digest('base64url').slice(0, 27)}"`
+    expect(etag).toBe(expected)
+
+    // 条件请求：带同一 ETag ⇒ 304 且无响应体
+    const cond = await fetch(cardUrl, { headers: { 'if-none-match': etag! } })
+    expect(cond.status).toBe(304)
+    expect(await cond.text()).toBe('')
+    // 带 Last-Modified ⇒ 同样 304
+    const byDate = await fetch(cardUrl, {
+      headers: { 'if-modified-since': res.headers.get('last-modified')! },
+    })
+    expect(byDate.status).toBe(304)
   })
 })
 
@@ -376,7 +429,10 @@ describe('A2aServer：并发与幂等', () => {
     expect(other.body.result.task.status.state).toBe('TASK_STATE_INPUT_REQUIRED')
   })
 
-  it('迟到 / 重复的答复 ⇒ 回放快照，不重复执行也不报错', async () => {
+  // 行为修正（外部验收查出）：原先这里断言"回放快照且不报错"，但协议要求给**终态任务**
+  // 发消息必须报错（官方 a2a-tck CORE-SEND-002 / CORE-MULTI-006，都是 MUST）。
+  // 静默回放会把"用错 taskId"掩盖成成功。**不重复执行**这条保证不变（工具调用数仍为 1）。
+  it('迟到 / 重复的答复 ⇒ 任务已终态，结构化拒绝且不重复执行', async () => {
     const { server, calls } = await makeServer({ mock: toolThenText('go', '工具说 ok'), permissionMode: 'ask' })
     const first = taskOf(await send(server, 'go', { contextId: 'c1', messageId: 'm1' }))
     expect(first.status.state).toBe('TASK_STATE_INPUT_REQUIRED')
@@ -388,13 +444,45 @@ describe('A2aServer：并发与幂等', () => {
     expect(done.status.state).toBe('TASK_STATE_COMPLETED')
     expect(calls.echo).toBe(1)
 
-    // 再答一次（同一 taskId、新 messageId）：挂起表里已无该 task ⇒ 安全忽略（回放快照）
-    const late = taskOf(
-      await send(server, 'allow', { contextId: first.contextId, taskId: first.id, messageId: 'm3' }),
-    )
-    expect(late.id).toBe(first.id)
-    expect(late.status.state).toBe('TASK_STATE_COMPLETED')
+    // 再答一次（同一 taskId、新 messageId）：挂起表里已无该 task，任务已终态 ⇒ 拒绝
+    const late = await send(server, 'allow', { contextId: first.contextId, taskId: first.id, messageId: 'm3' })
+    expect(late.body.error.data.a2aCode).toBe('TASK_TERMINAL')
     expect(calls.echo).toBe(1)
+  })
+
+  // 协议 MUST（官方 a2a-tck CORE-SEND-002）
+  it('给终态任务发消息 ⇒ TASK_TERMINAL（不是静默回放旧快照）', async () => {
+    const { server } = await makeServer({ mock: { defaultResponse: '完事' } })
+    const first = taskOf(await send(server, 'hi', { contextId: 'c1', messageId: 'm1' }))
+    expect(first.status.state).toBe('TASK_STATE_COMPLETED')
+
+    const again = await send(server, 'follow up', { contextId: 'c1', taskId: first.id, messageId: 'm2' })
+    expect(again.body.error.code).toBe(-32004)
+    expect(again.body.error.data.a2aCode).toBe('TASK_TERMINAL')
+    expect(again.body.result).toBeUndefined()
+  })
+
+  // 协议 MUST（官方 a2a-tck CORE-MULTI-006）
+  it('taskId 与 contextId 不匹配 ⇒ CONTEXT_TASK_MISMATCH（不放行写进去）', async () => {
+    const { server } = await makeServer({ mock: { defaultResponse: '完事' } })
+    const first = taskOf(await send(server, 'hi', { contextId: 'c-real', messageId: 'm1' }))
+    expect(first.status.state).toBe('TASK_STATE_COMPLETED')
+
+    const bad = await send(server, 'x', { contextId: 'c-wrong', taskId: first.id, messageId: 'm2' })
+    expect(bad.body.error.code).toBe(-32602)
+    expect(bad.body.error.data.a2aCode).toBe('CONTEXT_TASK_MISMATCH')
+  })
+
+  // 反面保险：**中断态不是终态** —— 挂起中的任务必须仍然可续接（判成终态会把续接挡死）
+  it('INPUT_REQUIRED（中断态）不算终态 ⇒ 续接照常放行', async () => {
+    const { server } = await makeServer({ mock: toolThenText('go', 'ok'), permissionMode: 'ask' })
+    const first = taskOf(await send(server, 'go', { contextId: 'c1', messageId: 'm1' }))
+    expect(first.status.state).toBe('TASK_STATE_INPUT_REQUIRED')
+
+    const resumed = taskOf(
+      await send(server, 'allow', { contextId: 'c1', taskId: first.id, messageId: 'm2' }),
+    )
+    expect(resumed.status.state).toBe('TASK_STATE_COMPLETED')
   })
 
   it('重复 messageId ⇒ 回放任务快照，**不重复执行**', async () => {
@@ -411,6 +499,49 @@ describe('A2aServer：并发与幂等', () => {
     expect(taskOf(again).id).toBe(first.id)
     expect(taskOf(again).status.state).toBe('TASK_STATE_COMPLETED')
     expect(calls.echo).toBe(1)
+
+    // 回放的**出参形态**必须是 SendMessageResponse（`{task}`），不能把 GetTask 的裸 Task 透传。
+    // 反例：`result` 直接是 Task 字段 ⇒ 对端按 SendMessageResponse 校验报
+    // "additional properties are not allowed"（官方 a2a-tck CORE-EXECUTION-MODE-001/002 即此）。
+    const raw = (again.body as { result?: Record<string, unknown> }).result!
+    expect(Object.keys(raw)).toEqual(['task'])
+    expect((raw['task'] as { id?: string }).id).toBe(first.id)
+  })
+
+  it('流式回放的 SSE 帧同样是 StreamResponse（`{task}`），不是裸 Task', async () => {
+    const { server } = await makeServer({ mock: { defaultResponse: '流式回放' } })
+    const first = await streamSend(server, 'go', { contextId: 'c-sl', messageId: 'ms1' })
+    const firstTaskId = first.events[0].result.task.id as string
+    expect(first.events.at(-1).result.statusUpdate.status.state).toBe('TASK_STATE_COMPLETED')
+
+    // 同一 messageId 再发流式 ⇒ 回放
+    const replay = await streamSend(server, 'go', { contextId: 'c-sl', messageId: 'ms1' })
+    expect(replay.events).toHaveLength(1)
+    const result = replay.events[0].result
+    expect(Object.keys(result)).toEqual(['task'])
+    expect(result.task.id).toBe(firstTaskId)
+  })
+
+  // 回归：SDK 的流是**惰性**的（`resubscribe` / `sendMessageStream` 返回生成器），
+  // 参数或任务不合法时异常要到第一次 `next()` 才抛。不在提交 SSE 响应**之前**预热首值，
+  // 异常就会落进 SSE 写出逻辑 ⇒ 客户端只收到 **200 空体**，错误被吞掉
+  // （官方 a2a-tck STREAM-SUB-004 正是这么判失败的）。
+  it('订阅不存在的任务 ⇒ 普通 JSON-RPC error（不是 200 空体 / 空 SSE）', async () => {
+    const { server } = await makeServer({})
+    const res = await fetch(server.url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', [A2A_VERSION_HEADER]: '1.0' },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: 'req-sub',
+        method: 'SubscribeToTask',
+        params: { id: 'no-such-task' },
+      }),
+    })
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).not.toContain('text/event-stream')
+    const body = (await res.json()) as { error?: { code?: number } }
+    expect(body.error?.code).toBe(-32001)
   })
 
   it('并发上限生效 ⇒ TOO_MANY_TASKS', async () => {

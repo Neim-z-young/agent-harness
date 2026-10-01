@@ -18,6 +18,10 @@ export type A2aErrorCode =
   | 'BAD_REQUEST'
   /** `messageId` 重复且无法回放（仍在执行中，尚无可回放的快照；plan §3.5 幂等） */
   | 'DUPLICATE_MESSAGE'
+  /** 消息带 `taskId`，但该任务已进入终态（协议 MUST：不能再给它发消息） */
+  | 'TASK_TERMINAL'
+  /** 消息同时带 `taskId` 与不匹配的 `contextId`（协议 MUST：拒绝） */
+  | 'CONTEXT_TASK_MISMATCH'
 
 export class A2aServerError extends Error {
   readonly code: A2aErrorCode
@@ -97,5 +101,44 @@ export class DuplicateMessageError extends A2aServerError {
       detail: { messageId },
     })
     this.name = 'DuplicateMessageError'
+  }
+}
+
+/**
+ * 消息带 `taskId`，但该任务**已进入终态**（completed / failed / canceled / rejected）。
+ *
+ * 协议要求 `SendMessage` 拒绝发往终态任务的消息（官方 a2a-tck `CORE-SEND-002`，MUST）。
+ * 客户端收到它应当 **`GetTask` 读终态**，而不是重试。
+ *
+ * ⚠️ 这条错误**修正了一处原设计偏差**：原先"带 `taskId` 但挂起表里没有 ⇒ 一律回放快照
+ * 且不报错"（plan §3.4 要点 3 的"安全忽略"）。那条只对**迟到的权限答复**成立；对"给一个
+ * 已结束的任务发新消息"这种普通用法，静默返回快照会把**错误掩盖成成功**。现在按协议报错
+ * —— 仍然不重复执行，只是把结果如实告知。**正常续接不受影响**：真续接时
+ * `executor.suspend.has(taskId)` 为真，走的是放行分支。
+ */
+export class TaskTerminalError extends A2aServerError {
+  constructor(taskId: string, state: string) {
+    super('TASK_TERMINAL', `任务 ${taskId} 已进入终态（${state}），不能再给它发消息`, {
+      detail: { taskId, state },
+      // -32004 = UnsupportedOperation（A2A 错误码表）
+      jsonRpcCode: -32004,
+    })
+    this.name = 'TaskTerminalError'
+  }
+}
+
+/**
+ * 消息同时带了 `taskId` 与**不属于该任务**的 `contextId`。
+ *
+ * 协议要求拒绝这种自相矛盾的请求（官方 a2a-tck `CORE-MULTI-006`，MUST）——放行会
+ * 让两个会话的历史被同一任务写入。`-32602` = Invalid params。
+ */
+export class ContextTaskMismatchError extends A2aServerError {
+  constructor(taskId: string, contextId: string) {
+    super('CONTEXT_TASK_MISMATCH', `contextId ${contextId} 与任务 ${taskId} 所属会话不一致`, {
+      detail: { taskId, contextId },
+      jsonRpcCode: -32602,
+    })
+    this.name = 'ContextTaskMismatchError'
   }
 }
