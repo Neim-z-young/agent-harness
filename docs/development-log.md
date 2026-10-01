@@ -1,5 +1,46 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 230）P0 收尾 S1：装配期诊断通道（`renderNotice` 逐字复刻 + 等级只有一份）
+
+### 为什么先落 S1 而不是直接搬 `boot`
+
+设计稿（`docs/host-extraction-design.md`，本轮定稿）把 P0 收尾拆成 S1–S4，**S1 是纯新增、不接线**：
+先把"文案"从"会不会被 boot 的其它改动顺带改掉"里摘出来。20 处输出今天**只有 1 条被测试钉住**
+（`cli.test.ts:1939`），其余 19 条既无断言也没进任何结构化通道 —— 直接搬 boot，等于在没有任何
+判据的情况下同时改动 20 条文案。S1 之后，S2 的"文案逐字不变"成为**可执行的断言**。
+
+### 三处实测修正（相对设计稿）
+
+1. **`level` 只有一份**：设计稿让调用点自己填 `level`。那等于把"这条算不算必须知道的事实"
+   复制到 20 个调用点 —— 本仓"同一个东西两套写法"的老病。改为 `NOTICE_LEVEL: Record<NoticeCode,
+   NoticeLevel>` 是唯一来源，`makeNotice()` 从表里盖 ⇒ 调用点**类型上无从填错**，降级必须改表。
+   反向验证已确认：把 `provider.fallback-mock` 降成 `log` ⇒ 2 条用例失败（含"从表里盖等级"那条）。
+2. **站点是 21 个 `code`，不是 20 个**：原表把 `2336` 行记成一个站点，实际那是 `loadPluginDirs`
+   的 `log` 回调，背后有**三条不同消息**（代码注入闸门块 / 单模块加载失败 / 模块既无通用插件
+   也无 Provider 工厂），前两条还是**多次 `write` 的扇出** ⇒ 模板按整块字节复刻。
+   另发现**一条漏网站点**：`preloadBuiltinToolMetas` 用 `console.warn` 直写，既不走 `stdout`
+   也不走 `setLogSink`，是本轮唯一"两个出口都不沾"的装配期诊断（S2 要一并处理）。
+3. **外部插件目录那三条是"双换行"，且必须保留**：`out()` 参数自带 `\n`，CLI 回调又加一个
+   ⇒ 每个 `out` 落成 `…\n\n`。要 S2 零 diff 就得复刻它；测试里专门跑一遍真实 `loadPluginDirs`
+   对比**捕获字节**，因此这不是"本模块的风格选择"，而是与实现对齐的硬约束。
+
+### 顺带修掉上一轮遗留的 typecheck 缺口
+
+上一轮 B 档写了"typecheck 40 包 exit 0"，但那是在 `config-window.test.ts` **写出来之前**跑的 ——
+该文件 4 处 `t.byProvider[...]` / `t.byModel[...]` 一直没过类型检查（`ProviderWindowTable` 的两个
+字段在插件侧是**可选**的）。本轮补类型时暴露并修掉：`buildProviderWindowTable` 的返回类型收紧为
+`ProviderWindowTableView`（三字段恒存在）——装配方的**产出**不该说"可能没有"，否则每个消费方
+都要写一次 `?.` / `!`。**教训：验收口径要跑在最后一个改动之后，测试文件也是产物。**
+
+### 产物
+
+`packages/host/src/notice.ts`（`NoticeLevel` / `NoticePayloads` 判别联合 / `NOTICE_LEVEL` /
+`makeNotice` / `renderNotice` / `installConsoleCapture`）、`notice.test.ts`（25 条）、
+`packages/host/src/index.ts` 转出。**不接线** ⇒ 除 host 新增 25 条外，其余测试逐条不变。
+
+验证：`bun run typecheck` 40 包 exit 0；`bun test ./packages` **2197 pass / 0 fail**（93 文件，
+原 2172/92 + 25）；`packages/host` 71 pass。反向验证两条均已执行并确认失败。
+
 ## 2026-10-01（续 229）P0 第三步：搬配置归一化与窗口推导（B 档）—— 顺带定下"窄类型"这条边界
 
 ### 切口：B 档连着 config 层，但**不搬 config 模型**

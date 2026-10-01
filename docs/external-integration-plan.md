@@ -283,7 +283,7 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 | 阶段 | 内容 | 交付物 | 验收口径（预期行为，非执行步骤） |
 |---|---|---|---|
 | **P0.5（✅ 已完成 2026-10-01）** | ① SDK **无框架** server 入口 + `Bun.serve` 最小可跑（回一个 `SendMessage` + 一张 agent-card）；② `bun build --compile` 产出的二进制**能否加载用户目录的动态 TS 插件** | `spikes/a2a/` 两个可复现脚本 + 结论已回写本文档（§3.1.1 / §3.4 / §8） | ① **可行**：`JsonRpcTransportHandler.handle(body, ctx)` 纯 JSON-RPC 进出、**完全不接触 HTTP**，直挂 `Bun.serve`，无需任何框架 peer dep；13 项自检全绿（取卡 / 非流式 / SSE / GetTask / ListTasks / CancelTask / **`INPUT_REQUIRED` 挂起与续接** / 版本校验 / 异常转 FAILED）。② **可行**：`--compile` 二进制**内嵌转译器**，能运行期加载用户目录 `.ts`（不只是 `.js`/`.mjs`），61MB / 冷启动 18ms ⇒ **P3 sidecar 可走单文件二进制**。SDK 版本**钉死 `@a2a-js/sdk@1.3.0`** |
-| **P0**（🔨 进行中：**前三步已完成 2026-10-01**） | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器。**第一步**：`loadPluginDirs` 簇（A 档）⇒ 2137 pass。**第二步**：内置注册表三节（C 档：Provider 类型工厂 / 内置通用插件 / 内置工具元信息，连同共用的 `lazyImport`）⇒ 2156 pass。**第三步**：配置归一化与窗口推导（B 档：`normalizeProviderConfigs` / `parseModelSpec` / `resolveContextWindowTokens` / `buildProviderWindowTable`，用 `ProviderWindowConfigSource` 窄类型避免拖走 `HarnessConfig`）⇒ **40 包 typecheck exit 0 / 全量 2172 pass**（2156 + host 新增 16，其余逐条不变）。**剩余**：仅 `HarnessApp.boot` 主体（→ `createHost({...})` + boot 内 16 处 `stdout.write` 三级分级 + 接管 SDK 的 console） |
+| **P0**（🔨 进行中：**前三步已完成 2026-10-01**） | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器。**第一步**：`loadPluginDirs` 簇（A 档）⇒ 2137 pass。**第二步**：内置注册表三节（C 档：Provider 类型工厂 / 内置通用插件 / 内置工具元信息，连同共用的 `lazyImport`）⇒ 2156 pass。**第三步**：配置归一化与窗口推导（B 档：`normalizeProviderConfigs` / `parseModelSpec` / `resolveContextWindowTokens` / `buildProviderWindowTable`，用 `ProviderWindowConfigSource` 窄类型避免拖走 `HarnessConfig`）⇒ **40 包 typecheck exit 0 / 全量 2172 pass**（2156 + host 新增 16，其余逐条不变）。**剩余**：仅 `HarnessApp` 本体（56 个成员 ≈ 1150 行）→ 上移为 `HarnessHost` + CLI `extends`，装配期 **20 处**输出改结构化 notice，并给 SDK 的 console 留接管钩子。**接口设计稿已出**：`docs/host-extraction-design.md`（含 20 处逐条分级表、三条接缝、4 步落地顺序、3 个待定分叉）。**设计已定稿**（三处分叉按推荐选项落定：继承 / `renderNotice` 放 host / `asker` 四态，`Host.notices` 环形缓冲要）。**S1 已落地**（2026-10-01）：`packages/host/src/notice.ts` —— 21 枚 `code` 的判别联合类型、`NOTICE_LEVEL` 表（等级只有一份，调用点无从填错）、`renderNotice` 逐字复刻今天写进 stdout 的字节、`installConsoleCapture`，配 25 条用例（含与真实 `loadPluginDirs` 的**捕获字节**对齐）⇒ **40 包 typecheck exit 0 / 全量 2197 pass**（2172 + 25，其余逐条不变）。**剩余**：S2（`HarnessHost` 上移 + boot 20 处改 `emitNotice` + CLI `extends`）/ S3（权限四态上移）/ S4（导出 `createHost()` + 收口重叠测试） |
 | **P1** | A2A 一期：AgentCard + SendMessage + SendStreamingMessage(SSE) + GetTask + CancelTask + Bearer + `A2A-Version` 校验 + `INPUT_REQUIRED` 权限（含 §3.4 挂起机制、§3.5 并发/幂等）；默认 127.0.0.1 | `@harness/a2a-server` 与 `harness a2a` 启动方式 | 用官方 `a2a-inspector` / `a2a-tck` 跑通：取到 agent-card；发消息后收到 task→artifact/状态更新→`TASK_STATE_COMPLETED` 的事件序列；取消后转 `TASK_STATE_CANCELED`；权限点转 `TASK_STATE_INPUT_REQUIRED` 且答复后续接；同 session 并发请求被串行化或结构化拒绝；重复 `messageId` 不重复执行 |
 | **P2** | VSCode Chat Participant（B2）：spawn sidecar（stdio）或连本地 A2A，转发流到 ResponseStream，含取消与权限弹窗 | VSIX 扩展（不发布 Marketplace） | 在 VSCode 中 `@harness` 提问可看到流式回答、工具进度、斜杠命令；终止按钮可中断；权限请求弹窗可决策 |
 | **P3** | VSCode Webview（B3）：平移块模型与侧栏（会话/后台任务/文件引用/统计）；sidecar 分发（`--compile` 或随扩展带 bun，取决于 P0.5 结论） | VSIX 完整版 | 终端 TUI 的核心信息结构在 IDE 内等价呈现 |
@@ -291,23 +291,16 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 
 依赖顺序：**P0.5 已出结论，P1/P3 的前置条件已解除**（协议口径与分发路径都定了）；**P0 是 P1/P2/P3 的共同前置**；P1 的 server 可直接充当 P2 的 sidecar 传输层；旁路 B1 与主线并行、互不阻塞。
 
-**P0 的 `createHost` 接口清单（必须覆盖 `boot()` 现状，原稿只写 4 个字段远不够）**：
+**P0 的 `createHost` 接口设计 → 见 `docs/host-extraction-design.md`（2026-10-01 定稿；S1 已落地，S2–S4 待做）**。
 
-```ts
-createHost({
-  cwd, dataDir,                       // 工作区与数据目录（由 resolveWorkspace 统一解析）
-  provider?, model?,                  // 默认端点覆盖（原 CLI 的 --provider / --model）
-  providers?,                         // config.json → providers 的覆盖
-  anthropicProviderConfig?, mockProviderConfig?,
-  permissionMode?, askPrompt?,        // 权限档位
-  permissionAsk?,                     // 远程 ask 回调（A2A / VSCode 注入）
-  allowPluginCode?,                   // 外部插件目录代码注入闸门
-  agents?, agentDirs?,                // Agent 定义与两级目录
-  plugins?,                           // config.json → plugins 声明式启用
-  snapshot?,                          // 文件快照服务
-  logSink?, stdout?,                  // 日志/诊断出口（见下方分级要求）
-})
-```
+该文档已按实测重写本节原草稿，两处修正值得记在这里：
+
+- ❌ 原草稿的 `agentDirs?` / `plugins?` **不是 boot 的入参**：`plugins` 来自 `config.json`（boot 内
+  `resolveBuiltinPlugins(cfg.plugins)`），`agentDirs`/`skillDirs` 由 `workspace` 派生出 user/project 两级。
+  写成入参等于给出第二条口径。
+- ❌ 原草稿的 `permissionAsk?` / `logSink?` 两个名词都不准确：真正的接缝是
+  `asker(req, prompt) → 四态`（不是文本往返）与 `onNotice(notice: HostNotice)`（三级结构化，与既有
+  `setLogSink` 是**两条**通道，不合并）。`askPrompt` / `stdout` 留在 CLI 侧 —— host 不认识 readline 与直写流。
 
 **P0 的搬迁清单（定义在 `packages/cli/src/index.ts`，不在 core）**：`BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` / `loadPluginDirs` / `buildProviderWindowTable`。搬走后 `@harness/cli` 必须继续 re-export 这些符号（`cli.test.ts` 直接 import），否则等于制造一次无谓的测试翻修。
 
@@ -323,7 +316,7 @@ createHost({
 >
 > **第一步的机制验证点**：`cli.test.ts` 有 9 条 `loadPluginDirs` 用例直接 `import` 这些符号 —— 搬走后它们必须**逐字通过**（实测 429 pass / 0 fail），这就是"re-export 兼容"这条约定的验收口径。host 包另建同能力用例（`load-plugin-dirs.test.ts`，11 条）按"能力归属"覆盖实现；两处的重叠是**有意的**，待第二步搬 `boot` 时统一收口去重。
 
-**P0 的 stdout 分级要求**：boot 内 16 处 `stdout?.write` 混着三类语义 —— ① 用户可见诊断（如"未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider"）② 告警 ③ 日志。抽 host 时必须先分级：A2A 宿主若把 ① 也塞进 `logSink`，远程调用方会**静默拿到 mock 回答**。① 应升格为**可观测事件**（P1 落进任务 metadata / 服务日志 / 启动自检输出）。
+**P0 的 stdout 分级要求**：装配期共 **20 处** `stdout?.write`（boot 内 16 + 后台预加载 4）混着三类语义 —— ① 用户可见诊断（如"未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider"）② 告警 ③ verbose 日志。抽 host 时必须先分级：A2A 宿主若把 ① 也塞进日志通道，远程调用方会**静默拿到 mock 回答**。① 应升格为**可观测事件**（P1 落进任务 metadata / 服务日志 / 启动自检输出），并在 host 侧保留环形缓冲供事后回读（今天不传 `stdout` 这 20 条**全部静默丢弃**）。逐条分级表与文案复刻方案见 `docs/host-extraction-design.md` §2.5。**现状参考**：20 处里只有 1 处被测试钉住（`cli.test.ts:1939`），其余 19 处既无断言也不进任何结构化通道。
 
 ---
 
@@ -332,7 +325,7 @@ createHost({
 1. **权限 ask 远程化**：新增 `RemotePermissionEngine`（实现 `PermissionEngine`，与 `CliPermissionEngine` 一样只覆盖 `ask`），ask 向 UI 发请求并 await 决策。**真正的难点不是换实现，而是 §3.4 的挂起/唤醒机制**——两种宿主只是它的两个壳（A2A=`INPUT_REQUIRED`，VSCode=授权卡）。check→ask 两步、`ToolPermissionDeniedError` 判定、规则持久化全部沿用，不改语义。
 2. **会话/任务映射**：`contextId=sessionId`、`taskId=请求 id`；**续接按 taskId**；`ListTasks` 走 task 索引而非 session（§3.5）。
 3. **长等待心跳**：`step_gate` 一个事件两种壳——A2A 转 WORKING 状态更新，VSCode 转 progress；不在各壳另做超时猜测（预算语义已在引擎内：超预算继续等待但标 `overBudget`）。
-4. **日志通道**：复用 `HarnessApp` 上已落地的 `setLogSink` / `emitLog` **模式**（注意：它在 CLI 宿主层，**不在 core**），P0 抽 host 时一并上移到 `@harness/host`。A2A server 把 warn/error 收进任务 metadata/服务日志，绝不直写共享 stdout；VSCode 侧经消息桥进 webview console 块。
+4. **日志通道**：`HarnessApp` 已有的 `setLogSink` / `emitLog` **模式**（注意：它在 CLI 宿主层，**不在 core**）随 P0 上移到 `@harness/host`；另新增装配期的 `onNotice`（三级结构化）。**两条通道不合并**——时机（装配期一次性 vs 运行期每轮）、内容（结构化 code vs 自由文本）、挂载方式（构造期 option vs 运行期 setter）都不同，合并要改一个已被 `cli.test.ts:3185` 钉住的契约。见 `docs/host-extraction-design.md` §2.5。A2A server 把 warn/error 收进任务 metadata/服务日志，绝不直写共享 stdout；VSCode 侧经消息桥进 webview console 块。
 5. **后台任务可见性**：外部 UI 统一订阅 bus（`SubagentEvents.*`、单任务完成与 barrier 两条事件不合并），不新建轮询通道。
 6. **版本兼容**：AgentCard 的 `supportedInterfaces[].protocolVersion` 声明协议版本（顶层 `version` 是 agent 自身版本，**不要**写成 `protocol_version`）；每个请求校验 `A2A-Version` 头。host 装配层接口稳定后，CLI/server/扩展各自独立发版。
 
