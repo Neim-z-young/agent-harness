@@ -1,5 +1,93 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 240）P2-A：控制通道 `POST /harness/rpc` —— 把协议之外的管理面补上
+
+### 做什么
+
+按设计稿 §10 的推荐项开工（**案 A 传输** + 仓内 `adapters/vscode/` + **`/harness/rpc` 控制面** + 复用
+`INPUT_REQUIRED` 挂起）。第一刀落在**控制面**而不是扩展骨架，是一条依赖顺序决定的：
+
+1. 扩展的 `HarnessTransport.control()` **依赖它**（12/18 个斜杠命令只有它能承载）；
+2. 它**完全在仓内、能被 `bun test` 端到端验证** —— 扩展骨架在本机没有 VSCode 可跑，只能 typecheck，
+   而本仓的纪律是"改动必须有可执行的验收口径"；
+3. 它还顺手收掉了 plan §6 末尾挂着的那一格（**装配期降级事实到不了调用方**）。
+
+产出：新增 `packages/a2a-server/src/control.ts`（方法注册表 + `dispatchControl`）+ `control.test.ts`；
+`server.ts` 增 `POST /harness/rpc` 路由与 `controlPath` / `controlUrl`；`index.ts` 导出控制面符号；
+`harness a2a` 启动信息多一行控制端点。
+
+### 三个设计判断
+
+| # | 判断 | 依据 |
+|---|---|---|
+| 1 | **另开一条路径，不塞进 `/a2a` 的方法空间** | `/a2a` 的"未知方法 ⇒ `MethodNotFound`"是 TCK 的断言项；混进去等于把 P0 刚拆开的协议面/实现面重新粘上，且日后每次动 A2A 都要重推"这条会不会影响私有方法"。另开路径后 **TCK 永远碰不到它** |
+| 2 | **不进 AgentCard** | 卡片是发给 **A2A 客户端**的发现文档；控制面是扩展私有的实现细节，声明出去等于对外承诺一套并不打算标准化的 API。有守卫用例钉着（卡片 JSON 里不得出现 `/harness`、`rpc`） |
+| 3 | **共用同一个 Bearer，但其余一律不同** | 同一端口不该有两套凭据；但**不做 `validateVersion`**（它不是 A2A）、**不查幂等/并发/归属**（管理操作没有回放语义）。错误词汇也刻意与 `A2aErrorCode` 分开 —— 那份枚举是协议的一部分，不该为它长新成员 |
+
+### 一处刻意的设计判断：入参结构化，**不收 CLI 的模糊词法**
+
+CLI 的 `/model hy3` 需要 `resolveModelArg` 消解歧义（序号 / 实例 id / 模型名 / `provider/model` 四种写法）。
+这套词法属**终端输入面** —— 与 `packages/host/src/permission.ts` 文件头那条既有判断**完全同构**：
+「文本 → 四态的翻译属 CLI 的输入词汇，留在 `@harness/cli`」。
+
+于是控制面收 `{ providerId, modelId }`，歧义消解留在敲命令的那一端（VSCode 扩展 / CLI）。
+好处是**协议没有歧义态**：不必定义"我让用户再选一次"这种回环，也不必把 CLI 的解析器搬过来。
+
+另一处边界纪律：**每条方法只做「参数校验 + 调 host 公共面 + 组织出参」**。一旦在 sidecar 里补一句
+"顺便也把 X 改了"，就与 CLI 的 `/xxx` 长成两份实现 —— 这正是 P1 踩过的同形态坑。
+
+### 首批 14 个方法
+
+| 分组 | 方法 | 对应 CLI | host 落点 |
+|---|---|---|---|
+| 诊断 | `harness/notice.list` | —（**新增能力**） | `host.notices` + `renderNotice` |
+| 会话 | `harness/session.list` / `.get` / `.new` / `.resume` | `/sessions` `/new` `/resume` | `sessionStore` / `sessionPointer` / `harness.session.create` / `restoreSession` |
+| Agent | `harness/agent.list` / `.set` | `/agent` `/switch` | `harness.agent` + `session.agentId`（**立即落盘**） |
+| 模型 | `harness/model.get` / `.set` | `/model`（含 `reset` / `--global`） | `resolveSessionModel` / `setSessionModel` / `setModel` |
+| 权限 | `harness/permission.get` / `.set` | `/permission`（查看 / mode / `k=v` / reset） | `permission.getMode` / `setPermissionRules` |
+| 技能 | `harness/skill.list` / `.set` | `/skills` | `skillInfos` / `enableSkill` / `disableSkill` / `reloadSkill` |
+| 压缩 | `harness/compact` | `/compact [auto\|prune\|summary\|agent]` | `buildCompactionOptions` + `session.compactIfNeeded` / `compact` |
+
+**会话寻址**：`sessionId` **就是 A2A 的 `contextId`**（`executor.ensureSession` 钉死的 `contextId = sessionId`）
+⇒ "控制面改的是哪条会话"与"聊天在跟哪条会话说话"是同一个身份，不需要第二套映射。缺省 = sidecar boot 选中的那条。
+读操作（`get` / `list`）**不 `restore`**、写操作才 `restore` —— 读一次状态不该在 `SessionManager` 里凭空建出一个会话。
+
+**`harness/notice.list` 是首批里最有价值的一条**：它把 host 装配期的环形缓冲送到消费方，于是
+"**在 IDE 里拿到 mock 回答却毫无信号**"在结构上不可能发生（plan §6 末尾点名的那条风险）。
+返回的每条 notice 都带 `renderNotice()` 的**渲染结果** —— 22 条文案只有 host 里那一份实现，扩展端不抄第二份。
+
+### 验证
+
+**三段式**：`bun run typecheck` → **41 包 exit 0**（0 行 `error TS`）；`bun run test` → **2299 pass / 0 fail / 41 包 exit 0**
+（较 P1-E 收尾的 2265 增 34：`control.test.ts` 新增 28 条、`server.test.ts` 新增 6 条）。
+单包 `@harness/a2a-server` **70 → 104 pass / 0 fail**。
+
+**反向验证（5 处，每处都必须变红）**：
+
+| 实验 | 结果 |
+|---|---|
+| 摘掉 `handle()` 里的控制面路由 | **4 fail**（可达 / 尾斜杠 / 401 / 405 全红） |
+| `handleControl` 里把 `verifyBearer(authHeader, token)` 改成恒真 | **1 fail**（401 用例） |
+| `agent.set` 去掉"立即落盘"（只改内存） | **1 fail**（落盘断言） |
+| `permission.set` 的 `key` 分支从"增改"退化成"整份替换" | **1 fail**（`*: ask` 被覆盖） |
+| `session.new` 不继承会话级模型覆盖 | **1 fail**（`carriedModelOverride`） |
+
+每次还原后 `sha256` 与实验前**逐字一致**，最后 104 pass / 0 fail。
+
+### 明确未做（边界写下来，免得被当成遗漏）
+
+- **`harness/stats.get`**：它要的 `resolveCurrentUsage` / `renderContextOccupancy` 目前还住在 `@harness/cli`
+  （sidecar 不能反向依赖 cli）⇒ 需先把这几个纯函数上移到共享位置，**不在控制面顺手抄一份**。
+- **`adapters/vscode/` 扩展骨架**：下一步（P2-B）。
+- **`harness a2a` 的结构化端点输出**（设计稿 §9 开工第一步 2）：真正的消费者是 spawn 它的扩展，
+  放到 P2-B 一起做，现在只在启动信息里加了一行人可读的控制端点。
+
+### 下一步
+
+P2-B：`adapters/vscode/` 骨架 —— `package.json`（`chatParticipants` 贡献点）+ 独立 `tsconfig`（**不入 workspace、
+不进 root `tsconfig.include`**，并加守卫测试）+ `HarnessTransport` 接口与案 A 实现 + `sidecar.ts`（spawn / 端点解析 /
+生命周期）+ 最小参与者（`@harness <prompt>` 拿到一段完整回答）。传输选型已定（案 A），控制面的 `control()` 现已有实现可打。
+
 ## 2026-10-01（续 239）P2 设计稿：VSCode 接入 —— A2A 协议里"没有的那一半"
 
 ### 做什么

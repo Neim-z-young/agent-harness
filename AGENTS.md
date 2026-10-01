@@ -170,6 +170,29 @@
     `DM-MSG-001`（强制 `SendMessage` 返回 `Message`，而协议允许返回 `Task`）是**参考 SUT 特化断言、非协议要求**，
     不算我方缺陷；`SKIPPED` 多为未声明 gRPC/HTTP+JSON/push。**真起 SUT 的本地环境坑**：沙箱代理会把 `127.0.0.1`
     劫持成 502（TCK 侧 `NO_PROXY=127.0.0.1,localhost`），后台 SUT 必须用常驻方式起（`&`+`nohup` 会随命令结束被回收）。
+  - **控制面 `POST /harness/rpc`（P2-A）**：A2A 协议里**没有的那一半**。`/a2a` 只认 6 个方法，而 CLI 有 18 个
+    斜杠命令、其中 **12 个是本进程管理操作**（`/compact` `/stats` `/agent` `/model` `/permission` `/skills` …）
+    —— 协议里**无处安放**（这是协议定位，不是缺陷）。实现见 `control.ts`（方法注册表 + `dispatchControl`），
+    路由在 `server.ts` 的 `handle()` 里**与协议面并列**。三条硬约束：① **不塞进 `/a2a` 的方法空间**（那里的
+    "未知方法 ⇒ `MethodNotFound`"是 TCK 的断言项，混进去等于把 P0 刚拆开的协议面/实现面重新粘上，且日后每次
+    动 A2A 都要重推一遍"这条会不会影响私有方法"）；② **不进 AgentCard**（卡片是发给 A2A 客户端的发现文档，
+    控制面是扩展私有的实现细节；有守卫用例钉着）；③ **共用同一个 Bearer**（同端口不该有两套凭据），但
+    **不做 `validateVersion`**（它不是 A2A）、**不查幂等/并发/归属**（管理操作没有回放语义，也没有多租户问题）。
+    错误词汇也**刻意与 `A2aErrorCode` 分开**（`ControlError` / `controlCode`）—— 那份枚举是协议的一部分，不该为它长新成员。
+  - **控制面入参是结构化的，不收 CLI 的模糊词法**：`/model hy3` 这类自由文本要 `resolveModelArg` 消解歧义
+    （序号 / 实例 id / 模型名 / `provider/model` 四种写法），那是**终端输入词汇** —— 与 `permission.ts` 文件头
+    那条既有判断同构（"文本 → 四态的翻译属 CLI 的输入词汇，留在 `@harness/cli`"）。故控制面收 `{ providerId, modelId }`，
+    歧义消解留在敲命令的那一端 ⇒ **协议没有歧义态**，不必定义"请你再选一次"这种回环。
+  - ⚠️ **控制面每条方法只做「参数校验 + 调 host 公共面 + 组织出参」**：一旦在 sidecar 里补一句"顺便也把 X 改了"，
+    就与 CLI 的 `/xxx` 长成两份实现（P1 已踩过同形态的坑；这份纪律与 `a2a-server` 其余部分同一条）。
+    `harness/notice.list` 是首批里最有价值的一条：把 host 装配期的环形缓冲（`host.notices`）送到消费方，
+    于是"**在 IDE 里拿到 mock 回答却毫无信号**"在结构上不可能发生（正是 plan §6 末尾点名的那条风险）；
+    返回的每条 notice 都带 `renderNotice()` 的**渲染结果**，22 条文案只有 host 里那一份实现。
+    `harness/stats.get` **尚未实现**：它要的 `resolveCurrentUsage` / `renderContextOccupancy` 目前还住在 `@harness/cli`
+    （sidecar 不能反向依赖 cli），需先把这几个纯函数上移到共享位置 —— **不在控制面顺手抄一份**。
+  - **会话寻址：控制面的 `sessionId` 就是 A2A 的 `contextId`**（`executor.ensureSession` 钉死的 `contextId = sessionId`）
+    ⇒ "控制面改的是哪条会话"与"聊天在跟哪条会话说话"是同一个身份，不需要第二套映射。缺省 = sidecar boot 选中的那条。
+    **读操作不 `restore`、写操作才 `restore`**：读一次状态不该在 `SessionManager` 里凭空建出一个会话。
 
 ## 4. 硬性约束
 

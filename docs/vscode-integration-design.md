@@ -1,6 +1,8 @@
 # VSCode 接入设计稿（P2 / P3）
 
-> 状态：**设计稿（待拍板）** · 2026-10-01
+> 状态：**设计稿（§10 推荐项已按"案 A + 控制面 `POST /harness/rpc`"开工）** · 2026-10-01
+> 落地进度：**P2-A 控制通道已实现**（`packages/a2a-server/src/control.ts`，见 `docs/development-log.md` 续 240）；
+> 扩展骨架（P2-B）待做。下表 §9 的分期仍按本稿口径。
 > 上游：`docs/external-integration-plan.md` §4（方案 B）/ §5（总体架构）/ §6（P2/P3）
 > 前置：`docs/host-extraction-design.md`（P0，已落地）、`packages/a2a-server`（P1，已落地 + 官方 TCK 外部验收）
 >
@@ -327,7 +329,18 @@ SendMessage / SendStreamingMessage / GetTask / CancelTask / ListTasks
 | (ii) 把 `harness/*` 方法塞进 `/a2a` 的 JSON-RPC 命名空间 | ⚠️ 能跑，但**污染协议面**：`/a2a` 的"未知方法必须 MethodNotFound"是 TCK 的断言项；一个端点两套语义，日后每次改 A2A 都要重想"这条会不会影响私有方法" |
 | (iii) **另开路径 `POST /harness/rpc`** | ✅ **建议** |
 
-### 6.3 建议方案：`POST /harness/rpc`
+### 6.3 建议方案：`POST /harness/rpc`（✅ 已落地 · P2-A）
+
+> **落地记录（2026-10-01，`docs/development-log.md` 续 240）**：`packages/a2a-server/src/control.ts`
+> 实现了首批 **14 个 `harness/*` 方法**（notice / session / agent / model / permission / skill / compact），
+> 路由在 `server.ts` 的 `handle()` 里与 `/a2a` **并列**，共用同一个 Bearer 但不做 A2A 版本校验、
+> 不进 AgentCard，错误词汇独立（`ControlError` / `controlCode`）。
+> **两处与本节原稿的偏差**（都是实现时才定下来的）：
+> ① **入参一律结构化**（如 `harness/model.set` 收 `{ providerId, modelId }` 而不是 `/model hy3` 这类自由文本）
+> —— 歧义消解属"输入词汇"，留在敲命令的那一端（见 `control.ts` 文件头）；
+> ② `harness/stats.get` **未在首批**：它要的 `resolveCurrentUsage` / `renderContextOccupancy` 还住在
+> `@harness/cli`（sidecar 不能反向依赖 cli），需先把这几个纯函数上移到共享位置。
+
 
 - 同一个 `Bun.serve`，**不同路径**，自己的小 JSON-RPC（`{jsonrpc,id,method,params}` 形状照搬，便于复用现有错误码词汇）。
 - 方法命名空间 `harness/*`，与 A2A 方法**没有任何交集**。
@@ -445,7 +458,8 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| **P2-v0（骨架）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答（非流式也先跑通） | 在 VSCode 里提问有回答 |
+| **P2-A（✅ 已落地）** | **控制通道**：`POST /harness/rpc` + 14 个 `harness/*` 方法（`packages/a2a-server/src/control.ts`） | `@harness/a2a-server` 70 → **104 pass / 0 fail**；与协议面互不串线（同一方法名打到 `/a2a` ⇒ `MethodNotFound`）；卡片不含控制路径 |
+| **P2-B（骨架 / P2-v0）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答（非流式也先跑通） | 在 VSCode 里提问有回答 |
 | **P2-v1（对齐 plan 口径）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`）；启动自检提示 | plan §6 的 P2 验收全绿 |
 | **P2-v2** | 全部 18 命令；follow-ups；`reference`/`filetree` 呈现（文件引用、diff 预览） | — |
 | **P3** | webview 平移块模型与侧栏；`--compile` 单文件二进制随扩展分发 | plan §6 的 P3 验收 |
