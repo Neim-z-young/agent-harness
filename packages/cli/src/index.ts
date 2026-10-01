@@ -124,7 +124,7 @@ export { InteractivePermissionEngine } from '@harness/host'
 import { HarnessHost, renderNotice } from '@harness/host'
 import { createHost } from '@harness/host'
 // A2A 服务端宿主（宿主/适配器层）。只做协议翻译与装配 —— 复用 host 的同一份装配。
-import { AGENT_CARD_PATH, DEFAULT_A2A_PORT, createA2aServer } from '@harness/a2a-server'
+import { AGENT_CARD_PATH, DEFAULT_A2A_PORT, createA2aServer, listControlMethods } from '@harness/a2a-server'
 import type { HostOptions, SessionRestoreInfo } from '@harness/host'
 export type { HostOptions, SessionRestoreInfo } from '@harness/host'
 export { HarnessHost, createHost } from '@harness/host'
@@ -1976,6 +1976,9 @@ export async function runA2aCli(options: {
   write(`A2A 服务已启动\n`)
   write(`  JSON-RPC 端点: ${server.url}\n`)
   write(`  AgentCard:     ${origin}/${AGENT_CARD_PATH}\n`)
+  // 控制面（P2-A）：与协议面并列的另一条路径 —— CLI 斜杠命令里"改本进程状态"那 12 条
+  // 在 A2A 协议里无处安放，走这里。see packages/a2a-server/src/control.ts
+  write(`  控制端点:      ${server.controlUrl}（${listControlMethods().length} 个 harness/* 方法）\n`)
   write(`  认证:          ${args.a2aToken ? 'Bearer（已配置）' : '匿名（仅 127.0.0.1 可达）'}\n`)
   write(`  权限模式:      ${permissionMode}${permissionMode === 'ask' ? '' : '（不会产生 INPUT_REQUIRED 挂起）'}\n`)
   write(`  Ctrl-C 退出\n`)

@@ -77,3 +77,18 @@ export {
   createA2aServer,
 } from './server'
 export type { A2aServer, A2aServerOptions } from './server'
+
+// 8. 控制通道（P2-A：`POST /harness/rpc`）—— A2A 协议里没有的那一半
+//
+// 与 §1~§7 分开成文件是刻意的：那一半是**协议面**（被官方 TCK 盯着），这一半是**本地管理面**
+// （`/compact` `/stats` `/agent` `/model` `/permission` `/skills` 这些 CLI 斜杠命令的对应物）。
+// 两条面共享同一个 `Bun.serve` 与同一个 Bearer，但**方法空间与错误词汇互不相通**。
+export {
+  CONTROL_METHOD_PREFIX,
+  ControlError,
+  DEFAULT_CONTROL_PATH,
+  dispatchControl,
+  isControlMethod,
+  listControlMethods,
+} from './control'
+export type { ControlErrorCode } from './control'

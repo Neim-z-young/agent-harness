@@ -584,3 +584,94 @@ describe('A2aServer：调用方隔离（CallerRegistry）', () => {
     expect(reg.claim('', 'bob')).toBe(true)
   })
 })
+
+// ========================================================================
+// 控制面（P2-A）：POST /harness/rpc
+//
+// 这里只测**属于 HTTP 层**的四件事：路由可达、鉴权（同一 Bearer）、方法与状态码、
+// 以及与协议面**互不串线**。方法本身的参数校验与 host 调用次序在 control.test.ts 里
+// 直接打 `dispatchControl`（控制面没有 SSE，没有必须走网线的理由）。
+// ========================================================================
+
+function controlUrlOf(server: A2aServer, path = server.controlPath): string {
+  return `${new URL(server.url).origin}${path}`
+}
+
+async function control(
+  server: A2aServer,
+  method: string,
+  params?: unknown,
+  headers: Record<string, string> = {},
+): Promise<RpcResult> {
+  const res = await fetch(controlUrlOf(server), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...headers },
+    body: JSON.stringify({ jsonrpc: '2.0', id: 'ctl-1', method, params }),
+  })
+  const text = await res.text()
+  return { status: res.status, body: text ? JSON.parse(text) : undefined }
+}
+
+describe('A2aServer：控制面（/harness/rpc）', () => {
+  it('端点暴露且可达；**不需要 A2A-Version 头**（它不是 A2A，故不做版本校验）', async () => {
+    const { server } = await makeServer({})
+    expect(server.controlPath).toBe('/harness/rpc')
+    expect(server.controlUrl).toBe(controlUrlOf(server))
+    const res = await control(server, 'harness/notice.list')
+    expect(res.status).toBe(200)
+    expect(Array.isArray(res.body.result.notices)).toBe(true)
+    expect(res.body.error).toBeUndefined()
+  })
+
+  it('容忍尾斜杠（与 /a2a 同一理由：客户端会把 base_url 规范成带尾斜杠）', async () => {
+    const { server } = await makeServer({})
+    const res = await fetch(`${controlUrlOf(server)}/`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 'c', method: 'harness/permission.get' }),
+    })
+    expect(res.status).toBe(200)
+    expect((await res.json()).result.mode).toBe('ask')
+  })
+
+  it('与协议面**共用同一个 Bearer**：配了 token 时未带凭据 ⇒ 401', async () => {
+    const { server } = await makeServer({ token: 'secret' })
+    const denied = await control(server, 'harness/permission.get')
+    expect(denied.status).toBe(401)
+    expect(denied.body.error.data.a2aCode).toBe('UNAUTHORIZED')
+    const allowed = await control(server, 'harness/permission.get', undefined, {
+      authorization: 'Bearer secret',
+    })
+    expect(allowed.status).toBe(200)
+    expect(allowed.body.result.mode).toBe('ask')
+  })
+
+  it('非 POST ⇒ 405；未知控制方法 ⇒ -32601 + controlCode', async () => {
+    const { server } = await makeServer({})
+    expect((await fetch(controlUrlOf(server))).status).toBe(405)
+    const res = await control(server, 'harness/does-not-exist')
+    expect(res.status).toBe(200)
+    expect(res.body.error.code).toBe(-32601)
+    expect(res.body.error.data.controlCode).toBe('METHOD_NOT_FOUND')
+  })
+
+  it('协议面**不认**控制方法：同一方法名打到 /a2a ⇒ MethodNotFound（两条面互不串线）', async () => {
+    const { server } = await makeServer({})
+    const res = await rpc(server, 'harness/notice.list', {})
+    expect(res.body.result).toBeUndefined()
+    expect(res.body.error.code).toBe(-32601)
+    // 且错误词汇是 A2A 的，不是控制面的 controlCode
+    expect(res.body.error.data?.controlCode).toBeUndefined()
+  })
+
+  it('控制路径**不进 AgentCard**（不对外承诺一套不打算标准化的 API）', async () => {
+    const { server } = await makeServer({ token: 'secret' })
+    const card = (await fetch(`${new URL(server.url).origin}/${AGENT_CARD_PATH}`).then((r) => r.json())) as {
+      supportedInterfaces: Array<{ url: string }>
+    }
+    const text = JSON.stringify(card)
+    expect(text).not.toContain('/harness')
+    expect(text).not.toContain('rpc')
+    expect(card.supportedInterfaces[0]?.url).toBe(server.url)
+  })
+})

@@ -42,6 +42,7 @@ import {
 import type { Host } from '@harness/host'
 import { CallerRegistry, callerKey, verifyBearer } from './auth'
 import { JSONRPC_BINDING, buildAgentCard, cardToJSON } from './card'
+import { ControlError, DEFAULT_CONTROL_PATH, dispatchControl } from './control'
 import {
   A2aServerError,
   ConcurrentTaskError,
@@ -100,6 +101,11 @@ export interface A2aServerOptions {
   hostname?: string
   /** JSON-RPC 端点路径，默认 `/a2a` */
   path?: string
+  /**
+   * 控制面路径，默认 `/harness/rpc`（见 `control.ts` 文件头）。
+   * 与协议面分开是刻意的：`/a2a` 的行为被官方 TCK 盯着，控制面则是本扩展私有的本地管理面。
+   */
+  controlPath?: string
   /** 卡片里 `supportedInterfaces[].url` 的基址，默认 `http://<hostname>:<port>` */
   baseUrl?: string
   /** Bearer token：配了则校验 + 卡片声明安全方案；不配则匿名（仅本机可访问） */
@@ -134,6 +140,10 @@ export interface A2aServer {
   readonly url: string
   /** JSON-RPC 端点路径 */
   readonly jsonRpcPath: string
+  /** 控制面端点完整 URL（`/harness/rpc`，非 A2A 协议面；见 `control.ts`） */
+  readonly controlUrl: string
+  /** 控制面路径 */
+  readonly controlPath: string
   /** 调用方归属表（自检用） */
   readonly callers: CallerRegistry
   /** 当前已登记的 `messageId` 数（自检用） */
@@ -261,6 +271,7 @@ class HarnessEventBusManager extends DefaultExecutionEventBusManager {
 export function createA2aServer(opts: A2aServerOptions): A2aServer {
   const host = opts.host
   const jsonRpcPath = normalizePath(opts.path ?? DEFAULT_JSONRPC_PATH)
+  const controlPath = normalizePath(opts.controlPath ?? DEFAULT_CONTROL_PATH)
   const agentCardPath = normalizePath(`/${AGENT_CARD_PATH}`)
   const hostname = opts.hostname ?? DEFAULT_A2A_HOSTNAME
   const token = opts.token
@@ -520,6 +531,56 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
     return new Response(cardBody, { status: 200, headers: cardHeaders })
   }
 
+  /**
+   * 控制面路由（`POST /harness/rpc`）。
+   *
+   * 与 `handleJsonRpc` 的**三处有意的差异**（理由见 `control.ts` 文件头）：
+   * 1. **不做 `validateVersion`** —— 控制面不是 A2A，`A2A-Version` 头对它没有意义。
+   *    照抄一遍版本校验会让扩展在升级 A2A 协议时必须同步改控制面客户端，纯属自找。
+   * 2. **不查幂等键 / 并发 / 归属** —— 管理操作没有回放语义，也没有多租户问题。
+   * 3. **错误词汇不同** —— `ControlError` 而非 `A2aServerError`。
+   *
+   * 相同的一处：**同一个 Bearer**（同一端口不该有两套凭据；`verifyBearer` 与业务侧的
+   * "未配置 token = 匿名但只听 127.0.0.1"语义逐字一致）。
+   *
+   * HTTP 状态沿用 JSON-RPC over HTTP 的惯例：**错误在体里、状态仍是 200**（401 / 405 除外）。
+   */
+  const handleControl = async (req: Request): Promise<Response> => {
+    if (req.method !== 'POST') return new Response('method not allowed', { status: 405 })
+
+    let body: Record<string, unknown>
+    try {
+      body = (await req.json()) as Record<string, unknown>
+    } catch {
+      return rpcError(null, { code: -32700, message: '请求体不是合法 JSON' })
+    }
+
+    const authHeader = req.headers.get('authorization')
+    if (!verifyBearer(authHeader, token)) {
+      const err = new UnauthorizedError()
+      return Response.json(
+        { jsonrpc: '2.0', id: body['id'] ?? null, error: err.toJsonRpc() },
+        { status: 401 },
+      )
+    }
+
+    const id = body['id'] ?? null
+    const method = body['method']
+    if (typeof method !== 'string' || method === '') {
+      return rpcError(id, new ControlError('INVALID_PARAMS', 'method 必填且必须是非空字符串').toJsonRpc())
+    }
+
+    try {
+      return Response.json({ jsonrpc: '2.0', id, result: await dispatchControl(host, method, body['params']) })
+    } catch (e) {
+      if (e instanceof ControlError) return rpcError(id, e.toJsonRpc())
+      // 未预期异常：结构化 code + **安全文案**（堆栈只进服务日志，不出网线）
+      const msg = (e instanceof Error ? e.message : String(e)).split('\n')[0]!.slice(0, 300)
+      logger?.warn?.('a2a: 控制面处理异常', { method, message: msg })
+      return rpcError(id, new ControlError('INTERNAL', msg).toJsonRpc())
+    }
+  }
+
   const handle = async (req: Request): Promise<Response> => {
     const url = new URL(req.url)
     const path = normalizePath(url.pathname)
@@ -527,6 +588,8 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
     if (req.method === 'GET' && path === agentCardPath) {
       return cardResponse(req)
     }
+    // 控制面：**与协议面并列的另一条路径**（不共享方法空间，见 control.ts 文件头）
+    if (path === controlPath) return handleControl(req)
     if (path === jsonRpcPath) return handleJsonRpc(req)
     return new Response('not found', { status: 404 })
   }
@@ -570,6 +633,8 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
     port: actualPort,
     url,
     jsonRpcPath,
+    controlPath,
+    controlUrl: `${opts.baseUrl ?? `http://${hostname}:${actualPort}`}${controlPath}`,
     callers,
     get seenMessageCount() {
       return messageIndex.size
