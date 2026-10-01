@@ -121,9 +121,10 @@
   全部能力经 `@harness/host` 既有公共面进入。SDK **钉死 `@a2a-js/sdk@1.3.0`**；服务默认仅监听 `127.0.0.1`。
 
   - **模块分层**：`mapping.ts`（纯映射：Part/Message 双向、状态名、四态权限词汇表、`StreamAdapter` 事件合并）/
-    `card.ts`（`buildAgentCard` + `cardToJSON`）/ `suspend.ts`（`taskId → resolver` 挂起表 + TTL）/
-    `executor.ts`（`HarnessAgentExecutor`：`promptStream` → A2A 任务生命周期）/ `errors.ts`（结构化错误码）。
-    **新增实现不要写进 `index.ts`**（它只是 barrel）。
+    `card.ts`（`buildAgentCard` + `cardToJSON`）/ `auth.ts`（`verifyBearer` + `CallerRegistry` 隔离）/
+    `suspend.ts`（`taskId → resolver` 挂起表 + TTL）/ `executor.ts`（`HarnessAgentExecutor`：`promptStream` →
+    A2A 任务生命周期）/ `server.ts`（`createA2aServer`：`Bun.serve` + 卡路由 + SSE + 版本/认证/并发/幂等/隔离）/
+    `errors.ts`（结构化错误码）。**新增实现不要写进 `index.ts`**（它只是 barrel）。
   - **四个"两套表示"静默失败坑**（出参一律走 SDK 的 `toJSON()`，不裸 `JSON.stringify`）：① `Part/Message` 内部是
     `content:{$case,value}`、线上是 `{"text":…}`；② `TaskState` 是**数字 enum**（线上才是字符串，比较走 `taskStateToJSON`）；
     ③ `Role` 也是数字 enum（`ROLE_USER === 1`）；④ `AgentCard` 的 `securitySchemes[*].scheme` 是判别式联合，
@@ -132,11 +133,24 @@
     生成器内部，并发任务下模块级变量必然串话；ALS 按异步调用链隔离（实测跨 `await` 保持、并发不串话）。
     **模式 A**：executor 在 `INPUT_REQUIRED` 后**不 return**（`await` 答复），挂起表只需 `taskId → resolver`；
     代价是 Promise 长期悬挂 ⇒ **TTL 是必需项**（`DEFAULT_SUSPEND_TTL_MS` = 5 分钟），否则挂起表与 task 记录一起泄漏。
+  - ⚠️ **权限桥必须"接线"**：宿主 boot 在 executor 之前（executor 要 `getHost()`）⇒ host 的权限引擎 boot 时拿不到
+    A2A asker，`ask()` 走默认 deny。故 `createA2aServer` 里必须 `host.permission.setAsker(executor.asker)`
+    （正是 `setAsker` 存在的场景：启动后注入交互器）。**CLI / 其它宿主不要再传 `asker`** —— 两份装配抢同一个接缝。
+  - ⚠️ **续接请求会误杀共享事件总线**：续接的 executor 不发事件就返回 ⇒ SDK 观察到
+    `lastObservedState === undefined` ⇒ 默认策略**立刻 `bus.finished()` + 清理这条共享 bus**，而第一轮仍在跑
+    （随后要补发 artifact + 终态）⇒ 事件全丢、续接请求报 `no result`。故自定义 `EventBusManager.settleByTaskId`：
+    **判据是"任务还在跑"（`executor.isRunning(taskId)`）而不是"这条请求发了事件"**。配套：只有"确实挂着一个待决
+    询问"（`executor.suspend.has(taskId)`）的带 `taskId` 请求才放行进 executor，否则回放任务快照（迟到/重复答复）。
   - ⚠️ **权限询问不是"工具一执行就自动弹"**：`ToolPipeline.execute` 仅在**工具声明了
     `permission: { key, extractPatterns }` 且有 `checkPermission`** 时才问引擎（`packages/tool/src/index.ts:1330`）。
     写测试夹具时若工具**不声明 `permission`**，整条 `check → ask → asker → 挂起` 链路根本不启动 ——
     `INPUT_REQUIRED` 用例会**静默退化成"任务直接 COMPLETED"**（`isReadOnly` 不影响权限，只读工具照样要声明）。
     另：任务的 `SUBMITTED` 挂在 **`task` 事件本体**（`data.status.state`）上，不是一条独立 `statusUpdate`。
+  - **宿主责任（SDK 不管的三件事）**：① 版本校验 `validateVersion(requestedVersion, card, 'JSONRPC')`（头缺失时
+    `requestedVersion` 默认 `'0.3'` ⇒ 只声明 `1.0` 的卡片必然拒绝）；② 认证（transport 不认识 `Authorization`）；
+    ③ 并发 / 幂等 / 隔离（同 `contextId` 并行第二条直接拒绝、`messageId` 重复回放快照、`contextId` 绑定调用方）。
+  - **入口 `harness a2a [--port <n>] [--token <t>]`**：复用 `createHost`（**不是** `HarnessApp` —— A2A 是无终端宿主）。
+    权限模式默认 `ask`；`allow-all`/`deny-all` 会短路、不产生挂起。
 
 ## 4. 硬性约束
 

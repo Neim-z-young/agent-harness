@@ -1,5 +1,71 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 237）A2A P1-D：`harness a2a` 子命令（P1 收口）
+
+### 做什么
+
+给 P1-C 的服务端一个**可用的入口**：`harness a2a [--port <n>] [--token <t>]`。
+
+- `CliArgs` 加 `'a2a'` 命令 + `a2aPort` / `a2aToken`；`parseCliArgs` 识别 `a2a` 与 `--port` / `--token`；`main` 在 `teammate` 之后分派 `runA2aCli`；`HELP_TEXT` 补用法与选项块。
+- `runA2aCli` **复用 `createHost` 而不是 `HarnessApp`**：A2A 是**无终端**宿主，`HarnessApp` 多带的两个终端适配面（`stdout → onNotice`、`askPrompt → asker`）在这里没意义，用它会把"装配"与"终端形态"重新绑回一起。装配期诊断经 `onNotice → stderr`，stdout 只留服务启动信息（脚本可消费）。
+- 端口校验（0~65535 整数）；`SIGINT` / `SIGTERM` 优雅停止（`server.stop(true)` 释放 executor 的挂起与任务）。
+- 权限模式默认 `ask`（远程权限点应挂起、等客户端答复）；`allow-all` / `deny-all` 会短路、**不产生挂起** —— help 里已标明，这是"信任调用方"的主动选择，不是默认。
+- **CLI 侧不传 `asker`**：`createA2aServer` 会把 executor 的 asker 装回 host 的权限引擎，CLI 再传就是两份装配抢同一个接缝。
+- `@harness/a2a-server` barrel 转出 `AGENT_CARD_PATH`（协议常量取自 SDK）⇒ CLI / 文档不必直接依赖 SDK。
+
+### 冒烟（真起服务，不只是单测）
+
+`harness a2a --port 4501 -p mock -d <tmp>` → 取卡 `protocolVersion=1.0` / `protocolBinding=JSONRPC`；
+`SendMessage("hello")` 返回 `TASK_STATE_COMPLETED` + artifact `(Mock Provider) 你好，我是测试助手。`；
+`SIGINT` 打印"正在停止"后进程退出。
+
+### 产物与验证
+
+改动文件：`packages/cli/src/index.ts`（CliArgs / parseCliArgs / HELP_TEXT / `runA2aCli`）、`packages/cli/src/cli.test.ts`（a2a 用例 + HELP_TEXT 断言）、`packages/a2a-server/src/index.ts`（转出 `AGENT_CARD_PATH`）。
+
+验证：`bun run typecheck` **41 包 exit 0**；`bun test ./packages` **2258 pass / 0 fail / 99 文件**。**P1 全部落地。**
+
+## 2026-10-01（续 236）A2A P1-C：HTTP/SSE 服务端宿主 —— 两个"不接线就静默失效"的坑
+
+### 做什么
+
+`createA2aServer`：把 `@harness/host` 的装配挂到 `Bun.serve` 上（plan §3）。只做**路由与协议**，任务生命周期归 `executor.ts`。
+
+- 路由：`GET /.well-known/agent-card.json` → `cardToJSON(card)`；`POST /a2a` → JSON-RPC。
+- **SSE**：`SendStreamingMessage` 返回 `AsyncGenerator` ⇒ 自己用 `formatSSEEvent` + `SSE_HEADERS` 写 `ReadableStream`（SDK 只管分帧函数，不管 HTTP）。
+- **三处"宿主必须自己做"的**（SDK 不做）：① 版本校验（头缺失时 `requestedVersion` 默认 `'0.3'` ⇒ 卡片只声明 `1.0` 时必然被拒，正是我们要的）；② 认证（transport 不认识 `Authorization`）；③ 并发 / 幂等 / 隔离。
+- `auth.ts`：`verifyBearer` / `callerKey` / **`CallerRegistry`**（`contextId → 调用方` 归属绑定 —— `contextId` 就是 `sessionId`，**会读写同一份会话历史与工作目录状态**，别的调用方猜到它就能接上别人的会话）。
+- 并发：同一 `contextId` 并行第二条**直接拒绝**（`CONCURRENT_TASK`，一期不排队），挂起中的任务也算活跃；全局上限 `TOO_MANY_TASKS`。
+- 幂等：`messageId` 已执行完 ⇒ **回放任务快照**（走 GetTask，不重复执行）；仍在处理中 ⇒ `DUPLICATE_MESSAGE`（客户端应等待而非重试）。
+
+### 坑 1：权限桥必须**接线**，否则挂起链路不启动
+
+初跑 5 条失败（`INPUT_REQUIRED` 全退化成 `COMPLETED`）。根因：**host 由调用方在 `createA2aServer` 之前 boot，而 executor 只能建在 host 之后**（它要 `getHost()`）⇒ host 的权限引擎在 boot 时拿不到 A2A 的 asker，`ask()` 走默认 deny。
+
+修：`createA2aServer` 里 `host.permission.setAsker(executor.asker)` —— 这正是 `InteractivePermissionEngine.setAsker` 存在的场景（TUI 也用它启动后注入模态审批）。**CLI 侧不要再传 `asker`**，否则两份装配抢同一个接缝。
+
+### 坑 2：续接请求会**误杀共享事件总线**（spike 靠微任务次序侥幸躲过）
+
+续接请求的 executor **不发任何事件就返回**，SDK 因此观察到 `lastObservedState === undefined` ⇒ `_settleBus` 默认策略**立刻 `bus.finished()` + 清理这条共享 bus**。可第一轮此刻仍在跑（它随后要往**同一条** bus 上补发 artifact + 终态）⇒ 事件全丢，续接请求报 `Agent execution finished without a result`。
+
+P0.5 spike 没暴露它，只因 spike 的第一轮在 `resolve()` 之后**同步**续跑（同一条微任务链上先于续接请求的 `.finally`）；真实 harness 的第一轮要走 LLM（多个 `await`），次序正好反过来。
+
+修：自定义 `EventBusManager.settleByTaskId` —— **判据是"任务还在跑"而不是"这条请求发了事件"**：`lastObservedState === undefined` 且 `executor.isRunning(taskId)` ⇒ 接管（返回 `true`，不结束），等第一轮收尾时再走常规结算。
+
+配套：**只有"确实挂着一个待决询问"的续接请求才放行进 executor**（`taskId && !executor.suspend.has(taskId)` ⇒ 回放快照）。否则迟到 / 重复的答复会走到"executor 不发事件"的悬挂路径。
+
+### 反向验证（证明这两处不是装饰）
+
+1. 摘掉 `host.permission.setAsker(...)` ⇒ **5 条失败**（全部是权限挂起相关）。
+2. 摘掉 `settleByTaskId` 的接管（恒 `return false`）⇒ **3 条失败**（续接 / 迟到答复）。
+3. 还原 ⇒ 18 条全绿。两处均已执行并还原（文件与还原前逐字一致）。
+
+### 产物与验证
+
+改动文件：`packages/a2a-server/src/{server,auth,server.test}.ts`（新建）、`{errors,executor,index}.ts`（补码 / `isRunning` / barrel）。
+
+验证：`bun run typecheck` **41 包 exit 0**；`bun test ./packages` **2257 pass / 0 fail / 99 文件**（2239 + 18：卡路由 / SSE / 版本 / 认证 / INPUT_REQUIRED 续接 / 并发拒绝 / 幂等回放 / 调用方隔离）。
+
 ## 2026-10-01（续 234）A2A P1-B：`HarnessAgentExecutor` + 挂起表 + 权限桥 —— 权限链路的触发条件是个坑
 
 ### 做什么
