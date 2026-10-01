@@ -5,6 +5,7 @@
     "": {
       "name": "agent-harness",
       "dependencies": {
+        "@harness/a2a-server": "workspace:*",
         "@harness/acp-context": "workspace:*",
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
@@ -48,6 +49,21 @@
         "typescript": "^5.5.0",
       },
     },
+    "packages/a2a-server": {
+      "name": "@harness/a2a-server",
+      "version": "0.1.0",
+      "dependencies": {
+        "@a2a-js/sdk": "1.3.0",
+        "@harness/agent": "workspace:*",
+        "@harness/core": "workspace:*",
+        "@harness/host": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+      },
+      "devDependencies": {
+        "@harness/provider-mock": "workspace:*",
+      },
+    },
     "packages/agent": {
       "name": "@harness/agent",
       "version": "0.1.0",
@@ -63,6 +79,7 @@
         "harness": "./src/index.ts",
       },
       "dependencies": {
+        "@harness/a2a-server": "workspace:*",
         "@harness/acp-context": "workspace:*",
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
@@ -141,8 +158,11 @@
         "@harness/provider-mock": "workspace:*",
         "@harness/provider-openai": "workspace:*",
         "@harness/provider-qwen": "workspace:*",
+        "@harness/revert": "workspace:*",
         "@harness/session": "workspace:*",
+        "@harness/skill": "workspace:*",
         "@harness/skill-forge": "workspace:*",
+        "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
         "@harness/swarm": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
@@ -152,6 +172,7 @@
         "@harness/tools-search": "workspace:*",
         "@harness/tools-web": "workspace:*",
         "@harness/workspace": "workspace:*",
+        "@harness/workspace-shell": "workspace:*",
         "acp-kernel": "^0.0.63",
       },
     },
@@ -485,6 +506,8 @@
     },
   },
   "packages": {
+    "@a2a-js/sdk": ["@a2a-js/sdk@1.3.0", "https://registry.npmmirror.com/@a2a-js/sdk/-/sdk-1.3.0.tgz", { "dependencies": { "jose": "^6.2.3" }, "peerDependencies": { "@bufbuild/protobuf": "^2.10.2", "@grpc/grpc-js": "^1.11.0", "better-sqlite3": "^12.0.0 || ^13.0.0", "express": "^4.21.2 || ^5.1.0", "kysely": "^0.28.17 || ^0.29.0", "mysql2": "^3.0.0", "pg": "^8.0.0" }, "optionalPeers": ["@bufbuild/protobuf", "@grpc/grpc-js", "better-sqlite3", "express", "kysely", "mysql2", "pg"], "bin": { "a2a-db": "dist/cli/a2a_db.js" } }, "sha512-OpK4nygUnLKlpTFZlM2IrYu7f3c/B7c4u4Z14+vgMq24lEINTVCxH/BqZx+GL92rNf7CoBL5oTP5UhNsl75yyg=="],
+
     "@babel/code-frame": ["@babel/code-frame@7.29.7", "https://registry.npmmirror.com/@babel/code-frame/-/code-frame-7.29.7.tgz", { "dependencies": { "@babel/helper-validator-identifier": "^7.29.7", "js-tokens": "^4.0.0", "picocolors": "^1.1.1" } }, "sha512-Aup7aUOfpbAUg2ROOJN6Iw5f9DMBlzu0mIkm/malLQFN/YQgO48wCj0Kxa3sEHJvPVFg7siR+qRInwXd2qhQKw=="],
 
     "@babel/generator": ["@babel/generator@7.29.8", "https://registry.npmmirror.com/@babel/generator/-/generator-7.29.8.tgz", { "dependencies": { "@babel/parser": "^7.29.8", "@babel/types": "^7.29.8", "@jridgewell/gen-mapping": "^0.3.12", "@jridgewell/trace-mapping": "^0.3.28", "jsesc": "^3.0.2" } }, "sha512-gZbepsdh3WDtgZKWL+vTPh71LSBrm/Y4/QDZBVCcYfmeTEEuoOYwlSy+G1StfJg+/Zy550u/3TATbm7qDbbMtg=="],
@@ -502,6 +525,8 @@
     "@babel/traverse": ["@babel/traverse@7.29.8", "https://registry.npmmirror.com/@babel/traverse/-/traverse-7.29.8.tgz", { "dependencies": { "@babel/code-frame": "^7.29.7", "@babel/generator": "^7.29.8", "@babel/helper-globals": "^7.29.7", "@babel/parser": "^7.29.8", "@babel/template": "^7.29.7", "@babel/types": "^7.29.8", "debug": "^4.3.1" } }, "sha512-I5z7H3bf/41ktsNVLtpN0wAa336HkqIHQ5BuPLEhTkt1jVSyZpeNKIzTgEWmlxjdg81R0IgUCcaE+Ok3NvrfZg=="],
 
     "@babel/types": ["@babel/types@7.29.8", "https://registry.npmmirror.com/@babel/types/-/types-7.29.8.tgz", { "dependencies": { "@babel/helper-string-parser": "^7.29.7", "@babel/helper-validator-identifier": "^7.29.7" } }, "sha512-Vj1jF3cPfxg7OAfoI7QnVKLoILlm2JF9pnVHrX8qx7AHMiYWT+NDAA7jChlNgRS4WTLc/fD1lXLmPixluj+3Gg=="],
+
+    "@harness/a2a-server": ["@harness/a2a-server@workspace:packages/a2a-server"],
 
     "@harness/acp-context": ["@harness/acp-context@workspace:packages/plugins/acp-context"],
 
@@ -636,6 +661,8 @@
     "emoji-regex": ["emoji-regex@10.6.0", "https://registry.npmmirror.com/emoji-regex/-/emoji-regex-10.6.0.tgz", {}, "sha512-toUI84YS5YmxW219erniWD0CIVOo46xGKColeNQRgOzDorgBi1v4D71/OFzgD9GO2UGKIv1C3Sp8DAn0+j5w7A=="],
 
     "get-east-asian-width": ["get-east-asian-width@1.6.0", "https://registry.npmmirror.com/get-east-asian-width/-/get-east-asian-width-1.6.0.tgz", {}, "sha512-QRbvDIbx6YklUe6RxeTeleMR0yv3cYH6PsPZHcnVn7xv7zO1BHN8r0XETu8n6Ye3Q+ahtSarc3WgtNWmehIBfA=="],
+
+    "jose": ["jose@6.2.12", "https://registry.npmmirror.com/jose/-/jose-6.2.12.tgz", {}, "sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw=="],
 
     "js-tokens": ["js-tokens@4.0.0", "https://registry.npmmirror.com/js-tokens/-/js-tokens-4.0.0.tgz", {}, "sha512-RdJUflcE3cUzKiMqQgsCu06FPu9UdIJO0beYbPhHN4k6apgJtifcoCtT9bcxOpYBtpD2kCM6Sbzg4CausW/PKQ=="],
 

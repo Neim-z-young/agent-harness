@@ -13,6 +13,7 @@
     }
   },
   "dependencies": {
+    "@harness/a2a-server": "workspace:*",
     "@harness/acp-context": "workspace:*",
     "@harness/agent": "workspace:*",
     "@harness/bus": "workspace:*",

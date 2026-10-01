@@ -16,6 +16,7 @@
     "probe:cache": "bun run packages/cli/src/probe-cache-telemetry.ts"
   },
   "dependencies": {
+    "@harness/a2a-server": "workspace:*",
     "@harness/agent": "workspace:*",
     "@harness/acp-context": "workspace:*",
     "@harness/bus": "workspace:*",

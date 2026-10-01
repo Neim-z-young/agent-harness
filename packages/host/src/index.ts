@@ -110,6 +110,7 @@ export type {
 export { InteractivePermissionEngine, buildPermissionPrompt } from './permission'
 export type {
   PermissionAnswer,
+  PermissionAskInput,
   PermissionAsker,
   PermissionMode,
   PermissionPrompt,
