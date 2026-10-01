@@ -732,6 +732,19 @@ export function resolveContextWindowTokens(cfg: ProviderWindowConfigSource, defa
 }
 
 /**
+ * `buildProviderWindowTable` 的返回形状：两张表**恒存在**（只是内容可能为空），`fallback` 恒有值。
+ *
+ * 为什么不让它沿用 `ProviderWindowTable` 的可选字段：那是**插件侧**的入参契约（调用方可以只给
+ * 一半），而这里是**装配方的产出**——它必然建好两张表。返回类型说"可能没有"会让每个消费方
+ * 都写一次 `?.` / `!`，把"实际恒有"的事实藏进断言里。
+ */
+export type ProviderWindowTableView = ProviderWindowTable & {
+  byProvider: Record<string, number>
+  byModel: Record<string, number>
+  fallback: number
+}
+
+/**
  * 构造「Provider / 模型 → 上下文窗口」表，供 ACP 按会话**实际**使用的端点解析占用率分母。
  *
  * 为什么必须按端点分化：`resolveContextWindowTokens` 只回答「**默认** Provider 的窗口是多少」，
@@ -751,7 +764,7 @@ export function resolveContextWindowTokens(cfg: ProviderWindowConfigSource, defa
 export function buildProviderWindowTable(
   cfg: ProviderWindowConfigSource,
   defaultProviderId: string,
-): ProviderWindowTable & { fallback: number } {
+): ProviderWindowTableView {
   const { providers } = normalizeProviderConfigs(cfg.providers ?? [])
   const byProvider: Record<string, number> = {}
   const byModel: Record<string, number> = {}
@@ -764,3 +777,25 @@ export function buildProviderWindowTable(
   }
   return { byProvider, byModel, fallback: resolveContextWindowTokens(cfg, defaultProviderId) }
 }
+
+// ========================================================================
+// 4. 装配期诊断通道（P0 收尾 · S1）
+// ========================================================================
+// `HostNotice` / `renderNotice` / `installConsoleCapture` 单独成文件（`./notice.ts`）：
+// 它们是**装配期的输出面**，与 §2 的注册表、§3 的纯函数推导没有共同闭包，混在一起会让
+// "这一节在讲什么"变模糊。这里只做转出，便于消费方一律 `from '@harness/host'` 取。
+export {
+  NOTICE_LEVEL,
+  makeNotice,
+  renderNotice,
+  installConsoleCapture,
+} from './notice'
+export type {
+  HostNotice,
+  NoticeCode,
+  NoticeData,
+  NoticeLevel,
+  NoticePayloads,
+  NoticeSink,
+  NoticeVariant,
+} from './notice'
