@@ -172,6 +172,11 @@ export {
   buildProviderTypesSection,
 } from '@harness/host'
 export type { HarnessConfig, AcpScopeSection, ModelResolution, SessionEndpoint } from '@harness/host'
+// 权限接缝（P0 收尾 S2 第二步）：四态语义 / 模式短路 / 规则写回已上移到 host，cli 只留文本提问适配。
+import { InteractivePermissionEngine } from '@harness/host'
+import type { PermissionAnswer, PermissionAsker, PermissionMode, PermissionStoreFile } from '@harness/host'
+export type { PermissionAnswer, PermissionAsker, PermissionMode, PermissionStoreFile } from '@harness/host'
+export { InteractivePermissionEngine } from '@harness/host'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
 import { LifecycleEvents } from '@harness/core'
 import { startTuiRepl } from './tui'
@@ -400,78 +405,56 @@ async function lazyAnthropicProvider(config: unknown): Promise<AgentPlugin & { p
 // 保持导出面逐字不变。
 
 
-/** 规则持久化（dataDir/permissions.json） */
-export interface PermissionStoreFile {
-  rules: Record<string, unknown> // 对应 PermissionRuleset
-}
-
-export class CliPermissionEngine extends DefaultPermissionEngine {
+/**
+ * CLI 权限引擎：`InteractivePermissionEngine` 的**适配器**（P0 收尾 S2 第二步）。
+ *
+ * 四态语义 / 模式短路 / 规则写回都已上移到 `@harness/host/permission`（三个宿主共用一份），
+ * 这里只留 CLI 的输入形态：文本提问（TUI 模态 或 readline）→ 四态答复的翻译。
+ * 导出面与改造前逐字相同（`PermissionStoreFile` 亦从 host re-export）。
+ *
+ * 为什么不把「文本 → 四态」也上移：`y/n/a/d/A/D` 是 CLI 的输入词汇，不是协议。
+ * 远程宿主直接给四态，不该被迫走"伪造文本再解析回来"的往返（见 host 侧文件头）。
+ */
+export class CliPermissionEngine extends InteractivePermissionEngine {
   constructor(
     rules: Record<string, unknown> = { '*': 'ask' },
     private readonly options: {
       store?: PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }
-      mode?: 'allow-all' | 'ask' | 'deny-all'
+      mode?: PermissionMode
       /** 测试注入：替换真实 readline 交互 */
       askPrompt?: (question: string) => Promise<string>
       stdout?: NodeJS.WritableStream | { write: (s: string) => void }
     } = {}
   ) {
-    super(rules as any)
+    super(rules, { store: options.store, mode: options.mode, asker: cliAsker(options.askPrompt) })
   }
 
-  private write(s: string) {
-    ;(this.options.stdout ?? process.stdout).write(s)
-  }
-
-  /** 当前交互模式（allow-all / ask / deny-all），供 /permission 查看与切换 */
-  getMode(): 'allow-all' | 'ask' | 'deny-all' {
-    return this.options.mode ?? 'ask'
-  }
-  /** 切换交互模式（不影响持久化规则，仅影响「询问型请求」的自动答复） */
-  setMode(mode: 'allow-all' | 'ask' | 'deny-all'): void {
-    this.options.mode = mode
-  }
   /** 替换询问交互器（TUI 在启动后注入模态审批，替代默认 readline 行内提问） */
   setAskPrompt(fn?: (question: string) => Promise<string>): void {
     this.options.askPrompt = fn
-  }
-
-  /** CLI 级 ask：默认 mode=allow-all 直接 allow；mode=ask 则 prompt 用户 */
-  override async ask(req: any): Promise<PermissionDecision> {
-    if (this.options.mode === 'allow-all') return { behavior: 'allow', matchedRule: 'global' }
-    if (this.options.mode === 'deny-all') return { behavior: 'deny', matchedRule: 'global' }
-    const promptFn = this.options.askPrompt ?? defaultCliAsk(this.write)
-    const pat = (req.patterns ?? []).slice(0, 3).join(', ') || '(无路径)'
-    const q = `\n⚠️  权限请求 [${req.toolKey}] ${pat}\n` +
-      `  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] `
-    const answer = ((await promptFn(q)) ?? '').trim()
-    const low = answer.toLowerCase()
-    // 先判断"永久"：answer 保留大小写（A/D 直接表示永久），否则"always"/"never"语义
-    const permanentAllow = low === 'always' || low === 'all' || answer === 'A'
-    const permanentDeny = low === 'never' || low === 'none' || answer === 'D'
-    if (permanentAllow) {
-      const current = this.getRules()
-      const updated = { ...current, [req.toolKey]: 'allow' }
-      this.updateRules(updated)
-      await this.options.store?.save?.(updated)
-      return { behavior: 'allow', matchedRule: 'tool', remember: true }
-    }
-    if (permanentDeny) {
-      const current = this.getRules()
-      const updated = { ...current, [req.toolKey]: 'deny' }
-      this.updateRules(updated)
-      await this.options.store?.save?.(updated)
-      return { behavior: 'deny', matchedRule: 'tool', remember: true }
-    }
-    // 单次
-    if (['y', 'yes', 'a', 'allow'].includes(low)) return { behavior: 'allow', matchedRule: 'tool' }
-    if (['n', 'no', 'd', 'deny'].includes(low)) return { behavior: 'deny', matchedRule: 'tool' }
-    return { behavior: 'deny', matchedRule: 'global' }
+    this.setAsker(cliAsker(fn))
   }
 }
 
+/** 把 CLI 的文本答复翻成四态；无法识别返回 `undefined` ⇒ 引擎按 deny 处理（与改造前逐位一致） */
+export function parseCliAnswer(answer: string): PermissionAnswer | undefined {
+  const low = answer.toLowerCase()
+  // 先判断"永久"：answer 保留大小写（A/D 直接表示永久），否则"always"/"never"语义
+  if (low === 'always' || low === 'all' || answer === 'A') return 'always-allow'
+  if (low === 'never' || low === 'none' || answer === 'D') return 'always-deny'
+  if (['y', 'yes', 'a', 'allow'].includes(low)) return 'allow'
+  if (['n', 'no', 'd', 'deny'].includes(low)) return 'deny'
+  return undefined
+}
+
+/** 组装 CLI 的 asker：默认 readline 行内提问；`askPrompt` 可替换为 TUI 模态 */
+function cliAsker(askPrompt?: (question: string) => Promise<string>): PermissionAsker {
+  const ask = askPrompt ?? defaultCliAsk()
+  return async (_req, prompt) => parseCliAnswer(((await ask(prompt.text)) ?? '').trim())
+}
+
 /** 默认 CLI 读行（process.stdin/readline） */
-function defaultCliAsk(write: (s: string) => void): (q: string) => Promise<string> {
+function defaultCliAsk(): (q: string) => Promise<string> {
   return (q: string) => new Promise<string>((resolve) => {
     const rl = createInterface({ input: process.stdin, output: process.stdout })
     rl.question(q, (ans) => { rl.close(); resolve(ans) })
