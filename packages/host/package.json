@@ -1,7 +1,7 @@
 {
   "name": "@harness/host",
   "version": "0.1.0",
-  "description": "宿主装配层：外部插件目录加载等与宿主无关的装配原语（CLI / A2A server / VSCode 扩展共用一份装配）",
+  "description": "宿主装配层：外部插件目录加载 + 内置 Provider/插件注册表等与宿主无关的装配原语（CLI / A2A server / VSCode 扩展共用一份装配）",
   "type": "module",
   "exports": {
     ".": {
@@ -17,6 +17,28 @@
   },
   "dependencies": {
     "@harness/plugin": "workspace:*",
-    "@harness/workspace": "workspace:*"
+    "@harness/workspace": "workspace:*",
+    "@harness/computer-use": "workspace:*",
+    "@harness/coordinator": "workspace:*",
+    "@harness/code-intel": "workspace:*",
+    "@harness/herdr": "workspace:*",
+    "@harness/manage-plugin": "workspace:*",
+    "@harness/mcp-server-registry": "workspace:*",
+    "@harness/memory": "workspace:*",
+    "@harness/provider-anthropic": "workspace:*",
+    "@harness/provider-gemini": "workspace:*",
+    "@harness/provider-glm": "workspace:*",
+    "@harness/provider-mock": "workspace:*",
+    "@harness/provider-openai": "workspace:*",
+    "@harness/provider-qwen": "workspace:*",
+    "@harness/skill-forge": "workspace:*",
+    "@harness/subagent": "workspace:*",
+    "@harness/swarm": "workspace:*",
+    "@harness/tools-builtin": "workspace:*",
+    "@harness/tools-glob": "workspace:*",
+    "@harness/tools-manager": "workspace:*",
+    "@harness/tools-media": "workspace:*",
+    "@harness/tools-search": "workspace:*",
+    "@harness/tools-web": "workspace:*"
   }
 }
