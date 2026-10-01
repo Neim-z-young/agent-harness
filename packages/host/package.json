@@ -16,6 +16,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@harness/acp-context": "workspace:*",
     "@harness/plugin": "workspace:*",
     "@harness/workspace": "workspace:*",
     "@harness/computer-use": "workspace:*",

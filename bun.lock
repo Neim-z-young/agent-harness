@@ -125,6 +125,7 @@
       "name": "@harness/host",
       "version": "0.1.0",
       "dependencies": {
+        "@harness/acp-context": "workspace:*",
         "@harness/code-intel": "workspace:*",
         "@harness/computer-use": "workspace:*",
         "@harness/coordinator": "workspace:*",
