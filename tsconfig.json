@@ -26,6 +26,7 @@
       "@harness/workspace": ["./packages/workspace/src"],
       "@harness/revert": ["./packages/revert/src"],
       "@harness/usage": ["./packages/usage/src"],
+      "@harness/host": ["./packages/host/src"],
       "@harness/provider-mock": ["./packages/plugins/provider-mock/src"],
       "@harness/tools-builtin": ["./packages/plugins/tools-builtin/src"],
       "@harness/tools-builtin/meta": ["./packages/plugins/tools-builtin/src/meta.ts"],

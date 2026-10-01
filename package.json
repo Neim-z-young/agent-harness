@@ -23,6 +23,7 @@
     "@harness/computer-use": "workspace:*",
     "@harness/coordinator": "workspace:*",
     "@harness/core": "workspace:*",
+    "@harness/host": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-client": "workspace:*",
     "@harness/mcp-server-registry": "workspace:*",

@@ -12,6 +12,7 @@
         "@harness/computer-use": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/host": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-client": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
@@ -68,6 +69,7 @@
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/herdr": "workspace:*",
+        "@harness/host": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
         "@harness/memory": "workspace:*",
@@ -116,6 +118,14 @@
         "@harness/snapshot": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/usage": "workspace:*",
+        "@harness/workspace": "workspace:*",
+      },
+    },
+    "packages/host": {
+      "name": "@harness/host",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
         "@harness/workspace": "workspace:*",
       },
     },
@@ -484,6 +494,8 @@
     "@harness/core": ["@harness/core@workspace:packages/core"],
 
     "@harness/herdr": ["@harness/herdr@workspace:packages/plugins/herdr"],
+
+    "@harness/host": ["@harness/host@workspace:packages/host"],
 
     "@harness/manage-plugin": ["@harness/manage-plugin@workspace:packages/plugins/manage-plugin"],
 

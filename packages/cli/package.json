@@ -18,6 +18,7 @@
     "@harness/bus": "workspace:*",
     "@harness/coordinator": "workspace:*",
     "@harness/core": "workspace:*",
+    "@harness/host": "workspace:*",
     "@harness/herdr": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-server-registry": "workspace:*",
