@@ -16,6 +16,8 @@ export type A2aErrorCode =
   | 'TOO_MANY_TASKS'
   /** 请求体不是合法 JSON-RPC */
   | 'BAD_REQUEST'
+  /** `messageId` 重复且无法回放（仍在执行中，尚无可回放的快照；plan §3.5 幂等） */
+  | 'DUPLICATE_MESSAGE'
 
 export class A2aServerError extends Error {
   readonly code: A2aErrorCode
@@ -69,5 +71,31 @@ export class ContextForbiddenError extends A2aServerError {
   constructor(contextId: string) {
     super('CONTEXT_FORBIDDEN', `无权访问会话 ${contextId}`, { detail: { contextId } })
     this.name = 'ContextForbiddenError'
+  }
+}
+
+/** 服务已达并发上限 */
+export class TooManyTasksError extends A2aServerError {
+  constructor(limit: number) {
+    super('TOO_MANY_TASKS', `服务并发已达上限（${limit}），请稍后重试或先取消在跑的任务`, {
+      detail: { limit },
+    })
+    this.name = 'TooManyTasksError'
+  }
+}
+
+/**
+ * `messageId` 重复且**无法回放**。
+ *
+ * 幂等的两条路径（plan §3.5）：① 已执行完 ⇒ 回放任务快照（不重复执行）；
+ * ② 仍在执行中 ⇒ 这条错误（既不能重跑、也还没有可回放的终态快照）。
+ * 客户端收到它应当**等待**而非重试同一 `messageId`。
+ */
+export class DuplicateMessageError extends A2aServerError {
+  constructor(messageId: string) {
+    super('DUPLICATE_MESSAGE', `消息 ${messageId} 正在处理中，请等待其完成后再查询任务`, {
+      detail: { messageId },
+    })
+    this.name = 'DuplicateMessageError'
   }
 }

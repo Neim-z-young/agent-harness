@@ -248,6 +248,18 @@ export class HarnessAgentExecutor implements AgentExecutor {
     return this.running.size
   }
 
+  /**
+   * 该 `taskId` 是否仍在执行（**含挂起中**）。
+   *
+   * 消费方是 server 的事件总线结算策略（`settleByTaskId`）：续接请求的 executor
+   * 不发任何事件就返回，SDK 因此观察到 `lastObservedState === undefined`，默认策略会
+   * **立刻结束这条共享 bus** —— 而第一轮此刻仍在跑（它稍后要补发 artifact + 终态）。
+   * 判据必须是"任务还在跑"，而不是"这条请求发了事件"。
+   */
+  isRunning(taskId: string): boolean {
+    return this.running.has(taskId)
+  }
+
   /** 释放全部挂起与运行中的任务（关闭服务时用，避免进程无法退出） */
   shutdown(): void {
     this.suspendTable.clear()

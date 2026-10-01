@@ -44,14 +44,34 @@ export {
 } from './card'
 export type { BuildAgentCardOptions } from './card'
 
-// 3. 结构化错误
-export { A2aServerError, ConcurrentTaskError, ContextForbiddenError, UnauthorizedError } from './errors'
+// 3. 认证与调用方隔离（plan §3.5）
+export { CallerRegistry, LOCAL_CALLER, callerKey, extractBearer, verifyBearer } from './auth'
+
+// 4. 结构化错误
+export {
+  A2aServerError,
+  ConcurrentTaskError,
+  ContextForbiddenError,
+  DuplicateMessageError,
+  TooManyTasksError,
+  UnauthorizedError,
+} from './errors'
 export type { A2aErrorCode } from './errors'
 
-// 4. 挂起表（远程权限的核心机制，plan §3.4）
+// 5. 挂起表（远程权限的核心机制，plan §3.4）
 export { DEFAULT_SUSPEND_TTL_MS, SuspendTable } from './suspend'
 export type { PendingAsk, SuspendOutcome, SuspendResult, SuspendTableOptions } from './suspend'
 
-// 5. AgentExecutor（harness 流 → A2A 任务生命周期）
+// 6. AgentExecutor（harness 流 → A2A 任务生命周期）
 export { HarnessAgentExecutor } from './executor'
 export type { A2aLogger, HarnessAgentExecutorOptions } from './executor'
+
+// 7. 服务端宿主（HTTP + SSE，挂 Bun.serve）
+export {
+  DEFAULT_A2A_HOSTNAME,
+  DEFAULT_A2A_PORT,
+  DEFAULT_JSONRPC_PATH,
+  DEFAULT_MAX_CONCURRENT_TASKS,
+  createA2aServer,
+} from './server'
+export type { A2aServer, A2aServerOptions } from './server'
