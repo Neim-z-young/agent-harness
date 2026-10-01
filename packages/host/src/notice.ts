@@ -1,5 +1,5 @@
 /**
- * 装配期诊断通道（P0 收尾 · S1）
+ * 装配期诊断通道（P0 收尾 · S1；S2 补一枚漏网 code `preload.meta-source-failed`）
  *
  * 解决的问题：`HarnessApp.boot` 与 boot 末尾的后台预加载共 20 处
  * `this.options.stdout?.write?.(...)` ——
@@ -12,7 +12,7 @@
  * `docs/host-extraction-design.md` §4）：
  *   1. `HostNotice` 判别联合：`code` → 结构化 `data` 的类型映射；
  *   2. `renderNotice`：**逐字复刻**今天写进 stdout 的字节（含结尾换行），供 CLI 直接用
- *      ⇒ 搬迁后文案零变化，且 21 条从此有独立快照可依附（不再靠"跑一次 boot 抄 stdout"）；
+ *      ⇒ 搬迁后文案零变化，且 22 条从此有独立快照可依附（不再靠"跑一次 boot 抄 stdout"）；
  *   3. `installConsoleCapture`：罩住第三方 SDK 自己 `console.*` 的输出（P0.5 spike 实测：
  *      A2A SDK 的 `DefaultRequestHandler` 在 executor 抛异常时自己 `console.error` 打完整堆栈）。
  *
@@ -81,6 +81,12 @@ export interface NoticePayloads {
   'preload.warmed': { pluginId: string }
   'preload.install-failed': { message: string }
   'preload.tools-failed': { message: string }
+  /**
+   * L1 元信息来源预载失败（`preloadBuiltinToolMetas`）。
+   * **S2 才纳入的漏网站点**：这条此前是 `console.warn` 直写（不走 stdout、也不走 setLogSink），
+   * 是本仓唯一"两个出口都不沾"的装配期诊断 —— 在 A2A 宿主下等于无声（见设计稿 §8 ②）。
+   */
+  'preload.meta-source-failed': { pluginId: string; message: string }
 
   // ── verbose 日志 ──
   'log.info': { message: string; meta?: unknown }
@@ -115,6 +121,7 @@ export const NOTICE_LEVEL: { readonly [C in NoticeCode]: NoticeLevel } = {
   'preload.plugin-failed': 'warn',
   'preload.install-failed': 'warn',
   'preload.tools-failed': 'warn',
+  'preload.meta-source-failed': 'warn',
   // verbose 才要的（门控在 host 侧：verbose 为假时干脆不 emit，渲染器不必知道 verbose）
   'log.info': 'log',
   'log.debug': 'log',
@@ -263,6 +270,11 @@ export function renderNotice(n: HostNotice): string {
 
     case 'preload.tools-failed':
       return `[WARN] 工具池预热失败：${n.data.message}\n`
+
+    case 'preload.meta-source-failed':
+      // 改造前是 `console.warn('…')` —— console.warn 自己补换行，所以这里要把那个 `\n` 显式写上，
+      // 两条出口（sink / console 兜底）的最终字节才一致。
+      return `[WARN] 内置插件「${n.data.pluginId}」元信息来源预载失败：${n.data.message}\n`
 
     case 'log.info':
       // `meta` 用真值判断（与改造前逐字一致：空串 / 0 / null 都不追加）

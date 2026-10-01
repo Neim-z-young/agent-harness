@@ -147,13 +147,18 @@ describe('renderNotice：逐条字节快照（S2 的逐字不变判据）', () =
     )
   })
 
-  it('preload.*：后台预加载的四条（含 verbose 才要的 warmed）', () => {
+  it('preload.*：后台预加载的四条（含 verbose 才要的 warmed）+ L1 元信息预载失败', () => {
     expect(r('preload.plugin-failed', { pluginId: 'subagent', message: 'boom' })).toBe(
       '[WARN] 内置插件「subagent」后台预加载失败：boom\n',
     )
     expect(r('preload.warmed', { pluginId: 'subagent' })).toBe('[INFO] 内置插件「subagent」已后台预热。\n')
     expect(r('preload.install-failed', { message: 'boom' })).toBe('[WARN] 内置插件安装失败：boom\n')
     expect(r('preload.tools-failed', { message: 'boom' })).toBe('[WARN] 工具池预热失败：boom\n')
+    // S2 补的漏网 code：字节必须**显式带换行** —— 改造前是 `console.warn(无换行结尾的串)`，
+    // 换行由 console 自己补。sink 出口没有 console 代劳，所以要自己写。
+    expect(r('preload.meta-source-failed', { pluginId: 'tools-builtin', message: 'boom' })).toBe(
+      '[WARN] 内置插件「tools-builtin」元信息来源预载失败：boom\n',
+    )
   })
 
   it('log.info / log.debug：meta 用真值判断（空串 / 0 / null 都不追加）', () => {
@@ -184,6 +189,7 @@ describe('renderNotice：逐条字节快照（S2 的逐字不变判据）', () =
       ['preload.warmed', { pluginId: 'p' }],
       ['preload.install-failed', { message: 'm' }],
       ['preload.tools-failed', { message: 'm' }],
+      ['preload.meta-source-failed', { pluginId: 'p', message: 'm' }],
       ['log.info', { message: 'm' }],
       ['log.debug', { message: 'm' }],
     ]
@@ -275,6 +281,7 @@ describe('等级表：分级不是装饰', () => {
       'preload.plugin-failed',
       'preload.install-failed',
       'preload.tools-failed',
+      'preload.meta-source-failed',
     ]
     for (const c of warnCodes) expect(NOTICE_LEVEL[c]).toBe('warn')
   })

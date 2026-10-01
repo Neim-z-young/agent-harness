@@ -691,7 +691,7 @@ export class HarnessHost {
   async boot(): Promise<{ harness: Harness; session: Session }> {
     // 多级加载 L1：预载内置工具静态元信息（描述/别名/安全），由各工具插件自携带 metaSource，
     // 保证后续 /tools 等命令在任何运行时工具模块（L2）加载前即可展示内置工具描述。
-    await preloadBuiltinToolMetas()
+    await preloadBuiltinToolMetas((n) => this.emitNotice(n))
 
     const rules = await this.loadRules()
     const mode = this.options.permissionMode ?? 'ask'

@@ -584,8 +584,15 @@ export function getBuiltinToolRegistry(): BuiltinToolRegistry {
  * 遍历 `getBuiltinRegistry().list()`，对每个携带 `metaSource` 的插件 dynamic import 其 /meta 模块
  * （纯数据、无副作用）并登记到 `getBuiltinToolRegistry()`。plugin 自携带，宿主不硬编码具体包导出。
  * 失败按插件隔离，不阻塞整体登记（避免单个 meta 模块异常影响 boot）。
+ *
+ * ## 诊断出口：与 `loadPluginDirs` 同形（结构化 notice 优先，否则回落到文本）
+ * S1 盘点时这里是**唯一"两个出口都不沾"的装配期诊断** —— `console.warn` 直写，既不走宿主输出流、
+ * 也不走 `setLogSink`（见 `docs/host-extraction-design.md` §8 ②）。A2A / VSCode 宿主因此对
+ * "元信息来源预载失败"完全无声。S2 把它纳入同一条通道：有 `onNotice` 发 notice（等级 `warn`），
+ * 没有则保留 `console.warn` —— 两条出口的**最终字节相同**（换行由 renderNotice 显式补上，
+ * 因为 console.warn 是自己补的）。
  */
-export async function preloadBuiltinToolMetas(): Promise<void> {
+export async function preloadBuiltinToolMetas(onNotice?: NoticeSink): Promise<void> {
   const reg = getBuiltinToolRegistry()
   const items = getBuiltinRegistry().list().filter((p) => p.metaSource)
   await Promise.all(
@@ -594,8 +601,12 @@ export async function preloadBuiltinToolMetas(): Promise<void> {
         const source = await p.metaSource!()
         reg.registerSource(source)
       } catch (err) {
-        // eslint-disable-next-line no-console
-        console.warn(`[WARN] 内置插件「${p.id}」元信息来源预载失败：${(err as Error)?.message ?? String(err)}`)
+        const message = (err as Error)?.message ?? String(err)
+        if (onNotice) onNotice(makeNotice('preload.meta-source-failed', { pluginId: p.id, message }))
+        else {
+          // eslint-disable-next-line no-console
+          console.warn(`[WARN] 内置插件「${p.id}」元信息来源预载失败：${message}`)
+        }
       }
     }),
   )
