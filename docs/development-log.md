@@ -1,5 +1,59 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 228）P0 第二步：搬内置注册表三节（C 档）—— 顺带把"隐式依赖"显式化
+
+### 切口：先搬 C 档，不碰 `boot`
+
+第一步（续 227）已把 A 档 `loadPluginDirs` 簇搬完。第二步原计划直接动 `HarnessApp.boot`，
+但那要连 `lazyImport`（cli 内 27 处使用）与 `BuiltinToolRegistry` 一起拖走。故改为**先搬 C 档
+（内置注册表三节）**，用小步换定位成本：这一步搬完，`boot` 主体剩下的外部依赖就只有
+`buildProviderWindowTable`（B 档，连着 config 解析层）。
+
+### 闭包实测：原清单又漏了 4 个符号
+
+| 档 | 本次搬走的符号 | 备注 |
+|---|---|---|
+| **C** | `lazyImport` · `registerBuiltinProviderTypes`（含私有 `BUILTIN_PROVIDER_META` / `registerBuiltinProviderType`）· `BuiltinGeneralPlugin` · `BuiltinPluginRegistry` · `getBuiltinRegistry` · `unknownBuiltinPluginIds` · `resolveBuiltinPlugins` · `BuiltinToolRegistry` · `getBuiltinToolRegistry` · `preloadBuiltinToolMetas` | 计划文档原清单只列了 4 个；实测**多出** `BuiltinToolRegistry` / `getBuiltinToolRegistry` / `unknownBuiltinPluginIds` / `registerBuiltinProviderTypes` —— 它们是闭包带出来的 |
+
+搬走后 cli 变死的 import（顺带清理）：`ProviderTypeMeta`、`ProviderTypeFactory`、
+`resolveProviderTypeFactory`、`ToolMetaEntry`、`ToolMetaRegistry`、`ToolMetaSource`。
+**保留** `ProviderTypeRegistry` / `ProviderConfig` / `ToolMetaLookup` / `AgentPlugin`（cli 别处仍在用）。
+`loadPluginDirs` 反过来要在 cli 内继续 import —— 第一轮以为它只在 re-export 面，实测 cli 内部
+两处仍在用（boot 装配与 `config check`），typecheck 直接把这个假设打回来了。
+
+### 新增的一类约束：`lazyImport` 的 specifier 是**隐式依赖**
+
+`getBuiltinRegistry()` 用 `lazyImport('@harness/tools-builtin')` 这类字符串引用 22 个内置插件包。
+两个后果此前没有明确记录：
+
+1. **TS 看不见**（specifier 是 `string`，不是 import 语句）⇒ typecheck 全绿不代表运行时能解析；
+2. **`bun build --compile` 无法静态分析 `import(变量)`** ⇒ 这些包不会自动进 bundle。
+
+处理：把这 22 个包**显式写进 `packages/host/package.json` 的 `dependencies`**。这是本步真正的
+架构产出 —— 把"反正是 monorepo 根 node_modules 有"这种隐式事实，换成一份可机读的契约
+（改内置插件清单 ⇒ 必须同步改 `package.json`；打包器按同一清单收入口）。AGENTS.md §3 与
+计划文档 §7 都已补上这条纪律。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `bun run typecheck` | **40 包 exit 0** |
+| `bun test ./packages` | **2156 pass / 0 fail**（91 文件）—— 原 2137 / 90 文件 **+19 / +1**，其余逐条不变 |
+| `packages/cli` 单包 | **429 pass / 0 fail**，与搬迁前**逐条一致**（re-export 兼容的验收口径） |
+| `packages/host` 单包 | **30 pass / 0 fail**（原 11 + 新增 19 条内置注册表用例） |
+
+测试仍**有意重叠**：`cli.test.ts` 侧保留原用例测"符号还能从 `@harness/cli` 拿到"，host 侧新写的
+`builtin-registry.test.ts` 测"能力本身成立且不经过 cli"（将来 A2A server 也吃这份实现）。收口留到
+`boot` 搬完时统一做。
+
+### 实现细节：大段搬迁用行区间删除而非逐段 Edit
+
+cli 的 C 档是连续 407 行（含注释），逐段 `Edit` 需要 12 次精确匹配。改用 Python 按行区间删除 +
+断言校验边界（起止行必须分别是 `// ---` 与 `}`、紧随其后的 `lazyMockProvider` 必须存在），
+并在原位置留三行说明注释。**断言是必要的**：第一次就因断言索引写错而中止，等于顺手确认了
+"删错行会立刻失败"而不是静默截断。
+
 ## 2026-10-01（续 227）P0 第一步：抽出 `@harness/host`，先搬 `loadPluginDirs` 簇
 
 ### 调研把"6 个符号一次搬完"这个前提否掉了

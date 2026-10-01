@@ -266,7 +266,15 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 | A2A server | JSON-RPC HTTP | SSE | `TASK_STATE_INPUT_REQUIRED` + 挂起任务表（§3.4） |
 | VSCode sidecar | stdio JSON-RPC / SSE | 消息桥 → webview | webview 授权卡 |
 
-> **`@harness/host` 的依赖面要显式接受**：它会 import 内置插件与工具包（tools-builtin / tools-manager / manage-plugin / workspace-shell / revert / snapshot / subagent / swarm / coordinator …）以及 `core`/`plugin`/`workspace`/`permission`，因此必然成为新的"巨型组合根"。这是"一份装配、多个宿主"的代价；方案接受它，但要求 host **只做装配与注入**，不承载任何业务逻辑，依赖清单在实现时写进包的 README。
+> **`@harness/host` 的依赖面要显式接受**：它会 import 内置插件与工具包（tools-builtin / tools-manager / manage-plugin / workspace-shell / revert / snapshot / subagent / swarm / coordinator …）以及 `core`/`plugin`/`workspace`/`permission`，因此必然成为新的"巨型组合根"。这是"一份装配、多个宿主"的代价；方案接受它，但要求 host **只做装配与注入**，不承载任何业务逻辑。
+>
+> **（2026-10-01 实测补充）** 依赖分两类，落法不同：
+> 1. **静态 import 的包**（`@harness/plugin` / `@harness/workspace`）—— TS 侧可见，直接进 `dependencies`。
+> 2. **`lazyImport(specifier)` 惰性引用的内置插件包**（22 个：provider-* / tools-* / 编排类 / memory 等）
+>    —— specifier 是 `string`，**TS 看不见**，只在运行期由消费方的依赖树解析。这类依赖已显式写进
+>    `packages/host/package.json` 的 `dependencies`，作用是**把隐式依赖显式化**：改内置插件清单时必须
+>    同步改 `package.json`，否则运行时才炸；`bun build --compile` 打包时也按这份清单显式收入口
+>    （`import(变量)` 无法被静态分析，不会自动进 bundle）。
 
 ---
 
@@ -275,7 +283,7 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 | 阶段 | 内容 | 交付物 | 验收口径（预期行为，非执行步骤） |
 |---|---|---|---|
 | **P0.5（✅ 已完成 2026-10-01）** | ① SDK **无框架** server 入口 + `Bun.serve` 最小可跑（回一个 `SendMessage` + 一张 agent-card）；② `bun build --compile` 产出的二进制**能否加载用户目录的动态 TS 插件** | `spikes/a2a/` 两个可复现脚本 + 结论已回写本文档（§3.1.1 / §3.4 / §8） | ① **可行**：`JsonRpcTransportHandler.handle(body, ctx)` 纯 JSON-RPC 进出、**完全不接触 HTTP**，直挂 `Bun.serve`，无需任何框架 peer dep；13 项自检全绿（取卡 / 非流式 / SSE / GetTask / ListTasks / CancelTask / **`INPUT_REQUIRED` 挂起与续接** / 版本校验 / 异常转 FAILED）。② **可行**：`--compile` 二进制**内嵌转译器**，能运行期加载用户目录 `.ts`（不只是 `.js`/`.mjs`），61MB / 冷启动 18ms ⇒ **P3 sidecar 可走单文件二进制**。SDK 版本**钉死 `@a2a-js/sdk@1.3.0`** |
-| **P0**（🔨 进行中：**第一步已完成 2026-10-01**） | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器。**第一步进度**：`packages/host` 已建，`loadPluginDirs` 簇（A 档）已迁出 + CLI re-export，**40 包 typecheck exit 0 / 全量 2137 pass**（原 2126 + host 新增 11，其余逐条不变） |
+| **P0**（🔨 进行中：**第一/二步已完成 2026-10-01**） | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器。**第一步**：`loadPluginDirs` 簇（A 档）迁出 + CLI re-export ⇒ 40 包 typecheck exit 0 / 全量 2137 pass。**第二步**：内置注册表三节（C 档：Provider 类型工厂 / 内置通用插件 / 内置工具元信息，连同共用的 `lazyImport`）迁出 + CLI re-export ⇒ **40 包 typecheck exit 0 / 全量 2156 pass**（2137 + host 新增 19，其余逐条不变）。**剩余**：`buildProviderWindowTable`（B 档，连着 config 解析层）与 `HarnessApp.boot` 主体 |
 | **P1** | A2A 一期：AgentCard + SendMessage + SendStreamingMessage(SSE) + GetTask + CancelTask + Bearer + `A2A-Version` 校验 + `INPUT_REQUIRED` 权限（含 §3.4 挂起机制、§3.5 并发/幂等）；默认 127.0.0.1 | `@harness/a2a-server` 与 `harness a2a` 启动方式 | 用官方 `a2a-inspector` / `a2a-tck` 跑通：取到 agent-card；发消息后收到 task→artifact/状态更新→`TASK_STATE_COMPLETED` 的事件序列；取消后转 `TASK_STATE_CANCELED`；权限点转 `TASK_STATE_INPUT_REQUIRED` 且答复后续接；同 session 并发请求被串行化或结构化拒绝；重复 `messageId` 不重复执行 |
 | **P2** | VSCode Chat Participant（B2）：spawn sidecar（stdio）或连本地 A2A，转发流到 ResponseStream，含取消与权限弹窗 | VSIX 扩展（不发布 Marketplace） | 在 VSCode 中 `@harness` 提问可看到流式回答、工具进度、斜杠命令；终止按钮可中断；权限请求弹窗可决策 |
 | **P3** | VSCode Webview（B3）：平移块模型与侧栏（会话/后台任务/文件引用/统计）；sidecar 分发（`--compile` 或随扩展带 bun，取决于 P0.5 结论） | VSIX 完整版 | 终端 TUI 的核心信息结构在 IDE 内等价呈现 |

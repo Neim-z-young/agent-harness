@@ -55,9 +55,18 @@
 
 - 插件包：provider-\* / tools-\* / mcp-client / mcp-server-registry / computer-use 等
 
-- `@harness/host`：宿主装配层 —— 与**具体宿主无关**的装配原语（外部插件目录加载等），
-  供 CLI / A2A server / VSCode 扩展**共用一份装配**（避免"两份装配必然分叉"）。只做装配与注入，
-  不内置业务决策、不绕过权限、不直接调工具。P0 第一步已落 `loadPluginDirs` 簇
+- `@harness/host`：宿主装配层 —— 与**具体宿主无关**的装配原语，供 CLI / A2A server / VSCode
+  扩展**共用一份装配**（避免"两份装配必然分叉"）。只做装配与注入，不内置业务决策、不绕过权限、
+  不直接调工具。已落两批：① `loadPluginDirs` 簇（外部插件目录加载）；② 内置注册表三节
+  （`registerBuiltinProviderTypes` + `BuiltinPluginRegistry` 簇 + `BuiltinToolRegistry` 簇 + 共用
+  的 `lazyImport`）。剩余 `buildProviderWindowTable` 与 `HarnessApp.boot` 主体待随 P0 第二步收尾。
+
+  - **依赖契约**：host 的内置注册表用 `lazyImport(specifier)` 惰性引用 22 个内置插件包
+    （provider-* / tools-* / 编排类 / memory 等），这些 specifier **由消费方的依赖树解析**，
+    TS 侧看不见。故 host 的 `package.json` 把这份清单显式声明为 `dependencies` ——
+    改这份清单时必须**同时**改代码与 `package.json`，否则运行时才炸。
+  - **打包约束**：`bun build --compile` 无法静态分析 `import(变量)` ⇒ 这批包不会自动进 bundle，
+    打包配置需按同一清单显式收入口（P3 分发路径的前置项）。
 
 ## 4. 硬性约束
 
