@@ -124,7 +124,13 @@ export { InteractivePermissionEngine } from '@harness/host'
 import { HarnessHost, renderNotice } from '@harness/host'
 import { createHost } from '@harness/host'
 // A2A 服务端宿主（宿主/适配器层）。只做协议翻译与装配 —— 复用 host 的同一份装配。
-import { AGENT_CARD_PATH, DEFAULT_A2A_PORT, createA2aServer, listControlMethods } from '@harness/a2a-server'
+import {
+  A2A_PROTOCOL_VERSION,
+  AGENT_CARD_PATH,
+  DEFAULT_A2A_PORT,
+  createA2aServer,
+  listControlMethods,
+} from '@harness/a2a-server'
 import type { HostOptions, SessionRestoreInfo } from '@harness/host'
 export type { HostOptions, SessionRestoreInfo } from '@harness/host'
 export { HarnessHost, createHost } from '@harness/host'
@@ -191,6 +197,14 @@ export interface CliArgs {
   a2aPort?: number
   /** a2a 子命令：Bearer token（配了才校验 + 卡片声明安全方案） */
   a2aToken?: string
+  /**
+   * a2a 子命令：以**单行 JSON 握手**启动。
+   *
+   * stdout 只输出一行机器可读的端点信息（其余人类可读信息一律改走 stderr），
+   * 供扩展 / 脚本「spawn 后确定性地取端点」—— 不必解析人类可读文案（那是一个
+   * 改一个字就静默崩掉的耦合面，见 `spawn --port 0` 的端口回填场景）。
+   */
+  json?: boolean
 }
 
 /**
@@ -238,6 +252,7 @@ export function parseCliArgs(raw: string[]): CliArgs {
     if (a === '--no-resume') { out.noResume = true; continue }
     // 代码注入防护：默认不加载外部插件代码，需显式开闸
     if (a === '--allow-plugin-code') { out.allowPluginCode = true; continue }
+    if (a === '--json') { out.json = true; continue }
     if (a === '--check-config') { out.checkConfig = true; continue }
     const [k, v] = a.startsWith('--')
       ? a.slice(2).split('=', 2) as [string, string | undefined]
@@ -1783,7 +1798,7 @@ export const HELP_TEXT = `harness — Agent Harness CLI
   harness config set-key <providerId> <apiKey>   加密写入 provider 的 apiKey（enc:v1 密文）
   harness config get-key <providerId>            解密查看 provider 的 apiKey
   harness config check [options]       校验 config.json 并打印 Provider/模型概览
-  harness a2a [--port <n>] [--token <t>]   以 A2A（Agent2Agent）服务启动（默认仅监听 127.0.0.1）
+  harness a2a [--port <n>] [--token <t>] [--json]   以 A2A 服务启动（默认仅监听 127.0.0.1）
   harness help | -h | --help            显示帮助
 
 teammate 选项:
@@ -1794,6 +1809,8 @@ a2a 选项:
       --port <n>              JSON-RPC 端点端口（默认 4321；监听地址恒为 127.0.0.1）
       --token <t>             Bearer token：配了则校验并在卡片声明安全方案；不配则匿名（仅本机）
                               取卡：GET http://127.0.0.1:<port>/.well-known/agent-card.json
+      --json                  以「单行 JSON 握手」启动：stdout 只输出一行机器可读的端点信息
+                              （供扩展 / 脚本 spawn 后确定性地取端点，不必解析人类可读文案）
 
 选项:
   -c, --cwd <dir>            工作目录（启动时传入即以此为准；不传才取当前目录）。
@@ -1973,19 +1990,47 @@ export async function runA2aCli(options: {
   })
 
   const origin = new URL(server.url).origin
-  write(`A2A 服务已启动\n`)
-  write(`  JSON-RPC 端点: ${server.url}\n`)
-  write(`  AgentCard:     ${origin}/${AGENT_CARD_PATH}\n`)
-  // 控制面（P2-A）：与协议面并列的另一条路径 —— CLI 斜杠命令里"改本进程状态"那 12 条
-  // 在 A2A 协议里无处安放，走这里。see packages/a2a-server/src/control.ts
-  write(`  控制端点:      ${server.controlUrl}（${listControlMethods().length} 个 harness/* 方法）\n`)
-  write(`  认证:          ${args.a2aToken ? 'Bearer（已配置）' : '匿名（仅 127.0.0.1 可达）'}\n`)
-  write(`  权限模式:      ${permissionMode}${permissionMode === 'ask' ? '' : '（不会产生 INPUT_REQUIRED 挂起）'}\n`)
-  write(`  Ctrl-C 退出\n`)
+  const cardUrl = `${origin}/${AGENT_CARD_PATH}`
+
+  if (args.json) {
+    // 单行 JSON 握手：**stdout 只有这一行**。
+    //
+    // 为什么需要它（而不是让调用方解析下面那段人类可读文案）：`--port 0` 时端口由内核分配，
+    // 调用方**必须**从进程输出里拿回真实端点；而解析带中文标签的多行文本，是一个"文案改一个
+    // 字就静默崩掉"的耦合面。握手把这件事变成一个显式的、可版本化的契约（`v` 字段）。
+    write(
+      `${JSON.stringify({
+        v: 1,
+        pid: process.pid,
+        port: server.port,
+        protocolVersion: A2A_PROTOCOL_VERSION,
+        rpcUrl: server.url,
+        cardUrl,
+        controlUrl: server.controlUrl,
+        auth: args.a2aToken ? 'bearer' : 'anonymous',
+        permissionMode,
+        cwd: host.workspace.cwd,
+      })}\n`,
+    )
+  } else {
+    write(`A2A 服务已启动\n`)
+    write(`  JSON-RPC 端点: ${server.url}\n`)
+    write(`  AgentCard:     ${cardUrl}\n`)
+    // 控制面（P2-A）：与协议面并列的另一条路径 —— CLI 斜杠命令里"改本进程状态"那 12 条
+    // 在 A2A 协议里无处安放，走这里。see packages/a2a-server/src/control.ts
+    write(`  控制端点:      ${server.controlUrl}（${listControlMethods().length} 个 harness/* 方法）\n`)
+    write(`  认证:          ${args.a2aToken ? 'Bearer（已配置）' : '匿名（仅 127.0.0.1 可达）'}\n`)
+    write(`  权限模式:      ${permissionMode}${permissionMode === 'ask' ? '' : '（不会产生 INPUT_REQUIRED 挂起）'}\n`)
+    write(`  Ctrl-C 退出\n`)
+  }
+
+  // json 模式：握手之后 stdout 不再出现任何字节（调用方可能只读一行就停）——
+  // 停机提示这类人类信息改走 stderr。
+  const notice = args.json ? (s: string) => process.stderr.write(s) : write
 
   await new Promise<void>((resolve) => {
     const bye = () => {
-      write('\n[a2a] 正在停止...\n')
+      notice('\n[a2a] 正在停止...\n')
       server.stop(true)
       resolve()
     }

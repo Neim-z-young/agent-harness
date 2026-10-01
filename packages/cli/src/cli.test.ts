@@ -147,6 +147,14 @@ describe('parseCliArgs 命令解析', () => {
     expect(parseCliArgs(['a2a', '--port', '0']).a2aToken).toBeUndefined()
   })
 
+  it('a2a --json：结构化握手标记（默认关闭）', () => {
+    // 供扩展 / 脚本 spawn 后确定性地取端点；不传则走人类可读多行输出。
+    expect(parseCliArgs(['a2a', '--json']).json).toBe(true)
+    expect(parseCliArgs(['a2a', '--json', '--port', '0'])).toMatchObject({ json: true, a2aPort: 0 })
+    expect(parseCliArgs(['a2a']).json).toBeUndefined()
+    expect(parseCliArgs([]).json).toBeUndefined()
+  })
+
   it('--snapshot 布尔标记', () => {
     expect(parseCliArgs(['--snapshot']).snapshot).toBe(true)
     expect(parseCliArgs(['repl', '--snapshot', '-v'])).toMatchObject({ snapshot: true, verbose: true })

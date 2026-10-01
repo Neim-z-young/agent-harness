@@ -43,8 +43,10 @@ export {
   skillOf,
 } from './card'
 export type { BuildAgentCardOptions } from './card'
-// 卡路由路径（协议常量，取自 SDK）—— 消费方（CLI / 文档）不必直接依赖 SDK
-export { AGENT_CARD_PATH } from '@a2a-js/sdk'
+// 卡路由路径与协议版本（协议常量，取自 SDK）—— 消费方（CLI / 扩展 / 文档）不必直接依赖 SDK。
+// `A2A_PROTOCOL_VERSION` 是**必须随请求发送 `A2A-Version` 头**的那个值（缺失时 SDK 按 '0.3' 处理，
+// 会被只声明 1.0 的卡片拒掉）—— 故它属于"调用方需要"的常量，和卡路径一起外露。
+export { AGENT_CARD_PATH, A2A_PROTOCOL_VERSION } from '@a2a-js/sdk'
 
 // 3. 认证与调用方隔离（plan §3.5）
 export { CallerRegistry, LOCAL_CALLER, callerKey, extractBearer, verifyBearer } from './auth'
