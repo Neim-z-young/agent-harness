@@ -1,5 +1,78 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 231）P0 收尾 S2：`HarnessHost` 上移 + notice 全量接线 —— 顺带补掉一枚漏网 code
+
+### 为什么这一步被拆成三个 commit
+
+设计稿把这次改造写成"S2 一步"（搬 `HarnessApp` 主体 + 20 处改 `emitNotice` + `HarnessApp extends`）。
+实测**一步搬不动**，根因是环：`host.ts` 要用 `loadPluginDirs` / `getBuiltinRegistry` /
+`preloadBuiltinToolMetas` / `registerBuiltinProviderTypes` / `resolveBuiltinPlugins` —— 它们当时都定义在
+`index.ts`。`host.ts` 若从 `./index` 取就形成 `host.ts → index.ts → host.ts` 的环，而本仓已明确回避
+该形态（`./lazy.ts` 就是为此拆的）。⇒ 先做一步**纯搬移**把 A 档 + C 档抽成 `./plugins.ts`，
+`index.ts` 退化为纯 barrel（688 → 125 行）。这一步零行为变化、单独验证成本极低 —— 属于"先拆环、再搬家"。
+
+同时权限引擎是**构造期**依赖而非运行期依赖：`boot()` 里就 `new CliPermissionEngine(...)`，主体不先拿到
+一个宿主无关的引擎就搬不走。⇒ 原 S3（权限接缝）实际前插为 **S2-②**，排在主体之前。于是实际序列是
+S1 → S2-① 配置层 → S2-② 权限接缝 → S2-③ 前置（拆环）+ 主体 → S2-③ 补（漏网站点）。
+
+### `createPermissionEngine` 覆写点的取舍
+
+主体上移后 `app.permission` 若直接是 `InteractivePermissionEngine`，`tui.tsx:1515` 的
+`setAskPrompt(...)` 就没有了（`cli.test.ts` 也依赖 `CliPermissionEngine` 这个导出）。两条路：
+改 TUI 用 `setAsker(cliAsker(...))`（动 2 处 + 导出内部函数），或给 host 一个覆写点。选了后者 ——
+`protected createPermissionEngine(rules, save, mode)`，CLI 覆写成返回 `CliPermissionEngine`，并用
+`declare public permission: CliPermissionEngine` 窄化字段类型。**收益**：`tui.tsx` / `cli.test.ts` /
+`CliPermissionEngine` 全部逐字未改，且四态语义依然只有一份（CLI 覆写的只是"用什么问"，不是
+"问到之后怎么记"）。
+
+### 四处**有意偏离**设计稿（每处都留痕在 §9.2）
+
+1. **`type Host = HarnessHost`，不另立 interface**：设计稿写 `interface Host { …（56 成员） }` +
+   `class HarnessHost implements Host`。那是把同一份 56 个成员写两遍（名称、签名、只读性各维护一次）
+   —— 且漂移是**静默的**（interface 不会因 class 改了而报错）。`type` 别名让两者定义上同一。
+2. **多补一个 `logLine?: (line: string) => void`**：设计稿只列了装配期的 `onNotice`，漏了**运行期**
+   `emitLog` 的兜底出口。host 不再有 `stdout`，不补则运行期引擎 warn/error 在 headless 下无处可去。
+   它与 `onNotice` 仍是**两条通道**（时机 / 内容 / 消费方都不同），不是合并。
+3. **`anthropicProviderConfig?: any` 保留原类型**：设计稿写 `unknown`，但会把
+   `this.options.anthropicProviderConfig?.apiKey` 与 `...spread` 逼出四处无谓 cast，收益为零。
+   不为"更严"制造噪音。
+4. **`stdout` 缺省落 `process.stdout`** + 多一个覆写点：`stdout ?? process.stdout` 是**搬迁前**的既有
+   语义（`main()` 不传 stdout），不补就会让真 CLI 的装配诊断全部消失 —— 这是"零行为变化"判据要求的。
+
+### 反向验证三连（证明 20 处输出**确实**走这条通道）
+
+① 只摘 CLI 侧 `onNotice` ⇒ **仍通过**：`logLine` 兜底同字节 —— 这正是"两条出口不是两份事实"的
+可执行证据。② 两条出口**同时**摘掉 ⇒ `boot：config.json → plugins 有未登记 id 时只告警` 报
+`Received: ""`，文案用例失败 ⇒ 证明 20 处输出确实经过 `emitNotice`。③ **不给**任何输出出口 ⇒
+文本丢失，但 `app.notices` 环形缓冲里仍能按 `code` 取回降级事实 ⇒ 固化为 `notices.test.ts` 的常驻
+用例（治"静默丢弃"的正面断言）。
+
+### 顺带补掉 S1 遗漏的漏网站点（+1 code）
+
+`preloadBuiltinToolMetas` 用 `console.warn` 直写，既不走 `stdout` 也不走 `setLogSink` —— 是本轮唯一
+"两个出口都不沾"的装配期诊断。S2-③ 补（`6dc4e69`）新增 code `preload.meta-source-failed`（`warn` 级），
+与 `loadPluginDirs` 同形的 `onNotice?` 双出口。注意模板要**显式带结尾换行** —— 改造前那个 `\n` 是
+`console.warn` 代劳的，sink 出口没有人代劳。code 总数 **22**。
+
+### 一处守卫改址（不是改断言）
+
+`cli.test.ts` 有一条读**源码文本**的防回归守卫（守 `acp.createAcpContextPlugin({...})` 必须传
+`modelContextLimit` 与 `providerWindows`）。装配行随 `boot()` 搬进 `packages/host/src/host.ts`
+⇒ 守卫改读 `../../host/src/host.ts`，**两条断言逐字未改**。这是本次改造唯一暴露的测试失败，
+而它报的正是这个：**守卫必须跟着代码走**，否则"代码搬走了"会以"测试失败"的形式误报。
+**教训：搬代码时务必搜一遍「读 `./index.ts` 源码」这类测试。**
+
+### 产物
+
+`packages/host/src/host.ts`（`HarnessHost` + `HostOptions` + `createHost()` + `type Host`）、
+`plugins.ts`（A/C 档）、`config.ts` / `provider.ts`（S2-①）、`permission.ts`（S2-②）、
+`index.ts` 退化为纯 barrel、`notices.test.ts`（5 条端到端）、`cli/src/index.ts` 变薄子类
+（3415 → 2156 行）。三个 commit：`bbb366d`（拆环）/ `b13f81a`（主体）/ `6dc4e69`（补漏网）。
+
+验证：`bun run typecheck` 40 包 exit 0；`bun test ./packages` **2215 pass / 0 fail / 95 文件**
+（基线 2210 + host notice 端到端 5）；`packages/host` 89 pass。**剩余：仅 S4**（收口 host/cli 之间
+有意重叠的测试 + 文档收尾）。
+
 ## 2026-10-01（续 230）P0 收尾 S1：装配期诊断通道（`renderNotice` 逐字复刻 + 等级只有一份）
 
 ### 为什么先落 S1 而不是直接搬 `boot`

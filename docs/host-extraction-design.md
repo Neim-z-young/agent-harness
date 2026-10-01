@@ -1,8 +1,8 @@
 # P0 收尾设计：`createHost` 接口与三条接缝
 
-> 状态：**已定稿并开工** —— 三个分叉按 §7 的推荐选项落定（继承 / `renderNotice` 放 host / `asker` 四态
-> + `Host.notices` 环形缓冲要）；**S1 已落地**（`packages/host/src/notice.ts` + 25 条用例），
-> S1 期间的三处实测修正见 §8。
+> 状态：**已落地（S1 / S2 / S3 全部完成，只剩 S4 收尾）** —— 三个分叉按 §7 的推荐选项落定
+> （继承 / `renderNotice` 放 host / `asker` 四态 + `Host.notices` 环形缓冲要）。
+> S1（notice 通道）见 §8 的三处实测修正；S2（`HarnessHost` 上移）的三处实测修正与四处**有意偏离**见 §9。
 > 前置：`@harness/host` 已完成三批搬迁（A 档 `loadPluginDirs` 簇 / C 档内置注册表三节 / B 档配置归一化与窗口推导），
 > 外部依赖闭包**已全部就位**。本设计只处理唯一剩余项：`HarnessApp` 本体（56 个成员 ≈ 1150 行）与它那 20 处输出站点。
 > 相关：`docs/external-integration-plan.md` §5 / §6 / §7。
@@ -417,14 +417,21 @@ CLI 保留（不动）：`CliPermissionEngine`、`defaultCliAsk`、`formatAgo`�
 
 ---
 
-## 4. 落地步骤（4 个可独立验证的 commit）
+## 4. 落地步骤（实际拆成 6 个可独立验证的 commit）
 
-| 步 | 内容 | 独立性 |
+设计稿原排 S1→S2→S3→S4；实施时把 S3（权限接缝）**前插到 S2 之前**，因为 `boot()` 直接构造
+`CliPermissionEngine`，而 host 不能再反向 import cli —— 不先上移权限引擎，主体就搬不动。
+于是实际序列为 S1 → S2-① → S2-②（= 原 S3）→ S2-③（前置 + 主体）→ S2-③补 → S4。
+
+| 步 | 内容 | 独立性 / 验证 |
 |---|---|---|
-| **S1** ✅ | `packages/host/src/notice.ts`：`HostNotice` / `NoticeCode` / `renderNotice` + 21 条快照测试 | **纯新增、不接线** ⇒ 其余测试逐条不变，可单独验证「渲染器是否逐字复刻」。**已完成**：host 71 pass（原 46 + 25）、全量 2197 pass（原 2172 + 25，其余逐条不变）、typecheck 40 包 exit 0 |
-| **S2** | boot 主体 20 处改 `emitNotice`；`HarnessHost` 上移；`HarnessApp extends`；CLI 装默认渲染 sink | 最大的一步，但 S1 的快照测试此时成为兜底 |
-| **S3** | `InteractivePermissionEngine` + `PermissionAsker` 上移；`CliPermissionEngine` 只留 asker | 权限用例（`cli.test.ts` 权限段）逐字通过 = 语义没动 |
-| **S4** | 导出 `createHost()`；收口 host/cli 重叠测试；更新 `AGENTS.md` §3 与计划文档 | 文档与收尾 |
+| **S1** ✅ | `packages/host/src/notice.ts`：`HostNotice` / `NoticeCode` / `renderNotice` + 25 条用例 | **纯新增、不接线** ⇒ 其余测试逐条不变。host 71 pass、全量 2197 pass、typecheck 40 包 exit 0。三处实测修正见 §8 |
+| **S2-①** ✅ | 配置层上移（`./config.ts`）：`HarnessConfig` / 模型解析 / Provider 校验 / 各段检查 / ACP 档位翻译 / 配置概览 | boot 直接依赖它。`4197a3b`，全量 2197 pass |
+| **S2-②** ✅ | 权限接缝上移（`./permission.ts`）：`InteractivePermissionEngine` + `PermissionAsker` 四态；`CliPermissionEngine` 退化为 asker 适配器 | 权限用例（`cli.test.ts` 权限段）**逐字通过** = 语义没动。`3e8c4f5`，全量 2210 pass |
+| **S2-③ 前置** ✅ | `./plugins.ts`：A 档 + C 档自 `index.ts` 抽出，`index.ts` 退化为纯 barrel | 主体要用这几个装配原语，留在 index 就成环（叶子不得反向 import barrel）。纯搬移，全量 2210 pass 逐条不变。`bbb366d` |
+| **S2-③ 主体** ✅ | `./host.ts`：`HarnessHost` + `HostOptions` + `createHost()`；21 处 `stdout?.write?.(…)` → `emitNotice`；CLI 变 `HarnessApp extends HarnessHost` | 最大的一步。**2215 pass**（基线 2210 + host notice 端到端 5 条）。三处实测修正 + 四处有意偏离见 §9。`b13f81a` |
+| **S2-③ 补** ✅ | `preloadBuiltinToolMetas` 的 `console.warn` 漏网站点纳入 notice（+1 code） | §8 ② 要求 S2 一并处理。`6dc4e69` |
+| **S4** ⏳ | 收口 host / cli 之间有意重叠的测试；更新 `AGENTS.md` 与计划文档 | 文档与收尾 |
 
 S1 先做的意义：把「文案」从「会不会被 boot 的其它改动顺带改掉」里摘出来 —— 20 条文案一旦有独立快照，
 S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
@@ -451,7 +458,13 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
    纯快照用例 **和** `与真实 loadPluginDirs 的捕获字节对齐` 那条。后者证明快照绑的是**实现现实**
    （真的跑一遍 `loadPluginDirs` 再比字节），不是"自己和自己比"。
 3. 把 `asker` 换成永远返回 `undefined` ⇒ `always-allow` 的规则写回必须不发生（`remember` 不置位）。
-   ⏳ 待 S3。
+   ✅ **已执行**（S2-②）：`permission.test.ts` 13 条含这条，`cli.test.ts` 权限段 8 条逐字通过。
+4. **S2-③ 追加**：把 CLI 侧的两条输出出口（`onNotice` 与 `logLine`）**同时摘掉** ⇒ 钉住文案的用例
+   必须失败。✅ **已执行**：`boot：config.json → plugins 有未登记 id 时只告警` 报
+   `Received: ""` —— 证明 20 处输出**确实走在这条通道上**；只摘 `onNotice` 时仍通过，说明
+   `logLine` 兜底**同字节**（这正是"两条出口不是两份事实"的可执行证据）。
+5. **S2-③ 追加**：不给任何输出出口 ⇒ 文本丢失，但 `app.notices` 里仍能按 `code` 取回。
+   ✅ 已固化为 `notices.test.ts` 的常驻用例（治「静默丢弃」的正面断言）。
 
 > 现状：20 处输出里**只有 1 条**被测试钉住（`:1939`）。剩下 19 条今天既没有断言、也没进任何结构化通道 ——
 > 「配置写了没生效」这类问题因此只以「终端上的一行」形式存在，跑 headless / A2A 时全部消失。
@@ -473,9 +486,9 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
 
 | # | 分叉 | 定案 | 落地位置 |
 |---|---|---|---|
-| 1 | **形态** | ✅ **`HarnessApp extends HarnessHost`**（继承；实测 56 个成员 0 个 CLI 专属，继承贴着事实） | S2 |
+| 1 | **形态** | ✅ **`HarnessApp extends HarnessHost`**（继承；实测 56 个成员 0 个 CLI 专属，继承贴着事实） | S2-③ |
 | 2 | **文案归属** | ✅ **`renderNotice` 放 host 并导出**（逐字复刻；A2A 可选择不用） | S1 |
-| 3 | **ask 接缝粒度** | ✅ **`asker(req, prompt) → 四态`**（远程宿主直接给四态，不做文本往返） | S3 |
+| 3 | **ask 接缝粒度** | ✅ **`asker(req, prompt) → 四态`**（远程宿主直接给四态，不做文本往返） | S2-② |
 
 小项：✅ **`Host.notices` 环形缓冲要** —— 它是「不传 `stdout` 就静默丢失」这个缺陷的正面解法。
 
@@ -496,10 +509,13 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
 代码注入闸门块 / 单模块加载失败 / 模块既无通用插件也无 Provider 工厂。前两条又各自是
 **多次 `write` 的扇出**（闸门块 5–7 次、加载失败 1–2 次），所以模板按**整块字节**复刻。
 
-还有一条**漏网站点**：`host/src/index.ts` 的 `preloadBuiltinToolMetas` 用 `console.warn` 直写
+还有一条**漏网站点**：`preloadBuiltinToolMetas` 用 `console.warn` 直写
 （不走 `stdout`、也不走 `setLogSink`），是本轮唯一"两个出口都不沾"的装配期诊断。S1 未纳入
 （它属于 console 通道，与 `installConsoleCapture` 同侧）；**S2 要一并处理**，否则"元信息来源预载失败"
 在 A2A 宿主下同样无声。
+⇒ ✅ **S2-③ 补已完成**（`6dc4e69`）：新增 code `preload.meta-source-failed`（`warn` 级），
+`preloadBuiltinToolMetas(onNotice?)` 与 `loadPluginDirs` 同形的双出口。注意模板要**显式带结尾换行**
+—— 改造前那个 `\n` 是 `console.warn` 代劳的，sink 出口没有人代劳。于是 code 总数 **22**。
 
 ### ③ 外部插件目录那三条字节是**双换行**，这是要保留的
 
@@ -516,3 +532,61 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
 不该说"可能没有"，否则每个消费方都要写一次 `?.` / `!`。
 
 > 教训：验收口径要跑在**最后一个改动之后**。测试文件也是产物，写完必须再过一次 typecheck。
+
+---
+
+## 9. S2 落地实测修正（三处）与有意偏离（四处）
+
+### 9.1 三处实测修正（设计稿没算到的）
+
+#### ① 主体搬不动，除非先把 A/C 档从 `index.ts` 摘出去
+
+设计稿把这次改造写成"S2 一步"。实测：`host.ts` 需要 `loadPluginDirs` / `getBuiltinRegistry` /
+`preloadBuiltinToolMetas` / `registerBuiltinProviderTypes` / `resolveBuiltinPlugins` —— 它们当时都
+定义在 `index.ts`。`host.ts` 若从 `./index` 取，就形成 `host.ts → index.ts → host.ts` 的环，
+而本仓已明确回避该形态（`./lazy.ts` 就是为此拆的）。⇒ 先做一步**纯搬移**把 A 档 + C 档抽成
+`./plugins.ts`（`bbb366d`），`index.ts` 退化为纯 barrel（688 → 125 行）。
+这一步是零行为变化的，单独验证成本极低 —— 属于"先拆环、再搬家"。
+
+#### ② 权限引擎是**构造期**依赖，不是运行期依赖 ⇒ 原 S3 必须前插
+
+设计稿把权限接缝排在主体之后。实测：`boot()` 里就 `new CliPermissionEngine(...)`，主体不先拿到
+一个宿主无关的引擎就搬不走。⇒ 权限接缝（原 S3）实际是 **S2-②**，排在主体之前。
+
+#### ③ TUI 的 `setAskPrompt` 逼出一个**有意的覆写点**
+
+主体上移后，`app.permission` 若直接是 `InteractivePermissionEngine`，`tui.tsx:1515` 的
+`setAskPrompt(...)` 就没有了（`cli.test.ts` 也依赖 `CliPermissionEngine` 这个导出）。
+两条路：改 TUI 用 `setAsker(cliAsker(...))`（动 2 处 + 导出内部函数），或给 host 一个覆写点。
+选了后者 —— `protected createPermissionEngine(rules, save, mode)`，CLI 覆写成返回
+`CliPermissionEngine`，并用 `declare public permission: CliPermissionEngine` 窄化字段类型。
+**收益**：`tui.tsx` / `cli.test.ts` / `CliPermissionEngine` 全部逐字未改，且四态语义依然只有一份
+（CLI 覆写的只是"用什么问"，不是"问到之后怎么记"）。
+
+### 9.2 四处**有意偏离**设计稿（每一处都要留痕）
+
+| # | 设计稿 | 实际 | 理由 |
+|---|---|---|---|
+| ① | `export interface Host { …（56 个成员） }` + `class HarnessHost implements Host` | `export type Host = HarnessHost` | 另立 interface 就是把同一份 56 个成员写两遍（名称、签名、只读性各维护一次）——**这种重复的漂移是静默的**（interface 不会因为 class 改了而报错）。`type` 别名让两者定义上同一。设计稿自己反对"同一个东西两套写法"，这一条同理 |
+| ② | `HostOptions` 19 个原字段 − 2 个 CLI 专属 + `onNotice` | 再多一个 `logLine?: (line: string) => void` | 设计稿只列了**装配期**的 `onNotice`，漏了**运行期** `emitLog` 的兜底出口。host 不再有 `stdout`，不补这个字段则运行期引擎 warn/error 在 headless 下无处可去。它与 `onNotice` 仍是**两条通道**（时机/内容/消费方都不同），不是合并 |
+| ③ | `anthropicProviderConfig?: unknown` | `anthropicProviderConfig?: any` | `unknown` 会把 `this.options.anthropicProviderConfig?.apiKey` 与 `...spread` 逼出四处无谓 cast，收益为零。**保留原类型**，不为了"更严"制造噪音 |
+| ④ | CLI 侧 `super({ ...options, asker: ..., onNotice: (n) => options.stdout?.write?.(renderNotice(n)) })` | 多两样：`stdout` 缺省落 `process.stdout`；多一个 `createPermissionEngine` 覆写 | `stdout ?? process.stdout` 是**搬迁前**的既有语义（`main()` 不传 stdout），不补就会让真 CLI 的装配诊断全部消失 —— 这是"零行为变化"判据要求的。覆写点见 9.1 ③ |
+
+### 9.3 一处守卫改址（**不是**改断言）
+
+`cli.test.ts` 有一条读**源码文本**的防回归守卫：守 `acp.createAcpContextPlugin({...})` 必须传
+`modelContextLimit: compression.modelContextLimit` 与 `providerWindows: buildProviderWindowTable(cfg, defaultProviderId)`
+（读源码是因为这条装配行**没有任何别的守卫能覆盖**：插件侧用例无论收到什么选项都成立，
+类型上 `modelContextLimit?: number` 也收得下任何数字，而写错就等于复活"分母共用"那个 bug）。
+
+装配行随 `boot()` 搬进了 `packages/host/src/host.ts` ⇒ 守卫改读 `../../host/src/host.ts`，
+**两条断言逐字未改**。这是本次改造第一轮唯一暴露的测试失败，而它报的正是这个：
+守卫必须跟着代码走，否则"代码搬走了"会以**测试失败**的形式误报。
+
+### 9.4 一个未处理的已知项（留给 S4）
+
+`flushDirtySessions` 里的 `console.warn('[WARN] 脏会话落盘失败（…）')` **保持原样**。理由：
+它是**运行期**（`sendStream` / `shutdown` 路径）诊断，不在 `notice` 的"装配期"分级表内；
+把它塞进 notice 会让"装配期 vs 运行期"这条边界变模糊，而它今天走 stderr、本来也不会污染
+stdout 协议。真要收，应该收进 `emitLog`（运行期通道）而不是 notice —— 但那会把它的流向从
+stderr 改成宿主的 `logLine`，属于**另一次有意识的改动**，不混在搬迁里。

@@ -57,11 +57,20 @@
 
 - `@harness/host`：宿主装配层 —— 与**具体宿主无关**的装配原语，供 CLI / A2A server / VSCode
   扩展**共用一份装配**（避免"两份装配必然分叉"）。只做装配与注入，不内置业务决策、不绕过权限、
-  不直接调工具。已落三批：① `loadPluginDirs` 簇（外部插件目录加载）；② 内置注册表三节
-  （`registerBuiltinProviderTypes` + `BuiltinPluginRegistry` 簇 + `BuiltinToolRegistry` 簇 + 共用的
+  不直接调工具。**已整体落地**（2026-10-01）：① `loadPluginDirs` 簇（外部插件目录加载）；② 内置注册表
+  三节（`registerBuiltinProviderTypes` + `BuiltinPluginRegistry` 簇 + `BuiltinToolRegistry` 簇 + 共用的
   `lazyImport`）；③ 配置归一化与上下文窗口推导（`normalizeProviderConfigs` / `parseModelSpec` /
-  `resolveContextWindowTokens` / `buildProviderWindowTable`）。剩余仅 `HarnessApp.boot` 主体
-  （→ `createHost({...})` + 日志分级）。
+  `resolveContextWindowTokens` / `buildProviderWindowTable`）；④ 权限接缝（`InteractivePermissionEngine`
+  + `PermissionAsker` 四态）；⑤ **宿主装配主体**（`HarnessHost` + `HostOptions` + `createHost()`）。
+  CLI 侧 `HarnessApp extends HarnessHost` 只留两个终端适配面（`stdout → onNotice`、`askPrompt → asker`）。
+
+  - **模块分层：叶子不反向 import barrel**。`index.ts` 是纯转出 barrel；实现分在
+    `plugins.ts`（装配原语）/ `provider.ts`（窗口推导）/ `config.ts`（配置模型与检查）/
+    `notice.ts`（装配期诊断）/ `permission.ts`（权限接缝）/ `host.ts`（装配主体）/ `lazy.ts`。
+    **新增实现不要写进 `index.ts`**，也不要从叶子 import `./index`（那会成环 —— `host.ts` 需要
+    装配原语却不能用 barrel，正是 A/C 档被抽成 `plugins.ts` 的原因）。
+  - **`Host` 是 `type Host = HarnessHost`，不是另立 interface**：同一份 56 个成员写两遍
+    （名称、签名、只读性各维护一次）必然静默漂移。要表达契约就改 `HarnessHost` 本身。
 
   - **窗口/配置口径只有一份**：窗口是占用率的**分母**，显示 / 压缩阈值 / ACP 三处各算一遍就会
     出现"概览说 26%、实际已 103%"这类**全程无症状**的故障。故窗口链与配置归一化同处 host，
@@ -78,14 +87,23 @@
   - **打包约束**：`bun build --compile` 无法静态分析 `import(变量)` ⇒ 这批包不会自动进 bundle，
     打包配置需按同一清单显式收入口（P3 分发路径的前置项）。
 
-  - **装配期诊断走 notice，不走裸 `stdout`**：boot 的 20 处输出按三级（`notice` / `warn` / `log`）
-    结构化后经 `onNotice` 出口（`packages/host/src/notice.ts`）。**等级只有一份**——`NOTICE_LEVEL[code]`
-    表是唯一来源、由 `makeNotice()` 盖上，调用点不得自己填 `level`（20 个调用点各填一次就是本仓
-    "同一个东西两套写法"的老病）。`notice` 级 = **用户必须知道的事实**（尤其"配置意图 ≠ 实际装配"，
-    如无 key 自动 fallback 到 Mock）：远程宿主必须上报，否则调用方拿到假回答而毫无信号。
-  - **文案改动必须让快照失败**：`renderNotice` 复刻的是**今天写进 stdout 的字节**（含结尾换行、
-    缩进、外部插件目录那三条的"双换行"），`notice.test.ts` 逐条钉住。改文案是改模板 + 改快照，
-    不是"顺手优化措辞"；改 `level` 是改表（反向验证已确认会失败）。
+  - **装配期诊断走 notice，不走裸 `stdout`**：boot 的 21 处输出按三级（`notice` / `warn` / `log`）
+    结构化后经 `onNotice` 出口（`packages/host/src/notice.ts`，共 **22 枚 code**）。
+    **等级只有一份**——`NOTICE_LEVEL[code]` 表是唯一来源、由 `makeNotice()` 盖上，调用点不得自己填
+    `level`（20 个调用点各填一次就是本仓"同一个东西两套写法"的老病）。`notice` 级 = **用户必须知道的
+    事实**（尤其"配置意图 ≠ 实际装配"，如无 key 自动 fallback 到 Mock）：远程宿主必须上报，
+    否则调用方拿到假回答而毫无信号。
+  - **三条接缝的边界**：`onNotice`（装配期、结构化、一次性）与 `setLogSink` / `logLine`（运行期、
+    自由文本、每轮）是**两条通道，不合并**；`asker` 只负责"怎么问到答复"，"问到之后怎么记"
+    （四态语义 + 规则写回）留在 `InteractivePermissionEngine`，三个宿主共用一份。
+  - **新宿主别照抄 `stdout`**：不传任何输出出口时文本会丢，但 `Host.notices` 环形缓冲仍在 ——
+    A2A / VSCode 启动自检应读它，否则"降级到 Mock 却毫无信号"这个老病会在新宿主上复发。
+  - **文案改动必须让快照失败**：`renderNotice` 复刻的是**改造前写进 stdout 的字节**（含结尾换行、
+    缩进、外部插件目录那三条的"双换行"），`notice.test.ts` 逐条钉住（含"每个 code 都必须出现在样本里"
+    的覆盖度自查）。改文案是改模板 + 改快照，不是"顺手优化措辞"；改 `level` 是改表（反向验证已确认会失败）。
+  - **守卫必须跟着代码走**：`cli.test.ts` 有一条读**源码文本**的防回归守卫（守 ACP 装配行的窗口口径），
+    装配行搬进 host 后它改读 `packages/host/src/host.ts`，**断言逐字未改**。搬代码时务必搜一遍
+    「读 `./index.ts` 源码」这类测试，否则会以"测试失败"的形式误报。
   - **测试文件也是产物**：`config-window.test.ts` 曾因"写在最后一次 typecheck 之后"而带着 4 个类型
     错误合入。**验收口径必须跑在最后一个改动之后**（typecheck 要覆盖到新写的测试文件）。
 
@@ -220,7 +238,7 @@
 
 - **不许为"实际到不了的状态"造契约值（枚举/字段/分支）**：闸门遥测初稿写了 `skipReason: 'aborted'`，但中断在**循环顶部的步边界检查**就 `break`（`if (signal?.aborted) break` 在闸门那段之前）⇒ 闸门根本不会被问到，那个值永远是死码。写之前先问"**哪条路径能走到这里**"，验证方式是**写出触发它的那条用例** —— 写不出就是不可达，删掉而不是留着"以防万一"（留着会误导消费方以为"中断也会记一条"，还在给下一轮埋"配了没用"的坑）。同族历史：`subagents:` 字段只解析无人消费、摘要提示语的判据 `ctx.variables.callerToolIds` 曾全仓无写入方。
 
-- **提示词（agent 提示词与工具提示词）一律放独立 `prompts/*.txt`，改提示词不动代码**（现状即如此：`cli/src/prompts/default-agent.txt`、`coordinator/src/prompts/coordinator.txt`、`subagent/src/prompts/*`）。改完要在测试里钉住**关键约束本身**（如"默认指令含结论段/禁流水账/限 60 行"），否则下一个人删掉一句完全看不出来
+- **提示词（agent 提示词与工具提示词）一律放独立 `prompts/*.txt`，改提示词不动代码**（现状即如此：`host/src/prompts/default-agent.txt`、`coordinator/src/prompts/coordinator.txt`、`subagent/src/prompts/*`。注意默认 Agent 提示词随 `defaultAgent()` 住在 host，不在 cli —— P0 搬迁时跟着走的）。改完要在测试里钉住**关键约束本身**（如"默认指令含结论段/禁流水账/限 60 行"），否则下一个人删掉一句完全看不出来
 
 - **Agent 提示词必须同时写「执行纪律」与「输出纪律」，两条缺一不可**：① 执行纪律 = 只做当前这一步该做的事（用户没要求的重构 / 额外检查 / 顺带修复一律不做；先定"这一轮交付什么"，交付即停；发现别的问题最多记一句备注，不擅自展开）；② 输出纪律 = 1-3 句 + 必要证据（路径 / 行号 / 命令输出关键行），不写开场白、不复述任务、不写过程流水账、不写"接下来可以…"的建议清单、不写客套。判据一句话：**放进上下文的每一句都得能改变下一步决策，否则就是付费噪音**（它会进历史、每轮重发）。同理适用于 coordinator：不播报进度（"我正在派 worker…"），每轮只输出这一轮的**决策结果**
 
