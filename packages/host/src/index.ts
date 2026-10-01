@@ -115,3 +115,11 @@ export type {
   PermissionPrompt,
   PermissionStoreFile,
 } from './permission'
+
+// ========================================================================
+// 6. 宿主装配主体（P0 收尾 S2 第三步：自 @harness/cli 上移）
+// ========================================================================
+// `HarnessHost`（装配实现，≈1150 行）+ `HostOptions` / `SessionRestoreInfo` / `createHost`。
+// 单独成文件（`./host.ts`）—— 它要用 §1 的装配原语，而叶子模块不得反向 import 本 barrel。
+export { HarnessHost, createHost, HOST_NOTICE_LIMIT } from './host'
+export type { Host, HostOptions, SessionRestoreInfo } from './host'

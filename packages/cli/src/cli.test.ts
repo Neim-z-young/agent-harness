@@ -776,7 +776,11 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     // `resolveContextWindowTokens(cfg, defaultProviderId)` 就等于**复活本轮修的 bug**：
     // 所有会话（含子 Agent）共用默认 Provider 的分母，占用率虚低、压缩不触发且毫无症状。
     // 两份文本断言都很短且唯一，失败时的信息直接指出"装配行写错了"。
-    const src = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+    //
+    // P0 收尾 S2 第三步：装配行随 `boot()` 搬进了 `@harness/host`（`packages/host/src/host.ts`），
+    // 守卫据此改读新家 —— 断言的两行**逐字未改**，只是位置变了。这一点很重要：守卫必须跟着
+    // 代码走，否则它会在"代码搬走了"时以失败的形式误报（本次改造第一轮就跑出过这条失败）。
+    const src = readFileSync(new URL('../../host/src/host.ts', import.meta.url), 'utf8')
     const start = src.indexOf('acp.createAcpContextPlugin({')
     expect(start).toBeGreaterThan(0)
     const body = src.slice(start, src.indexOf('})', start))

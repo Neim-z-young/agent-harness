@@ -32,8 +32,11 @@
     "@harness/provider-mock": "workspace:*",
     "@harness/provider-openai": "workspace:*",
     "@harness/provider-qwen": "workspace:*",
+    "@harness/revert": "workspace:*",
     "@harness/session": "workspace:*",
+    "@harness/skill": "workspace:*",
     "@harness/skill-forge": "workspace:*",
+    "@harness/snapshot": "workspace:*",
     "@harness/subagent": "workspace:*",
     "@harness/swarm": "workspace:*",
     "@harness/tools-builtin": "workspace:*",
@@ -43,6 +46,7 @@
     "@harness/tools-search": "workspace:*",
     "@harness/tools-web": "workspace:*",
     "@harness/workspace": "workspace:*",
+    "@harness/workspace-shell": "workspace:*",
     "acp-kernel": "^0.0.63"
   }
 }
