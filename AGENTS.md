@@ -151,6 +151,25 @@
     ③ 并发 / 幂等 / 隔离（同 `contextId` 并行第二条直接拒绝、`messageId` 重复回放快照、`contextId` 绑定调用方）。
   - **入口 `harness a2a [--port <n>] [--token <t>]`**：复用 `createHost`（**不是** `HarnessApp` —— A2A 是无终端宿主）。
     权限模式默认 `ask`；`allow-all`/`deny-all` 会短路、不产生挂起。
+  - ⚠️ **外部验收（官方 `a2a-tck`，A2A v1.0.0）捞到的 5 处互操作缺陷 —— 本仓自测全绿也照样踩**：① **路径等价类**：
+    客户端 httpx 会把 `base_url` 规范成**带尾斜杠**（`/a2a` → `/a2a/`）⇒ 服务端精确匹配就 404 + 非 JSON 体 ⇒
+    客户端 `response.json()` 抛 `JSONDecodeError`（**不落进它的 `except httpx.HTTPError`**），一个斜杠放大成全轮崩盘。
+    `jsonRpcPath`/`agentCardPath` 必须走 `normalizePath()` 剥尾斜杠。② **出参信封**：同一个 `Task`，`GetTask`/`CancelTask`
+    出**裸体**、`SendMessage` 出 `{message}` 或 `{task}`、`SendStreamingMessage` 出 `StreamResponse.toJSON(event)`
+    —— 幂等回放**必须按"该方法该有的信封"重新包**，不能透传裸 Task（否则对端按 `SendMessageResponse` 校验报
+    `additional properties are not allowed`）。③ **SDK 流是惰性的**：参数/任务非法要到**第一次 `next()`** 才抛 ⇒
+    已回 `text/event-stream` 头再抛错 = 客户端收到 200 空体、错误被吞。必须**预热首值**（`await iterator.next()`），
+    预流错误 ⇒ 回**普通 JSON-RPC error（200 + application/json）**；只在已提交 SSE 后的**中途**错误才
+    `formatSSEErrorEvent` 写 `event: error` 帧（`sseBody` 的 `catch` 里补，别只在 `finally` 里 `close()`）。
+    ④ **带 `taskId` 的守卫按协议判定，不能一律回放**：给**终态任务**发消息 MUST 报 `UnsupportedOperationError`
+    （`-32004`）、`taskId` 与 `contextId` 不匹配 MUST 报 `-32602`；静态回放会把这两件 MUST 报错**掩盖成成功**。
+    改法：先 `taskStore.load()` 取真实状态 → `isTerminalState()` ⇒ `TASK_TERMINAL` / `CONTEXT_TASK_MISMATCH`。
+    **注意 `INPUT_REQUIRED`/`AUTH_REQUIRED` 是"中断态"不是终态**（别误杀正常续接）。⑤ **卡片缓存**：端点 SHOULD 带
+    `Cache-Control`（含 `max-age`）/`ETag`、MAY 带 `Last-Modified`，并支持 `If-None-Match`/`If-Modified-Since` 回 `304`
+    （`ETag` 对**实际响应字节**取 sha256）。**判读提醒**：TCK 的 `DM-ART-001`（固定 artifact 文本/文件名/文件部分）与
+    `DM-MSG-001`（强制 `SendMessage` 返回 `Message`，而协议允许返回 `Task`）是**参考 SUT 特化断言、非协议要求**，
+    不算我方缺陷；`SKIPPED` 多为未声明 gRPC/HTTP+JSON/push。**真起 SUT 的本地环境坑**：沙箱代理会把 `127.0.0.1`
+    劫持成 502（TCK 侧 `NO_PROXY=127.0.0.1,localhost`），后台 SUT 必须用常驻方式起（`&`+`nohup` 会随命令结束被回收）。
 
 ## 4. 硬性约束
 

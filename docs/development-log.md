@@ -1,5 +1,70 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 238）A2A P1 外部验收：官方 `a2a-tck` 五轮收敛 —— 5 处互操作缺陷 + 零真实遗留
+
+### 做什么
+
+P1 的验收口径最后一格是「用官方 `a2a-inspector` / `a2a-tck` 跑通同一序列」（plan §6）。本仓自测（`server.test.ts`）已覆盖该序列，这一步是**外部**复核：把 `harness a2a` 起成真 SUT，用官方 TCK（`a2aproject/a2a-tck`，Python + uv，规格版本 **A2A v1.0.0**）从 `{sut}/.well-known/agent-card.json` 取卡后全量打。
+
+- `a2a-inspector` 是**浏览器 UI**，本环境无头、未跑；等价能力由 TCK 的 agent-card 用例组 + 手工 curl 取卡覆盖。
+- 结论：**跑通**。终轮 `5 failed / 74 passed / 186 skipped`，**剩余 5 条全部是"参考 SUT 字面量断言"**（见下），**零真实协议缺陷遗留**。
+
+### 环境坑（先把 SUT 起稳，否则全是假阳性）
+
+两条叠加，把首轮放大成 **254 条 error（全 `502 Bad Gateway`）**：
+
+1. **后台进程随命令回收** —— Bash 里 `nohup … &` 起的 SUT 在该条命令结束时被一并收回，TCK 打过去全是连接失败。修：用 `run_in_background: true` + `exec` 常驻。
+2. **沙箱代理劫持 `127.0.0.1`** —— shell 里有 `HTTP_PROXY=http://127.0.0.1:62038`，任何对本机回环的 HTTP 都被代理吞掉、统一回 **502**（不是连接被拒，更像"服务在但返 502"，极易误判成 SUT bug）。修：TCK 侧 `export NO_PROXY="127.0.0.1,localhost"`（curl 侧 `--noproxy '*'`）。
+
+### 五轮收敛曲线（每轮只修一类根因）
+
+| 轮次 | 结果 | 当轮暴露的根因 |
+|---|---|---|
+| 首轮 | `4 failed, 4 passed, 254 errors` | 代理 502 + 进程回收（环境） |
+| 第 2 轮 | `64 failed, 18 passed, 177 skipped, 6 errors` | **尾斜杠 404** ⇒ 一个斜杠级联成全轮崩盘 |
+| 第 3 轮 | `14 failed, 61 passed, 190 skipped` | 修尾斜杠后暴露真问题：幂等回放信封 + 惰性流吞错 |
+| 第 4 轮 | `11 failed, 68 passed, 186 skipped` | 修回放 + 预热后，**新暴露 2 条 MUST**（终态 / MISMATCH 被回放掩盖） |
+| 第 5 轮 | `9 failed, 70 passed, 186 skipped` | 终态/MISMATCH 修完，卡片缓存头前的中间态 |
+| **终轮** | **`5 failed, 74 passed, 186 skipped`** | **剩 5 条全是参考 SUT 字面量断言** |
+
+兼容性数字（`reports/compatibility.json`）：`overall 69.2%` / `must 70.4%` / `should 42.9%` / `may 100.0%`。
+逐条分布（更权威，共 129 条需求）：`MUST PASS 57 / FAIL 2 / SKIPPED 33 / NOT TESTED 22`；`SHOULD PASS 3 / SKIPPED 4 / NOT TESTED 4`；`MAY PASS 3 / SKIPPED 1`。
+
+### 五处互操作缺陷（全部是"本仓自测覆盖不到、只有真客户端才暴露"的）
+
+1. **尾斜杠互操作（`normalizePath`）** —— TCK 的 `JsonRpcClient` 用 `httpx.Client(base_url=interface.url)`，httpx 会把 `base_url` 规范成**带尾斜杠**（`/a2a` → `/a2a/`），再 `post("/")` ⇒ 实际请求 `POST /a2a/`。我们只做精确路径匹配 ⇒ 404 + **非 JSON 体** ⇒ 客户端 `response.json()` 抛 `JSONDecodeError`，**不落进它自己的 `except httpx.HTTPError`** ⇒ 一个尾斜杠放大成 64 failed。修：`normalizePath()` 剥尾斜杠，JSON-RPC 路由与卡路由都过它。**教训：服务端对"路径等价类"的容忍度，是互操作的一部分，不是洁癖。**
+2. **幂等回放的"信封"**（`CORE-EXECUTION-MODE-001/002`、`JSONRPC-SSE-001`） —— 重复 `messageId` 时我们直接透传 `GetTask` 的**裸 Task**，但 `SendMessage` / `SendStreamingMessage` 的 `result` 必须是 `{task}` **信封**（`Task` 字段裸放 ⇒ 对端按 `SendMessageResponse` 校验报 `additional properties are not allowed`）。修：`replay()` 统一包一层（非流式 `{result:{task}}`；流式走 `once()` 生成器，帧同样是 `StreamResponse`）。**同一个 Task 对象，`GetTask` 出裸体、`SendMessage` 出信封 —— 这是 SDK 出参形态的差异，不能"顺手复用"。**
+3. **SDK 的流是惰性的 ⇒ 必须"预热首值"**（`STREAM-SUB-004`） —— `sendMessageStream` / `resubscribe` 返回生成器，参数或任务非法时异常要到**第一次 `next()`** 才抛。我们已提前回了 `text/event-stream` 头 ⇒ 客户端收到 **200 空体**，`TaskNotFoundError` 被吞。修：流式分支先 `await iterator.next()` **预热**，预流抛错 ⇒ 回**普通 JSON-RPC error（200 + application/json）**；只在已提交 SSE 之后的**中途错误**才 `formatSSEErrorEvent` 写 `event: error` 帧（`sseBody` 里补上，此前 `finally { close() }` 把错误静默丢弃）。这正是 SDK 自带 express 宿主的做法。
+4. **带 `taskId` 的守卫要按协议判定，不能一律回放**（`CORE-SEND-002`、`CORE-MULTI-006`，修完 3 之后才暴露） —— 此前的逻辑是"带 `taskId` 且挂起表里没有 ⇒ 一律回放快照、不报错"，把两件 **MUST 要报错**的事**掩盖成成功**：① 给**终态任务**发消息（协议 MUST 报 `UnsupportedOperationError` = `-32004`）；② `taskId` 与 `contextId` 不匹配（MUST 报 `-32602`）。修：改成先 `taskStore.load()` 取真实状态 → `isTerminalState()` ⇒ `TASK_TERMINAL`；`contextId` 与任务既有 `contextId` 不符 ⇒ `CONTEXT_TASK_MISMATCH`；只有两者都过才回放。配套新增 `TaskTerminalError` / `ContextTaskMismatchError`（`errors.ts`）。**注意 `INPUT_REQUIRED`（6）/ `AUTH_REQUIRED` 是"中断态"不是终态** —— 反面保险用例专门钉住"中断态续接照常放行"，否则会把正常续接一起杀。
+5. **卡片缓存头 + 条件请求**（`CARD-CACHE-001/002/003`，SHOULD/MAY） —— 协议 §8.6.1：卡片端点 SHOULD 带 `Cache-Control`（含 `max-age`）/ `ETag`、MAY 带 `Last-Modified`，并支持条件请求回 `304`。修：`Cache-Control: public, max-age=300` + `ETag`（对**实际响应字节**取 sha256，base64url 截 27 位）+ `Last-Modified`；`If-None-Match` / `If-Modified-Since` 命中 → `304`（头照带）。
+
+### 反向验证（证明 5 处不是装饰）
+
+每处修复都做了"回退变红"，**还原后 `diff -q` 逐字一致**：
+
+| 摘掉/改坏 | 变红条数 |
+|---|---|
+| 摘 `normalizePath` | 1 fail |
+| 回放透传裸 Task | 2 fail |
+| 不预热首值 | 1 fail |
+| 去掉卡片缓存头 | 1 fail |
+| `isTerminalState` 恒 `false` | 2 fail |
+
+### 剩余 5 条 FAIL 的归因（**均为 TCK 的"参考 SUT 特化"断言，非协议要求**）
+
+- `DM-ART-001`：断言 artifact 字面量 —— 文本必须是 `'Generated text content'`、文件部分 filename 必须是 `'output.txt'`、还要有 file/data part（`{'key':'value','count':42}`）。这是 TCK 内置参考 SUT 的固定产出，**协议不要求**具体内容。
+- `DM-MSG-001`：**强制要求 `SendMessage` 返回 `Message`**，而协议**允许返回 `Task`**。我们返回 `Task`（正确的 A2A 语义）。
+
+`SKIPPED` 主要是未声明 gRPC / HTTP+JSON 传输、未声明 push notification（TCK 据此跳过）；`NOT TESTED` 是 TCK 自己没挂上测试。**故"零真实缺陷遗留"。**
+
+### 产物与验证
+
+改动文件：`packages/a2a-server/src/server.ts`（`normalizePath` / `sseBody` 补 error 帧 + `once()` / `replay()` 信封 / 流式预热首值 / 终态与 MISMATCH 守卫 + `isTerminalState` / 卡片缓存头与 304）、`packages/a2a-server/src/errors.ts`（`TASK_TERMINAL` / `CONTEXT_TASK_MISMATCH` + 两个错误类）、`packages/a2a-server/src/server.test.ts`（**18 → 25 条**：新增尾斜杠容忍 / 回放信封 / 流式回放 / 订阅不存在 / 卡片缓存与 304 / 终态 / MISMATCH / 中断态反面保险共 8 条，**改写 1 条** —— 旧"迟到答复 ⇒ 回放快照、不报错"改为"⇒ 任务已终态、结构化拒绝"）。
+
+验证：`bun run typecheck` **41 包 exit 0**；`@harness/a2a-server` **70 pass / 0 fail**（63 → 70，+7）；`bun run test` **2265 pass / 0 fail / 99 文件 / 41 包 exit 0**（较 P1-D 的 2258 增 7 条）。
+
+证据文件（`reference/` 已 gitignore，不入库）：`reference/a2a-tck/reports/compatibility.{json,html}`、`reports/tck_report.html`、`reports/junitreport.xml`。
+
 ## 2026-10-01（续 237）A2A P1-D：`harness a2a` 子命令（P1 收口）
 
 ### 做什么
