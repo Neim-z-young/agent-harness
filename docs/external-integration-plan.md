@@ -275,7 +275,7 @@ Extension host（Node）+ React webview（Vite）+ 类型化双向消息桥。�
 | 阶段 | 内容 | 交付物 | 验收口径（预期行为，非执行步骤） |
 |---|---|---|---|
 | **P0.5（✅ 已完成 2026-10-01）** | ① SDK **无框架** server 入口 + `Bun.serve` 最小可跑（回一个 `SendMessage` + 一张 agent-card）；② `bun build --compile` 产出的二进制**能否加载用户目录的动态 TS 插件** | `spikes/a2a/` 两个可复现脚本 + 结论已回写本文档（§3.1.1 / §3.4 / §8） | ① **可行**：`JsonRpcTransportHandler.handle(body, ctx)` 纯 JSON-RPC 进出、**完全不接触 HTTP**，直挂 `Bun.serve`，无需任何框架 peer dep；13 项自检全绿（取卡 / 非流式 / SSE / GetTask / ListTasks / CancelTask / **`INPUT_REQUIRED` 挂起与续接** / 版本校验 / 异常转 FAILED）。② **可行**：`--compile` 二进制**内嵌转译器**，能运行期加载用户目录 `.ts`（不只是 `.js`/`.mjs`），61MB / 冷启动 18ms ⇒ **P3 sidecar 可走单文件二进制**。SDK 版本**钉死 `@a2a-js/sdk@1.3.0`** |
-| **P0** | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器 |
+| **P0**（🔨 进行中：**第一步已完成 2026-10-01**） | 抽出 `@harness/host`：把 `HarnessApp.boot` 与装配符号迁出，CLI 改为消费它 | 新包 + CLI 行为不变（cli 侧保持 re-export） | CLI/TUI/headless 全部现有测试逐字通过；三种宿主的装配差异仅剩适配器。**第一步进度**：`packages/host` 已建，`loadPluginDirs` 簇（A 档）已迁出 + CLI re-export，**40 包 typecheck exit 0 / 全量 2137 pass**（原 2126 + host 新增 11，其余逐条不变） |
 | **P1** | A2A 一期：AgentCard + SendMessage + SendStreamingMessage(SSE) + GetTask + CancelTask + Bearer + `A2A-Version` 校验 + `INPUT_REQUIRED` 权限（含 §3.4 挂起机制、§3.5 并发/幂等）；默认 127.0.0.1 | `@harness/a2a-server` 与 `harness a2a` 启动方式 | 用官方 `a2a-inspector` / `a2a-tck` 跑通：取到 agent-card；发消息后收到 task→artifact/状态更新→`TASK_STATE_COMPLETED` 的事件序列；取消后转 `TASK_STATE_CANCELED`；权限点转 `TASK_STATE_INPUT_REQUIRED` 且答复后续接；同 session 并发请求被串行化或结构化拒绝；重复 `messageId` 不重复执行 |
 | **P2** | VSCode Chat Participant（B2）：spawn sidecar（stdio）或连本地 A2A，转发流到 ResponseStream，含取消与权限弹窗 | VSIX 扩展（不发布 Marketplace） | 在 VSCode 中 `@harness` 提问可看到流式回答、工具进度、斜杠命令；终止按钮可中断；权限请求弹窗可决策 |
 | **P3** | VSCode Webview（B3）：平移块模型与侧栏（会话/后台任务/文件引用/统计）；sidecar 分发（`--compile` 或随扩展带 bun，取决于 P0.5 结论） | VSIX 完整版 | 终端 TUI 的核心信息结构在 IDE 内等价呈现 |
@@ -302,6 +302,18 @@ createHost({
 ```
 
 **P0 的搬迁清单（定义在 `packages/cli/src/index.ts`，不在 core）**：`BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` / `loadPluginDirs` / `buildProviderWindowTable`。搬走后 `@harness/cli` 必须继续 re-export 这些符号（`cli.test.ts` 直接 import），否则等于制造一次无谓的测试翻修。
+
+> ⚠️ **实测修正（2026-10-01）：这 6 个符号不能一次搬完 —— 它们的依赖闭包差三档**，"先建包再逐个迁"比"一次搬完整套"风险低得多：
+>
+> | 档 | 符号 | 闭包 | 处置 |
+> |---|---|---|---|
+> | **A** | `loadPluginDirs` + `PluginLoadResult` + `probeAgentPlugin` + `collectAgentPlugins` + `registerProviderTypeFactory` | **自足**：只依赖 `@harness/plugin` 的类型与 `@harness/workspace` 的 `MultiDirLoader`/`normalizeDirs`（`normalizeDirs` 在 cli 内只此一处用）。且是 A2A 宿主**必需**的能力（要能加载用户插件） | ✅ **已完成** —— 第一步就搬它 |
+> | **B** | `buildProviderWindowTable` | 连着 cli 的 config 解析层（`normalizeProviderConfigs` / `resolveContextWindowTokens` / `HarnessConfig`），这些在 cli 别处大量复用 ⇒ 单搬它会拖出整层 | 第二步，与 config 层一起上移 |
+> | **C** | `BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` | 连着 `lazyImport`（cli 内 **27 处**使用）与 `BuiltinToolRegistry`（**8 处**）；`preloadBuiltinToolMetas` 还连带 `BuiltinToolRegistry` + `getBuiltinToolRegistry`（这两个不在原清单里，是闭包带出来的） | 第二步，与 `lazyImport` 启动基建一起上移 |
+>
+> 另注：`lazyImport` 是 cli 的启动基建（27 处），**它才是 P0 真正的搬迁重心**，不是那 6 个符号。
+>
+> **第一步的机制验证点**：`cli.test.ts` 有 9 条 `loadPluginDirs` 用例直接 `import` 这些符号 —— 搬走后它们必须**逐字通过**（实测 429 pass / 0 fail），这就是"re-export 兼容"这条约定的验收口径。host 包另建同能力用例（`load-plugin-dirs.test.ts`，11 条）按"能力归属"覆盖实现；两处的重叠是**有意的**，待第二步搬 `boot` 时统一收口去重。
 
 **P0 的 stdout 分级要求**：boot 内 16 处 `stdout?.write` 混着三类语义 —— ① 用户可见诊断（如"未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock Provider"）② 告警 ③ 日志。抽 host 时必须先分级：A2A 宿主若把 ① 也塞进 `logSink`，远程调用方会**静默拿到 mock 回答**。① 应升格为**可观测事件**（P1 落进任务 metadata / 服务日志 / 启动自检输出）。
 

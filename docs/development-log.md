@@ -1,5 +1,52 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 227）P0 第一步：抽出 `@harness/host`，先搬 `loadPluginDirs` 簇
+
+### 调研把"6 个符号一次搬完"这个前提否掉了
+
+计划文档列的 6 个装配符号，实测依赖闭包后**差三档**，一次搬完等于把 cli 的启动基建与 config
+解析层一起拖走：
+
+| 档 | 符号 | 闭包 |
+|---|---|---|
+| **A** | `loadPluginDirs` + `PluginLoadResult` + `probeAgentPlugin` + `collectAgentPlugins` + `registerProviderTypeFactory` | **自足** —— 只依赖 `@harness/plugin` 类型与 `@harness/workspace` 的 `MultiDirLoader`/`normalizeDirs`（后者在 cli 内只此一处用） |
+| B | `buildProviderWindowTable` | 连着 config 解析层（`normalizeProviderConfigs` / `resolveContextWindowTokens` / `HarnessConfig`），在 cli 别处大量复用 |
+| C | `BuiltinPluginRegistry` / `getBuiltinRegistry` / `resolveBuiltinPlugins` / `preloadBuiltinToolMetas` | 连着 `lazyImport`（cli 内 **27 处**）与 `BuiltinToolRegistry`（**8 处**）；`preloadBuiltinToolMetas` 还连带 `BuiltinToolRegistry` + `getBuiltinToolRegistry` —— **这两个不在原清单里，是闭包带出来的** |
+
+⇒ **`lazyImport` 才是 P0 真正的搬迁重心**（27 处使用），原清单只是"看得见的冰山尖"。
+
+### 第一步做了什么
+
+新建 `packages/host`（`@harness/host`），迁 A 档；`@harness/cli` 顶部 `import ... from '@harness/host'`
++ `export { ... }` 保持**导出面逐字不变**（`cli.test.ts` 直接 import 这些符号）。顺带清掉 cli 里
+因此变成死引用的 `MultiDirLoader` / `normalizeDirs` / `pathToFileURL` 三个 import。
+
+选择 A 档先做的第二个理由：它是 A2A 宿主**必需**的能力 —— server 侧同样要能加载用户插件，
+这一步同时也是 P1 的铺路，不只是"为了搬而搬"。
+
+**新包登记**（AGENTS.md §1）：根 `tsconfig.json` paths、根 `package.json` 与 `packages/cli/package.json`
+的 `dependencies`、`bun install`，四件事齐了才算完成定义。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `bun run typecheck` | **40 包 exit 0**（含新增 `@harness/host`） |
+| `bun test ./packages` | **2137 pass / 0 fail**（90 文件）—— 原 2126 / 89 文件 **+11 / +1**，其余逐条不变 |
+| `packages/cli` 单包 | **429 pass / 0 fail**（含 9 条 `loadPluginDirs` 用例 —— re-export 兼容的验收口径） |
+| `packages/host` 单包 | **11 pass / 0 fail**（新写的归属测试） |
+
+**测试的有意重叠**：那 9 条 cli 侧用例保留原样（它们是 re-export 兼容回归），host 侧另写 11 条
+按能力归属覆盖实现。两处重叠是刻意的，待第二步搬 `boot` 时统一收口去重 —— 现在删任何一边都会
+要么丢兼容保护、要么丢能力覆盖。
+
+### 踩坑
+
+`bun test packages/cli`（**无 `./` 前缀**）会把 `reference/opencode-dev/packages/cli` 一起扫进来，
+报 4 个与本次改动无关的 `Cannot find package 'effect'`。两个正确跑法：`cd packages/cli && bun test`，
+或带前缀的 `bun test ./packages`。这与 AGENTS.md §2 已记的"别用根目录 `bun test`"同源 —— 路径参数的
+模糊匹配也会踩到同一个坑，值得补进 §2。
+
 ## 2026-10-01（续 226）A2A P0.5 两个 spike：**两条风险假设都被证伪**
 
 `docs/external-integration-plan.md` §6 的 P0.5 要求先用两个 spike 定案协议口径与分发路径。

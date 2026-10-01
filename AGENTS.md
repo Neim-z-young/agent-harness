@@ -31,6 +31,7 @@
 - 全量测试：`bun run test`（= `bun --filter=* run test`，逐包跑，退出码可用于 CI/脚本判断；此前因 `@harness/permission` 一个测试文件都没有而**恒为 1**，已补该包测试修正）
 
 > 别用根目录的 `bun test`：它会把 `reference/**`（参考代码 / 外部仓库快照）一起扫进来，那里缺 react 等依赖，会产生数百个与本次改动无关的失败。
+> **路径参数同样会踩这个坑**：`bun test packages/cli`（无 `./` 前缀）按模糊匹配把 `reference/opencode-dev/packages/cli` 也扫进来（实测 4 个 `Cannot find package 'effect'`）。安全写法只有两种：`cd packages/<pkg> && bun test`，或 `bun test ./packages`（带前缀）。
 
 - **`bun test` 不做类型检查 ⇒ 测试全绿 ≠ 类型正确**：往测试文件里加用例（尤其 `const script = [...]` 这类**先赋值给变量**的字面量，会丢掉调用点的上下文类型 ⇒ `'text_delta'` 被拓宽成 `string` ⇒ TS2345）后，必须**单独跑 `typecheck`**。改完代码的收尾验证要**同时**给出 `typecheck` 与 `test` 两行结果
 
@@ -53,6 +54,10 @@
 - `@harness/core`：`createHarness` / `Harness`，组装 agent/session/tool/permission/skill
 
 - 插件包：provider-\* / tools-\* / mcp-client / mcp-server-registry / computer-use 等
+
+- `@harness/host`：宿主装配层 —— 与**具体宿主无关**的装配原语（外部插件目录加载等），
+  供 CLI / A2A server / VSCode 扩展**共用一份装配**（避免"两份装配必然分叉"）。只做装配与注入，
+  不内置业务决策、不绕过权限、不直接调工具。P0 第一步已落 `loadPluginDirs` 簇
 
 ## 4. 硬性约束
 
