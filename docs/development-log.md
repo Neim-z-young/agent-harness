@@ -1,5 +1,74 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 232）P0 收尾 S4：测试收口「能力归 host，兼容归 cli」—— 顺带补齐 host 自测缺口
+
+### 背景：这份「有意重叠」本来就登记着要收
+
+P0 分步搬迁时，为了让"CLI 导出面逐字不变"这条约定有据可依，`cli.test.ts` / `provider-model.test.ts`
+里**原样保留**了一份与 host 同能力的用例。计划 §5 当时就写明：「两处的重叠是**有意的**，待第二步搬
+`boot` 时统一收口去重」。S2-③ 把 `boot` 搬完之后，这一步（S4）就到期了。
+
+先摸清重叠面：host 侧 6 个文件 **89 条**是搬迁时按"能力归属"新建的 canonical 用例；cli 侧存在同
+覆盖。口径按一条原则定：**能力测试只留 host 一份，cli 只留「re-export 兼容」+「CLI 专属」**。
+
+### ① 删掉的 24 条重复（同一符号两侧都有覆盖）
+
+| 位置 | 删除 | host 侧对应 |
+|---|---|---|
+| `cli.test.ts` `ProviderTypeRegistry / 插件化扩展` | `loadPluginDirs` 9 条 + `registerBuiltinProviderTypes` 6 类型 + `listMeta` + `BuiltinPluginRegistry` + `BuiltinToolRegistry` L1 | `load-plugin-dirs.test.ts` / `builtin-registry.test.ts` |
+| `cli.test.ts` `内置插件声明式启用` | `resolveBuiltinPlugins` 依赖闭包/去重/coordinator + `unknownBuiltinPluginIds`（4 条） | `builtin-registry.test.ts` |
+| `cli.test.ts` `配置校验` | `resolveContextWindowTokens` + `buildProviderWindowTable`（2 条） | `config-window.test.ts` |
+| `cli.test.ts` `CliPermissionEngine` | allow-all / deny-all / getMode-setMode（3 条模式短路） | `permission.test.ts` |
+| `provider-model.test.ts` | `normalizeProviderConfigs` / `sanitizeProviderId` / `checkProviderConfigs` 整个 describe（8 条） | `config-window.test.ts` |
+
+### ② 从「只有 cli 覆盖」移回 host 的 3 处（host 拥有该能力，只能搬不能删）
+
+`resolveCompactionWindow`、`buildCompactionOptions`（→ `config-window.test.ts`）、
+`loadPluginDirs` 相对路径导入失败（→ `load-plugin-dirs.test.ts`）。删前先把 `provider-model` 里
+2 条**独有用例**（同模型多实例保留各自 baseUrl、显式 id 与派生 id 不冲突）并入 host，避免删出覆盖洞。
+
+### ③ 换成一条 re-export 兼容断言
+
+`cli.test.ts` 新增 describe：逐个断言 35 个上移符号从 `@harness/cli` 与从 `@harness/host` 取到的
+是**同一个引用**。这把"导出面不变"从"靠 24 条行为用例顺带守着"变成一条直指的断言 —— 而且它钉的
+比 24 条更强：**是同一个函数，不是重新包一层**。（补充：任一条 re-export 被删，`cli.test.ts` 的
+静态 import 会先以 `SyntaxError` 报错 —— 两层保护都在。）
+
+### ④ 刻意保留在 cli 的
+
+presentation（`formatProviderTypeList` / `buildProviderTypesSection`）、`parseCliArgs`、
+`CliPermissionEngine` 的 `askPrompt → 四态` 映射、provider 包工厂契约、boot 预加载集成、
+REPL `/tools`、日志 sink、ACP 装配**源码守卫**，以及跨包一致性守卫（`resolveCompactionWindow`
+与 `acp-context.lookupProviderWindow` 对照）。
+
+### ⑤ 一处刻意不动的残留（不是"重叠"）
+
+`provider-model.test.ts` 里仍有若干 **host 拥有但只有 cli 覆盖**的直接函数用例（`resolveModelArg` /
+`formatResolutionRef` / `formatApiKeyTag` / `findTokenOnlyDuplicates`），以及它们被 CLI 集成用例
+当 helper 复用的部分。它们**不是"两侧都有一份"的重叠**，按"先不动"留待一次单独的**能力归位** ——
+把直接函数用例搬进 host、集成用例留 cli。这条边界写进了设计稿 §9.5 ⑤，免得下次被当成漏网。
+
+### 顺带修掉两处因删除而失效的行号引用
+
+`notice.test.ts` 里「`cli.test.ts:1939` 钉的就是这条」与设计稿 §5 表里的 `:1939` / `:1027` / `:3185`
+在删除后全部漂了（cli.test.ts 净删约 330 行）。**改成按用例名指认**（"boot「有未登记 id 时只告警」"
+等）而不是行号 —— 行号是易失的，用例名才是稳定的锚点。另 `:1939` 断言现位于 `:1597`。
+
+### 反向验证（证明收口后的用例不是装饰）
+
+6. 把 `resolveCompactionWindow` 的端点查表摘掉（恒回 `fallback`）⇒ 刚移入 host 的两条用例失败
+   （`resolveCompactionWindow`、`buildCompactionOptions` 各一条）。✅
+7. 从 `cli/src/index.ts` 摘掉任一条 re-export ⇒ 模块加载即 `SyntaxError`（兼容断言也被触发）。✅
+
+### 产物与验证
+
+改动文件：`packages/host/src/{config-window,load-plugin-dirs,builtin-registry,notice}.test.ts`、
+`packages/cli/src/{cli,provider-model}.test.ts`、`docs/host-extraction-design.md`（§4/§5/§9.4/§9.5）、
+`docs/external-integration-plan.md`（P0 行 / §5 / §9 指针）、`AGENTS.md`（新增「测试归属」条）。
+
+验证：`bun run typecheck` **40 包 exit 0**；`bun test ./packages` **2194 pass / 0 fail / 95 文件**
+（2215 − 24 − 8 + 10 + 1 = 2194：host 89 → **99**、cli 429 → **398**）。**P0 收尾 S1–S4 全部落地。**
+
 ## 2026-10-01（续 231）P0 收尾 S2：`HarnessHost` 上移 + notice 全量接线 —— 顺带补掉一枚漏网 code
 
 ### 为什么这一步被拆成三个 commit

@@ -80,6 +80,14 @@
     二十来段且住在 cli，为两个字段整块拖进共用层会让 host 反向依赖 cli 的配置口径。这是依赖
     倒置，宽类型天然兼容，不存在第二份实现。
 
+  - **测试归属：能力归 host，兼容归 cli**。上移符号的**能力测试只留 host 一份**
+    （`packages/host/src/*.test.ts`）；cli 侧只留两样 —— ① 一条 **re-export 兼容断言**
+    （`cli.test.ts` 的「@harness/cli re-export 兼容」describe，逐个断言上移符号 `===` 从
+    `@harness/host` 取到的那一个）；② **CLI 专属**用例（presentation / `parseCliArgs` /
+    `askPrompt → 四态` 映射 / boot 预加载集成 / REPL `/tools` / 日志 sink / 源码守卫）。
+    **别再往 cli 补一份同能力的行为用例** —— 那正是 P0 收尾 S4 收掉的东西（搬迁期"两边各一份"
+    是过渡态，不是终态）。host 拥有但**只有 cli 覆盖**的能力用例应移回 host，不是留着。
+
   - **依赖契约**：host 的内置注册表用 `lazyImport(specifier)` 惰性引用 22 个内置插件包
     （provider-* / tools-* / 编排类 / memory 等），这些 specifier **由消费方的依赖树解析**，
     TS 侧看不见。故 host 的 `package.json` 把这份清单显式声明为 `dependencies` ——

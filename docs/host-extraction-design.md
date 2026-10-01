@@ -1,8 +1,9 @@
 # P0 收尾设计：`createHost` 接口与三条接缝
 
-> 状态：**已落地（S1 / S2 / S3 全部完成，只剩 S4 收尾）** —— 三个分叉按 §7 的推荐选项落定
+> 状态：**已全部落地（S1 / S2 / S3 / S4 完成）** —— 三个分叉按 §7 的推荐选项落定
 > （继承 / `renderNotice` 放 host / `asker` 四态 + `Host.notices` 环形缓冲要）。
-> S1（notice 通道）见 §8 的三处实测修正；S2（`HarnessHost` 上移）的三处实测修正与四处**有意偏离**见 §9。
+> S1（notice 通道）见 §8 的三处实测修正；S2（`HarnessHost` 上移）的三处实测修正与四处**有意偏离**见 §9；
+> S4（测试收口：能力归 host、兼容归 cli）见 §9.5。
 > 前置：`@harness/host` 已完成三批搬迁（A 档 `loadPluginDirs` 簇 / C 档内置注册表三节 / B 档配置归一化与窗口推导），
 > 外部依赖闭包**已全部就位**。本设计只处理唯一剩余项：`HarnessApp` 本体（56 个成员 ≈ 1150 行）与它那 20 处输出站点。
 > 相关：`docs/external-integration-plan.md` §5 / §6 / §7。
@@ -336,14 +337,14 @@ export function renderNotice(n: HostNotice): string
 > 渲染器因此是纯全函数 —— 21 个 code 都能出文案，快照测试不必为 log 级造两种期望。
 
 选它放 host 的三条理由：
-1. CLI 直接用 ⇒ **文案逐字不变**，`cli.test.ts:1939`（`config.json → plugins 有未生效项：no-such-plugin`）与
-   `cli.test.ts:1027`（verbose ⇒ `已后台预热`）无需改动；
+1. CLI 直接用 ⇒ **文案逐字不变**：`cli.test.ts` 的 boot「有未登记 id 时只告警」与「后台静默预加载」
+   （verbose ⇒ `已后台预热`）两条用例无需改动；
 2. 纯函数 ⇒ 20 条可逐条快照测试，**不再依赖「跑一次 boot 抄 stdout」**；
 3. A2A/VSCode 可以不用它（按 `code` 上报），也可以用它（写服务日志）——是**默认**不是**唯一**。
 
 **`onNotice` 与既有 `setLogSink` 的关系：两条通道，不合并**。
 
-| | `onNotice`（新） | `setLogSink`（已存在，`cli.test.ts:3185` 已测） |
+| | `onNotice`（新） | `setLogSink`（已存在，`cli.test.ts` 的「HarnessApp 日志 sink」describe 已测） |
 |---|---|---|
 | 时机 | 装配期一次性（boot + 后台预加载） | 运行期每轮 query |
 | 内容 | 事实 + 告警 + verbose 日志（结构化 `code`） | 引擎 warn/error（自由文本 msg + meta） |
@@ -417,7 +418,7 @@ CLI 保留（不动）：`CliPermissionEngine`、`defaultCliAsk`、`formatAgo`�
 
 ---
 
-## 4. 落地步骤（实际拆成 6 个可独立验证的 commit）
+## 4. 落地步骤（实际拆成 7 个可独立验证的 commit）
 
 设计稿原排 S1→S2→S3→S4；实施时把 S3（权限接缝）**前插到 S2 之前**，因为 `boot()` 直接构造
 `CliPermissionEngine`，而 host 不能再反向 import cli —— 不先上移权限引擎，主体就搬不动。
@@ -431,7 +432,7 @@ CLI 保留（不动）：`CliPermissionEngine`、`defaultCliAsk`、`formatAgo`�
 | **S2-③ 前置** ✅ | `./plugins.ts`：A 档 + C 档自 `index.ts` 抽出，`index.ts` 退化为纯 barrel | 主体要用这几个装配原语，留在 index 就成环（叶子不得反向 import barrel）。纯搬移，全量 2210 pass 逐条不变。`bbb366d` |
 | **S2-③ 主体** ✅ | `./host.ts`：`HarnessHost` + `HostOptions` + `createHost()`；21 处 `stdout?.write?.(…)` → `emitNotice`；CLI 变 `HarnessApp extends HarnessHost` | 最大的一步。**2215 pass**（基线 2210 + host notice 端到端 5 条）。三处实测修正 + 四处有意偏离见 §9。`b13f81a` |
 | **S2-③ 补** ✅ | `preloadBuiltinToolMetas` 的 `console.warn` 漏网站点纳入 notice（+1 code） | §8 ② 要求 S2 一并处理。`6dc4e69` |
-| **S4** ⏳ | 收口 host / cli 之间有意重叠的测试；更新 `AGENTS.md` 与计划文档 | 文档与收尾 |
+| **S4** ✅ | 收口 host / cli 之间有意重叠的测试（能力归 host、兼容归 cli）；更新 `AGENTS.md` 与计划文档 | 见 §9.5。**2194 pass**（host 99 / cli 398）。反向验证 6/7 已执行 |
 
 S1 先做的意义：把「文案」从「会不会被 boot 的其它改动顺带改掉」里摘出来 —— 20 条文案一旦有独立快照，
 S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
@@ -443,9 +444,9 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
 | 项 | 判据 |
 |---|---|
 | `bun run typecheck` | 40 包 exit 0 |
-| `bun test ./packages` | 现有 2172 pass 逐条不变 + 新增 host 用例 |
-| `cli.test.ts` | **逐字通过**，含三条被钉住的契约：`:1939`（plugins 未生效项文案）、`:1027`（verbose 预热日志）、`:3185`（`setLogSink` 路由 warn/error） |
-| `packages/cli` | 429 pass，与搬迁前逐条一致 |
+| `bun test ./packages` | 现有用例逐条不变 + 新增 host 用例（S4 收口后基线：**2194 pass / 0 fail / 95 文件**） |
+| `cli.test.ts` | **逐字通过**，含三条被钉住的契约：boot「有未登记 id 时只告警」（plugins 未生效项文案）、boot「后台静默预加载」（verbose 预热日志）、「HarnessApp 日志 sink」（`setLogSink` 路由 warn/error） |
+| `packages/cli` | 随迁移更新的用例逐条通过（S4 收口后 **398 pass**：删掉与 host 重复的行为用例、加一条 re-export 兼容断言）；`packages/host` **99 pass** |
 | 行为不变 | cli / tui / headless 三种启动路径输出与今天一致 |
 
 **反向验证**（证明分级不是装饰）：
@@ -465,8 +466,15 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
    `logLine` 兜底**同字节**（这正是"两条出口不是两份事实"的可执行证据）。
 5. **S2-③ 追加**：不给任何输出出口 ⇒ 文本丢失，但 `app.notices` 里仍能按 `code` 取回。
    ✅ 已固化为 `notices.test.ts` 的常驻用例（治「静默丢弃」的正面断言）。
+6. **S4 追加**（证明收口后的用例不是装饰）：把 `resolveCompactionWindow` 的端点查表摘掉
+   （恒回 `fallback`）⇒ 刚移入 host 的用例必须失败。✅ **已执行**：2 条失败
+   （`resolveCompactionWindow` 与 `buildCompactionOptions` 各一条）。
+7. **S4 追加**（证明 re-export 兼容断言有效）：从 `cli/src/index.ts` 摘掉任一条 re-export
+   ⇒ 断言/模块加载必须失败。✅ **已执行**：摘掉 `resolveBuiltinPlugins` ⇒ 模块加载即
+   `SyntaxError: Export named 'resolveBuiltinPlugins' not found`。
 
-> 现状：20 处输出里**只有 1 条**被测试钉住（`:1939`）。剩下 19 条今天既没有断言、也没进任何结构化通道 ——
+> 现状（S1 时的记录）：20 处输出里**只有 1 条**被测试钉住（`:1939`，S4 后迁到 `:1597`）。其余 19 条
+> 当时既没有断言、也没进任何结构化通道 ——
 > 「配置写了没生效」这类问题因此只以「终端上的一行」形式存在，跑 headless / A2A 时全部消失。
 
 ---
@@ -583,10 +591,52 @@ S2 的重构就有了**逐字不变**的判据，而不是靠读 diff 目测。
 **两条断言逐字未改**。这是本次改造第一轮唯一暴露的测试失败，而它报的正是这个：
 守卫必须跟着代码走，否则"代码搬走了"会以**测试失败**的形式误报。
 
-### 9.4 一个未处理的已知项（留给 S4）
+### 9.4 一个未处理的已知项（非重叠，留作后续）
 
 `flushDirtySessions` 里的 `console.warn('[WARN] 脏会话落盘失败（…）')` **保持原样**。理由：
 它是**运行期**（`sendStream` / `shutdown` 路径）诊断，不在 `notice` 的"装配期"分级表内；
 把它塞进 notice 会让"装配期 vs 运行期"这条边界变模糊，而它今天走 stderr、本来也不会污染
 stdout 协议。真要收，应该收进 `emitLog`（运行期通道）而不是 notice —— 但那会把它的流向从
 stderr 改成宿主的 `logLine`，属于**另一次有意识的改动**，不混在搬迁里。
+
+### 9.5 S4 测试收口：能力归 host，兼容归 cli
+
+搬迁期为了让"CLI 导出面逐字不变"这条约定有据可依，`cli.test.ts` / `provider-model.test.ts`
+里**原样保留**了一份与 host 同能力的用例（计划 §5 明确记为"有意重叠，待搬 `boot` 时统一收口"）。
+S4 收口按一条原则落地：**能力测试只留 host 一份，cli 只留「re-export 兼容」+「CLI 专属」**。
+
+**① 删除的重复（同一符号两侧都有覆盖）** —— cli 侧净删 24 条：
+
+| 位置 | 删除的用例 | host 侧对应能力测试 |
+|---|---|---|
+| `cli.test.ts` `ProviderTypeRegistry / 插件化扩展` | `loadPluginDirs` 9 条、`registerBuiltinProviderTypes` 6 类型、惰性展示元信息、`BuiltinPluginRegistry` 统一登记、`BuiltinToolRegistry` 多级加载 L1 | `load-plugin-dirs.test.ts` / `builtin-registry.test.ts` |
+| `cli.test.ts` `内置插件声明式启用` | `resolveBuiltinPlugins` 依赖闭包/去重/coordinator、`unknownBuiltinPluginIds` | `builtin-registry.test.ts` |
+| `cli.test.ts` `配置校验` | `resolveContextWindowTokens`、`buildProviderWindowTable` | `config-window.test.ts` |
+| `cli.test.ts` `CliPermissionEngine` | allow-all / deny-all / getMode-setMode 三条模式短路 | `permission.test.ts` |
+| `provider-model.test.ts` | `normalizeProviderConfigs`/`sanitizeProviderId`/`checkProviderConfigs` 整个 describe（8 条） | `config-window.test.ts` |
+
+**② 从"仅 cli 覆盖"移入 host 的 3 处**（host 拥有该能力，却只有 cli 有用例 —— 只能搬不能删）：
+`resolveCompactionWindow`、`buildCompactionOptions`（→ `config-window.test.ts`）、
+`loadPluginDirs` 相对路径导入失败（→ `load-plugin-dirs.test.ts`）。其中 `provider-model.test.ts`
+的 `normalizeProviderConfigs` 段里 2 条**独有用例**（同模型多实例的 baseUrl 保留、显式 id 与派生
+id 不冲突）在删除前先并入 host，避免删出覆盖洞。
+
+**③ 替换为一条 re-export 兼容断言**：`cli.test.ts` 新增 `describe('@harness/cli re-export 兼容')`
+—— 逐个断言上移符号（A/C/B 档 + 配置层 + 权限接缝 + 装配主体，共 35 个）从 `@harness/cli` 与从
+`@harness/host` 取到的是**同一个引用**。这把"导出面不变"从"靠 24 条行为用例顺带守着"变成"一条
+直指的断言"。（注：任一条 re-export 被删，`cli.test.ts` 的静态 import 会先以 `SyntaxError` 报错
+—— 兼容断言额外钉住"是同一个函数，不是重新包一层"。）
+
+**④ 刻意保留在 cli 的**：presentation（`formatProviderTypeList` / `buildProviderTypesSection`）、
+`parseCliArgs`、`CliPermissionEngine` 的 `askPrompt → 四态` 映射、provider 包工厂契约、boot 预加载
+集成、REPL `/tools`、日志 sink、ACP 装配源码守卫，以及跨包一致性守卫（`resolveCompactionWindow`
+与 `acp-context.lookupProviderWindow` 对照）。
+
+**⑤ 已知的残留（非"重叠"，不在 S4 范围）**：`provider-model.test.ts` 里仍有若干 **host 拥有但只有
+cli 覆盖**的直接函数用例（`resolveModelArg` / `formatResolutionRef` / `formatApiKeyTag` /
+`findTokenOnlyDuplicates`），以及它们作为 helper 被 CLI 集成用例复用的部分。它们不是"两侧都有一份"
+的重叠，按"先不动"留待一次单独的**能力归位**（把直接函数用例搬进 host，集成用例留 cli）。
+
+**验证**：`bun run typecheck` 40 包 exit 0；`bun test ./packages` **2194 pass / 0 fail / 95 文件**
+（2215 − 24 − 8 + 10 + 1 = 2194：host +10、cli −23）；`packages/host` 99 pass、`packages/cli` 398 pass。
+反向验证 6/7（见 §5）：摘端点查表 ⇒ 移入的用例失败；摘 re-export ⇒ 兼容断言/模块加载失败。
