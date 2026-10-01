@@ -1,5 +1,62 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 239）P2 设计稿：VSCode 接入 —— A2A 协议里"没有的那一半"
+
+### 做什么
+
+P1 收口后，下一步是 P2（VSCode Chat Participant）。但这一格在计划里挂着两个**待确认决策**（§10.1 传输形态、§10.4 代码位置），且仓里既无 `adapters/` 也无任何 VSCode 工具链 —— 属于"动代码前先定方向"的岔口。按"先出设计稿再动代码"（与 P0 的 `host-extraction-design.md` 同一套路）产出 `docs/vscode-integration-design.md`。
+
+**所有 VSCode API 签名都从 `vscode.d.ts`（main 分支，2026-10-01 下载）核对，没凭记忆写。** 这一步是必要的 —— 有三处凭记忆必错：
+
+- `ChatResponseStream` 稳定版**只有 7 个方法**（`markdown`/`anchor`/`button`/`filetree`/`progress`/`reference`/`push`）。`thinkingProgress` / `warning` / `confirmation` **只在 proposed**（`vscode.proposed.chatParticipantAdditions.d.ts`）⇒ reasoning、工具块、警示全得用 `markdown`/`progress` 拼。
+- `ChatRequest.toolInvocationToken` 在稳定版里类型是 **`never`**（真类型由 proposed 声明合并补上）。
+- `ChatContext` **只有 `history`，没有 chat session id** ⇒ 跨轮状态只能走官方那两条：`ChatResult.metadata` 写、`ChatResponseTurn.result` 读（`vscode.d.ts:19641`）。
+
+### 三个关键判断（本稿的核心）
+
+1. **不使用 `request.model`** —— harness 自带 Provider 与 agentic loop；用 VSCode 的模型等于把 loop 劈成两半。代价要明说：Chat 视图的模型下拉对本参与者**无效**。
+2. **必须新增"控制通道"** —— A2A transport 只认 6 个方法，而 CLI 有 **18** 个斜杠命令，其中 **12 个是本地管理操作**（`/compact` `/stats` `/agent` `/model` `/permission` `/skills` `/config` `/search` `/export` `/save` `/sessions` `/resume`），协议里**无处安放**。这不是缺陷而是**协议定位**：A2A 是远程 agent 互操作协议，不负责本地管理面。
+3. **两案都要 spawn 子进程** —— harness 是 Bun、extension host 是 Node ⇒ "复用 A2A" **不等于** "不用 spawn"，差别只在**管道形态**。plan §4.3 的表容易被读成前者，本稿专门澄清。
+
+### 传输：案 A（复用 A2A HTTP+SSE）vs 案 B（stdio sidecar）
+
+**建议案 A**，按权重：① P1-C/D/E 那笔投入只有走案 A 才回收，走 stdio 等于对 P2 归零，且并发/幂等/隔离要**再做一遍并再验收一遍**；② P2/P3 共用同一传输；③ 端口问题量级可控（默认 `4321`，冲突用 `--port 0`，`server.ts` 已有回填真实端口的分支；本机误连已被 `verifyBearer` + `CallerRegistry` 挡住）。
+**但把传输抽成 `HarnessTransport` 接口**，让案 B 将来是"加一个实现"而非"改一遍"。
+**反方立场一并记下**：若定位是"绝不开放端口"（强合规），案 B 的"无网络面"是硬要求，此时该直接选 B。
+
+### 控制通道：A2A 之外另开一条路径
+
+三案对比后建议 **`POST /harness/rpc`**（同一个 `Bun.serve`、不同路径、自己的小 JSON-RPC）：
+
+- ❌ 塞进 `/a2a` 的命名空间 ⇒ **污染协议面**：`/a2a` 的"未知方法必须 `MethodNotFound`"是 TCK 的断言项，一个端点两套语义会让"协议面"与"实现面"重新耦上 —— 正是 P0 花四步拆掉的那种耦合。
+- ✅ 另开路径 ⇒ TCK 永远碰不到它；且**不进 AgentCard**（声明出去等于对外承诺一套不打算标准化的 API）。
+- 首批方法清单（`harness/session.*` `harness/stats.get` `harness/agent.*` `harness/model.*` `harness/permission.*` `harness/skill.*`）**以 host 公共面为唯一实现来源**，sidecar 里不许另写逻辑（同 P1 对 a2a-server 的纪律）。
+
+其中 **`harness/notice.list`** 是新加也是最有价值的一条：把 `host.notices` 环形缓冲（`packages/host/src/host.ts:284`）暴露给扩展 ⇒ "**无 key 回落到 Mock**"这类事实能在 IDE 里显示出来 —— 正好收掉 plan §6 末尾点名的那条风险（远程调用方静默拿到 mock 回答）。**现状核对**：`runA2aCli` 已把装配期 notice 全部渲染到 stderr（`packages/cli/src/index.ts:1962`），差的只是"让调用方能读到"这最后一跳。
+
+### 权限：一处最容易想歪的地方
+
+`lm.registerTool` 的 `prepareInvocation` / `confirmationMessages`（`vscode.d.ts:21184`）**看着很像**"工具权限弹窗"，但它属于"**Copilot 调用你的工具**"路径（B1 / agent mode）；harness 的场景是"**harness 调用自己的工具**"，Copilot 的编排器根本不在这条链路上，那个弹窗**永远不会被触发**。正确落法是 `showInformationMessage({ modal: true }, '允许一次', '本会话始终允许', '拒绝', '始终拒绝')` 映射四态（关掉对话框 = 取不到答复 ⇒ 引擎按 deny，与 CLI 同一 fail-safe）。
+
+另有两处**跨进程**的真难点：
+
+- **asker 在扩展进程、host 在 sidecar 进程** ⇒ `host.permission.setAsker(...)` 那套接线跨不过进程边界。建议**复用 A2A 的 `INPUT_REQUIRED` 挂起**（P1 已做好并验收过，零新增协议）—— 这里是"选案 A"的收益第二次兑现：选 stdio 就得重做这套挂起。
+- **四态词汇表不该写第二份**：`PERMISSION_ANSWERS` / `parsePermissionAnswer` / `buildPermissionQuestion` / `buildPermissionMetadata`（`packages/a2a-server/src/mapping.ts:157/165/184/194`）已定义过，应上移到中性位置共用。这是**开工前的重构点**。
+
+### 其他落点
+
+- **目录结构**：建议 `adapters/vscode/` **仓内但不入 `workspaces`、不进 root `tsconfig.include`** —— 与"独立仓库"隔离效果相同，但契约漂移能在同一提交里发现。⚠️ 必须配守卫测试防它被 `bun --filter=* run typecheck` 收进去（主仓 CI 没有 `@types/vscode`）。
+- **会话绑定**：`history.length === 0` ⇒ 新对话；harness `contextId` 经 `result.metadata` 跨轮携带。**不把 VSCode `history` 塞进 harness prompt**（harness 有自己完整的会话历史，塞进去 = 同一段上下文两份、口径还不一致）。
+- **开工第一步是三个实测项**（不是设计问题）：`/permission bash=deny` 时 `request.command` 与 `request.prompt` 的切分行为；spawn 后从 stdout 读端点的时序（应改结构化输出）；模态对话框与 `token` 取消的竞争。
+
+### 产物与验证
+
+新增：`docs/vscode-integration-design.md`（11 节 + 引用位置附表）。
+更新：`docs/external-integration-plan.md`（P2 行补设计稿要点；§10.1 / §10.4 标注"建议已更新、仍待拍板"；§5 后补设计稿指针）。
+
+**本步未改任何代码** —— 设计稿的验收口径是"**每个判断都有可核查的依据**"：VSCode 侧 12 处签名逐一取自 `vscode.d.ts`（附行号），harness 侧 10 处符号逐一标注实际文件位置（`core/index.ts:660`、`host/host.ts:1307/284`、`permission.ts:29/38/49/62`、`mapping.ts:157/165/184/194/217`、`cli/index.ts:1922/1962` 等）。
+**待办**：§10 的 7 项待拍板（传输 / 目录 / 控制面路径 / asker 跨进程 / reasoning 默认渲染 / 是否兼注册 `languageModelTools` / 无 Copilot 环境的兜底）。
+
 ## 2026-10-01（续 238）A2A P1 外部验收：官方 `a2a-tck` 五轮收敛 —— 5 处互操作缺陷 + 零真实遗留
 
 ### 做什么
