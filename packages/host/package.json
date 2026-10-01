@@ -17,21 +17,22 @@
   },
   "dependencies": {
     "@harness/acp-context": "workspace:*",
-    "@harness/plugin": "workspace:*",
-    "@harness/workspace": "workspace:*",
+    "@harness/code-intel": "workspace:*",
     "@harness/computer-use": "workspace:*",
     "@harness/coordinator": "workspace:*",
-    "@harness/code-intel": "workspace:*",
+    "@harness/core": "workspace:*",
     "@harness/herdr": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-server-registry": "workspace:*",
     "@harness/memory": "workspace:*",
+    "@harness/plugin": "workspace:*",
     "@harness/provider-anthropic": "workspace:*",
     "@harness/provider-gemini": "workspace:*",
     "@harness/provider-glm": "workspace:*",
     "@harness/provider-mock": "workspace:*",
     "@harness/provider-openai": "workspace:*",
     "@harness/provider-qwen": "workspace:*",
+    "@harness/session": "workspace:*",
     "@harness/skill-forge": "workspace:*",
     "@harness/subagent": "workspace:*",
     "@harness/swarm": "workspace:*",
@@ -40,6 +41,8 @@
     "@harness/tools-manager": "workspace:*",
     "@harness/tools-media": "workspace:*",
     "@harness/tools-search": "workspace:*",
-    "@harness/tools-web": "workspace:*"
+    "@harness/tools-web": "workspace:*",
+    "@harness/workspace": "workspace:*",
+    "acp-kernel": "^0.0.63"
   }
 }
