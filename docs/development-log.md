@@ -1,5 +1,60 @@
 # Agent Harness 开发日志
 
+## 2026-10-01（续 229）P0 第三步：搬配置归一化与窗口推导（B 档）—— 顺带定下"窄类型"这条边界
+
+### 切口：B 档连着 config 层，但**不搬 config 模型**
+
+原计划 B 档只列了 `buildProviderWindowTable` 一个符号。实测它的闭包是一条**推导链**：
+`buildProviderWindowTable → resolveContextWindowTokens → normalizeProviderConfigs → parseModelSpec`
+（外加 `sanitizeProviderId` / `isUsableWindow` 两个判据与 `ResolvedProviderConfig` / `ProviderConfigIssue`
+两个类型）⇒ 一并搬走。真正需要裁剪的只有一处：**`HarnessConfig` 不搬**。
+
+`HarnessConfig` 是 cli 的配置模型（三百来行，二十来段：compression / compaction / memory /
+telemetry / plugins / snapshots…），而窗口链只读其中两段。为两个字段把整份模型拖进共用装配层，
+等于让 host 反向依赖 cli 的配置口径 —— 而 A2A server / 编辑器扩展的配置来源未必是 config.json。
+
+**处理：引入 `ProviderWindowConfigSource` 窄类型**（`providers` + `compression.modelContextLimit`）。
+这不是本仓的老病"同一个东西两套写法"—— 它不含任何第二份实现，是**依赖倒置**：函数只声明自己
+真读的字段，宽类型（`HarnessConfig`）传进来天然兼容。测试里专门留了一条用例钉住这点
+（传带 `agentId` / `compaction` / `plugins` 等多余字段的宽对象，行为不变）。
+
+### 为什么窗口链值得和配置归一化同处一包
+
+窗口是占用率的**分母**。此前概览与 boot 各写一份、会话压缩干脆硬编码 200000，于是同一份 config
+能同时得出 200000 与 102400 —— 按概览做的判断全部落空，会话压缩则因阈值算到真实窗口之外
+（256500 > 200000）**永不触发**，且全程无任何症状。搬到 host 后三处（显示 / 压缩阈值 / ACP 占用率）
+共用同一份实现，`cli.test.ts` 里那条"查表顺序与 acp-context 的 `lookupProviderWindow` 一致"的
+守卫用例继续钉住取小 / 判空 / 优先级规则。
+
+### 迁出符号（10 个）
+
+`parseModelSpec` · `formatModel` · `sanitizeProviderId` · `normalizeProviderConfigs` ·
+`isUsableWindow`（原本私有，本次导出 —— cli 的 compaction 层仍在用它判断查表结果）·
+`resolveContextWindowTokens` · `buildProviderWindowTable` · 类型 `ResolvedProviderConfig` /
+`ProviderConfigIssue` / `ProviderWindowConfigSource`（新）。
+
+新增依赖：`@harness/acp-context`（**仅类型** —— 窗口表的形状定义在那边，写内联结构体就会与插件侧
+两份定义漂移）。`import type` 完全擦除，不会把 ACP 内核拖上启动路径。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| `bun run typecheck` | **40 包 exit 0** |
+| `bun test ./packages` | **2172 pass / 0 fail**（92 文件）—— 原 2156 / 91 **+16 / +1**，其余逐条不变 |
+| `packages/cli` 单包 | **429 pass / 0 fail**，与搬迁前逐条一致（含读源码文本断言的 ACP 装配行守卫） |
+| `packages/host` 单包 | **46 pass / 0 fail**（原 30 + 新增 16 条配置/窗口用例） |
+
+新写的 `config-window.test.ts` 按能力覆盖且不经过 cli；`cli.test.ts` / `provider-model.test.ts`
+侧原用例保留测导出面兼容。重叠仍是有意的，收口留到 `boot` 搬完。
+
+### 剩下的只有 boot 主体了
+
+P0 的外部依赖已全部就位：`loadPluginDirs`（A）+ 三个注册表（C）+ 配置与窗口（B）。
+下一步把 `HarnessApp.boot`（约 1200 行，重度依赖 `this.permission` / `this.loadedProviders` /
+`this.configStore` / `this.workspace` / `this.options` 等实例状态）抽成
+`createHost({...})`，并给 boot 内 16 处 `stdout.write` 做三级分级。
+
 ## 2026-10-01（续 228）P0 第二步：搬内置注册表三节（C 档）—— 顺带把"隐式依赖"显式化
 
 ### 切口：先搬 C 档，不碰 `boot`

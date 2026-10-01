@@ -57,9 +57,19 @@
 
 - `@harness/host`：宿主装配层 —— 与**具体宿主无关**的装配原语，供 CLI / A2A server / VSCode
   扩展**共用一份装配**（避免"两份装配必然分叉"）。只做装配与注入，不内置业务决策、不绕过权限、
-  不直接调工具。已落两批：① `loadPluginDirs` 簇（外部插件目录加载）；② 内置注册表三节
-  （`registerBuiltinProviderTypes` + `BuiltinPluginRegistry` 簇 + `BuiltinToolRegistry` 簇 + 共用
-  的 `lazyImport`）。剩余 `buildProviderWindowTable` 与 `HarnessApp.boot` 主体待随 P0 第二步收尾。
+  不直接调工具。已落三批：① `loadPluginDirs` 簇（外部插件目录加载）；② 内置注册表三节
+  （`registerBuiltinProviderTypes` + `BuiltinPluginRegistry` 簇 + `BuiltinToolRegistry` 簇 + 共用的
+  `lazyImport`）；③ 配置归一化与上下文窗口推导（`normalizeProviderConfigs` / `parseModelSpec` /
+  `resolveContextWindowTokens` / `buildProviderWindowTable`）。剩余仅 `HarnessApp.boot` 主体
+  （→ `createHost({...})` + 日志分级）。
+
+  - **窗口/配置口径只有一份**：窗口是占用率的**分母**，显示 / 压缩阈值 / ACP 三处各算一遍就会
+    出现"概览说 26%、实际已 103%"这类**全程无症状**的故障。故窗口链与配置归一化同处 host，
+    任何宿主都不得另写一份（`cli.test.ts` 有对照 acp-context 的守卫用例钉住取小/判空/优先级）。
+  - **窄类型不是重复定义**：host 的窗口函数收 `ProviderWindowConfigSource`（只声明
+    `providers` + `compression.modelContextLimit` 两段）而不是 `HarnessConfig` —— 配置模型有
+    二十来段且住在 cli，为两个字段整块拖进共用层会让 host 反向依赖 cli 的配置口径。这是依赖
+    倒置，宽类型天然兼容，不存在第二份实现。
 
   - **依赖契约**：host 的内置注册表用 `lazyImport(specifier)` 惰性引用 22 个内置插件包
     （provider-* / tools-* / 编排类 / memory 等），这些 specifier **由消费方的依赖树解析**，
