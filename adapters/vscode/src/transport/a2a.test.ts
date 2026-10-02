@@ -164,6 +164,36 @@ describe('A2aTransport.cancel', () => {
   })
 })
 
+describe('A2aTransport.listTasks', () => {
+  it('走 /a2a 的 ListTasks —— 协议里有的方法不许搬进控制面（设计稿 §12.2）', async () => {
+    const { fetch, calls } = recordingFetch(() =>
+      Response.json({ jsonrpc: '2.0', id: 1, result: { tasks: [{ id: 't1', status: { state: 'TASK_STATE_WORKING' } }] } }),
+    )
+    const t = new A2aTransport({ sidecar: fakeSidecar(), fetchImpl: fetch })
+
+    const r = await t.listTasks()
+
+    expect(String(calls[0]!.url)).toBe(HS.rpcUrl)
+    expect(JSON.parse(calls[0]!.init.body as string).method).toBe('ListTasks')
+    expect(r).toEqual({ tasks: [{ id: 't1', status: { state: 'TASK_STATE_WORKING' } }] })
+  })
+
+  it('服务端不认识 ListTasks ⇒ 抛错（由调用方按分区降级，不静默）', async () => {
+    const { fetch } = recordingFetch(() =>
+      Response.json({ jsonrpc: '2.0', id: 1, error: { code: -32601, message: 'Method not found' } }),
+    )
+    const t = new A2aTransport({ sidecar: fakeSidecar(), fetchImpl: fetch })
+
+    let thrown: unknown
+    try {
+      await t.listTasks()
+    } catch (e) {
+      thrown = e
+    }
+    expect((thrown as TransportError).code).toBe(-32601)
+  })
+})
+
 describe('A2aTransport.control', () => {
   it('打向 controlUrl，不是 rpcUrl —— 控制面与协议面不共享路径', async () => {
     const { fetch, calls } = recordingFetch(() =>

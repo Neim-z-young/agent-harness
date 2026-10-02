@@ -120,6 +120,24 @@ export class A2aTransport implements HarnessTransport {
     await expectOk(res, 'CancelTask')
   }
 
+  // ---------------------------------------------------------------- 任务清单
+
+  /**
+   * `ListTasks`（A2A 协议方法）—— 面板"后台任务"分区的数据源。
+   *
+   * 走 `/a2a` 而不是 `/harness/rpc`：协议里有的方法不许搬进控制面（设计稿 §12.2）。
+   * 服务端不认识它 ⇒ `MethodNotFound`，调用方按分区降级处理。
+   */
+  async listTasks(): Promise<unknown> {
+    const hs = this.opts.sidecar.endpoint
+    const res = await this.fetchImpl(hs.rpcUrl, {
+      method: 'POST',
+      headers: this.headers(),
+      body: JSON.stringify(jsonRpcRequest(this.nextId(), 'ListTasks', { pageSize: 20 })),
+    })
+    return (await expectOk(res, 'ListTasks')).result
+  }
+
   // ---------------------------------------------------------------- 控制面
 
   async control(method: string, params?: unknown): Promise<unknown> {

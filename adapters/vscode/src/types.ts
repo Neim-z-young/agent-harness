@@ -73,6 +73,15 @@ export interface HarnessTransport {
     signal: AbortSignal,
   ): AsyncIterable<unknown>
   cancel(taskId: string): Promise<void>
+  /**
+   * 后台任务清单（A2A `ListTasks`）。
+   *
+   * **走协议面而不是控制面**（设计稿 §12.2 第 2 条）：A2A 自己有这个方法，
+   * 为它另开一个 `harness/tasks.list` 就是把协议的活搬进私有面 —— 与 §6.3
+   * 「控制面只放协议里没有的那一半」同一条界线。服务端若不支持 ⇒ 抛错，
+   * 由调用方降级（面板只让那一个分区变灰）。
+   */
+  listTasks(): Promise<unknown>
   /** 控制通道（设计稿 §6）：斜杠命令走这里，不走 A2A */
   control(method: string, params?: unknown): Promise<unknown>
   dispose(): Promise<void>
