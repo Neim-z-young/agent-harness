@@ -362,8 +362,9 @@ SendMessage / SendStreamingMessage / GetTask / CancelTask / ListTasks
 > **两处与本节原稿的偏差**（都是实现时才定下来的）：
 > ① **入参一律结构化**（如 `harness/model.set` 收 `{ providerId, modelId }` 而不是 `/model hy3` 这类自由文本）
 > —— 歧义消解属"输入词汇"，留在敲命令的那一端（见 `control.ts` 文件头）；
-> ② `harness/stats.get` **未在首批**：它要的 `resolveCurrentUsage` / `renderContextOccupancy` 还住在
-> `@harness/cli`（sidecar 不能反向依赖 cli），需先把这几个纯函数上移到共享位置。
+> ② `harness/stats.get` 当时未实现 —— ✅ **续 242 已补**（2026-10-02）：四个装配函数
+> （`resolveCurrentUsage` / `renderChildAgentRollup` / `renderContextOccupancy` / `collectTodayUsage`）
+> 已上移 `@harness/usage`（结构化最小接口、零新增包依赖），CLI 与 sidecar 共用同一份实现。
 
 
 - 同一个 `Bun.serve`，**不同路径**，自己的小 JSON-RPC（`{jsonrpc,id,method,params}` 形状照搬，便于复用现有错误码词汇）。
@@ -484,7 +485,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 |---|---|---|
 | **P2-A（✅ 已落地）** | **控制通道**：`POST /harness/rpc` + 14 个 `harness/*` 方法（`packages/a2a-server/src/control.ts`） | `@harness/a2a-server` 70 → **104 pass / 0 fail**；与协议面互不串线（同一方法名打到 `/a2a` ⇒ `MethodNotFound`）；卡片不含控制路径 |
 | **P2-B（骨架 / P2-v0）（✅ 已落地 2026-10-01，续 241）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答 | **无头可验的部分全绿**：`adapters/vscode` 57 pass / 0 fail（含 6 条真 sidecar 端到端：握手 / 取卡 / 版本头陷阱 / 控制面 / 流式管道 / dispose 无残留）；VSIX 打包并用 `code --install-extension` 实装成功。**仍需人手点验**：在 Chat 视图里 `@harness` 提问（本机未装 Copilot，Chat 视图无模型提供方时不显示参与者） |
-| **P2-v1（对齐 plan 口径）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`）；启动自检提示 | plan §6 的 P2 验收全绿 |
+| **P2-v1（✅ 已落地 2026-10-02，续 242）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗（三项 P2-B 已落地）；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`，解析在 `commands.ts` 纯模块，`/model` 为 get→resolve→set 两段协议）；启动自检提示（warn notices 每线程首轮一次） | 扩展 79 pass（含 7 条真 sidecar E2E）；主仓 2308 pass / 0 fail |
 | **P2-v2** | 全部 18 命令；follow-ups；`reference`/`filetree` 呈现（文件引用、diff 预览） | — |
 | **P3** | webview 平移块模型与侧栏；`--compile` 单文件二进制随扩展分发 | plan §6 的 P3 验收 |
 

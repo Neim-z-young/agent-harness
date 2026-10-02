@@ -1,5 +1,70 @@
 # Agent Harness 开发日志
 
+## 2026-10-02（续 242）P2-v1：6 个斜杠命令 + `harness/stats.get` + 启动自检
+
+### 做什么
+
+收掉设计稿 §9 里 P2-v1 剩余的两件事（事件映射 / 取消 / 权限四态弹窗已在 P2-B 落地）：
+
+1. **6 个斜杠命令**（`/compact /stats /agent /model /permission /skills`）：
+   `adapters/vscode` 新增 `src/commands.ts` 纯模块（不 import vscode）承担
+   「CLI 词法 → 结构化入参」与「控制出参 → markdown」；`package.json` 在
+   `chatParticipants.commands` 声明命令（Chat 视图的斜杠菜单可见）。
+2. **启动自检**（设计稿 §8）：参与者在线程首轮调 `harness/notice.list {level:'warn'}`，
+   warn 条目以 markdown 提示呈现一次（`ChatResult.metadata.noticesShown` 标记，防重复）。
+
+### `/stats` 的前置：装配函数上移 `@harness/usage`
+
+`harness/stats.get` 是 P2-A 时明确欠下的债：`resolveCurrentUsage` / `renderChildAgentRollup` /
+`renderContextOccupancy` / `collectTodayUsage` 住在 `@harness/cli`，而 sidecar 不能反向依赖 CLI。
+本轮把四个函数上移 `@harness/usage`：
+
+- 依赖纪律：全部走**结构化最小接口**（`StatsHarnessLike` / `StatsSessionLike` /
+  `OccupancyCompactOpts`），**不新增对 core/session 的包依赖**，`@harness/usage` 保持零依赖。
+  方法用**方法语法**声明（TS 方法参数双变），真实 `Harness` 才能结构性赋值过去。
+- CLI 保留薄再导出（`index.ts` re-export + `usage-today.ts` 变薄壳），既有导入面
+  （tui / 测试）一字未动；`resolveTodayUsage` 因签名带 `HarnessApp` 留在 CLI。
+- 类型摩擦两处，都在边界显式收窄：`cli/index.ts` 的 `/stats` 调用点
+  （`s as Session | undefined`）与 `tui.tsx` 的 `ContextOccupancyLine`（闭包包装）。
+
+### `harness/stats.get`（a2a-server 第 15 个控制方法）
+
+与 CLI `/stats` 同口径：`renderStatsText` + 子 agent 聚合（`usage.children()` 按
+`Session.parentId` 反查）+ 上下文占用区（窗口/阈值走 `buildCompactionOptions`，
+**按会话实际端点解析分母**）+ 当日跨会话归集。出参同时给结构化字段
+（`usage` / `today`）与**服务端渲染好的整页 `text`** —— 渲染文案只有宿主一份，
+扩展端直接显示（设计稿 §11 对策）。
+
+### 扩展端要点
+
+- **`/model` 的两段协议**：`planCommand` 返回 `model-resolve` 计划 → 参与者先
+  `harness/model.get` 拿 configured 清单 → `resolveModelSpec` 消解（序号 /
+  `provider/model` / 裸名精确匹配，匹配不上交纯 modelId 由 sidecar 判断）→
+  `harness/model.set`。歧义消解属**输入词汇**，按 control.ts 的既有判断留在敲命令的一端。
+- **prompt 切分不假设**：宿主各版本对 `request.prompt` 是否含命令名行为不一，
+  `planCommand` 统一剥前导 `/command` 再解析（§6.4 的实测警告落成代码）。
+- 渲染形状对不上时退化为 JSON 代码块 —— 宁可原始，不可编造。
+
+### 验证
+
+- 主仓 typecheck **41 包全绿**；全量测试（`bun run test`，per-package filter 口径）**2308 pass / 0 fail**
+  （a2a-server 104 → 108：stats +4；注意**全量口径是 per-package**，根目录裸 `bun test` 会把 826 个
+  测试文件串进同一 runtime，跨包冲突出大量假失败 —— 别用那个口径）。
+- 扩展 tsc（真 @types/vscode）exit 0；`adapters/vscode` **79 pass / 0 fail**
+  （57 → 79：commands 纯单测 +21、真 sidecar E2E +1 即 `stats.get` 全链路）。
+- 反向验证 4 处全部变红、还原后逐字一致（见下）。
+
+| # | 反向实验 | 预期变红 |
+|---|---|---|
+| 1 | `commands.ts` 去掉剥前导命令名的正则 | `宿主把整行塞进 prompt 时剥掉前导命令名` |
+| 2 | `resolveModelSpec` 序号分支删掉 configured 命中判断 | `序号 → configured 清单命中` |
+| 3 | `renderControlResult` stats 分支恒 false（强制走 JSON 兜底） | `直接展示服务端渲染的整页 text` |
+| 4 | `control.ts` 注销 `harness/stats.get` | 控制面 3 条 stats 用例 |
+
+### 落档
+
+设计稿 §6.3 订正框（stats 已落地）/ §9 表（P2-v1 ✅）更新；计划 P2 行更新；
+新 skill 增补；memory 追加。提交按主题分块：usage 上移 / a2a-server stats / vscode 命令+自检 / docs。
 ## 2026-10-01（续 241）P2-B：VSCode 扩展骨架 `adapters/vscode/` —— 案 A 传输 + 真 sidecar 端到端
 
 ### 做什么
