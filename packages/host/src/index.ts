@@ -77,6 +77,7 @@ export type {
 // Provider 校验和配置概览。它们此前住在 `@harness/cli`，但 `boot()` 直接依赖 —— 而 host 不能再
 // 反向 import cli。单独成文件（`./config.ts`），与上面的纯推导分开：那一节是"分母从哪来"，
 // 这一节是"配置写了什么、生效了没有"。
+export * from './files'
 export * from './config'
 
 
