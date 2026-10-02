@@ -6,7 +6,9 @@
  */
 
 import * as vscode from 'vscode'
+import { existsSync } from 'node:fs'
 import { buildFollowups, type FollowupsStateLike } from './followups'
+import { resolveLaunchOptions } from './launch'
 import { createParticipantHandler } from './participant'
 import { Sidecar } from './sidecar'
 import { A2aTransport } from './transport/a2a'
@@ -71,8 +73,9 @@ export function deactivate(): void {
 /**
  * 决定"用什么跑 CLI"。
  *
- * harness 是 **Bun**、extension host 是 **Node** —— 这条边界躲不掉（设计稿 §3.1）。
- * 优先级：显式配置 > 工作区内的 `packages/cli/src/index.ts`（配 bun）> PATH 上的 `harness`。
+ * 优先级与理由都写在 `launch.ts`（纯模块）：显式配置 > 工作区内的**编译二进制**
+ * （P3-A：`bun run build:sidecar` 产出，自包含）> 工作区内的 TS 入口（配 bun）
+ * > PATH 上的 `harness`。这里只负责把 vscode 的配置/工作区喂进去。
  */
 function resolveLaunch(_context: vscode.ExtensionContext): {
   cliPath: string
@@ -81,32 +84,23 @@ function resolveLaunch(_context: vscode.ExtensionContext): {
   token?: string
 } {
   const cfg = vscode.workspace.getConfiguration('harness')
-  const configured = cfg.get<string>('cliPath', '').trim()
-  const token = cfg.get<string>('token', '').trim()
   const folders = vscode.workspace.workspaceFolders ?? []
   const cwd = folders[0]?.uri.fsPath ?? process.cwd()
 
-  if (configured !== '') {
-    // 显式给了入口：`.ts` 需要 bun 跑，否则当作可执行
-    return {
-      cliPath: configured,
-      runner: configured.endsWith('.ts') ? findBun() : undefined,
-      cwd,
-      token,
-    }
-  }
-
-  // 自动探测：本仓布局 `packages/cli/src/index.ts`
-  const inRepo = `${cwd}/packages/cli/src/index.ts`
-  try {
-    if (require('node:fs').existsSync(inRepo)) {
-      return { cliPath: inRepo, runner: findBun(), cwd, token }
-    }
-  } catch {
-    /* 忽略：拿不到 fs 就走兜底 */
-  }
-
-  return { cliPath: 'harness', cwd, token }
+  return resolveLaunchOptions({
+    cwd,
+    sidecarPath: cfg.get<string>('sidecarPath', ''),
+    cliPath: cfg.get<string>('cliPath', ''),
+    token: cfg.get<string>('token', ''),
+    bun: findBun(),
+    exists: (p) => {
+      try {
+        return existsSync(p)
+      } catch {
+        return false
+      }
+    },
+  })
 }
 
 function tokenOf(): string | undefined {

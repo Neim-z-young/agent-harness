@@ -34,6 +34,48 @@ function launch(): Sidecar {
   return new Sidecar({ cliPath: CLI, runner: 'bun', cwd: REPO, timeoutMs: 60_000 })
 }
 
+/**
+ * 编译二进制（`bun run build:sidecar` 产出）端到端 —— P3-A 的分发路径。
+ *
+ * 为什么单独一条：编译产物的失败模式是**启动即崩**（`Cannot find module '@harness/…'
+ * from '/$bunfs/root/…'`），与源码路径完全无关；只有真跑二进制才验得到。
+ * 没构建过就跳过（二进制不该进 git）。
+ */
+const BINARY = join(REPO, 'packages/cli/dist/harness-a2a')
+const hasBinary = existsSync(BINARY)
+
+describe.skipIf(!hasBinary)('编译二进制 sidecar 端到端（P3-A）', () => {
+  it('二进制模式握手：不给 runner，端点与源码模式同构', async () => {
+    const s = new Sidecar({ cliPath: BINARY, cwd: REPO, timeoutMs: 60_000 })
+    try {
+      const hs = await s.start()
+      expect(hs.v).toBe(1)
+      expect(hs.port).toBeGreaterThan(0)
+      expect(hs.controlUrl).toContain('/harness/rpc')
+      // 卡片可取 ⇒ 内置插件的惰性加载在编译产物里真的成立
+      // （失败模式是启动即 Fatal，握手根本走不到这里）
+      const res = await fetch(hs.cardUrl)
+      expect(res.ok).toBe(true)
+      const card = (await res.json()) as Record<string, unknown>
+      expect(card['name']).toBeTruthy()
+    } finally {
+      await s.dispose()
+    }
+  })
+
+  it('控制面在二进制模式下同样可用（不是只有 A2A 面活着）', async () => {
+    const s = new Sidecar({ cliPath: BINARY, cwd: REPO, timeoutMs: 60_000 })
+    try {
+      const t = new A2aTransport({ sidecar: s })
+      await t.start()
+      const r = (await t.control('harness/notice.list')) as { total?: number }
+      expect(typeof r.total).toBe('number')
+    } finally {
+      await s.dispose()
+    }
+  })
+})
+
 describe.skipIf(!hasCli)('sidecar 端到端', () => {
   it('握手：拿到真端口与三个端点', async () => {
     const s = launch()
