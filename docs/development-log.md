@@ -1,5 +1,63 @@
 # Agent Harness 开发日志
 
+## 2026-10-02（续 245）P3-B：侧栏 webview 面板（不依赖 Copilot 的那个落点）
+
+### 做什么
+
+设计稿 §1 里 P3 只有一句验收口径（"块模型 / 侧栏 / 会话 / 后台任务 / 文件引用 / 统计"），
+§12 是本轮开工前补的**组件级设计**。本轮落地的是**侧栏**：把控制面已有的事实常驻呈现 + 可点操作。
+
+动机是开放问题 #7 的另一半：P2 全押在 Chat 视图上，而 Chat 视图要 Copilot Chat 存在，
+且 `ChatResponseStream` 稳定面只有 7 个方法（§4.2）——"会话/任务/文件/统计"这类结构性信息
+在那里只能靠一条条 `/xxx` 命令问出来。侧栏是**不依赖 Copilot** 的落点。
+
+### 三条硬纪律（本轮的设计核心，写在设计稿 §12.2）
+
+| # | 纪律 | 为什么 |
+|---|---|---|
+| 1 | **不新增"面板专用"控制方法** | 面板只调已有 `harness/*`。为 UI 开后门 = 退回 P0 拆掉的耦合 |
+| 2 | **后台任务走 A2A 的 `ListTasks`** | 协议里有的方法不许搬进控制面（与 §6.3 同一条界线）。实测真服务端认它（返回 `{tasks:[]}`）⇒ 不是只写在纸上的纪律 |
+| 3 | **文案只有宿主一份** | 统计/通知/文件树一律直显 sidecar 回传的 text 字段，扩展不写第二套渲染器 |
+
+### 落地
+
+| 改动 | 说明 |
+|---|---|
+| `adapters/vscode/src/webview/state.ts`（新） | 纯模块：view-model 归一（endpoint / 会话 / 任务 / 引用 / 统计 / 通知）+ **分区独立降级** + `planPanelAction`（webview 消息 → 动作描述）。跨进程回包形状不可信 ⇒ 一律 `unknown` 入、归一失败即该分区降级 |
+| `adapters/vscode/src/webview/html.ts`（新） | 纯模块：面板骨架 + **CSP（`default-src 'none'`，脚本只认 nonce）**。容器 id 与前端一一对应，有用例钉住 |
+| `adapters/vscode/src/webview/panel.ts`（新） | 唯一碰 `vscode.WebviewView` 的文件：`Promise.all` 并行拉五个分区 → `settled()` 转"值或原因" → 推给前端；动作执行（control / open-file / command） |
+| `adapters/vscode/media/panel.{css,js}`（新） | 前端**手写、无构建链**（§10.4）：只用 `textContent` 不用 `innerHTML`（内容来自跨进程回包），按钮只发动作 type、方法名由 `planPanelAction` 侧校验 |
+| `adapters/vscode/media/activitybar.svg`（新） | 单色 `currentColor` 图标 |
+| `types.ts` / `transport/a2a.ts` | `HarnessTransport` 新增 `listTasks()`（打 `/a2a` 的 `ListTasks`，**不是** `/harness/rpc`）+ 2 条假 fetch 用例（含 `MethodNotFound` ⇒ 抛错由调用方降级） |
+| `package.json` | 贡献点：`viewsContainers.activitybar` + `views.webview`（`harness.panel`）+ 命令 `harness.refreshPanel`（挂在 `view/title`）；**`package` 脚本改为先 `compile` 再打包** |
+| `extension.ts` | 注册 `HarnessPanelProvider`（`retainContextWhenHidden`）+ `harness.refreshPanel` |
+
+### 实测到的一件事
+
+`out/` 此前是**过期产物**（还停在 P2-v1：没有 `commands.js` / `followups.js` / `launch.js`）——
+说明前几轮"打包 VSIX"有可能打的是旧编译结果（`vsce` 不会替你编译）。
+已把 `compile` 接进 `package` 脚本（`bun run compile && vsce package --no-dependencies`），
+本轮打包前重编译，产物从 42 → **62 文件**（`out/` 28 个）。
+
+### 验证
+
+- 扩展 **147 pass / 0 fail**（112 → 147，+35：state 25 / html 6 / ListTasks 2 / 面板 E2E 1 / …）；
+  `tsc --noEmit` exit 0。
+- **真 sidecar 面板 E2E**：四个控制面 + `ListTasks` 全部取到 ⇒ `buildPanelState` 的 `ready=true`、
+  会话非空、统计含"上下文占用"、通知非空、`warnings` **为空**（分区没降级）。
+- 主仓 typecheck 41 包全绿；全量 **2318 pass / 0 fail**（adapters 隔离，未被本轮触碰）。
+- **反向验证 4 处全部变红**，还原后 `shasum -a 256 -c` 逐字一致：
+  ① 去掉会话排序 ⇒ 排序用例红；② `buildPanelState` 忽略 `statsError` ⇒ 统计降级用例红；
+  ③ `compact` 模式白名单去掉 ⇒ 白名单用例红；④ 骨架 script 去掉 nonce ⇒ CSP 用例红。
+- VSIX 重新打包（62 文件 / 141.5KB）并 `code --install-extension --force` 实装成功。
+
+### 遗留
+
+- **P3-B2（块模型时间线）**：把流式回答的 text / 工具 / 权限 / 错误块搬进 webview ——
+  需要"最近一轮块"的宿主侧缓冲，是独立一条线。
+- 人手点验：会话恢复按钮、文件引用点开、`/compact` 按钮、面板在无 Copilot 环境下能否独立工作。
+- 79.9MB 二进制仍不进 VSIX（P3-A 遗留，未变）。
+
 ## 2026-10-02（续 244）P3-A：sidecar 单文件二进制分发（含 `--compile` 前置项收口）
 
 ### 做什么

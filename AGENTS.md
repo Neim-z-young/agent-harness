@@ -18,9 +18,11 @@
 
 - 新包必须同步在根 `tsconfig.json` 的 `paths` 与相关 `package.json` 的 `dependencies` 注册，然后 `bun install`
 
-- **`adapters/` 是例外，刻意不进 workspace**（`adapters/vscode/`：VSCode Chat Participant，P2）：
+- **`adapters/` 是例外，刻意不进 workspace**（`adapters/vscode/`：VSCode Chat Participant（P2）+ 侧栏 webview 面板（P3-B））：
 
-  - 它带 `@types/vscode` 与 webview 构建链，进 workspace 会污染主包的类型面与依赖树；独立 `package.json` / `tsconfig.json`（`types: ["vscode","node"]`）
+  - 它带 `@types/vscode`，进 workspace 会污染主包的类型面与依赖树；独立 `package.json` / `tsconfig.json`（`types: ["vscode","node"]`）；**前端（`media/panel.{css,js}`）手写、不引入构建链**（否则要把该目录变成"需要打包的目录"，稀释下面这条隔离）
+
+  - 侧栏面板分层（P3-B）：`src/webview/state.ts`（纯：view-model 归一 + 动作规划）/ `src/webview/html.ts`（纯：骨架 + CSP nonce）/ `src/webview/panel.ts`（**唯一**碰 `vscode.WebviewView` 的文件）。面板只调**已有**的 `harness/*` 控制方法 + A2A `ListTasks`，**不为 UI 新增控制方法**（设计稿 §12.2）
 
   - **不依赖任何 `@harness/*`、源码也不 `import @harness/*`** —— 它是纯协议客户端，跨进程只讲 A2A（+ 控制面 `/harness/rpc`）
 

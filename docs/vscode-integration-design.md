@@ -496,7 +496,8 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | **P2-v1（✅ 已落地 2026-10-02，续 242）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗（三项 P2-B 已落地）；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`，解析在 `commands.ts` 纯模块，`/model` 为 get→resolve→set 两段协议）；启动自检提示（warn notices 每线程首轮一次） | 扩展 79 pass（含 7 条真 sidecar E2E）；主仓 2308 pass / 0 fail |
 | **P2-v2（✅ 已落地 2026-10-02，续 243）** | 14 个斜杠命令（+`/sessions /new /resume /save /tree /stats-export /history /help`；`/config /plugins /edit /exit` 为 TUI 专属语义、刻意不适配）；`/new /resume` 换绑 TurnState.contextId，`/resume` 为 session.list→消解→resume 两段协议；`/tree` → `stream.filetree`（树纯函数上移 `@harness/host/files.ts`）；`/stats-export` → `stream.reference`（新控制方法 `session.save` / `tree.get` / `stats.export`）；对话正文文件引用扫描（正则与宿主同源，守卫测试钉住）；follow-ups 三档 | 扩展 101 pass（含 9 条真 sidecar E2E）；主仓 2314 pass / 0 fail |
 | **P3-A（✅ 已落地 2026-10-02，续 244）** | sidecar **单文件二进制分发**：`bun run build:sidecar` 产出 `packages/cli/dist/harness-a2a`（79.9MB / 354 modules）；前置是把 `lazyImport` 的内置包改**静态查表**（30 个 specifier）+ 双向守卫测试；扩展新增 `launch.ts` 纯模块（优先级：显式 `sidecarPath` > 显式 `cliPath` > 工作区二进制 > TS 入口配 bun > PATH `harness`）与配置 `harness.sidecarPath` | 扩展 112 pass（含 2 条**真二进制 E2E**：握手 + 取卡 + 控制面）；主仓 2318 pass / 0 fail |
-| **P3-B（未开工）** | webview 平移块模型与侧栏（会话 / 后台任务 / 文件引用 / 统计） | plan §6 的 P3 验收 |
+| **P3-B1（✅ 已落地 2026-10-02，续 245）** | **侧栏 webview 面板**：`webview/state.ts`（纯 view-model + `planPanelAction`）/ `webview/html.ts`（纯骨架 + CSP nonce）/ `webview/panel.ts`（唯一碰 `vscode.WebviewView`）/ `media/panel.{css,js}`（手写、无构建链）；五个分区（会话 / 后台任务 / 文件引用 / 统计 / 宿主通知）**并行拉取、分区独立降级**；`HarnessTransport.listTasks()` 走 A2A `ListTasks`（不是控制面） | 扩展 **147 pass / 0 fail**（+35）；真 sidecar 面板 E2E：`ready=true`、`warnings` 为空（无分区降级）；主仓 2318 pass / 0 fail；反向验证 4 处全红；VSIX 62 文件实装成功 |
+| **P3-B2（未开工）** | **块模型时间线**：把流式回答的 text / 工具 / 权限 / 错误块搬进 webview（需"最近一轮块"的宿主侧缓冲） | plan §6 的 P3 验收的剩余一格 |
 
 **P2-v1 的"开工第一步"**（三个必须先钉死的行为，都不是设计问题而是实测问题）：
 1. `request.command` 与 `request.prompt` 对 `/permission bash=deny` 的切分行为（§6.4）。
@@ -529,6 +530,96 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | 两套界面（CLI 与 VSCode）文案漂移 | 渲染文案复用同一批纯函数（`renderStatsText` / `renderContextOccupancy` / `buildPermissionPrompt` 等） |
 | 扩展依赖 `harness` 二进制分发 | ~~P3 用 `bun build --compile`（P0.5：61MB / 冷启动 18ms / 能加载用户 TS 插件）~~ **P3-A 实测订正**：光有 P0.5 的结论不够 —— 真编译主 CLI 会**启动即崩**（`Cannot find module '@harness/provider-openai' from '/$bunfs/root/…'`），因为内置插件是**按包名**动态导入、`import(变量)` 进不了 bundle（P0.5 验的是用户插件的 `file://` 绝对路径，不是同一条路）。**对策**：`packages/host/src/lazy.ts` 改静态查表（字面量可静态分析），并加双向守卫（注册点集合 == 表键集合 + 表内逐个真 import）。修完实测：二进制握手 / 取卡 / 控制面全通 |
 | 主仓 CI 被扩展依赖污染 | `adapters/vscode/` 不进 `workspaces`、不进 root `tsconfig.include`，并加**守卫测试**（§3.2） |
+
+---
+
+## 12. P3-B1 组件级设计：侧栏 webview
+
+> P3 在本稿里此前"只定接缝"（§1），P3-B 开工前补这一节。**本轮已落地**（续 245），
+> §12.8 的块模型时间线留给 P3-B2。
+
+### 12.1 它补的是什么
+
+P2 的落点是 **Chat 视图**（`chatParticipants`），代价写在开放问题 #7：Chat 视图要 Copilot Chat 存在，且
+`ChatResponseStream` 稳定面只有 7 个方法（§4.2）——"侧栏常驻的会话/任务/文件/统计"这类**结构性信息**
+在那里无处安放，只能靠 `/sessions` `/stats` `/tree` 一条条命令问出来。
+
+P3-B 补的是**不依赖 Copilot 的那个落点**：一个 webview 侧栏，把控制面已有的事实**常驻呈现 + 可点操作**。
+
+### 12.2 硬纪律（三条，都是本仓既有纪律的延伸）
+
+| # | 纪律 | 理由 |
+|---|---|---|
+| 1 | **不新增"面板专用"控制方法** | 面板只读/只调**已有**的 `harness/*`（`session.list` / `stats.get` / `tree.get` / `notice.list` / `session.new` / `session.resume` / `session.save` / `compact` / `stats.export`）。控制面一旦为 UI 开后门，就退回到 P0 拆掉的那种耦合 |
+| 2 | **后台任务走 A2A 协议方法，不走控制面** | `ListTasks` 是 A2A 自己的方法（不是我方私有），放 `HarnessTransport.listTasks()` 而不是 `harness/tasks.list` —— 协议面能表达的，不许落进控制面（与 §6.3 同一条界线） |
+| 3 | **渲染文案只有宿主一份** | 面板的统计/通知/文件树一律显示 sidecar 回传的 **text 字段**（`stats.get.text` / `notice.list[].text` / `tree.get.text`），扩展端不写第二套渲染器（§11「两套界面文案漂移」的对策） |
+
+### 12.3 分层（纯模块 + 薄适配，与 `commands.ts` / `launch.ts` 同一套路）
+
+```
+adapters/vscode/
+├─ src/webview/state.ts     ← 纯：view-model 归一 + 面板动作规划（不 import vscode）
+├─ src/webview/html.ts      ← 纯：面板骨架 + CSP（nonce 由调用方注入）
+├─ src/webview/panel.ts     ← 薄：唯一碰 vscode.WebviewView 的文件（拉数据 / 发消息 / 执行动作）
+└─ media/panel.{css,js}     ← 前端：手写，无构建链（§10.4「避免 webview 构建链污染」）
+```
+
+为什么前端**不引入构建链**：面板是"信息面板"，DOM 量小；为一个 esbuild 配置把 `adapters/vscode/`
+变成需要打包的目录，会污染 §3.2 那套隔离（守卫测的是"扩展不依赖 `@harness/*`"，但构建链会引入
+另一类依赖面）。手写 JS + CSP nonce 足够，且 VSIX 打包无需额外步骤。
+
+### 12.4 数据流
+
+```
+webview (media/panel.js)                    extension host                    sidecar
+   │  postMessage {type:'refresh'|'new'|'resume'|…}     │                        │
+   ├─ planPanelAction(msg) ─────────────► PanelAction ──┤                        │
+   │                                    control(...) ──┼── POST /harness/rpc ───►│
+   │                                    listTasks()  ──┼── POST /a2a (ListTasks)►│
+   │  ◄── {type:'state', state: PanelState} ───────────┤                        │
+```
+
+- **分区独立、并行拉取**（`Promise.allSettled`）：一个分区失败只降级那一个（`warnings` 里写明原因），
+  不整块变灰 —— 与 §8「降级事实可见」同一口径。
+- **刷新时机**：视图首次可见、面板内点操作后、命令 `harness.refreshPanel`。**不做轮询**
+  （sidecar 没有变更推送，轮询只会制造噪声与端口流量）。
+
+### 12.5 view-model 契约（`PanelState`）
+
+`PanelState` 是**扩展与 webview 之间唯一的契约**（`postMessage` 的 payload）：
+
+| 分区 | 来源 | 归一要点 |
+|---|---|---|
+| `endpoint` | `SidecarHandshake` | pid / port / auth / permissionMode，用于"面板连的是哪个 sidecar" |
+| `sessions` | `harness/session.list` | 排序：当前 → 项目指针 → 本目录 → 更新时间倒序；标记徽章（当前/指针/本目录） |
+| `tasks` | A2A `ListTasks` | `TASK_STATE_*` 前缀剥掉后人读化；取不到 ⇒ 降级为"不可用"并给原因 |
+| `refs` | `harness/tree.get` 的 `refs` | 对话引用过的文件（截断到上限），点开直达 |
+| `stats` | `harness/stats.get` 的 `text` | 整页文本直显 |
+| `notices` | `harness/notice.list` | 宿主的降级事实（"未配置 key ⇒ 回落 Mock"）**常驻可见** |
+| `warnings` | 逐个分区的失败原因 | 面板自己也要能说出"我为什么是空的" |
+
+### 12.6 面板能触发什么（`PanelAction`）
+
+`planPanelAction(msg)` 是纯函数（与 `planCommand` 同源思路），输出**动作描述**而非执行：
+
+```
+refresh → 重拉      new/resume/save/compact/stats-export → control(方法, 参数) + 刷新
+open    → vscode 打开该文件      show-status → 执行已有命令 harness.showStatus
+未知   → noop（带 reason，写进日志，不静默）
+```
+
+面板**不发对话**（那是 Chat 视图的事）—— 刻意不把 prompt 输入框搬进来，避免两条对话入口。
+
+### 12.7 验收（可自动化的部分）
+
+- 纯模块单测：`state.ts`（归一/排序/降级/动作规划）+ `html.ts`（CSP nonce 覆盖到 script 标签）。
+- 真 sidecar E2E：起真进程 → 拉四个分区 → `buildPanelState` 的 `warnings` 为空且各分区非空。
+- 无法自动化：webview 里的点击与样式（要人手点）。
+
+### 12.8 不做（留给 P3-B2）
+
+**块模型时间线**（把流式回答的 text / 工具 / 权限 / 错误块搬进 webview）不在本轮 ——
+它要求把参与者的流式事件同时喂给面板（需要一条"最近一轮块"的宿主侧缓冲），是独立的一条线。
 
 ---
 
