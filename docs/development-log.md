@@ -1,5 +1,60 @@
 # Agent Harness 开发日志
 
+## 2026-10-02（续 244）P3-A：sidecar 单文件二进制分发（含 `--compile` 前置项收口）
+
+### 做什么
+
+P3 的第一格：**sidecar 不再依赖「机器上有 bun + 仓库源码」**，改成 spawn
+`bun build --compile` 产出的单文件二进制。
+
+### 实测先推翻了一个既有结论
+
+设计稿 §10 第 6 项与 plan §8 写着「P3 sidecar 走 `--compile`」，依据是 P0.5 的
+spike 结论（61MB / 冷启动 18ms / 能加载用户 TS 插件）。**直接编译主 CLI 后发现不成立**：
+
+```
+$ bun build packages/cli/src/index.ts --compile --outfile dist/harness-a2a   # 354 modules / 79.9MB
+$ ./dist/harness-a2a a2a --json --port 0
+[WARN] 内置插件「tools-builtin」元信息来源预载失败：Cannot find module '@harness/tools-builtin/meta' from '/$bunfs/root/harness-a2a'
+Fatal: Cannot find module '@harness/provider-openai' from '/$bunfs/root/harness-a2a'
+```
+
+根因不是 `--compile` 不支持动态导入 —— **是打包器只能静态分析字面量**：
+
+- P0.5 验的是「**用户插件目录**的动态 `.ts`」，specifier 是 `file://` 绝对路径 —— 编译后照样可用；
+- 主 CLI 还依赖另一条：**内置插件按包名**动态导入（`lazyImport('@harness/provider-openai')`，
+  变量形式）⇒ 不进 bundle ⇒ 运行期从 `/$bunfs/root/` 按路径找 `node_modules` ⇒ 必挂。
+  未编译时这条路径靠 monorepo 根 `node_modules` 的软链命中，所以**只有编译后才暴露**。
+
+`packages/host/src/lazy.ts` 的文件头其实早就点了这件事（"打包时需按清单显式收入口"），
+但那是推断；**本轮是第一次真编译**，把推断变成了事实。
+
+### 落地
+
+| 改动 | 说明 |
+|---|---|
+| `packages/host/src/lazy.ts` | 内置包改**静态查表**（`BUILTIN_LAZY`，30 个 specifier 全数字面量 `() => import('…')`）：字面量 ⇒ 可静态分析 ⇒ 进 bundle 且运行期重写命中；**惰性语义不变**（表值是函数，不调用就不加载）。表外 specifier（外部/用户插件的 `file://` 绝对 URL）仍走动态路径 |
+| `packages/host/package.json` | 补 `@harness/telemetry` 显式依赖（它在 `packages/plugins/` 下、不在 `packages/*` 平铺层，此前靠根 node_modules 软链隐式解析 —— 正是"编译后才漏"的典型） |
+| `packages/host/src/builtin-registry.test.ts` | **守卫 +4**：扫描 `plugins.ts` / `host.ts` 的注册点集合 == 静态表键集合（双向：漏项 / 腐烂项都红）+ 表内每个 specifier 真 import 一遍 |
+| `packages/cli/package.json` | 新增脚本 `build:sidecar` |
+| `adapters/vscode/src/launch.ts` | 新增**纯模块**（不 import vscode）：启动解析优先级 = 显式 `sidecarPath` > 显式 `cliPath` > 工作区编译二进制 > 工作区 TS 入口（配 bun）> PATH `harness` |
+| `adapters/vscode/package.json` | 新增配置 `harness.sidecarPath` |
+| `adapters/vscode/src/extension.ts` | `resolveLaunch` 改为灌配置进 `resolveLaunchOptions`（顺序与理由都在纯模块里，可单测） |
+
+### 验证
+
+- 二进制冒烟：握手吐合法 JSON（port 60216）、AgentCard 可取、控制面 `notice.list` 通 ⇒
+  内置插件的惰性加载在编译产物里真的成立（失败模式是启动即 Fatal，握手根本走不到）。
+- 扩展新增 2 条**真二进制 E2E**（二进制不存在时 `skipIf` 跳过 —— 二进制不该进 git，
+  `dist/` 已 gitignore）。
+- 主仓 typecheck 41 包全绿；全量 **2318 pass / 0 fail**（41 包）；扩展 tsc exit 0、**112 pass / 0 fail**。
+
+### 遗留
+
+- 79.9MB 二进制**不进 VSIX**（本地实装够用即可）；要随扩展分发得再定裁剪方案。
+- `@harness/telemetry` 的包位置（`packages/plugins/telemetry`）说明 `packages/*` 的
+  glob 假设并不覆盖全部 workspace 包 —— 类似的"隐式解析"可能还有别处，等下一次编译撞到。
+
 ## 2026-10-02（续 243）P2-v2：全部命令接入 + `reference`/`filetree` 呈现 + follow-ups
 
 ### 做什么

@@ -495,7 +495,8 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | **P2-B（骨架 / P2-v0）（✅ 已落地 2026-10-01，续 241）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答 | **无头可验的部分全绿**：`adapters/vscode` 57 pass / 0 fail（含 6 条真 sidecar 端到端：握手 / 取卡 / 版本头陷阱 / 控制面 / 流式管道 / dispose 无残留）；VSIX 打包并用 `code --install-extension` 实装成功。**仍需人手点验**：在 Chat 视图里 `@harness` 提问（本机未装 Copilot，Chat 视图无模型提供方时不显示参与者） |
 | **P2-v1（✅ 已落地 2026-10-02，续 242）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗（三项 P2-B 已落地）；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`，解析在 `commands.ts` 纯模块，`/model` 为 get→resolve→set 两段协议）；启动自检提示（warn notices 每线程首轮一次） | 扩展 79 pass（含 7 条真 sidecar E2E）；主仓 2308 pass / 0 fail |
 | **P2-v2（✅ 已落地 2026-10-02，续 243）** | 14 个斜杠命令（+`/sessions /new /resume /save /tree /stats-export /history /help`；`/config /plugins /edit /exit` 为 TUI 专属语义、刻意不适配）；`/new /resume` 换绑 TurnState.contextId，`/resume` 为 session.list→消解→resume 两段协议；`/tree` → `stream.filetree`（树纯函数上移 `@harness/host/files.ts`）；`/stats-export` → `stream.reference`（新控制方法 `session.save` / `tree.get` / `stats.export`）；对话正文文件引用扫描（正则与宿主同源，守卫测试钉住）；follow-ups 三档 | 扩展 101 pass（含 9 条真 sidecar E2E）；主仓 2314 pass / 0 fail |
-| **P3** | webview 平移块模型与侧栏；`--compile` 单文件二进制随扩展分发 | plan §6 的 P3 验收 |
+| **P3-A（✅ 已落地 2026-10-02，续 244）** | sidecar **单文件二进制分发**：`bun run build:sidecar` 产出 `packages/cli/dist/harness-a2a`（79.9MB / 354 modules）；前置是把 `lazyImport` 的内置包改**静态查表**（30 个 specifier）+ 双向守卫测试；扩展新增 `launch.ts` 纯模块（优先级：显式 `sidecarPath` > 显式 `cliPath` > 工作区二进制 > TS 入口配 bun > PATH `harness`）与配置 `harness.sidecarPath` | 扩展 112 pass（含 2 条**真二进制 E2E**：握手 + 取卡 + 控制面）；主仓 2318 pass / 0 fail |
+| **P3-B（未开工）** | webview 平移块模型与侧栏（会话 / 后台任务 / 文件引用 / 统计） | plan §6 的 P3 验收 |
 
 **P2-v1 的"开工第一步"**（三个必须先钉死的行为，都不是设计问题而是实测问题）：
 1. `request.command` 与 `request.prompt` 对 `/permission bash=deny` 的切分行为（§6.4）。
@@ -526,7 +527,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | 控制面方法随 CLI 漂移 | 控制面方法以"host 公共面"为唯一实现来源，**不许在 sidecar 里另写逻辑**（同 P1 对 a2a-server 的纪律：只做翻译与装配） |
 | 端口冲突 / sidecar 残留 | `--port 0` 自动分配 + 扩展 deactivate 时 `kill`；`--token <随机>` 防本机其他进程误连 |
 | 两套界面（CLI 与 VSCode）文案漂移 | 渲染文案复用同一批纯函数（`renderStatsText` / `renderContextOccupancy` / `buildPermissionPrompt` 等） |
-| 扩展依赖 `harness` 二进制分发 | P3 用 `bun build --compile`（P0.5 已验证：61MB / 冷启动 18ms / 能加载用户 TS 插件） |
+| 扩展依赖 `harness` 二进制分发 | ~~P3 用 `bun build --compile`（P0.5：61MB / 冷启动 18ms / 能加载用户 TS 插件）~~ **P3-A 实测订正**：光有 P0.5 的结论不够 —— 真编译主 CLI 会**启动即崩**（`Cannot find module '@harness/provider-openai' from '/$bunfs/root/…'`），因为内置插件是**按包名**动态导入、`import(变量)` 进不了 bundle（P0.5 验的是用户插件的 `file://` 绝对路径，不是同一条路）。**对策**：`packages/host/src/lazy.ts` 改静态查表（字面量可静态分析），并加双向守卫（注册点集合 == 表键集合 + 表内逐个真 import）。修完实测：二进制握手 / 取卡 / 控制面全通 |
 | 主仓 CI 被扩展依赖污染 | `adapters/vscode/` 不进 `workspaces`、不进 root `tsconfig.include`，并加**守卫测试**（§3.2） |
 
 ---
