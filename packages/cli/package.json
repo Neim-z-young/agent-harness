@@ -58,7 +58,8 @@
     "build": "bun build src/index.ts --outdir dist --target bun",
     "start": "bun run ./src/index.ts repl",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build:sidecar": "bun build src/index.ts --compile --outfile dist/harness-a2a"
   },
   "devDependencies": {
     "@types/react": "^19.2.18"
