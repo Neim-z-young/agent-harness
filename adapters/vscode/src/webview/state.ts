@@ -143,6 +143,8 @@ export type PanelAction =
   | { readonly kind: 'open-file'; readonly path: string }
   /** 执行扩展已有命令 */
   | { readonly kind: 'command'; readonly id: string; readonly refresh: boolean }
+  /** 清空时间线（只清视图，不动会话 —— 与 sidecar 无关，故不是控制面调用） */
+  | { readonly kind: 'clear-timeline' }
   /** 认不出来：带 reason 记日志，不静默丢 */
   | { readonly kind: 'noop'; readonly reason: string }
 
@@ -207,6 +209,8 @@ export function planPanelAction(msg: unknown): PanelAction {
     }
     case 'show-status':
       return { kind: 'command', id: 'harness.showStatus', refresh: false }
+    case 'timeline-clear':
+      return { kind: 'clear-timeline' }
     default:
       return { kind: 'noop', reason: `未知消息类型：${type === '' ? '(空)' : type}` }
   }
@@ -223,6 +227,8 @@ export function describePanelAction(action: PanelAction): string {
       return `open-file ${action.path}`
     case 'command':
       return `command ${action.id}`
+    case 'clear-timeline':
+      return 'clear-timeline'
     case 'noop':
       return `noop(${action.reason})`
   }

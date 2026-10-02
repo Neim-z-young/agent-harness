@@ -27,8 +27,22 @@ import type { FileTreeWireNode, HarnessTransport, RenderOp } from './types'
 /** 权限续接的最大轮数（防死循环：每轮一次挂起） */
 const MAX_PERMISSION_ROUNDS = 8
 
+/**
+ * 块模型时间线的写入口（P3-B2）。
+ *
+ * 参与者**只认这个接口**，不认 `TimelineStore` —— 于是"每轮做了什么"既能喂侧栏，
+ * 也能将来喂别的落点（而参与者本身不需要知道谁在消费）。
+ */
+export interface TimelineSink {
+  startTurn(prompt: string): void
+  append(op: RenderOp): void
+  finish(outcome: string): void
+}
+
 export interface ParticipantDeps {
   readonly transport: HarnessTransport
+  /** 块模型时间线的写入口（侧栏订阅它）；缺省则不记 */
+  readonly timeline?: TimelineSink
   /** 追踪输出；`harness.trace` 打开时才写字 */
   readonly log?: (msg: string) => void
   /** 是否显示"在思考"之类提示（案 A 下拿不到推理内容，只有规模） */
@@ -83,6 +97,8 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
 
       let prompt = request.prompt
       let outcome: 'done' | 'cancelled' | 'error' = 'done'
+      // 时间线：本轮的"块"从这里开始累积（侧栏订阅它 —— 设计稿 §12.9）
+      deps.timeline?.startTurn(prompt)
 
       // 权限续接：挂起 ⇒ 弹窗 ⇒ 把答复当作新一条消息发回（带 taskId + contextId）
       for (let round = 0; round < MAX_PERMISSION_ROUNDS; round++) {
@@ -106,6 +122,8 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
           if (ids.taskId) state = { ...state, taskId: ids.taskId }
 
           const op = mapA2aEvent(frame)
+          // Chat 视图与时间线**同一份映射**（一份真相，两个落点）
+          deps.timeline?.append(op)
           switch (op.kind) {
             case 'text':
               textOut += op.text
@@ -160,11 +178,14 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       }
 
       if (outcome === 'cancelled') stream.markdown('\n\n_已停止_\n')
+      deps.timeline?.finish(outcome === 'done' ? 'completed' : outcome)
       return { metadata: state satisfies TurnState }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       stream.markdown(`\n\n❌ ${msg}\n\n`)
       log(`[error] ${msg}`)
+      // 异常退出也要收尾：否则时间线永远显示"进行中"
+      deps.timeline?.finish('error')
       return { metadata: state }
     } finally {
       token.onCancellationRequested(() => {})

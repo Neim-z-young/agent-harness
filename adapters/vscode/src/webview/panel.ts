@@ -22,6 +22,7 @@ import {
   planPanelAction,
   type PanelState,
 } from './state'
+import { TIMELINE_FLUSH_MS, TimelineStore, shouldFlush, type TimelineSnapshot } from './timeline'
 import type { HarnessTransport } from '../types'
 
 /** 与 `package.json` 的 `views[].id` 一致（改一处要改两处，故写死常量并加守卫用例） */
@@ -31,6 +32,8 @@ export interface PanelDeps {
   readonly transport: HarnessTransport
   /** 扩展根目录（`media/` 在它下面） */
   readonly extensionUri: vscode.Uri
+  /** 块模型时间线的共享缓冲（参与者写、面板订阅；P3-B2） */
+  readonly timeline?: TimelineStore
   /** 追踪输出 */
   readonly log?: (msg: string) => void
 }
@@ -39,8 +42,32 @@ export class HarnessPanelProvider implements vscode.WebviewViewProvider {
   private view: vscode.WebviewView | undefined
   /** 上一次成功拿到的端点（面板重显时先按它渲染，避免闪"未连接"） */
   private lastEndpoint: unknown
+  /** 时间线最近一次快照（视图还没就绪时先存着，就绪即补发） */
+  private lastTimeline: TimelineSnapshot | undefined
+  /** 时间线上次推送时刻（节流） */
+  private lastTimelineFlush = 0
+  /** 尾部推送的挂起定时器（保证最后一帧一定送到） */
+  private pendingFlush: ReturnType<typeof setTimeout> | undefined
 
-  constructor(private readonly deps: PanelDeps) {}
+  constructor(private readonly deps: PanelDeps) {
+    // 块更新是**流式每帧**的，节流后再推 —— 否则每个 token 都要走一次 postMessage。
+    // 但**最后一帧必须送到**（终态块落在节流窗口里就永远不显示了）⇒ 补一个尾部推送。
+    this.deps.timeline?.subscribe((snap) => {
+      this.lastTimeline = snap
+      const now = Date.now()
+      if (shouldFlush(now, this.lastTimelineFlush)) {
+        this.lastTimelineFlush = now
+        this.postTimeline(snap)
+        return
+      }
+      if (this.pendingFlush !== undefined) return
+      this.pendingFlush = setTimeout(() => {
+        this.pendingFlush = undefined
+        this.lastTimelineFlush = Date.now()
+        if (this.lastTimeline) this.postTimeline(this.lastTimeline)
+      }, TIMELINE_FLUSH_MS)
+    })
+  }
 
   // ---------------------------------------------------------------- 生命周期
 
@@ -61,6 +88,8 @@ export class HarnessPanelProvider implements vscode.WebviewViewProvider {
     view.webview.onDidReceiveMessage((msg: unknown) => {
       void this.handle(msg)
     })
+    // 视图刚可见：补发时间线（避免"刚切到面板时时间线是空的"）
+    if (this.lastTimeline) this.postTimeline(this.lastTimeline)
     // 前端脚本 load 时也会发一次 refresh；这里是"视图刚可见"的那一发
     void this.refresh()
   }
@@ -123,6 +152,10 @@ export class HarnessPanelProvider implements vscode.WebviewViewProvider {
         return
       case 'noop':
         return
+      case 'clear-timeline':
+        // 只清视图：不动会话、不调控制面（清空是 UI 状态，不是 harness 状态）
+        this.deps.timeline?.clear()
+        return
       case 'open-file':
         try {
           await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(action.path))
@@ -159,6 +192,11 @@ export class HarnessPanelProvider implements vscode.WebviewViewProvider {
 
   private post(state: PanelState): void {
     void this.view?.webview.postMessage({ type: 'state', state })
+  }
+
+  /** 时间线走**独立通道**（`state` 重且低频；块轻且高频） */
+  private postTimeline(snap: TimelineSnapshot): void {
+    void this.view?.webview.postMessage({ type: 'timeline', timeline: snap })
   }
 }
 

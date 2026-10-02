@@ -14,9 +14,10 @@ import { describe, expect, it } from 'bun:test'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { Sidecar } from './sidecar'
-import { extractTaskIds } from './map/render'
+import { extractTaskIds, mapA2aEvent } from './map/render'
 import { A2aTransport } from './transport/a2a'
 import { buildPanelState } from './webview/state'
+import { TimelineStore } from './webview/timeline'
 
 // 代理会把对 127.0.0.1 的请求吞掉（实测 502）⇒ 连本机前先摘掉
 for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
@@ -218,6 +219,37 @@ describe.skipIf(!hasCli)('sidecar 端到端', () => {
       // 任务分区走 A2A 的 ListTasks（不是控制面）：真服务端认它 ⇒ 不降级
       expect(Array.isArray(st.tasks)).toBe(true)
       expect(st.warnings).toEqual([])
+    } finally {
+      await s.dispose()
+    }
+  })
+
+  it('时间线（P3-B2）：真流式帧喂进块模型 ⇒ 累积成块（与 Chat 视图同一份映射）', async () => {
+    const s = launch()
+    try {
+      const t = new A2aTransport({ sidecar: s })
+      await t.start()
+      const store = new TimelineStore()
+      store.startTurn('只回复两个字：收到')
+
+      const controller = new AbortController()
+      for await (const frame of t.send({}, '只回复两个字：收到', controller.signal)) {
+        store.append(mapA2aEvent(frame))
+        // 拿到第一块就够证明"协议帧 → 块"这条线通；继续跑要等模型
+        if (store.snapshot.blocks.length > 0) break
+      }
+      controller.abort()
+
+      const snap = store.snapshot
+      expect(snap.started).toBe(true)
+      expect(snap.blocks.length).toBeGreaterThan(0)
+      // 第一块是 user（startTurn 落的），其后至少一块来自真协议帧
+      expect(snap.blocks[0]?.kind).toBe('user')
+      expect(snap.blocks.slice(1).map((b) => b.kind).length).toBeGreaterThan(0)
+
+      store.finish('completed')
+      expect(store.snapshot.streaming).toBe(false)
+      expect(store.snapshot.outcome).toBe('completed')
     } finally {
       await s.dispose()
     }

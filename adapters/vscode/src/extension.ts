@@ -13,6 +13,7 @@ import { createParticipantHandler } from './participant'
 import { Sidecar } from './sidecar'
 import { A2aTransport } from './transport/a2a'
 import { HarnessPanelProvider, PANEL_VIEW_ID } from './webview/panel'
+import { TimelineStore } from './webview/timeline'
 
 let current: { sidecar: Sidecar; transport: A2aTransport } | undefined
 let channel: vscode.OutputChannel | undefined
@@ -28,8 +29,13 @@ export function activate(context: vscode.ExtensionContext): void {
   const transport = new A2aTransport({ sidecar, token: tokenOf() })
   current = { sidecar, transport }
 
+  // 块模型时间线（P3-B2）：参与者写、侧栏订阅。同一个 store 注入两处 ——
+  // 参与者只认 `TimelineSink` 接口，面板只认 `TimelineStore`，两边都不依赖对方。
+  const timeline = new TimelineStore()
+
   const participant = vscode.chat.createChatParticipant('harness.agent', createParticipantHandler({
     transport,
+    timeline,
     log: (m) => channel?.appendLine(m),
     traceEnabled: () => vscode.workspace.getConfiguration('harness').get<boolean>('trace', false),
   }))
@@ -49,6 +55,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // 统计 / 宿主通知常驻可见，数据全部来自已有控制面 + A2A ListTasks（设计稿 §12）。
   const panel = new HarnessPanelProvider({
     transport,
+    timeline,
     extensionUri: context.extensionUri,
     log: (m) => channel?.appendLine(m),
   })

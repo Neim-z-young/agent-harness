@@ -45,6 +45,7 @@ export function createNonce(): string {
 export const PANEL_ELEMENT_IDS = {
   status: 'panel-status',
   warnings: 'panel-warnings',
+  timeline: 'panel-timeline',
   sessions: 'panel-sessions',
   tasks: 'panel-tasks',
   refs: 'panel-refs',
@@ -77,6 +78,11 @@ export function renderPanelHtml(o: PanelHtmlOptions): string {
 
 <div id="${ids.status}" class="status">正在连接 sidecar…</div>
 <ul id="${ids.warnings}" class="warnings"></ul>
+
+<section>
+  <h2>本轮时间线<button id="btn-clear" class="link" title="清空时间线（只是清视图，不动会话）">清空</button></h2>
+  <ul id="${ids.timeline}" class="list"></ul>
+</section>
 
 <section>
   <h2>会话</h2>

@@ -14,12 +14,23 @@ const vscode = acquireVsCodeApi()
 const IDS = {
   status: 'panel-status',
   warnings: 'panel-warnings',
+  timeline: 'panel-timeline',
   sessions: 'panel-sessions',
   tasks: 'panel-tasks',
   refs: 'panel-refs',
   stats: 'panel-stats',
   notices: 'panel-notices',
   refreshed: 'panel-refreshed',
+}
+
+/** 块种类 → 徽章文案（与 `timeline.ts` 的 PanelBlockKind 对应） */
+const KIND_LABEL = {
+  user: '我',
+  assistant: '答',
+  tool: '工具',
+  permission: '权限',
+  error: '错误',
+  system: '系统',
 }
 
 function el(tag, className, text) {
@@ -133,6 +144,42 @@ function renderRefs(state) {
   if (refs.truncated) node.appendChild(el('li', 'meta', `还有 ${Math.max(refs.total - refs.items.length, 0)} 条未显示`))
 }
 
+/**
+ * 块模型时间线（P3-B2）—— **第二条通道**：块是流式每帧更新（轻、高频），
+ * 而 PanelState 是手动刷新才拉（重、低频），混在一起会让每个 token 都重发整份 state。
+ */
+function renderTimeline(snap) {
+  const node = document.getElementById(IDS.timeline)
+  const blocks = (snap && snap.blocks) || []
+  if (blocks.length === 0) {
+    emptyInto(node, snap && snap.started ? '本轮还没有内容…' : '在 Chat 视图里 @harness 提问后，本轮过程会同步出现在这里')
+    return
+  }
+  clear(node)
+  for (const b of blocks) {
+    const li = document.createElement('li')
+
+    const head = el('div', 'row')
+    head.appendChild(el('span', 'badge', KIND_LABEL[b.kind] || b.kind))
+    if (b.repeats && b.repeats > 1) head.appendChild(el('span', 'meta', `×${b.repeats}`))
+    if (b.streaming) head.appendChild(el('span', 'badge', '进行中'))
+    li.appendChild(head)
+
+    const body = el('div', 'pre')
+    body.textContent = b.text
+    li.appendChild(body)
+
+    for (const r of b.refs || []) {
+      const btn = el('button', 'link', r)
+      btn.title = r
+      btn.addEventListener('click', () => post({ type: 'open', path: r }))
+      li.appendChild(btn)
+    }
+    node.appendChild(li)
+  }
+  if (snap && snap.streaming) node.appendChild(el('li', 'meta', '进行中…（流式更新，节流后刷新）'))
+}
+
 function renderStats(state) {
   const node = document.getElementById(IDS.stats)
   const stats = state && state.stats
@@ -176,6 +223,7 @@ window.addEventListener('message', (event) => {
   const msg = event.data
   if (!msg || typeof msg !== 'object') return
   if (msg.type === 'state') render(msg.state)
+  if (msg.type === 'timeline') renderTimeline(msg.timeline)
 })
 
 const bind = (id, msg) => {
@@ -188,5 +236,6 @@ bind('btn-new', { type: 'new' })
 bind('btn-save', { type: 'save' })
 bind('btn-compact', { type: 'compact' })
 bind('btn-status', { type: 'show-status' })
+bind('btn-clear', { type: 'timeline-clear' })
 
 post({ type: 'refresh' })
