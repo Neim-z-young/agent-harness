@@ -21,7 +21,15 @@
         "name": "harness",
         "fullName": "Agent Harness",
         "description": "用本仓 Agent Harness 对话（自带 Provider 与 agentic loop，不使用 Chat 视图的模型）",
-        "isSticky": true
+        "isSticky": true,
+        "commands": [
+          { "name": "compact", "description": "压缩当前会话上下文（可选：ifneeded / prune / summary / agent）" },
+          { "name": "stats", "description": "用量统计与上下文占用" },
+          { "name": "agent", "description": "查看或切换当前 Agent（/agent <id>）" },
+          { "name": "model", "description": "查看或切换模型（/model <序号 | provider/model | reset>）" },
+          { "name": "permission", "description": "查看或设置权限（/permission <mode | key=behavior | reset>）" },
+          { "name": "skills", "description": "查看或管理技能（/skills <enable | disable | reload> <id>）" }
+        ]
       }
     ],
     "commands": [

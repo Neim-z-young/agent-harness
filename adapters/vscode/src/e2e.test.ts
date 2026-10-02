@@ -99,6 +99,22 @@ describe.skipIf(!hasCli)('sidecar 端到端', () => {
     }
   })
 
+  it('控制面端到端：harness/stats.get 带回服务端渲染的整页 text', async () => {
+    const s = launch()
+    try {
+      const t = new A2aTransport({ sidecar: s })
+      await t.start()
+      const r = (await t.control('harness/stats.get')) as { text?: unknown; usage?: unknown; today?: unknown }
+      expect(r.usage).toBeObject()
+      expect(r.today).toBeObject()
+      expect(typeof r.text).toBe('string')
+      expect(r.text).toContain('上下文占用')
+      expect(r.text).toContain('（全部会话·当日）')
+    } finally {
+      await s.dispose()
+    }
+  })
+
   it('流式管道：拿到 task 帧与 contextId，且可取消', async () => {
     const s = launch()
     try {

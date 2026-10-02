@@ -11,6 +11,14 @@
  */
 
 import * as vscode from 'vscode'
+import {
+  planCommand,
+  renderCommandHelp,
+  renderControlResult,
+  renderWarnNotices,
+  resolveModelSpec,
+  type ConfiguredProvider,
+} from './commands'
 import { extractTaskIds, mapA2aEvent } from './map/render'
 import type { HarnessTransport, RenderOp } from './types'
 
@@ -29,6 +37,8 @@ export interface ParticipantDeps {
 interface TurnState {
   readonly contextId?: string
   readonly taskId?: string
+  /** 启动自检（warn notices）已在本线程展示过 —— 每条线程只提示一次 */
+  readonly noticesShown?: boolean
 }
 
 export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequestHandler {
@@ -43,11 +53,28 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
     try {
       await deps.transport.start()
 
+      // 启动自检（设计稿 §8）：每条线程首轮把 sidecar 的 warn 级降级事实亮出来。
+      // 失败静默 —— 自检永远不能挡住正常对话。
+      if (!state.noticesShown) {
+        state = { ...state, noticesShown: true }
+        try {
+          const notices = (await deps.transport.control('harness/notice.list', { level: 'warn' })) as {
+            notices?: Array<{ text?: unknown }>
+          }
+          const texts = (notices?.notices ?? [])
+            .map((n) => n.text)
+            .filter((t): t is string => typeof t === 'string' && t !== '')
+          if (texts.length > 0) stream.markdown(renderWarnNotices(texts))
+        } catch (e) {
+          log(`[self-check] notice.list 失败（忽略）：${e instanceof Error ? e.message : String(e)}`)
+        }
+      }
+
       // 斜杠命令 → 控制通道（设计稿 §6）。它们改的是 sidecar 进程状态，
       // A2A 协议里无处安放，故不走 /a2a。
       const command = request.command
       if (command) {
-        return await handleCommand(deps, command, request.prompt, stream)
+        return await handleCommand(deps, command, request.prompt, stream, state)
       }
 
       let prompt = request.prompt
@@ -176,36 +203,50 @@ async function askPermission(
 // 斜杠命令 → 控制通道
 // ========================================================================
 
-/** 命令名 → 控制面方法；只有这层知道映射，A2A 协议面不掺和 */
-const COMMAND_METHODS: Record<string, string> = {
-  stats: 'harness/notice.list',
-  notice: 'harness/notice.list',
-  sessions: 'harness/session.list',
-  agents: 'harness/agent.list',
-  skills: 'harness/skill.list',
-  permission: 'harness/permission.get',
-  model: 'harness/model.get',
-}
-
+/**
+ * 命令执行（设计稿 §6.4）。解析在 `commands.ts`（纯模块）；这里只编排：
+ *
+ * - 普通 `call` → `transport.control` → `renderControlResult`；
+ * - `/model <spec>` 的两段协议：先 `model.get` 拿 configured 清单，
+ *   扩展端消解歧义（序号 / provider/model / 裸名）后调 `model.set`；
+ * - 命令轮同样把 `TurnState`（含 noticesShown）写回 metadata。
+ */
 async function handleCommand(
   deps: ParticipantDeps,
   command: string,
   prompt: string,
   stream: vscode.ChatResponseStream,
+  state: TurnState,
 ): Promise<vscode.ChatResult> {
-  const method = COMMAND_METHODS[command]
-  if (!method) {
-    stream.markdown(`未知命令 \`/${command}\`。可用：${Object.keys(COMMAND_METHODS).map((c) => `\`/${c}\``).join('、')}`)
-    return {}
+  const plan = planCommand(command, prompt)
+
+  if (plan.kind === 'unknown') {
+    stream.markdown(`❌ ${plan.message}\n\n${renderCommandHelp()}`)
+    return { metadata: state }
   }
+
   try {
-    const result = await deps.transport.control(method, prompt.trim() === '' ? {} : { text: prompt })
-    stream.markdown(`### /${command}\n\n\`\`\`json\n${JSON.stringify(result, null, 2)}\n\`\`\``)
+    if (plan.kind === 'model-resolve') {
+      // 两段：get 清单 → 扩展端消解 → set
+      const info = (await deps.transport.control('harness/model.get', {})) as {
+        configured?: ConfiguredProvider[]
+      }
+      const resolved = resolveModelSpec(plan.spec, info?.configured ?? [])
+      if (typeof resolved === 'string') {
+        stream.markdown(`❌ /model ${plan.spec}：${resolved}\n\n_用 \`/model\` 查看可选清单。_`)
+        return { metadata: state }
+      }
+      const result = await deps.transport.control('harness/model.set', resolved)
+      stream.markdown(renderControlResult('model', result))
+    } else {
+      const result = await deps.transport.control(plan.call.method, plan.call.params)
+      stream.markdown(renderControlResult(command, result))
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     stream.markdown(`\n\n❌ \`/${command}\` 失败：${msg}\n\n`)
   }
-  return {}
+  return { metadata: state }
 }
 
 // ========================================================================
