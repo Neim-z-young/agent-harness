@@ -6,7 +6,7 @@
  */
 
 import { describe, expect, it } from 'bun:test'
-import { extractTaskIds, isTerminalState, mapA2aEvent, textOf } from './render'
+import { extractFileRefPaths, extractTaskIds, isTerminalState, mapA2aEvent, textOf } from './render'
 
 const wrap = (result: unknown) => ({ jsonrpc: '2.0', id: 1, result })
 
@@ -199,5 +199,40 @@ describe('textOf', () => {
   })
   it('undefined ⇒ 空串', () => {
     expect(textOf(undefined)).toBe('')
+  })
+})
+
+// ========================================================================
+// P2-v2：正文文件引用识别（reference 呈现的数据源）
+// ========================================================================
+
+describe('extractFileRefPaths（P2-v2）', () => {
+  it('识别带目录前缀的路径，剥 :行:列 后缀去重，限量 8', () => {
+    const out = extractFileRefPaths('改了 src/index.ts:12 和 packages/core/src/x.ts，见 docs/guide.md')
+    expect(out).toContain('src/index.ts:12')
+    expect(out).toContain('packages/core/src/x.ts')
+    expect(out).toContain('docs/guide.md')
+  })
+
+  it('同一文件不同行号按基础路径去重（保留首次形态）', () => {
+    const out = extractFileRefPaths('src/a.ts:1 与 src/a.ts:99')
+    expect(out.filter((x) => x.startsWith('src/a.ts'))).toHaveLength(1)
+  })
+
+  it('无目录前缀的裸文件名不匹配（与宿主同一口径）', () => {
+    expect(extractFileRefPaths('见 package.json 和 README')).toHaveLength(0)
+  })
+})
+
+describe('正文引用进入 text 算子（P2-v2）', () => {
+  it('artifactUpdate 的文本含路径时带回 refs', () => {
+    const op = mapA2aEvent({
+      artifactUpdate: {
+        taskId: 't', contextId: 'c',
+        artifact: { artifactId: 'a', name: 'answer', parts: [{ text: '已写入 src/main.ts' }] },
+        lastChunk: true,
+      },
+    })
+    expect(op).toMatchObject({ kind: 'text', refs: ['src/main.ts'] })
   })
 })

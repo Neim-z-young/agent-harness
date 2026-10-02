@@ -132,7 +132,11 @@ function mapArtifactUpdate(u: WireArtifactUpdate & Record<string, unknown>): Ren
     const name = strOr(u['artifact']?.['name'], 'artifact')
     return { kind: 'progress', text: `产出非文本产物：${name}` }
   }
-  return { kind: 'text', text }
+  // 正文里的类文件路径 → reference 呈现（P2-v2）：agent 改完文件后用户可以点着看。
+  // 正则与 `@harness/host` 的 FILE_REF_RE 同源（跨进程不能 import，逐字同步，
+  // 守卫测试钉住一致性）；引用多为相对路径，由参与者按 sidecar cwd / 工作区根解析。
+  const refs = extractFileRefPaths(text)
+  return refs.length > 0 ? { kind: 'text', text, refs } : { kind: 'text', text }
 }
 
 function mapMessage(m: WireMessage & Record<string, unknown>): RenderOp {
@@ -214,6 +218,37 @@ function mapWorkingPhase(md: Record<string, unknown> | undefined): RenderOp {
       // 未知相位：不报错也不显示 —— 新增相位时不该让旧扩展崩掉。
       return { kind: 'noop' }
   }
+}
+
+// ========================================================================
+// 文件引用提取（与 @harness/host/src/files.ts 的 FILE_REF_RE 逐字同源）
+// ========================================================================
+
+const FILE_REF_RE =
+  /(?:\b(?:src|packages|docs|lib|app|api|scripts|test|tests|build)\b(?:\/[\w.\-]+)+|(?:~\/)?\/?(?:[\w.\-]+\/)+[\w.\-]+\.[A-Za-z]{1,6})(?::\d+(?::\d+)?)?/g
+
+/** 正则源文本（供守卫测试比对扩展端与宿主端同源） */
+export const FILE_REF_SOURCE = FILE_REF_RE.source
+
+/**
+ * 从正文提取类文件路径（去 :行:列 后缀去重、限量 8）。
+ * 纯函数、可单测；与宿主侧 `collectFileRefsFromTexts` 同一识别口径。
+ */
+export function extractFileRefPaths(text: string): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  const re = new RegExp(FILE_REF_RE.source, 'g')
+  let m: RegExpExecArray | null
+  while ((m = re.exec(text)) !== null) {
+    const base = m[0].replace(/:\d+(?::\d+)?$/, '')
+    if (!seen.has(base)) {
+      seen.add(base)
+      out.push(m[0])
+      if (out.length >= 8) return out
+    }
+    if (re.lastIndex === m.index) re.lastIndex++
+  }
+  return out
 }
 
 // ========================================================================

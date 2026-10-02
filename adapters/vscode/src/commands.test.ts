@@ -13,6 +13,8 @@ import {
   resolveModelSpec,
   SLASH_COMMANDS,
   type ConfiguredProvider,
+  resolveSessionSpec,
+  type SessionListEntry,
 } from './commands'
 
 const CONFIGURED: ConfiguredProvider[] = [
@@ -216,5 +218,100 @@ describe('启动自检（设计稿 §8）', () => {
   it('SLASH_COMMANDS 清单与帮助文案一致', () => {
     const help = renderCommandHelp()
     for (const c of SLASH_COMMANDS) expect(help).toContain(`/${c.name}`)
+  })
+})
+
+// ========================================================================
+// P2-v2：新命令计划与渲染
+// ========================================================================
+
+describe('planCommand：P2-v2 新命令', () => {
+  it('sessions / save / new / stats-export / tree 的结构化入参', () => {
+    expect(planCommand('sessions', '')).toMatchObject({ kind: 'call', call: { method: 'harness/session.list' } })
+    expect(planCommand('save', '')).toMatchObject({ kind: 'call', call: { method: 'harness/session.save' } })
+    expect(planCommand('new', '')).toMatchObject({ kind: 'call', call: { method: 'harness/session.new' } })
+    expect(planCommand('stats-export', '')).toMatchObject({ kind: 'call', call: { method: 'harness/stats.export', params: {} } })
+    expect(planCommand('stats-export', 'json')).toMatchObject({ kind: 'call', call: { params: { format: 'json' } } })
+    expect(planCommand('tree', '')).toMatchObject({ kind: 'call', call: { method: 'harness/tree.get', params: {} } })
+    expect(planCommand('tree', 'src/lib')).toMatchObject({ kind: 'call', call: { params: { root: 'src/lib' } } })
+  })
+
+  it('resume 无参 = 先看清单；带参走 session-resolve 两段计划', () => {
+    expect(planCommand('resume', '')).toMatchObject({ kind: 'call', call: { method: 'harness/session.list' } })
+    expect(planCommand('resume', '3')).toMatchObject({ kind: 'session-resolve', spec: '3' })
+    expect(planCommand('resume', 's_x1')).toMatchObject({ kind: 'session-resolve', spec: 's_x1' })
+  })
+
+  it('history / help 是本地渲染，不碰控制通道', () => {
+    expect(planCommand('history', '')).toMatchObject({ kind: 'local' })
+    expect(planCommand('help', '')).toMatchObject({ kind: 'local' })
+  })
+
+  it('新命令都在 SLASH_COMMANDS 声明里（与 package.json 一致的前置）', () => {
+    const names = SLASH_COMMANDS.map((c) => c.name)
+    for (const n of ['stats-export', 'sessions', 'new', 'resume', 'save', 'tree', 'history', 'help']) {
+      expect(names).toContain(n)
+    }
+    expect(SLASH_COMMANDS).toHaveLength(14)
+  })
+})
+
+describe('resolveSessionSpec（/resume 的歧义消解）', () => {
+  const LIST: SessionListEntry[] = [
+    { index: 1, id: 's_aaa', title: 'A' },
+    { index: 2, id: 's_bbb', title: 'B' },
+  ]
+  it('序号 → 清单命中', () => {
+    expect(resolveSessionSpec('2', LIST)).toEqual({ id: 's_bbb' })
+  })
+  it('序号越界 → 错误文案（带回 /sessions 提示）', () => {
+    expect(resolveSessionSpec('9', LIST)).toBe('序号 9 不在会话清单里（用 /sessions 查看）')
+  })
+  it('非序号整串当 sessionId 交给 sidecar 判断', () => {
+    expect(resolveSessionSpec('s_whatever', LIST)).toEqual({ id: 's_whatever' })
+  })
+  it('空参 → 错误文案', () => {
+    expect(resolveSessionSpec('', LIST)).toContain('不能为空')
+  })
+})
+
+describe('renderControlResult：P2-v2 新命令', () => {
+  it('/sessions：清单表格 + 序号 + 本目录上次标记', () => {
+    const out = renderControlResult('sessions', [
+      { index: 1, id: 's_a', title: '修 bug', updatedAt: 1760000000000, messageCount: 12, current: true },
+      { index: 2, id: 's_b', title: null },
+    ])
+    expect(out).toContain('### /sessions')
+    expect(out).toContain('`s_a`')
+    expect(out).toContain('修 bug')
+    expect(out).toContain('← 本目录上次')
+    expect(out).toContain('/resume')
+  })
+
+  it('/new /resume：成功文案带新 sessionId', () => {
+    const n = renderControlResult('new', { sessionId: 's_new', agentId: 'default', model: 'hy3', carriedModelOverride: true })
+    expect(n).toContain('`s_new`')
+    expect(n).toContain('模型覆盖已沿用')
+    const r = renderControlResult('resume', { sessionId: 's_r', title: 'T', messageCount: 5 })
+    expect(r).toContain('已恢复会话 `s_r`')
+    expect(r).toContain('5')
+  })
+
+  it('/save /stats-export：短文案 + 路径提示', () => {
+    expect(renderControlResult('save', { ok: true, id: 's_a', messageCount: 3 })).toContain('已保存会话 `s_a`')
+    expect(renderControlResult('stats-export', { ok: true, path: '/tmp/x.md', format: 'markdown', bytes: 10 }))
+      .toContain('路径见回复引用')
+  })
+})
+
+describe('文件引用正则与宿主同源（守卫）', () => {
+  it('扩展本地的 FILE_REF_RE 与 @harness/host/src/files.ts 逐字一致', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { join } = await import('node:path')
+    const hostSrc = readFileSync(join(process.cwd(), '../../packages/host/src/files.ts'), 'utf8')
+    const m = /const FILE_REF_RE =\n\s*\/(.+)\/g\n/.exec(hostSrc)
+    expect(m).not.toBeNull()
+    const { FILE_REF_SOURCE } = await import('./map/render')
+    expect(FILE_REF_SOURCE).toBe(m![1])
   })
 })

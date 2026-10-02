@@ -91,8 +91,8 @@ export interface HarnessTransport {
  * "稳定版能表达"的这几种，不定义渲染不出来的东西。
  */
 export type RenderOp =
-  /** 正文增量（markdown） */
-  | { readonly kind: 'text'; readonly text: string }
+  /** 正文增量（markdown）；refs = 正文里识别出的文件引用（供参与者 reference 呈现） */
+  | { readonly kind: 'text'; readonly text: string; readonly refs?: readonly string[] }
   /** 进度提示（工具调用 / 步骤 / 闸门心跳） */
   | { readonly kind: 'progress'; readonly text: string }
   /** 权限待决：参与者据此弹四态对话框 */
@@ -103,9 +103,24 @@ export type RenderOp =
       readonly options: readonly string[]
       readonly question: string
     }
+  /** 目录树呈现（/tree）：`stream.filetree(nodes, baseUri)` */
+  | { readonly kind: 'filetree'; readonly baseUri: string; readonly nodes: readonly FileTreeWireNode[] }
+  /** 文件引用（/stats-export 等）：`stream.reference(uri)` */
+  | { readonly kind: 'reference'; readonly path: string }
   /** 终态 */
   | { readonly kind: 'done'; readonly state: string; readonly text?: string }
   /** 错误（协议错误 / 传输错误都归一到这里） */
   | { readonly kind: 'error'; readonly code: number; readonly message: string }
   /** 静默帧（已处理但不产生可见输出） */
   | { readonly kind: 'noop' }
+
+/**
+ * 控制面 `harness/tree.get` 回传的节点（`FileRefTreeNode` 的线上形状，扩展端不认
+ * `key`/`absPath` 之外的字段就丢弃）。`ChatResponseFileTree` 只要 label + children。
+ */
+export interface FileTreeWireNode {
+  readonly name: string
+  readonly kind?: string
+  readonly marked?: boolean
+  readonly children?: readonly FileTreeWireNode[]
+}

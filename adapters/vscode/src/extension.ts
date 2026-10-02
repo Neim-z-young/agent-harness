@@ -6,6 +6,7 @@
  */
 
 import * as vscode from 'vscode'
+import { buildFollowups, type FollowupsStateLike } from './followups'
 import { createParticipantHandler } from './participant'
 import { Sidecar } from './sidecar'
 import { A2aTransport } from './transport/a2a'
@@ -30,6 +31,15 @@ export function activate(context: vscode.ExtensionContext): void {
     traceEnabled: () => vscode.workspace.getConfiguration('harness').get<boolean>('trace', false),
   }))
   participant.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'icon.png')
+  // Follow-ups（建议后续问题）：纯建议，不碰传输 —— metadata 里有什么就说什么。
+  participant.followupProvider = {
+    provideFollowups(result: vscode.ChatResult): vscode.ChatFollowup[] {
+      return buildFollowups(result?.metadata as FollowupsStateLike | undefined).map((f) => ({
+        prompt: f.prompt,
+        label: f.label,
+      }))
+    },
+  }
   context.subscriptions.push(participant)
 
   context.subscriptions.push(

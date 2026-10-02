@@ -8,9 +8,12 @@
  * 控制面收的是**结构化入参**（`{ providerId, modelId }`，见 `control.ts` 文件头）；
  * `/model hy3`、`/permission bash=deny` 这类**人类词法**的歧义消解就在本模块完成 ——
  * sidecar 只做"把话说清楚的一次翻译"，扩展端负责把人说的话翻译成结构。
- * `/model` 的解析要靠 `harness/model.get` 带回的 configured 清单（序号 / 实例 id），
- * 所以它不是一次调用而是一小段协议（get → resolve → set），见 `planCommand` 的
- * `model-resolve` 计划。
+ *
+ * 两段协议（get → 消解 → set）目前有两条：
+ * - `/model <spec>`：`harness/model.get` 带回 configured 清单（序号 / 实例 id）；
+ * - `/resume <序号>`：`harness/session.list` 带回会话清单（序号 → sessionId）。
+ * `/new` `/resume` 成功后**必须换绑 TurnState 的 contextId**（= sessionId），
+ * 否则下一轮还在跟旧会话说话 —— 参与者按 `CommandPlan.affectsContext` 处理。
  */
 
 // ========================================================================
@@ -26,22 +29,33 @@ export interface ControlCall {
 /**
  * 命令的执行计划。
  *
- * 大多数命令是单次 `call`；`/model <spec>` 需要**两段**（先 `model.get` 拿清单再 `model.set`），
- * 由参与者按 `model-resolve` 计划编排 —— 纯模块不碰传输。
+ * 大多数命令是单次 `call`；两段协议（`model-resolve` / `session-resolve`）由参与者
+ * 编排 —— 纯模块不碰传输。`affectsContext` 标出会**更换 harness 会话**的命令：
+ * 参与者执行成功后要把返回的 sessionId 写进 TurnState.contextId、清掉 taskId。
  */
 export type CommandPlan =
-  | { readonly kind: 'call'; readonly call: ControlCall }
+  | { readonly kind: 'call'; readonly call: ControlCall; readonly affectsContext?: boolean }
   | { readonly kind: 'model-resolve'; readonly spec: string }
+  | { readonly kind: 'session-resolve'; readonly spec: string }
+  | { readonly kind: 'local'; readonly message: string }
   | { readonly kind: 'unknown'; readonly message: string }
 
-/** 参与者声明的 6 个斜杠命令（package.json 的 `chatParticipants.commands` 与此一一对应） */
+/** 参与者声明的斜杠命令（package.json 的 `chatParticipants.commands` 与此一一对应） */
 export const SLASH_COMMANDS: ReadonlyArray<{ name: string; description: string }> = [
   { name: 'compact', description: '压缩当前会话上下文（可选：ifneeded / prune / summary / agent）' },
   { name: 'stats', description: '用量统计与上下文占用' },
+  { name: 'stats-export', description: '导出统计报告到文件（可选 json；路径见回复中的引用）' },
   { name: 'agent', description: '查看或切换当前 Agent（/agent <id>）' },
   { name: 'model', description: '查看或切换模型（/model <序号 | provider/model | reset>）' },
   { name: 'permission', description: '查看或设置权限（/permission <mode | key=behavior | reset>）' },
   { name: 'skills', description: '查看或管理技能（/skills <enable | disable | reload> <id>）' },
+  { name: 'sessions', description: '列出全部持久化会话' },
+  { name: 'new', description: '新建会话（沿用当前 Agent 与模型设置）' },
+  { name: 'resume', description: '恢复会话（/resume <序号 | 会话id>）' },
+  { name: 'save', description: '立即保存当前会话' },
+  { name: 'tree', description: '目录树，* 标记对话引用过的文件（/tree [路径]）' },
+  { name: 'history', description: '输入历史说明（Chat 视图自带历史）' },
+  { name: 'help', description: '查看可用命令' },
 ]
 
 const COMPACT_STRATEGIES = ['ifneeded', 'prune', 'summary', 'agent'] as const
@@ -73,6 +87,13 @@ export function planCommand(command: string, args: string): CommandPlan {
     case 'stats':
       if (rest !== '') return unknown('用法：/stats（无参数）')
       return call('harness/stats.get', {})
+
+    case 'stats-export': {
+      // /stats-export [json] —— 导出文件落在 sidecar 工作目录（控制面固定行为）
+      if (rest === '') return call('harness/stats.export', {})
+      if (rest === 'json' || rest === '--json') return call('harness/stats.export', { format: 'json' })
+      return unknown('用法：/stats-export [json]（文件写到工作目录，路径见回复）')
+    }
 
     case 'agent': {
       if (rest === '') return call('harness/agent.list', {})
@@ -112,6 +133,36 @@ export function planCommand(command: string, args: string): CommandPlan {
       return unknown(`用法：/skills（查看）｜ /skills <${SKILL_OPS.join(' | ')}> <id>`)
     }
 
+    case 'sessions':
+      if (rest !== '') return unknown('用法：/sessions（无参数）')
+      return call('harness/session.list', {})
+
+    case 'new':
+      if (rest !== '') return unknown('用法：/new（无参数；沿用当前 Agent 与模型设置）')
+      return call('harness/session.new', {})
+
+    case 'resume': {
+      if (rest === '') return call('harness/session.list', {})
+      return { kind: 'session-resolve', spec: rest }
+    }
+
+    case 'save':
+      if (rest !== '') return unknown('用法：/save（无参数）')
+      return call('harness/session.save', {})
+
+    case 'tree':
+      return call('harness/tree.get', rest === '' ? {} : { root: rest })
+
+    case 'history':
+      return {
+        kind: 'local',
+        message:
+          'Chat 视图自带输入历史（输入框 **上/下方向键**，或历史面板）；harness 侧不另存一份，避免两边口径不一致。',
+      }
+
+    case 'help':
+      return { kind: 'local', message: renderCommandHelp() }
+
     default:
       return unknown(`未知命令 /${command}`)
   }
@@ -125,7 +176,7 @@ function unknown(message: string): CommandPlan {
 }
 
 // ========================================================================
-// /model 的歧义消解（输入词汇，扩展端独有）
+// 两段协议的消解（输入词汇，扩展端独有）
 // ========================================================================
 
 /** `harness/model.get` 出参里的 configured 条目（扩展端只认这几个字段） */
@@ -170,6 +221,37 @@ export function resolveModelSpec(
   return { modelId: s }
 }
 
+/** `harness/session.list` 出参里的会话条目（扩展端只认这几个字段） */
+export interface SessionListEntry {
+  readonly index: number
+  readonly id: string
+  readonly title: string | null
+  /** 更新时间（epoch ms）；sidecar 端回传 */
+  readonly updatedAt?: number
+  readonly messageCount?: number
+  /** sidecar 标出的「本目录上次会话」 */
+  readonly current?: boolean
+}
+
+/**
+ * 把 `/resume <spec>` 的自由文本解析成 sessionId：
+ * 序号 → 清单命中（不存在则报错文案）；其余整串当 sessionId 交给 sidecar 判断。
+ */
+export function resolveSessionSpec(
+  spec: string,
+  sessions: readonly SessionListEntry[],
+): { id: string } | string {
+  const s = spec.trim()
+  if (s === '') return '会话 id 不能为空'
+  if (/^\d+$/.test(s)) {
+    const idx = Number(s)
+    const hit = sessions.find((c) => c.index === idx)
+    if (!hit) return `序号 ${idx} 不在会话清单里（用 /sessions 查看）`
+    return { id: hit.id }
+  }
+  return { id: s }
+}
+
 // ========================================================================
 // 渲染：控制结果 → markdown
 // ========================================================================
@@ -177,8 +259,8 @@ export function resolveModelSpec(
 /**
  * 把控制通道的出参渲染成 markdown。
  *
- * ⚠️ 文案纪律（设计稿 §11）：整页文本（stats）来自**服务端渲染**的 `text` 字段，
- * 这里不抄第二份统计渲染器；其余命令按结构化字段排版。形状对不上时退化为
+ * ⚠️ 文案纪律（设计稿 §11）：整页文本（stats / tree）来自**服务端渲染**的 `text` 字段，
+ * 这里不抄第二份渲染器；其余命令按结构化字段排版。形状对不上时退化为
  * JSON 代码块 —— 宁可原始，不可编造。
  */
 export function renderControlResult(command: string, result: unknown): string {
@@ -297,6 +379,53 @@ export function renderControlResult(command: string, result: unknown): string {
           lines.push(``, `> 摘要预览：${i.summaryPreview}`)
         }
         return lines.join('\n')
+      }
+      break
+    }
+
+    case 'sessions': {
+      if (Array.isArray(result)) {
+        const rows = (result as SessionListEntry[])
+          .map((s) => {
+            const when = s.updatedAt ? new Date(s.updatedAt).toLocaleString() : '—'
+            const mark = s.current ? ' ← 本目录上次' : ''
+            return `| ${s.index} | \`${str(s.id)}\` | ${str(s.title) || '(untitled)'} | ${num(s.messageCount)} | ${when}${mark} |`
+          })
+          .join('\n')
+        return `### /sessions\n\n| 序号 | id | 标题 | 消息 | 更新时间 |\n|---|---|---|---|---|\n${rows}\n\n_用 \`/resume <序号 | id>\` 恢复。_`
+      }
+      break
+    }
+
+    case 'new': {
+      const r = result as { sessionId?: unknown; agentId?: unknown; model?: unknown; carriedModelOverride?: unknown }
+      if (r?.sessionId !== undefined) {
+        const carry = r.carriedModelOverride === true ? '（模型覆盖已沿用）' : ''
+        return `### /new\n\n✅ 已新建会话 \`${str(r.sessionId)}\`\n\n- Agent：\`${str(r.agentId)}\`${carry}\n- 模型：${str(r.model) || '（Provider 默认）'}\n\n_后续消息将进入新会话。_`
+      }
+      break
+    }
+
+    case 'resume': {
+      const r = result as { sessionId?: unknown; title?: unknown; agentId?: unknown; messageCount?: unknown; model?: unknown }
+      if (r?.sessionId !== undefined) {
+        return `### /resume\n\n✅ 已恢复会话 \`${str(r.sessionId)}\`${r.title ? `（${str(r.title)}）` : ''}\n\n- Agent：\`${str(r.agentId)}\`\n- 消息数：${num(r.messageCount)}\n- 模型：${str(r.model) || '（Provider 默认）'}\n\n_后续消息将接在该会话上。_`
+      }
+      break
+    }
+
+    case 'save': {
+      const r = result as { ok?: unknown; id?: unknown; messageCount?: unknown }
+      if (r?.ok !== undefined) {
+        return `### /save\n\n✅ 已保存会话 \`${str(r.id)}\`（${num(r.messageCount)} 条消息）`
+      }
+      break
+    }
+
+    case 'stats-export': {
+      const r = result as { ok?: unknown; path?: unknown; format?: unknown; bytes?: unknown }
+      if (r?.path !== undefined) {
+        return `### /stats-export\n\n✅ 已导出（${str(r.format)}，${num(r.bytes)} 字节）→ 路径见回复引用。`
       }
       break
     }

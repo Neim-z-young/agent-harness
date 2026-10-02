@@ -99,6 +99,42 @@ describe.skipIf(!hasCli)('sidecar 端到端', () => {
     }
   })
 
+  it('控制面端到端：harness/tree.get 带回结构化节点与 CLI 口径 text（P2-v2）', async () => {
+    const s = launch()
+    try {
+      const t = new A2aTransport({ sidecar: s })
+      await t.start()
+      const r = (await t.control('harness/tree.get')) as {
+        root?: unknown; nodes?: unknown; truncated?: unknown; text?: unknown
+      }
+      expect(typeof r.root).toBe('string')
+      expect(Array.isArray(r.nodes)).toBe(true)
+      expect((r.nodes as unknown[]).length).toBeGreaterThan(0)
+      expect(String(r.text)).toContain('文件树')
+    } finally {
+      await s.dispose()
+    }
+  })
+
+  it('控制面端到端：harness/stats.export 真写文件且回传路径（P2-v2）', async () => {
+    const s = launch()
+    try {
+      const t = new A2aTransport({ sidecar: s })
+      await t.start()
+      const r = (await t.control('harness/stats.export', { format: 'json' })) as {
+        ok?: unknown; path?: unknown; bytes?: unknown
+      }
+      expect(r.ok).toBe(true)
+      expect(String(r.path)).toContain('.json')
+      expect(Number(r.bytes)).toBeGreaterThan(0)
+      // 自清理：导出文件落在 sidecar cwd（本 E2E 即仓库根），不留给工作区
+      const { rm } = await import('node:fs/promises')
+      await rm(String(r.path), { force: true })
+    } finally {
+      await s.dispose()
+    }
+  })
+
   it('控制面端到端：harness/stats.get 带回服务端渲染的整页 text', async () => {
     const s = launch()
     try {

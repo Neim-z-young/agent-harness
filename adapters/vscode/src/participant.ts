@@ -17,10 +17,12 @@ import {
   renderControlResult,
   renderWarnNotices,
   resolveModelSpec,
+  resolveSessionSpec,
   type ConfiguredProvider,
+  type SessionListEntry,
 } from './commands'
 import { extractTaskIds, mapA2aEvent } from './map/render'
-import type { HarnessTransport, RenderOp } from './types'
+import type { FileTreeWireNode, HarnessTransport, RenderOp } from './types'
 
 /** 权限续接的最大轮数（防死循环：每轮一次挂起） */
 const MAX_PERMISSION_ROUNDS = 8
@@ -39,6 +41,8 @@ interface TurnState {
   readonly taskId?: string
   /** 启动自检（warn notices）已在本线程展示过 —— 每条线程只提示一次 */
   readonly noticesShown?: boolean
+  /** 上一轮刚执行过 /new 或 /resume（follow-ups 换一档建议） */
+  readonly sessionSwitched?: boolean
 }
 
 export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequestHandler {
@@ -106,6 +110,12 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
             case 'text':
               textOut += op.text
               stream.markdown(op.text)
+              // 正文里识别出的文件引用 → Chat 引用区（点开即达）。
+              // 相对路径按工作区根解析；sidecar cwd 可能与工作区根不同（--cwd），以它为准。
+              for (const ref of op.refs ?? []) {
+                const uri = resolveRefUri(ref)
+                if (uri) stream.reference(uri)
+              }
               break
             case 'progress':
               stream.progress(op.text)
@@ -207,8 +217,12 @@ async function askPermission(
  * 命令执行（设计稿 §6.4）。解析在 `commands.ts`（纯模块）；这里只编排：
  *
  * - 普通 `call` → `transport.control` → `renderControlResult`；
- * - `/model <spec>` 的两段协议：先 `model.get` 拿 configured 清单，
- *   扩展端消解歧义（序号 / provider/model / 裸名）后调 `model.set`；
+ * - `/model <spec>` 两段协议：`model.get` 拿清单 → 扩展端消解 → `model.set`；
+ * - `/resume <spec>` 两段协议：`session.list` 拿清单 → 消解序号 → `session.resume`；
+ * - `/tree`：结构化节点 → `stream.filetree`（这是稳定 API 的目录树呈现落点）；
+ * - `/stats-export`：`stream.reference` 指到导出文件（P2-v2 的 reference 落点）；
+ * - `/new` `/resume` 成功后**换绑 TurnState**：contextId = 新 sessionId、taskId 清空 ——
+ *   否则下一轮还在跟旧会话说话。
  * - 命令轮同样把 `TurnState`（含 noticesShown）写回 metadata。
  */
 async function handleCommand(
@@ -224,8 +238,14 @@ async function handleCommand(
     stream.markdown(`❌ ${plan.message}\n\n${renderCommandHelp()}`)
     return { metadata: state }
   }
+  if (plan.kind === 'local') {
+    stream.markdown(`### /${command}\n\n${plan.message}`)
+    return { metadata: state }
+  }
 
   try {
+    let contextBinding: string | undefined
+
     if (plan.kind === 'model-resolve') {
       // 两段：get 清单 → 扩展端消解 → set
       const info = (await deps.transport.control('harness/model.get', {})) as {
@@ -236,17 +256,102 @@ async function handleCommand(
         stream.markdown(`❌ /model ${plan.spec}：${resolved}\n\n_用 \`/model\` 查看可选清单。_`)
         return { metadata: state }
       }
-      const result = await deps.transport.control('harness/model.set', resolved)
-      stream.markdown(renderControlResult('model', result))
+      stream.markdown(renderControlResult('model', await deps.transport.control('harness/model.set', resolved)))
+    } else if (plan.kind === 'session-resolve') {
+      // 两段：session.list → 序号消解 → session.resume
+      const list = (await deps.transport.control('harness/session.list', {})) as unknown
+      const entries = asSessionEntries(list)
+      const resolved = resolveSessionSpec(plan.spec, entries)
+      if (typeof resolved === 'string') {
+        stream.markdown(`❌ /resume ${plan.spec}：${resolved}\n\n_用 \`/sessions\` 查看会话清单。_`)
+        return { metadata: state }
+      }
+      const result = await deps.transport.control('harness/session.resume', { id: resolved.id })
+      stream.markdown(renderControlResult('resume', result))
+      contextBinding = (result as { sessionId?: unknown })?.sessionId !== undefined
+        ? String((result as { sessionId?: unknown }).sessionId)
+        : undefined
     } else {
       const result = await deps.transport.control(plan.call.method, plan.call.params)
       stream.markdown(renderControlResult(command, result))
+
+      // 附加呈现（结构化 part，不走 markdown）
+      if (command === 'tree') {
+        const r = result as { root?: unknown; nodes?: unknown }
+        if (typeof r?.root === 'string' && Array.isArray(r.nodes)) {
+          stream.filetree(toFileTree(r.nodes as FileTreeWireNode[]), vscode.Uri.file(r.root))
+        }
+      }
+      if (command === 'stats-export') {
+        const r = result as { path?: unknown }
+        if (typeof r?.path === 'string' && r.path !== '') stream.reference(vscode.Uri.file(r.path))
+      }
+
+      // 换绑会话的命令：/new /resume 出参都带 sessionId（= A2A contextId）
+      if (plan.affectsContext || command === 'new' || command === 'resume') {
+        const sid = (result as { sessionId?: unknown })?.sessionId
+        if (typeof sid === 'string' && sid !== '') contextBinding = sid
+      }
+    }
+
+    if (contextBinding) {
+      state = { ...state, contextId: contextBinding, taskId: undefined, sessionSwitched: true }
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
     stream.markdown(`\n\n❌ \`/${command}\` 失败：${msg}\n\n`)
   }
   return { metadata: state }
+}
+
+// ========================================================================
+// 呈现辅助
+// ========================================================================
+
+/** `harness/session.list` 的线上形状（数组或 { sessions: [...] } 都收）→ 消解入参 */
+function asSessionEntries(list: unknown): SessionListEntry[] {
+  const arr = Array.isArray(list)
+    ? list
+    : Array.isArray((list as { sessions?: unknown })?.sessions)
+      ? (list as { sessions: unknown[] }).sessions
+      : []
+  return arr.map((s, i) => {
+    const o = (s ?? {}) as Record<string, unknown>
+    return {
+      index: typeof o['index'] === 'number' ? o['index'] : i + 1,
+      id: String(o['id'] ?? o['sessionId'] ?? ''),
+      title: typeof o['title'] === 'string' ? o['title'] : null,
+      updatedAt: typeof o['updatedAt'] === 'number' ? o['updatedAt'] : undefined,
+      messageCount: typeof o['messageCount'] === 'number' ? o['messageCount'] : undefined,
+      current: o['current'] === true,
+    }
+  }).filter((s) => s.id !== '')
+}
+
+/** 控制面节点 → `ChatResponseFileTree`（只有 name/children；标记信息并入 name） */
+function toFileTree(nodes: readonly FileTreeWireNode[]): vscode.ChatResponseFileTree[] {
+  return nodes.map((n) => ({
+    name: n.name + (n.kind === 'dir' ? '/' : '') + (n.marked ? ' *' : ''),
+    children: n.children ? toFileTree(n.children) : undefined,
+  }))
+}
+
+/**
+ * 对话正文里的文件引用 → Uri。相对路径按**工作区根**解析；`~` 展开 home；
+ * 绝对路径直接用。解析不了返回 undefined（宁可少一条引用，不可给个坏 Uri）。
+ *
+ * 局限要认：sidecar 的 cwd 可能不等于工作区根（`--cwd`），此时相对路径会指错 ——
+ * 控制面 `harness/tree.get` 的出参里带 `cwd`，聊天流程里没有顺手的获取点，
+ * P2-v2 先按工作区根近似（与 CLI 常见用法一致），偏差留给后续增量。
+ */
+export function resolveRefUri(ref: string): vscode.Uri | undefined {
+  const cleaned = ref.replace(/:\d+(?::\d+)?$/, '')
+  if (cleaned === '') return undefined
+  if (cleaned.startsWith('~/')) return vscode.Uri.file(`${process.env['HOME'] ?? ''}${cleaned.slice(1)}`)
+  if (cleaned.startsWith('/')) return vscode.Uri.file(cleaned)
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri
+  if (!root) return undefined
+  return vscode.Uri.joinPath(root, cleaned)
 }
 
 // ========================================================================
@@ -264,8 +369,10 @@ function readState(context: vscode.ChatContext): TurnState {
     const turn = context.history[i]
     if (turn instanceof vscode.ChatResponseTurn) {
       const md = turn.result?.metadata as Partial<TurnState> | undefined
-      if (md && (md.contextId || md.taskId)) {
-        return { contextId: md.contextId, taskId: md.taskId }
+      if (md && (md.contextId || md.taskId || md.noticesShown)) {
+        // 全字段继承（含 noticesShown / sessionSwitched）—— 只继承 id 会让
+        // "每线程一次"的启动自检变成每轮都弹。
+        return { contextId: md.contextId, taskId: md.taskId, noticesShown: md.noticesShown }
       }
     }
   }

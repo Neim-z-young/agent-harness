@@ -25,10 +25,18 @@
         "commands": [
           { "name": "compact", "description": "压缩当前会话上下文（可选：ifneeded / prune / summary / agent）" },
           { "name": "stats", "description": "用量统计与上下文占用" },
+          { "name": "stats-export", "description": "导出统计报告到文件（可选 json）" },
           { "name": "agent", "description": "查看或切换当前 Agent（/agent <id>）" },
           { "name": "model", "description": "查看或切换模型（/model <序号 | provider/model | reset>）" },
           { "name": "permission", "description": "查看或设置权限（/permission <mode | key=behavior | reset>）" },
-          { "name": "skills", "description": "查看或管理技能（/skills <enable | disable | reload> <id>）" }
+          { "name": "skills", "description": "查看或管理技能（/skills <enable | disable | reload> <id>）" },
+          { "name": "sessions", "description": "列出全部持久化会话" },
+          { "name": "new", "description": "新建会话（沿用当前 Agent 与模型设置）" },
+          { "name": "resume", "description": "恢复会话（/resume <序号 | 会话id>）" },
+          { "name": "save", "description": "立即保存当前会话" },
+          { "name": "tree", "description": "目录树，* 标记对话引用过的文件（/tree [路径]）" },
+          { "name": "history", "description": "输入历史说明（Chat 视图自带历史）" },
+          { "name": "help", "description": "查看可用命令" }
         ]
       }
     ],
