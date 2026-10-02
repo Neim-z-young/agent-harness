@@ -2647,7 +2647,16 @@ function ContextOccupancyLine(props: {
     if (!props.compactOpts) return
     let alive = true
     const refresh = () => {
-      renderContextOccupancy(props.harness, { id: props.sessionId } as never, props.compactOpts!, props.resolveWindow)
+      // renderContextOccupancy 已上移 @harness/usage，其 resolveWindow 形参是结构化最小视图；
+      // 本组件的闭包按真实 Session 解析窗口 —— 在边界上显式收窄一次。
+      renderContextOccupancy(
+        props.harness,
+        { id: props.sessionId } as never,
+        props.compactOpts!,
+        props.resolveWindow
+          ? (s) => props.resolveWindow!((s ?? undefined) as Session | undefined)
+          : undefined,
+      )
         .then((t) => { if (alive) setText(t.trim()) })
         .catch(() => {})
     }

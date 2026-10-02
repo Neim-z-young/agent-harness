@@ -138,7 +138,7 @@ export type { Host } from '@harness/host'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
 import { LifecycleEvents } from '@harness/core'
 import { startTuiRepl } from './tui'
-import { emptyUsage, sumUsage, usageFromMeta, usageFromMessages, renderStatsText, exportStatsJson, exportStatsMarkdown, hydrateUsage, isBlankUsage, cacheHitRate, todayUsageLine, type UsageStats } from './usage-stats'
+import { emptyUsage, sumUsage, usageFromMeta, usageFromMessages, renderStatsText, exportStatsJson, exportStatsMarkdown, hydrateUsage, isBlankUsage, cacheHitRate, todayUsageLine, resolveCurrentUsage, renderChildAgentRollup, renderContextOccupancy, type UsageStats } from './usage-stats'
 import { formatAgentStatus, initialAgentStatus, reduceAgentStatus } from './agent-status'
 import type { CompactOptions } from '@harness/session'
 import { collectTodayUsage } from './usage-today'
@@ -784,115 +784,21 @@ export interface ProcessLineOptions {
 export type ProcessLineResult = 'continue' | 'exit'
 
 /**
- * 解析当前会话用量统计：meta 持久化的累积器（有数据时）优先 → 否则由消息历史重建。
- * 与 TUI 共用 `hydrateUsage`，保证重连（resume）后能读到重连前累计的用量，
- * 且不会被「空累积器」误判为无数据。
- */
-/**
- * 「含子 agent」聚合行（子 agent 用量归一：父会话面板此前完全看不到这部分）。
- *
- * 为什么在**展示层**聚合，而不是把子会话并进父会话的 `meta.usageStats`：子会话有自己的
- * meta 与生命周期（可能被别的入口再次打开），并进去会让同一条链在"全部会话·当日"里被
- * 重复计入；展示层聚合随时可算、可撤。引擎侧已提供 `usage.children()`（按 `meta.parentId`
- * 反查），这里只做求和与排版。
- */
-export async function renderChildAgentRollup(harness: Harness, sessionId: string): Promise<string> {
-  const usageApi = (harness as { usage?: Harness['usage'] }).usage
-  if (!usageApi) return ''
-  const ids = await usageApi.children(sessionId).catch(() => [] as string[])
-  if (ids.length === 0) return ''
-  const usages: UsageStats[] = []
-  for (const id of ids) usages.push(await usageApi.get(id).catch(() => emptyUsage()))
-  const sum = sumUsage(usages)
-  return (
-    `含子 agent：${ids.length} 个子会话 · 调用 ${sum.llmCalls} 次 · ` +
-    `in ${sum.inputTokens} / out ${sum.outputTokens}` +
-    (sum.cacheReadTokens > 0 ? `（缓存命中 ${sum.cacheReadTokens}）` : '') +
-    '\n'
-  )
-}
-
-/**
- * 统计页上下文占用区：本会话 + 各子会话的上下文占用率。
- *
- * - 窗口 / 阈值 / 保留 / 口径一律取 `/compact` 同一套推导（`buildCompactionOptions`），
- *   避免同一份 config 又算出两个窗口（历史教训：三处各算一次 ⇒ 阈值判据失效）；
- * - 占用 token 用 `session.estimateTokens`（与会话压缩同口径，含 CJK 感知）；
- * - 子会话占用逐行列出，且**分母各自解析**（见下方 resolveWindow）—— 子 Agent 常被派到
- *   另一个窗口的端点上，沿用父会话的分母会让小窗口子会话的占用率虚低（"报 40% 其实已满"）。
- */
-export async function renderContextOccupancy(
-  harness: Harness,
-  session: Session,
-  compactOpts: CompactOptions,
-  /**
-   * 「会话 → 该会话**实际**该用的窗口」，走 {@link resolveCompactionWindow}。
-   * 不传 = 全部用 `compactOpts.contextWindowTokens`（= 改造前行为）：拿不到 config / Provider
-   * 注册表的宿主（如测试替身）走这条路，行为不变。
-   */
-  resolveWindow?: (session: Session | undefined) => number,
-): Promise<string> {
-  const reserved = compactOpts.reservedTokens ?? 30_000
-  const pct = compactOpts.autoCompactThresholdPct ?? 80
-  const calibration = compactOpts.tokenCalibration
-  const pctOf = (n: number, w: number) => (w > 0 ? (n / w) * 100 : 0).toFixed(1)
-  /**
-   * 回源取最新一份会话：调用方（尤其 TUI）手里那个对象可能是**调用时的快照**，
-   * 而 `/model` 切过后窗口就变了。取不到（测试替身没有 session.get / 会话已删）就用手上这份。
-   */
-  const liveSession = async (fallback: Session | undefined, id: string): Promise<Session | undefined> => {
-    const get = (harness as { session?: { get?: (id: string) => Promise<Session | undefined> } }).session?.get
-    if (!get) return fallback
-    try { return (await get.call(harness.session, id)) ?? fallback } catch { return fallback }
-  }
-  const window = resolveWindow
-    ? resolveWindow(await liveSession(session, session.id))
-    : (compactOpts.contextWindowTokens ?? 200_000)
-  const threshold = Math.floor((window - reserved) * (pct / 100))
-
-  const est = await harness.session.estimateTokens(session.id, calibration).catch(() => 0)
-  const lines = [
-    `上下文占用：${est.toLocaleString()} / ${window.toLocaleString()} tokens（${pctOf(est, window)}%）` +
-      ` · 自动压缩阈值 ${threshold.toLocaleString()}（${pct}% ×（窗口−保留 ${reserved.toLocaleString()}））`,
-  ]
-  // 子 agent 上下文：每个子会话单独一行（分母按该子会话自身端点解析 —— 解析不出才回落父会话的窗口；
-  // 子会话量小则不可见 —— 有值才列）
-  const usageApi = (harness as { usage?: Harness['usage'] }).usage
-  if (usageApi) {
-    const ids = await usageApi.children(session.id).catch(() => [] as string[])
-    for (const id of ids) {
-      const childEst = await harness.session.estimateTokens(id, calibration).catch(() => 0)
-      if (childEst <= 0) continue
-      const childWindow = resolveWindow ? resolveWindow(await liveSession(undefined, id)) : window
-      lines.push(
-        `  子会话 ${id}：占用 ${childEst.toLocaleString()} / ${childWindow.toLocaleString()} tokens（${pctOf(childEst, childWindow)}%）`,
-      )
-    }
-  }
-  return lines.join('\n') + '\n'
-}
-
-export async function resolveCurrentUsage(harness: Harness, current: Session): Promise<UsageStats> {
-  const hydrated = hydrateUsage(current)
-  if (!isBlankUsage(hydrated)) return hydrated
-  // 内存态可能是不完整视图（分页/裁剪/仅近期消息），只要水合结果为空就回源再试一次。
-  // 注意：不能按 current.messages.length 判断——消息非空也可能全是未带 tokenUsage 的
-  // 消息，此时若不回源，磁盘上的历史用量就永远读不到（/stats 与导出均显示 0）。
-  const sess = await harness.session.get(current.id).catch(() => undefined)
-  if (sess && sess !== current) {
-    const rebuilt = hydrateUsage(sess)
-    if (!isBlankUsage(rebuilt)) return rebuilt
-  }
-  return hydrated
-}
-
-/**
  * 归集当日（本地时区）跨会话用量：只读持久化会话文件、不写回，
  * 因此重连前当天产生的用量依然可统计 / 可导出。失败时回落为当前会话当日用量。
  */
 export async function resolveTodayUsage(app: HarnessApp | undefined, current: Session): Promise<UsageStats> {
   return collectTodayUsage(app?.sessionStore, current)
 }
+
+// /stats 的装配函数（resolveCurrentUsage / renderChildAgentRollup / renderContextOccupancy）
+// 已上移 @harness/usage（P2-v1：sidecar 的 harness/stats.get 也要用，CLI 不能成为唯一定义处）；
+// 这里再导出以维持 './index' 的既有导入面（tui / 测试）。
+export {
+  resolveCurrentUsage,
+  renderChildAgentRollup,
+  renderContextOccupancy,
+} from './usage-stats'
 
 /**
  * 工具结果「续行」标记：多行输出的第 2..N 行以此开头。
@@ -1337,7 +1243,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           // 本会话与各子会话的分母**各自**按自身端点解析：子 Agent 常被派到另一个窗口的端点上，
           // 沿用父会话的分母会让小窗口子会话的占用率虚低（"报 40% 其实已满"）。
           out(await renderContextOccupancy(harness, current, statsCompactOpts, (s) =>
-            resolveCompactionWindow(statsCfg, statsProvider, app.resolveSessionEndpoint(s))))
+            resolveCompactionWindow(statsCfg, statsProvider, app.resolveSessionEndpoint(s as Session | undefined))))
           out(`\n${todayUsageLine(t)}（全部会话·当日）\n`)
           return 'continue'
         }
