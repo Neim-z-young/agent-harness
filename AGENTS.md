@@ -22,7 +22,8 @@
 
   - 它带 `@types/vscode`，进 workspace 会污染主包的类型面与依赖树；独立 `package.json` / `tsconfig.json`（`types: ["vscode","node"]`）；**前端（`media/panel.{css,js}`）手写、不引入构建链**（否则要把该目录变成"需要打包的目录"，稀释下面这条隔离）
 
-  - 侧栏面板分层（P3-B）：`src/webview/state.ts`（纯：view-model 归一 + 动作规划）/ `src/webview/html.ts`（纯：骨架 + CSP nonce）/ `src/webview/panel.ts`（**唯一**碰 `vscode.WebviewView` 的文件）。面板只调**已有**的 `harness/*` 控制方法 + A2A `ListTasks`，**不为 UI 新增控制方法**（设计稿 §12.2）
+  - 侧栏面板分层（P3-B）：`src/webview/state.ts`（纯：view-model 归一 + 动作规划）/ `src/webview/html.ts`（纯：骨架 + CSP nonce）/ `src/webview/panel.ts`（**唯一**碰 `vscode.WebviewView` 的文件）/ `src/webview/timeline.ts`（纯：块模型归约器 + `TimelineStore`）。面板只调**已有**的 `harness/*` 控制方法 + A2A `ListTasks`，**不为 UI 新增控制方法**（设计稿 §12.2）
+  - 侧栏有**两条 `postMessage` 通道**：`{type:'state'}`（重、手动刷新）与 `{type:'timeline'}`（轻、流式每帧、节流 120ms + 尾部推送）—— 混在一起会让每个 token 重发整份 state（设计稿 §12.8）
 
   - **不依赖任何 `@harness/*`、源码也不 `import @harness/*`** —— 它是纯协议客户端，跨进程只讲 A2A（+ 控制面 `/harness/rpc`）
 

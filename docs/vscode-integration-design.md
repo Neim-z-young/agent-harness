@@ -497,7 +497,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | **P2-v2（✅ 已落地 2026-10-02，续 243）** | 14 个斜杠命令（+`/sessions /new /resume /save /tree /stats-export /history /help`；`/config /plugins /edit /exit` 为 TUI 专属语义、刻意不适配）；`/new /resume` 换绑 TurnState.contextId，`/resume` 为 session.list→消解→resume 两段协议；`/tree` → `stream.filetree`（树纯函数上移 `@harness/host/files.ts`）；`/stats-export` → `stream.reference`（新控制方法 `session.save` / `tree.get` / `stats.export`）；对话正文文件引用扫描（正则与宿主同源，守卫测试钉住）；follow-ups 三档 | 扩展 101 pass（含 9 条真 sidecar E2E）；主仓 2314 pass / 0 fail |
 | **P3-A（✅ 已落地 2026-10-02，续 244）** | sidecar **单文件二进制分发**：`bun run build:sidecar` 产出 `packages/cli/dist/harness-a2a`（79.9MB / 354 modules）；前置是把 `lazyImport` 的内置包改**静态查表**（30 个 specifier）+ 双向守卫测试；扩展新增 `launch.ts` 纯模块（优先级：显式 `sidecarPath` > 显式 `cliPath` > 工作区二进制 > TS 入口配 bun > PATH `harness`）与配置 `harness.sidecarPath` | 扩展 112 pass（含 2 条**真二进制 E2E**：握手 + 取卡 + 控制面）；主仓 2318 pass / 0 fail |
 | **P3-B1（✅ 已落地 2026-10-02，续 245）** | **侧栏 webview 面板**：`webview/state.ts`（纯 view-model + `planPanelAction`）/ `webview/html.ts`（纯骨架 + CSP nonce）/ `webview/panel.ts`（唯一碰 `vscode.WebviewView`）/ `media/panel.{css,js}`（手写、无构建链）；五个分区（会话 / 后台任务 / 文件引用 / 统计 / 宿主通知）**并行拉取、分区独立降级**；`HarnessTransport.listTasks()` 走 A2A `ListTasks`（不是控制面） | 扩展 **147 pass / 0 fail**（+35）；真 sidecar 面板 E2E：`ready=true`、`warnings` 为空（无分区降级）；主仓 2318 pass / 0 fail；反向验证 4 处全红；VSIX 62 文件实装成功 |
-| **P3-B2（未开工）** | **块模型时间线**：把流式回答的 text / 工具 / 权限 / 错误块搬进 webview（需"最近一轮块"的宿主侧缓冲） | plan §6 的 P3 验收的剩余一格 |
+| **P3-B2（✅ 已落地 2026-10-03，续 246）** | **块模型时间线**（设计稿 §12.8）：`webview/timeline.ts` 纯归约器（块词汇与 TUI 的 `ChatBlockKind` 对齐、差异显式列出）+ `TimelineStore`；参与者写、侧栏订阅，**独立第二条通道**（`{type:'timeline'}`，节流 120ms + 尾部推送）；文本/心跳合并、环形缓冲 200 块 | 扩展 **166 pass / 0 fail**（+19，含 1 条真流式 E2E：真协议帧 → 块）；主仓 2318 pass / 0 fail；反向验证 4 处全红；VSIX 66 文件实装成功 |
 
 **P2-v1 的"开工第一步"**（三个必须先钉死的行为，都不是设计问题而是实测问题）：
 1. `request.command` 与 `request.prompt` 对 `/permission bash=deny` 的切分行为（§6.4）。
@@ -616,10 +616,48 @@ open    → vscode 打开该文件      show-status → 执行已有命令 harne
 - 真 sidecar E2E：起真进程 → 拉四个分区 → `buildPanelState` 的 `warnings` 为空且各分区非空。
 - 无法自动化：webview 里的点击与样式（要人手点）。
 
-### 12.8 不做（留给 P3-B2）
+### 12.8 块模型时间线（P3-B2，**已落地** 2026-10-03，续 246）
 
-**块模型时间线**（把流式回答的 text / 工具 / 权限 / 错误块搬进 webview）不在本轮 ——
-它要求把参与者的流式事件同时喂给面板（需要一条"最近一轮块"的宿主侧缓冲），是独立的一条线。
+P3-B1 的侧栏只有"结构性事实"，**看不到一轮对话里发生了什么** —— 那些只活在 Chat 视图里，
+而 Chat 视图要 Copilot 存在。时间线把参与者每轮的 `RenderOp` 流累积成**块**，在侧栏呈现。
+
+#### 12.8.1 它是**第二条通道**，不是 `PanelState` 的一个字段
+
+| | `{type:'state'}` | `{type:'timeline'}` |
+|---|---|---|
+| 内容 | 会话 / 任务 / 引用 / 统计 / 通知 | 本轮的块 |
+| 触发 | 手动刷新（首次可见 / 操作后 / 命令） | **流式每帧** |
+| 代价 | 五个控制面调用（重） | 一份小数组（轻） |
+
+混进一份消息 ⇒ 每个 token 都要重发整份 `PanelState`。故分成两条，`timeline` 侧**节流**
+（`TIMELINE_FLUSH_MS = 120`）后再推，且**带尾部推送**（终态块落在节流窗口里也必须送到）。
+
+#### 12.8.2 块词汇：与 TUI 对齐，差异要**显式列出**
+
+`ChatBlockKind`（`packages/cli/src/tui.tsx`）= system / user / thinking / assistant / tool /
+compact / loadmore。本模块取能用的一档，其余不平移并写明理由：
+
+| TUI | 侧栏 | 说明 |
+|---|---|---|
+| `user` / `assistant` / `tool` / `system` | 同名同义 | 平移 |
+| `thinking` | ❌ | **案 A 下推理内容拿不到**（§5 已订正：服务端只累计字符数） |
+| `compact` / `loadmore` | ❌ | 终端分页/折叠专属，IDE 里没有对应交互 |
+| —— | `permission`（新增） | TUI 用控制台文本呈现权限询问；IDE 里它是**模态对话框**，需单独一类 |
+| —— | `error`（新增） | TUI 把错误混在控制台块里；IDE 里错误要能一眼看到 |
+
+差异**写在文件头表格里**，而不是悄悄不一致 —— 这是"两套界面不漂移"（§11）那条的延伸。
+
+#### 12.8.3 合并口径（与服务端 `StreamAdapter` 同类选择，不是性能优化）
+
+- 连续 `text` 并进同一个 assistant 块（逐帧增量不该碎成上百个块）；
+- 连续**同文案**的 `progress` 合并计数（闸门心跳重复报同一句，否则一条"等待中"刷满一屏）；
+- `done` / `error` 收尾：关掉所有 `streaming` 并写一个终态 system 块。
+
+#### 12.8.4 边界
+
+- **环形缓冲**（`MAX_TIMELINE_BLOCKS = 200`）：时间线是"最近若干块"的视图，不是全量会话历史；
+- **参与者只认 `TimelineSink` 接口**、面板只认 `TimelineStore`，两边不互相依赖；
+- **清空只是 UI 状态**：不动会话、不调控制面（它不是 harness 的状态）。
 
 ---
 

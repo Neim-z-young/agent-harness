@@ -1,5 +1,71 @@
 # Agent Harness 开发日志
 
+## 2026-10-03（续 246）P3-B2：块模型时间线（把"这一轮发生了什么"搬进侧栏）
+
+### 做什么
+
+P3-B1 的侧栏只有**结构性事实**（会话 / 任务 / 文件 / 统计），看不到一轮对话里发生了什么 ——
+那些只活在 Chat 视图里，而 Chat 视图要 Copilot 存在。本轮把参与者每轮的 `RenderOp`
+流累积成**块**，在侧栏以时间线呈现（设计稿 §12.8）。
+
+### 三个设计决策
+
+**① 时间线是第二条通道，不是 `PanelState` 的一个字段。**
+`state` 是"手动刷新才拉"的重数据（五个控制面），块是**流式每帧**更新的轻数据 ——
+混在一起 ⇒ 每个 token 都要重发整份 state。故 `postMessage` 有两类：`{type:'state'}`
+与 `{type:'timeline'}`；后者节流（120ms）后再推，且**带尾部推送**（终态块落在节流窗口里
+也必须送到，否则时间线永远停在"进行中"）。
+
+**② 块词汇与 TUI 对齐，差异显式列出。**
+`ChatBlockKind`（`packages/cli/src/tui.tsx`）= system/user/thinking/assistant/tool/compact/loadmore：
+
+| TUI | 侧栏 | 理由 |
+|---|---|---|
+| user / assistant / tool / system | 同名同义 | 平移 |
+| `thinking` | ❌ | 案 A 下推理内容拿不到（设计稿 §5 已订正） |
+| `compact` / `loadmore` | ❌ | 终端分页/折叠专属 |
+| —— | `permission`（新增） | TUI 用控制台文本呈现权限询问；IDE 里它是**模态对话框** |
+| —— | `error`（新增） | TUI 把错误混在控制台块里；IDE 里错误要能一眼看到 |
+
+差异写在 `timeline.ts` 文件头的表格里 —— 这是 §11「两套界面文案漂移」那条的延伸：
+**不一致可以，悄悄不一致不行**。
+
+**③ 合并口径**（与服务端 `StreamAdapter` 同类选择，不是性能优化）：
+连续 `text` 并进同一个 assistant 块；连续**同文案**的 `progress` 合并计数（闸门心跳
+重复报同一句，否则一条"等待中"能刷满一屏）；`done`/`error` 收尾关掉所有 streaming。
+
+### 落地
+
+| 改动 | 说明 |
+|---|---|
+| `adapters/vscode/src/webview/timeline.ts`（新） | 纯归约器（`startTimeline` / `appendOp` / `finishTimeline` / `shouldFlush`）+ `TimelineStore`（订阅式，仍不碰 vscode）；环形缓冲 200 块 |
+| `src/participant.ts` | 新增 `TimelineSink` 接口（参与者只认接口，不认 store）：开轮 / 每帧 `append(op)` / 收尾（含异常路径也 finish —— 否则时间线永远显示进行中） |
+| `src/webview/panel.ts` | 订阅 store：节流推送 + 尾部推送；视图就绪时补发最近快照（避免"刚切到面板时时间线是空的"）；动作 `clear-timeline` |
+| `src/webview/state.ts` | `planPanelAction` 新增 `timeline-clear` ⇒ `{kind:'clear-timeline'}`（**只清视图**：不动会话、不调控制面） |
+| `src/webview/html.ts` + `media/panel.js` | 时间线分区 + 清空按钮；块渲染只用 `textContent`；引用可点开 |
+
+### 验证
+
+- 扩展 **166 pass / 0 fail**（147 → 166，+19：timeline 18 + 真流式 E2E 1）；`tsc --noEmit` exit 0。
+- **真流式 E2E**：真 sidecar 的协议帧 → `mapA2aEvent` → `TimelineStore` ⇒ 首块是 `user`、
+  其后至少一块来自真协议帧；`finish('completed')` 后 `streaming=false`。
+  与 Chat 视图**同一份映射**（一份真相，两个落点）。
+- 主仓全量 **2318 pass / 0 fail**（adapters 隔离）；typecheck 41 包全绿。
+- **反向验证 4 处全部变红**，还原后 `shasum -a 256 -c` 逐字一致：
+  ① 文本不合并 ⇒2F；② 心跳不合并 ⇒1F；③ `done` 不写终态块/不关 streaming ⇒2F；④ 去掉环形缓冲 ⇒1F。
+- VSIX 重新打包（66 文件）并 `code --install-extension --force` 实装成功。
+
+### 小坑
+
+`bun` 一度从 shell 的 PATH 里消失 ⇒ 真 sidecar E2E 全体超时（spawn 的 runner 找不到 `bun`）。
+跑测试时显式 `PATH="/opt/homebrew/bin:$PATH"`（本机 bun 由 homebrew 装在那里）。
+**E2E 超时 3s 且成片失败时，先怀疑 PATH / runner，而不是协议。**
+
+### 遗留
+
+- 时间线**只记最近一轮**（换会话/重开面板后清空）—— 多轮历史要落盘的话是另一条线。
+- 人手点验：流式块滚动、权限块、清空按钮、无 Copilot 环境下侧栏独立工作。
+
 ## 2026-10-02（续 245）P3-B：侧栏 webview 面板（不依赖 Copilot 的那个落点）
 
 ### 做什么
