@@ -1,5 +1,69 @@
 # Agent Harness 开发日志
 
+## 2026-10-02（续 243）P2-v2：全部命令接入 + `reference`/`filetree` 呈现 + follow-ups
+
+### 做什么
+
+收掉设计稿 §9 的 P2-v2：扩展侧 14 个斜杠命令（P2-v1 的 6 个 + 新增 8 个）、
+`stream.filetree` / `stream.reference` 两个稳定 API 呈现落点、follow-ups 建议档。
+
+1. **新增 8 个斜杠命令**：`/sessions` `/new` `/resume` `/save` `/tree`
+   `/stats-export` `/history` `/help`。其中 `/history` `/help` 是本地渲染
+   （Chat 视图自带历史，harness 不另存一份）；`/config` `/plugins` `/edit`
+   `/exit` 是 TUI 专属语义（交互式界面 / 挂起前台编辑器 / 退出 REPL），
+   在 Chat 语境里没有对应物，**不声明**——这是「全部 18 命令」里刻意不适配的部分。
+2. **`/new` `/resume` 换绑会话**：出参 `sessionId`（= A2A `contextId`）写回
+   TurnState、清空 taskId，并置 `sessionSwitched` —— 否则下一轮还在跟旧会话说话。
+   `/resume <序号>` 是第二条两段协议：`session.list` 拿清单 → `resolveSessionSpec`
+   消解序号 → `session.resume`（与 `/model` 同构）。
+3. **`/tree` → `stream.filetree`**：控制面回结构化节点（`FileRefTreeNode` 线上形状），
+   扩展端转 `ChatResponseFileTree`（只有 name/children；`*` 标记并入 name）。
+   磁盘树 + 会话引用标记的纯函数（`buildDiskFileTree` / `collectFileRefsFromTexts` /
+   `findFileReferences` / `abbrevFileRef` / `resolveEditPath`）上移 **`@harness/host`
+   的 `files.ts`**（sidecar 不能反向依赖 CLI，与 P2-v1 的 stats 上移同一条纪律）；
+   TUI 薄再导出，`collectFileReferences` 改为调共享的 `collectFileRefsFromTexts`。
+4. **`/stats-export` → `stream.reference`**：新控制方法 `harness/stats.export`
+   （第 16-18 个：`session.save` / `tree.get` / `stats.export`）把报告写到 sidecar
+   工作目录、回传 path，扩展端 reference 呈现。**不回传 content**：控制面回包不背大文本。
+5. **对话正文的文件引用 → `stream.reference`**：`render.ts` 在 artifactUpdate 文本上
+   扫描类文件路径（正则与 `@harness/host` **逐字同源**，跨进程不能 import，
+   由**守卫测试**读宿主源码比对 `FILE_REF_SOURCE`），参与者按工作区根解析为
+   Uri 后 `stream.reference`（相对路径按工作区根近似，sidecar `--cwd` 偏差留给增量）。
+6. **follow-ups**：`followups.ts` 纯模块按 metadata 分三档（新线程 / 活动会话 /
+   刚换过会话），`extension.ts` 注册 `followupProvider`。纯建议，不碰传输。
+
+### 顺手修的既有缺陷
+
+`readState` 只在 `contextId || taskId` 存在时继承 metadata —— 命令轮（如首轮就敲
+`/help`）写回的 `noticesShown` 下一轮读不回来，「每线程一次」的启动自检实际会
+每轮都弹。改为全字段继承。
+
+### 验证
+
+- 主仓 typecheck **41 包全绿**；全量测试 **2314 pass / 0 fail**（host +11、
+  a2a-server +6、cli/tui 迁移不丢、vscode +21）。
+- 扩展 tsc exit 0；`adapters/vscode` **101 pass / 0 fail**（80 → 101：commands
+  +11、render +4、followups +3、真 sidecar E2E +2 即 `tree.get` / `stats.export` 全链路）。
+- VSIX 重打包（40 文件）并 `code --install-extension` 实装成功。
+- 反向验证 4 处全部变红、还原后 sha256 逐字一致：
+
+| # | 反向实验 | 变红用例 |
+|---|---|---|
+| 1 | `resolveSessionSpec` 序号越界时错误命中第一条 | `序号越界 → 错误文案`（2 条） |
+| 2 | `extractFileRefPaths` 去重逻辑删除 | `同一文件不同行号按基础路径去重` |
+| 3 | `harness/tree.get` 的会话引用收集传空数组 | `tree.get … 会话引用过的文件带 marked` |
+| 4 | 扩展端 `FILE_REF_RE` 删掉 `test|tests|build` 前缀（偏离宿主） | `文件引用正则与宿主同源（守卫）` |
+
+### 文件锚点
+
+- `packages/host/src/files.ts`（新）：文件引用提取 + 磁盘目录树纯函数。
+- `packages/a2a-server/src/control.ts`：+`harness/session.save` / `harness/tree.get` / `harness/stats.export`。
+- `adapters/vscode/src/commands.ts`：SLASH_COMMANDS 14 条、`session-resolve` / `local` 计划、
+  `resolveSessionSpec`、新命令渲染。
+- `adapters/vscode/src/map/render.ts`：`extractFileRefPaths` + `FILE_REF_SOURCE`（守卫锚点）。
+- `adapters/vscode/src/participant.ts`：filetree/reference 执行、contextId 换绑、readState 全字段继承。
+- `adapters/vscode/src/followups.ts`（新）+ `extension.ts` 注册。
+
 ## 2026-10-02（续 242）P2-v1：6 个斜杠命令 + `harness/stats.get` + 启动自检
 
 ### 做什么

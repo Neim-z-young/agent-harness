@@ -390,6 +390,14 @@ harness/skill.list / .set   → [{ id, name, enabled, sourceLabel }] / { ok }   
 harness/notice.list         → HostNotice[]                                        （**E2E 可观测性**：见 §8）
 ```
 
+> **P2 增量（续 242 / 243 落地）**：最终 18 个方法 —— 上表 + `harness/session.get` /
+> `harness/permission.set` / `harness/skill.set` / `harness/stats.get`（出参是
+> `usage` / `today` / `rollupText` / `occupancyText` / **整页 `text`**，渲染文案唯一在宿主）/
+> `harness/session.save` / `harness/tree.get`（磁盘树 + 会话引用标记，节点形状见
+> `@harness/host/files.ts` 的 `FileRefTreeNode`）/ `harness/stats.export`（写文件回
+> `path`，**不回传 content**）。统计与目录树的纯函数分别上移 `@harness/usage`
+> 与 `@harness/host`，sidecar 不反向依赖 CLI。
+
 > `harness/notice.list` 是新加的、也是最有价值的一条：它把 host 的装配期环形缓冲（`host.notices`，`packages/host/src/host.ts:284`）暴露给扩展 —— 于是"**无 key 回落到 Mock**"这类事实能在 VSCode 里显示出来，而不是让用户在 IDE 里拿到 mock 回答却没有任何信号（plan §6 末尾点名的那条风险）。
 
 ### 6.4 参与者命令 → 控制通道的映射
@@ -486,7 +494,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | **P2-A（✅ 已落地）** | **控制通道**：`POST /harness/rpc` + 14 个 `harness/*` 方法（`packages/a2a-server/src/control.ts`） | `@harness/a2a-server` 70 → **104 pass / 0 fail**；与协议面互不串线（同一方法名打到 `/a2a` ⇒ `MethodNotFound`）；卡片不含控制路径 |
 | **P2-B（骨架 / P2-v0）（✅ 已落地 2026-10-01，续 241）** | 扩展注册参与者；spawn sidecar 拿端点；`@harness <prompt>` 能拿到一段完整回答 | **无头可验的部分全绿**：`adapters/vscode` 57 pass / 0 fail（含 6 条真 sidecar 端到端：握手 / 取卡 / 版本头陷阱 / 控制面 / 流式管道 / dispose 无残留）；VSIX 打包并用 `code --install-extension` 实装成功。**仍需人手点验**：在 Chat 视图里 `@harness` 提问（本机未装 Copilot，Chat 视图无模型提供方时不显示参与者） |
 | **P2-v1（✅ 已落地 2026-10-02，续 242）** | 事件映射（文本/工具/闸门）流式呈现；取消；权限四态弹窗（三项 P2-B 已落地）；6 个斜杠命令（`/compact /stats /agent /model /permission /skills`，解析在 `commands.ts` 纯模块，`/model` 为 get→resolve→set 两段协议）；启动自检提示（warn notices 每线程首轮一次） | 扩展 79 pass（含 7 条真 sidecar E2E）；主仓 2308 pass / 0 fail |
-| **P2-v2** | 全部 18 命令；follow-ups；`reference`/`filetree` 呈现（文件引用、diff 预览） | — |
+| **P2-v2（✅ 已落地 2026-10-02，续 243）** | 14 个斜杠命令（+`/sessions /new /resume /save /tree /stats-export /history /help`；`/config /plugins /edit /exit` 为 TUI 专属语义、刻意不适配）；`/new /resume` 换绑 TurnState.contextId，`/resume` 为 session.list→消解→resume 两段协议；`/tree` → `stream.filetree`（树纯函数上移 `@harness/host/files.ts`）；`/stats-export` → `stream.reference`（新控制方法 `session.save` / `tree.get` / `stats.export`）；对话正文文件引用扫描（正则与宿主同源，守卫测试钉住）；follow-ups 三档 | 扩展 101 pass（含 9 条真 sidecar E2E）；主仓 2314 pass / 0 fail |
 | **P3** | webview 平移块模型与侧栏；`--compile` 单文件二进制随扩展分发 | plan §6 的 P3 验收 |
 
 **P2-v1 的"开工第一步"**（三个必须先钉死的行为，都不是设计问题而是实测问题）：
