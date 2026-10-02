@@ -166,6 +166,7 @@
         "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
         "@harness/swarm": "workspace:*",
+        "@harness/telemetry": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
         "@harness/tools-glob": "workspace:*",
         "@harness/tools-manager": "workspace:*",

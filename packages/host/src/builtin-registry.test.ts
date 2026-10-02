@@ -12,6 +12,7 @@
  */
 
 import { describe, it, expect } from 'bun:test'
+import { readFileSync } from 'node:fs'
 import { ProviderTypeRegistry } from '@harness/plugin'
 import {
   lazyImport,
@@ -206,6 +207,63 @@ describe('preloadBuiltinToolMetas：preload 后内置工具描述无需加载 L2
     }
     for (const [id, k] of Object.entries(permByTool)) {
       expect(reg.get(id)?.permissionKey).toBe(k)
+    }
+  })
+})
+
+// ========================================================================
+// P3-A：内置包清单 ↔ lazy.ts 静态查表（编译友好性守卫）
+// ========================================================================
+
+/**
+ * 为什么要有这条：内置包是**按包名**惰性 import 的，而打包器只能静态分析字面量
+ * —— `import(变量)` 不会进 bundle，`bun build --compile` 出的二进制一启动就
+ * `Cannot find module '@harness/provider-openai' from '/$bunfs/root/…'`（P3-A 实测）。
+ * 故 lazy.ts 把它们改成了静态查表；**新增内置插件忘了同步表 = 编译产物启动即崩**，
+ * 这条守卫把「注册点集合」与「查表键集合」钉在一起。
+ */
+describe('内置包清单与 lazy.ts 静态查表一致（--compile 友好性）', () => {
+  /** 源码里出现的内置包 specifier（注册点集合） */
+  const REGISTERED = new Set<string>()
+  for (const file of ['./plugins.ts', './host.ts']) {
+    const src = readFileSync(new URL(file, import.meta.url), 'utf8')
+    for (const m of src.matchAll(/lazyImport(?:<[\s\S]*?>)?\s*\(\s*'([\w@/.\-]+)'/g)) REGISTERED.add(m[1])
+    for (const m of src.matchAll(/lazyToolMetaSource\('([\w@/.\-]+)'\)/g)) REGISTERED.add(m[1])
+    for (const m of src.matchAll(/registerBuiltinProviderType\(registry,\s*'[\w-]+',\s*'([\w@/.\-]+)'\)/g)) {
+      REGISTERED.add(m[1])
+    }
+  }
+
+  /** lazy.ts 静态表的键集合 */
+  const TABLED = new Set(
+    [...readFileSync(new URL('./lazy.ts', import.meta.url), 'utf8').matchAll(/^ {2}'(@harness\/[\w.\-/]+)':/gm)].map(
+      (m) => m[1],
+    ),
+  )
+
+  // 注：`@harness/telemetry` 住在 packages/plugins/ 下（不在 packages/* 平铺层），
+  // 靠根 node_modules 软链解析 —— 未编译时能命中、编译后就会漏，是最典型的一类
+  // 「静态表漏项」受害者，故本轮一并收进静态表并把依赖显式声明进 host。
+
+  it('注册点集合非空（扫描正则本身没失效）', () => {
+    expect(REGISTERED.size).toBeGreaterThan(20)
+  })
+
+  it('每个注册点都在静态表里', () => {
+    const missing = [...REGISTERED].filter((s) => !TABLED.has(s))
+    expect(missing).toEqual([])
+  })
+
+  it('静态表里没有已失效的注册点（表不会腐烂）', () => {
+    const stale = [...TABLED].filter((s) => !REGISTERED.has(s))
+    expect(stale).toEqual([])
+  })
+
+  it('表内 specifier 都能被真实解析（编译期可静态分析的前置）', async () => {
+    // 逐个真的 import 一遍：解析不到会直接抛 —— 比"表看起来对"更硬
+    for (const spec of [...TABLED].filter((s) => !s.endsWith('/meta'))) {
+      const mod = await lazyImport<Record<string, unknown>>(spec)
+      expect(mod).toBeObject()
     }
   })
 })
