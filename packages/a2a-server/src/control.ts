@@ -41,18 +41,32 @@
  * | 调用方隔离（`contextId` 归属） | 有 | 无 —— 控制面是"持有 token 者即管理员" |
  * | 鉴权 | Bearer | **同一个 Bearer**（同一端口不该有两套凭据） |
  */
+import { statSync } from 'node:fs'
+import { writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
-import { buildCompactionOptions, formatModel, renderNotice, resolveCompactionWindow } from '@harness/host'
+import {
+  anyMarked,
+  buildCompactionOptions,
+  buildDiskFileTree,
+  collectFileRefsFromTexts,
+  formatModel,
+  renderFileRefTree,
+  renderNotice,
+  resolveCompactionWindow,
+  resolveEditPath,
+} from '@harness/host'
 import type { Host, HostNotice, PermissionMode } from '@harness/host'
+import type { Session, TextPart } from '@harness/session'
 import {
   collectTodayUsage,
+  exportStatsJson,
+  exportStatsMarkdown,
   renderChildAgentRollup,
   renderContextOccupancy,
   renderStatsText,
   resolveCurrentUsage,
   todayUsageLine,
 } from '@harness/usage'
-import type { Session } from '@harness/session'
 
 /** 默认控制端点路径（本扩展私有，非 A2A 协议面） */
 export const DEFAULT_CONTROL_PATH = '/harness/rpc'
@@ -651,6 +665,82 @@ METHODS.set('harness/stats.get', async (p, host) => {
       occupancyText +
       `\n${todayUsageLine(today)}（全部会话·当日）\n`,
   }
+})
+
+// ---- 会话保存 / 目录树 / 统计导出（P2-v2）----------------------------------
+
+/**
+ * `harness/session.save` —— 对应 `/save`：把当前（或指定）会话立即落盘。
+ * harness 平时在每轮结束时保存，「切完就退出」这类窗口期由本方法显式收口。
+ */
+METHODS.set('harness/session.save', async (p, host) => {
+  const cur = await requireLiveSession(host, p['sessionId'])
+  const live = await host.harness.session.get(cur.id)
+  if (!live) throw new ControlError('NOT_FOUND', `会话 ${cur.id} 不存在或已失效`)
+  await host.sessionStore.save(live)
+  return { ok: true as const, id: live.id, messageCount: live.messages.length }
+})
+
+/**
+ * `harness/tree.get` —— 对应 `/tree [path]`：磁盘目录树 + 对话引用标记。
+ *
+ * 与 CLI 同一套纯函数（`buildDiskFileTree` / `collectFileRefsFromTexts`，上移
+ * `@harness/host` 后两边共享）；对话引用从会话消息的 text part 收集。
+ * 出参给**结构化节点**（扩展端喂 `stream.filetree`）与 **text 渲染**（CLI 口径）两份。
+ */
+METHODS.set('harness/tree.get', async (p, host) => {
+  const cur = await requireLiveSession(host, p['sessionId'])
+  const rootArg = optionalString(p, 'root')
+  const root = rootArg ? resolveEditPath(rootArg, host.workspace.cwd) : host.workspace.cwd
+  let isDir = false
+  try { isDir = statSync(root).isDirectory() } catch { isDir = false }
+  if (!isDir) throw new ControlError('INVALID_PARAMS', `目录不存在：${root}`)
+
+  const refs = collectFileRefsFromTexts(
+    cur.messages.flatMap((m) => m.parts.filter((pt): pt is TextPart => pt.type === 'text').map((pt) => pt.text)),
+  )
+  const maxDepth = typeof p['maxDepth'] === 'number' ? p['maxDepth'] : undefined
+  const maxNodes = typeof p['maxNodes'] === 'number' ? p['maxNodes'] : undefined
+  const { nodes, truncated } = buildDiskFileTree(root, refs, {
+    cwd: host.workspace.cwd,
+    ...(maxDepth !== undefined ? { maxDepth } : {}),
+    ...(maxNodes !== undefined ? { maxNodes } : {}),
+  })
+  return {
+    root,
+    cwd: host.workspace.cwd,
+    refs,
+    nodes,
+    truncated,
+    marked: anyMarked(nodes),
+    /** CLI `/tree` 的同一段文本渲染（根行 + 树形 + 截断标记） */
+    text: `文件树（${nodes[0].name}）${truncated ? '（截断）' : ''}：\n${renderFileRefTree(nodes)}${anyMarked(nodes) ? '\n\n* = 对话中引用过的文件' : ''}`,
+  }
+})
+
+/**
+ * `harness/stats.export` —— 对应 `/stats-export [json|md] [path]`。
+ *
+ * 复用 `@harness/usage` 的同两个导出纯函数（CLI 一份口径）；文件落在 sidecar 的
+ * 工作目录下 —— 扩展端拿到 `path` 后用 `stream.reference` 呈现（P2-v2 的
+ * reference 落点之一）。**不回传 content**：内容进文件即可，控制面回包不背大文本。
+ */
+METHODS.set('harness/stats.export', async (p, host) => {
+  const cur = await requireLiveSession(host, p['sessionId'])
+  const format = optionalEnum(p, 'format', ['markdown', 'json'] as const) ?? 'markdown'
+  const usage = await resolveCurrentUsage(host.harness, cur)
+  const today = await collectTodayUsage(host.sessionStore, cur)
+  const content = format === 'json'
+    ? exportStatsJson(usage, { sessionId: cur.id, title: cur.title, today })
+    : exportStatsMarkdown(usage, { sessionId: cur.id, title: cur.title, today })
+  const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '').replace('T', '-')
+  const path = resolve(host.workspace.cwd, `harness-stats-${stamp}.${format === 'json' ? 'json' : 'md'}`)
+  try {
+    await writeFile(path, content, 'utf8')
+  } catch (e) {
+    throw new ControlError('INTERNAL', `统计报告写入失败（${path}）：${e instanceof Error ? e.message : String(e)}`)
+  }
+  return { ok: true as const, path, format, bytes: Buffer.byteLength(content, 'utf8') }
 })
 
 // ---- 压缩 ----------------------------------------------------------------

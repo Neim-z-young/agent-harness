@@ -11,6 +11,7 @@
  */
 import { describe, it, expect, afterEach } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentDefinition } from '@harness/core'
@@ -522,5 +523,90 @@ describe('控制面：harness/stats.get', () => {
     }
     expect(res.occupancyText).toContain('上下文占用')
     await expectControlError(() => call(host, 'harness/stats.get', { sessionId: 'ghost-id' }), 'NOT_FOUND')
+  })
+})
+
+// ========================================================================
+// 会话保存 / 目录树 / 统计导出（harness/session.save、tree.get、stats.export）
+// ========================================================================
+
+describe('控制面：harness/session.save（P2-v2）', () => {
+  it('把当前会话立即落盘（messageCount 回传）', async () => {
+    const host = await makeHost()
+    const res = (await call(host, 'harness/session.save')) as { ok: boolean; id: string; messageCount: number }
+    expect(res.ok).toBe(true)
+    expect(res.id).toBe(host.session.id)
+    expect(typeof res.messageCount).toBe('number')
+    // 落盘可验证：sessionStore 能读回同一条
+    const saved = await host.sessionStore.load(res.id)
+    expect(saved?.id).toBe(res.id)
+  })
+
+  it('sessionId 不可寻址 → NOT_FOUND', async () => {
+    const host = await makeHost()
+    await expectControlError(() => call(host, 'harness/session.save', { sessionId: 'ghost' }), 'NOT_FOUND')
+  })
+})
+
+describe('控制面：harness/tree.get（P2-v2）', () => {
+  it('返回磁盘树结构化节点 + CLI 口径 text；会话引用过的文件带 marked', async () => {
+    const host = await makeHost()
+    // 在工作目录里摆 src/a.txt 与 b.txt，并让会话引用其一（路径与磁盘一致才会标 *，CLI 同语义）
+    const ws = host.workspace.cwd
+    await mkdir(join(ws, 'src'), { recursive: true })
+    await writeFile(join(ws, 'src', 'a.txt'), 'a')
+    await writeFile(join(ws, 'b.txt'), 'b')
+    const cur = (await host.harness.session.get(host.session.id))!
+    cur.messages.push({
+      id: 'm1', role: 'user', createdAt: Date.now(),
+      parts: [{ type: 'text', text: '请看 src/a.txt 和 packages/x/index.ts' }],
+    } as never)
+    const res = (await call(host, 'harness/tree.get')) as {
+      root: string; refs: string[]; truncated: boolean; marked: boolean
+      nodes: Array<{ name: string; children: Array<{ name: string; marked?: boolean; children?: Array<{ name: string; marked?: boolean }> }> }>
+      text: string
+    }
+    expect(res.root).toBe(ws)
+    expect(res.refs.some((r) => r.startsWith('src/a.txt'))).toBe(true)
+    expect(res.marked).toBe(true)
+    const topNames = res.nodes.flatMap((n) => n.children.map((c) => c.name))
+    expect(topNames).toContain('src')
+    expect(topNames).toContain('b.txt')
+    const srcDir = res.nodes.flatMap((n) => n.children).find((c) => c.name === 'src')
+    const a = srcDir?.children?.find((c) => c.name === 'a.txt')
+    expect(a?.marked).toBe(true)
+    const b = res.nodes.flatMap((n) => n.children).find((c) => c.name === 'b.txt')
+    expect(b?.marked).toBeFalsy()
+    expect(res.text).toContain('文件树')
+    expect(res.text).toContain('a.txt*')
+  })
+
+  it('root 参数指向不存在的目录 → INVALID_PARAMS', async () => {
+    const host = await makeHost()
+    await expectControlError(
+      () => call(host, 'harness/tree.get', { root: '/nonexistent-dir-xyz' }),
+      'INVALID_PARAMS',
+    )
+  })
+})
+
+describe('控制面：harness/stats.export（P2-v2）', () => {
+  it('默认 markdown：写入工作目录并回传 path；内容是渲染好的统计报告', async () => {
+    const host = await makeHost()
+    const res = (await call(host, 'harness/stats.export')) as { ok: boolean; path: string; bytes: number }
+    expect(res.ok).toBe(true)
+    expect(res.path.endsWith('.md')).toBe(true)
+    const content = await readFile(res.path, 'utf8')
+    expect(Buffer.byteLength(content, 'utf8')).toBe(res.bytes)
+    expect(content).toContain('# 会话用量统计报告')
+    expect(content).toContain('| LLM 调用次数（单轮对话） |')
+  })
+
+  it('format=json：导出 JSON 且可解析', async () => {
+    const host = await makeHost()
+    const res = (await call(host, 'harness/stats.export', { format: 'json' })) as { path: string }
+    expect(res.path.endsWith('.json')).toBe(true)
+    const parsed = JSON.parse(await readFile(res.path, 'utf8')) as { sessionId?: string }
+    expect(parsed).toBeObject()
   })
 })
