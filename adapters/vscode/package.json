@@ -15,6 +15,25 @@
   "main": "./out/extension.js",
   "activationEvents": [],
   "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "harnessPanel",
+          "title": "Agent Harness",
+          "icon": "media/activitybar.svg"
+        }
+      ]
+    },
+    "views": {
+      "harnessPanel": [
+        {
+          "type": "webview",
+          "id": "harness.panel",
+          "name": "状态",
+          "contextualTitle": "Agent Harness 状态"
+        }
+      ]
+    },
     "chatParticipants": [
       {
         "id": "harness.agent",
@@ -90,8 +109,22 @@
       {
         "command": "harness.restartSidecar",
         "title": "Agent Harness: 重启 sidecar"
+      },
+      {
+        "command": "harness.refreshPanel",
+        "title": "Agent Harness: 刷新面板",
+        "icon": "$(refresh)"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "harness.refreshPanel",
+          "when": "view == harness.panel",
+          "group": "navigation"
+        }
+      ]
+    },
     "configuration": {
       "title": "Agent Harness",
       "properties": {
@@ -126,7 +159,8 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test",
-    "package": "vsce package --no-dependencies"
+    "compile": "tsc -p tsconfig.json",
+    "package": "bun run compile && vsce package --no-dependencies"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

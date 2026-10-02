@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { Sidecar } from './sidecar'
 import { extractTaskIds } from './map/render'
 import { A2aTransport } from './transport/a2a'
+import { buildPanelState } from './webview/state'
 
 // 代理会把对 127.0.0.1 的请求吞掉（实测 502）⇒ 连本机前先摘掉
 for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
@@ -188,6 +189,35 @@ describe.skipIf(!hasCli)('sidecar 端到端', () => {
       expect(typeof r.text).toBe('string')
       expect(r.text).toContain('上下文占用')
       expect(r.text).toContain('（全部会话·当日）')
+    } finally {
+      await s.dispose()
+    }
+  })
+
+  it('面板分区（P3-B）：四个控制面 + ListTasks 在真 sidecar 下都能取到，且无降级 warning', async () => {
+    const s = launch()
+    try {
+      const t = new A2aTransport({ sidecar: s })
+      const hs = await t.start()
+
+      const [sessionList, stats, tree, notices, tasks] = await Promise.all([
+        t.control('harness/session.list'),
+        t.control('harness/stats.get'),
+        t.control('harness/tree.get'),
+        t.control('harness/notice.list'),
+        t.listTasks(),
+      ])
+
+      const st = buildPanelState({ endpoint: hs, sessionList, stats, tree, notices, tasks })
+
+      expect(st.ready).toBe(true)
+      expect(st.endpoint?.port).toBe(hs.port)
+      expect(st.sessions.items.length).toBeGreaterThan(0)
+      expect(st.stats?.text).toContain('上下文占用')
+      expect(st.notices.length).toBeGreaterThan(0)
+      // 任务分区走 A2A 的 ListTasks（不是控制面）：真服务端认它 ⇒ 不降级
+      expect(Array.isArray(st.tasks)).toBe(true)
+      expect(st.warnings).toEqual([])
     } finally {
       await s.dispose()
     }

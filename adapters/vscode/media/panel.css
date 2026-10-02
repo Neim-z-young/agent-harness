@@ -1,0 +1,165 @@
+/* 面板样式：只用 VSCode 的主题变量（不写死颜色，明暗主题都靠它） */
+
+:root {
+  --pad: 8px;
+}
+
+body {
+  padding: 0 var(--pad) var(--pad);
+  font-size: var(--vscode-font-size, 13px);
+  color: var(--vscode-foreground);
+  background: var(--vscode-sideBar-background, transparent);
+}
+
+.bar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: var(--pad) 0;
+  background: var(--vscode-sideBar-background, transparent);
+  border-bottom: 1px solid var(--vscode-panel-border, transparent);
+}
+
+.bar .title {
+  font-weight: 600;
+}
+
+.bar .spacer {
+  flex: 1;
+}
+
+button {
+  padding: 2px 6px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: 1px solid transparent;
+  border-radius: 2px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+button:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
+button.primary {
+  background: var(--vscode-button-background);
+  font-weight: 600;
+}
+
+button.icon {
+  min-width: 22px;
+  padding: 2px 4px;
+}
+
+button.link {
+  color: var(--vscode-textLink-foreground);
+  background: transparent;
+  border: none;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.link:hover {
+  text-decoration: underline;
+}
+
+.status {
+  padding: 4px 0;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+}
+
+.warnings {
+  margin: 4px 0;
+  padding: 4px 8px;
+  list-style: none;
+  border-left: 3px solid var(--vscode-inputValidation-warningBorder, #b89500);
+  background: var(--vscode-inputValidation-warningBackground, transparent);
+}
+
+.warnings li {
+  font-size: 12px;
+}
+
+section {
+  margin-top: 10px;
+}
+
+h2 {
+  margin: 0 0 4px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.list li {
+  padding: 3px 0;
+  border-bottom: 1px solid var(--vscode-editorWidget-border, transparent);
+}
+
+.list li:last-child {
+  border-bottom: none;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.row .grow {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.badge {
+  padding: 0 4px;
+  font-size: 11px;
+  border-radius: 8px;
+  color: var(--vscode-badge-foreground);
+  background: var(--vscode-badge-background);
+}
+
+.meta {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.empty {
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  font-style: italic;
+}
+
+.pre {
+  margin: 0;
+  padding: 6px 8px;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 11px;
+  background: var(--vscode-textCodeBlock-background, transparent);
+}
+
+footer {
+  margin-top: 12px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}

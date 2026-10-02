@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- 单色（fill 用 currentColor）：activitybar 图标在明暗主题下都要能看清 -->
+  <g fill="currentColor">
+    <circle cx="12" cy="6" r="2.6" />
+    <circle cx="6" cy="17" r="2.2" />
+    <circle cx="18" cy="17" r="2.2" />
+    <path d="M12 8.6 L6.9 14.9 h1.5 L12 11 l3.6 3.9 h1.5 Z" />
+    <path d="M8.2 18.4 h7.6 v1.3 h-7.6 Z" />
+  </g>
+</svg>

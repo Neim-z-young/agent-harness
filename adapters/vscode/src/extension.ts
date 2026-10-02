@@ -12,6 +12,7 @@ import { resolveLaunchOptions } from './launch'
 import { createParticipantHandler } from './participant'
 import { Sidecar } from './sidecar'
 import { A2aTransport } from './transport/a2a'
+import { HarnessPanelProvider, PANEL_VIEW_ID } from './webview/panel'
 
 let current: { sidecar: Sidecar; transport: A2aTransport } | undefined
 let channel: vscode.OutputChannel | undefined
@@ -43,6 +44,21 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   }
   context.subscriptions.push(participant)
+
+  // 侧栏面板（P3-B）：不依赖 Copilot 的那个落点 —— 会话 / 后台任务 / 文件引用 /
+  // 统计 / 宿主通知常驻可见，数据全部来自已有控制面 + A2A ListTasks（设计稿 §12）。
+  const panel = new HarnessPanelProvider({
+    transport,
+    extensionUri: context.extensionUri,
+    log: (m) => channel?.appendLine(m),
+  })
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(PANEL_VIEW_ID, panel, {
+      // 面板重建 DOM 的代价不大，但会话列表滚动位置会丢 ⇒ 保留上下文
+      webviewOptions: { retainContextWhenHidden: true },
+    }),
+    vscode.commands.registerCommand('harness.refreshPanel', () => void panel.refresh()),
+  )
 
   context.subscriptions.push(
     vscode.commands.registerCommand('harness.showStatus', () => {
