@@ -42,8 +42,16 @@
  * | 鉴权 | Bearer | **同一个 Bearer**（同一端口不该有两套凭据） |
  */
 import { resolve } from 'node:path'
-import { buildCompactionOptions, formatModel, renderNotice } from '@harness/host'
+import { buildCompactionOptions, formatModel, renderNotice, resolveCompactionWindow } from '@harness/host'
 import type { Host, HostNotice, PermissionMode } from '@harness/host'
+import {
+  collectTodayUsage,
+  renderChildAgentRollup,
+  renderContextOccupancy,
+  renderStatsText,
+  resolveCurrentUsage,
+  todayUsageLine,
+} from '@harness/usage'
 import type { Session } from '@harness/session'
 
 /** 默认控制端点路径（本扩展私有，非 A2A 协议面） */
@@ -602,6 +610,49 @@ METHODS.set('harness/skill.set', async (p, host) => {
   return { ...res, op, id }
 })
 
+// ---- 统计 ----------------------------------------------------------------
+
+/**
+ * `harness/stats.get` —— 对应 `/stats`。
+ *
+ * 前置（P2-v1 落地）：`resolveCurrentUsage` / `renderChildAgentRollup` /
+ * `renderContextOccupancy` / `collectTodayUsage` 已上移 `@harness/usage` ——
+ * CLI 与本方法共用同一批装配函数，文案只有一份（设计稿 §11 的对策）。
+ *
+ * 与 CLI `/stats` 同口径的三件事：
+ * - 「含子 agent」聚合行走 `usage.children()`（展示层聚合，不并进父会话 meta）；
+ * - 上下文占用区的窗口/阈值取 `/compact` 同一套 `buildCompactionOptions`，
+ *   且**按本会话实际端点**解析分母（子会话分母各自解析）；
+ * - 当日用量只读持久化会话文件归集（跨会话），当前会话无条件纳入。
+ *
+ * 出参同时给**结构化字段**（usage / today）与**服务端渲染好的 text**（整页）——
+ * 渲染文案的唯一定义在宿主侧，扩展端直接显示 text，不抄第二份渲染器。
+ */
+METHODS.set('harness/stats.get', async (p, host) => {
+  const cur = await requireLiveSession(host, p['sessionId'])
+  const usage = await resolveCurrentUsage(host.harness, cur)
+  const today = await collectTodayUsage(host.sessionStore, cur)
+  const rollupText = await renderChildAgentRollup(host.harness, cur.id)
+  const cfg = await host.configStore.load()
+  const providerId = cfg.provider ?? 'anthropic'
+  const compactOpts = buildCompactionOptions(cfg, providerId, host.resolveSessionEndpoint(cur))
+  const occupancyText = await renderContextOccupancy(host.harness, cur, compactOpts, (s) =>
+    resolveCompactionWindow(cfg, providerId, host.resolveSessionEndpoint(s as Session | undefined)))
+  return {
+    usage,
+    today,
+    rollupText,
+    occupancyText,
+    /** 整页文本 = CLI `/stats` 的同一段输出（renderStatsText + 子 agent 聚合 + 占用区 + 当日行） */
+    text:
+      renderStatsText(usage) +
+      '\n' +
+      rollupText +
+      occupancyText +
+      `\n${todayUsageLine(today)}（全部会话·当日）\n`,
+  }
+})
+
 // ---- 压缩 ----------------------------------------------------------------
 
 /**
@@ -610,9 +661,8 @@ METHODS.set('harness/skill.set', async (p, host) => {
  * 窗口/阈值口径走 `buildCompactionOptions`（host 里的唯一一份推导），且**按本会话实际端点**解析 ——
  * 这正是 AGENTS.md 记着的那条老病：同一份 config 算出两个窗口，阈值判据就失效了。
  *
- * `stats` 不在首批：它要的 `resolveCurrentUsage` / `renderContextOccupancy` 目前还住在
- * `@harness/cli` 里（clI 不能被 sidecar 依赖），需要先把这几个纯函数上移到共享位置。
- * 这是 P2 的后续增量（设计稿 §11「渲染文案复用同一批纯函数」），不在这里顺手抄一份。
+ * `stats` 已在 P2-v1 补上（`harness/stats.get`）：其前置是把装配函数上移 `@harness/usage`，
+ * 见下方该方法与设计稿 §6.3 的订正框。
  */
 METHODS.set('harness/compact', async (p, host) => {
   const cur = await requireLiveSession(host, p['sessionId'])

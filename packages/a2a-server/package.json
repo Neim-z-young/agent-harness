@@ -21,7 +21,8 @@
     "@harness/core": "workspace:*",
     "@harness/host": "workspace:*",
     "@harness/plugin": "workspace:*",
-    "@harness/session": "workspace:*"
+    "@harness/session": "workspace:*",
+    "@harness/usage": "workspace:*"
   },
   "devDependencies": {
     "@harness/provider-mock": "workspace:*"

@@ -470,3 +470,57 @@ describe('控制面：技能与压缩', () => {
     expect(dflt.strategy).toBe('ifneeded')
   })
 })
+
+// ========================================================================
+// 统计（harness/stats.get）
+// ========================================================================
+
+describe('控制面：harness/stats.get', () => {
+  it('出参同时有结构化字段与服务端渲染的整页 text（渲染文案只有宿主一份）', async () => {
+    const host = await makeHost()
+    const res = (await call(host, 'harness/stats.get')) as {
+      usage: { llmCalls: number }
+      today: { llmCalls: number }
+      rollupText: string
+      occupancyText: string
+      text: string
+    }
+    expect(res.usage).toBeObject()
+    expect(res.today).toBeObject()
+    // 空会话没有子 agent ⇒ 聚合行为空串（不占版面，与 CLI 一致）
+    expect(res.rollupText).toBe('')
+    // 占用区至少有本会话一行，且带窗口/阈值口径
+    expect(res.occupancyText).toContain('上下文占用')
+    expect(res.occupancyText).toContain('自动压缩阈值')
+    // 整页 text 按 CLI `/stats` 的段落顺序拼装
+    expect(res.text).toContain('上下文占用')
+    expect(res.text).toContain('（全部会话·当日）')
+  })
+
+  it('子 agent 用量进入 rollupText（children 按 Session.parentId 反查 + 展示层聚合）', async () => {
+    const host = await makeHost()
+    const child = await host.harness.session.create({ parentId: host.session.id })
+    // 引擎是唯一累加者（UsageAccessor 只读）；测试里直接写 meta.usageStats 模拟"子会话已跑过"
+    await host.harness.session.updateMeta(child.id, {
+      usageStats: {
+        llmCalls: 2, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0,
+        models: [], tools: [], agents: [], hourly: [],
+      },
+    })
+    const res = (await call(host, 'harness/stats.get')) as { rollupText: string }
+    expect(res.rollupText).toContain('1 个子会话')
+    expect(res.rollupText).toContain('调用 2 次')
+    expect(res.rollupText).toContain('in 100 / out 50')
+  })
+
+  it('sessionId 可寻址到落盘会话（与其它方法同一条 readSessionView 路径）', async () => {
+    const host = await makeHost()
+    const saved = host.session
+    await host.sessionStore.save(saved)
+    const res = (await call(host, 'harness/stats.get', { sessionId: saved.id })) as {
+      occupancyText: string
+    }
+    expect(res.occupancyText).toContain('上下文占用')
+    await expectControlError(() => call(host, 'harness/stats.get', { sessionId: 'ghost-id' }), 'NOT_FOUND')
+  })
+})
