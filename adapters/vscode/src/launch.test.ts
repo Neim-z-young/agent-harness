@@ -63,3 +63,41 @@ describe('resolveLaunchOptions：优先级', () => {
     expect(resolveLaunchOptions(input({ cwd: '/other' })).cwd).toBe('/other')
   })
 })
+
+describe('resolveLaunchOptions：bun 缺失（A3 分发下的主要失败模式）', () => {
+  it('没 bun 时**跳过** TS 入口路线（自动探测不选一条跑不起来的路线）', () => {
+    const r = resolveLaunchOptions(input({ bun: undefined, exists: (p) => p === ENTRY }))
+    expect(r.cliPath).toBe('harness')
+    expect(r.notes.some((n) => n.includes('没找到 bun'))).toBe(true)
+  })
+
+  it('编译二进制不依赖 bun：无 bun 也走二进制，且不产出噪声', () => {
+    const r = resolveLaunchOptions(input({ bun: undefined }))
+    expect(r.cliPath).toBe(BINARY)
+    expect(r.runner).toBeUndefined()
+    expect(r.notes).toEqual([])
+  })
+
+  it('显式配置的 .ts 入口照用，但把"多半会失败"和补救办法说清楚', () => {
+    const r = resolveLaunchOptions(input({ bun: '', sidecarPath: '/x/cli.ts' }))
+    expect(r.cliPath).toBe('/x/cli.ts')
+    expect(r.runner).toBeUndefined()
+    expect(r.notes[0]).toContain('harness.sidecarPath')
+    expect(r.notes[0]).toContain('harness.bunPath')
+  })
+
+  it('bun 是空白串当没找到（配置被清空后的常见形态）', () => {
+    const r = resolveLaunchOptions(input({ bun: '   ', exists: (p) => p === ENTRY }))
+    expect(r.cliPath).toBe('harness')
+  })
+
+  it('回落到 PATH harness 时记一条 note（这条最可能失败）', () => {
+    const r = resolveLaunchOptions(input({ bun: undefined, exists: () => false }))
+    expect(r.notes.some((n) => n.includes('PATH 上的 harness'))).toBe(true)
+  })
+
+  it('正常路径下 notes 为空（排障信息不制造噪声）', () => {
+    expect(resolveLaunchOptions(input({ exists: (p) => p === ENTRY })).notes).toEqual([])
+    expect(resolveLaunchOptions(input()).notes).toEqual([])
+  })
+})

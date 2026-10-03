@@ -128,10 +128,15 @@
     "configuration": {
       "title": "Agent Harness",
       "properties": {
+        "harness.bunPath": {
+          "type": "string",
+          "default": "",
+          "description": "bun 可执行文件的路径。本扩展不自带 sidecar 二进制，用你机器上的 bun 跑 harness，所以找不到 bun 就用不了。留空则自动发现：PATH → BUN_INSTALL → 常见安装位置（/opt/homebrew/bin/bun、/usr/local/bin/bun、~/.bun/bin/bun、~/.asdf/shims/bun 等）。macOS 上 GUI 启动的 VSCode 常常继承不到 shell 的 PATH，自动发现失败时把 `command -v bun` 的输出填这里。"
+        },
         "harness.sidecarPath": {
           "type": "string",
           "default": "",
-          "description": "编译好的 sidecar 二进制路径（bun run build:sidecar 产出：packages/cli/dist/harness-a2a）。留空则自动探测：先找仓库内的编译二进制，再找 CLI 的 TS 入口（配 bun），最后回落 PATH 上的 harness。"
+          "description": "编译好的 sidecar 二进制路径（bun run build:sidecar 产出：packages/cli/dist/harness-a2a）。留空则自动探测：先找仓库内的编译二进制，再找 CLI 的 TS 入口（配 bun），最后回落 PATH 上的 harness。扩展包默认不带二进制，这项是给想用二进制分发的人留的口子。"
         },
         "harness.cliPath": {
           "type": "string",

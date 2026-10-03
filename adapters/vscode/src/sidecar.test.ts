@@ -5,7 +5,7 @@
  */
 
 import { describe, expect, it } from 'bun:test'
-import { HandshakeError, parseHandshake, pickHandshakeLine } from './sidecar'
+import { HandshakeError, parseHandshake, pickHandshakeLine, Sidecar } from './sidecar'
 
 const REAL =
   '{"v":1,"pid":82400,"port":65184,"protocolVersion":"1.0","rpcUrl":"http://127.0.0.1:65184/a2a","cardUrl":"http://127.0.0.1:65184/.well-known/agent-card.json","controlUrl":"http://127.0.0.1:65184/harness/rpc","auth":"anonymous","permissionMode":"ask","cwd":"/repo"}'
@@ -59,5 +59,44 @@ describe('pickHandshakeLine', () => {
 
   it('没有 JSON 行 ⇒ undefined（继续等下一次 data）', () => {
     expect(pickHandshakeLine('[a2a] 正在停止...\n')).toBeUndefined()
+  })
+})
+
+describe('reconfigure（配置变更后重启要生效）', () => {
+  it('换参数后 launch 反映新值', () => {
+    const s = new Sidecar({ cliPath: '/repo/packages/cli/src/index.ts', runner: '/opt/homebrew/bin/bun', cwd: '/repo' })
+    s.reconfigure({ cliPath: '/opt/harness-a2a', runner: undefined, cwd: '/repo', token: undefined })
+    expect(s.launch.cliPath).toBe('/opt/harness-a2a')
+    expect(s.launch.runner).toBeUndefined()
+  })
+
+  it('runner 能被清掉（.ts → 二进制时必须清，否则会 spawn "bun 跑二进制"）', () => {
+    const s = new Sidecar({ cliPath: '/x/cli.ts', runner: 'bun', cwd: '/r' })
+    s.reconfigure({ cliPath: '/x/cli.ts', runner: undefined, cwd: '/r', token: undefined })
+    expect(s.launch.runner).toBeUndefined()
+  })
+
+  it('cwd / token 也一起换', () => {
+    const s = new Sidecar({ cliPath: '/x', cwd: '/old', token: 'old' })
+    s.reconfigure({ cliPath: '/x', runner: undefined, cwd: '/new', token: 'new' })
+    expect(s.launch.cliPath).toBe('/x')
+  })
+
+  it('未运行时可反复调用（幂等，后一次覆盖前一次）', () => {
+    const s = new Sidecar({ cliPath: '/x', cwd: '/r' })
+    s.reconfigure({ cliPath: '/a', runner: undefined, cwd: '/r', token: undefined })
+    s.reconfigure({ cliPath: '/b', runner: undefined, cwd: '/r', token: undefined })
+    expect(s.launch.cliPath).toBe('/b')
+  })
+
+  it('运行中调用 ⇒ 抛，且参数不被改（否则会留下跑着旧参数的进程）', () => {
+    const s = new Sidecar({ cliPath: '/x', cwd: '/r' })
+    // 伪造"有进程在跑"：起一个真进程要挑「忽略参数、打印握手、且不退出」的可执行文件，
+    // 为一个守卫分支不值得。cast 进私有字段能精确命中这条分支。
+    ;(s as unknown as { proc: unknown }).proc = { pid: 1 }
+    expect(() => s.reconfigure({ cliPath: '/y', runner: undefined, cwd: '/r', token: undefined })).toThrow(
+      /正在运行/,
+    )
+    expect(s.launch.cliPath).toBe('/x')
   })
 })

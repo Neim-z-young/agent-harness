@@ -146,7 +146,39 @@ export class Sidecar {
   private stderrTail = ''
   private handshake: SidecarHandshake | undefined
 
-  constructor(private readonly opts: SidecarLaunchOptions) {}
+  constructor(private opts: SidecarLaunchOptions) {}
+
+  /**
+   * 换一套启动参数（配置变更后重启用）。
+   *
+   * 为什么不"重建 Sidecar 实例"：`A2aTransport`、参与者、面板都持有这个实例，
+   * 换实例就得把所有引用改一遍 —— 而"重启后新配置生效"只需要改几个字段。
+   *
+   * 四个字段**显式全给**（而不是 `Partial` 合并）：把 `sidecarPath` 从 `.ts`
+   * 改成二进制时，`runner` 必须能**被清掉**；可选字段的浅合并做不到这件事，
+   * 留着旧 runner 会 spawn 出一个"bun 跑二进制"的怪指令。
+   *
+   * 运行中调用是错的（会留下一个跑着旧参数的进程）⇒ 直接抛。
+   */
+  reconfigure(next: {
+    cliPath: string
+    runner: string | undefined
+    cwd: string
+    token: string | undefined
+  }): void {
+    if (this.proc !== undefined) throw new SidecarError('sidecar 正在运行：先 dispose 再 reconfigure')
+    this.opts = { ...this.opts, ...next }
+  }
+
+  /**
+   * 当前启动参数（排障用）。
+   *
+   * A3 下的失败多半只是 "spawn ENOENT" —— 而"我到底想跑哪个文件、经谁跑"
+   * 只有这里能回答，所以让它可读（扩展会写进输出通道）。
+   */
+  get launch(): { cliPath: string; runner: string | undefined } {
+    return { cliPath: this.opts.cliPath, runner: this.opts.runner }
+  }
 
   get endpoint(): SidecarHandshake {
     if (!this.handshake) throw new SidecarError('sidecar 尚未完成握手')

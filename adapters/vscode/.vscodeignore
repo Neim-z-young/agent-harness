@@ -1,0 +1,17 @@
+# 发布包只留"运行时真正会读的东西"：out/*.js + media/* + package.json + README。
+#
+# 为什么值得单独一个文件：`vsce` 不写这份清单就会把**整个目录**塞进去 —— 实测
+# 带上 `src/**`（TS 源码 + 测试）、`tsconfig.json`、`.gitignore` 与 sourcemap，
+# 170KB 里有 216KB 是源码（压缩前），而运行时一个字节都读不到它们。
+
+# 源码与测试（运行时只用 out/）
+src/**
+**/*.test.ts
+tsconfig.json
+.gitignore
+
+# sourcemap：发布包不需要（要排查去看仓库）
+out/**/*.map
+
+# 本地产物
+*.vsix
