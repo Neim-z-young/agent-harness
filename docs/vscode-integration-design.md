@@ -498,6 +498,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | **P3-A（✅ 已落地 2026-10-02，续 244）** | sidecar **单文件二进制分发**：`bun run build:sidecar` 产出 `packages/cli/dist/harness-a2a`（79.9MB / 354 modules）；前置是把 `lazyImport` 的内置包改**静态查表**（30 个 specifier）+ 双向守卫测试；扩展新增 `launch.ts` 纯模块（优先级：显式 `sidecarPath` > 显式 `cliPath` > 工作区二进制 > TS 入口配 bun > PATH `harness`）与配置 `harness.sidecarPath` | 扩展 112 pass（含 2 条**真二进制 E2E**：握手 + 取卡 + 控制面）；主仓 2318 pass / 0 fail |
 | **P3-B1（✅ 已落地 2026-10-02，续 245）** | **侧栏 webview 面板**：`webview/state.ts`（纯 view-model + `planPanelAction`）/ `webview/html.ts`（纯骨架 + CSP nonce）/ `webview/panel.ts`（唯一碰 `vscode.WebviewView`）/ `media/panel.{css,js}`（手写、无构建链）；五个分区（会话 / 后台任务 / 文件引用 / 统计 / 宿主通知）**并行拉取、分区独立降级**；`HarnessTransport.listTasks()` 走 A2A `ListTasks`（不是控制面） | 扩展 **147 pass / 0 fail**（+35）；真 sidecar 面板 E2E：`ready=true`、`warnings` 为空（无分区降级）；主仓 2318 pass / 0 fail；反向验证 4 处全红；VSIX 62 文件实装成功 |
 | **P3-B2（✅ 已落地 2026-10-03，续 246）** | **块模型时间线**（设计稿 §12.8）：`webview/timeline.ts` 纯归约器（块词汇与 TUI 的 `ChatBlockKind` 对齐、差异显式列出）+ `TimelineStore`；参与者写、侧栏订阅，**独立第二条通道**（`{type:'timeline'}`，节流 120ms + 尾部推送）；文本/心跳合并、环形缓冲 200 块 | 扩展 **166 pass / 0 fail**（+19，含 1 条真流式 E2E：真协议帧 → 块）；主仓 2318 pass / 0 fail；反向验证 4 处全红；VSIX 66 文件实装成功 |
+| **P3-C（✅ 已落地 2026-10-03，续 247）** | **分发策略定为 A3 + bun 发现**（设计稿 §13）：扩展包不带二进制；`src/bun.ts` 纯模块（配置 > `BUN_INSTALL` > PATH > 已知安装位置），修掉旧 `findBun`"裸 bun 短路 ⇒ 绝对路径兜底永不执行"的缺陷；配置 `harness.bunPath`；`Sidecar.reconfigure` 让配置变更后重启真正生效（重新解析，而非重跑旧参数）；`[launch]` 启动自检三行写输出通道 | 扩展 **195 pass / 0 fail**（+29）；反向验证 4 处全红；`env -i` 模拟 GUI 环境实测命中 `/opt/homebrew/bin/bun`；主仓 2318 pass / 0 fail |
 
 **P2-v1 的"开工第一步"**（三个必须先钉死的行为，都不是设计问题而是实测问题）：
 1. `request.command` 与 `request.prompt` 对 `/permission bash=deny` 的切分行为（§6.4）。
@@ -528,7 +529,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | 控制面方法随 CLI 漂移 | 控制面方法以"host 公共面"为唯一实现来源，**不许在 sidecar 里另写逻辑**（同 P1 对 a2a-server 的纪律：只做翻译与装配） |
 | 端口冲突 / sidecar 残留 | `--port 0` 自动分配 + 扩展 deactivate 时 `kill`；`--token <随机>` 防本机其他进程误连 |
 | 两套界面（CLI 与 VSCode）文案漂移 | 渲染文案复用同一批纯函数（`renderStatsText` / `renderContextOccupancy` / `buildPermissionPrompt` 等） |
-| 扩展依赖 `harness` 二进制分发 | ~~P3 用 `bun build --compile`（P0.5：61MB / 冷启动 18ms / 能加载用户 TS 插件）~~ **P3-A 实测订正**：光有 P0.5 的结论不够 —— 真编译主 CLI 会**启动即崩**（`Cannot find module '@harness/provider-openai' from '/$bunfs/root/…'`），因为内置插件是**按包名**动态导入、`import(变量)` 进不了 bundle（P0.5 验的是用户插件的 `file://` 绝对路径，不是同一条路）。**对策**：`packages/host/src/lazy.ts` 改静态查表（字面量可静态分析），并加双向守卫（注册点集合 == 表键集合 + 表内逐个真 import）。修完实测：二进制握手 / 取卡 / 控制面全通 |
+| 扩展依赖 `harness` 二进制分发 | ~~P3 用 `bun build --compile`（P0.5：61MB / 冷启动 18ms / 能加载用户 TS 插件）~~ **P3-A 实测订正**：光有 P0.5 的结论不够 —— 真编译主 CLI 会**启动即崩**（`Cannot find module '@harness/provider-openai' from '/$bunfs/root/…'`），因为内置插件是**按包名**动态导入、`import(变量)` 进不了 bundle（P0.5 验的是用户插件的 `file://` 绝对路径，不是同一条路）。**对策**：`packages/host/src/lazy.ts` 改静态查表（字面量可静态分析），并加双向守卫（注册点集合 == 表键集合 + 表内逐个真 import）。修完实测：二进制握手 / 取卡 / 控制面全通。**A3 订正（§13）**：二进制**不再随 VSIX 分发** —— 79.9MB 里 60MB 是不可剥离的 Bun runtime，随包分发等于每版让用户重下它。改复用机器上的 bun，并把"能不能找到 bun"当作一等公民来做（`src/bun.ts`） |
 | 主仓 CI 被扩展依赖污染 | `adapters/vscode/` 不进 `workspaces`、不进 root `tsconfig.include`，并加**守卫测试**（§3.2） |
 
 ---
@@ -658,6 +659,94 @@ compact / loadmore。本模块取能用的一档，其余不平移并写明理�
 - **环形缓冲**（`MAX_TIMELINE_BLOCKS = 200`）：时间线是"最近若干块"的视图，不是全量会话历史；
 - **参与者只认 `TimelineSink` 接口**、面板只认 `TimelineStore`，两边不互相依赖；
 - **清空只是 UI 状态**：不动会话、不调控制面（它不是 harness 的状态）。
+
+---
+
+## 13. 分发：A3 —— 扩展包不带二进制，复用机器上的 bun
+
+> 2026-10-03（续 247）落地。§11 风险表里"扩展依赖 harness 二进制分发"那条按本节订正。
+
+### 13.1 先算清账：79.9MB 里 60MB 是 runtime
+
+P3-A 产出的 `bun build --compile` 单文件二进制是 **79.9MB**。拆开看（`--metafile` 归组）：
+
+| 构成 | 实测 | 可裁？ |
+|---|---|---|
+| Bun runtime | ~60MB（75%） | **不可剥离** |
+| JS bundle | 5.75MB | 可（其中 **73% 是 TUI 侧**带进来的：`@opentui/core` 1.42 + React 家族 1.42 + Babel 家族 1.38） |
+| tree-sitter wasm 资产 | 3.56MB | 可（随 TUI 一起去掉） |
+
+各裁剪路线实测（同一台机器）：
+
+| 路线 | 结果 |
+|---|---|
+| 基线 `--compile` | 79.9MB |
+| `+ --minify` | 73.5MB |
+| `--minify --bytecode` | ❌ **编译失败**（`@opentui/core` 的语法不被 bytecode 编译器接受） |
+| 瘦入口（不 import `./tui`）+ `--minify` | 62.1MB —— 已贴 runtime 地板 |
+| **VSIX 打包后（含二进制）** | **27.1MB**（vsce 走 zip deflate，2.8:1） |
+
+结论：**JS 侧怎么裁，地板都是那 60MB 的 runtime**。要么接受"每版让用户下 27MB"，要么不随包分发。
+
+### 13.2 选择：不随包分发
+
+扩展包只带扩展（VSIX 0.15MB），sidecar 用**用户机器上的 bun** 跑工作区里的 `packages/cli/src/index.ts`。
+
+理由：harness 本来就是 bun 生态的运行时（全链只有 3 处 Bun 专属 API：`Bun.serve` 在 `a2a-server/src/server.ts:605`、`Bun.spawn`/`spawnSync` 在 `packages/snapshot`）—— 用户装 harness 的前置条件里本来就有 bun，让扩展再背一份 60MB 的副本只是重复。
+
+**逃生门保留**：`harness.sidecarPath` 还在。想走二进制分发的人自己 `bun run build:sidecar` 并指过去，扩展照用（优先级仍在最前）。
+
+### 13.3 bun 发现链路（`src/bun.ts`）
+
+纯模块（不 import vscode、不 spawn、不读 fs；`exists` 注入，可单测），顺序**先精确后宽泛、命中即止**：
+
+| # | 来源 | 说明 |
+|---|---|---|
+| 1 | `harness.bunPath` | 显式配置。绝对路径存在即用；裸命令名（不含分隔符）当"交给 PATH"，不算失效 |
+| 2 | `BUN_INSTALL/bin/bun` | bun 官方安装器写进 profile 的环境变量 |
+| 3 | `PATH` 逐个目录 | GUI 启动的 VSCode PATH 很短、通常扫不中，但**不能跳过** |
+| 4 | 已知安装位置 | `/opt/homebrew/bin`、`/usr/local/bin`、`~/.bun/bin`、`~/.local/bin`、volta / asdf / mise shims、`/usr/bin`、项目本地 `node_modules/.bin` |
+
+只列**能写出出处**的位置 —— 猜错的路径会在排障时误导人，比"没找到"更糟。
+
+#### 13.3.1 旧实现为什么是坏的（实测）
+
+旧 `findBun()` 的候选表第一项是裸 `bun`，逻辑是"不含 `/` 就直接 return" ⇒ **后面所有绝对路径兜底永远不会被执行**。症状正是本仓反复踩到的那个："开发机上好好的，GUI 启动的 VSCode 里 spawn 不到 bun"。
+
+`env -i` 模拟 GUI 启动的 VSCode（PATH 只有 launchd 给的最小值）：
+
+```
+$ env -i HOME=$HOME PATH=/usr/bin:/bin:/usr/sbin:/sbin bun --version
+env: bun: No such file or directory                          ← 裸 bun 在这个环境跑不了
+旧 findBun → bun                                             ← 所以它必然失败
+新 resolveBun → /opt/homebrew/bin/bun（来源：well-known）      ← 已知位置兜底在起作用
+```
+
+### 13.4 为什么不做 login shell 探测
+
+`$SHELL -ilc 'command -v bun'` 是 GUI 应用的经典兜底，但两条路都不划算：同步执行会**阻塞扩展激活**（用户 rc 慢就是几秒），异步化要把整条解析链改成异步。已知安装位置 + 显式配置的覆盖面已经够 —— **不做**，留作后续。
+
+### 13.5 失败语义（一律不静默）
+
+| 情况 | 行为 |
+|---|---|
+| 配了绝对路径但不存在 | 回落自动发现，并置 `configInvalid` ⇒ 激活时 warning + 「打开设置」按钮；输出通道写明 |
+| 完全找不到 bun | 不空转：`launch.ts` **跳过**"工作区 TS 入口"路线（自动探测不该选一条跑不起来的路线），回落 PATH `harness`，原因写进 `notes` |
+| 显式配的 `.ts` 入口但没有 bun | **照用**（尊重显式选择），`notes` 说明"多半失败 + 怎么修" |
+| 改了 `bunPath` / `sidecarPath` / `cliPath` | 提示「重启 sidecar 后生效」+ 一键重启；**重启会重新解析**（`Sidecar.reconfigure`），不是把旧参数再跑一遍 |
+
+排障入口：输出通道的 `[launch]` 三行（跑什么 / 经什么跑 / 为什么降级）；`harness.showStatus` 附带 bun 摘要（`describeBun`）。
+
+### 13.6 验收
+
+- 扩展 **195 pass / 0 fail**（166 → 195，+29）：`bun.test.ts` 新增 17 条（含"GUI 场景"回归与 Windows 分隔符）、`launch.test.ts` +6、`sidecar.test.ts` +5
+- **反向验证 4 处全红**：去掉 well-known 兜底 ⇒ 5F / 配置失效静默 ⇒ 2F / 无 bun 仍走 TS 入口 ⇒ 2F / 去掉 reconfigure 守卫 ⇒ 1F；还原后 `shasum -a 256 -c` 逐字一致
+- 模拟 GUI 环境实测（`env -i`，见 §13.3.1）命中 `/opt/homebrew/bin/bun`
+
+### 13.7 不做
+
+- **不做 login shell 探测**（§13.4）
+- **不做瘦入口 / `--minify`**：既然二进制不再随包分发，这两个只影响"要不要发二进制"时的体积，不是当前问题；要发时再按 §13.1 的表挑
 
 ---
 

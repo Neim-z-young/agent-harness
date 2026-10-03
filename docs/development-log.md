@@ -1,5 +1,68 @@
 # Agent Harness 开发日志
 
+## 2026-10-03（续 247）P3-C：分发定为 A3 + bun 路径发现
+
+### 做什么
+
+先被问"79.9MB 二进制有哪些可用裁剪方案"，于是把账算清（结论见设计稿 §13.1）：
+**60MB 是不可剥离的 Bun runtime**，JS 侧怎么裁都贴不到地板以下。据此选 **A3：扩展包不带二进制**，
+sidecar 用**用户机器上的 bun** 跑工作区里的 `packages/cli/src/index.ts`。
+
+这一选把"能不能找到 bun"从边角问题变成**首要可用性问题** —— 本轮主体就是它的发现链路。
+
+### 实测（所有数字都是跑出来的）
+
+| 路线 | 结果 |
+|---|---|
+| 基线 `--compile` | 79.9MB |
+| `+ --minify` | 73.5MB |
+| `--minify --bytecode` | ❌ **编译失败**（`@opentui/core` 的语法不被接受）⇒ 路线否决 |
+| 瘦入口（不 import `./tui`）+ minify | 62.1MB（已贴 runtime 地板） |
+| VSIX 含二进制 | **27.1MB**（vsce 走 zip deflate，2.8:1） |
+| VSIX 不含二进制 | 0.151MB |
+
+构成：runtime ~60MB / JS bundle 5.75MB（**73% 是 TUI 侧**：@opentui 1.42 + React 家族 1.42 +
+Babel 家族 1.38）/ tree-sitter wasm 3.56MB。真正需要的 `@a2a-js/sdk` 只有 152KB。
+
+### 改了什么
+
+- **新 `src/bun.ts`（纯模块，17 条用例）**：`resolveBun` 顺序 = `harness.bunPath` > `BUN_INSTALL` >
+  PATH 逐目录 > 已知安装位置（homebrew / 官方安装器 / volta / asdf / mise / 项目本地）；返回
+  `path/source/tried/configInvalid`，另给 `describeBun` 人读摘要。路径拼接按平台走
+  `node:path` 的 win32/posix —— 手写 `'/'` 在 Windows 上会拼出混合分隔符（被测试抓到）。
+- **修掉旧 `findBun()` 的静默缺陷**：候选表第一项是裸 `bun`，"不含 `/` 就直接 return" ⇒
+  后面所有绝对路径兜底**永远不会被执行**。实测证据：
+
+  ```
+  $ env -i HOME=$HOME PATH=/usr/bin:/bin:/usr/sbin:/sbin bun --version
+  env: bun: No such file or directory        ← GUI 环境里裸 bun 跑不了
+  旧 findBun → bun                           ← 所以它必然失败
+  新 resolveBun → /opt/homebrew/bin/bun（来源：well-known）
+  ```
+
+- **`launch.ts`**：`bun` 变可选；**没有 bun 时跳过"工作区 TS 入口"路线**（自动探测不该选一条
+  跑不起来的路线），回落 PATH `harness`；新增 `notes` 把每个降级决定写下来。
+- **`sidecar.ts`**：`reconfigure()` + `launch` getter —— "改配置 → 重启"是**重新解析**而非重跑旧参数；
+  四个字段显式全给（`.ts` → 二进制时 `runner` 必须能被清掉，浅合并做不到）；运行中调用直接抛。
+- **`extension.ts`**：`[launch]` 自检三行（跑什么 / 经什么跑 / 为什么降级）；`configInvalid`
+  弹 warning + 「打开设置」；配置变更提示一键重启；`harness.showStatus` 附 bun 摘要。
+- **`package.json`**：新增配置 `harness.bunPath`；`sidecarPath` 描述改成"逃生门"语义。
+
+### 验证
+
+- 扩展 **195 pass / 0 fail**（166 → 195，+29）；`tsc --noEmit` exit 0
+- 主仓 typecheck 41 包全绿；全量 **2318 pass / 0 fail**
+- **反向验证 4 处全红**，还原后 `shasum -a 256 -c` 逐字一致：
+  去掉 well-known 兜底 ⇒5F / 配置失效静默 ⇒2F / 无 bun 仍走 TS 入口 ⇒2F / 去掉 reconfigure 守卫 ⇒1F
+- **模拟 GUI 环境实测**（`env -i`，见上）：命中 `/opt/homebrew/bin/bun（来源：well-known）`；
+  另测"配置失效"⇒ 回落且摘要写明"配置的路径不存在，已回落"
+
+### 顺手记下的两个构建坑
+
+- `bun build` 的 `--metafile` 值**必须写成 `--metafile=<file>`**；空格分隔会被当成下一个 entry point。
+- 普通 `bun build`（非 `--compile`）会因 `@opentui/core` 的平台包解析失败而报错，需
+  `--external='@opentui/core-*'`。
+
 ## 2026-10-03（续 246）P3-B2：块模型时间线（把"这一轮发生了什么"搬进侧栏）
 
 ### 做什么

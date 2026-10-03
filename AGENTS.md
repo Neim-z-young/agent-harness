@@ -25,11 +25,15 @@
   - 侧栏面板分层（P3-B）：`src/webview/state.ts`（纯：view-model 归一 + 动作规划）/ `src/webview/html.ts`（纯：骨架 + CSP nonce）/ `src/webview/panel.ts`（**唯一**碰 `vscode.WebviewView` 的文件）/ `src/webview/timeline.ts`（纯：块模型归约器 + `TimelineStore`）。面板只调**已有**的 `harness/*` 控制方法 + A2A `ListTasks`，**不为 UI 新增控制方法**（设计稿 §12.2）
   - 侧栏有**两条 `postMessage` 通道**：`{type:'state'}`（重、手动刷新）与 `{type:'timeline'}`（轻、流式每帧、节流 120ms + 尾部推送）—— 混在一起会让每个 token 重发整份 state（设计稿 §12.8）
 
+  - **分发策略是 A3：扩展包不带 sidecar 二进制**（设计稿 §13）—— `bun build --compile` 产物 79.9MB 里 **60MB 是不可剥离的 Bun runtime**，随包分发等于每版让用户重下它。sidecar 改用**用户机器上的 bun** 跑工作区里的 `packages/cli/src/index.ts`，所以 `src/bun.ts`（纯模块）的发现链路是一等公民：`harness.bunPath` > `BUN_INSTALL` > `PATH` 逐目录 > 已知安装位置（homebrew / 官方安装器 / volta / asdf / mise / 项目本地）。**注意 macOS 上 GUI 启动的 VSCode 继承不到 login shell 的 PATH**（`env -i` 实测裸 `bun` 不可用）
+
+  - `src/launch.ts` 在**找不到 bun 时跳过"工作区 TS 入口"路线**（自动探测不该选一条跑不起来的路线），回落 PATH `harness`，并把每个降级决定写进 `notes` → 输出通道的 `[launch]` 三行是 A3 下的主要排障入口；`Sidecar.reconfigure` 保证"改配置 → 重启"是**重新解析**而不是重跑旧参数
+
   - **不依赖任何 `@harness/*`、源码也不 `import @harness/*`** —— 它是纯协议客户端，跨进程只讲 A2A（+ 控制面 `/harness/rpc`）
 
   - 隔离由守卫测试断言（`packages/a2a-server/src/adapters-isolation.test.ts` 5 条）：`workspaces` 与 root `tsconfig.include` 都不含 adapters、扩展不依赖 `@harness/*`、引擎下限 ≥ 1.138
 
-  - 验证走自己的口径：`adapters/vscode` 下 `npm run typecheck`（真 `@types/vscode`）与 `bun test`（含真 sidecar 端到端）；主仓 `bun run typecheck` / `bun run test` **不覆盖**它
+  - 验证走自己的口径：`adapters/vscode` 下 `bun run typecheck`（真 `@types/vscode`）与 `bun test`（含真 sidecar 端到端）；主仓 `bun run typecheck` / `bun run test` **不覆盖**它
 
 ## 2. 运行命令（本机 bun 在 `/opt/homebrew/bin/bun`）
 
