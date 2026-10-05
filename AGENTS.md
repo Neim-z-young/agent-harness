@@ -75,7 +75,7 @@
 
 - `@harness/core`：`createHarness` / `Harness`，组装 agent/session/tool/permission/skill
 
-- 插件包：provider-\* / tools-\* / mcp-client / mcp-server-registry / computer-use 等
+- 插件包：provider-\* / tools-\* / mcp-client / mcp-server-registry / mcp-server / computer-use 等
 
 - `@harness/host`：宿主装配层 —— 与**具体宿主无关**的装配原语，供 CLI / A2A server / VSCode
   扩展**共用一份装配**（避免"两份装配必然分叉"）。只做装配与注入，不内置业务决策、不绕过权限、
@@ -232,6 +232,10 @@
 - Agent 与会话消费需要加载的技能/插件目录须支持两级：user（`~/.harness/...`）与 project（`.harness/...`，项目级覆盖用户级）
 
 - MCP server 相关新增插件一律依赖 `@harness/mcp-server-registry` 启动并复用 `@harness/mcp-client` 连接，**不要集成进 core**
+  - **唯一例外**：`@harness/mcp-server` 是 **server 端**（把工具集暴露给外部 MCP 客户端），
+    与上面这条方向相反 —— 不经 registry 连任何 server，故**无 `dependsOn`**、自带 `Bun.serve`。
+    配套约束：它把 MCP 会话 id 写进 `ToolContext.sessionId`，权限确认经 elicitation 桥回
+    （客户端不支持 ⇒ Fail-Closed 拒绝）。注意别名极易混：`mcp-server-registry` = "我们去连谁"。
 
 - Agent 插件类型不做硬编码，使用注册表/机制（如 `ProviderTypeRegistry`）；Provider 插件 id 由 `providerId` 派生（`provider.{providerId}`），避免同一类型多实例冲突
 

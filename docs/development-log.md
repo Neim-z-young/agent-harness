@@ -1,5 +1,82 @@
 # Agent Harness 开发日志
 
+## 2026-10-05（续 253）`@harness/mcp-server`：把工具集经 MCP 暴露出去（含权限桥拍板 B）
+
+### 起因
+
+`remaining-work-plan.md` §2-B 的"从零写"在续 252 的勘察里已被推翻（四块可复用资产），
+设计稿 `docs/mcp-server-plugin.md` 定稿后只差一个决策：权限桥 A/B/C/D。用户拍板 **B**
+（给 `PermissionRequest` 加 `sessionId`，三包纯增量，根治）。
+
+### 落地（权限桥预备 + 四段）
+
+| 段 | 产出 |
+|---|---|
+| 预备 | `tool` / `permission` / `host` 三包加 `sessionId`：`ToolContext.sessionId`（**本是必填**）在 Pipeline **Step 4** 填进 `PermissionRequest`；`PermissionAskInput` 的 Pick 扩到 `'toolKey' \| 'patterns' \| 'sessionId'`；`buildPermissionPrompt` 透传 |
+| 一 | `protocol.ts`（JSON-RPC 2.0 + 错误码 + 版本协商 + SSE 编解码，**零 IO**）+ `tools.ts`（`ToolRegistry` → MCP 描述 / 调用结果，**动态**映射） |
+| 二 | `session.ts`（会话表 + 待决 elicitation 表 + TTL）+ `server.ts`（`Bun.serve` Streamable HTTP，逐条对齐 `HttpTransport`） |
+| 三 | `elicit.ts`（`ask` ⇒ `elicitation/create` 映射）+ 插件层 asker 包装 |
+| 四 | `index.ts`（`/mcp-serve` / `/mcp-status` / `/mcp-stop`）+ 登记链路（root `tsconfig` paths → 包 `deps` → host `deps` → `lazy.ts` 静态表 → `plugins.ts`，`optIn: true`） |
+
+### 四处与设计稿的偏离（都是实现时才暴露的）
+
+1. **`PermissionAskInput` 的 `Pick` 不再是"引擎真正读的两项"** —— 设计稿把它收窄到
+   `toolKey` / `patterns`；`sessionId` 进去的**理由不同**（引擎不读它，是 asker 路由要）。
+   注释里把两条理由分开写死，免得下次有人按"引擎要读什么"的规则又把它裁掉。
+2. **还需要第 4 处 host 改动：`InteractivePermissionEngine.getAsker()`** ——
+   设计稿说"三包纯增量"，但包装型 asker 必须拿到**被包装者**，而 `setAsker` 只有 setter。
+   没有 getter 就只能"替换"，两个询问源会互相顶掉（先装的那个**静默失效**）。
+   纯增量（`return this.asker`），不破坏任何既有调用点。
+3. **`tools/call` 的工具级失败用 MCP 的 `isError` 结果，不用 `-32603`** ——
+   权限拒绝 / schema 失败 / 工具内抛错在 MCP 语义下都是 `isError: true` 的内容结果。
+   用协议错误会让 IDE 只显示"请求失败"，恰恰把最需要看清的"为什么被拒"藏起来。
+   协议级错误（未知工具 / 参数非对象）仍走 `-32602`。
+4. **`canElicit` 的行为分水岭需要一条专门断言** —— 反向验证时发现"去掉 `canElicit` 检查"
+   居然**不变红**：客户端回 `-32601` 时 `answerFromResponse` 会兜底成 cancel ⇒ 同样 deny。
+   于是补了一条手工客户端用例（旧协议版本 ⇒ **首帧即最终结果**、不存在 elicitation 帧），
+   把"发不发帧"这个行为差异钉住。
+
+### 权限桥的分流逻辑（最终形态）
+
+```
+asker = (req, prompt) =>
+  server.owns(req.sessionId)      // MCP 会话 ⇒ elicitation（客户端不支持则 Fail-Closed deny）
+    ? server.asker(req, prompt)
+    : prevAsker?.(req, prompt)    // 其余（TUI 的 Agent）⇒ 交回原 asker
+```
+
+启动时 `getAsker()` 存原 asker、停止时**仅在仍是我们那个**的前提下还原（不顶掉宿主中途换上的）。
+`ToolContext.sessionId` 填的是 **MCP 会话 id**（不是 agent 会话 id）—— 两条链路的归属标识同源，
+asker 才分得清"这次询问属于谁"。
+
+### 验证
+
+- `bun run typecheck` ✅（首轮 4 处红：`isResponse` 读 `JsonRpcResponse.method`、Bun `server.port`
+  可选、asker 返回 `undefined` vs `Promise<undefined>` ×2；已修）
+- `bun run test` ✅ 全绿（mcp-server 63 / host 107 / tool 101）
+- 反向验证 8 处，**每处预期 1 红、实际 1 红**，还原后 `shasum -a 256` 逐字一致：
+
+| # | 突变 | 包 | 预期/实际 |
+|---|---|---|---|
+| M1 | Pipeline Step 4 的 `sessionId: ctx.sessionId` → `undefined` | tool | 1 / 1 |
+| M2 | `buildPermissionPrompt` 的 `sessionId: req.sessionId` → `undefined` | host | 1 / 1 |
+| M3 | `getAsker()` → `return undefined` | host | 1 / 1 |
+| M4 | `lazy.ts` 删 `@harness/mcp-server` 表项 | host | 1 / 1 |
+| M5 | `supportsElicitation` 未知版本 → `true` | mcp-server | 1 / 1 |
+| M6 | `answerFromElicit` 的 accept 直接 `allow`（不校验 confirm） | mcp-server | 1 / 1 |
+| M7 | `canElicit: session.elicitation` → `true` | mcp-server | 1 / 1 |
+| M8 | 超时结算 `cancel` → `accept + confirm:true` | mcp-server | 1 / 1 |
+
+> **计数踩坑**：`grep -c '^(fail)'` 会**双计**（bun 在文件段落与末尾汇总各打一次），
+> 首轮 8 处全报"实际 2 红"。改用汇总行 `^ *[0-9]+ fail` 取数才是真值 ——
+> 反向验证的"实际值"必须用汇总行，否则会把 1 看成 2、误判成"预期偏保守"。
+
+### 遗留（有意，见设计稿 §9）
+
+- 一期不做 `resources/*` / `prompts/*` / `sampling`、stdio transport、`mcp__*` 二级转发。
+- **真机端到端**（IDE 侧 Copilot Chat / Continue 配 `url` 实连）未做 —— 需外部客户端，
+  与本仓「本包测试走 hook/HTTP 级」的惯例一致。
+
 ## 2026-10-05（续 251）项 D 拆解：三处"遗留"核实，其中一处早已闭合
 
 ### 起因
