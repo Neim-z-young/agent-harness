@@ -159,7 +159,436 @@
           "description": "把 A2A 事件原样输出到 “Agent Harness” 输出通道，便于排查。"
         }
       }
-    }
+    },
+    "languageModelTools": [
+      {
+        "name": "harness_bash",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "bash",
+        "displayName": "Bash",
+        "modelDescription": "执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "要执行的 shell 命令"
+            },
+            "cwd": {
+              "type": "string",
+              "description": "工作目录（默认使用当前会话 cwd）"
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "超时时间（毫秒，默认 30000）"
+            },
+            "env": {
+              "type": "object",
+              "description": "附加环境变量",
+              "additionalProperties": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_bash_ro",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "bash_ro",
+        "displayName": "Bash Ro",
+        "modelDescription": "执行**只读** shell 命令（白名单受限：cat/head/tail/wc/grep/sed/awk/find/ls/stat/du/git log/python3 -c 等）。拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "要执行的只读命令（不得含 >、$()、反引号、heredoc）"
+            },
+            "cwd": {
+              "type": "string",
+              "description": "工作目录（默认当前会话 cwd，且不得逃出它）"
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "超时时间（毫秒，默认 15000）"
+            }
+          },
+          "required": [
+            "command"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_edit_file",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "edit_file",
+        "displayName": "Edit File",
+        "modelDescription": "编辑文件：精确查找并替换文本片段。默认只替换第一个匹配，支持 replaceAll。需要 oldString 在文件中唯一匹配。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "文件路径（相对 cwd 或绝对路径）"
+            },
+            "oldString": {
+              "type": "string",
+              "description": "要替换的旧文本（必须精确匹配，含缩进/换行）"
+            },
+            "newString": {
+              "type": "string",
+              "description": "替换为的新文本"
+            },
+            "replaceAll": {
+              "type": "boolean",
+              "description": "是否替换所有匹配（默认 false，仅替换第一个）"
+            }
+          },
+          "required": [
+            "path",
+            "oldString",
+            "newString"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_glob",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "glob",
+        "displayName": "Glob",
+        "modelDescription": "按模式（glob，支持 **/*/? 通配符，! 取反）递归搜索文件，支持排除、大小过滤、深度限制。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ],
+              "description": "匹配模式（如 \"*.ts\"、[\"src/**/*.ts\",\"!src/dist/**\"]，\"!\" 开头表示排除）"
+            },
+            "path": {
+              "type": "string",
+              "description": "搜索根目录（相对 cwd 或绝对路径，默认 \".\"）"
+            },
+            "maxResults": {
+              "type": "number",
+              "description": "最大结果数量（默认 500）"
+            },
+            "includeHidden": {
+              "type": "boolean",
+              "description": "是否包含隐藏文件（默认 false）"
+            },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "排除模式数组（便捷字段，等同在 pattern 里用 \"!\" 前缀）"
+            },
+            "minSizeBytes": {
+              "type": "number",
+              "description": "最小文件大小（字节），小于它的条目被过滤"
+            },
+            "maxSizeBytes": {
+              "type": "number",
+              "description": "最大文件大小（字节），大于它的条目被过滤"
+            },
+            "maxDepth": {
+              "type": "number",
+              "description": "最大递归深度（默认 10，上限 20）"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_grep_file",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "grep_file",
+        "displayName": "Grep File",
+        "modelDescription": "在文件或目录中搜索文本。pattern 默认按**正则**解释；编译失败会自动退化为字面量搜索并在结果里注明。要搜纯文本（如 `](`、`![`、`.*` 这类符号）请显式传 literal:true。支持 glob 过滤、大小写、递归。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "搜索模式：默认按正则解释；literal:true 时按纯文本"
+            },
+            "path": {
+              "type": "string",
+              "description": "搜索根目录或文件（默认 \".\"）"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "是否递归子目录（默认 true）"
+            },
+            "caseSensitive": {
+              "type": "boolean",
+              "description": "是否区分大小写（默认 true = 区分；传 false 则忽略大小写）"
+            },
+            "include": {
+              "type": "string",
+              "description": "文件名过滤 glob（如 \"*.ts\"）"
+            },
+            "maxResults": {
+              "type": "number",
+              "description": "最大匹配数"
+            },
+            "literal": {
+              "type": "boolean",
+              "description": "按纯文本搜索，不做正则解释（默认 false）"
+            }
+          },
+          "required": [
+            "pattern"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_list_dir",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "list_dir",
+        "displayName": "List Dir",
+        "modelDescription": "列出目录内容。支持递归、隐藏文件显示。返回文件名、类型和大小。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "要列出的目录（相对 cwd 或绝对路径，默认 \".\"）"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "是否递归列出子目录"
+            },
+            "showHidden": {
+              "type": "boolean",
+              "description": "是否包含隐藏文件（默认 false）"
+            },
+            "maxDepth": {
+              "type": "number",
+              "description": "递归时的最大深度"
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_read_file",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "read_file",
+        "displayName": "Read File",
+        "modelDescription": "读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。调用示例：read_file({\"path\":\"src/index.ts\"})、read_file({\"path\":\"src/index.ts\",\"offset\":1,\"limit\":80})；path 是必填项，只给路径即可，不要省略 arguments。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "文件路径（相对 cwd 或绝对路径）"
+            },
+            "offset": {
+              "type": "number",
+              "description": "起始行号（1-based，默认 1）"
+            },
+            "limit": {
+              "type": "number",
+              "description": "读取行数（默认全部）"
+            },
+            "showLineNumbers": {
+              "type": "boolean",
+              "description": "是否添加行号前缀（默认 false）"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_view_image",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "view_image",
+        "displayName": "View Image",
+        "modelDescription": "读取本地图像文件，返回 base64 data URI 与尺寸/格式信息，供多模态 LLM 识别。支持 PNG/JPEG/GIF/WebP/BMP 自动识别。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "图像路径（相对 cwd 或绝对路径）"
+            },
+            "maxBytes": {
+              "type": "number",
+              "description": "最大字节数（默认 8MB，超出则只返回元数据不含 base64）"
+            },
+            "strictSize": {
+              "type": "boolean",
+              "description": "true = 超出 maxBytes 直接报错；false = 降级为仅元数据（默认）"
+            }
+          },
+          "required": [
+            "path"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_web_fetch",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "web_fetch",
+        "displayName": "Web Fetch",
+        "modelDescription": "通过 HTTP(S) 抓取 URL 内容。支持自定义方法/头/体，返回 text / json / base64。默认禁止访问私有网络（SSRF 防护）。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "url": {
+              "type": "string",
+              "description": "要抓取的 URL（仅 http/https；私有网络被 SSRF 防护拒绝）"
+            },
+            "method": {
+              "type": "string",
+              "enum": [
+                "GET",
+                "POST",
+                "PUT",
+                "DELETE",
+                "HEAD",
+                "PATCH",
+                "OPTIONS"
+              ],
+              "description": "HTTP 方法（默认 GET）"
+            },
+            "headers": {
+              "type": "object",
+              "description": "请求头",
+              "additionalProperties": {
+                "type": "string"
+              }
+            },
+            "body": {
+              "description": "请求体（POST/PUT/PATCH 等）：对象会 JSON 序列化，字符串直接传"
+            },
+            "format": {
+              "type": "string",
+              "enum": [
+                "text",
+                "json",
+                "base64"
+              ],
+              "description": "返回格式：text 文本 / json 解析对象 / base64 原始字节"
+            },
+            "timeoutMs": {
+              "type": "number",
+              "description": "超时毫秒（默认 15000）"
+            },
+            "followRedirects": {
+              "type": "boolean",
+              "description": "是否跟随重定向（默认 true）"
+            },
+            "maxResponseBytes": {
+              "type": "number",
+              "description": "最大响应字节数（默认 2MB），超过即截断"
+            },
+            "allowPrivateNetwork": {
+              "type": "boolean",
+              "description": "是否允许访问私有 IP / localhost（默认 false，出于 SSRF 防护）"
+            }
+          },
+          "required": [
+            "url"
+          ],
+          "additionalProperties": false
+        }
+      },
+      {
+        "name": "harness_write_file",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "write_file",
+        "displayName": "Write File",
+        "modelDescription": "写入本地文件。支持覆盖、追加和仅新建模式。只能在工目录内写入。",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "文件路径（相对 cwd 或绝对路径）"
+            },
+            "content": {
+              "type": "string",
+              "description": "写入内容"
+            },
+            "mode": {
+              "type": "string",
+              "enum": [
+                "overwrite",
+                "append",
+                "create"
+              ],
+              "description": "overwrite=覆盖/创建，append=追加，create=仅新建"
+            },
+            "createDirs": {
+              "type": "boolean",
+              "description": "是否自动创建父目录（默认 true）"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ],
+          "additionalProperties": false
+        }
+      }
+    ]
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",

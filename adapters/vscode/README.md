@@ -53,4 +53,21 @@ bun test          # 含真 sidecar 端到端（会 spawn harness a2a）
 npm run package   # 出 VSIX
 ```
 
+### ⚠️ `contributes.languageModelTools` 是**生成的**，不要手改
+
+`package.json` 里那一段（P3-D：把 harness 工具暴露给 Copilot agent mode）由
+**仓库根**的脚本从**真实工具池**生成：
+
+```bash
+bun run gen:lm-tools          # 改完工具（新增工具 / 改描述 / 改入参 schema）后跑这一步
+bun run gen:lm-tools --check  # 只比对，不写
+```
+
+为什么必须生成：`lm.registerTool` 只提供实现体，**模型看到的描述与入参 schema 全部来自
+package.json 这份静态声明** —— 手写必然漂移，而漂移的后果不是报错，是模型拿不到 schema、
+于是发 `input: {}`（`read_file` 在真机上被这样发过 14 次）。
+
+守卫：`packages/cli/src/gen-lm-tools.test.ts` 会现场取一份工具池与已提交的清单比对，
+**漂移即测试变红**。设计稿 §14.4。
+
 设计稿：`docs/vscode-integration-design.md`。

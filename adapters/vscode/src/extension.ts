@@ -1,8 +1,12 @@
 /**
- * 扩展入口：装配 sidecar + 传输 + 参与者。
+ * 扩展入口：装配 sidecar + 传输 + 参与者 + LM 工具。
  *
  * 装配纪律与 `packages/a2a-server/src/server.ts` 一致：**顺序有讲究** ——
  * 参与者可以先注册（它自己是懒启动的），但传输必须先拿到 sidecar 句柄。
+ *
+ * P3-D（LM 工具，设计稿 §14）是**唯一在激活期就拉起 sidecar** 的地方：它的调用方是
+ * Copilot、发生在参与者轮次之外，注册不能依赖"用户先跟 @harness 说过话"。理由写在
+ * `refreshLmTools` 的调用点。
  */
 
 import * as vscode from 'vscode'
@@ -11,9 +15,21 @@ import { homedir } from 'node:os'
 import { describeBun, resolveBun, type BunResolution } from './bun'
 import { buildFollowups, type FollowupsStateLike } from './followups'
 import { resolveLaunchOptions, type LaunchOptions } from './launch'
+import { ToolRegistrar } from './lm-registrar'
+import {
+  ApprovalLedger,
+  confirmationFor,
+  planToolCall,
+  renderToolOutcome,
+  TOOL_CALL_METHOD,
+  TOOL_LIST_METHOD,
+  type LmToolSpec,
+} from './lmtools'
 import { createParticipantHandler } from './participant'
+import { SessionTracker } from './session-tracker'
 import { Sidecar } from './sidecar'
 import { A2aTransport } from './transport/a2a'
+import type { HarnessTransport } from './types'
 import { HarnessPanelProvider, PANEL_VIEW_ID } from './webview/panel'
 import { TimelineStore } from './webview/timeline'
 
@@ -55,9 +71,16 @@ export function activate(context: vscode.ExtensionContext): void {
   // 参与者只认 `TimelineSink` 接口，面板只认 `TimelineStore`，两边都不依赖对方。
   const timeline = new TimelineStore()
 
+  // P3-D（设计稿 §14）：两个**跨轮次**的状态。
+  // - sessions：当前会话 —— `lm.invokeTool` 发生在参与者轮次之外，没有 TurnState 可读；
+  // - approvals：审批台账 —— 只有"确实弹过框"的调用才带 approve（细节见 lmtools.ts）。
+  const sessions = new SessionTracker()
+  const approvals = new ApprovalLedger()
+
   const participant = vscode.chat.createChatParticipant('harness.agent', createParticipantHandler({
     transport,
     timeline,
+    sessions,
     log: (m) => channel?.appendLine(m),
     traceEnabled: () => vscode.workspace.getConfiguration('harness').get<boolean>('trace', false),
   }))
@@ -72,6 +95,24 @@ export function activate(context: vscode.ExtensionContext): void {
     },
   }
   context.subscriptions.push(participant)
+
+  // ---- P3-D：把 harness 的工具池注册成 LM 工具（设计稿 §14）----
+  //
+  // 与参与者**有意不同**的一点：这里在激活期就把 sidecar 拉起来。
+  // 参与者是懒启动的（首次对话才起），但 P3-D 的前提恰恰是"Copilot 自己编排、
+  // 工具调用发生在参与者轮次之外"—— 若注册依赖参与者先跑过一轮，那么
+  // "用户从没 @ 过 harness、却让 Copilot 调 harness 工具"这条主路径就永远是死的。
+  //
+  // 失败一律降级到输出通道：激活期弹错误框是打扰（用户可能根本不用这条线），
+  // 而 `[lmtools]` 那几行足以排障；真正的失败在调用时还会以文本回到模型。
+  const registrar = new ToolRegistrar({
+    list: () => transport.control(TOOL_LIST_METHOD),
+    register: (lmName, spec) =>
+      vscode.lm.registerTool(lmName, makeHarnessLmTool({ transport, sessions, approvals, spec })),
+    log: (m) => channel?.appendLine(m),
+  })
+  context.subscriptions.push({ dispose: () => registrar.dispose() })
+  void refreshLmTools(transport, registrar, (m) => channel?.appendLine(m))
 
   // 侧栏面板（P3-B）：不依赖 Copilot 的那个落点 —— 会话 / 后台任务 / 文件引用 /
   // 统计 / 宿主通知常驻可见，数据全部来自已有控制面 + A2A ListTasks（设计稿 §12）。
@@ -120,6 +161,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       logLaunch(next, nextNotes)
       await transport.start()
+      // P3-D：新 sidecar = 新工具池（插件/工具启停都会变）⇒ 重注册一遍。
+      // 台账不清：里面的记录代表"用户确实点过 Continue"，与进程无关，且自带 TTL。
+      await refreshLmTools(transport, registrar, (m) => channel?.appendLine(m))
       void vscode.window.showInformationMessage('Agent Harness：sidecar 已重启')
     }),
   )
@@ -194,6 +238,106 @@ function logLaunch(resolved: ResolvedLaunch, notes: readonly string[] = resolved
   channel?.appendLine(`[launch] sidecar: ${o.cliPath}（${how}）`)
   channel?.appendLine(`[launch] bun: ${describeBun(resolved.bun)}`)
   for (const n of notes) channel?.appendLine(`[launch] ${n}`)
+}
+
+// ========================================================================
+// P3-D：LM 工具（设计稿 §14）
+// ========================================================================
+
+/**
+ * 拿不到当前会话时的回话。
+ *
+ * 刻意**不回落** sidecar 的 boot 会话（设计稿 §14.2 ③）：工具执行的遥测、事实事件、
+ * 权限询问三处的归属都取 `sessionId`，回落等于把这次调用记到**另一个会话**上。
+ * 「归属不明就挑一个」正是本仓反复栽过的那类静默失效，所以这里明确报错并给出补救动作。
+ */
+const UNBOUND_SESSION_HINT =
+  '❌ 还没有 harness 会话可以归属这次调用。请先在 Chat 里对 `@harness` 说一句话'
+  + '（或在 `@harness` 里用 `/new`）建立会话，再让我调用 harness 工具。\n\n'
+  + '_（这里刻意不猜一个会话出来：工具执行的事件与权限询问都会记到那个会话上，猜错就是静默写错归属。）_'
+
+/**
+ * 造一个 LM 工具实现。
+ *
+ * 为什么每次重注册都要**重新造对象**：LM 工具的元信息（描述 / 入参 schema）全在
+ * `package.json` 的 `contributes.languageModelTools` 里，`registerTool` 只提供实现体
+ * —— 于是 `spec` 只能闭包捕获，工具集一变就得重造（见 `lm-registrar.ts`）。
+ */
+function makeHarnessLmTool(deps: {
+  readonly transport: HarnessTransport
+  readonly sessions: SessionTracker
+  readonly approvals: ApprovalLedger
+  readonly spec: LmToolSpec
+}): vscode.LanguageModelTool<Record<string, unknown>> {
+  const { transport, sessions, approvals, spec } = deps
+  return {
+    /**
+     * 唯一确认面（设计稿 §14.2 ②）。
+     *
+     * 只在 `requiresConfirmation` 时才弹框 —— 它的判据是"工具声明了 `permission`"
+     * （= 权限链会启动、可能落到 ask），**不是**"这是个写操作"（只读工具照样可能声明
+     * permission，`read_file` 就是），细节见 `tool-exposure.ts`。
+     *
+     * ⚠️ 这里的 `approvals.note()` 是**有意偏离** `prepareInvocation` 的
+     * 「Must be free of side-effects」契约的：不记这一笔，`invoke` 就无法区分
+     * "用户点过 Continue" 与 "第三方扩展绕过它直接 invokeTool"。完整论证见 `lmtools.ts`。
+     */
+    prepareInvocation(options): vscode.PreparedToolInvocation | undefined {
+      if (!spec.requiresConfirmation) return undefined
+      approvals.note(spec.lmName, options.input)
+      return { confirmationMessages: confirmationFor(spec, options.input) }
+    },
+
+    async invoke(options, token): Promise<vscode.LanguageModelToolResult> {
+      if (token.isCancellationRequested) return textResult('（已取消）')
+
+      const sessionId = sessions.get()
+      if (sessionId === undefined) return textResult(UNBOUND_SESSION_HINT)
+
+      // `approve` 的判据只有 `planToolCall` 这一处（它内部消费台账）
+      const params = planToolCall(sessionId, spec, options.input, approvals)
+      try {
+        const raw = await transport.control(TOOL_CALL_METHOD, params)
+        return textResult(renderToolOutcome(raw, spec.lmName))
+      } catch (e) {
+        // 协议级错误（会话不在 / 工具未知 / sidecar 没起来 / 传输失败）也必须是**文本**：
+        // 抛出去模型只看到"调用失败"，看不到原因。与工具级失败刻意用不同措辞区分。
+        return textResult(protocolFailureText(spec.lmName, e))
+      }
+    },
+  }
+}
+
+function textResult(s: string): vscode.LanguageModelToolResult {
+  return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(s)])
+}
+
+/** 协议级失败的措辞：与"工具执行失败"分开说，模型才能分辨"改入参"与"先修环境" */
+function protocolFailureText(lmName: string, e: unknown): string {
+  const message = e instanceof Error ? e.message : String(e)
+  const code = (e as { code?: unknown } | null)?.code
+  const suffix = typeof code === 'number' ? `（code ${code}）` : ''
+  return `❌ harness 工具 \`${lmName}\` 的**请求**失败（不是工具执行失败）：${message}${suffix}\n\n`
+    + '_这多半是：会话已不在、工具不在注册表、或 sidecar 没起来。_'
+}
+
+/**
+ * 起 sidecar 并刷新 LM 工具注册。
+ *
+ * **不抛**：两个调用点（激活期、重启 sidecar 后）都不该因为这条线失败而中断 ——
+ * 失败的表现只是"Copilot 看不到 `harness_*` 工具"，而那件事已经写进日志了。
+ */
+async function refreshLmTools(
+  transport: HarnessTransport,
+  registrar: ToolRegistrar,
+  log: (m: string) => void,
+): Promise<void> {
+  try {
+    await transport.start()
+    await registrar.refresh()
+  } catch (e) {
+    log(`[lmtools] 注册失败：${e instanceof Error ? e.message : String(e)}`)
+  }
 }
 
 function existsOnDisk(p: string): boolean {

@@ -6,8 +6,11 @@
  * 1. **不使用 `request.model`** —— harness 自带 Provider 与 agentic loop，
  *    借 VSCode 的模型等于把 loop 劈成两半。代价要认：Chat 视图的模型下拉对本参与者无效。
  * 2. **权限弹窗必须自己做** —— `lm.registerTool` 的 `prepareInvocation` / `confirmationMessages`
- *    看着像权限确认，但那是"Copilot 编排器调你的工具"的路径；harness 是自己调自己的工具，
- *    编排器不在链路上，那个弹窗**永远不会被触发**。正确落法是模态对话框 + 四态按钮。
+ *    看着像权限确认，但那是"Copilot 编排器调你的工具"的路径；**本参与者**是 harness 自己调
+ *    自己的工具，编排器不在链路上，所以那个弹窗在这条线上**永远不会被触发**。正确落法是
+ *    模态对话框 + 四态按钮。
+ *    （P3-D 是**另一条线**：那里 Copilot 是编排方，`prepareInvocation` 正是唯一确认面，
+ *     见 `lmtools.ts` 与设计稿 §14.2 ②。两条线刻意不混，本文件一行不改它的机制。）
  */
 
 import * as vscode from 'vscode'
@@ -39,10 +42,26 @@ export interface TimelineSink {
   finish(outcome: string): void
 }
 
+/**
+ * 会话承载点的**写入口**（P3-D，设计稿 §14.2 ③）。
+ *
+ * 参与者只认这个接口，不认 `SessionTracker` —— 于是"当前会话"既能喂 P3-D 的 LM 工具
+ * （Copilot 编排那条线），也能将来喂别的落点，而参与者本身不需要知道谁在消费。
+ *
+ * 为什么这里必须写：**Copilot 的 `lm.invokeTool` 发生在参与者轮次之外**，
+ * 那时候没有 `ChatContext` / `TurnState` 可读 ⇒ 轮次内不记下来，工具调用就归属不明。
+ */
+export interface SessionSink {
+  /** 记下当前会话；`undefined` / 空串 = 空操作（调用点直接写 `set(ids.contextId)`） */
+  set(sessionId: string | undefined): void
+}
+
 export interface ParticipantDeps {
   readonly transport: HarnessTransport
   /** 块模型时间线的写入口（侧栏订阅它）；缺省则不记 */
   readonly timeline?: TimelineSink
+  /** 当前会话的写入口（P3-D）；缺省则不记 */
+  readonly sessions?: SessionSink
   /** 追踪输出；`harness.trace` 打开时才写字 */
   readonly log?: (msg: string) => void
   /** 是否显示"在思考"之类提示（案 A 下拿不到推理内容，只有规模） */
@@ -118,7 +137,11 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
           if (deps.traceEnabled?.()) log(`[a2a] ${JSON.stringify(frame)}`)
 
           const ids = extractTaskIds(frame)
-          if (ids.contextId) state = { ...state, contextId: ids.contextId }
+          if (ids.contextId) {
+            state = { ...state, contextId: ids.contextId }
+            // 会话归属同步给 P3-D（Copilot 编排那条线在轮次之外用它）
+            deps.sessions?.set(ids.contextId)
+          }
           if (ids.taskId) state = { ...state, taskId: ids.taskId }
 
           const op = mapA2aEvent(frame)
@@ -317,6 +340,8 @@ async function handleCommand(
 
     if (contextBinding) {
       state = { ...state, contextId: contextBinding, taskId: undefined, sessionSwitched: true }
+      // /new 或 /resume 成功后换绑会话归属（P3-D）：LM 工具随后的调用要落到**新**会话上
+      deps.sessions?.set(contextBinding)
     }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)
