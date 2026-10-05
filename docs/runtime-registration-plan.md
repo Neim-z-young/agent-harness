@@ -509,6 +509,6 @@ CLI 侧**一行没改** —— `cli.command` 的 `cmdInput.harness` 本来就是
 
 ### 9.9 剩余未做
 
-1. `UsageStats` 的 provider 维度（§9.6 的格式变更部分）。
-2. `unregister` 的级联语义（§7 刻意不做）。
-3. `_setChatProvider` 的最终删除（当前保留为 deprecated 委托，只剩第三方桩在走）。
+1. `UsageStats` 的 provider 维度（§9.6 的格式变更部分）。 — ✅ **已落地**（续 250；原 §2-C）
+2. `unregister` 的级联语义（§7 刻意不做）。 — ⏸ **仍刻意不做**：非欠债，等真实需求驱动（`remaining-work-plan.md` §4）。
+3. `_setChatProvider` 的最终删除（当前保留为 deprecated 委托，只剩第三方桩在走）。 — ✅ **已删除**（续 254；原 §2-D）：6 个 provider 插件的回退分支 + 方法本体齐删，仅留注释引用与类型层守卫用例（`core.test.ts:1255`）。

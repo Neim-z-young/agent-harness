@@ -1,5 +1,87 @@
 # Agent Harness 开发日志
 
+## 2026-10-05（续 254）VSCode 集成 P3-D：`_setChatProvider` 删除 + 扩展注册 LM 工具（生成式贡献点）
+
+### 起因
+
+`remaining-work-plan.md` 的两项收口：**§2-D**（`_setChatProvider` 最终删除）与 **§2-E**
+（VSCode 注册 `languageModelTools`，设计稿 §10-6 的 B1 变体）。用户拍板：§2-D **直接删干净**
+（不再保留"老宿主 + 新插件"兼容）；§2-E **暴露全部工具 + 写操作走 `prepareInvocation` 原生确认框**。
+
+开工即撞上一处硬约束：**`LanguageModelTool<T>` 只有 `invoke` / `prepareInvocation` 两个成员，
+没有任何描述字段**（`vscode.d.ts:21165`/`21181`）⇒ 模型可见的 `displayName` / `modelDescription` /
+`inputSchema` **全部来自 `package.json` 的 `contributes.languageModelTools`**（`vscode.d.ts:20777`
+明写"must also be registered in the package.json `languageModelTools` contribution point"）。
+贡献点**必须静态**，而工具池是**运行期**才装配出来的 ⇒ 手写必然漂移。用户二次拍板：
+**§14 原机制 + 生成式贡献点**（保留 `prepareInvocation` 原生确认框；新增仓库脚本从运行期注册表
+**生成** `package.json` 的那一段）。
+
+### 落地（四段）
+
+| 段 | 产出 |
+|---|---|
+| 左半（§2-D） | 6 个 provider 插件（anthropic / openai / glm / gemini / qwen / mock）摘掉 `else if (harness?._setChatProvider)` 回退分支；`core` 删除 `_setChatProvider` 方法本体（`chat.provider` 的老注入链退场，`context.register('chat.provider', this.chatProvider)` 改为注册构造期那份）。只留注释引用 + 一条**类型层守卫**用例（`core.test.ts:1255`：有人加回来则编译不过） |
+| 右半纯模块 | `adapters/vscode/src/lmtools.ts`（工具名净化 / 清单解析 / 审批台账 / 调用编排 / 结果渲染）、`session-tracker.ts`（会话绑定）、`lm-registrar.ts`（`ToolRegistrar`，**先撤旧再装新**）。三份纯模块均不 import `vscode` / `@harness/*`，可脱离宿主单测 |
+| 右半装配 | `extension.ts` 装配 `ToolRegistrar`（`list: () => transport.control(TOOL_LIST_METHOD)`，`register: (lmName, spec) => vscode.lm.registerTool(...)`）、`SessionTracker`、`ApprovalLedger`；`participant.ts` 在拿到 `contextId` / 绑定 `contextBinding` 时写入 `SessionTracker` |
+| 生成式贡献点 | `packages/cli/src/gen-lm-tools.ts`（`buildContributions` / `collectDescriptors`+**密封** / `applyContribution` / `main`，支持 `--check`）；根 `package.json` 加 `gen:lm-tools`；`adapters/vscode/package.json` 的 `contributes.languageModelTools` 为**生成产物**（10 条） |
+
+### 三处只有实现时才暴露的发现
+
+1. **`requiresConfirmation` 的判据必须与权限链启动条件逐字一致 —— 只看是否声明了 `permission`，与"只读"无关。**
+   初版我写成 `tool.permission && !readOnly`，而权限链是否启动只看 `tool.permission`
+   （`tool/src/index.ts:1338`：`if (tool.permission && this.checkPermission)`）。`read_file` 是只读，
+   但**声明了** `permission: { key: 'read' }`（`tools-builtin/src/index.ts:131/133`），默认规则
+   `{ '*': 'ask' }`（`host/src/host.ts:338`）下照样落到 `ask`。判成"不需确认"的后果很实：
+   Copilot 调 `harness_read_file` 被**静默拒绝且无批准途径**。已改 `tool.permission !== undefined`，
+   并造 `echo_ro_perm` 夹具（只读 + 声明 permission）把这条钉死。
+
+2. **`harness/tools.list` 必须自己保证"工具池已就绪"**：A2A 服务端 `runA2aCli` 传
+   `backgroundPreload: false`（启动提示要确定性），而工具池装配**只存在于后台预加载里** ⇒
+   两件事都没做 ⇒ 实测 `tools.list` = **0**（静默、且看起来像正常状态）。修法是给 host 加**幂等**的
+   `warmupBuiltins()`（抽出原 `scheduleBuiltinPreload` 的实现、可 await、缓存首次结果），
+   `harness/tools.list` 先调它。实测三档：不做任何事 = 0；只调 `assembleTools()` = 5；
+   装齐 `tools.glob/search/web/media` + `assembleTools()` = **10**（真实 sidecar 因用户 `config.json`
+   声明了额外插件为 32；密封生成器只取 10 个默认）。
+
+3. **`ToolRegistrar` 的两处实现缺陷**：① `names` / `RefreshResult.registered` 报的是"**解析出来的**"
+   而非"**注册成功的**" ⇒ 诊断信息在失败时撒谎，改为只收注册成功的；② `refresh()` 次序错误
+   （先装新、再撤旧）—— `lm.registerTool` 对**同名重复注册会抛错**，而"重启 sidecar 后工具集几乎完全
+   重叠"正是最常见路径 ⇒ 必须先撤旧、再装新。
+
+### 生成器的密封性（为什么不能直接读开发机的工具池）
+
+真实 sidecar 读个人 `config.json`（实测 32 个工具，含 `mcp__wb-llm__web_search` 这类**私有**
+MCP server 工具）。若不密封，就把**某个人的机器状态**当成产品默认值写进 `package.json`。
+故 `collectDescriptors()` 用 `mkdtempSync` 临时 `dataDir` + `provider:'mock'` + 显式 `warmupBuiltins()`，
+空池即抛错。跨包命名规则（`sanitizeToolName` 等）在 `packages/cli` 与 `adapters/vscode` 各一份
+（扩展不能 import 本仓）⇒ 用**源码文本守卫**（正则字面量比对）钉住同源，与 `map/render.ts` 的
+`FILE_REF_RE` 同手法；另加"整段比对贡献点"的漂移守卫。
+
+### 验证
+
+- `bun run typecheck` ✅（25 个包全绿）
+- `bun run test` ✅ 根 **2558 pass / 0 fail**
+- `adapters/vscode`（**不在根 workspaces 内，必须单独跑**）✅ typecheck 干净 + **243 pass / 0 fail**
+  ⇒ 全仓口径 **2801 pass / 0 fail**
+- `bun run gen:lm-tools --check` ✅（10 条，与已提交一致）
+- 反向验证 6 处，还原后 35 个文件与备份**逐字一致**、源码 `grep 反向验证临时` 零残留：
+
+| # | 突变 | 目标包 | 预期/实际 | 命中用例 |
+|---|---|---|---|---|
+| M1 | `requiresConfirmation` 改回 `&& !readOnly` | a2a-server | 2 / **2** | 「描述符 > requiresConfirmation 与权限链启动条件同判据」+「控制面 > tools.list：列出已注册工具」 |
+| M2 | `tools.list` 删掉 `await host.warmupBuiltins()` | a2a-server | 1 / **1** | 「工具池就绪 > backgroundPreload=false 的宿主…tools.list 仍能列到内置工具」 |
+| M3 | `warmupBuiltins()` 去掉幂等缓存 | host | 1 / **1** | 「工具池就绪 > warmupBuiltins() 幂等」 |
+| M4 | `planToolCall` 永远带 `approve: true` | vscode | 3 / **4** | 「没弹过框 ⇒ 不带 approve」「只生效一次」「入参不同不共用」+「并发两次询问」（预登记时已标注可能连带此条） |
+| M5 | `lm-registrar` 次序改回"先装新、再撤旧" | vscode | 1 / **1** | 「二次刷新先撤旧的再装新的（不留僵尸工具）」 |
+| M6 | 生成器把 `inputSchema` 写成空对象 | cli | 2 / **3** | 「漂移守卫」「生成的条目非空且带准确 inputSchema」+「描述符 → 贡献点 > 字段映射…schema 直出」（多出的是纯函数直钉） |
+
+### 另一处踩坑（本仓第三次）与新增工程约定
+
+- **BSD grep 不支持 `\|` / `\+` 交替**：`grep "a\|b"` 会当**字面量**静默返回空。本轮第三次栽在这
+  （`mcp` 查 `@types/vscode` 曾据此误判"MCP API 不存在"，实际存在）⇒ 一律 `grep -E` 或 Grep 工具。
+- `AGENTS.md` §5 补两条：**`adapters/vscode` 不在 workspaces ⇒ 必须单独跑测试**；
+  **`contributes.languageModelTools` 是生成的、何时必须重跑 `gen:lm-tools`**。
+
 ## 2026-10-05（续 253）`@harness/mcp-server`：把工具集经 MCP 暴露出去（含权限桥拍板 B）
 
 ### 起因

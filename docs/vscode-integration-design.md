@@ -516,7 +516,7 @@ host 侧另有环形缓冲 `host.notices`（`host.ts:284`，容量 `HOST_NOTICE_
 | 3 | 控制面路径 | **`POST /harness/rpc`**，不进 AgentCard（§6.3） |
 | 4 | 权限 asker 跨进程 | **复用 A2A 的 `INPUT_REQUIRED` 挂起**（§7.1 方案 a） |
 | 5 | `reasoning_delta` 默认渲染？ | ❌ **案 A 下不可实现**（§5 订正）：`StreamAdapter` 只累计字符数、不发事件，扩展拿不到内容。要么改 `StreamAdapter` 让它发出来（会污染 A2A 产物语义），要么**放弃**该项。当前实现：只显示"在思考"级别的提示 |
-| 6 | 要不要同时把 harness 工具注册成 `languageModelTools`（让 Copilot agent mode 直接调）？ | **另开一条线**（即 plan 的 B1 变体），**不混进 P2** —— 二者是"harness 自主"与"Copilot 编排"两种世界观 |
+| 6 | 要不要同时把 harness 工具注册成 `languageModelTools`（让 Copilot agent mode 直接调）？ | **另开一条线**（即 plan 的 B1 变体），**不混进 P2** —— 二者是"harness 自主"与"Copilot 编排"两种世界观。**✅ 已落地**（续 254），见 §14 |
 | 7 | 无 Copilot Chat 的环境怎么办？ | P2 只要求 Copilot Chat 存在（plan 已明示该局限）；P3 的 webview 是不依赖 Copilot 的兜底 |
 
 ---
@@ -750,12 +750,239 @@ env: bun: No such file or directory                          ← 裸 bun 在这�
 
 ---
 
+## 14. P3-D：把工具注册成 `languageModelTools`（B1 变体，✅ 已落地 2026-10-05 续 254）
+
+> 本节兑现 §10 开放问题 **#6** 的裁决（「另开一条线，不混进 P2」）—— 现在正是另开的那条线。
+
+### 14.1 它是什么，以及它和 P2 的关系
+
+P2 的落点是 **`chatParticipants`**：用户对着 `@harness` 说话，**harness 自己**跑 agentic loop，
+自己决定调哪个工具。本节反过来：把 harness 的工具注册成 VSCode 的 `lm.registerTool`，
+让 **Copilot 的 agent mode 自己编排**、按需调用 harness 的工具。
+
+| | P2（`chatParticipants`） | P3-D（`languageModelTools`） |
+|---|---|---|
+| 谁编排 | harness | Copilot |
+| 谁决定调哪个工具 | harness 的 agentic loop | Copilot |
+| 工具从哪来 | harness 的 ToolRegistry | 同左（**同一份注册表**，不另开） |
+
+两种世界观，**刻意不混**（§10-6）。共享的只有两样：同一个 sidecar、同一份工具池。
+
+**⚠️ 初稿写"本节一行也不改 P2 的参与者代码"，落地后这句不成立**，实际动了三处
+（都不是机制变更，是**归属信息的出口**）：
+
+| 动的地方 | 为什么必须动 |
+|---|---|
+| `participant.ts` 加 `SessionSink` 依赖 + **两处会话写点**（收到 `contextId` 时、`/new`·`/resume` 换绑时） | 会话归属只有参与者知道；不记下来，"Copilot 编排"那条线就没有归属可给（§14.2 ③） |
+| `extension.ts` 加 LM 工具注册装配（并因此在**激活期**就拉起 sidecar） | 注册不能依赖"用户先跟 @harness 说过话"，否则"从没 @ 过 harness 却让 Copilot 调工具"这条主路径是死的 |
+| `participant.ts` 文件头第 2 条注释 | 它原写"`prepareInvocation` 那个弹窗永远不会被触发"，在 P3-D 落地后**半真半假**（P2 那条线仍不触发，P3-D 那条线正是靠它），不改就会误导后来人 |
+
+新增的是：控制面两个方法（+ 一个"预热"前提，见 §14.4.1）、扩展侧三个纯模块
+（`lmtools.ts` / `session-tracker.ts` / `lm-registrar.ts`）、一个生成器（§14.4）。
+
+### 14.2 三个接缝（本节的全部设计都在这三行里）
+
+**① 暴露面 = 全部工具**，不做白名单、不按 agent 过滤（与 `@harness/mcp-server` 一期同口径）。
+
+- **名字加 `harness_` 前缀**：`lm.registerTool` 的工具名是**全局**的（跨扩展可见），
+  harness 的 `read_file` / `bash` / `glob` 太通用，不加前缀会与别的扩展撞名。
+- `inputSchema` 直出工具的 `__jsonSchema`（与 mcp-server 的 `jsonSchemaOf` 同一取源），
+  缺省 `{ type: 'object', properties: {} }`。
+- `readOnly` 取 `tool.isReadOnly?.() ?? false` —— **Fail-Closed**：未声明 / 声明为 false /
+  求值抛错一律算"可写"。代价是"按入参才只读"的工具（如 `glob` 的某些模式）会被保守地
+  当成可写 ⇒ 多问一次确认，**不是安全洞**。
+- `requiresConfirmation` 取 `tool.permission !== undefined` —— **判据必须与权限链的启动条件
+  逐字一致**：链是否启动只看有没有声明 `permission`（`ToolPipeline.execute` Step 4：
+  `if (tool.permission && this.checkPermission)`，`tool/src/index.ts:1338`），**与只读无关**。
+  曾经写成 `&& !readOnly`，后果很实：`read_file` 是只读但**声明了** `permission: { key: 'read' }`
+  （`tools-builtin/src/index.ts:131/133`），默认规则 `{ '*': 'ask' }`（`host/src/host.ts:338`）下
+  它照样落到 `ask` ⇒ 扩展以为"只读不用确认"、不带 `approve`，调用被**静默拒绝**且无批准途径。
+  语义是"**可能**被问"而非"一定被问"：静态规则已 allow 时 `engine.check` 会短路。
+  报宽的代价是"规则已 allow 时多问一次"（噪音），报窄的代价是"照常会问的调用被直接拒"（功能失效）。
+
+**② 权限承接：`prepareInvocation` 是唯一的用户确认面。**
+
+```
+Copilot 要调 harness_bash
+  → 扩展 prepareInvocation() 返回 confirmationMessages（VSCode 原生 Continue / Cancel 框）
+  → 用户点 Continue
+  → 扩展调 harness/tools.call { sessionId, name, input, approve: true }
+  → sidecar 在 ALS 作用域内跑 toolPipeline.execute()
+      · engine.check() 命中静态规则（allow-all / 已写回的单次或永久规则）⇒ 直接放行，根本不问
+      · 落到 ask() ⇒ 我们的包装 asker 看到 ALS 里的 approve ⇒ allow
+  → 工具执行
+```
+
+**关键是 sidecar 侧的 Fail-Closed 双层**，而不是"信任扩展"：
+
+- `harness/tools.call` **不自己判权限**，一律走 `toolPipeline.execute` ⇒ 与 harness 自主路径
+  **同一条链**（静态规则、`core.permission.check` hook、四态写回全都在）。
+  `approve` 只影响"ask 阶段谁来答"，**不改写任何本地规则**。
+- 没有 `approve` 时 ALS 作用域为空 ⇒ 询问委派给**原 A2A asker** ⇒ 而控制面调用
+  **不在 A2A 任务上下文里**（`executor.makeAsker` 的 ALS 取不到 task）⇒ **deny + 一条 warn**。
+  ⇒ 客户端忘了带 `approve` 只会"被拒 + 日志可见"，不会静默放行。
+- 反过来，静态规则已经 allow 的情况下**本该**不多问 —— 但要注意 `requiresConfirmation` 是
+  **描述符级**属性（`tools.list` 不带入参），它**看不到**规则命中结果，所以做不到"规则已 allow
+  就不弹"。目前的取法（`permission !== undefined`）是**宁多问一次**：确认框弹出来点了 Continue
+  而 sidecar 直接放行，代价只是多一次点击；反过来漏弹则会静默拒绝。若将来要把这一格做准，
+  得加一个带 `input` 的 `harness/tools.prepare`（用 `engine.check` 干跑一次），本期不做。
+
+**②a 副作用：`approve` 绝不能由"扩展觉得该批"决定。**（落地时补的，初稿漏了）
+
+官方指南有一句初稿没注意到的话：「**A generic confirmation dialog will always be shown for
+tools from extensions**」—— 确认框不由我们决定弹不弹，`prepareInvocation` 只定制**文案**。
+但这**不**等于"能走到 `invoke` 就说明用户点过 Continue"：`lm.invokeTool` 是公开 API
+（`vscode.d.ts:20791`：「…or **globally by any extension in any custom flow**」），
+**任何别的扩展**都能绕过 `prepareInvocation` 直接调 `harness_bash`。若那种调用也被当成
+"用户已确认"，等于把批准权白送给第三方扩展。
+
+⇒ 落法是**审批台账**（`lmtools.ts` 的 `ApprovalLedger`）：`prepareInvocation` 弹框时按
+`工具名 + 入参指纹` 记一笔，`invoke` 时消费一笔；**没有对应记录就不带 `approve`**，
+于是 sidecar 侧委派原 asker ⇒ deny + warn。台账带 **TTL（10 分钟）**，把"试探性调用留下的
+陈记录"从无界收成有界。
+
+代价要认：这一笔记录**偏离了 `prepareInvocation` 的「Must be free of side-effects」契约**
+（`vscode.d.ts:21178`）。它只改进程内一个计数器、不碰文件不发请求；不记的代价是上面那个
+"白送批准权"。残留窗口写在这里：**"弹了框但用户点取消"会留下一笔记录**，接着同一工具同一入参的
+`invoke` 会把它消费掉 ⇒ 那一次多带一个 `approve: true`。窗口被 TTL + 入参指纹夹住；
+要彻底消掉同样得加带 `input` 的 `harness/tools.prepare`。
+
+**③ 会话归属：`sessionId` 必填，且必须来自"当前正在进行的那一轮"。**
+
+- 控制面入参是 `sessionId`（不是复用 sidecar 的 boot 会话）—— 工具执行的 `ToolContext.sessionId`
+  就用它，于是遥测、事实事件、权限询问的归属**全部指向同一个会话**。
+- 扩展侧由 `SessionTracker`（纯模块 `session-tracker.ts`、可单测）持有：参与者每处理一轮写一次、`/new` `/resume`
+  成功后换绑一次。**Copilot 的 `lm.invokeTool` 发生在参与者轮次之外**（没有 `TurnState` 可读），
+  所以必须有一个模块级的"当前会话"承载点。
+- 拿不到当前会话 ⇒ **明确报错**（"先在 @harness 里开始一个会话"），**不静默归属 boot 会话**：
+  「归属不明就挑一个」正是本仓反复栽过的那类静默失效。
+- **因此 sidecar 必须在激活期就起来**（与参与者的懒启动相反）：注册 LM 工具要先拿到工具清单，
+  而"用户从没 @ 过 harness、却让 Copilot 调 harness 工具"正是这条线的主路径。
+  成本要认：开一个编辑器窗口 = 起一个 sidecar 进程（本来用户一开口也会起）。
+
+### 14.3 协议：两个新控制方法
+
+控制面纪律照旧（`control.ts` 文件头）：**只做参数校验 + 调 host 公共面 + 组织出参**。
+
+| 方法 | 入参 | 出参 |
+|---|---|---|
+| `harness/tools.list` | 无 | `{ tools: [{ name, description, inputSchema, readOnly, requiresConfirmation }] }` |
+| `harness/tools.call` | `{ sessionId, name, input, approve? }` | `{ ok: true, output, durationMs }` 或 `{ ok: false, error: { message, code? } }` |
+
+**两个层级刻意分开**（与 `@harness/mcp-server` 同一个判断）：
+
+- **协议级错误**（走 `ControlError`，调用方拿到"请求失败"）：`sessionId` 缺失/非字符串、
+  `name` 缺失、`input` 不是对象 ⇒ `INVALID_PARAMS`；工具名不在注册表 ⇒ `NOT_FOUND`。
+- **工具级失败**（走正常回包 `{ ok: false }`，**不要**变成协议错误）：权限被拒、入参不合 schema、
+  工具自己抛错。理由同 mcp-server：协议错误会把"为什么被拒"藏成一句"请求失败"，
+  而 Copilot 需要把原因读回上下文才能改。
+
+`durationMs` 取 `ToolResult.meta.durationMs`（管道 Step 5 已经算了，不重复计）。
+
+### 14.4 贡献点：必须静态 ⇒ 生成式（✅ 定案 2026-10-05）
+
+**这是本稿初稿漏掉的一条硬约束**，会决定实现形态，故记在最前。
+
+`lm.registerTool` 的文档要求工具**同时**在 `package.json` 的 `contributes.languageModelTools`
+里声明；更关键的是 —— **`LanguageModelTool<T>` 接口只有 `invoke` / `prepareInvocation`，没有任何
+描述字段**（`vscode.d.ts:21165`/`21181`）。⇒ 模型能看到的 `displayName` / `modelDescription` /
+`inputSchema` **全部来自 package.json 那份静态声明**，`registerTool` 只提供实现体。
+
+| 事实 | 位置 |
+|---|---|
+| `LanguageModelTool` 只有 `invoke` / `prepareInvocation` | `vscode.d.ts:21165` / `21181` |
+| `LanguageModelToolInformation`（模型可见的那份）字段全在贡献点 | `vscode.d.ts:21129` |
+| 贡献点必填 `name` / `displayName` / `modelDescription`；`inputSchema` 可选 | VSCode 贡献点文档 |
+| `registerTool` 文档：「must also be registered in the package.json `languageModelTools` contribution point」 | `vscode.d.ts:20777` |
+
+**为什么不能"不带 inputSchema"**：不给 schema ⇒ 模型不知道入参形状 ⇒ 会发 `input: {}`。
+这不是假想，`read_file` 在真机上被发过 **14 次 `input: {}`**（`tools-builtin/src/index.ts:119`
+有完整记录：每轮都是一次完整 prompt，全 run 约 0.68M token ≈ 10%）。**故 schema 必须准确。**
+
+而 harness 的工具池是**运行期动态**的（~30 个工具、跨 9 个插件包），静态清单只能靠人肉维护 ⇒
+必然漂移。**定案：生成式贡献点。**
+
+```
+bun run gen:lm-tools
+  → 起一个**密封** host（临时 dataDir + mock provider）
+  → 调 warmupBuiltins() 后读 harness.tools.list（**与运行期同一个源**，不是另抄一份工具定义）
+  → 覆写 adapters/vscode/package.json 的 contributes.languageModelTools
+```
+
+五条纪律（后两条是**落地实测**才暴露出来的，初稿没有）：
+
+- **取源是运行期注册表，不是静态元信息**。`src/meta.ts`（L1）有 `id`/`description`/`permissionKey`/
+  `isReadOnly`，但**没有 `inputSchema`** —— 拿它生成等于交出一份没有 schema 的贡献点，正好踩上面那个坑。
+- **必须密封**：开发机上的真实 sidecar 读个人 `config.json`，实测工具池是 **32 个**
+  （含 `mcp__wb-llm__web_search` 这类**私有 MCP server** 的工具）。照抄等于把某一个人的机器状态
+  当产品默认值 ⇒ 生成器用**临时 `dataDir`** 起 host，拿到的是**默认装配**（实测 12 插件 / 10 工具，
+  两次独立运行结果一致）。
+- **`inputSchema` 直出**、`modelDescription` 直出工具自己的描述，`canBeReferencedInPrompt: true`
+  （官方指南把这一项与"能被 agent 使用"写在同一条），`toolReferenceName` = 净化后的工具原名。
+  `tags` 固定 `['harness']`。
+- **JSON 不能写注释** ⇒ 初稿写的"生成段落带 `DO NOT EDIT` 头"落不了地。改放三处：生成器文件头、
+  `adapters/vscode/README.md`、守卫用例的名字。贡献点里**不塞占位字段**（不认识的键会让 VSCode 校验告警）。
+- **加一条守卫用例**（`packages/cli/src/gen-lm-tools.test.ts`，能 import `@harness/*`）：现场取一份
+  工具池与已提交的贡献点**整段比对** ⇒ 有人改了工具却忘了重生成时**测试变红**，而不是等真机发现
+  Copilot 调不动。另有一条**跨包逐字守卫**：命名规则在两侧各一份（扩展不能 import 本仓），
+  比对源码文本里的 `LM_TOOL_PREFIX` 与两个净化正则 —— 与 `map/render.ts` 的 `FILE_REF_RE` 同一手法。
+
+#### 14.4.1 落地时挖出的前提：`harness/tools.list` 必须自己保证"池子已就绪"
+
+**这一条不是贡献点的事，但没有它 P3-D 整体是死的**，所以记在这里。
+
+「工具池可列」= 「非 optIn 内置插件都装了」+「`assembleTools()` 跑过」，**缺一不可**。
+而 A2A 服务端**故意**用 `backgroundPreload:false` 启动（`runA2aCli` 的理由：启动提示应当确定性）
+⇒ 那两件事都没做。实测（真实 sidecar，`curl /harness/rpc`）：
+
+| 状态 | `harness/tools.list` |
+|---|---|
+| 原样（改前） | **0 个** |
+| 只调 `assembleTools()` | 5 个（仅 `tools.builtin` 的工具） |
+| 装齐 `tools.glob/search/web/media` + `assembleTools()` | 10 个（默认装配的完整池） |
+
+失败形态是"清单为空"——**静默，且看起来像正常状态**（空清单本来不报错）。客户端那头更狠：
+扩展在**激活期**拿这份清单去 `lm.registerTool`，拿到空的就一个 LM 工具都注册不上，
+用户只会看到"Copilot 里没有 harness 工具"。
+
+处置：host 上新增**幂等**的 `warmupBuiltins()`（把 `scheduleBuiltinPreload` 的实现抽出来、
+可 await、缓存首次结果），`harness/tools.list` **先调它再列**。这样"读工具池"不再依赖
+**启动顺序**。守卫：`control.test.ts` 的「工具池就绪（P3-D 的前提）」一组 —— 宿主用
+`backgroundPreload:false`（= 服务端形态）boot，断言 `tools.list` **非空**且含 `read_file`/`bash`。
+
+
+**已知边界（写下来，不假装没有）**：第三方插件在运行期新增的工具，其名字**不在**静态贡献点里 ⇒
+`lm.tools` 可见、`lm.invokeTool` 可调，但**模型看不见**（元信息是打包期固化的）。这与
+"不做白名单、暴露全部工具"不矛盾：暴露面仍是全部，只是"模型可见"这一格需要重跑生成脚本才刷新。
+
+### 14.5 不做
+
+- **不写本地 `permissions.json`**：没有 `always-allow` 通道 —— 一个远端编排器不该有改写
+  本地权限规则的权力（同 mcp-server）。
+- **不按 agent 过滤工具集**：Copilot 调用方不带 agent 概念；工具池就是全局注册表。
+- **不做 `mcp__*` 二级转发**：与 mcp-server 面一致。
+- **不做反向的 `lm.invokeTool`**（harness 去调别的扩展的工具）：那是另一种世界观，等需求。
+
+### 14.6 验收
+
+| 闸门 | 判据 |
+|---|---|
+| 可自动化 | sidecar 两侧控制方法单测（列出 / 执行 / 未知工具 / 参数非对象 / 需确认未 approve ⇒ 拒 / 已 approve ⇒ 放行 / 静态规则已 allow 则不问）+ 扩展侧 `lmtools` / `SessionTracker` / 注册器纯函数单测 + 贡献点守卫用例（§14.4） |
+| **真实点验（需 Copilot）** | 装 Copilot + Chat 后，在 agent mode 下看 `harness_*` 工具是否出现、调用是否真的执行、确认框是否弹 —— **本仓无法闭环**（同 §3 的 P2/P3 人手点验） |
+
+---
+
 ## 附：本稿引用的关键位置
 
 | 符号 | 位置 |
 |---|---|
 | `ChatResponseStream` / `ChatRequest` / `ChatParticipant` / `ChatResult` | `vscode.d.ts`（main，2026-10-01 下载核对）：19910 / 19855 / 19788 / 19696 |
 | `LanguageModelTool` / `LanguageModelToolConfirmationMessages` / `lm.invokeTool` | `vscode.d.ts`：21161 / 21184 / lm 命名空间 |
+| `lm.registerTool` / `prepareInvocation` | `vscode.d.ts`：20782 / 21181 |
+| 控制面方法注册表 + 分发 | `packages/a2a-server/src/control.ts:253`（`METHODS`）/ `dispatchControl:806` |
+| A2A asker 接线点（§14.2 的包装点） | `packages/a2a-server/src/server.ts:299` |
+| `executor.makeAsker`（ALS 取 task，取不到 ⇒ deny） | `packages/a2a-server/src/executor.ts:293` |
+| `ToolPipeline.execute` 的权限步（Step 4） | `packages/tool/src/index.ts:1337` |
 | `AgentStreamEvent` 联合 | `packages/core/src/index.ts:660` |
 | `host.sendStream` | `packages/host/src/host.ts:1307` |
 | `host.notices` 环形缓冲 | `packages/host/src/host.ts:284` |

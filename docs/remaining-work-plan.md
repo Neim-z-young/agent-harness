@@ -57,24 +57,23 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 | `read_file` / `write_file` / `bash` / `edit_file` **直调入参守卫** | 见上节更正；四处 `guardInput`（`tools-builtin/src/index.ts:139/281/569/1325`） |
 | 上下文压缩 V5 四阶段 | 见上节 |
 | bash AST + Kitty | 调研报告"实施进展"两轮全 ✅ |
+| VSCode 集成 P3-D 左半：`_setChatProvider` 最终删除（原 §2-D） | 续 254；6 个 provider 插件的 `else if (harness?._setChatProvider)` 回退分支 + 方法本体齐删 |
+| VSCode 集成 P3-D 右半：扩展注册 `languageModelTools`（设计稿 §10-6 / §14，原 §2-E） | 续 254；`adapters/vscode` 内 `lm.registerTool` + **生成式贡献点**（`bun run gen:lm-tools`，10 条） |
 
 ---
 
 ## 2. 仍可继续（纯代码，本仓可闭环）
 
 > 编号沿用原盘点：**B 已落地**（见下行，续 253）；**C 已落地移入 §1**（不再重复列）；
-> **原 D 已按性质拆解** ——
-> `read_file` 直调守卫 → §1、`unregister` 级联 → §4、只剩 `_setChatProvider` 删除留在本表（见下方备注）。
+> **D / E 均已落地移入 §1**（续 254）—— 本节只剩 **A**（仅剩真 harness 装配级端到端）与 **F**。
 
 | # | 项 | 现状判据 | 依赖 / 风险 |
 |---|---|---|---|
 | **A** | `@harness/planning-files` 插件 | ✅ **阶段一~四已落地**（续 248/249） | 仅剩「真 harness 装配级端到端」（本包测试走 hook 级） |
 | **B** | MCP **server 端**插件（旁路 B1） | ✅ **已落地**（续 253）：`@harness/mcp-server` —— Streamable HTTP + 动态工具映射 + elicitation 权限桥（`optIn`）。§1 勘察已订正原判"从零写"（进程内 server / `McpTransport` / 注册链四块可复用） | 一期不做 `resources`/`prompts`/`sampling`、stdio、`mcp__*` 二级转发；IDE 侧真机联调待外部客户端 |
-| D | `_setChatProvider` 最终删除（含 `chat.provider` 老注入链退场） | `core:4791` 标 `@deprecated`；6 个内置 provider 插件（anthropic / openai / glm / gemini / qwen / mock）各留一条 `else if (harness?._setChatProvider)` 回退分支；**生产路径已无调用者**，真走到的只有测试桩（`cli.test.ts:1900`、`core.test.ts:1216+`） | 低风险，但**顺序不能颠倒的三步**（见下）；动手前先确认是否继续支持「老宿主 + 新插件」 |
-| E | VSCode 注册 `languageModelTools`（设计稿 §10-6，B1 变体） | 扩展内无 `lm.registerTool` | 点验需 Copilot |
 | F | 79.9MB 二进制裁剪 B1/B2（`--minify` + 瘦入口） | `packages/cli/package.json` 的 `build:sidecar` 未带 minify | A3 选定后优先级已降；实测可到 62.1MB / zip 后 ~21MB |
 
-> **§2-D 备注：删除 `_setChatProvider` 的前置三步（顺序不可颠倒）**
+> **§2-D 备注（已实施，续 254）：`_setChatProvider` 删除的三步顺序**
 >
 > 1. 摘掉 6 个内置 provider 插件里的 `else if (harness?._setChatProvider)` 回退分支；
 > 2. 摘掉 `context.register('chat.provider', p)` —— 这条老注入路径**正是 `resolve()` 链最后一环的
@@ -82,7 +81,8 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 > 3. 最后删 `core:4791` 的方法本体。
 >
 > 任何一步单做都会让「老宿主 + 新插件」**静默失效**：插件注入不上 ⇒ 回落构造期 Provider，
-> 且**一条告警都没有**（`provider.registered` 压根不会发布）。
+> 且**一条告警都没有**（`provider.registered` 压根不会发布）。续 254 已确认**生产路径无调用者**，
+> 仍走到的只有测试桩，故按上述顺序一次性删净。
 
 ## 3. 需外部条件（无法在本仓闭环）
 
