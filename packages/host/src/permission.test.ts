@@ -90,6 +90,25 @@ describe('InteractivePermissionEngine · 取不到答复一律 deny（反向验�
     e.setAsker(() => Promise.resolve('always-allow'))
     expect((await e.ask({ toolKey: 'bash', patterns: [] })).behavior).toBe('allow')
   })
+
+  it('getAsker 拿到当前交互器：包装型 asker 必需（否则"包装"会退化成"替换"）', async () => {
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask' })
+    expect(e.getAsker()).toBeUndefined()
+    const prev: PermissionAsker = () => Promise.resolve('deny')
+    e.setAsker(prev)
+    expect(e.getAsker()).toBe(prev)
+    // 典型用法：先取到原 asker，再装一个按会话归属分流的包装（进程内 MCP server 的形态）
+    const captured = e.getAsker()!
+    const delegated: string[] = []
+    e.setAsker(async (req, prompt) => {
+      if (req.sessionId === 'mine') return 'allow'
+      delegated.push(req.toolKey)
+      return await captured(req, prompt)
+    })
+    expect((await e.ask({ toolKey: 'bash', patterns: [], sessionId: 'mine' })).behavior).toBe('allow')
+    expect((await e.ask({ toolKey: 'bash', patterns: [], sessionId: 'tui' })).behavior).toBe('deny')
+    expect(delegated).toEqual(['bash'])
+  })
 })
 
 describe('buildPermissionPrompt · 文案逐字（改造前 cli 内的 readline 问题串）', () => {
@@ -104,6 +123,22 @@ describe('buildPermissionPrompt · 文案逐字（改造前 cli 内的 readline 
 
   it('无 pattern 时显示 (无路径)', () => {
     expect(buildPermissionPrompt({ toolKey: 'read', patterns: [] }).summary).toBe('权限请求 [read] (无路径)')
+  })
+
+  it('透传会话归属：有则原样带出，无则 undefined（asker 据此路由，未给时不伪造）', () => {
+    expect(buildPermissionPrompt({ toolKey: 'bash', patterns: [], sessionId: 'sess-1' }).sessionId).toBe('sess-1')
+    expect(buildPermissionPrompt({ toolKey: 'bash', patterns: [] }).sessionId).toBeUndefined()
+  })
+
+  it('asker 收到的 req 保留 sessionId（路由信息不被引擎层剥掉）', async () => {
+    const got: Array<string | undefined> = []
+    const asker: PermissionAsker = (req) => {
+      got.push(req.sessionId)
+      return Promise.resolve('deny')
+    }
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', asker })
+    await e.ask({ toolKey: 'bash', patterns: [], sessionId: 'sess-9' })
+    expect(got).toEqual(['sess-9'])
   })
 
   it('引擎把 prompt.text 原样交给 asker', async () => {

@@ -564,6 +564,20 @@ describe('@harness/tool', () => {
         expect(err).toBeInstanceOf(ToolPermissionAskRequiredError)
       })
 
+      it('checkPermission 拿得到会话归属（sessionId 取自 ctx，不是工具入参）', async () => {
+        const seen: Array<string | undefined> = []
+        const p = new ToolPipeline({
+          checkPermission: async (req) => {
+            seen.push(req.sessionId)
+            return { behavior: 'allow' }
+          },
+        })
+        await p.execute(writeFileTool, { path: '/tmp/x', content: 'y' }, makeCtx({ sessionId: 'sess-a' }))
+        await p.execute(writeFileTool, { path: '/tmp/x', content: 'y' }, makeCtx({ sessionId: 'sess-b' }))
+        // 两次调用归属各归各的：asker 是全局单槽，靠这个字段才能区分"这次询问属于谁"
+        expect(seen).toEqual(['sess-a', 'sess-b'])
+      })
+
       it('checkPermission updatedInput 会重写输入参数', async () => {
         const p = new ToolPipeline({
           checkPermission: async () => ({

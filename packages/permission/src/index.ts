@@ -97,6 +97,20 @@ export interface PermissionRequest {
   /** 请求来源（如 agentId / pluginId） */
   from?: string
   /**
+   * 发起该请求的会话 ID（由 ToolPipeline 从 `ToolContext.sessionId` 填入）。
+   *
+   * 为什么需要：`asker` 是**全局单槽**（`InteractivePermissionEngine.setAsker`），而同一
+   * 进程里可能同时存在多个"询问源" —— TUI 里的 Agent、A2A 任务、本进程的 MCP server。
+   * 没有归属信息时，后装的 asker 无法判断"这次询问该由谁应答"，只能顶掉前一个
+   * （并发下互相串台）。带上会话 ID 后，包装型 asker 可据此路由：属于自己接管的会话
+   * ⇒ 自己应答；否则委派给被包装的原 asker。
+   *
+   * 为什么可选：既有引擎实现与测试桩只读 `toolKey` / `patterns`，不应因新增归属信息被迫
+   * 改写；且工具内直接调 `ctx.requestPermission` 的场景未必拿得到会话归属 —— 缺省即
+   * "无归属"，按既有行为处理。
+   */
+  sessionId?: string
+  /**
    * 仅参与 **deny** 判定的附加 pattern（可选，如 bash 的段级命令）。
    * allow/ask 是任一 pattern 命中即生效，混入段级 pattern 会放宽它们；
    * deny 是任一命中即拒绝 —— 本字段只进 deny 判定，只收紧不放宽。

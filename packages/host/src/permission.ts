@@ -31,11 +31,18 @@ export type PermissionAnswer = 'allow' | 'deny' | 'always-allow' | 'always-deny'
 /**
  * 询问接缝实际依赖的输入面。
  *
- * 刻意**收窄**到引擎真正读的两项（`toolKey` / `patterns`），而不是整个 `PermissionRequest`：
- * 引擎与提问材料的组装都不碰 `input`，把它写进契约只会让每个调用点（含测试桩）多伪造一个字段。
+ * 刻意**收窄**到引擎与路由真正要的三项，而不是整个 `PermissionRequest`：引擎读
+ * `toolKey` / `patterns`，`sessionId` 则供 **asker 路由**（见下）。其余字段（`input` 等）
+ * 引擎与提问材料的组装都不碰，写进契约只会让每个调用点（含测试桩）多伪造一个字段。
  * 宽类型（完整 `PermissionRequest`）传进来天然兼容 —— 依赖倒置，不是第二份定义。
+ *
+ * ## 为什么 `sessionId` 要进这个"窄"契约
+ * `asker` 是**全局单槽**（`InteractivePermissionEngine.setAsker`），而宿主可以并存多个询问源
+ * （TUI 里的 Agent、A2A 任务、进程内 MCP server）。收窄时若把归属信息一并裁掉，包装型
+ * asker 就无从判断"这次询问该由谁应答"，只能靠"当前谁在忙"这类不可靠标志（并发不安全）。
+ * 故它是**路由的最小必要信息**，与"引擎要读什么"是两条独立理由，不能按同一条规则裁。
  */
-export type PermissionAskInput = Pick<PermissionRequest, 'toolKey' | 'patterns'>
+export type PermissionAskInput = Pick<PermissionRequest, 'toolKey' | 'patterns' | 'sessionId'>
 
 /** 交互模式：`allow-all` / `deny-all` 直接短路，只有 `ask` 才走 asker */
 export type PermissionMode = 'allow-all' | 'ask' | 'deny-all'
@@ -49,6 +56,8 @@ export type PermissionMode = 'allow-all' | 'ask' | 'deny-all'
 export interface PermissionPrompt {
   toolKey: string
   patterns: string[]
+  /** 会话归属，透传自 `PermissionAskInput`（asker 路由用；无归属时为 undefined） */
+  sessionId?: string
   /** 一句话摘要，如 `权限请求 [bash] rm -rf /tmp/x`（CLI 的 readline 首行就是它） */
   summary: string
   /** 默认完整问题（含操作说明与 `[a/d/A/D]` 提示），CLI 逐字使用 */
@@ -80,6 +89,7 @@ export function buildPermissionPrompt(req: PermissionAskInput): PermissionPrompt
   return {
     toolKey: req.toolKey,
     patterns,
+    sessionId: req.sessionId,
     summary,
     text:
       `\n⚠️  ${summary}\n` +
@@ -125,6 +135,18 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
   /** 替换询问交互器（TUI 在启动后注入模态审批，替代默认 readline 行内提问） */
   setAsker(fn?: PermissionAsker): void {
     this.asker = fn
+  }
+
+  /**
+   * 当前询问交互器（`undefined` = 未装，此时 ask → deny）。
+   *
+   * 存在的理由：**新增的询问源需要"包装"而不是"替换"现有 asker**。典型场景是进程内
+   * MCP server —— 它只能处理"属于自己会话"的询问（`PermissionAskInput.sessionId`），
+   * 其余的必须交回原 asker，否则就把 TUI 的模态审批顶掉了。没有 getter 时拿不到被包装者，
+   * "包装"只能退化成"替换" ⇒ 两个询问源互相顶掉、先装的那个静默失效。
+   */
+  getAsker(): PermissionAsker | undefined {
+    return this.asker
   }
 
   /**

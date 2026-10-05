@@ -511,6 +511,14 @@ export interface PermissionRequest {
   /** 原始输入 */
   input: unknown
   /**
+   * 发起该请求的会话 ID（ToolPipeline 在 Step 4 从 `ctx.sessionId` 填入）。
+   *
+   * 与 `@harness/permission` 的 `PermissionRequest.sessionId` 同义：询问接缝的 `asker` 是全局
+   * 单槽，多宿主（TUI / A2A / 进程内 MCP server）并存时靠它区分"这次询问属于谁"，
+   * 否则后装的 asker 会顶掉前一个。可选是为了让既有调用点（`ctx.requestPermission`）不必伪造。
+   */
+  sessionId?: string
+  /**
    * 仅参与 **deny** 判定的附加 pattern（可选）。
    *
    * 为什么不让工具直接把它们混进 `patterns`：权限引擎的 allow / ask 是**任一 pattern
@@ -1333,6 +1341,9 @@ export class ToolPipeline {
           patterns: tool.permission.extractPatterns(input as any),
           input,
           denyPatterns: tool.permission.extractDenyPatterns?.(input as any),
+          // 会话归属：询问接缝（asker）是全局单槽，多宿主并存时靠它路由。
+          // 从 ctx 取而非从 input 取 —— 归属是"谁在调"，不是工具参数的一部分。
+          sessionId: ctx.sessionId,
         }
         const decision = await Promise.resolve(this.checkPermission(permReq))
         // 允许插件通过 updatedInput 重写输入（Claude Code 风格）
