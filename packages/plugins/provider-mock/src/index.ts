@@ -349,7 +349,7 @@ export class MockChatProvider implements ChatProvider {
  *
  * 流程：
  * 1. install：从 ctx.config.get('provider.mock') 读取配置 → 创建 MockChatProvider 实例
- * 2. core.harness.init Hook：从 output.harness 拿到 HarnessImpl → 调用 _setChatProvider 注入
+ * 2. core.harness.init Hook：从 output.harness 拿到 HarnessImpl → `providers.register` 注册实例
  *
  * @param config 可选：直接传入配置（覆盖 config store 中的值）
  * @returns AgentPlugin 实例
@@ -383,7 +383,6 @@ export function createProviderMockPlugin(config?: MockProviderConfig): AgentPlug
           const harness = (output as { harness?: unknown }).harness as
             | {
                 providers?: ProviderRuntime
-                _setChatProvider?: (p: ChatProvider) => void
               }
             | undefined
           if (!provider) return
@@ -393,9 +392,9 @@ export function createProviderMockPlugin(config?: MockProviderConfig): AgentPlug
               source: `plugin:${pluginId}`,
               type: 'mock',
             })
-          } else if (harness?._setChatProvider) {
-            harness._setChatProvider(provider)
           } else {
+            // 无兼容回退：`_setChatProvider` 已删除（见 remaining-work-plan §2-D）。
+            // 宿主没有 `providers` 实例表时**只告警不静默** —— 这条 else 是唯一可见出口。
             ctx.log.warn('Harness.providers not found, Mock Provider may not be registered')
           }
         },

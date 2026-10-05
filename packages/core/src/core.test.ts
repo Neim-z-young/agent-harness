@@ -1212,12 +1212,12 @@ describe('@harness/core', () => {
         ],
         chatProvider: pAlpha,
       })
-      // 模拟多个 Provider 插件逐个注册（注册表按 id 分发，最后注册的作为默认）
-      ;(h as unknown as HarnessImpl)._setChatProvider(pAlpha)
-      ;(h as unknown as HarnessImpl)._setChatProvider(pBeta)
-      ;(h as unknown as HarnessImpl)._setChatProvider(pGamma)
-      // 显式指定默认 = beta（覆盖 context 中最后注册的 gamma）
-      ;(h as unknown as HarnessImpl)._setChatProvider(pBeta)
+      // 模拟多个 Provider 插件逐个注册（公开路径：注册键由调用方给，注册本身**不设默认**）
+      h.providers.register('alpha', pAlpha, { source: 'plugin:provider.alpha' })
+      h.providers.register('beta', pBeta, { source: 'plugin:provider.beta' })
+      h.providers.register('gamma', pGamma, { source: 'plugin:provider.gamma' })
+      // 显式指定默认 = beta（不再靠「最后注册赢」那条老语义）
+      h.providers.setDefault('beta')
 
       await h.start()
       const sess = await h.session.create()
@@ -1241,14 +1241,23 @@ describe('@harness/core', () => {
         cwd: process.cwd(),
         chatProvider: pLegacy,
       } as any)
-      impl._setChatProvider(pAlpha)
-      impl._setChatProvider(pBeta)
+      impl.providers.register('alpha', pAlpha)
+      impl.providers.register('beta', pBeta)
+      impl.providers.setDefault('beta')
       expect(impl.resolveChatProvider('alpha')).toBe(pAlpha)
       expect(impl.resolveChatProvider('beta')).toBe(pBeta)
-      // 'default' 与未注册 id 均回退默认（最后注册的 beta）
+      // 'default' 与未注册 id 均回退默认（显式默认 beta）
       expect(impl.resolveChatProvider('default')).toBe(pBeta)
       expect(impl.resolveChatProvider('nonexistent')).toBe(pBeta)
       expect(impl.resolveChatProvider(undefined)).toBe(pBeta)
+    })
+
+    it('`_setChatProvider` 已删除：类型层守卫（有人加回来 ⇒ 本用例编译不过）', () => {
+      // 反向守卫：条件类型在方法存在时求值为 `never` ⇒ 下面那行赋值报 TS2322。
+      // 删除动作发生在 remaining-work-plan §2-D：Provider 注入此后**只有** providers.register 一条路。
+      type LegacySetterRemoved = HarnessImpl extends { _setChatProvider: unknown } ? never : true
+      const check: LegacySetterRemoved = true
+      expect(check).toBe(true)
     })
 
     // ---- 运行期注册表（ProviderRuntime）：键由调用方给 / 默认显式 / 可反注册 ----

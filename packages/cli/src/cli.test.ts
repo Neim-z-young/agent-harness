@@ -1897,7 +1897,7 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
           }
           return {
             async 'core.harness.init'(_i: unknown, output: any) {
-              output?.harness?._setChatProvider?.(provider as any)
+              output?.harness?.providers?.register('my-gw', provider as any, { source: 'plugin:my-gw' })
             },
           } as any
         },
@@ -1910,10 +1910,10 @@ describe('HarnessApp + startRepl 集成（mock provider）', () => {
       providers: { list(): Array<{ id: string; source: string }> }
     }
     expect(h.resolveChatProvider('my-gw')?.id).toBe('my-gw')
-    // 老路径对照：这个桩走 `_setChatProvider` ⇒ source 记 legacy。
-    // 「内置包已全部迁到 providers.register」与「第三方桩仍可走老路径」两件事同时成立，
-    // 也说明回退分支不是死代码。
-    expect(h.providers.list().map((p) => p.source)).toEqual(['legacy'])
+    // 第三方插件走的是**与内置包同一条**公开路径（`providers.register`）。
+    // `_setChatProvider` 删除后不再有第二条注入路径 —— 这也是"内置包全迁完"
+    // 与"第三方不落后"两件事同时成立的原因（见 remaining-work-plan §2-D）。
+    expect(h.providers.list().map((p) => p.source)).toEqual(['plugin:my-gw'])
     await app.shutdown()
   })
 

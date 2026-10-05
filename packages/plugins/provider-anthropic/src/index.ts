@@ -823,7 +823,6 @@ export function createProviderAnthropicPlugin(config?: AnthropicProviderConfig):
           const harness = (output as { harness?: unknown }).harness as
             | {
                 providers?: ProviderRuntime
-                _setChatProvider?: (p: ChatProvider) => void
                 tools?: { list?: () => Tool[] }
               }
             | undefined
@@ -837,10 +836,9 @@ export function createProviderAnthropicPlugin(config?: AnthropicProviderConfig):
               source: `plugin:${pluginId}`,
               type: 'anthropic',
             })
-          } else if (harness?._setChatProvider) {
-            // 老宿主回退（渐进迁移）
-            harness._setChatProvider(provider)
           } else {
+            // 无兼容回退：`_setChatProvider` 已删除（见 remaining-work-plan §2-D）。
+            // 宿主没有 `providers` 实例表时**只告警不静默** —— 这条 else 是唯一可见出口。
             ctx.log.warn('Harness.providers 未找到，Anthropic Provider 可能未注册')
           }
 

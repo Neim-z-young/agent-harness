@@ -777,7 +777,8 @@ export interface AgentStreamEvent {
  * 注入路径（推荐程度从高到低）：
  * 1. `harness.providers.register(id, provider, meta)` —— 运行期注册，**键由调用方给**（推荐）
  * 2. `harness.providers.setDefault(id)` —— 显式指定默认（不再靠注册顺序）
- * 3. `ctx.context.register('chat.provider', xxx)` —— 老路径，只当作 resolve() 链的最后一环
+ * 3. `AgentHarnessOptions.chatProvider` —— 构造期兜底，只当作 resolve() 链的最后一环
+ *    （旧的 `harness._setChatProvider` 运行期注入路径已删除，见 remaining-work-plan §2-D）
  *
  * ⚠️ `id` 是**类型标识**（"我是 anthropic 类型"），**不是**装配实例的唯一键 ——
  * 同一份 config 数组里可以有两个 anthropic 端点。实例键必须由调用方从 `ProviderConfig.id` 传入。
@@ -842,7 +843,7 @@ class MissingChatProvider implements ChatProvider {
  * 只能靠 source 回答。
  */
 export interface ProviderInstanceMeta {
-  /** 来源：`config`（config.json）/ `options`（构造参数）/ `legacy`（旧 _setChatProvider）/ `runtime`（运行期注册） */
+  /** 来源：`config`（config.json）/ `options`（构造参数）/ `plugin:<id>`（插件装配）/ `runtime`（运行期注册） */
   source: string
   /** 该实例对应的 ProviderConfig.type，仅作展示 */
   type?: string
@@ -4316,8 +4317,8 @@ export const AgentEvents = {
  *
  * 持有实例表与「显式默认」，并发布注册事实事件。
  *
- * 构造期 Provider（`options.chatProvider`）与 `ctx.context.register('chat.provider', p)`
- * 这条老注入路径**不进实例表** —— 它们是 resolve() 链的最后一环（显式 id → 显式默认 →
+ * 构造期 Provider（`options.chatProvider`，构造时写入 context 的 `chat.provider` 键）
+ * **不进实例表** —— 它是 resolve() 链的最后一环（显式 id → 显式默认 →
  * 首个已注册 → 构造期 Provider）；混进表里会让 list() 出现「来源不明的实例」，
  * 也会让「首个已注册」这个语义变得不可解释。
  */
@@ -4457,7 +4458,15 @@ export class HarnessImpl implements Harness {
    */
   private readonly countTokens: (text: string) => number
 
-  private chatProvider: ChatProvider
+  /**
+   * 构造期 Provider —— resolve() 链的**最后一环**（不再有运行期写入者）。
+   *
+   * 此前是可变字段（`_setChatProvider` 会在运行期替换它）；那个注入方法已删除
+   * （见 `docs/remaining-work-plan.md` §2-D），实例注册一律走 `this.providers`，
+   * 故这里标 `readonly` 表达"它在构造后不再变"。`context['chat.provider']` 仍在构造期写入，
+   * 是 fallback 的读点。
+   */
+  private readonly chatProvider: ChatProvider
   private started = false
   private stopped = false
 
@@ -4469,7 +4478,7 @@ export class HarnessImpl implements Harness {
     this.permission = options.permission ?? new DefaultPermissionEngine({ '*': 'ask' })
     this.tools = options.toolRegistry ?? new ToolRegistry()
 
-    // ChatProvider（支持后替换，给插件注入留入口）
+    // ChatProvider：构造期 Provider = resolve() 链的最后一环（运行期增删走 this.providers）
     this.chatProvider = options.chatProvider ?? new MissingChatProvider()
     this.context.register('chat.provider', this.chatProvider)
     // Provider 实例注册表：构造期 Provider 不进实例表 —— 它是 resolve() 链的最后一环
@@ -4774,25 +4783,6 @@ export class HarnessImpl implements Harness {
    */
   resolveChatProvider(providerId?: string, ctx?: ProviderResolveCtx): ChatProvider {
     return this.providers.resolve(providerId, ctx)
-  }
-
-  // ----- 兼容层：旧注入路径（供尚未迁移的 Provider 插件使用） -----
-
-  /**
-   * @deprecated 用 `harness.providers.register(id, p, meta)` + `harness.providers.setDefault(id)`。
-   *
-   * 保留仅因为各 provider 插件此前跨包 cast 调用它；语义等价于「按 `p.id` 注册 + 设为默认」。
-   *
-   * ⚠️ **语义变化（有意）**：旧实现是「最后调用者赢」（既改默认又改注册表），
-   * 新实现是「注册 + 显式设默认」——`p.id` 作为键仍是对象自报，这正是 P2 缺陷的口径；
-   * 迁移完成的插件应改用 `providers.register(ProviderConfig.id, p)`，键由调用方给。
-   * 同时保留 `context['chat.provider']` 写入：那条老注入路径仍在 resolve() 链的最后一环。
-   */
-  _setChatProvider(p: ChatProvider): void {
-    this.chatProvider = p
-    this.context.register('chat.provider', p)
-    this.providers.register(p.id, p, { source: 'legacy' })
-    this.providers.setDefault(p.id)
   }
 }
 
