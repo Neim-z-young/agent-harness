@@ -44,6 +44,7 @@ const BUILTIN_LAZY: Record<string, () => Promise<Record<string, unknown>>> = {
   '@harness/manage-plugin': () => import('@harness/manage-plugin'),
   '@harness/mcp-server-registry': () => import('@harness/mcp-server-registry'),
   '@harness/memory': () => import('@harness/memory'),
+  '@harness/planning-files': () => import('@harness/planning-files'),
   '@harness/provider-anthropic': () => import('@harness/provider-anthropic'),
   '@harness/provider-gemini': () => import('@harness/provider-gemini'),
   '@harness/provider-glm': () => import('@harness/provider-glm'),

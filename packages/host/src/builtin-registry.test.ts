@@ -125,6 +125,16 @@ describe('resolveBuiltinPlugins / unknownBuiltinPluginIds：声明式启用路�
     expect(plugins).toHaveLength(2)
   })
 
+  it('planning-files 可从 id 实例化（真 import + 真工厂调用），且不在默认装配里', async () => {
+    const { plugins, unknown } = await resolveBuiltinPlugins(['planning-files'])
+    expect(unknown).toEqual([])
+    expect(plugins.map((p) => p.id)).toEqual(['planning-files'])
+    expect(typeof plugins[0]!.install).toBe('function')
+    // optIn：不声明就不装配 —— 它每轮往请求尾部注入计划块，是有成本的行为
+    const none = await resolveBuiltinPlugins([])
+    expect(none.plugins.map((p) => p.id)).not.toContain('planning-files')
+  })
+
   it('只声明 coordinator 时经 dependsOn 自动补上 subagent', async () => {
     const { plugins, unknown } = await resolveBuiltinPlugins(['coordinator'])
     expect(unknown).toEqual([])

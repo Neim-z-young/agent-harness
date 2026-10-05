@@ -462,6 +462,18 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       optIn: true,
       load: async () => (await lazyImport<{ createMemoryPlugin: () => AgentPlugin }>('@harness/memory')).createMemoryPlugin(),
     })
+    // planning-files：文件化持久规划（计划放 .planning/ 三文件，每轮尾部注入）。
+    // optIn：它**每轮都往请求尾部注入计划块** —— 那是有成本的行为（额外 prefill + 上下文占用），
+    // 属于"启用了才付代价"的能力，不能默认给所有会话挂上（与 memory 同理：默认零行为）。
+    // 未启用时完全零行为（既不建 .planning/、也不注入）。
+    defaultBuiltinRegistry.register({
+      id: 'planning-files',
+      name: 'Planning Files',
+      description: '文件化持久规划：task_plan / findings / progress 三文件放 .planning/，每轮尾部注入（跨会话 / 压缩 / 崩溃存活）+ /plan 系命令',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createPlanningFilesPlugin: () => AgentPlugin }>('@harness/planning-files')).createPlanningFilesPlugin(),
+    })
     // skill-forge：技能锻造（F1/F2）。optIn：会往 skills 目录写文件，必须显式声明才启用。
     // 与 memory 互补：单条事实进记忆，多步流程进技能（见 docs/memory-and-skill-forge-plan.md §0）。
     defaultBuiltinRegistry.register({

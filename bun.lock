@@ -152,6 +152,7 @@
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
         "@harness/memory": "workspace:*",
+        "@harness/planning-files": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/provider-anthropic": "workspace:*",
         "@harness/provider-gemini": "workspace:*",
@@ -286,6 +287,13 @@
       "devDependencies": {
         "@harness/core": "workspace:*",
         "@harness/workspace": "workspace:*",
+      },
+    },
+    "packages/plugins/planning-files": {
+      "name": "@harness/planning-files",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/plugin": "workspace:*",
       },
     },
     "packages/plugins/provider-anthropic": {
@@ -559,6 +567,8 @@
     "@harness/memory": ["@harness/memory@workspace:packages/plugins/memory"],
 
     "@harness/permission": ["@harness/permission@workspace:packages/permission"],
+
+    "@harness/planning-files": ["@harness/planning-files@workspace:packages/plugins/planning-files"],
 
     "@harness/plugin": ["@harness/plugin@workspace:packages/plugin"],
 
