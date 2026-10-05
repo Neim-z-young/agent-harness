@@ -87,7 +87,7 @@ describe('BuiltinPluginRegistry：内置通用插件统一登记', () => {
     for (const id of [
       'tools-builtin', 'tools-manager', 'manage-plugin',
       'tools-search', 'tools-glob', 'tools-web', 'tools-media',
-      'code-intel', 'computer-use', 'mcp.server-registry',
+      'code-intel', 'computer-use', 'mcp.server-registry', 'mcp-server',
       'subagent', 'coordinator', 'swarm',
       'herdr', 'memory', 'skill-forge',
     ]) {
@@ -104,7 +104,7 @@ describe('BuiltinPluginRegistry：内置通用插件统一登记', () => {
 
   it('optIn 语义：进程内 MCP server 与编排类插件默认不自动装配', () => {
     const reg = getBuiltinRegistry()
-    for (const id of ['code-intel', 'computer-use', 'mcp.server-registry', 'subagent', 'coordinator', 'swarm', 'memory', 'skill-forge', 'herdr']) {
+    for (const id of ['code-intel', 'computer-use', 'mcp.server-registry', 'mcp-server', 'subagent', 'coordinator', 'swarm', 'memory', 'skill-forge', 'herdr']) {
       expect(reg.get(id)!.optIn).toBe(true)
     }
     // tools-* 是默认装配的：没有 optIn 标记

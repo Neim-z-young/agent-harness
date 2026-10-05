@@ -23,6 +23,7 @@
     "@harness/core": "workspace:*",
     "@harness/herdr": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
+    "@harness/mcp-server": "workspace:*",
     "@harness/mcp-server-registry": "workspace:*",
     "@harness/memory": "workspace:*",
     "@harness/planning-files": "workspace:*",

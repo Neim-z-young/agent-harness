@@ -406,6 +406,19 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       optIn: true,
       load: async () => (await lazyImport<{ createMcpServerRegistryPlugin: () => AgentPlugin }>('@harness/mcp-server-registry')).createMcpServerRegistryPlugin(),
     })
+    // mcp.server：把 harness 工具集经 MCP（Streamable HTTP）**暴露给外部客户端**
+    //（IDE 侧 Copilot Chat / Continue / Cline）。与上面 `mcp.server-registry` 方向相反 ——
+    // 那个管"我们去连谁"，这个管"谁被允许连我们"，故**无 dependsOn**（不经 registry 连任何 server）。
+    // optIn：占端口 + 开网络面（虽只绑回环），不给用不到的会话起服务。
+    // 权限：写操作的确认走 MCP elicitation（客户端不支持则 Fail-Closed 拒绝）。
+    defaultBuiltinRegistry.register({
+      id: 'mcp-server',
+      name: 'MCP Server',
+      description: '把工具集经 MCP 暴露给外部客户端（/mcp-serve 起服务，写操作经 elicitation 二次确认）',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createMcpServerPlugin: () => AgentPlugin }>('@harness/mcp-server')).createMcpServerPlugin(),
+    })
     // ── Agent 编排类插件（subagent / coordinator / swarm）──
     // 与 tools-* 的区别是 **optIn**：登记只让它们「可声明」（config.json → plugins 校验/补全、
     // /plugins 可见），不自动装配——不给用不到的会话注入 subagent 工具与编排 Hook。

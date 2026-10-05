@@ -150,6 +150,7 @@
         "@harness/core": "workspace:*",
         "@harness/herdr": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
+        "@harness/mcp-server": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
         "@harness/memory": "workspace:*",
         "@harness/planning-files": "workspace:*",
@@ -266,6 +267,18 @@
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/workspace": "workspace:*",
+      },
+    },
+    "packages/plugins/mcp-server": {
+      "name": "@harness/mcp-server",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/core": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+      "devDependencies": {
+        "@harness/mcp-client": "workspace:*",
       },
     },
     "packages/plugins/mcp-server-registry": {
@@ -561,6 +574,8 @@
     "@harness/manage-plugin": ["@harness/manage-plugin@workspace:packages/plugins/manage-plugin"],
 
     "@harness/mcp-client": ["@harness/mcp-client@workspace:packages/plugins/mcp-client"],
+
+    "@harness/mcp-server": ["@harness/mcp-server@workspace:packages/plugins/mcp-server"],
 
     "@harness/mcp-server-registry": ["@harness/mcp-server-registry@workspace:packages/plugins/mcp-server-registry"],
 

@@ -1,0 +1,26 @@
+{
+  "name": "@harness/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP Server 插件：把 harness 工具集经 MCP 协议（Streamable HTTP）暴露给外部 MCP 客户端（VSCode Copilot Chat / Continue / Cline 等），写操作经 elicitation 二次确认（不支持则 Fail-Closed）",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/tool": "workspace:*"
+  },
+  "devDependencies": {
+    "@harness/mcp-client": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

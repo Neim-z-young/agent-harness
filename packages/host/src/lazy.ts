@@ -42,6 +42,7 @@ const BUILTIN_LAZY: Record<string, () => Promise<Record<string, unknown>>> = {
   '@harness/coordinator': () => import('@harness/coordinator'),
   '@harness/herdr': () => import('@harness/herdr'),
   '@harness/manage-plugin': () => import('@harness/manage-plugin'),
+  '@harness/mcp-server': () => import('@harness/mcp-server'),
   '@harness/mcp-server-registry': () => import('@harness/mcp-server-registry'),
   '@harness/memory': () => import('@harness/memory'),
   '@harness/planning-files': () => import('@harness/planning-files'),

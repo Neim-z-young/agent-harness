@@ -50,6 +50,7 @@
       "@harness/planning-files": ["./packages/plugins/planning-files/src"],
       "@harness/provider-anthropic": ["./packages/plugins/provider-anthropic/src"],
       "@harness/mcp-client": ["./packages/plugins/mcp-client/src"],
+      "@harness/mcp-server": ["./packages/plugins/mcp-server/src"],
       "@harness/mcp-server-registry": ["./packages/plugins/mcp-server-registry/src"],
       "@harness/computer-use": ["./packages/plugins/computer-use/src"],
       "@harness/computer-use/meta": ["./packages/plugins/computer-use/src/meta.ts"],
