@@ -1,5 +1,72 @@
 # Agent Harness 开发日志
 
+## 2026-10-05（续 248）新插件 `@harness/planning-files`：计划放盘上，每轮尾部注入
+
+### 做什么
+
+把上游 planning-with-files 的「三文件持久规划」搬成本仓插件
+（`docs/planning-files-plugin.md` 阶段一 → 二 → 三，一次性交付成可用能力）：
+
+| 文件 | 作用 |
+|---|---|
+| `src/plan-files.ts` | 纯文件模型：路径 / slug 校验 / 幂等初始化 / 三文件读写 / `parsePlan` / attestation / 人读摘要 |
+| `src/plan-block.ts` | 注入块组装（smart/full/降级）+ **签名缓存**（逐字稳定） |
+| `src/index.ts` | 装配：`core.session.preModel` 注入 + 5 个 `/plan*` 命令 + `core.harness.init` 注册 SKILL |
+| `src/templates/*.txt` | 三份外置模板（`/plan` 初始化的就是它们） |
+
+### 三个关键决策（都有理由）
+
+1. **注入走 tail、不落历史**（设计稿 D1）：`preModel` 里往 messages 尾部 push 一条 user 消息，
+   **不调 `input.save()`** —— 本轮请求用完即弃。历史前缀因此纹丝不动。
+   *可测判据*：假的 `input.save` 被调用次数必须为 0（反向验证第 1 处就打在它上面）。
+2. **逐字稳定用「签名」而不是「文本比对」**（D8）：签名 = 三文件 `name:size:mtime` 的 sha256；
+   命中就连组装都不做。收益不只是"文本相同"，还省掉每轮读盘 + 组装。
+3. **改计划不 attest ⇒ 只注入 `[PLAN TAMPERED]` 告警行、不注入正文**（D4）。纯工具模式下
+   拦不住写盘，能做的只有"区分已批准 / 未批准改动"，目的是逼出"改完重新认证"这个动作。
+
+### 与设计稿的有意偏离（1 处）
+
+**不注册 `core.session.compacting`**。上游要它是因为它在内存里攒了 progress 缓冲、压缩前不落盘就丢；
+本插件的三文件**始终在盘上**、且每轮都注入计划块 ⇒ 压缩既不会丢文件，也不会让模型失去计划可见性，
+flush 无事可做。写一个空转 hook 只会制造"看起来对齐上游"的假象。已回写设计稿 §5 阶段二。
+
+### 踩到的坑：Bun 把 `.md` 导入转成 HTML
+
+模板最初命名为 `templates/*.md` + `declare module '*.md'`，测试立刻红：
+
+```
+Expected to contain: "## Goal"
+Received: "<h1>任务计划</h1>\n<h2>Goal</h2>\n<p>（一句话写清…）</p>…"
+```
+
+**Bun 对 `.md` 的默认 loader 是 markdown→HTML**，`import tpl from './x.md'` 拿到的是 HTML 串
+（`/plan` 落盘后打开就是一堆标签）。改用 `.txt`（text loader）才行 —— 这正是 computer-use 用
+`prompts/*.txt` 的原因，当时没深究，这次被测试直接撞出来。判据写进 `src/env.d.ts` 注释。
+
+### 另一处顺手的发现：AGENTS.md 的"打包约束"已过期
+
+原文写着「`bun build --compile` 无法静态分析 `import(变量)` ⇒ 这批包不会自动进 bundle，打包配置需按
+同一清单显式收入口」—— 这是 **P3-A 之前**的描述。P3-A 已改 `BUILTIN_LAZY` 静态查表 + 双向守卫。
+已订正，并把「新增内置插件必须同步 `lazy.ts` 静态表 + `plugins.ts` 注册点」写进 §1 的登记清单
+（漏这一步的后果是"未编译时好好的、二进制启动即崩"）。
+
+### 验证
+
+- 新包 **70 pass / 0 fail**（`plan-files` 33 / `plan-block` 17 / `index` 20）
+- host 注册表守卫 **+1**（`planning-files` 真实例化 + `optIn` 不在默认装配里）
+- 主仓 `typecheck` **42 包 0 error**；全量 **2389 pass / 0 fail**（2318 → 2389，+71）
+- **反向验证 4 处全部精确变红**（每处恰好 1 条用例，还原后 `shasum -a 256 -c` 逐字一致）：
+  ① 注入后补调 `save()` ⇒ "不落历史"红；② 忽略签名命中 ⇒ "逐字复用 reused=true"红；
+  ③ `mismatch` 分支短路 ⇒ "只注入告警行"红；④ 去掉子会话判据 ⇒ "子会话默认不注入"红
+- 包加载链路：host 守卫的"表内 specifier 真 import 一遍"覆盖 `@harness/planning-files` ✓
+
+### 未做（边界写清）
+
+- **真 harness 端到端**（`createHarness` 装配后跑一轮、观察注入）**未做**：本包测试走的是
+  hook 级（真 fs + 真 plan 文件 + 按真签名调 `preModel`），插件包未声明 `@harness/core` 依赖；
+  "core 会不会调这个 hook"由 core 自己的测试保证。这个边界写在这里，免得下次被当成"验过了"。
+- 阶段四（多计划切换完整化 / catchup / gated 提示）未做。
+
 ## 2026-10-03（续 247）P3-C：分发定为 A3 + bun 路径发现
 
 ### 做什么

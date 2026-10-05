@@ -18,6 +18,11 @@
 
 - 新包必须同步在根 `tsconfig.json` 的 `paths` 与相关 `package.json` 的 `dependencies` 注册，然后 `bun install`
 
+- **内置插件包（`packages/plugins/*` 里随应用打包的那些）还要多两步**，漏一步的后果是「未编译时好好的一切正常、`bun build --compile` 出的二进制一启动就崩」：
+  1. `packages/host/src/lazy.ts` 的 `BUILTIN_LAZY` **静态查表**加一行（必须写成**字面量** `() => import('@harness/<name>')` —— 打包器只认字面量）；
+  2. `packages/host/src/plugins.ts` 的 `getBuiltinRegistry()` 里 `register` 一项。
+  两条由 `packages/host/src/builtin-registry.test.ts` 的**双向守卫**钉住（注册点集合 ↔ 表键集合，缺一个红一个），并且它会把表里每个 specifier 真 import 一遍
+
 - **`adapters/` 是例外，刻意不进 workspace**（`adapters/vscode/`：VSCode Chat Participant（P2）+ 侧栏 webview 面板（P3-B））：
 
   - 它带 `@types/vscode`，进 workspace 会污染主包的类型面与依赖树；独立 `package.json` / `tsconfig.json`（`types: ["vscode","node"]`）；**前端（`media/panel.{css,js}`）手写、不引入构建链**（否则要把该目录变成"需要打包的目录"，稀释下面这条隔离）
@@ -105,12 +110,15 @@
     **别再往 cli 补一份同能力的行为用例** —— 那正是 P0 收尾 S4 收掉的东西（搬迁期"两边各一份"
     是过渡态，不是终态）。host 拥有但**只有 cli 覆盖**的能力用例应移回 host，不是留着。
 
-  - **依赖契约**：host 的内置注册表用 `lazyImport(specifier)` 惰性引用 22 个内置插件包
-    （provider-* / tools-* / 编排类 / memory 等），这些 specifier **由消费方的依赖树解析**，
+  - **依赖契约**：host 的内置注册表用 `lazyImport(specifier)` 惰性引用内置插件包
+    （provider-* / tools-* / 编排类 / memory / planning-files 等），这些 specifier **由消费方的依赖树解析**，
     TS 侧看不见。故 host 的 `package.json` 把这份清单显式声明为 `dependencies` ——
     改这份清单时必须**同时**改代码与 `package.json`，否则运行时才炸。
-  - **打包约束**：`bun build --compile` 无法静态分析 `import(变量)` ⇒ 这批包不会自动进 bundle，
-    打包配置需按同一清单显式收入口（P3 分发路径的前置项）。
+  - **打包约束（P3-A 已收口，别再按旧写法理解）**：这批包**必须**走 `lazy.ts` 的
+    `BUILTIN_LAZY` 静态查表，**不能**写 `import(变量)` —— 打包器只认字面量，变量形式不会进
+    bundle，编译成单文件二进制后启动即 `Cannot find module '@harness/<name>' from '/$bunfs/root/…'`
+    （实测 77MB 二进制一启动就死在这条）。表外 specifier 只允许是**用户/外部插件目录的绝对路径**
+    （`file://` URL，P0.5 已证实在编译产物下可用）。新增内置插件忘同步表 ⇒ 守卫测试红。
 
   - **装配期诊断走 notice，不走裸 `stdout`**：boot 的 21 处输出按三级（`notice` / `warn` / `log`）
     结构化后经 `onNotice` 出口（`packages/host/src/notice.ts`，共 **22 枚 code**）。

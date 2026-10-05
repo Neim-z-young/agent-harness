@@ -6,8 +6,9 @@
 > 跨会话 / 压缩 / 崩溃存活**。
 
 - 参考上游：OthmanAdi/planning-with-files（MIT）
-- 本方案决策：注入方式 = **system prompt 注入**；文件位置 = **`.planning/` 目录**；工具策略 = **复用现有读写工具**
-- 状态：方案待批，尚未实施
+- 本方案决策：注入方式 = **system prompt 注入**（落地时按 §4 D1 收敛为 **tail 放置**）；文件位置 = **`.planning/` 目录**；工具策略 = **复用现有读写工具**
+- 状态：**阶段一 / 二 / 三已落地**（2026-10-05，开发日志续 248）—— `packages/plugins/planning-files/`，已登记进内置注册表（`optIn: true`）。阶段四（多计划切换完整化 / catchup / gated 提示）未做
+- 落地时与本文档的三处差异，见 §5 各阶段的"落地备注"
 
 ---
 
@@ -125,6 +126,12 @@
   - **变化检测（缓存友好，D8）**：记录 `{ lastBlockText, lastSig }`（sig = 三文件 mtime+size+hash）；本轮 sig 与上次一致 → 直接复用 `lastBlockText`（逐字相同，前缀缓存命中）；变化 → 重算注入块并更新 `lastBlockText`
 - `core.session.compacting` hook：压缩前把 `progress.md` 尾部（本轮进度）flush 到盘（PreCompact 对应，防压缩丢尾部日志）
 - 单测：注入块内容/格式、smart 裁剪、tampered 告警、**变化检测（sig 不变时注入文本逐字一致）**、tail 模式不落历史（hook 后 messages 恢复原样）
+
+**落地备注（2026-10-05）**：
+1. **不注册 `core.session.compacting`**（有意偏离）。上游要它是因为它在内存里攒了 progress 缓冲条目、压缩前不落盘就丢；本插件的三文件**始终直接在盘上**（模型用 `write_file` 写），且每轮都注入计划块 ⇒ 压缩既不会丢文件、也不会让模型失去计划可见性，flush 无事可做。写一个空转 hook 只会制造"看起来对齐了上游"的假象。
+2. **变化检测用「签名」而不是「文本比对」**：签名 = 三文件 `name:size:mtime` 的 sha256（`planSignature`）。签名命中就**连组装都不做**，直接复用上轮文本 —— 收益不只是"文本相同"，还省掉每轮的读盘与组装。判据写在 `plan-block.ts` 的 `resolveInjectedBlock`。
+3. **注入块内不含时间戳**：任何随时刻变化的字段都会让"逐字一致"这条断言变成假的（测不出真正的稳定性）。
+4. **子会话默认不注入**（`includeSubagents: true` 才注入）：一个 plan 是"这条任务线"的，不是每个侦察兵的 —— 与 memory 插件"子 Agent 不注入"同一口径。
 
 ### 阶段三：CLI 命令 + Skill 注册
 - `cli.commands` 注册：`plan`、`plan-status`、`plan-attest`、`plan-doctor`、`plan-complete`
