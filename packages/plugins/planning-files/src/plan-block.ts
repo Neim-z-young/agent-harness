@@ -17,7 +17,7 @@
 import { createHash } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
-import { PLAN_FILE_NAMES, shortHash, type AttestationVerdict, type ParsedPlan } from './plan-files'
+import { PLAN_FILE_NAMES, shortHash, unfinishedPhases, type AttestationVerdict, type ParsedPlan } from './plan-files'
 
 export const PLAN_BLOCK_BEGIN = '===BEGIN PLAN DATA==='
 export const PLAN_BLOCK_END = '===END PLAN DATA==='
@@ -99,6 +99,23 @@ function attestLine(verdict: AttestationVerdict): string {
   }
 }
 
+/**
+ * gated 行（阶段四）：还没收尾的阶段数 + 一句"别提前收工"。
+ *
+ * 上游的 gated mode 是**真的拦**（stop 事件里拒绝结束）；本插件没有 stop 级钩子，
+ * 能做的只有把"还有几个阶段没完成"摆在模型每轮都看得到的地方。既然拦不住，
+ * 提醒语就不能省 —— 只报个数字，模型完全可能读成"进度信息"而不是"别停"。
+ *
+ * 全部完成 / 尚无条目时**不出现**（那两种情况没有"未完成"可言），
+ * 这条也保证了 complete 之后注入文本依然逐字稳定。
+ */
+function gatedLine(parsed: ParsedPlan): string | undefined {
+  const pending = unfinishedPhases(parsed)
+  if (pending.length === 0) return undefined
+  const names = pending.map((p) => (p.index === 0 ? p.title : `Phase ${p.index}`)).join('、')
+  return `未完成阶段: ${pending.length} 个（${names}），勿提前宣布完成`
+}
+
 /** 篡改块：**只注入告警行，不注入计划正文**（设计稿 D4） */
 function tamperedBlock(opts: PlanBlockOptions, verdict: AttestationVerdict): string {
   return [
@@ -133,6 +150,8 @@ export function buildPlanBlock(input: PlanBlockInput): string | undefined {
   head.push(currentPhaseLine(parsed))
   if (parsed.nextStep !== undefined && parsed.nextStep !== '') head.push(`下一步: ${clip(parsed.nextStep, 200)}`)
   head.push(progressLine(parsed))
+  const gate = gatedLine(parsed)
+  if (gate !== undefined) head.push(gate)
   head.push(attestLine(verdict))
 
   const tail: string[] = [PLAN_BLOCK_END]
@@ -157,14 +176,19 @@ export function buildPlanBlock(input: PlanBlockInput): string | undefined {
   let text = [...head, ...tail].join('\n')
   if (text.length <= maxChars) return text
 
-  // 逐级降级：目标 → 下一步 → 认证行，最后只剩"计划路径 + 当前阶段"
+  // 逐级降级：gated 行 → 认证行 → 目标 → 下一步，最后只剩"计划路径 + 当前阶段"
+  //
+  // 顺序即优先级，**最不重要的先掉**：
+  // - gated 行是"额外提醒"（阶段四加的），认证行是状态说明 —— 两者掉了都不影响"计划是什么"；
+  // - 目标 / 下一步 是 smart 策略的核心（治 goal drift，设计稿 D5），必须撑到最后一刻。
+  // 反过来排（先砍目标）会让"预算紧张时模型看不到目标"—— 那恰好把 smart 策略的意义砍掉了。
   const minimal: string[] = [PLAN_BLOCK_BEGIN, `计划: ${options.planPath}`, currentPhaseLine(parsed), PLAN_BLOCK_END]
   if (minimal.join('\n').length <= maxChars) {
-    // 砍掉最长的可选行（目标 / 下一步）后仍超 ⇒ 只留最小块
-    const withoutGoal = head.filter((l) => !l.startsWith('目标: '))
+    const withoutGate = head.filter((l) => !l.startsWith('未完成阶段: '))
+    const withoutAttest = withoutGate.filter((l) => !l.startsWith('认证: '))
+    const withoutGoal = withoutAttest.filter((l) => !l.startsWith('目标: '))
     const withoutNext = withoutGoal.filter((l) => !l.startsWith('下一步: '))
-    const withoutAttest = withoutNext.filter((l) => !l.startsWith('认证: '))
-    for (const candidate of [withoutGoal, withoutNext, withoutAttest]) {
+    for (const candidate of [withoutGate, withoutAttest, withoutGoal, withoutNext]) {
       text = [...candidate, ...tail].join('\n')
       if (text.length <= maxChars) return text
     }

@@ -8,25 +8,32 @@ import {
   PLAN_DIR_NAME,
   PLAN_FILE_NAMES,
   attestPlan,
+  detectProgressRegression,
   displayPlanPath,
   ensurePlanFiles,
   hashPlan,
   isValidPlanSlug,
+  listPlans,
   parsePlan,
   planFileStatus,
   planInitialized,
   readActivePlan,
   readAttestation,
   readPlanFiles,
+  renderPlanList,
   renderPlanSummary,
   replaceGoal,
   resolvePlanDir,
   resolvePlanRoot,
   setActivePlan,
   shortHash,
+  unfinishedPhases,
   verifyAttestation,
   writePlanFile,
 } from './plan-files'
+
+/** 1/2 完成的计划（进度快照测试的基准） */
+const PLAN_ONE_OF_TWO = '## Phase 1: a\n- [x] x\n- [ ] y\n'
 
 const dirs: string[] = []
 function tmp(): string {
@@ -307,5 +314,110 @@ describe('展示工具', () => {
 
   it('PLAN_DIR_NAME 是 .planning', () => {
     expect(PLAN_DIR_NAME).toBe('.planning')
+  })
+})
+
+describe('多计划：listPlans（阶段四）', () => {
+  it('目录不存在 ⇒ 空列表（不抛）', () => {
+    expect(listPlans(resolvePlanDir(tmp()))).toEqual([])
+  })
+
+  it('空 .planning/ ⇒ 空列表（不要把"没有任何计划"渲染成一条 0/0）', () => {
+    const dir = resolvePlanDir(tmp())
+    mkdirSync(dir, { recursive: true })
+    expect(listPlans(dir)).toEqual([])
+  })
+
+  it('默认计划已初始化 ⇒ 一条「（默认）」且 active', () => {
+    const dir = resolvePlanDir(tmp())
+    writePlanFile(dir, 'task_plan.md', PLAN_ONE_OF_TWO)
+    const list = listPlans(dir)
+    expect(list).toHaveLength(1)
+    expect(list[0]!.label).toBe('（默认）')
+    expect(list[0]!.slug).toBeUndefined()
+    expect(list[0]!.active).toBe(true)
+    expect(list[0]!.initialized).toBe(true)
+    expect(list[0]!.doneCount).toBe(1)
+    expect(list[0]!.totalCount).toBe(2)
+  })
+
+  it('子目录计划被列出；.active_plan 指向它时只有它 active', () => {
+    const dir = resolvePlanDir(tmp())
+    writePlanFile(dir, 'task_plan.md', PLAN_ONE_OF_TWO)
+    writePlanFile(join(dir, 'task-b'), 'task_plan.md', '## Phase 1: b\n- [ ] x\n')
+    setActivePlan(dir, 'task-b')
+    const list = listPlans(dir)
+    expect(list.map((l) => l.label)).toEqual(['（默认）', 'task-b'])
+    expect(list[0]!.active).toBe(false)
+    expect(list[1]!.active).toBe(true)
+    expect(list[1]!.totalCount).toBe(1)
+  })
+
+  it('非目录 / 非法 slug 名不进列表；顺序强制确定（根在前、slug 升序）', () => {
+    const dir = resolvePlanDir(tmp())
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'not-a-plan.md'), 'x', 'utf8') // 文件，跳过
+    mkdirSync(join(dir, 'zeta'), { recursive: true })
+    mkdirSync(join(dir, 'alpha'), { recursive: true })
+    mkdirSync(join(dir, 'bad slug'), { recursive: true }) // 含空格 ⇒ 非法
+    const list = listPlans(dir)
+    expect(list.map((l) => l.label)).toEqual(['alpha', 'zeta'])
+    expect(list[1]!.initialized).toBe(false)
+    expect(list[1]!.doneCount).toBe(0)
+  })
+
+  it('renderPlanList：▶ 标活动；空列表给可执行提示', () => {
+    expect(renderPlanList([])).toContain('尚无任何计划')
+    const dir = resolvePlanDir(tmp())
+    writePlanFile(dir, 'task_plan.md', PLAN_ONE_OF_TWO)
+    writePlanFile(join(dir, 'task-b'), 'task_plan.md', '## Phase 1: b\n- [x] x\n')
+    setActivePlan(dir, 'task-b')
+    const rendered = renderPlanList(listPlans(dir))
+    expect(rendered).toContain('  （默认）（1/2）')
+    expect(rendered).toContain('▶ task-b（1/1）')
+  })
+})
+
+describe('进度快照与回退检测（阶段四：并行写守卫降级版）', () => {
+  it('attest 记下当时的已完成条目数，verdict 带出来', () => {
+    const root = resolvePlanDir(tmp())
+    writePlanFile(root, 'task_plan.md', PLAN_ONE_OF_TWO)
+    const rec = attestPlan(root)
+    expect(rec.checked).toBe(1)
+    expect(readAttestation(root)?.checked).toBe(1)
+    expect(verifyAttestation(root).approvedChecked).toBe(1)
+  })
+
+  it('旧记录（没有 checked 字段）读作未知，**不当成**下降了', () => {
+    const root = resolvePlanDir(tmp())
+    writePlanFile(root, 'task_plan.md', PLAN_ONE_OF_TWO)
+    writeFileSync(join(root, ATTEST_FILE_NAME), JSON.stringify({ hash: hashPlan(root), at: 0 }), 'utf8')
+    const v = verifyAttestation(root)
+    expect(v.status).toBe('ok')
+    expect(v.approvedChecked).toBeUndefined()
+    expect(detectProgressRegression(parsePlan(PLAN_ONE_OF_TWO), v)).toBeUndefined()
+  })
+
+  it('完成数下降 ⇒ 报回退（含少掉的条数）；持平 / 上升 / 未认证 ⇒ 不报', () => {
+    const root = resolvePlanDir(tmp())
+    writePlanFile(root, 'task_plan.md', PLAN_ONE_OF_TWO)
+    const v = verifyAttestation(root) // 未认证
+    expect(detectProgressRegression(parsePlan(PLAN_ONE_OF_TWO), v)).toBeUndefined()
+
+    attestPlan(root) // 快照 = 1
+    expect(detectProgressRegression(parsePlan(PLAN_ONE_OF_TWO), verifyAttestation(root))).toBeUndefined()
+
+    const reg = detectProgressRegression(parsePlan('## Phase 1: a\n- [ ] x\n- [ ] y\n'), verifyAttestation(root))
+    expect(reg).toEqual({ approvedChecked: 1, currentChecked: 0, dropped: 1 })
+
+    const up = detectProgressRegression(parsePlan('## Phase 1: a\n- [x] x\n- [x] y\n'), verifyAttestation(root))
+    expect(up).toBeUndefined()
+  })
+
+  it('unfinishedPhases：只算"有条目且没做完"的阶段（空阶段不算）', () => {
+    const parsed = parsePlan(
+      ['## Phase 1: done', '- [x] a', '', '## Phase 2: doing', '- [ ] b', '', '## Phase 3: empty', ''].join('\n'),
+    )
+    expect(unfinishedPhases(parsed).map((p) => p.index)).toEqual([2])
   })
 })

@@ -24,7 +24,7 @@
  */
 
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 // 模板外置为 `.txt`（**不是 `.md`**：Bun 会把 .md 转成 HTML，见 env.d.ts 的说明）
 import findingsTemplate from './templates/findings.txt'
@@ -107,6 +107,67 @@ export function displayPlanPath(cwd: string, abs: string): string {
   return abs.startsWith(`${root}/`) ? abs.slice(root.length + 1) : abs
 }
 
+/** 一条多计划条目（`/plan list` / `/plan use` 无参时展示） */
+export interface PlanListing {
+  /** 计划名；`undefined` = `.planning/` 根上的默认计划 */
+  slug?: string
+  /** 展示标签（slug 或「（默认）」） */
+  label: string
+  /** 是否当前 `.active_plan` 指向的那一个 */
+  active: boolean
+  /** task_plan.md 是否存在 */
+  initialized: boolean
+  doneCount: number
+  totalCount: number
+}
+
+/**
+ * 列出 `.planning/` 下的所有计划：根上的默认计划（若已初始化）+ 每个合法 slug 子目录。
+ *
+ * 两个刻意的口径：
+ * - **根计划只在已初始化时列出** —— 没写过计划的空 `.planning/` 不该在列表里占一行"0/0"。
+ *   子目录只要存在就列（它的存在本身就是"这里有个计划"的声明）。
+ * - **排序强制确定**：先根、再按 slug 升序。`readdirSync` 的返回顺序由文件系统决定，
+ *   而这份列表要出现在命令输出里（会被人对着念），两次运行顺序不同就是 bug。
+ */
+export function listPlans(dir: string): PlanListing[] {
+  if (!existsSync(dir)) return []
+  const active = readActivePlan(dir)
+  const one = (slug: string | undefined, root: string): PlanListing => {
+    const initialized = planInitialized(root)
+    const parsed = parsePlan(readTaskPlan(root))
+    return {
+      ...(slug === undefined ? {} : { slug }),
+      label: slug ?? '（默认）',
+      active: slug === active,
+      initialized,
+      doneCount: initialized ? parsed.doneCount : 0,
+      totalCount: initialized ? parsed.totalCount : 0,
+    }
+  }
+  const out: PlanListing[] = []
+  if (planInitialized(dir)) out.push(one(undefined, dir))
+  let names: string[] = []
+  try {
+    names = readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory() && isValidPlanSlug(e.name))
+      .map((e) => e.name)
+  } catch {
+    names = []
+  }
+  names.sort()
+  for (const name of names) out.push(one(name, join(dir, name)))
+  return out
+}
+
+/** 多计划列表的人读输出 */
+export function renderPlanList(listings: PlanListing[]): string {
+  if (listings.length === 0) return '尚无任何计划 —— 运行 /plan <目标> 新建。'
+  return listings
+    .map((l) => `${l.active ? '▶' : ' '} ${l.label}（${l.initialized ? `${l.doneCount}/${l.totalCount}` : '未初始化'}）`)
+    .join('\n')
+}
+
 // ---------------------------------------------------------------- 读写
 
 /** 原子写：同目录临时文件 + rename（避免半截文件被下一轮注入读到） */
@@ -161,6 +222,16 @@ export function readPlanFiles(root: string): Record<PlanFileName, string> {
     }
   }
   return out
+}
+
+/** 单读 task_plan.md（缺失 / 读取失败 ⇒ 空串 —— 认证与解析路径都不该因此抛错） */
+export function readTaskPlan(root: string): string {
+  try {
+    const p = join(root, 'task_plan.md')
+    return existsSync(p) ? readFileSync(p, 'utf8') : ''
+  } catch {
+    return ''
+  }
 }
 
 /** 原子写单个计划文件（供命令用；模型改文件走 write_file，不经过这里） */
@@ -365,24 +436,33 @@ export interface AttestRecord {
   hash: string
   /** 认证时刻（ms） */
   at: number
+  /**
+   * 认证时刻 task_plan.md 的**已完成条目数**（进度快照）。
+   *
+   * 用途：并行写守卫的降级版（设计稿 D6 / 阶段四）。纯工具模式下拦不住写盘，
+   * 但"完成项数从 5 掉回 3"是并发会话互相覆盖的**方向性**信号 —— 哈希不匹配只说
+   * "被改过"，说不清是推进还是回退。
+   *
+   * 旧记录（本字段引入前写的 `.attest.json`）没有它 ⇒ `undefined`，此时**不提示**：
+   * 把"没有记录"读成"下降了"会让每个老计划开局就误报。
+   */
+  checked?: number
 }
 
 /** task_plan.md 的 sha256（文件缺失 ⇒ 对空串取哈希，不抛错） */
 export function hashPlan(root: string): string {
-  let content = ''
-  try {
-    const p = join(root, 'task_plan.md')
-    if (existsSync(p)) content = readFileSync(p, 'utf8')
-  } catch {
-    content = ''
-  }
-  return createHash('sha256').update(content, 'utf8').digest('hex')
+  return createHash('sha256').update(readTaskPlan(root), 'utf8').digest('hex')
 }
 
-/** 锁定当前 hash（`/plan-attest`） */
+/** 锁定当前 hash（`/plan-attest`）；同时记下进度快照供回退检测用 */
 export function attestPlan(root: string, at: number = Date.now()): AttestRecord {
   mkdirSync(root, { recursive: true })
-  const rec: AttestRecord = { file: 'task_plan.md', hash: hashPlan(root), at }
+  const rec: AttestRecord = {
+    file: 'task_plan.md',
+    hash: hashPlan(root),
+    at,
+    checked: parsePlan(readTaskPlan(root)).doneCount,
+  }
   atomicWrite(join(root, ATTEST_FILE_NAME), `${JSON.stringify(rec, null, 2)}\n`)
   return rec
 }
@@ -394,7 +474,12 @@ export function readAttestation(root: string): AttestRecord | undefined {
   try {
     const raw = JSON.parse(readFileSync(p, 'utf8')) as Partial<AttestRecord>
     if (typeof raw.hash !== 'string' || raw.hash === '') return undefined
-    return { file: 'task_plan.md', hash: raw.hash, at: typeof raw.at === 'number' ? raw.at : 0 }
+    return {
+      file: 'task_plan.md',
+      hash: raw.hash,
+      at: typeof raw.at === 'number' ? raw.at : 0,
+      ...(typeof raw.checked === 'number' ? { checked: raw.checked } : {}),
+    }
   } catch {
     return undefined
   }
@@ -407,6 +492,8 @@ export interface AttestationVerdict {
   /** 已认证的哈希（missing 时 undefined） */
   approved?: string
   current: string
+  /** 认证时刻的已完成条目数（未认证 / 旧记录 ⇒ undefined） */
+  approvedChecked?: number
 }
 
 /**
@@ -420,7 +507,36 @@ export function verifyAttestation(root: string): AttestationVerdict {
   const current = hashPlan(root)
   const rec = readAttestation(root)
   if (rec === undefined) return { status: 'missing', current }
-  return rec.hash === current ? { status: 'ok', approved: rec.hash, current } : { status: 'mismatch', approved: rec.hash, current }
+  const checked = rec.checked === undefined ? {} : { approvedChecked: rec.checked }
+  return rec.hash === current
+    ? { status: 'ok', approved: rec.hash, current, ...checked }
+    : { status: 'mismatch', approved: rec.hash, current, ...checked }
+}
+
+/** 进度回退（已认证快照 → 当前完成数下降） */
+export interface ProgressRegression {
+  approvedChecked: number
+  currentChecked: number
+  /** 少掉的条目数 */
+  dropped: number
+}
+
+/**
+ * 并行写守卫（降级版，设计稿 D6 / 阶段四）：完成项数是否**下降**。
+ *
+ * 触发条件同时满足：① 认证记录里带进度快照；② 当前完成数 **严格小于** 快照。
+ * 未认证、旧记录无快照、或只是"又完成了几条"一律不触发 —— 这条判断的价值全在
+ * "只报方向性异常"，报多了就没人看。
+ */
+export function detectProgressRegression(parsed: ParsedPlan, verdict: AttestationVerdict): ProgressRegression | undefined {
+  const approved = verdict.approvedChecked
+  if (approved === undefined || parsed.doneCount >= approved) return undefined
+  return { approvedChecked: approved, currentChecked: parsed.doneCount, dropped: approved - parsed.doneCount }
+}
+
+/** 还有未完成项的阶段（gated 提示用）。空阶段（0 条）不算"未完成" */
+export function unfinishedPhases(parsed: ParsedPlan): PlanPhase[] {
+  return parsed.phases.filter((p) => p.totalCount > 0 && p.doneCount < p.totalCount)
 }
 
 /** 短哈希（展示用）：`sha256:abcd1234…` */

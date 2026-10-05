@@ -1,10 +1,10 @@
 import { describe, it, expect, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliCommandInput, CliCommandsInput, Hooks, PluginContext } from '@harness/plugin'
 import { createPlanningFilesPlugin, parsePlanArgs, planningFilesSkillContent } from './index'
-import { attestPlan, ensurePlanFiles, resolvePlanDir, writePlanFile } from './plan-files'
+import { attestPlan, ensurePlanFiles, readPlanFiles, resolvePlanDir, resolvePlanRoot, setActivePlan, writePlanFile } from './plan-files'
 
 const dirs: string[] = []
 function tmp(): string {
@@ -71,12 +71,34 @@ async function install(opts: Parameters<typeof createPlanningFilesPlugin>[0] = {
   return hooks
 }
 
+/** 往 `fakeCtx` 约定的 dataDir（`<cwd>/.harness`）里放一个会话文件（供 /plan-catchup 用） */
+function writeSession(cwd: string, sessionId: string, turns: Array<{ role: string; text: string }>, title = '会话标题'): void {
+  const dir = join(cwd, '.harness', 'sessions')
+  mkdirSync(dir, { recursive: true })
+  const messages = turns.map((t) => ({ role: t.role, parts: [{ type: 'text', text: t.text }] }))
+  writeFileSync(join(dir, `${sessionId}.json`), JSON.stringify({ title, messages }), 'utf8')
+}
+
 describe('parsePlanArgs', () => {
   it('解析 --use / flag / 剩余文本', () => {
     expect(parsePlanArgs('/plan 把 A 做完 --force')).toEqual({ flags: ['force'], text: '把 A 做完' })
     expect(parsePlanArgs('/plan --use task-b')).toEqual({ flags: [], use: 'task-b', text: '' })
+    // 原始行里没有 shell 拆词 ⇒ 引号原样进来，必须归一成空串（否则会当成非法 slug 抛错）
+    expect(parsePlanArgs('/plan --use ""')).toEqual({ flags: [], use: '', text: '' })
+    expect(parsePlanArgs("/plan --use ''")).toEqual({ flags: [], use: '', text: '' })
     expect(parsePlanArgs('/plan-attest --clear')).toEqual({ flags: ['clear'], text: '' })
     expect(parsePlanArgs('/plan')).toEqual({ flags: [], text: '' })
+  })
+
+  it('子动作只在**首个** token 上识别：`use` 出现在目标文本里不算子动作', () => {
+    expect(parsePlanArgs('/plan use task-b')).toEqual({ flags: [], use: 'task-b', text: '', sub: 'use' })
+    expect(parsePlanArgs('/plan use')).toEqual({ flags: [], text: '', sub: 'use' })
+    expect(parsePlanArgs('/plan use ""')).toEqual({ flags: [], use: '', text: '', sub: 'use' })
+    expect(parsePlanArgs('/plan list')).toEqual({ flags: [], text: '', sub: 'list' })
+    expect(parsePlanArgs('/plan catchup')).toEqual({ flags: [], text: '', sub: 'catchup' })
+    // 关键边界：目标文本里的 use / list 不该被当成子动作吃掉
+    expect(parsePlanArgs('/plan 把 use 命令做完')).toEqual({ flags: [], text: '把 use 命令做完' })
+    expect(parsePlanArgs('/plan 整理 list 输出')).toEqual({ flags: [], text: '整理 list 输出' })
   })
 })
 
@@ -104,6 +126,7 @@ describe('preModel 注入', () => {
     expect(messages[1]!.role).toBe('user')
     expect(messages[1]!.parts[0]!.text).toContain('===BEGIN PLAN DATA===')
     expect(messages[1]!.parts[0]!.text).toContain('下一步: b')
+    expect(messages[1]!.parts[0]!.text).toContain('未完成阶段: 1 个（Phase 1）')
     expect(saves).toHaveLength(0)
   })
 
@@ -173,27 +196,35 @@ describe('preModel 注入', () => {
   })
 })
 
-describe('cli.commands / cli.command', () => {
-  function run(hooks: Hooks, raw: string): string {
-    let text = ''
-    const input = {
-      raw,
-      command: raw.split(/\s+/)[0]!.replace(/^\//, ''),
-      arg: raw.split(/\s+/).slice(1).join(' '),
-      out: (t: string) => {
-        text += t
-      },
-      sessionId: 's1',
-    } as unknown as CliCommandInput
-    hooks['cli.command']!(input)
-    return text
-  }
+/** 跑一条 `/plan*` 命令并收集输出（模块级：多个 describe 共用） */
+function run(hooks: Hooks, raw: string): string {
+  let text = ''
+  const input = {
+    raw,
+    command: raw.split(/\s+/)[0]!.replace(/^\//, ''),
+    arg: raw.split(/\s+/).slice(1).join(' '),
+    out: (t: string) => {
+      text += t
+    },
+    sessionId: 's1',
+  } as unknown as CliCommandInput
+  hooks['cli.command']!(input)
+  return text
+}
 
-  it('注册 5 个命令且带用法', async () => {
+describe('cli.commands / cli.command', () => {
+  it('注册 6 个命令且带用法', async () => {
     const hooks = await install({ cwd: tmp() })
     const cmds: CliCommandsInput = { commands: [] }
     hooks['cli.commands']!(cmds)
-    expect(cmds.commands.map((c) => c.command)).toEqual(['plan', 'plan-status', 'plan-attest', 'plan-doctor', 'plan-complete'])
+    expect(cmds.commands.map((c) => c.command)).toEqual([
+      'plan',
+      'plan-status',
+      'plan-attest',
+      'plan-doctor',
+      'plan-catchup',
+      'plan-complete',
+    ])
     expect(cmds.commands.every((c) => typeof c.usage === 'string' && c.usage.length > 0)).toBe(true)
   })
 
@@ -272,9 +303,12 @@ describe('cli.commands / cli.command', () => {
     const hooks = await install({ cwd })
     const partial = run(hooks, '/plan-complete')
     expect(partial).toContain('完成度：1/2')
+    expect(partial).toContain('未完成阶段 1 个')
     expect(partial).toContain('- [ ] b')
     writePlanFile(root, 'task_plan.md', '## Phase 1: 甲\n- [x] a\n- [x] b\n')
-    expect(run(hooks, '/plan-complete')).toContain('全部条目已完成')
+    const done = run(hooks, '/plan-complete')
+    expect(done).toContain('全部条目已完成')
+    expect(done).toContain('未完成阶段 0 个')
   })
 
   it('命令异常被兜住（输出错误而不是抛穿）', async () => {
@@ -283,6 +317,163 @@ describe('cli.commands / cli.command', () => {
     const hooks = await install({ cwd })
     // --use 传非法 slug ⇒ setActivePlan 抛错 ⇒ 命令层捕获
     expect(run(hooks, '/plan --use ../evil')).toContain('命令失败')
+  })
+})
+
+describe('阶段四：多计划', () => {
+  it('/plan use <名> 切到不存在的计划 ⇒ 用模板建起来（不报"没有这个计划"）', async () => {
+    const cwd = tmp()
+    const hooks = await install({ cwd })
+    const out = run(hooks, '/plan use task-b')
+    expect(out).toContain('已切换到计划 task-b')
+    expect(out).toContain('新建 3 个文件')
+    expect(readPlanFiles(join(resolvePlanDir(cwd), 'task-b'))['task_plan.md']).toContain('#')
+  })
+
+  it('/plan use 落到已有计划 ⇒ 报「已存在」不覆盖', async () => {
+    const cwd = tmp()
+    const dir = resolvePlanDir(cwd)
+    writePlanFile(join(dir, 'task-b'), 'task_plan.md', '## Phase 1: b\n- [x] x\n')
+    const hooks = await install({ cwd })
+    const out = run(hooks, '/plan use task-b')
+    expect(out).toContain('已存在 3 个文件')
+    expect(out).toContain('1/1 条完成')
+  })
+
+  it('/plan use "" 回落默认计划', async () => {
+    const cwd = tmp()
+    const dir = resolvePlanDir(cwd)
+    ensurePlanFiles(dir)
+    setActivePlan(dir, 'task-b')
+    const hooks = await install({ cwd })
+    expect(run(hooks, '/plan use ""')).toContain('已回落到默认计划')
+    expect(run(hooks, '/plan list')).toContain('▶ （默认）')
+  })
+
+  it('/plan use 无参只展示、**不改状态**（误敲不该清掉活动计划）', async () => {
+    const cwd = tmp()
+    const dir = resolvePlanDir(cwd)
+    ensurePlanFiles(dir)
+    writePlanFile(join(dir, 'task-b'), 'task_plan.md', '## Phase 1: b\n- [ ] x\n')
+    setActivePlan(dir, 'task-b')
+    const hooks = await install({ cwd })
+    const out = run(hooks, '/plan use')
+    expect(out).toContain('当前活动计划：task-b')
+    expect(out).toContain('▶ task-b')
+    expect(run(hooks, '/plan use')).toContain('当前活动计划：task-b') // 仍是 task-b
+  })
+
+  it('/plan list 空计划目录给可执行提示', async () => {
+    const hooks = await install({ cwd: tmp() })
+    expect(run(hooks, '/plan list')).toContain('尚无任何计划')
+  })
+
+  it('切换后注入与状态都读新计划（resolvePlanRoot 生效）', async () => {
+    const cwd = tmp()
+    const dir = resolvePlanDir(cwd)
+    writePlanFile(dir, 'task_plan.md', PLAN_MD)
+    writePlanFile(join(dir, 'task-b'), 'task_plan.md', '## Phase 1: b\n- [ ] 只属于 task-b\n')
+    const hooks = await install({ cwd })
+    expect(run(hooks, '/plan-status')).toContain('下一步：b')
+
+    run(hooks, '/plan use task-b')
+    expect(resolvePlanRoot(dir)).toBe(join(dir, 'task-b'))
+    expect(run(hooks, '/plan-status')).toContain('下一步：只属于 task-b')
+    expect(run(hooks, '/plan-status')).toContain('活动计划：task-b')
+  })
+})
+
+describe('阶段四：进度回退（并行写守卫降级版）', () => {
+  it('认证后完成项被改回未完成 ⇒ /plan-status 报回退', async () => {
+    const cwd = tmp()
+    const root = resolvePlanDir(cwd)
+    writePlanFile(root, 'task_plan.md', '## Phase 1: a\n- [x] x\n- [x] y\n')
+    attestPlan(root) // 快照 = 2
+    writePlanFile(root, 'task_plan.md', '## Phase 1: a\n- [x] x\n- [ ] y\n') // 掉回 1
+    const hooks = await install({ cwd })
+    const out = run(hooks, '/plan-status')
+    expect(out).toContain('进度回退')
+    expect(out).toContain('少 1 条')
+  })
+
+  it('正常推进（完成数上升）不报回退', async () => {
+    const cwd = tmp()
+    const root = resolvePlanDir(cwd)
+    writePlanFile(root, 'task_plan.md', '## Phase 1: a\n- [x] x\n- [ ] y\n')
+    attestPlan(root) // 快照 = 1
+    writePlanFile(root, 'task_plan.md', '## Phase 1: a\n- [x] x\n- [x] y\n') // 升到 2
+    const hooks = await install({ cwd })
+    expect(run(hooks, '/plan-status')).not.toContain('进度回退')
+  })
+
+  it('/plan-doctor 带出多计划 / 进度守卫 / catchup 三行', async () => {
+    const cwd = tmp()
+    const root = resolvePlanDir(cwd)
+    ensurePlanFiles(root)
+    writePlanFile(root, 'task_plan.md', PLAN_MD)
+    attestPlan(root)
+    const hooks = await install({ cwd })
+    const out = run(hooks, '/plan-doctor')
+    expect(out).toContain('多计划：默认计划（共 1 个')
+    expect(out).toContain('进度守卫：✅ 无回退')
+    expect(out).toContain('catchup：（本会话尚未 /plan-catchup）')
+  })
+})
+
+describe('阶段四：catchup', () => {
+  it('/plan-catchup 把本会话轮次写进 progress.md（保留原文、带 marker）', async () => {
+    const cwd = tmp()
+    const root = resolvePlanDir(cwd)
+    ensurePlanFiles(root)
+    writeSession(cwd, 's1', [
+      { role: 'user', text: '做 A' },
+      { role: 'assistant', text: 'A 做完了' },
+    ])
+    const hooks = await install({ cwd })
+    const out = run(hooks, '/plan-catchup')
+    expect(out).toContain('已把 2 轮汇总进 progress.md')
+    const progress = readPlanFiles(root)['progress.md']
+    expect(progress).toContain('<!-- plan-catchup:s1 -->')
+    expect(progress).toContain('- 用户：做 A')
+    expect(progress).toContain('- 助手：A 做完了')
+    expect(progress).toContain('会话标题')
+  })
+
+  it('同一会话再跑一次 ⇒ 跳过，progress.md 不再增长（追加式文件不能写两份）', async () => {
+    const cwd = tmp()
+    const root = resolvePlanDir(cwd)
+    ensurePlanFiles(root)
+    writeSession(cwd, 's1', [{ role: 'user', text: '做 A' }])
+    const hooks = await install({ cwd })
+    run(hooks, '/plan-catchup')
+    const first = readPlanFiles(root)['progress.md']
+    expect(run(hooks, '/plan-catchup')).toContain('已 catchup 过，跳过')
+    expect(readPlanFiles(root)['progress.md']).toBe(first)
+  })
+
+  it('会话文件不存在 ⇒ 明确提示（不写空节）', async () => {
+    const cwd = tmp()
+    const root = resolvePlanDir(cwd)
+    ensurePlanFiles(root)
+    const before = readPlanFiles(root)['progress.md']
+    const hooks = await install({ cwd })
+    expect(run(hooks, '/plan-catchup')).toContain('找不到会话文件')
+    expect(readPlanFiles(root)['progress.md']).toBe(before)
+  })
+
+  it('尚无计划 ⇒ 提示先 /plan（不建文件）', async () => {
+    const hooks = await install({ cwd: tmp() })
+    expect(run(hooks, '/plan-catchup')).toContain('尚无计划')
+  })
+
+  it('宿主未提供 dataDir ⇒ 明确报"无法定位"，不猜路径', async () => {
+    const cwd = tmp()
+    ensurePlanFiles(resolvePlanDir(cwd))
+    const plugin = createPlanningFilesPlugin({ cwd })
+    const { ctx } = fakeCtx(cwd)
+    const bare = { ...ctx, workspace: { cwd } } as unknown as PluginContext // 无 dataDir
+    const hooks = (await plugin.install!(bare)) as Hooks
+    expect(run(hooks, '/plan-catchup')).toContain('未提供 dataDir')
   })
 })
 

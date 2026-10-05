@@ -205,3 +205,36 @@ describe('planSignature / resolveInjectedBlock：逐字稳定（D8）', () => {
     expect(cache.block).toBeUndefined()
   })
 })
+
+describe('gated 行（阶段四）', () => {
+  it('还有未完成阶段 ⇒ 注入一行阶段数 + 勿提前收工的提醒', () => {
+    const text = buildPlanBlock({ parsed: parsePlan(MD), verdict: ok(), options: option() })!
+    expect(text).toContain('未完成阶段: 2 个（Phase 1、Phase 2），勿提前宣布完成')
+  })
+
+  it('全部完成 ⇒ 不出现（没有"未完成"可言，也保证 complete 后文本稳定）', () => {
+    const parsed = parsePlan('## Phase 1: x\n- [x] a\n')
+    const text = buildPlanBlock({ parsed, verdict: ok(), options: option() })!
+    expect(text).not.toContain('未完成阶段')
+  })
+
+  it('尚无条目 ⇒ 不出现（空计划不是"有阶段没做完"）', () => {
+    const parsed = parsePlan('# T\n\n## Goal\n\n做点事\n')
+    const text = buildPlanBlock({ parsed, verdict: ok(), options: option() })!
+    expect(text).not.toContain('未完成阶段')
+  })
+
+  it('full 模式也带 gated 行', () => {
+    const text = buildPlanBlock({ parsed: parsePlan(MD), verdict: ok(), options: option('full') })!
+    expect(text).toContain('未完成阶段:')
+    expect(text).toContain('阶段明细')
+  })
+
+  it('降级顺序：预算不够时先掉 gated 行，目标 / 下一步留在里面', () => {
+    const text = buildPlanBlock({ parsed: parsePlan(MD), verdict: ok(), options: option('smart', 140) })!
+    expect(text).not.toContain('未完成阶段')
+    expect(text).toContain('目标: 把 A 做成 B')
+    expect(text).toContain('下一步: 写结论')
+    expect(text).toContain('当前阶段:')
+  })
+})
