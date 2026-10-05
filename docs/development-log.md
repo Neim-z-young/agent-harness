@@ -1,5 +1,75 @@
 # Agent Harness 开发日志
 
+## 2026-10-05（续 250）`UsageStats` 的 provider 维度：按实例路由键切分用量
+
+### 做什么
+
+`remaining-work-plan.md` §2-C（「格式变更，需独立决策」）落地：用量统计多一个**端点维度**。
+
+| 文件 | 改动 |
+|---|---|
+| `packages/usage/src/index.ts` | 新增 `ProviderUsage` / `UsageStats.providers[]` / `CallRecord.provider` / `normalizeUsage` / `providerUsageRow`；`emptyUsage` / `recordCall` / `mergeUsage` / `usageSince` / `foldMessage` / `usageFromMeta` / `renderStatsText` / 两个导出同步 |
+| `packages/core/src/index.ts` | assistant 消息 meta 与 `model` 同位写 `providerId` |
+| `packages/session/src/index.ts` | `Message.meta.providerId?: string` 显式声明（此前只有索引签名兜着） |
+| `packages/cli/src/tui.tsx` | 统计侧栏新增「Provider」小节（排在「模型」之前） |
+| 三个测试文件 | usage +11 / core +3 / cli 断言扩 2 行 |
+
+### 四个决策
+
+1. **维度键用实例路由键（`ProviderConfig.id`），不是 provider 类型**。成本归因的轴是**端点**：
+   同一类型挂两个 key（两个 API key / 两个 baseUrl）就是两份账单，按类型分会让它们合成一行。
+   而且 `providerId` 已是 `core.llm.usage` 事件、`ProviderInstanceInfo.id`、`ProviderConfig.id`
+   的统一词汇，展示层不必再做一次映射。
+2. **数据来源必须是 assistant 消息的 `meta.providerId`（与 `model` 同位），不能只写累加器**。
+   `foldMessage` 是**增量折叠**与**全量自愈重建**的唯一同口径入口（`rebuildUsage` 就是逐条调它）。
+   provider 若只落在 `meta.usageStats`，自愈那一刻（触发条件恰恰是"消息被外部改过"）会把整个维度
+   丢掉 —— 症状是"用量统计跳了一下"，与 `foldMessage` 注释里警告的分叉是同一个坑。
+3. **`'default'` 哨兵原样写进 meta，与 `core.llm.usage` 事件的"省略"规则相反**。事件载荷省略它，
+   是因为那 feed 的是"每个端点的缓存视图"，凑一个不存在的端点会污染画面；统计需要一个
+   **全覆盖分区键** —— 省略会让"确定走默认端点"（`'default'`）和"旧会话根本没这字段"（`'unknown'`）
+   混成一组，信息就再也还原不出来。两条规则方向相反，理由各写在落点注释里。
+4. **兼容走"读边界归一"，不写迁移脚本、不升版本号**。旧 `meta.usageStats` 没有 `providers`，
+   而下游是直接 `[...u.providers]` 展开 ⇒ 抛 `TypeError`；**抛点偏偏落在 `accumulateUsage` 的
+   try/catch 里，症状是"用量静默不增长"而不是崩溃** —— 本项目反复栽在静默失效上，所以这条必须
+   在边界处钉死。`normalizeUsage` 在两个反序列化/聚合收敛点调用（`usageFromMeta` / `mergeUsage`），
+   旧会话读作 `providers: []`、新调用逐条追加；历史调用**不回填**（当时的端点已不可考，编一个
+   出来就是假数据）。
+
+### 顺手做对的两处细节
+
+- `renderStatsText` 把「按 Provider」排在「按模型」**之前**：provider 是更粗的划分（一个 provider
+  常含多个模型），读统计是自顶向下"先看落在哪个端点、再看哪个模型"，粗→细才不会来回跳。
+- `usageSince`（当日视图）里 providers 与 `models/tools/agents` 一并置空：hourly 桶里本就没有
+  端点信息，声称能按天切分就是假的。
+
+### 验证（三段式 + 反向验证 7 处）
+
+- `bun run typecheck`：**42 包 0 error**
+- `bun run test`（根脚本）：**2449 pass / 0 fail**（2435 → 2449，+14）
+- **反向验证 7 处，逐处先写预期变红条数再跑，全部精确命中**：
+
+| # | 破坏点 | 预测变红 | 实际 |
+|---|---|---|---|
+| M1 | `foldMessage` 不读 `meta.providerId` | usage 1 + core 1 | usage 1 + core 2 ✅ |
+| M2 | `usageFromMeta` 不做归一 | usage 1 / core 0 | 1 / 0 ✅ |
+| M3 | `mergeUsage` 不做归一 | usage 1 | 1 ✅ |
+| M4 | 缺省 provider 归 `'default'`（把"缺失"并进"确定走默认端点"） | usage 2 | 2 ✅ |
+| M5 | 「按 Provider」节挪到「按模型」之后 | usage 1 | 1 ✅ |
+| M6 | `usageSince` 保留 providers（声称能按天切分） | usage 1 | 1 ✅ |
+| M7 | core 不把 `providerId` 写进 assistant meta | core 2 | 2 ✅ |
+
+  M1 的 core 从预测 1 变 2 是**预测偏差、不是测试问题**：我只想到「未指定端点⇒记 default」那条，
+  漏了「显式 providerId⇒按实例键归并」里也有一句 `u.providers.map(...)` 读的正是折叠结果 ——
+  回看断言确认两条都该红，属漏算。M2/M3 拆两条是有意的：归一是**两道串联的闸**
+  （单条记录的反序列化点 × 跨会话聚合的收敛点），只破坏一层另一层照常兜住，各破一次才证明
+  两层都活着。还原后 `shasum -a 256 -c` 两文件 `OK`，并与仓库实际文件 `cmp` 逐字一致。
+
+### 落档
+
+- `docs/usage-accounting-and-prompt-cache-plan.md`：新增 **§7.9**（四个决策表 + 缺省值语义 + 落点 + 验证）。
+- `docs/remaining-work-plan.md`：§2-C 划掉、移入 §1 已闭合（附判据）；§5 补"阶段四已落地"；新增 §6 记本轮。
+- `AGENTS.md`：本轮无新增包/登记链路，未改。
+
 ## 2026-10-05（续 249）planning-files 阶段四：多计划 / catchup / 进度回退 / gated 提示
 
 ### 做什么

@@ -384,6 +384,32 @@ subagent 派生与 CLI 恢复都用它），`meta.parentId` 恒为 null。已改
 （且进一步改成尾部注入，见 §3/§7.2）、**#4 结果通道去重** ✅。
 记忆与技能锻造线（`docs/memory-and-skill-forge-plan.md`）的 M0~M3.1 / F0~F3 **全部完成并已串联**。
 
+### 7.9 Provider 维度：按实例路由键切分用量（2026-10-05，续 250）
+
+`UsageStats` 此前只有 `models / tools / agents / hourly` —— 「这次调用走了哪个**端点**」无处可看，
+于是「同一模型挂多个 Provider 实例」（P2 缺陷引出的正常配置）在报表里合成一行，账对不上。
+`remaining-work-plan.md` §2-C 把这件事标为「格式变更，需独立决策」；本节就是那四个决策。
+
+| # | 决策 | 选择 | 理由 |
+|---|---|---|---|
+| D1 | 维度键 | **实例路由键** `ProviderConfig.id`（如 `hy3` / `openai-2`），**不是** provider 类型 | 成本归因的轴是端点：同类型挂两个 key 就是两份账单，按类型分会让它们合成一行。与 `core.llm.usage` 事件、`ProviderInstanceInfo.id` 同词汇，展示层不用再映射一次 |
+| D2 | 数据来源 | assistant 消息的 `meta.providerId`（与 `model` **同位**） | `foldMessage` 是增量折叠与全量自愈重建的**唯一同口径入口**；provider 若只写累加器、不写消息 meta，自愈那一刻（触发条件恰恰是"消息被外部改过"）会把整个维度丢掉 ⇒ 两条路径分叉 |
+| D3 | `'default'` 哨兵 | **原样写进 meta**，统计里是独立分组（与同文件 `core.llm.usage` 事件的"省略"规则**相反**） | 事件载荷省略它，是为了不污染"每个端点的缓存视图"；统计需要一个**全覆盖分区键**，省略会让"确定走默认端点"与"旧会话无此字段"混成一组。两条规则方向相反，理由各写在落点 |
+| D4 | 兼容 | **读边界归一**（`usageFromMeta` / `mergeUsage` 调 `normalizeUsage` 补齐缺失数组）；不写迁移脚本、不升版本号 | 旧 `meta.usageStats` 没有 `providers`，而下游是直接 `[...u.providers]` 展开 ⇒ 抛 `TypeError`，且抛点落在 `accumulateUsage` 的 try/catch 里 —— 症状是**「用量静默不增长」而不是崩溃**。旧会话读作 `providers: []`、新调用逐条追加；历史调用不回填（当时的端点已不可考，编一个出来就是假数据） |
+
+两个缺省值**刻意不合并**：`'default'` = 未显式指定端点（确定走默认 Provider）；
+`'unknown'` = 消息里根本没有该字段（本维度引入前落盘的会话）。
+
+落点：`@harness/usage`（`ProviderUsage` / `UsageStats.providers` / `normalizeUsage` / `providerUsageRow`；
+`renderStatsText` 新增「按 Provider」节并排在「按模型」**之前**＝粗→细；JSON/Markdown 导出同步）·
+`core`（assistant 消息 meta 写 `providerId`）· `session`（`Message.meta.providerId` 类型声明）·
+`cli/tui`（统计侧栏新增「Provider」小节）。`usageSince` 与 `models/tools/agents` 一致置空 ——
+**当日视图不做 provider 切分**（hourly 桶里本就没有端点信息）。
+
+验证：42 包 typecheck 0 error；2449 pass / 0 fail（2435 → +14）；反向验证 7 处、逐处先写下预期变红条数
+再跑，全部精确命中（不读 meta / 不归一 ×2 层 / 缺省并进 default / 节序 / 当日切分 / 不写 meta）。
+详见 `docs/development-log.md` 续 250。
+
 ---
 
 ## 8. 两个待做项方案细化（2026-09-22 补充）

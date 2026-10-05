@@ -34,6 +34,7 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 | runtime-registration S1/S2/**S3** | S3 见日志续 213（事件归属 / 来源列 / 实例数 / 端点维度） |
 | memory & skill-forge M0~M3.1、F0~F3 | `docs/memory-and-skill-forge-plan.md` §3.9 / §4.6 全 ✅ |
 | 用量纳管 + 前缀缓存 | `docs/usage-accounting-and-prompt-cache-plan.md` §7.8 |
+| `UsageStats` 的 provider 维度 | 续 250；`packages/usage/src/index.ts` 有 `providers[]` + `normalizeUsage`，源文档 §7.9 |
 | 工具入参 runtime schema（30 工具）+ 守卫收拢 | 续 214~218；`tools-glob/src/index.ts:144-146` 已有 exclude/minSizeBytes/… |
 | 上下文压缩 V5 四阶段 | 见上节 |
 | bash AST + Kitty | 调研报告"实施进展"两轮全 ✅ |
@@ -44,9 +45,9 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 
 | # | 项 | 现状判据 | 依赖 / 风险 |
 |---|---|---|---|
-| **A** | **`@harness/planning-files` 插件**（`docs/planning-files-plugin.md` 已定稿四阶段） | `grep -rl planning packages/` ⇒ **零命中**，包不存在 | 无外部依赖；新包须同步 root `tsconfig` paths + `host/package.json` + `host/src/lazy.ts` 静态表 + 注册表（守卫测试卡） |
+| **A** | `@harness/planning-files` 插件 | ✅ **阶段一~四已落地**（续 248/249） | 仅剩「真 harness 装配级端到端」（本包测试走 hook 级） |
 | B | MCP **server 端**插件（旁路 B1） | 全仓无 `@modelcontextprotocol/sdk`；`mcp-server-registry` 是"注册要连的 server"，不是 server 端 | 从零写；独立线 |
-| C | `UsageStats` 的 provider 维度 | `packages/usage/src/index.ts:87-98` 只有 llmCalls/models/tools/agents/hourly | 格式变更，需独立决策 |
+| C | ~~`UsageStats` 的 provider 维度~~ | ✅ **已落地**（续 250） | — |
 | D | 承续 213/215 小遗留：`unregister` 级联、`_setChatProvider` 最终删除、`read_file` 直调守卫 | `core:4783` 仍在委托；`core:899/2643` 有 unregister 但级联语义需核 | 低风险杂活；**动手前先核现状** |
 | E | VSCode 注册 `languageModelTools`（设计稿 §10-6，B1 变体） | 扩展内无 `lm.registerTool` | 点验需 Copilot |
 | F | 79.9MB 二进制裁剪 B1/B2（`--minify` + 瘦入口） | `packages/cli/package.json` 的 `build:sidecar` 未带 minify | A3 选定后优先级已降；实测可到 62.1MB / zip 后 ~21MB |
@@ -70,6 +71,15 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 > 主仓 42 包 typecheck 0 error / 2389 pass 0 fail；反向验证 4 处全红。
 > **未做**：阶段四（多计划切换完整化 / catchup / gated 提示）、真 harness 装配级端到端。
 > 与设计稿的偏离（不注册 `core.session.compacting`）已回写 `docs/planning-files-plugin.md` §5。
+>
+> **后续（续 249）**：阶段四已落地（多计划 / catchup / 进度回退 / gated 提示）；**仅剩**真 harness 装配级端到端。
+
+## 6. 本轮开工：C —— `UsageStats` 的 provider 维度（✅ 已落地 2026-10-05，续 250）
+
+> 落地结果：`UsageStats.providers[]`（键 = 实例路由键）+ 读边界归一（旧落盘记录读作 `[]`）+ 四个渲染/导出出口。
+> 主仓 42 包 typecheck 0 error / **2449 pass** 0 fail（2435 → +14）；反向验证 7 处精确命中。
+> 四个决策（含 D3「`'default'` 哨兵与 `core.llm.usage` 事件规则相反」、D4「读边界归一而非迁移脚本」）
+> 记在 `docs/usage-accounting-and-prompt-cache-plan.md` §7.9。
 
 按 `docs/planning-files-plugin.md` 的阶段划分推进，**阶段一 → 二 → 三**一次交付成可用能力
 （阶段四的增强项——多计划切换 / catchup / gated——留作后续）：
