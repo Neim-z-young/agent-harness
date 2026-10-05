@@ -15,8 +15,11 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentDefinition } from '@harness/core'
+import { defineTool } from '@harness/core'
 import { HarnessHost, type Host } from '@harness/host'
+import { fromJsonSchema } from '@harness/tool'
 import { ControlError, dispatchControl, listControlMethods, type ControlErrorCode } from './control'
+import { wrapAskerWithControlApproval } from './control-approval'
 
 // ========================================================================
 // 夹具
@@ -608,5 +611,224 @@ describe('控制面：harness/stats.export（P2-v2）', () => {
     expect(res.path.endsWith('.json')).toBe(true)
     const parsed = JSON.parse(await readFile(res.path, 'utf8')) as { sessionId?: string }
     expect(parsed).toBeObject()
+  })
+})
+
+// ========================================================================
+// 工具暴露（P3-D，设计稿 §14）
+// ========================================================================
+
+describe('控制面：harness/tools.*（P3-D）', () => {
+  /**
+   * 注册一个测试工具。
+   *
+   * ⚠️ `permission` 决定**权限链是否启动**：`ToolPipeline` 只在
+   * 「工具声明了 `permission` 且有 `checkPermission`」时才构造 `PermissionRequest`
+   * （`packages/tool/src/index.ts:1337`）。不声明 ⇒ 整条 check → ask → asker 短路，
+   * 于是"未 approve 会被拒"这类用例会静默退化成"一律放行"。真实写工具都声明了它。
+   */
+  function installTool(host: Host, id: string, opts: { readOnly?: boolean; permission?: boolean } = {}): void {
+    host.harness.tools.register(
+      defineTool({
+        id,
+        description: `${id} 的说明`,
+        inputSchema: fromJsonSchema<{ msg?: string }>({ type: 'object', properties: { msg: { type: 'string' } } }),
+        ...(opts.readOnly ? { isReadOnly: () => true } : {}),
+        ...(opts.permission ? { permission: { key: id, extractPatterns: () => [] } } : {}),
+        async call() {
+          return { ok: true as const, output: `${id}:done` }
+        },
+      }),
+      { override: true },
+    )
+  }
+
+  /**
+   * 复刻 `server.ts` 的接线：**内层是 A2A asker**（在 A2A 任务上下文之外 ⇒ 返回 `undefined`
+   * ⇒ 引擎按 deny 处理）。返回的计数器用来区分"短路"与"委派"——
+   * 这正是本组用例真正在测的东西。
+   */
+  function installAsker(host: Host): { calls: number } {
+    const spy = { calls: 0 }
+    host.permission.setAsker(
+      wrapAskerWithControlApproval(async () => {
+        spy.calls += 1
+        return undefined
+      }),
+    )
+    return spy
+  }
+
+  it('tools.list：列出已注册工具，并给出 readOnly / requiresConfirmation 判定', async () => {
+    const host = await makeHost()
+    installTool(host, 'echo_ro', { readOnly: true })
+    installTool(host, 'echo_write', { permission: true })
+    // 只读 **且** 声明 permission —— 真实的 `read_file` 就是这个形状。它照样会落到 ask，
+    // 故 requiresConfirmation 必须为 true（判据与权限链启动条件一致，与只读无关）。
+    installTool(host, 'echo_ro_perm', { readOnly: true, permission: true })
+
+    const res = (await call(host, 'harness/tools.list')) as { tools: Array<Record<string, unknown>> }
+    const byName = new Map(res.tools.map((t) => [t['name'] as string, t]))
+    expect(byName.get('echo_ro')).toMatchObject({ readOnly: true, requiresConfirmation: false })
+    expect(byName.get('echo_ro_perm')).toMatchObject({ readOnly: true, requiresConfirmation: true })
+    expect(byName.get('echo_write')).toMatchObject({ readOnly: false, requiresConfirmation: true })
+    // 排序稳定（客户端 diff 不会误判"工具集变了"）
+    expect(res.tools.map((t) => t['name'])).toEqual([...res.tools.map((t) => t['name'])].sort())
+  })
+
+  it('tools.call：未声明 permission 的工具直接跑通 —— 权限链根本不启动，也就没人问', async () => {
+    const host = await makeHost()
+    const asker = installAsker(host)
+    installTool(host, 'echo_ro', { readOnly: true })
+
+    const res = (await call(host, 'harness/tools.call', {
+      sessionId: host.session.id,
+      name: 'echo_ro',
+      input: {},
+    })) as Record<string, unknown>
+
+    expect(res).toMatchObject({ ok: true, output: 'echo_ro:done' })
+    expect(asker.calls).toBe(0)
+  })
+
+  it('tools.call：写工具 + 未 approve ⇒ **委派**给原 asker ⇒ 最终被拒（Fail-Closed）', async () => {
+    const host = await makeHost()
+    const asker = installAsker(host)
+    installTool(host, 'echo_write', { permission: true })
+
+    const res = (await call(host, 'harness/tools.call', {
+      sessionId: host.session.id,
+      name: 'echo_write',
+      input: {},
+    })) as { ok: boolean; error?: { code?: string } }
+
+    expect(res.ok).toBe(false)
+    expect(res.error?.code).toBe('PERMISSION_DENIED')
+    // 关键：证明"没有 approve"走的是**委派**而不是"自己判拒绝"——
+    // 若哪天有人把这里改成直接 deny，本断言会红（那会掩盖"谁在拒绝"）。
+    expect(asker.calls).toBe(1)
+  })
+
+  it('tools.call：写工具 + approve ⇒ 放行，且**不打扰**原 asker（短路）', async () => {
+    const host = await makeHost()
+    const asker = installAsker(host)
+    installTool(host, 'echo_write', { permission: true })
+
+    const res = (await call(host, 'harness/tools.call', {
+      sessionId: host.session.id,
+      name: 'echo_write',
+      input: {},
+      approve: true,
+    })) as Record<string, unknown>
+
+    expect(res).toMatchObject({ ok: true, output: 'echo_write:done' })
+    expect(asker.calls).toBe(0)
+  })
+
+  it('tools.call：静态规则已放行（allow-all）⇒ 不需要 approve 也能跑（approve 不是必经之路）', async () => {
+    const host = await makeHost()
+    const asker = installAsker(host)
+    host.permission.setMode('allow-all')
+    installTool(host, 'echo_write', { permission: true })
+
+    const res = (await call(host, 'harness/tools.call', {
+      sessionId: host.session.id,
+      name: 'echo_write',
+      input: {},
+    })) as Record<string, unknown>
+
+    expect(res).toMatchObject({ ok: true })
+    expect(asker.calls).toBe(0)
+  })
+
+  it('tools.call：deny-all ⇒ 拒，**approve 也救不了**（approve 只影响 ask 阶段，不越过静态规则）', async () => {
+    const host = await makeHost()
+    installAsker(host)
+    host.permission.setMode('deny-all')
+    installTool(host, 'echo_write', { permission: true })
+
+    const res = (await call(host, 'harness/tools.call', {
+      sessionId: host.session.id,
+      name: 'echo_write',
+      input: {},
+      approve: true,
+    })) as { ok: boolean; error?: { code?: string } }
+
+    expect(res.ok).toBe(false)
+    expect(res.error?.code).toBe('PERMISSION_DENIED')
+  })
+
+  it('tools.call：会话不存在 ⇒ NOT_FOUND（**不回落 boot 会话**：归属不明就挑一个是静默失效）', async () => {
+    const host = await makeHost()
+    installTool(host, 'echo_ro', { readOnly: true })
+    await expectControlError(
+      () => call(host, 'harness/tools.call', { sessionId: 'sess-不存在', name: 'echo_ro', input: {} }),
+      'NOT_FOUND',
+    )
+  })
+
+  it('tools.call：形状错误 ⇒ 协议级错误（`input` 非对象 / 缺 sessionId / 工具名未知）', async () => {
+    const host = await makeHost()
+    installTool(host, 'echo_ro', { readOnly: true })
+
+    await expectControlError(() => call(host, 'harness/tools.call', { name: 'echo_ro', input: {} }), 'INVALID_PARAMS')
+    await expectControlError(
+      () => call(host, 'harness/tools.call', { sessionId: host.session.id, name: 'echo_ro', input: [1, 2] }),
+      'INVALID_PARAMS',
+    )
+    const err = await expectControlError(
+      () => call(host, 'harness/tools.call', { sessionId: host.session.id, name: 'nope', input: {} }),
+      'NOT_FOUND',
+    )
+    // 未知工具要把"有哪些"带回去，客户端才能纠错
+    expect(err.detail?.available).toBeArray()
+  })
+})
+
+// ========================================================================
+// 工具池就绪 —— P3-D 的**前提**（本组是回归守卫，防止再次静默变空）
+// ========================================================================
+
+/**
+ * 为什么单列一组：`makeHost()` 与 `runA2aCli` 一样用 `backgroundPreload:false`，
+ * 也就是说**内置工具插件不会在 boot 时装配、工具也不会注册**。实测（改造前）：
+ * `harness/tools.list` 返回 **0 个工具**，而失败形态是"清单为空"——静默、且看起来正常。
+ *
+ * 客户端那一侧更狠：编辑器扩展在**激活期**拿这份清单去 `lm.registerTool`，
+ * 拿到空的就一个 LM 工具都注册不上，用户只看到"Copilot 里没有 harness 工具"。
+ */
+describe('控制面：工具池就绪（P3-D 的前提）', () => {
+  it('backgroundPreload=false 的宿主（= A2A 服务端形态）里 tools.list 仍能列到内置工具', async () => {
+    const host = await makeHost()
+    const res = (await call(host, 'harness/tools.list')) as { tools: Array<{ name: string }> }
+    const names = res.tools.map((t) => t.name)
+    // 核心断言：**非空**。为空就是 P3-D 整体失效（0 个 LM 工具被注册）
+    expect(names.length).toBeGreaterThan(0)
+    expect(names).toContain('read_file')
+    expect(names).toContain('bash')
+  })
+
+  it('warmupBuiltins() 幂等：只跑一次，重复调用不重复装插件', async () => {
+    const host = await makeHost()
+    const first = await host.warmupBuiltins()
+    const second = await host.warmupBuiltins()
+
+    expect(first.tools).toBeGreaterThan(0)
+    // 幂等的实现是"缓存首次结果"⇒ 两次拿到**同一个对象**（这才叫没重跑）
+    expect(second).toBe(first)
+    expect(host.warmupBuiltins()).toBe(host.warmupBuiltins())
+
+    // 真正的"没重复装"看插件列表：装配后每个 id 只出现一次
+    const ids = host.harness.plugin.list().map((p) => p.plugin.id)
+    expect(ids.length).toBe(new Set(ids).size)
+    // 第一次预热确实装了东西（否则上面的"没重名"就退化成"什么都没有"）
+    expect(first.installed.length).toBeGreaterThan(0)
+  })
+
+  it('tools.list 每次读都先保证就绪 ⇒ 两次调用的清单一致（不会"第一次空、第二次才有"）', async () => {
+    const host = await makeHost()
+    const a = (await call(host, 'harness/tools.list')) as { tools: Array<{ name: string }> }
+    const b = (await call(host, 'harness/tools.list')) as { tools: Array<{ name: string }> }
+    expect(b.tools.map((t) => t.name)).toEqual(a.tools.map((t) => t.name))
   })
 })

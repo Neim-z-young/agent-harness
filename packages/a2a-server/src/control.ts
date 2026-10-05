@@ -41,6 +41,7 @@
  * | 调用方隔离（`contextId` 归属） | 有 | 无 —— 控制面是"持有 token 者即管理员" |
  * | 鉴权 | Bearer | **同一个 Bearer**（同一端口不该有两套凭据） |
  */
+import { randomUUID } from 'node:crypto'
 import { statSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { resolve } from 'node:path'
@@ -57,6 +58,9 @@ import {
 } from '@harness/host'
 import type { Host, HostNotice, PermissionMode } from '@harness/host'
 import type { Session, TextPart } from '@harness/session'
+import { type ToolContext, type ToolResult, normalizeToolError } from '@harness/tool'
+import { controlApproval } from './control-approval'
+import { listToolDescriptors, toToolCallOutcome } from './tool-exposure'
 import {
   collectTodayUsage,
   exportStatsJson,
@@ -785,6 +789,93 @@ METHODS.set('harness/compact', async (p, host) => {
       round: info.memory?.round ?? 0,
       summaryPreview: info.memory?.summaryText ? info.memory.summaryText.slice(0, 400) : null,
     },
+  }
+})
+
+// ---- 工具暴露（P3-D，设计稿 §14）-----------------------------------------
+
+/**
+ * `harness/tools.list` —— 把 `ToolRegistry` 的当前内容摊平给客户端。
+ *
+ * 无入参：**不做按 agent 过滤、不做白名单**（与 `@harness/mcp-server` 一期同口径，见 §14.5）。
+ * 每次都现取：工具启停是运行期行为（`/tools` 命令可改），缓存会让客户端看到一个过期的池子，
+ * 而"列出来的工具调不动"正是最难查的那类偏差。
+ *
+ * ## 为什么要先 `warmupBuiltins()`（这条不是可选的）
+ *
+ * 「工具池可列」= 「非 optIn 内置插件都装了」+「`assembleTools()` 跑过」，缺一不可。
+ * 而 A2A 服务端**故意**用 `backgroundPreload:false` 启动（`runA2aCli` 的理由：启动提示应当确定性）
+ * ⇒ 那两件事**都没有做**。实测：直接 list = **0 个工具**；`assembleTools()` 后 = 5；
+ * 把 `tools.glob/search/web/media` 也装上才到 10。
+ *
+ * 于是"读工具池"必须自己保证前提到位，而不是默认"启动时跑过了" —— 那是一个**启动顺序依赖**，
+ * 而它失效时的形态是"工具池看起来是空的"：静默，且看起来像正常状态（空清单本来不报错）。
+ * 客户端那边更狠：编辑器扩展会在**激活期**拿这份清单去 `lm.registerTool`，拿到空的就
+ * 一个 LM 工具都注册不上，而用户只会看到"Copilot 里没有 harness 工具"。
+ *
+ * `warmupBuiltins()` 是幂等的（host 侧缓存首次结果），所以"每次读都调一下"的代价可忽略。
+ */
+METHODS.set('harness/tools.list', async (_p, host) => {
+  assertBooted(host)
+  await host.warmupBuiltins()
+  return { tools: listToolDescriptors(host.harness.tools.list()) }
+})
+
+/**
+ * `harness/tools.call` —— 由**外部编排方**（VSCode Copilot agent mode，设计稿 §14）发起一次工具调用。
+ *
+ * 三条纪律：
+ *
+ * 1. **权限不在这里判** —— 一律走 `toolPipeline.execute`，与 harness 自主路径**同一条链**
+ *    （静态规则 / `core.permission.check` hook / 四态写回全都在）。`approve` 只影响
+ *    "ask 阶段谁来答"，**不改写任何本地规则** —— 没有 always-allow 通道（§14.5）。
+ * 2. **归属由调用方给** —— `sessionId` 必填并直接用作 `ToolContext.sessionId`：遥测、事实事件、
+ *    权限询问三处的归属因此指向同一个会话。**不回落** sidecar 的 boot 会话 ——
+ *    「归属不明就挑一个」正是本仓反复栽过的那类静默失效。
+ * 3. **失败分两级** —— 工具级失败（含权限被拒）走正常回包 `{ok:false}`；
+ *    只有"调用方写错了"（会话不存在 / 工具名未知 / `input` 非对象）才是 `ControlError`。
+ */
+METHODS.set('harness/tools.call', async (p, host) => {
+  assertBooted(host)
+  const sessionId = requireString(p, 'sessionId')
+  const name = requireString(p, 'name')
+  const input = p['input']
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new ControlError('INVALID_PARAMS', 'params.input 必须是对象（= 工具入参）')
+  }
+  // 缺省（未给 / 给 false）= 调用方**没有**做过交互式确认 ⇒ 不装审批作用域，
+  // 询问会落到原 A2A asker；而控制面调用不在 A2A 任务上下文里 ⇒ deny + 一条 warn（Fail-Closed）。
+  const approve = optionalBoolean(p, 'approve') === true
+
+  const tool = host.harness.tools.get(name)
+  if (!tool) {
+    throw new ControlError('NOT_FOUND', `工具 "${name}" 不在注册表中`, {
+      available: host.harness.tools.list().map((t) => t.id).sort(),
+    })
+  }
+
+  const session = await requireLiveSession(host, sessionId)
+  const ctx: ToolContext = {
+    sessionId: session.id,
+    agentId: session.agentId ?? host.defaultAgent().id,
+    // 控制面调用没有"助手消息"这一层：用一次性 id 占位（只用于日志/遥测关联，
+    // 本方法不向会话历史写任何消息）。
+    messageId: `control-${randomUUID()}`,
+    toolUseId: `control-${randomUUID()}`,
+    // 无外部中断源：控制面是单次请求，连接断开表现为调用方不再等结果（不做进程内 kill）
+    signal: new AbortController().signal,
+    variables: {},
+    cwd: session.cwd ?? host.workspace.cwd,
+  }
+
+  const run = (): Promise<ToolResult> => host.harness.toolPipeline.execute(tool, input, ctx)
+  try {
+    const result = await (approve ? controlApproval.run({ answer: 'allow' }, run) : run())
+    return toToolCallOutcome(result)
+  } catch (err) {
+    // 与 core 的 `safeExecuteTool` 逐字同构：权限拒绝 / schema 失败都是**工具级失败**，
+    // 不该升级成控制面错误 —— 否则编排方只看到一句"请求失败"，读不到"为什么被拒"。
+    return toToolCallOutcome({ ...normalizeToolError(err), interrupted: false })
   }
 })
 

@@ -168,9 +168,30 @@ export interface HostOptions {
   logLine?: (line: string) => void
 }
 
+/**
+ * {@link HarnessHost.warmupBuiltins} 的结果 —— 供调用方判断"工具池到底有没有备好"。
+ *
+ * 三个字段都是为了**可归因**：`installed` 空 + `tools` 为 0 时，是"本来就没插件"还是
+ * "插件都在、只是组装没跑"？只有分开报才答得出来。失败进 `failed`（并按既有 notice 上报），
+ * 不进异常 —— 一个插件坏了不该让工具池读不出来。
+ */
+export interface BuiltinWarmupResult {
+  /**
+   * 预热过程中**实际新装上**的非 optIn 内置插件 id（boot 阶段已装过的不列）。
+   *
+   * 注意它是"**那次预热**"的描述而不是"这次调用"的：整个预热只跑一次（见 `warmupBuiltins`），
+   * 后续调用拿到的是同一份结果对象 —— 所以第二次调用看到的 `installed` 与第一次**相同**，
+   * 这不表示它又装了一遍。判断"没重复装"要看插件列表有没有重名。
+   */
+  installed: string[]
+  /** 加载或安装失败的插件 id */
+  failed: string[]
+  /** 组装**之后** `ToolRegistry` 里的工具数（= 调用方接下来能列到的数量） */
+  tools: number
+}
+
 /** boot() 的会话决策结果，供各宿主的启动提示用（「已恢复上次会话」/「为何没恢复」） */
-export interface SessionRestoreInfo {
-  /** explicit：`-s/--session` 指定；auto：自动恢复最近会话；new：新建 */
+export interface SessionRestoreInfo {  /** explicit：`-s/--session` 指定；auto：自动恢复最近会话；new：新建 */
   source: 'explicit' | 'auto' | 'new'
   sessionId: string
   /** source=auto 时：该会话的消息条数 */
@@ -1326,56 +1347,86 @@ export class HarnessHost {
   }
 
   /**
-   * 多级加载 L2 —— boot 末尾后台静默预加载内置插件/工具。
+   * 多级加载 L2 —— boot 末尾后台静默预加载内置插件/工具（fire-and-forget）。
    *
-   * fire-and-forget：不阻塞 boot、不向上抛错；经 Promise.allSettled 采集结果，
-   * 失败仅向 stdout 写一条 WARN 日志。职责：
-   * 1) 预热已登记的内置插件（tools-builtin / tools-manager 等，动态 import 已被运行时缓存，重复调用开销极低）；
-   * 2) 将预加载出的插件模块安装进 Harness（跳过 boot 阶段已同步安装的），并触发
-   *    harness.assembleTools() 主动组装工具池——否则工具只在用户首条消息后（query 内
-   *    的 core.tool.pool.assemble）才注册，/tools 会一直停留在「仅元信息」，list_dir 等场景
-   *    工具也无法开箱即用。
+   * 真正的实现在 {@link warmupBuiltins}（**幂等、可 await**）：这里只是"不阻塞 boot"的那个调用形态。
+   * 「A2A 服务端不预加载」（`runA2aCli` 传 `backgroundPreload:false`）曾经意味着**工具池永远是空的**，
+   * 直到有人显式调 {@link warmupBuiltins} —— 这条因果见 `harness/tools.list` 的注释。
    */
   private scheduleBuiltinPreload(): void {
     if (this.options.backgroundPreload === false) return
+    void this.warmupBuiltins()
+  }
+
+  /**
+   * 把内置（**非 optIn**）插件补齐并组装工具池 —— **幂等**：重复调用只跑第一次。
+   *
+   * 为什么需要它（而不是只靠 boot 末尾那次 fire-and-forget）：
+   *
+   * - 「工具池已装配」这件事**不是 boot 的返回值**就能保证的。实测（`backgroundPreload:false`，
+   *   即 `runA2aCli` 的形态）：`tools.list()` = **0**，`await assembleTools()` 后 = 5
+   *   （只有 `tools.builtin` 的工具），把 `tools.glob/search/web/media` 也装上才到 10。
+   *   也就是说"工具可列"= 「非 optIn 内置插件都装了」+「assembleTools 跑过」，缺一不可。
+   * - 于是**读工具池的一方**（控制面 `harness/tools.list`、编辑器扩展的 LM 工具注册）不能依赖
+   *   "启动时它跑过"：那是一个**启动顺序**依赖，A2A 服务端恰好不满足它，而失败形态是
+   *   "工具池看起来是空的" —— 静默、且看起来像正常状态（空清单不该报错）。
+   *
+   * 幂等因此不是优化而是必要：调用点可能每读一次就调一次，装插件与组装都不该重复做。
+   *
+   * **不抛**：单个插件加载失败只记 notice（与原来的 fire-and-forget 同款语义）——
+   * 一个插件坏了不该让整个工具池读不出来。
+   */
+  warmupBuiltins(): Promise<BuiltinWarmupResult> {
+    this.warmupPromise ??= this.doWarmupBuiltins()
+    return this.warmupPromise
+  }
+
+  private warmupPromise: Promise<BuiltinWarmupResult> | undefined
+
+  private async doWarmupBuiltins(): Promise<BuiltinWarmupResult> {
+    const result: BuiltinWarmupResult = { installed: [], failed: [], tools: 0 }
     const harness = this.harness
     const items = getBuiltinRegistry().list()
-    if (!items.length || !harness) return
-    void (async () => {
-      // optIn 插件（computer-use / code-intel / subagent / coordinator / swarm）只「登记」，
-      // 不在此实例化：要么其工具需 mcp-client 连上才可用，要么是不该默认注入的可选能力。
-      // 它们的启用路径是 config.json → plugins 声明式启用，或外部插件目录显式装配。
-      const loadable = items.filter((p) => !p.optIn)
-      const results = await Promise.allSettled(loadable.map((p) => p.load()))
-      const installedIds = new Set(harness.plugin.list().map((lp) => lp.plugin.id))
-      const toInstall: AgentPlugin[] = []
-      for (let i = 0; i < loadable.length; i++) {
-        const item = loadable[i]!
-        const r = results[i]!
-        if (r.status === 'rejected') {
-          this.emitNotice(makeNotice('preload.plugin-failed', {
-            pluginId: item.id,
-            message: (r.reason as Error)?.message ?? String(r.reason),
-          }))
-        } else {
-          const plugin = r.value
-          if (plugin && !installedIds.has(plugin.id)) toInstall.push(plugin)
-          this.emitNotice(makeNotice('preload.warmed', { pluginId: item.id }))
-        }
+    if (!items.length || !harness) return result
+
+    // optIn 插件（computer-use / code-intel / subagent / coordinator / swarm）只「登记」，
+    // 不在此实例化：要么其工具需 mcp-client 连上才可用，要么是不该默认注入的可选能力。
+    // 它们的启用路径是 config.json → plugins 声明式启用，或外部插件目录显式装配。
+    const loadable = items.filter((p) => !p.optIn)
+    const results = await Promise.allSettled(loadable.map((p) => p.load()))
+    const installedIds = new Set(harness.plugin.list().map((lp) => lp.plugin.id))
+    const toInstall: AgentPlugin[] = []
+    for (let i = 0; i < loadable.length; i++) {
+      const item = loadable[i]!
+      const r = results[i]!
+      if (r.status === 'rejected') {
+        result.failed.push(item.id)
+        this.emitNotice(makeNotice('preload.plugin-failed', {
+          pluginId: item.id,
+          message: (r.reason as Error)?.message ?? String(r.reason),
+        }))
+      } else {
+        const plugin = r.value
+        if (plugin && !installedIds.has(plugin.id)) toInstall.push(plugin)
+        this.emitNotice(makeNotice('preload.warmed', { pluginId: item.id }))
       }
-      if (toInstall.length > 0) {
-        try {
-          await harness.plugin.loadInternal(toInstall)
-        } catch (err) {
-          this.emitNotice(makeNotice('preload.install-failed', { message: (err as Error)?.message ?? String(err) }))
-        }
-      }
+    }
+    if (toInstall.length > 0) {
       try {
-        await harness.assembleTools()
+        await harness.plugin.loadInternal(toInstall)
+        result.installed = toInstall.map((p) => p.id)
       } catch (err) {
-        this.emitNotice(makeNotice('preload.tools-failed', { message: (err as Error)?.message ?? String(err) }))
+        result.failed.push(...toInstall.map((p) => p.id))
+        this.emitNotice(makeNotice('preload.install-failed', { message: (err as Error)?.message ?? String(err) }))
       }
-    })()
+    }
+    try {
+      await harness.assembleTools()
+      result.tools = harness.tools.list().length
+    } catch (err) {
+      this.emitNotice(makeNotice('preload.tools-failed', { message: (err as Error)?.message ?? String(err) }))
+    }
+    return result
   }
 
   get _harness(): Harness { return this.harness }

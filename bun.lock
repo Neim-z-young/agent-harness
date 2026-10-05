@@ -59,6 +59,7 @@
         "@harness/host": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
         "@harness/usage": "workspace:*",
       },
       "devDependencies": {

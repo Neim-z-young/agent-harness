@@ -43,6 +43,7 @@ import type { Host } from '@harness/host'
 import { CallerRegistry, callerKey, verifyBearer } from './auth'
 import { JSONRPC_BINDING, buildAgentCard, cardToJSON } from './card'
 import { ControlError, DEFAULT_CONTROL_PATH, dispatchControl } from './control'
+import { wrapAskerWithControlApproval } from './control-approval'
 import {
   A2aServerError,
   ConcurrentTaskError,
@@ -296,7 +297,12 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
   // `InteractivePermissionEngine.setAsker` 正是为这种"启动后注入交互器"存在的
   // （TUI 也用它挂模态审批）。若不做这一步，权限点不会挂起，`INPUT_REQUIRED`
   // 用例会静默退化成"任务直接 COMPLETED"。
-  host.permission.setAsker(executor.asker)
+  //
+  // P3-D 起改为**包装**而非直接替换（设计稿 §14.2）：控制面发起的工具调用
+  // （`harness/tools.call`）已由扩展侧做过交互式确认，其应答从审批作用域里取；
+  // 作用域外一律**委派**给原 A2A asker ⇒ 两条询问源并存（A2A 挂起桥 / 控制面确认）
+  // 不会互相顶掉 —— `setAsker` 是全局单槽，直接替换会让先装的那条静默失效。
+  host.permission.setAsker(wrapAskerWithControlApproval(executor.asker))
 
   const taskStore = new InMemoryTaskStore()
   const eventBusManager = new HarnessEventBusManager((taskId) => executor.isRunning(taskId))

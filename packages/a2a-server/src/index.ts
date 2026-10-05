@@ -94,3 +94,13 @@ export {
   listControlMethods,
 } from './control'
 export type { ControlErrorCode } from './control'
+
+// 9. 工具暴露（P3-D，设计稿 §14）—— 把 harness 的工具交给**外部编排方**（VSCode Copilot agent mode）
+//
+// 与控制面分开成模块的理由同 §8：`tool-exposure` 是**纯函数**（Tool → 出参形状），
+// `control-approval` 是**接缝本体**（ALS，由 server.ts 装进 asker、由 control.ts 开启作用域）——
+// 两侧都 import 它，谁也不 import 谁。放在一起会让"接缝在哪儿"变得看不出来。
+export { controlApproval, wrapAskerWithControlApproval } from './control-approval'
+export type { ControlApproval } from './control-approval'
+export { listToolDescriptors, toToolCallOutcome, toToolDescriptor } from './tool-exposure'
+export type { ToolCallOutcome, ToolDescriptor } from './tool-exposure'
