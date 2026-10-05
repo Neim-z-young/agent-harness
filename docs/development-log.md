@@ -1,5 +1,58 @@
 # Agent Harness 开发日志
 
+## 2026-10-05（续 251）项 D 拆解：三处"遗留"核实，其中一处早已闭合
+
+### 起因
+
+`remaining-work-plan.md` §2-D 用一行装了三件不相干的事（`unregister` 级联、`_setChatProvider`
+最终删除、`read_file` 直调守卫），要判断"能不能开工"必须先回代码核清它们各自到底是什么。
+
+### 核实结论（逐条回代码，不看旧日志的措辞）
+
+| 项 | 代码现状 | 性质 |
+|---|---|---|
+| `unregister` 级联 | `AgentRegistry.unregister`（`core:2643`）= `delete` + publish，**无级联**；`ProviderRegistry.unregister`（`core:4350`）= `delete` + 默认回落「首个已注册」+ publish `defaultChanged{reason:'unregister'}`。与 `runtime-registration-plan.md:359` §7「**刻意不做**」**完全一致** | **有意留白，非欠债** |
+| `_setChatProvider` 最终删除 | `core:4791` 标 `@deprecated`；6 个内置 provider 插件（anthropic / openai / glm / gemini / qwen / mock）各留一条 `else if (harness?._setChatProvider)` 回退分支；**生产路径已无调用者**，真走到的只有测试桩（`cli.test.ts:1900`、`core.test.ts:1216+`） | **真技术债，有前置条件** |
+| `read_file` 直调守卫 | ✅ **早已闭合**：`tools-builtin/src/index.ts` 的 `call()` 入口四处 `guardInput`（read_file `:139` / write_file `:281` / bash `:569` / edit_file `:1325`） | **原文档的过期条目** |
+
+### 第三项为什么是过期条目
+
+它抄自续 214/215 的「遗留」段落 —— 那段话在叙述**当轮时点**是准确的（当轮 `read_file.call()`
+确实还裸着 `resolvePath(input.path)`，越过管道直调会抛 TypeError），**续 216（直调入参守卫）那轮
+已经收掉**。从旧日志往新计划里搬条目时没回代码复核，于是一条"已完成"被当成"待办"带了三轮。
+
+> **教训：从旧日志搬条目进新计划，"搬"这个动作本身就要附带一次重核。** 遗留段落的时点是**当轮**，
+> 不是**现在**；`docs/*.md` 的「遗留 / 后续」是历史陈述，不是待办清单。
+
+### 关键发现：`chat.provider` 就是 `resolve()` 链的最后一环
+
+`core:4333` 的注释写着「最后一环：构造期 Provider（**或经 context 注入的那一份**）」——
+即 `_setChatProvider` 里那句 `context.register('chat.provider', p)` 落下的键，正是回退链的终点。
+所以"删除 `_setChatProvider`"不是删一个 @deprecated 方法，而是**一条注入链退场**：
+
+1. 摘 6 个内置 provider 插件的 `else if (harness?._setChatProvider)` 回退分支；
+2. 摘 `context.register('chat.provider', p)`；
+3. 最后删方法本体。
+
+**顺序不可颠倒**，且任何一步单做都会让「老宿主 + 新插件」静默失效 —— 插件注入不上 ⇒ 回落构造期
+Provider，而 `provider.registered` 压根不发布 ⇒ **一条告警都没有**。这正是续 213 那轮「静默回退可见化」
+要防的同一类失败，只是换了个位置。
+
+### 订正（本轮只动文档，未动代码）
+
+`docs/remaining-work-plan.md`：
+
+- §0 新增「追加更正（续 251）」，附四处 `guardInput` 行号判据 + 两句教训
+- §1 新增一行：`read_file` / `write_file` / `bash` / `edit_file` 直调用入参守卫
+- §2：删掉已落地的 C 行（§1 已有）；原 D 拆解 —— D 行重写为只剩 `_setChatProvider` 删除，
+  并加「前置三步」备注；表头补一句编号沿用说明（C 移走、原 D 拆到三处）
+- §4：新增 `unregister` 级联（标注「刻意留白，等真实需求驱动，勿提前实现」）
+
+### 未做（有意）
+
+- **未动 `_setChatProvider`**：删除前需先确认"是否继续支持老宿主 + 新插件"，这是产品口径不是代码问题。
+- **未动 `unregister` 级联**：设计稿写明等真实需求，提前实现等于给没人用的分支写复杂语义。
+
 ## 2026-10-05（续 250）`UsageStats` 的 provider 维度：按实例路由键切分用量
 
 ### 做什么

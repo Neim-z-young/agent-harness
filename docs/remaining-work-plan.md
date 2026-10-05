@@ -23,6 +23,24 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 
 ⇒ **`docs/context-compression-plan.md` 四阶段全部完成**，该计划已收口，不再有剩余项。
 
+### 追加更正（续 251）：项 D 里的「`read_file` 直调守卫」早已闭合
+
+§2-D 原把「`read_file` 直调守卫」列为待办，**实际续 216（直调入参守卫）那轮就收掉了**。
+判据是 `packages/plugins/tools-builtin/src/index.ts` 各工具 `call()` 的入口：
+
+```
+:139    read_file    guardInput(readFileInputSchema,  input, 'path', 'PATH_REQUIRED')
+:281    write_file   guardInput(writeFileInputSchema, input, 'path', 'PATH_REQUIRED')
+:569    bash         guardInput(bashInputSchema,       input, 'command', 'COMMAND_REQUIRED')
+:1325   edit_file    guardInput(editFileInputSchema,  input, 'path', 'PATH_REQUIRED')
+```
+
+四个入口齐了 ⇒ 越过管道直调 `readFileTool.call({}, ctx)` 拿到的是结构化错误（`PATH_REQUIRED`），
+不再是 `resolvePath(undefined, cwd)` 抛出的 TypeError。**该项移入 §1，不再列待办。**
+
+> 教训：这条是从续 214/215 的「遗留」段落抄进 §2 的 —— 而遗留段落在叙述当轮时点是准的，
+> 抄进新文档时**没有回代码复核**就成了过期项。**凡从旧日志搬进新计划的条目，搬的时候就要重核一遍。**
+
 ---
 
 ## 1. 已闭合（不要再重复推进）
@@ -36,6 +54,7 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 | 用量纳管 + 前缀缓存 | `docs/usage-accounting-and-prompt-cache-plan.md` §7.8 |
 | `UsageStats` 的 provider 维度 | 续 250；`packages/usage/src/index.ts` 有 `providers[]` + `normalizeUsage`，源文档 §7.9 |
 | 工具入参 runtime schema（30 工具）+ 守卫收拢 | 续 214~218；`tools-glob/src/index.ts:144-146` 已有 exclude/minSizeBytes/… |
+| `read_file` / `write_file` / `bash` / `edit_file` **直调入参守卫** | 见上节更正；四处 `guardInput`（`tools-builtin/src/index.ts:139/281/569/1325`） |
 | 上下文压缩 V5 四阶段 | 见上节 |
 | bash AST + Kitty | 调研报告"实施进展"两轮全 ✅ |
 
@@ -43,14 +62,26 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 
 ## 2. 仍可继续（纯代码，本仓可闭环）
 
+> 编号沿用原盘点：**C 已落地移入 §1**（不再重复列）；**原 D 已按性质拆解** ——
+> `read_file` 直调守卫 → §1、`unregister` 级联 → §4、只剩 `_setChatProvider` 删除留在本表（见下方备注）。
+
 | # | 项 | 现状判据 | 依赖 / 风险 |
 |---|---|---|---|
 | **A** | `@harness/planning-files` 插件 | ✅ **阶段一~四已落地**（续 248/249） | 仅剩「真 harness 装配级端到端」（本包测试走 hook 级） |
 | B | MCP **server 端**插件（旁路 B1） | 全仓无 `@modelcontextprotocol/sdk`；`mcp-server-registry` 是"注册要连的 server"，不是 server 端 | 从零写；独立线 |
-| C | ~~`UsageStats` 的 provider 维度~~ | ✅ **已落地**（续 250） | — |
-| D | 承续 213/215 小遗留：`unregister` 级联、`_setChatProvider` 最终删除、`read_file` 直调守卫 | `core:4783` 仍在委托；`core:899/2643` 有 unregister 但级联语义需核 | 低风险杂活；**动手前先核现状** |
+| D | `_setChatProvider` 最终删除（含 `chat.provider` 老注入链退场） | `core:4791` 标 `@deprecated`；6 个内置 provider 插件（anthropic / openai / glm / gemini / qwen / mock）各留一条 `else if (harness?._setChatProvider)` 回退分支；**生产路径已无调用者**，真走到的只有测试桩（`cli.test.ts:1900`、`core.test.ts:1216+`） | 低风险，但**顺序不能颠倒的三步**（见下）；动手前先确认是否继续支持「老宿主 + 新插件」 |
 | E | VSCode 注册 `languageModelTools`（设计稿 §10-6，B1 变体） | 扩展内无 `lm.registerTool` | 点验需 Copilot |
 | F | 79.9MB 二进制裁剪 B1/B2（`--minify` + 瘦入口） | `packages/cli/package.json` 的 `build:sidecar` 未带 minify | A3 选定后优先级已降；实测可到 62.1MB / zip 后 ~21MB |
+
+> **§2-D 备注：删除 `_setChatProvider` 的前置三步（顺序不可颠倒）**
+>
+> 1. 摘掉 6 个内置 provider 插件里的 `else if (harness?._setChatProvider)` 回退分支；
+> 2. 摘掉 `context.register('chat.provider', p)` —— 这条老注入路径**正是 `resolve()` 链最后一环的
+>    fallback**（`core:4333` 注释：「最后一环：构造期 Provider（或经 context 注入的那一份）」）；
+> 3. 最后删 `core:4791` 的方法本体。
+>
+> 任何一步单做都会让「老宿主 + 新插件」**静默失效**：插件注入不上 ⇒ 回落构造期 Provider，
+> 且**一条告警都没有**（`provider.registered` 压根不会发布）。
 
 ## 3. 需外部条件（无法在本仓闭环）
 
@@ -62,6 +93,12 @@ packages/cli/src/tui.tsx:168     ChatBlockKind 含 'compact' | 'loadmore'
 
 - 遥测 OTLP 二期（`telemetry-plan.md` §10 第 6 步，可选）。
 - codeIntel 插件废弃评估 + `oneOf` 入参自愈（用户既定：等废弃决策一起处理）。
+- `unregister` **级联语义**（原 §2-D 里的一项，按其性质挪到这里）：`runtime-registration-plan.md`
+  §7 明确写着「**刻意不做**」——摘 Provider **不动**使用它的 Agent 定义、摘 Agent **不动**会话历史
+  里的引用，理由是"级联语义复杂且容易造成「静默改历史」，留给调用方显式处理"；§9.9 仍把它列为剩余。
+  现状与设计稿**一致**：`AgentRegistry.unregister`（`core:2643`）= `delete` + publish，无级联；
+  `ProviderRegistry.unregister`（`core:4350`）= `delete` + 默认回落「首个已注册」+ publish
+  `defaultChanged{reason:'unregister'}`。⇒ **它不是欠债，是有意的留白，等真实需求驱动，勿提前实现。**
 
 ---
 
