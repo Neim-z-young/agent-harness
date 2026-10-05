@@ -7,8 +7,8 @@
 
 - 参考上游：OthmanAdi/planning-with-files（MIT）
 - 本方案决策：注入方式 = **system prompt 注入**（落地时按 §4 D1 收敛为 **tail 放置**）；文件位置 = **`.planning/` 目录**；工具策略 = **复用现有读写工具**
-- 状态：**阶段一 / 二 / 三已落地**（2026-10-05，开发日志续 248）—— `packages/plugins/planning-files/`，已登记进内置注册表（`optIn: true`）。阶段四（多计划切换完整化 / catchup / gated 提示）未做
-- 落地时与本文档的三处差异，见 §5 各阶段的"落地备注"
+- 状态：**阶段一 / 二 / 三 / 四已落地**（2026-10-05，开发日志续 248 / 249）—— `packages/plugins/planning-files/`，已登记进内置注册表（`optIn: true`）
+- 落地时与本文档的差异见 §5 各阶段的"落地备注"
 
 ---
 
@@ -76,7 +76,7 @@
 - **注入**：`core.session.preModel` 每轮从盘读最新状态 → 组装计划块 → 在 messages 尾部临时插入一条 user 消息（不 `save`、不落历史）；计划未变化时注入与上轮逐字相同的文本（D8）。
 - **更新**：模型用既有 `write_file`/`read_file` 直接编辑三文件（复用工具策略，与原版一致）；改完运行 `/plan-attest` 重新认证。
 - **认证**：`/plan-attest` 锁 approved hash；注入时当前哈希 ≠ 已认证哈希 → 注入 `[PLAN TAMPERED]` 并拒绝计划正文。
-- **命令**：`/plan`（初始化/展示）、`/plan-status`（状态）、`/plan-attest`（认证）、`/plan-doctor`（自检）、`/plan-complete`（完成度）。
+- **命令**：`/plan`（初始化/展示；`list` / `use <名>` 子动作管多计划）、`/plan-status`（状态）、`/plan-attest`（认证）、`/plan-doctor`（自检）、`/plan-catchup`（历史汇总，显式触发）、`/plan-complete`（完成度）。
 
 ---
 
@@ -150,6 +150,31 @@
 - **catchup**：可选读取 `dataDir/sessions/{sessionId}.json` 汇总历史进度写入 progress.md（显式触发）
 - **gated 提示**：注入块包含未完成阶段数，配合 `/plan-complete` 提醒模型勿提前宣布完成
 
+**落地备注（2026-10-05，续 249）**：
+1. **parallel-write guard 落在 attestation 快照上**：`/plan-attest` 顺手记下当时的已完成条目数
+   （`.attest.json` 的 `checked`），注入侧与 `/plan-status` 比对"现在完成数 < 快照"才报警。
+   不新开状态文件 —— "批准时的进度"本来就该和"批准的哈希"存在一起。旧记录没有该字段 ⇒ **不提示**
+   （把"没有记录"读成"下降了"，会让每个老计划开局就误报）。
+2. **多计划**：`listPlans` 扫 `.planning/` 下合法 slug 子目录，**顺序强制确定**（根在前、slug 升序）——
+   这份列表要出现在命令输出里被人对着念，两次运行顺序不同就是 bug。`/plan use <名>` 切到不存在的
+   名字时**用模板把它建起来**（多计划的用法就是"开一条并行任务线"，先建后填才顺手），建了几个文件
+   写在输出里，不做静默副作用；`/plan use` 无参只展示、不改状态（误敲不该把活动计划清掉）。
+3. **catchup**：`/plan-catchup` 读 `<dataDir>/sessions/<sessionId>.json`，取 user / assistant 文本的
+   **尾部窗口**（最近 12 轮、每条 200 字符），折成单行追加进 `progress.md`。幂等靠
+   `<!-- plan-catchup:<sid> -->` marker —— 追加式文件不能靠"内容比对"去重（同一天的两轮本来就相似）。
+   会话文件只声明最小结构接口，不 import `@harness/workspace`（与 `plan-files.ts` 不依赖 core 同一取舍）；
+   注入块（`===BEGIN PLAN DATA===`）被识别并跳过，历史里的遗留块不该进日志。
+4. **gated 提示**：注入块多一行 `未完成阶段: N 个（Phase x、Phase y），勿提前宣布完成`。
+   全部完成 / 尚无条目时**不出现** —— 那两种情况没有"未完成"可言，这条同时保证 complete 之后
+   注入文本依然逐字稳定。上游 gated mode 是**真的拦**（stop 级拒绝结束），本插件没有该钩子，
+   所以提醒语不能省：只报个数字，模型完全可能读成"进度信息"而不是"别停"。
+5. **降级链顺序被改正**（阶段二遗留问题）：原实现按「目标 → 下一步 → 认证」砍，等于预算一紧就先
+   丢掉 smart 策略的核心（目标 / 下一步，见 D5）。现改为**最不重要的先掉**：
+   gated → 认证 → 目标 → 下一步。
+6. **顺带修掉一处空转**：文档一直写着 `--use ""` 可清除指针，但命令层拿到的是**原始行**（没有 shell
+   拆词），`""` 会原样进被当成非法 slug 抛错 —— 这条文档承诺从来没生效过。现在 `""` / `''` 归一成空串，
+   `/plan use ""` 与 `--use ""` 都真的能清除指针。
+
 ---
 
 ## 6. 与现有机制兼容性
@@ -169,7 +194,7 @@
 | 风险 | 对策 |
 |------|------|
 | 模型修改计划文件后忘 attest，注入触发 TAMPERED 误报 | D4 语义即"未批准修改"；SKILL 指南明确「改完必须 /plan-attest」纪律；`/plan-attest` 一键修复 |
-| 并发会话互相覆盖完成项 | D6：checked 计数提示（本阶段可接受；后续可加文件锁增强） |
+| 并发会话互相覆盖完成项 | D6 已落地（阶段四）：`/plan-attest` 存进度快照，完成数下降时 `/plan-status` 与 `/plan-doctor` 报警；仍非文件锁，真正的互斥要等后续增强 |
 | 注入块占用上下文 token | smart 策略默认裁剪；`inject: 'full'` 显式开启全量；token 上限 300 |
 | tail 临时插入与 ACP 同 hook 的顺序 | 计划注入 hook 与 ACP 均注册 `core.session.preModel`，按注册顺序执行；计划块插入在最后，不影响 ACP 压缩范围 |
 | 模板与上游格式漂移 | 模板外置 .md，文档标注与上游三文件格式对应关系 |
