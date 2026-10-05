@@ -23,9 +23,11 @@ import {
   sumUsage,
   hydrateUsage,
   isBlankUsage,
+  normalizeUsage,
   usageFromMeta,
   usageFromMessages,
   todayUsageLine,
+  providerUsageRow,
   exportStatsJson,
   exportStatsMarkdown,
   USAGE_STATS_KEY,
@@ -317,5 +319,146 @@ describe('foldMessage / rebuildUsage（引擎增量折叠与全量重建必须�
 
   it('是 usageFromMessages 的同一套规则（wrapper 与 rebuild 结果一致）', () => {
     expect(usageFromMessages(script)).toEqual(rebuildUsage(script).usage)
+  })
+})
+
+// ============================================================================
+// Provider 维度
+//
+// 键是**实例路由键**（ProviderConfig.id），不是 provider 类型 —— 成本归因的轴是端点。
+// 两个必须守住的点：
+// 1. 分区键全覆盖，且 `'default'`（未指定 ⇒ 走默认端点）与 `'unknown'`（旧会话无此字段）
+//    不得合并 —— 前者是事实，后者是缺失；
+// 2. 与 model / agent 同源：provider 从**消息 meta** 取，否则「全量自愈重建」会整个丢掉
+//    这一维度（见 core 的 accumulateUsage 双入口）。
+// ============================================================================
+
+describe('Provider 维度', () => {
+  it('recordCall 按 provider 归并 calls / token / 缓存，不同 provider 各自成行', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { provider: 'hy3', model: 'm', input: 100, output: 10, cacheRead: 30, cacheWrite: 5, ts: at(0, 9) })
+    u = recordCall(u, { provider: 'hy3', model: 'm', input: 50, output: 5, cacheRead: 20, cacheWrite: 0, ts: at(0, 9) })
+    u = recordCall(u, { provider: 'openai-2', model: 'gpt', input: 7, output: 1, ts: at(0, 9) })
+
+    expect(u.providers.map((p) => p.provider)).toEqual(['hy3', 'openai-2'])
+    const hy3 = u.providers.find((p) => p.provider === 'hy3')!
+    expect(hy3.calls).toBe(2)
+    expect(hy3.inputTokens).toBe(150)
+    expect(hy3.outputTokens).toBe(15)
+    expect(hy3.cacheRead).toBe(50)
+    expect(hy3.cacheWrite).toBe(5)
+  })
+
+  it("缺省归 'unknown'，显式 'default' 另成一组（「缺失」与「确定走默认端点」不得混淆）", () => {
+    let u = emptyUsage()
+    u = recordCall(u, { input: 1, output: 1, ts: at(0, 9) }) // 调用方没给 ⇒ 旧会话/未记录
+    u = recordCall(u, { provider: 'default', input: 2, output: 2, ts: at(0, 9) }) // 哨兵：确定走默认
+    expect(u.providers.map((p) => p.provider).sort()).toEqual(['default', 'unknown'])
+    expect(u.providers.find((p) => p.provider === 'default')!.inputTokens).toBe(2)
+    expect(u.providers.find((p) => p.provider === 'unknown')!.inputTokens).toBe(1)
+  })
+
+  it('mergeUsage 同 provider 相加、异 provider 并列', () => {
+    let a = emptyUsage()
+    a = recordCall(a, { provider: 'p1', model: 'm', input: 10, output: 1, cacheRead: 2, ts: at(0, 9) })
+    let b = emptyUsage()
+    b = recordCall(b, { provider: 'p1', model: 'm', input: 20, output: 2, cacheRead: 3, ts: at(0, 9) })
+    b = recordCall(b, { provider: 'p2', model: 'm', input: 5, output: 1, ts: at(0, 9) })
+
+    const m = mergeUsage(a, b)
+    expect(m.providers.map((p) => p.provider)).toEqual(['p1', 'p2'])
+    expect(m.providers.find((p) => p.provider === 'p1')).toMatchObject({
+      calls: 2, inputTokens: 30, outputTokens: 3, cacheRead: 5,
+    })
+  })
+
+  it('normalizeUsage：旧落盘记录缺 providers 等字段时补齐（否则下游展开即抛）', () => {
+    // 形态 = 本维度引入之前落盘的 meta.usageStats（真机形态：没有 providers 键）
+    const legacy = {
+      llmCalls: 2, inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0,
+      models: [], tools: [], agents: [], hourly: [],
+    } as unknown as UsageStats
+    const n = normalizeUsage(legacy)
+    expect(n.providers).toEqual([])
+    // 补齐后可直接参与运算（这正是崩溃点：`[...usage.providers]`）
+    const after = recordCall(n, { provider: 'p1', model: 'm', input: 1, output: 1 })
+    expect(after.providers).toHaveLength(1)
+    expect(after.llmCalls).toBe(3)
+    expect(normalizeUsage(undefined).providers).toEqual([])
+  })
+
+  it('usageFromMeta 是落盘记录的唯一反序列化入口 ⇒ 归一化在这里生效', () => {
+    const legacy = {
+      llmCalls: 1, inputTokens: 9, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+      models: [], tools: [], agents: [], hourly: [],
+    }
+    const u = usageFromMeta({ [USAGE_STATS_KEY]: legacy })!
+    expect(u.providers).toEqual([])
+    // 关键回归：折叠路径不会因为旧记录缺字段而抛 TypeError（那会被 catch 吞成"用量静默不增长"）
+    expect(() => foldMessage(u, { meta: { model: 'm', tokenUsage: { input: 1, output: 1 } } }, emptyFoldState())).not.toThrow()
+  })
+
+  it('mergeUsage 容忍旧记录（跨会话聚合的收敛点也补一次）', () => {
+    const legacy = {
+      llmCalls: 1, inputTokens: 5, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0,
+      models: [], tools: [], agents: [], hourly: [],
+    } as unknown as UsageStats
+    let fresh = emptyUsage()
+    fresh = recordCall(fresh, { provider: 'p1', model: 'm', input: 1, output: 1 })
+    const m = mergeUsage(legacy, fresh)
+    expect(m.llmCalls).toBe(2)
+    expect(m.providers.map((p) => p.provider)).toEqual(['p1'])
+  })
+
+  it('foldMessage 从 meta.providerId 取 provider（增量与全量重建同口径）', () => {
+    const script: UsageMessageLike[] = [
+      { meta: { model: 'm', providerId: 'hy3', tokenUsage: { input: 100, output: 20 } }, agentId: 'root', parts: [{ type: 'text' }] },
+      { meta: { model: 'm', providerId: 'openai-2', tokenUsage: { input: 50, output: 5 } }, agentId: 'root', parts: [{ type: 'text' }] },
+      { meta: { model: 'm', tokenUsage: { input: 7, output: 1 } }, agentId: 'root', parts: [{ type: 'text' }] }, // 旧消息：无 providerId
+    ]
+    const rebuilt = rebuildUsage(script)
+    expect(rebuilt.usage.providers.map((p) => p.provider)).toEqual(['hy3', 'openai-2', 'unknown'])
+
+    // 分批折叠（引擎的增量路径）必须得出同一份
+    const state = emptyFoldState()
+    let u = emptyUsage()
+    for (const m of script.slice(0, 1)) u = foldMessage(u, m, state)
+    for (const m of script.slice(1)) u = foldMessage(u, m, state)
+    expect(u.providers).toEqual(rebuilt.usage.providers)
+  })
+
+  it('当日视图不切分 Provider（与 models/tools/agents 同：无法按天切）', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { provider: 'p1', model: 'm', input: 10, output: 1, ts: at(0, 9) })
+    expect(todayUsage(u).providers).toEqual([])
+    expect(usageSince(u, 0).providers).toEqual([])
+  })
+
+  it('providerUsageRow 格式化（与 modelUsageRow 同形，便于对照阅读）', () => {
+    expect(providerUsageRow({ provider: 'hy3', calls: 2, inputTokens: 150, outputTokens: 30, cacheRead: 10, cacheWrite: 0 }))
+      .toBe('hy3 ×2 · ⚡10/w0 in150/out30')
+    expect(providerUsageRow({ provider: 'default', calls: 1, inputTokens: 200, outputTokens: 30, cacheRead: 0, cacheWrite: 0 }))
+      .toBe('default ×1 · in200/out30')
+  })
+
+  it('renderStatsText：Provider 节在模型节之前（粗→细）', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { provider: 'hy3', model: 'm', input: 10, output: 1, ts: at(0, 9) })
+    const text = renderStatsText(u)
+    expect(text).toContain('按 Provider：')
+    expect(text).toContain('hy3 ×1')
+    expect(text.indexOf('按 Provider：')).toBeLessThan(text.indexOf('按模型：'))
+    // 无调用时不出现该节（否则空会话 /stats 会多一行噪音）
+    expect(renderStatsText(emptyUsage())).not.toContain('按 Provider')
+  })
+
+  it('导出报告带 Provider 维度（JSON 字段 + Markdown 小节）', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { provider: 'hy3', model: 'm', input: 300, output: 30, ts: at(0, 9) })
+    const j = JSON.parse(exportStatsJson(u, { sessionId: 's1' }))
+    expect(j.providers).toEqual([{ provider: 'hy3', calls: 1, inputTokens: 300, outputTokens: 30, cacheRead: 0, cacheWrite: 0 }])
+    const md = exportStatsMarkdown(u, { sessionId: 's1' })
+    expect(md).toContain('## 按 Provider')
+    expect(md).toContain('| hy3 | 1 | 300 | 30 | 0 | 0 |')
   })
 })

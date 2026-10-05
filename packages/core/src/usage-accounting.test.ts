@@ -240,6 +240,66 @@ describe('用量纳管：引擎层折叠', () => {
   })
 })
 
+// ===== Provider 维度：引擎把「这次调用走了哪个端点」写进消息 meta =====
+//
+// 这个字段必须落在**消息 meta**（与 model 同位），不能只写进 meta.usageStats：
+// 引擎的累加有两条入口（`accumulateUsage` 增量折叠 / 自愈时 `rebuildUsage(消息)` 全量重建），
+// 后者只看得见消息上的字段 —— 只写累加器会让自愈那一刻把整个维度丢掉。
+// 下面第 3 条用例就是钉住这个不变量的。
+
+describe('用量纳管：Provider 维度', () => {
+  it("未指定端点 ⇒ 消息 meta 记 'default' 哨兵，统计按 'default' 归并", async () => {
+    const { h, sess } = await setup()
+    await collect(h.session.promptStream(sess.id, 'go', 2))
+
+    const u = await h.usage.get(sess.id)
+    expect(u.providers).toHaveLength(1)
+    expect(u.providers[0]).toMatchObject({ provider: 'default', calls: 2, inputTokens: 250, outputTokens: 30 })
+    // 不变量：Provider 是**全覆盖分区** —— 各行 calls 之和恒等于 llmCalls
+    expect(u.providers.reduce((s, p) => s + p.calls, 0)).toBe(u.llmCalls)
+
+    const assistants = (await liveSession(h, sess.id)).messages.filter((m) => m.role === 'assistant')
+    expect(assistants.length).toBe(2)
+    for (const m of assistants) expect(m.meta?.providerId).toBe('default')
+    await h.stop()
+  })
+
+  it('显式 providerId ⇒ 按实例路由键归并（同一模型挂多端点时能分开算账）', async () => {
+    const provider = scriptedProvider([toolCallChunks, finalTextChunks])
+    const h = await createHarness({
+      agents: [{ ...agent, model: { providerId: 'p1', modelId: 'm' } }],
+      chatProvider: provider,
+    })
+    h.tools.register(echoTool)
+    const sess = await h.session.create()
+    await collect(h.session.promptStream(sess.id, 'go', 2))
+
+    const u = await h.usage.get(sess.id)
+    expect(u.providers.map((p) => p.provider)).toEqual(['p1'])
+    expect(u.providers[0]!.calls).toBe(2)
+    expect((await liveSession(h, sess.id)).messages.find((m) => m.role === 'assistant')?.meta?.providerId).toBe('p1')
+    await h.stop()
+  })
+
+  it('自愈（全量重建）不丢 Provider 维度：重建值必须等于增量值', async () => {
+    const { h, sess } = await setup()
+    await collect(h.session.promptStream(sess.id, 'go', 2))
+
+    // 弄脏检查点（模拟 /compact、deleteMessage 这类外部改写）⇒ 下一轮走 rebuildUsage(消息)
+    await h.session.updateMeta(sess.id, {
+      usageFold: { upToMessageId: 'ghost-does-not-exist', state: { pending: null, attributed: false } },
+    })
+    await collect(h.session.promptStream(sess.id, 'third', 1))
+
+    const u = await h.usage.get(sess.id)
+    const live = await liveSession(h, sess.id)
+    expect(u.providers).toEqual(usageFromMessages(live.messages).providers)
+    expect(u.providers.length).toBeGreaterThan(0)
+    expect(u.providers.reduce((s, p) => s + p.calls, 0)).toBe(u.llmCalls)
+    await h.stop()
+  })
+})
+
 // ===== core.llm.usage：引擎把 provider 用量广播给插件（P3 的前提）=====
 //
 // 这条通道此前**根本不存在**：`@harness/acp-context` 的 `buildProviderCacheEvent` 注释写着

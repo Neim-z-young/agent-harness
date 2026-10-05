@@ -52,6 +52,7 @@ import {
   uncachedInput,
   cacheHitRate,
   modelUsageRow,
+  providerUsageRow,
   toolUsageRow,
   agentUsageRow,
   hourLabel,
@@ -753,6 +754,7 @@ export {
   uncachedInput,
   cacheHitRate,
   modelUsageRow,
+  providerUsageRow,
   toolUsageRow,
   agentUsageRow,
   hourLabel,
@@ -2253,6 +2255,17 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                     <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
                       {cacheUsageLine(stats.usage)}
                     </text>
+                  )}
+                  {/* Provider 在模型之前：粗→细（一个 provider 常含多个模型），与 /stats 的报告顺序一致 */}
+                  {stats.usage.providers.length > 0 && (
+                    <>
+                      <text attributes={createTextAttributes({ bold: true })}>Provider</text>
+                      {stats.usage.providers.map((p) => (
+                        <text key={p.provider} attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                          {providerUsageRow(p)}
+                        </text>
+                      ))}
+                    </>
                   )}
                   {stats.usage.models.length > 0 && (
                     <>

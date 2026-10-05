@@ -49,6 +49,7 @@ import {
   recordTaskDone,
   uncachedInput,
   modelUsageRow,
+  providerUsageRow,
   toolUsageRow,
   agentUsageRow,
   hourLabel,
@@ -715,11 +716,16 @@ describe('统计面板 / 复制辅助 / 帮助面板（模块 D）', () => {
     expect(uncachedInput(u)).toBe(50) // 110 - 40 - 20
   })
 
-  it('modelUsageRow / toolUsageRow / agentUsageRow / hourlyRow：格式化统计行', () => {
+  it('modelUsageRow / providerUsageRow / toolUsageRow / agentUsageRow / hourlyRow：格式化统计行', () => {
     expect(modelUsageRow({ model: 'gpt-4o', calls: 2, inputTokens: 150, outputTokens: 30, cacheRead: 10, cacheWrite: 0 }))
       .toBe('gpt-4o ×2 · ⚡10/w0 in150/out30')
     expect(modelUsageRow({ model: 'deepseek', calls: 1, inputTokens: 200, outputTokens: 30, cacheRead: 0, cacheWrite: 0 }))
       .toBe('deepseek ×1 · in200/out30')
+    // Provider 行与 model 行同形（面板里两节上下相邻，形状一致才好对照）
+    expect(providerUsageRow({ provider: 'hy3', calls: 2, inputTokens: 150, outputTokens: 30, cacheRead: 10, cacheWrite: 0 }))
+      .toBe('hy3 ×2 · ⚡10/w0 in150/out30')
+    expect(providerUsageRow({ provider: 'default', calls: 1, inputTokens: 200, outputTokens: 30, cacheRead: 0, cacheWrite: 0 }))
+      .toBe('default ×1 · in200/out30')
     expect(toolUsageRow({ tool: 'readFile', count: 3, errors: 0, inputTokens: 0, outputTokens: 0 })).toBe('readFile ×3')
     expect(toolUsageRow({ tool: 'shell', count: 1, errors: 2, inputTokens: 90, outputTokens: 30 }))
       .toBe('shell ×1 (2❌) · 90/30')

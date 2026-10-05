@@ -9,17 +9,34 @@
  * 会话级 LLM 用量统计，粒度与维度：
  * - 单轮 llm 对话：每一条 done 事件 = 一次 LLM 调用（llmCalls）
  * - 会话级别：整个 UsageStats 就是当前会话的聚合
+ * - 按 Provider：providers[]（**实例路由键**维度调用与 token，见下）
  * - 按模型：models[]（调用次数 + input/output + 缓存命中/写入）
  * - 按 agent/任务：agents[]（agentId 维度调用与 token，任务完成数）
  * - 按工具：tools[]（调用次数 + 失败数 + 归并的 input/output token）
  * - 按小时时序：hourly[]（每小时调用与 token，用于时序展示）
  * - 缓存明细：cacheReadTokens（命中缓存）/ cacheWriteTokens（写入缓存），
  *   未命中缓存 = inputTokens - cacheReadTokens - cacheWriteTokens
+ *
+ * 「按 Provider」的键是 `ProviderConfig.id`（**实例路由键**，如 `hy3` / `anthropic-2`），
+ * 不是 provider 类型（`anthropic`/`openai`）。理由：成本归因的轴是**端点** —— 同一类型挂
+ * 两个 key 就是两份账单，按类型分会让它们合成一行，账就对不上。这也与 `core.llm.usage`
+ * 事件、`ProviderInstanceInfo.id` 用同一套词汇，不需要在展示层再做一次映射。
+ *
+ * 分区键是**全覆盖**的（每一次调用都恰好落进一个分组），因此缺省值有语义：
+ * - `'default'`：调用方未显式指定端点 ⇒ 走默认 Provider（`_prepareQueryOnce` 的哨兵值）；
+ * - `'unknown'`：历史消息里根本没有 `providerId` 字段（本维度引入之前落盘的会话）。
+ * 两者刻意不合并 —— 前者是「确定走了默认端点」，后者是「不知道走的哪个」。
  */
 
 /** 一次 LLM 调用的记录参数 */
 export interface CallRecord {
   model?: string
+  /**
+   * Provider 实例路由键（`ProviderConfig.id`，如 `hy3` / `anthropic-2`）。
+   * 缺省归 `'unknown'` —— 但注意：真正走默认 Provider 的调用**不该**走缺省，
+   * 应由调用方显式传 `'default'`（core 就是这么写的），否则两种情形会被混成一组。
+   */
+  provider?: string
   agentId?: string
   input?: number
   output?: number
@@ -39,6 +56,18 @@ export interface ToolRecord {
   input?: number
   /** 归并到该工具的 output token */
   output?: number
+}
+
+/** 单 Provider 实例统计（键 = ProviderConfig.id 实例路由键；`'default'` / `'unknown'` 见包注释） */
+export interface ProviderUsage {
+  provider: string
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  /** 命中缓存 token */
+  cacheRead: number
+  /** 写入缓存 token */
+  cacheWrite: number
 }
 
 /** 单模型统计 */
@@ -91,6 +120,8 @@ export interface UsageStats {
   outputTokens: number
   cacheReadTokens: number
   cacheWriteTokens: number
+  /** 按 Provider 实例路由键（与 models 同为「调用的划分」，粒度更粗） */
+  providers: ProviderUsage[]
   models: ModelUsage[]
   tools: ToolUsage[]
   agents: AgentUsage[]
@@ -105,6 +136,7 @@ export function emptyUsage(): UsageStats {
     outputTokens: 0,
     cacheReadTokens: 0,
     cacheWriteTokens: 0,
+    providers: [],
     models: [],
     tools: [],
     agents: [],
@@ -112,15 +144,63 @@ export function emptyUsage(): UsageStats {
   }
 }
 
-/** 记录一次 LLM 调用（含用量与缓存明细），并按模型 / agent / 小时维度归并 */
+/**
+ * 读边界归一：补齐历史记录里**缺失的维度数组**，返回可直接参与运算的累积器。
+ *
+ * 为什么必须有：`providers` 是本维度引入后才写进落盘记录的字段，此前会话的
+ * `meta.usageStats` 里没有它。而下游是**直接迭代**这些数组的
+ * （`[...usage.providers]` / `mergeUsage`），缺失即 `undefined` ⇒ 展开就抛
+ * `TypeError: undefined is not iterable`，而且抛点在 `accumulateUsage` 的
+ * try/catch 里 ⇒ 症状是"用量静默不增长"，不是崩溃，极难定位。
+ *
+ * 口径选择：**读边界补齐，不写迁移脚本、不升版本号**。旧会话读出来 `providers: []`，
+ * 新调用逐条追加即可（渐进填充）；历史调用不回填（当时的端点信息已不可考，
+ * 编一个出来就是假数据）。`models/tools/agents/hourly` 一并防御 —— 同一个反序列化
+ * 边界，没理由只保一个字段。
+ */
+export function normalizeUsage(u: UsageStats | undefined): UsageStats {
+  if (!u) return emptyUsage()
+  return {
+    ...u,
+    providers: u.providers ?? [],
+    models: u.models ?? [],
+    tools: u.tools ?? [],
+    agents: u.agents ?? [],
+    hourly: u.hourly ?? [],
+  }
+}
+
+/** 记录一次 LLM 调用（含用量与缓存明细），并按 provider / 模型 / agent / 小时维度归并 */
 export function recordCall(usage: UsageStats, rec: CallRecord = {}): UsageStats {
   const m = rec.model || 'unknown'
+  const prov = rec.provider || 'unknown'
   const agentId = rec.model ? (rec.agentId || 'root') : 'root'
   const i = rec.input ?? 0
   const o = rec.output ?? 0
   const cr = rec.cacheRead ?? 0
   const cw = rec.cacheWrite ?? 0
   const ts = rec.ts ?? Date.now()
+
+  // 按 Provider 实例归并（粒度最粗，放在最前 —— 与展示顺序一致）
+  let providers = usage.providers ?? []
+  const pIdx = providers.findIndex((x) => x.provider === prov)
+  if (pIdx === -1) {
+    providers = [...providers, { provider: prov, calls: 1, inputTokens: i, outputTokens: o, cacheRead: cr, cacheWrite: cw }]
+  } else {
+    const cur = providers[pIdx]
+    providers = [
+      ...providers.slice(0, pIdx),
+      {
+        ...cur,
+        calls: cur.calls + 1,
+        inputTokens: cur.inputTokens + i,
+        outputTokens: cur.outputTokens + o,
+        cacheRead: cur.cacheRead + cr,
+        cacheWrite: cur.cacheWrite + cw,
+      },
+      ...providers.slice(pIdx + 1),
+    ]
+  }
 
   // 按模型归并
   let models = usage.models
@@ -187,6 +267,7 @@ export function recordCall(usage: UsageStats, rec: CallRecord = {}): UsageStats 
     outputTokens: usage.outputTokens + o,
     cacheReadTokens: usage.cacheReadTokens + cr,
     cacheWriteTokens: usage.cacheWriteTokens + cw,
+    providers,
     models,
     tools: usage.tools,
     agents,
@@ -290,7 +371,8 @@ export function isBlankUsage(u: UsageStats | undefined): boolean {
 
 /**
  * 截取 `fromTs`（含）之后的用量：按小时桶过滤后重算汇总。
- * models / tools / agents 无法按天切分，置空（hourly 保留当日桶，便于时序展示）。
+ * providers / models / tools / agents 无法按天切分，一律置空
+ * （hourly 保留当日桶，便于时序展示）。
  */
 export function usageSince(u: UsageStats, fromTs: number): UsageStats {
   const buckets = (u.hourly ?? []).filter((h) => h.hour >= fromTs)
@@ -312,6 +394,7 @@ export function usageSince(u: UsageStats, fromTs: number): UsageStats {
     outputTokens,
     cacheReadTokens,
     cacheWriteTokens,
+    providers: [],
     models: [],
     tools: [],
     agents: [],
@@ -326,6 +409,29 @@ export function todayUsage(u: UsageStats, now: number = Date.now()): UsageStats 
 
 /** 合并两个累积器（同 key 维度相加；hourly 按小时归并并保持升序） */
 export function mergeUsage(a: UsageStats, b: UsageStats): UsageStats {
+  // 归一：任意一侧可能是**旧落盘记录**（没有 providers 等新字段）。
+  // 本函数是跨会话聚合（sumUsage / 当日归集 / 子 agent rollup）的收敛点，
+  // 在这里补一次比在每个调用方补一次可靠。
+  a = normalizeUsage(a)
+  b = normalizeUsage(b)
+
+  const providers = [...a.providers]
+  for (const p of b.providers) {
+    const i = providers.findIndex((x) => x.provider === p.provider)
+    if (i === -1) providers.push({ ...p })
+    else {
+      const c = providers[i]
+      providers[i] = {
+        ...c,
+        calls: c.calls + p.calls,
+        inputTokens: c.inputTokens + p.inputTokens,
+        outputTokens: c.outputTokens + p.outputTokens,
+        cacheRead: c.cacheRead + p.cacheRead,
+        cacheWrite: c.cacheWrite + p.cacheWrite,
+      }
+    }
+  }
+
   const models = [...a.models]
   for (const m of b.models) {
     const i = models.findIndex((x) => x.model === m.model)
@@ -399,6 +505,7 @@ export function mergeUsage(a: UsageStats, b: UsageStats): UsageStats {
     outputTokens: a.outputTokens + b.outputTokens,
     cacheReadTokens: a.cacheReadTokens + b.cacheReadTokens,
     cacheWriteTokens: a.cacheWriteTokens + b.cacheWriteTokens,
+    providers,
     models,
     tools,
     agents,
@@ -433,6 +540,12 @@ export function hydrateUsage(s?: {
 /** 当日用量单行摘要：`今日 N次 · inX/outY` */
 export function todayUsageLine(u: UsageStats): string {
   return `今日 ${u.llmCalls}次 · in${u.inputTokens}/out${u.outputTokens}`
+}
+
+/** 单 Provider 统计行：`provider ×calls · inN(⚡cr)outN`（与 modelUsageRow 同形，便于对照阅读） */
+export function providerUsageRow(p: ProviderUsage): string {
+  const cache = p.cacheRead > 0 || p.cacheWrite > 0 ? `⚡${p.cacheRead}/w${p.cacheWrite} ` : ''
+  return `${p.provider} ×${p.calls} · ${cache}in${p.inputTokens}/out${p.outputTokens}`
 }
 
 /** 单模型统计行：`model ×calls · inN(⚡cr)outN` */
@@ -480,11 +593,16 @@ export function sparkline(value: number, maxValue: number, width: number): strin
 /** 约定写入 Session.meta 的 key：会话级用量统计数据 */
 export const USAGE_STATS_KEY = 'usageStats'
 
-/** 从 Session.meta 读取已持久化的用量统计（无则返回空累积器） */
+/**
+ * 从 Session.meta 读取已持久化的用量统计（无则返回 undefined）。
+ *
+ * **本函数是落盘记录的唯一反序列化入口**，因此归一（补齐缺失维度数组）放在这里 ——
+ * 见 {@link normalizeUsage}：旧记录没有 `providers`，下游直接展开就会抛。
+ */
 export function usageFromMeta(meta: Record<string, unknown> | undefined): UsageStats | undefined {
   const v = meta?.[USAGE_STATS_KEY]
   if (!v || typeof v !== 'object') return undefined
-  return v as UsageStats
+  return normalizeUsage(v as UsageStats)
 }
 
 /** 折叠过程的跨消息状态：`pending` = 最近一次 LLM 用量，`attributed` = 是否已归并到工具 */
@@ -518,11 +636,17 @@ export interface UsageMessageLike {
  * 两个口径一旦分叉，用户看到的就是用量莫名其妙跳变）。
  */
 export function foldMessage(u: UsageStats, m: UsageMessageLike, state: UsageFoldState): UsageStats {
-  const meta = m.meta as { model?: string; tokenUsage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } } | undefined
+  const meta = m.meta as { model?: string; providerId?: string; tokenUsage?: { input?: number; output?: number; cacheRead?: number; cacheWrite?: number } } | undefined
   if (meta?.tokenUsage) {
     const tu = meta.tokenUsage
     u = recordCall(u, {
       model: meta.model,
+      // Provider 维度：与 model 同源（都从 assistant 消息的 meta 上取）。
+      // **必须**从消息取而不是从事件流取，理由同下面的 agentId：引擎的「增量折叠」与
+      // 「全量自愈重建」是同一套规则的两个入口（rebuildUsage 就是逐条调用本函数），
+      // 从事件流取会让自愈那一刻把 provider 维度整个丢掉。
+      // meta 里没有该字段（本维度引入前落盘的旧会话）⇒ 归 'unknown'，不编造端点。
+      provider: meta.providerId,
       // agent 维度：宿主此前是从事件流里取 agentId 归并的，引擎侧改从消息上取
       // （core 会把当前 agentId 写在 assistant 消息上），这样重建与增量同口径。
       agentId: m.agentId,
@@ -583,6 +707,12 @@ export function renderStatsText(u: UsageStats): string {
   if (u.cacheReadTokens > 0 || u.cacheWriteTokens > 0) {
     lines.push(`缓存：命中 ${u.cacheReadTokens}（${cacheHitRate(u)}%），写入 ${u.cacheWriteTokens}，未命中 ${uncachedInput(u)}`)
   }
+  // Provider 在模型**之前**：读统计是自顶向下"先看在哪个端点、再看哪个模型"，
+  // 且 provider 是更粗的划分（一个 provider 常含多个模型），粗→细才不会来回跳。
+  if (u.providers.length) {
+    lines.push('按 Provider：')
+    for (const p of u.providers) lines.push(`  ${providerUsageRow(p)}`)
+  }
   if (u.models.length) {
     lines.push('按模型：')
     for (const m of u.models) lines.push(`  ${modelUsageRow(m)}`)
@@ -624,6 +754,7 @@ export function exportStatsJson(u: UsageStats, ctx: ExportStatsCtx = {}): string
     cacheReadTokens: u.cacheReadTokens,
     cacheWriteTokens: u.cacheWriteTokens,
     uncachedInput: uncachedInput(u),
+    providers: u.providers,
     models: u.models,
     tools: u.tools,
     agents: u.agents,
@@ -682,6 +813,10 @@ export function exportStatsMarkdown(u: UsageStats, ctx: ExportStatsCtx = {}): st
     L.push('| ' + header.map(() => '---').join(' | ') + ' |')
     for (const r of rows) L.push('| ' + r.join(' | ') + ' |')
     L.push('')
+  }
+  if (u.providers.length) {
+    section('按 Provider', ['Provider', '调用', '输入', '输出', '缓存命中', '缓存写入'],
+      u.providers.map((p) => [p.provider, String(p.calls), String(p.inputTokens), String(p.outputTokens), String(p.cacheRead), String(p.cacheWrite)]))
   }
   if (u.models.length) {
     section('按模型', ['模型', '调用', '输入', '输出', '缓存命中', '缓存写入'],

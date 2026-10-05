@@ -114,6 +114,15 @@ export interface Message {
   meta?: {
     /** 模型名 */
     model?: string
+    /**
+     * Provider 实例路由键（`ProviderConfig.id`；未显式指定时为 `'default'` 哨兵）。
+     *
+     * 引擎在构造 assistant 消息时与 `model` 一同写入。**用量统计的 Provider 维度
+     * 就靠它**（`@harness/usage` 的 `foldMessage` 从这里读，因而增量折叠与全量重建同口径）。
+     * 本维度引入之前落盘的会话没有这个字段 ⇒ 统计侧归 `'unknown'`（"不知道走的哪个"），
+     * 与 `'default'`（"确定走了默认端点"）刻意区分。
+     */
+    providerId?: string
     /** token 用量（含缓存命中/未命中明细） */
     tokenUsage?: TokenUsage
     [key: string]: unknown

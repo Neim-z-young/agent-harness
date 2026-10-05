@@ -3435,6 +3435,17 @@ export class AgentRuntimeImpl implements AgentRuntime {
       agentId,
       meta: {
         model,
+        // Provider 维度：与 model 同位写进消息 meta —— 这不是"再存一份状态"，而是**必须**。
+        // 用量累加有两条入口：`accumulateUsage` 的增量折叠，与自愈时的 `rebuildUsage(消息)`
+        // 全量重建；后者只看得见消息上的字段。provider 若不落在 meta，自愈那一刻
+        // （触发条件恰是"消息被外部改过"）会把 provider 维度整个丢掉 —— 两条路径分叉，
+        // 用户看到的就是"用量统计跳了一下"。
+        //
+        // 这里**原样记录 `'default'` 哨兵**（与下面 `core.llm.usage` 事件的"省略"规则相反）：
+        // 事件载荷省略它，是因为那 feed 的是"每个端点的缓存视图"，凑一个不存在的端点会污染画面；
+        // 而统计需要一个**全覆盖分区键** —— 省略会让"明确走默认端点"和"旧会话没这个字段"
+        // 混成同一组 'unknown'，信息就没法还原了。两条规则不同，理由都写在各自位置。
+        providerId,
         tokenUsage: tokenUsage ? {
           input: tokenUsage.input,
           output: tokenUsage.output,
