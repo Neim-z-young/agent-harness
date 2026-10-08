@@ -887,6 +887,37 @@ export interface OccupancyCompactOpts {
 }
 
 /**
+ * ACP 落在 `session.meta` 下的「上一轮**实际发出** token」口径。
+ *
+ * 键名与 `@harness/acp-context` 的 `ACP_OCCUPANCY_KEY` 对齐。这里刻意**不** import 那个包：
+ * 本包依赖纪律是"零依赖 @harness/core / @harness/session"，为一个字符串破例不划算。
+ * 代价是键名成了跨包字符串契约 —— 改名只会让本函数返回 undefined（第二行消失），
+ * 是**优雅降级**而不是崩，故可接受。
+ */
+const ACP_OCCUPANCY_META_KEY = 'acp.occupancy.v1'
+
+/**
+ * 读「实际发出」口径；缺键 / 结构不对一律返回 undefined（调用方退化为只输出原文口径一行）。
+ *
+ * 为什么要这个数：`estimateTokens`（原文口径）**不含压缩效果**，只给它会得到
+ * "压缩完占用怎么还没降"的误读 —— 两个数必须并排。语义与取舍见
+ * `docs/context-compression-plan.md`（两条压缩管线）。
+ */
+function readAcpOccupancy(
+  session: StatsSessionLike | undefined,
+): { requestTok: number; rawTok: number; window?: number } | undefined {
+  const raw = session?.meta?.[ACP_OCCUPANCY_META_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as { requestTok?: unknown; rawTok?: unknown; window?: unknown }
+  if (typeof r.requestTok !== 'number' || !Number.isFinite(r.requestTok)) return undefined
+  const rawTok = typeof r.rawTok === 'number' && Number.isFinite(r.rawTok) ? r.rawTok : r.requestTok
+  const win = typeof r.window === 'number' && Number.isFinite(r.window) && r.window > 0
+    ? r.window
+    : undefined
+  return { requestTok: r.requestTok, rawTok, ...(win != null ? { window: win } : {}) }
+}
+
+/**
  * 解析当前会话用量统计：meta 持久化的累积器（有数据时）优先 → 否则由消息历史重建。
  * 与 TUI 共用 `hydrateUsage`，保证重连（resume）后能读到重连前累计的用量，
  * 且不会被「空累积器」误判为无数据。
@@ -965,16 +996,29 @@ export async function renderContextOccupancy(
     if (!get) return fallback
     try { return (await get.call(harness.session, id)) ?? fallback } catch { return fallback }
   }
+  // 回源一次并复用：窗口解析与「实际发出」口径都要读最新那份会话的 meta
+  const live = await liveSession(session, session.id)
   const window = resolveWindow
-    ? resolveWindow(await liveSession(session, session.id))
+    ? resolveWindow(live)
     : (compactOpts.contextWindowTokens ?? 200_000)
   const threshold = Math.floor((window - reserved) * (pct / 100))
 
   const est = (await harness.session?.estimateTokens?.(session.id, calibration).catch(() => 0)) ?? 0
   const lines = [
     `上下文占用：${est.toLocaleString()} / ${window.toLocaleString()} tokens（${pctOf(est, window)}%）` +
-      ` · 自动压缩阈值 ${threshold.toLocaleString()}（${pct}% ×（窗口−保留 ${reserved.toLocaleString()}））`,
+      ` · 自动压缩阈值 ${threshold.toLocaleString()}（${pct}% ×（窗口−保留 ${reserved.toLocaleString()}））` +
+      ` · 原文口径（压缩不会降低此数）`,
   ]
+  // 「实际发出」= ACP 压缩后真正发给模型的量。原文口径不含压缩效果，只给它会得到
+  // "压缩完占用怎么还没降"的误读，故两个数并排。ACP 未启用 / 尚未跑过一轮 ⇒ 无此键 ⇒ 只出上面一行。
+  const acpOcc = readAcpOccupancy(live)
+  if (acpOcc) {
+    const aw = acpOcc.window ?? window
+    lines.push(
+      `  实际发出：${acpOcc.requestTok.toLocaleString()} / ${aw.toLocaleString()} tokens（${pctOf(acpOcc.requestTok, aw)}%）` +
+        ` · ACP 压缩后（未压缩为 ${acpOcc.rawTok.toLocaleString()}）`,
+    )
+  }
   // 子 agent 上下文：每个子会话单独一行（分母按该子会话自身端点解析 —— 解析不出才回落父会话的窗口；
   // 子会话量小则不可见 —— 有值才列）
   const usageApi = harness.usage

@@ -73,6 +73,19 @@ import {
 export const ACP_META_KEY = 'acp.v1'
 /** session.meta 中存储"被 session 压缩折叠窗口的原文归档"的键（跨重启回溯用） */
 export const ACP_ARCHIVE_KEY = 'acp.archive.v1'
+/**
+ * session.meta 中存储「上一轮**实际发出** token 口径」的键（面板展示用）。
+ *
+ * 为什么**单列一个键**、不塞进 {@link ACP_META_KEY} 的 state：state 是按 JSON 快照 diff
+ * 决定写不写的（见 `stateSnapshot`），把"每轮都在变的 token 数"混进去会让那个
+ * "仅在变化时写"的优化失效 —— 变成每轮都写一次完整 state 与归档。单列后两边各按各的
+ * 变化频率写。
+ *
+ * 消费方：`@harness/usage` 的 `renderContextOccupancy`。它原本只显示 `estimateTokens`
+ * 的**原文口径**，而那个数不含压缩效果 ⇒ 真机上出现"压缩成功、占用百分比却纹丝不动"
+ * 的误读。两个数并排后，面板才能同时回答"离强制压缩还有多远"与"这次请求实际带多少"。
+ */
+export const ACP_OCCUPANCY_KEY = 'acp.occupancy.v1'
 
 /**
  * 脱敏内核压缩系统提示里的**字面示例标签**。
@@ -436,6 +449,8 @@ interface AcpSessionCtx {
   recordedBlockIds: Set<string>
   /** 最近一次持久化的状态 JSON（用于跳过无变化的重复写入） */
   stateSnapshot: string
+  /** 最近一次写入 {@link ACP_OCCUPANCY_KEY} 的 JSON（同样用于跳过无变化的重复写入） */
+  occupancySnapshot?: string
   // ---- 增量渲染缓存 ----
   /** 已渲染（含压缩效果/refs 标签）的历史前缀的原始消息 id 序列 */
   prefixIds: string[]
@@ -1411,6 +1426,27 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     } catch {
       // 持久化失败不致命，内存态仍可用
     }
+  }
+
+  // ---- 面板口径：把「本轮真正发出去的 token」落进独立 meta 键 ----
+  // 与 ACP_META_KEY 分开写：那边按 state 的 JSON 快照 diff（仅变化时写），而 token 数每轮都在动，
+  // 混进去会让那个优化失效。消费方 @harness/usage 的 renderContextOccupancy 用它展示
+  // 「实际发出」，与"原文口径"并排 —— 只给原文口径会被读成"压缩完怎么还没降"。
+  try {
+    const occSnap = {
+      // 发往模型的量（已应用压缩：被块覆盖的区间换成了摘要）
+      requestTok: estimateTokens(res.messages, countTokens),
+      // 同期未压缩口径，供面板展示"省了多少"
+      rawTok: estimateTokens(inflat.cores, countTokens),
+      window: deps.config.modelContextLimit,
+    }
+    const occJson = JSON.stringify(occSnap)
+    if (ctx.occupancySnapshot !== occJson) {
+      ctx.occupancySnapshot = occJson
+      await meta.patch({ [ACP_OCCUPANCY_KEY]: occSnap })
+    }
+  } catch {
+    // 写失败不影响主流程；消费方在键缺失时退化为只输出原文口径那一行
   }
 
   // ---- 折叠轮持久化原文到 ACP_ARCHIVE_KEY ----

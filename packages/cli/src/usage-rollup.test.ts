@@ -12,7 +12,13 @@ import type { CompactOptions } from '@harness/session'
  */
 
 /** 最小 harness 替身：只提供 usage 通道 */
-const fakeHarness = (children: string[], usage: Record<string, ReturnType<typeof emptyUsage>>, est?: Record<string, number>) =>
+const fakeHarness = (
+  children: string[],
+  usage: Record<string, ReturnType<typeof emptyUsage>>,
+  est?: Record<string, number>,
+  /** 按会话 id 给 `session.get` 回填 meta（`renderContextOccupancy` 从它读 ACP 的「实际发出」口径） */
+  metas?: Record<string, Record<string, unknown>>,
+) =>
   ({
     usage: {
       children: async () => children,
@@ -20,8 +26,8 @@ const fakeHarness = (children: string[], usage: Record<string, ReturnType<typeof
     },
     session: {
       estimateTokens: async (id: string) => est?.[id] ?? 0,
-      // 供 renderContextOccupancy 回源取「最新一份」会话（它据此解析各会话自己的窗口）
-      get: async (id: string) => ({ id }),
+      // 供 renderContextOccupancy 回源取「最新一份」会话（它据此解析各会话自己的窗口 + 读 ACP 占用口径）
+      get: async (id: string) => ({ id, ...(metas?.[id] ? { meta: metas[id] } : {}) }),
     },
   }) as never
 
@@ -96,5 +102,34 @@ describe('renderContextOccupancy', () => {
     )
     expect(line).toContain('上下文占用：45,000 / 200,000 tokens（22.5%）')
     expect(line).toContain('子会话 c1：占用 20,000 / 200,000 tokens（10.0%）')
+  })
+
+  // 原文口径（estimateTokens）不含压缩效果：只显示它会出现"压缩成功、占用却没降"的误读
+  // （真机 s_1791373374635_9hqyb：原文口径 66.8% vs 实际发出 22.0%）。故两个数必须并排。
+  it('有 ACP「实际发出」口径时并排两行；原文口径行明确标注口径', async () => {
+    const line = await renderContextOccupancy(
+      fakeHarness([], {}, { s1: 45_000 }, {
+        s1: { 'acp.occupancy.v1': { requestTok: 12_000, rawTok: 45_000, window: 200_000 } },
+      }),
+      { id: 's1' } as never,
+      compactOpts,
+    )
+    expect(line).toContain('上下文占用：45,000 / 200,000 tokens（22.5%）')
+    expect(line).toContain('原文口径（压缩不会降低此数）')
+    expect(line).toContain('实际发出：12,000 / 200,000 tokens（6.0%）')
+    expect(line).toContain('ACP 压缩后（未压缩为 45,000）')
+  })
+
+  it('ACP 口径缺失或结构不对 ⇒ 只有原文口径一行，不出现「实际发出」', async () => {
+    const missing = await renderContextOccupancy(fakeHarness([], {}, { s1: 45_000 }), { id: 's1' } as never, compactOpts)
+    expect(missing).toContain('上下文占用：45,000 / 200,000 tokens（22.5%）')
+    expect(missing).not.toContain('实际发出')
+
+    const malformed = await renderContextOccupancy(
+      fakeHarness([], {}, { s1: 45_000 }, { s1: { 'acp.occupancy.v1': { requestTok: 'x' } } }),
+      { id: 's1' } as never,
+      compactOpts,
+    )
+    expect(malformed).not.toContain('实际发出')
   })
 })
