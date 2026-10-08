@@ -1,5 +1,95 @@
 # Agent Harness 开发日志
 
+## 2026-10-08（续 255）上下文占用的两把尺子：面板并排 + 两道闸（B2 合取条件 / B3 窗口保护）
+
+### 起因
+
+会话取证 `s_1791373374635_9hqyb` 一路问下来，从一个**显示问题**长成一条**设计缺口**。
+
+用户先问「有压缩的话，上下文占用百分比为啥没降」⇒ 查实同一时刻**三把尺子量出三个数**：
+面板 66.8% / 实际发出 22.0% / autoCompact 触发线 85.5%。面板那个数（`session.estimateTokens`）
+是**原文口径**、不含压缩效果 —— ACP 的 `compress` **不删 `sess.messages`**，只把被块覆盖的区间
+在本轮待发副本里换成摘要，所以那个数只随对话增长。而面板与 `compactIfNeeded` 用的是**同一把**
+原文尺子，它同时兼任"窗口保护"。
+
+缺口正在这里：`compactIfNeeded` 判原文口径（守"内存/磁盘别膨胀"，本身没错），而 ACP 把真实请求
+压得很低 ⇒ 原文口径先撞线，**在模型端还很宽裕时就裁掉百余条**（真机：原文 79.6% 撞线时
+真实请求只有 31.5%，一次裁掉 `keepRecentMessages` 默认 10 条之外的全部）。
+
+用户拍板：**B2 + B3 都做**，且 B3 **复用内核的压缩、不复用插件的 `runCompacting`**。
+
+### 落地（三段）
+
+| 段 | 产出 |
+|---|---|
+| ① 面板双口径 | `acp-context` 每轮写 `session.meta['acp.occupancy.v1']`（`{requestTok, rawTok, window}`）；`@harness/usage` 的 `renderContextOccupancy` 增「实际发出」一行，并在原文口径那行尾注「压缩不会降低此数」。**单列 meta 键**而非塞进 `acp.v1` —— 那边按 state 的 JSON 快照 diff 决定写不写，混入每轮都在变的 token 数会让"仅变化时写"的优化失效（退化成每轮写整份 state + 归档） |
+| ② B2 | `compactIfNeeded` 加**合取条件**：ACP 报过真实发出量时，还要求它也达 `requestPressurePct`。键缺失（ACP 关 / 尚未跑过一轮）⇒ 条件**视为成立** ⇒ 老行为逐位不变。键的**唯一产地**放 `@harness/session`（`ACP_OCCUPANCY_META_KEY` + `readAcpOccupancy`），core 从 session 导入 |
+| ③ B3 | 新增 `acp-context/window-guard.ts` 四档：`notify 0.75` → `forceCompress 0.90` → 内核 `truncate 0.95` → `refuse 0.98`（需显式开）。fold 复用内核 `nudge.compressibleRanges` + `engine.applyCompression`，摘要复用既有纯函数 `defaultRuleSummary`；**不自己划范围、不写折叠实现、不调 `runCompacting`**（那是"配合 core 删窗口"的语义；两者折叠动作本就同源，分道的是触发与选段） |
+
+设计稿 `docs/context-compression-window-guard.md`（两把尺子 / 三层现状盘点 / B2B3 设计 / 口径决策 / 验收）
+与代码同批落档。
+
+### 只有实现时才暴露的发现
+
+1. **默认开启 ≠ 行为不变** —— 本轮最大的一个判断被测试当场推翻，已写进 AGENTS §5。
+   设计初稿把「默认 `onExceed: 'truncate'`」当成"保持既有行为不变"，而内核原本的兜底在
+   `truncate.threshold`（0.95）且形态是**静默截断**；新闸的 `forceCompressPct = 0.90`
+   ⇒ **0.90~0.95 这段多了一次折叠**。抓出它的是 `acp-context` 的一条既有用例
+   （「能力判据：白名单里没有 compress」）：它用 `modelContextLimit: 2000` + `history(100)`，
+   注释估占用 0.8，**实测约 0.925** —— 注释漏算了 `renderTags: 'text-only'` 给每条
+   user/assistant 文本注入的 `<acp mNNNNN>` 标签（100 条约 +300 tokens）。结论：保留默认开启
+   （保护要在位），该用例显式 `windowGuard: { enabled: false }` 并注明各测各的；
+   配置面留一行**逐位回退开关**。
+2. **闸门必须插在 `processTurn` 返回后、写遥测/持久化/渲染之前。** 折叠要用新 state
+   **重跑一次** `processTurn`，插在下游会让 state 持久化 / 面板口径 / 原文归档 / 统一块模型 /
+   增量渲染缓存各基于**不同版本**的 `res` —— 本仓反复出事的那种口径分裂。代价：只有真正触发的
+   那一轮跑两次（罕见）。副作用要认下来：触发轮里 `preModel` 遥测记录的是**折叠后**的请求，
+   折叠动作本身由告警日志留痕（设计稿 §6.2 记了这个取舍）。
+3. **`refuse` 的抛错必须由 `core.session.preModel` hook 特判放行。** 该 hook 的 catch 是
+   "压缩是旁路优化 ⇒ 绝不阻断本轮"，不特判就等于把"静默损坏"换成"静默报错" ——
+   而本档的全部价值就在于这个动作不能被静默。配套：错误文案必须**自带出路**
+   （`/compact` / `decompress` / 改回 `truncate` / 调大窗口），否则只是换一种静默。
+4. **可压范围整批交内核，不要逐条预过滤。** 内核 `minCompressRange` 按**整批合计字符**判
+   （不是每范围），逐条过滤会把"合起来够格"的批次拆散。范围非空但整批不达标 ⇒ 内核 gate 拒
+   ⇒ `blocksCreated === 0` ⇒ 走"未折叠 + 交回内核截断兜底"的出口（真机最常见的形态，
+   已单列一条用例）。
+5. **两处内核既有事实（顺手记）**：① `nudge.compressibleRanges`（= 遥测 `suggestedRanges`）
+   是内核 `recommendNode` 的产出，**已按 `minCompressRange` 合并过**，可直接喂
+   `applyCompression`；② 内核的压力判据（overLimit / emergency / truncate）吃的是
+   `input.tokenCount` = **折叠前**的量，而插件上报的 `occupancy` 用 `res.messages` =
+   **折叠后** —— 两者不同源，做"窗口闸"必须用后者，否则等于在别人的尺子上量。
+   ③ `telemetry.emergencyCompressed` 是**死字段**（内核从未设置它，恒 false）。
+
+### 验证
+
+- `bun run typecheck` ✅ 全量 0 error
+- `bun run test` ✅ 根 **2593 pass / 0 fail**（2565 → +28）
+- `adapters/vscode`（**不在根 workspaces 内，必须单独跑**）✅ typecheck 干净 + **243 pass / 0 fail**
+- 新增用例：`window-guard.test.ts` 13 例（决策四档 + 边界 + 非单调配置 + 非法归一化 + 文案）·
+  `acp-context/index.test.ts` 13 例 · `core.test.ts` 5 例（B2 三种输入）· `cli.test.ts` 2 例
+- 反向验证 6 处，逐项"恰如预期变红"：
+
+| # | 突变 | 目标包 | 预期 / 实际 | 命中用例 |
+|---|---|---|---|---|
+| V1 | 决策函数的 `onExceed === 'refuse'` 改判 `'truncate'` | acp-context | 4 / **4** | 两条 refuse 用例 + 两条决策单测（另 4 条为同一函数的连带影响） |
+| V2 | `foldForWindowGuard` 恒返回 `undefined` | acp-context | 2 / **2** | 「过折叠线 ⇒ 折叠一次并持久化」+「折叠后请求更短」 |
+| V3 | `resolveWindowGuard` 去掉归一化 | acp-context | 1 / **1** | 「非法阈值一律回落默认」 |
+| V4 | 宿主 `checkWindowGuard` 去掉三档单调性检查 | cli | 1 / **1** | 「三档写反序要告警」 |
+| V5 | hook 去掉 `WindowGuardExceededError` 上抛 | acp-context | 1 / **1** | 「refuse 的错误不被 hook 吞掉」（**"其余异常仍被吞"那条保持绿** ⇒ 证明特判是精确的，不是把整条兜底撤了） |
+| V6 | 装配行去掉 `windowGuard: compression.windowGuard` | cli | 1 / **1** | 源码文本守卫「ACP 装配」（与 `modelContextLimit` / `providerWindows` 同一条） |
+
+  变异全部还原后 `shasum -a 256` 与基线**逐字相等**。
+
+### 落档时的两个操作细节（下次可复用）
+
+- **hunk 级拆分不必手抄 `git add -p` 的交互**：把 `git diff` 按 `@@` 切开、**保留原始 hunk 头**、
+  只挑需要的 hunk 拼成一个补丁，`git apply --cached` 即可（与 `git add -p` 内部做法一致）。
+  本轮只有 `acp-context/src/index.ts` 需要拆（面板 3 个 hunk / 闸门 14 个 hunk），
+  `host/src/config.ts` 整体属 B2+B3，不必拆。
+- **"某一段改动单独成立"这件事要真验，别推断**：`git stash push --keep-index` 把未暂存部分
+  收起、工作区仅剩暂存内容，即可在该状态下跑 typecheck + 测试（跑完 `stash pop` 复原）。
+  本轮用它确认了「面板改动独立于 B3 成立」（usage 41 / cli 417 / acp-context 107 全绿）。
+
 ## 2026-10-05（续 254）VSCode 集成 P3-D：`_setChatProvider` 删除 + 扩展注册 LM 工具（生成式贡献点）
 
 ### 起因
