@@ -63,6 +63,23 @@ export interface WindowGuardConfig {
    * - `'refuse'`：从 `preModel` 抛错中止本轮（不发请求）
    */
   onExceed?: 'truncate' | 'refuse'
+  /**
+   * 判据是否计入**固定前缀**（system prompt + 工具 schema）的实测规模。默认 `true`。
+   *
+   * 为什么需要：本闸的占用率原本只算**消息体**（ACP 折叠后 `requestTok / window`），
+   * 而真正发出去的请求还包含 system prompt 与全部工具 schema —— 那部分**不随会话增长，
+   * 却实占窗口**。真机实测（本机 32 个工具）：固定前缀约 **9,600 tokens**，在 30 万窗口上
+   * 让四档全部偏晚约 3.2%（`onExceedPct: 0.98` 的硬线实际在**超窗之后**才到）；
+   * 窗口越小越致命 —— 3.2 万窗口下偏差是 30 个百分点，`notify` 0.75 档触发时真实请求已超窗。
+   *
+   * 数字来自**实测而非配置**（见 ACP 的 `AcpSessionCtx.fixedPrefix`）：拿引擎累计的
+   * `usageStats.inputTokens` 与 ACP 自己估算的消息体相减，自动适配任何模型 / 工具集，
+   * 不需要把"32 个工具 ≈ 9600"这类值写死。拿不到实测值时按 0 处理 ⇒ 逐位回到老口径。
+   *
+   * 关掉即回到"只算消息体"（统计面板的「实际发出」一行**也随之**不再追加固定前缀段 ——
+   * 面板与判据刻意同源，否则会出现"面板显示合计、闸门按消息体判"的第三种口径）。
+   */
+  includeFixedOverhead?: boolean
 }
 
 /** 归一化后的生效值（所有字段必有值） */
@@ -72,6 +89,7 @@ export interface ResolvedWindowGuard {
   forceCompressPct: number
   onExceedPct: number
   onExceed: 'truncate' | 'refuse'
+  includeFixedOverhead: boolean
 }
 
 /**
@@ -85,6 +103,7 @@ export const WINDOW_GUARD_DEFAULTS: ResolvedWindowGuard = {
   forceCompressPct: 0.9,
   onExceedPct: 0.98,
   onExceed: 'truncate',
+  includeFixedOverhead: true,
 }
 
 /** 占用率阈值必须是 (0, 1] 内的有限数 —— 0 会让那一档恒真、>1 会让它恒假，都属非法 */
@@ -107,11 +126,27 @@ export function resolveWindowGuard(raw?: WindowGuardConfig): ResolvedWindowGuard
     forceCompressPct: usablePct(raw.forceCompressPct, WINDOW_GUARD_DEFAULTS.forceCompressPct),
     onExceedPct: usablePct(raw.onExceedPct, WINDOW_GUARD_DEFAULTS.onExceedPct),
     onExceed: raw.onExceed === 'refuse' ? 'refuse' : 'truncate',
+    includeFixedOverhead:
+      typeof raw.includeFixedOverhead === 'boolean'
+        ? raw.includeFixedOverhead
+        : WINDOW_GUARD_DEFAULTS.includeFixedOverhead,
   }
 }
 
 /** 本轮的处置档位 */
 export type WindowGuardAction = 'none' | 'notify' | 'forceCompress' | 'refuse'
+
+/**
+ * `forceCompress` 档**折不动**的三种成因 —— 三种的处境与出路都不同，混成一句
+ * 「没有够格的可折叠内容」时，前两种会被误读成"门槛没到、再等等就好"。
+ *
+ * - `no-ranges`：内核压根没推荐范围 ⇒ 本会话**没有未压缩原文**（都在块里了）。
+ *   等下去也不会变好，只能换手段（`/compact` 真删消息 / `decompress` 腾空）。
+ * - `no-summary`：有范围但取不回原文（归档缺失）⇒ 摘要生成不了。归档链坏了，同样等不动。
+ * - `below-threshold`：有范围、有原文，只是**合计字符数**没到内核 `minCompressRange`。
+ *   唯一"再涨涨就会出现"的一档。
+ */
+export type WindowGuardFoldSkipReason = 'no-ranges' | 'no-summary' | 'below-threshold'
 
 /**
  * 按占用率决定本级动作（纯函数）。
@@ -155,9 +190,16 @@ function num(v: number): string {
   return Math.round(v).toLocaleString('en-US')
 }
 
-/** 组装占位数字段：`窗口 300,000 · 实际发出 234,000（78.0%）` */
-function usagePart(window: number, used: number): string {
-  return `窗口 ${num(window)} · 实际发出 ${num(used)}（${pct(window > 0 ? used / window : 0)}）`
+/**
+ * 组装占位数字段：`窗口 300,000 · 实际发出 234,000（78.0%）`
+ *
+ * `fixed > 0` 时把固定前缀（system + 工具 schema）单列出来 —— 它是「实际发出」的一部分，
+ * 不标出来就会与占位率对不上（判据含它、读数不含它 = 两套口径）。
+ */
+function usagePart(window: number, used: number, fixed = 0): string {
+  const total = used + fixed
+  const base = `窗口 ${num(window)} · 实际发出 ${num(total)}（${pct(window > 0 ? total / window : 0)}）`
+  return fixed > 0 ? `${base}〔含固定前缀 ${num(fixed)}〕` : base
 }
 
 /**
@@ -167,28 +209,49 @@ function usagePart(window: number, used: number): string {
  * 是"刚过线"还是"马上要被动手"。
  */
 export function formatWindowGuardNotice(input: {
+  /**
+   * **触发时刻**的占用率 —— `forceCompress` 档是**折叠前**的值。
+   *
+   * 必须与 {@link occupancyAfter} 分开：折叠会立刻改写请求体，调用点若只留一个
+   * 变量，折叠后的值会覆盖掉触发时的值，文案就写成「占用 12.0% 已达强制折叠线
+   * 90.0%」这种自证矛盾的句子（真机实测踩过）。
+   */
   occupancy: number
+  /**
+   * `forceCompress` 档**折叠后**重算的占用率（缺省 = 本轮没折叠）。
+   * 与 {@link occupancy} 一起才构成「折叠前 X% → 折叠后 Y%」的完整读数。
+   */
+  occupancyAfter?: number
   window: number
   used: number
+  /**
+   * 固定前缀（system prompt + 工具 schema）的**实测** tokens，计入「实际发出」总量。
+   * 缺省 0 = 不含（老口径，读数与告警都只算消息体）。
+   */
+  fixed?: number
   guard: ResolvedWindowGuard
   /** forceCompress 档：实际折掉的结果（缺省表示"这个动作没触发"） */
   folded?: { blocks: number; tokens: number }
-  /** forceCompress 档但**没有可折内容**（此时只剩内核截断兜底） */
-  foldSkipped?: boolean
+  /**
+   * forceCompress 档但**没折成** —— 必须说明成因（三种处境不同，见
+   * {@link WindowGuardFoldSkipReason}）。此时只剩内核截断兜底。
+   */
+  foldSkipReason?: WindowGuardFoldSkipReason
 }): string {
-  const at = usagePart(input.window, input.used)
+  const at = usagePart(input.window, input.used, input.fixed ?? 0)
   if (input.folded) {
+    const after = input.occupancyAfter !== undefined ? `· 折叠后 ${pct(input.occupancyAfter)} ` : ''
     return (
-      `ACP 窗口保护：占用 ${pct(input.guard.forceCompressPct)} → 已强制折叠`
+      `ACP 窗口保护：占用 ${pct(input.occupancy)} 已达强制折叠线 ${pct(input.guard.forceCompressPct)} → 已强制折叠`
       + `（折 ${input.folded.blocks} 段 / 回收约 ${num(input.folded.tokens)} tokens；`
-      + `原文可用 decompress 还原）· 折叠前 ${pct(input.occupancy)} · ${at}`
+      + `原文可用 decompress 还原）${after}· ${at}`
     )
   }
-  if (input.foldSkipped) {
+  if (input.foldSkipReason) {
     return (
       `ACP 窗口保护：占用 ${pct(input.occupancy)} 已达强制折叠线 ${pct(input.guard.forceCompressPct)}，`
-      + `但当前没有够格的可折叠内容（内核 minCompressRange 门槛未达）⇒ 本轮未折叠，`
-      + `超出部分由内核 ${'truncate'} 兜底 · ${at}`
+      + `但${describeFoldSkip(input.foldSkipReason)} ⇒ 本轮未折叠，超出部分由内核 truncate 兜底 · ${at}\n`
+      + FOLD_SKIP_EXITS
     )
   }
   return (
@@ -196,6 +259,29 @@ export function formatWindowGuardNotice(input: {
     + `（强制折叠线 ${pct(input.guard.forceCompressPct)}）· ${at}`
   )
 }
+
+/** 三种"折不动"的成因，各自一句人话（措辞要能指向出路，不是复述 code） */
+function describeFoldSkip(reason: WindowGuardFoldSkipReason): string {
+  switch (reason) {
+    case 'no-ranges':
+      return '本会话已没有未压缩的原文可折（历史都已在折叠块里）'
+    case 'no-summary':
+      return '候选范围的原文取不回来（归档缺失），生成不了块摘要'
+    case 'below-threshold':
+      return '可折内容合计未达内核 minCompressRange 门槛'
+  }
+}
+
+/**
+ * 「折不动」时的出路。**必须自带出路**：只说"我没动手"，不说"接下来会怎样、你能做什么"，
+ * 就只是把静默损坏换成了静默报错 —— 与本模块 `refuse` 档文案同一条纪律。
+ *
+ * 前两条出路针对"没有可折内容"（等下去也不会变好），第三条针对"门槛没到 / 窗口配小了"。
+ */
+const FOLD_SKIP_EXITS =
+  '可选出路：① 执行 /compact（真删消息，直接降原文口径与磁盘）；'
+  + '② 用 decompress 取回并清理不再需要的折叠块，腾出可折空间；'
+  + '③ 调大 compression.modelContextLimit（若窗口配小导致占用虚高）。'
 
 /**
  * `refuse` 档文案。
@@ -207,9 +293,11 @@ export function formatWindowGuardRefusal(input: {
   occupancy: number
   window: number
   used: number
+  /** 固定前缀（system + 工具 schema）实测 tokens；与告警档同一口径 */
+  fixed?: number
   guard: ResolvedWindowGuard
 }): string {
-  const at = usagePart(input.window, input.used)
+  const at = usagePart(input.window, input.used, input.fixed ?? 0)
   return (
     `ACP 窗口保护（refuse）：本轮请求占用 ${pct(input.occupancy)} 已达硬线 ${pct(input.guard.onExceedPct)}，`
     + `已中止本轮、未向模型发起请求 · ${at}\n`

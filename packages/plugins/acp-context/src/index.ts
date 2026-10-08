@@ -68,6 +68,7 @@ import {
   WindowGuardExceededError,
   type ResolvedWindowGuard,
   type WindowGuardConfig,
+  type WindowGuardFoldSkipReason,
 } from './window-guard.js'
 import type { SystemStabilityReport } from '@harness/plugin'
 import {
@@ -511,6 +512,28 @@ interface AcpSessionCtx {
   telemetry?: TelemetryWriter
   /** 上轮 processTurn 返回的 cores（用于计算 ACP 侧缓存命中 = 同前缀占比） */
   prevRequestCores?: CoreMessage[]
+  /**
+   * **固定前缀实测探针**（system prompt + 工具 schema 的规模）—— B3 判据口径修正的来源。
+   *
+   * 为什么是实测而不是估算/配置：内核不告诉插件"固定前缀占多少 token"，而把
+   * "32 个工具 ≈ 9600"这类数字写进配置，换模型或换工具集就失效。可靠的做法是拿
+   * 引擎**每步**累加的 `usageStats.inputTokens` 与 ACP 自己估算的消息体相减 ——
+   * 差值就是那些"不随会话增长、却实占窗口"的开销，且自动跟随任何 Provider。
+   *
+   * 偏差方向是**保守**的：ACP 的中文估算偏高时 `stepReal − lastEstTok` 会偏小
+   * （甚至 ≤ 0，被 clamp 成 0 ⇒ 逐位回到老口径），不会把窗口占用算得比实际更小。
+   */
+  fixedPrefix?: {
+    /** 上一次读到的 `usageStats.inputTokens`（引擎累计值；用于与下一次读数做差得单步真实用量） */
+    cumulative: number
+    /**
+     * 上一步**发出的**请求体 token 估算（与上面那次消费相对应）。
+     * 只在遥测段（最终 `res` 已定）更新 —— 用折叠前的值会把固定前缀算大。
+     */
+    lastEstTok: number
+    /** 实测固定前缀 tokens（clamp ≥ 0；首步之前为 0） */
+    overhead: number
+  }
   // ---- 前缀缓存回退归因 ----
   /** 上一轮**实际发给模型**的 prompt 投影（role + 正文指纹用；不含 id，见 diffPromptPrefix） */
   prevPromptView?: { role: string; text: string }[]
@@ -1364,36 +1387,52 @@ interface RunPreModelDeps {
  * 内核自身的 `minCompressRange` 门槛按**整个批次合计**字符数判定（不是每条范围），
  * 所以这里把范围**整批**交给内核、不预先逐条过滤 —— 过滤反而会把"合起来够格"的批次拆散。
  *
- * @returns 折叠结果；`undefined` = 本轮没有折叠（无可折内容 / 未过内核门槛），调用方应放行到内核兜底
+ * @returns 折叠结果判别式；`ok:false` 时带**成因**（三种处境不同、出路不同，见
+ *   {@link WindowGuardFoldSkipReason}）—— 调用方据此出人话，不放行成一句含糊的"没折成"
  */
 function foldForWindowGuard(input: {
   res: ProcessTurnResult
   engine: ReturnType<typeof createCore>
   config: AcpConfig
   archive: Map<string, Message>
-}): { state: CompressionState; blocks: number; tokens: number } | undefined {
+}): WindowGuardFoldOutcome {
   const ranges: CompressibleRange[] = input.res.nudge?.compressibleRanges ?? []
-  if (ranges.length === 0) return undefined
+  // 内核没推荐任何范围 = 本会话没有未压缩原文（历史都已在块里）。与"有范围但不够格"
+  // 是两回事：前者等下去也不会变好，后者再涨涨就会出现。
+  if (ranges.length === 0) return { ok: false, reason: 'no-ranges' }
   const specs: { startRef: string; endRef: string; summary: string; topic: string }[] = []
   for (const r of ranges) {
     const summary = windowGuardRangeSummary(input.res.state, input.archive, r)
     if (!summary) continue
     specs.push({ startRef: r.startRef, endRef: r.endRef, summary, topic: '窗口保护闸自动折叠' })
   }
-  if (specs.length === 0) return undefined
+  if (specs.length === 0) return { ok: false, reason: 'no-summary' }
   const applied = input.engine.applyCompression({
     ranges: specs,
     messages: input.res.messages,
     state: input.res.state,
     config: input.config,
   })
-  if (applied.result.blocksCreated === 0) return undefined
+  // 内核按**整批合计**字符判 `minCompressRange`，一条都没建 = 整批不够格（不是"选错了段"）
+  if (applied.result.blocksCreated === 0) return { ok: false, reason: 'below-threshold' }
   return {
+    ok: true,
     state: applied.state,
     blocks: applied.result.blocksCreated,
     tokens: applied.result.tokensCompressed,
   }
 }
+
+/**
+ * `foldForWindowGuard` 的结果判别式。
+ *
+ * 为什么不是 `T | undefined`：`undefined` 把三种"折不动"的处境压成了一个值，
+ * 调用方只能出一句含糊的"没有够格的可折叠内容" —— 而"没有可压原文"（等下去也不会好）
+ * 与"不够门槛"（再涨涨就会出现）需要**不同的出路**。判别式让文案说得出原因。
+ */
+type WindowGuardFoldOutcome =
+  | { ok: true; state: CompressionState; blocks: number; tokens: number }
+  | { ok: false; reason: WindowGuardFoldSkipReason }
 
 /**
  * 给一段待折范围生成摘要文本。
@@ -1435,6 +1474,45 @@ function originalMessageForRef(
  * 压缩只作用于"本轮发给模型的请求"；压缩状态单独持久化到 session.meta，重启后可恢复，
  * 从而既有请求级 token 节省，又保证可回溯。
  */
+/**
+ * 刷新「固定前缀」实测探针（见 {@link AcpSessionCtx.fixedPrefix}）。
+ *
+ * 每步 preModel 读一次引擎的**累计** `usageStats.inputTokens`，与上一次读数相减 =
+ * **上一步真实发出**的 input tokens；再减去 ACP 当时估算的消息体 tokens，差值就是
+ * system prompt + 工具 schema 这些"不随会话增长、却实占窗口"的固定开销。
+ *
+ * 为什么在此处（而不是模型返回后）：ACP 没有"模型返回后"的 hook，而 preModel 每步都有。
+ * 慢一步用上一步的实测值没关系 —— 固定前缀本就是"一次会话内基本不变"的量。
+ *
+ * 三条 fail-soft 纪律：
+ * ① `meta` 读失败 ⇒ 直接返回，保持上一次的 overhead（绝不因为修正项读不到就中断本轮）；
+ * ② 读数**没有前进**（多步之间 meta 还没落盘、或宿主不维护 `usageStats`）⇒ 保持原值 ——
+ *    否则会把「0 增量」当成实测值，把 overhead 一路压成 0；
+ * ③ 差值为负（ACP 把中文估得比真实还大）⇒ clamp 到 0，即**退回老口径**。偏差只允许往
+ *    "更保守"的方向走。
+ */
+async function refreshFixedPrefixProbe(
+  ctx: AcpSessionCtx,
+  meta: RunPreModelDeps['meta'],
+): Promise<void> {
+  let cumulative: number | undefined
+  try {
+    const stats = (await meta.read())?.usageStats as { inputTokens?: unknown } | undefined
+    if (typeof stats?.inputTokens === 'number' && Number.isFinite(stats.inputTokens)) {
+      cumulative = stats.inputTokens
+    }
+  } catch {
+    return
+  }
+  if (cumulative === undefined) return
+  const prev = ctx.fixedPrefix
+  let overhead = prev?.overhead ?? 0
+  if (prev && cumulative > prev.cumulative && prev.lastEstTok > 0) {
+    overhead = Math.max(0, cumulative - prev.cumulative - prev.lastEstTok)
+  }
+  ctx.fixedPrefix = { cumulative, lastEstTok: prev?.lastEstTok ?? 0, overhead }
+}
+
 export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const { sessionId, messages, engine, config, meta } = deps
   // token 折算口径：必须与 engine（createCore）注入的一致，缺省即内核 CJK 感知口径
@@ -1508,6 +1586,11 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   } catch {
     // 读取失败不影响主流程
   }
+  // ---- 固定前缀实测（B3 判据口径修正）----
+  // 位置刻意在 processTurn **之前**：下面的闸门要用这份 overhead 算占用率。
+  // 只需会话 meta（内存对象）；读不到就保持上一次的值 —— 它是判据的**修正项**，
+  // 拿不到时退化成 0（= 改造前口径），绝不因此中断本轮。
+  await refreshFixedPrefixProbe(ctx, meta)
   const tokenCount = estimateTokens(inflat.cores, countTokens)
   // processTurn 的入参抽出成局部常量：窗口保护闸触发时要用**同一份入参**、只换 state 再跑一次
   // （见下方 B3 段），两处各写一遍必然漂移。
@@ -1537,35 +1620,52 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // 折叠后真正发往模型的量）—— 这正是"真实上下文占用率"，也是本闸独立于 `compactIfNeeded`
   // （原文口径）的意义所在。
   const guardWindow = Math.max(1, config.modelContextLimit)
-  let occupancy = estimateTokens(res.messages, countTokens) / guardWindow
+  // 判据含**固定前缀**（system prompt + 工具 schema）的实测规模（见 {@link AcpSessionCtx.fixedPrefix}）：
+  // 那部分不随会话增长、却实占窗口，漏掉会让四档全部偏晚（真机：30 万窗口偏 3.2%，
+  // 3.2 万窗口偏 30 个百分点 ⇒ notify 档触发时真实请求已超窗）。
+  // `windowGuard.includeFixedOverhead:false` 即回到"只算消息体"的老口径；实测值拿不到时自然为 0。
+  const fixedTok = deps.windowGuard?.includeFixedOverhead ? ctx.fixedPrefix?.overhead ?? 0 : 0
+  const bodyTok = (): number => estimateTokens(res.messages, countTokens)
+  let occupancy = (bodyTok() + fixedTok) / guardWindow
   if (deps.windowGuard?.enabled) {
     const guard = deps.windowGuard
     const action = decideWindowGuardAction({ occupancy, guard })
-    const used = (): number => estimateTokens(res.messages, countTokens)
+    const used = bodyTok
     if (action === 'refuse') {
       // 抛错是**故意**的：只有调用方不吞它，本轮才会真的中止（见 hook 里的 WindowGuardExceededError 分支）。
       throw new WindowGuardExceededError(
-        formatWindowGuardRefusal({ occupancy, window: guardWindow, used: used(), guard }),
+        formatWindowGuardRefusal({ occupancy, window: guardWindow, used: used(), fixed: fixedTok, guard }),
       )
     }
     if (action === 'notify') {
-      deps.notify?.(formatWindowGuardNotice({ occupancy, window: guardWindow, used: used(), guard }))
+      deps.notify?.(
+        formatWindowGuardNotice({ occupancy, window: guardWindow, used: used(), fixed: fixedTok, guard }),
+      )
     } else if (action === 'forceCompress') {
+      // 折前存档：下面那个 `occupancy` 会被折叠后的重算值覆盖，而文案要报**触发时**的值
+      // （只留一个变量就会出现「占用 60.0% → 折叠，折叠前 12.0%」这种自证矛盾的句子）。
+      const occupancyBefore = occupancy
       const folded = foldForWindowGuard({ res, engine, config, archive: ctx.archive })
-      if (folded) {
+      if (folded.ok) {
         // 用折叠后的 state 重建本轮请求；tokenCount 仍传**原文口径**（与常态一致 ——
         // 内核的 nudge 压力判据一直吃的是折叠前的量，见 window-guard.ts 头注的"三层"表）。
         res = engine.processTurn({ ...turnInput, state: folded.state })
         ctx.needFull = true
-        occupancy = estimateTokens(res.messages, countTokens) / guardWindow
+        // 固定前缀不因折叠而变 ⇒ 重算时同样带上 fixedTok，否则"折叠后"会假降一截
+        occupancy = (bodyTok() + fixedTok) / guardWindow
       }
       deps.notify?.(
         formatWindowGuardNotice({
-          occupancy,
+          occupancy: occupancyBefore,
+          ...(folded.ok ? { occupancyAfter: occupancy } : {}),
           window: guardWindow,
           used: used(),
+          fixed: fixedTok,
           guard,
-          ...(folded ? { folded: { blocks: folded.blocks, tokens: folded.tokens } } : { foldSkipped: true }),
+          // 折不动时带上**成因**（三种处境出路不同），不是一句含糊的"没折成"
+          ...(folded.ok
+            ? { folded: { blocks: folded.blocks, tokens: folded.tokens } }
+            : { foldSkipReason: folded.reason }),
         }),
       )
     }
@@ -1596,6 +1696,10 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     // 遥测失败不影响主流程
   }
 
+  // 固定前缀探针的「上一步估算值」：取**最终 res**（折叠后的才算真正发出去的量）——
+  // 用折叠前的值会把固定前缀算大。刻意放在遥测 try 之外：遥测写失败不该让探针停更。
+  if (ctx.fixedPrefix) ctx.fixedPrefix.lastEstTok = estimateTokens(res.messages, countTokens)
+
   // 持久化压缩状态（仅变化时写一次，避免每轮无谓 IO）
   const nextSnapshot = JSON.stringify(res.state)
   if (ctx.stateSnapshot !== nextSnapshot) {
@@ -1618,6 +1722,9 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
       // 同期未压缩口径，供面板展示"省了多少"
       rawTok: estimateTokens(inflat.cores, countTokens),
       window: deps.config.modelContextLimit,
+      // 固定前缀（system prompt + 工具 schema）的实测规模 —— 「实际发出」的第三部分。
+      // 不写进来的话面板读数会比闸门判据少这一块，看起来像"闸门凭空多算了占用"。
+      fixedTok,
     }
     const occJson = JSON.stringify(occSnap)
     if (ctx.occupancySnapshot !== occJson) {
@@ -1738,10 +1845,13 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   const request: Message[] = [...systemMsgs]
 
   // ---- 压缩手册：常量在前缀、变量在尾部 ----
-  // 占用率口径与遥测一致：telemetry 的 occupancy = requestTok / window，其中 requestTok =
-  // estimateTokens(res.messages)（发往模型的 history cores，不含 system）、window = config.modelContextLimit。
-  // 该值**已在函数上方（窗口保护闸处）算过一次**，这里直接复用局部变量 `occupancy` ——
-  // 不在两处写分叉的两份算法（闸门若折叠过，`occupancy` 已随最终 res 重算）。
+  // 复用**窗口保护闸处**算过的局部 `occupancy`（口径 = (消息体 + 固定前缀实测) / window）——
+  // 不在这里另写一份，免得两处算法分叉（闸门若折叠过，`occupancy` 已随最终 res 重算）。
+  //
+  // ⚠️ 它与遥测的 occupancy **不是同一个数**，这是**有意**的：遥测行是"发往模型的 history cores
+  // 体量"（`requestTok / window`，不含固定前缀），是给压缩效果归因用的**纯消息体口径**；
+  // 而本处判的是"窗口还剩多少"（手册该不该出现），固定前缀当然要算进去。
+  // 两者差一个固定前缀（真机约 9,600 tokens），排查"手册怎么早/晚出现了"时先认这一条。
   //
   // 前缀只放**恒定**文本：自动前缀缓存按最长公共 token 前缀命中，放在历史之前的文本一变，
   // 其后全部内容（含整段历史）都要重算（代价量化见 MANUAL_INJECT_MARGIN 的注释）。

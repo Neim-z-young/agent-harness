@@ -101,6 +101,8 @@ interface Harness {
     prefixRender: Message[]
     needFull: boolean
     lastTokens: number
+    /** 固定前缀实测探针（B3 判据口径修正）—— 用例要断言它的实测值 */
+    fixedPrefix?: { cumulative: number; lastEstTok: number; overhead: number }
   }
   meta: Record<string, unknown>
   patches: Array<Record<string, unknown>>
@@ -1739,6 +1741,9 @@ test('B3 forceCompress 档：过折叠线 → 复用内核折叠一次，请求�
   await h.run(messages)
   expect(notices).toHaveLength(1)
   expect(notices[0]).toContain('已强制折叠')
+  // ③ 文案回归：必须分开报「触发时」与「折叠后」，不能出现自证矛盾的「折叠前 <折叠后的值>」
+  expect(notices[0]).toContain('折叠后')
+  expect(notices[0]).not.toContain('折叠前')
   // 折叠真的发生了：内核产块 + 统计计数
   expect(h.ctx.state.blocks.length).toBeGreaterThan(0)
   expect(h.ctx.state.stats.compressionCount).toBeGreaterThan(0)
@@ -1759,7 +1764,7 @@ test('B3 forceCompress 档：折叠后的请求比不装闸时更短（这就是
   expect(size(guardedMsgs)).toBeLessThan(size(plainMsgs))
 })
 
-test('B3 forceCompress 档：无可折内容 → 明确报"未折叠 + 交回内核截断兜底"，不静默', async () => {
+test('B3 forceCompress 档：无可压原文 → 报"未折叠 + 成因 + 出路"，不静默', async () => {
   const notices: string[] = []
   // 把保留窗口拉满 ⇒ 所有消息都在保护区里 ⇒ 内核给不出可压范围
   const cfg = defaultConfig(5_000, {
@@ -1771,14 +1776,20 @@ test('B3 forceCompress 档：无可折内容 → 明确报"未折叠 + 交回内
   const h = makeHarness(cfg, 's1', { windowGuard: { forceCompressPct: 0.9 }, notify: (m) => notices.push(m) })
   await h.run(bulkHistory(5, 4_000))
   expect(notices).toHaveLength(1)
-  expect(notices[0]).toContain('没有够格的可折叠内容')
+  // 成因是「没有未压缩的原文可折」—— 与「不够门槛」是两回事，文案必须分得开
+  expect(notices[0]).toContain('没有未压缩的原文可折')
+  expect(notices[0]).not.toContain('minCompressRange')
+  // 出路纪律：折不动时要说清后果与可选动作，不能只报一句"没折"
+  expect(notices[0]).toContain('truncate')
+  expect(notices[0]).toContain('/compact')
   expect(h.ctx.state.blocks).toHaveLength(0)
 })
 
-test('B3 forceCompress 档：有范围但过不了内核 minCompressRange 门槛 ⇒ 同样只报"未折叠"（真机常见形态）', async () => {
+test('B3 forceCompress 档：有范围但过不了内核 minCompressRange 门槛 ⇒ 报"未折叠 + 成因"（真机常见形态）', async () => {
   // 生产 autoTune 下 `minCompressRange` 是 200,000 chars（30 万窗口）—— 会话没攒够原文时
-  // `nudge.compressibleRanges` **非空但整批不达标**，内核 gate 会拒。这正是真机上最可能遇到的形态，
-  // 必须与"范围为空"走到同一个出口（foldSkipped），而不是静默不折叠。
+  // `nudge.compressibleRanges` **非空但整批不达标**，内核 gate 会拒。这正是真机上最可能遇到的形态。
+  // **与"范围为空"一样要不静默，但成因必须分得开**：那条是"等下去也不会好"，这条是"再涨涨就有"，
+  // 出路不同（前者只能 /compact 或 decompress 腾空间，后者等或调窗口都行）。
   const notices: string[] = []
   const cfg = defaultConfig(5_000, {
     compress: { minCompressRange: 1_000_000_000, maxSummaryLength: 100000, minSummaryLength: 0 },
@@ -1789,7 +1800,9 @@ test('B3 forceCompress 档：有范围但过不了内核 minCompressRange 门槛
   const h = makeHarness(cfg, 's1', { windowGuard: { forceCompressPct: 0.9 }, notify: (m) => notices.push(m) })
   await h.run(bulkHistory(5, 4_000))
   expect(notices).toHaveLength(1)
-  expect(notices[0]).toContain('没有够格的可折叠内容')
+  // 成因是「可折内容合计未达门槛」（不是"没有可压内容"）—— 与上一条用例的措辞必须分开
+  expect(notices[0]).toContain('minCompressRange')
+  expect(notices[0]).not.toContain('没有未压缩的原文可折')
   expect(h.ctx.state.blocks).toHaveLength(0)
 })
 
@@ -1824,6 +1837,72 @@ test('B3 enabled=false：即使严重超窗也四档全静默（= 改造前行�
   await h.run(OCC_100.history())
   expect(notices).toEqual([])
   expect(h.ctx.state.blocks).toHaveLength(0)
+})
+
+// ===== B3 判据口径：固定前缀（system prompt + 工具 schema）实测 =====
+
+test('B3 判据：用 usageStats.inputTokens 与自身估算的差值实测固定前缀，不写死配置', async () => {
+  const h = makeHarness(makeConfig(), 's1', { windowGuard: { notifyPct: 0.001, forceCompressPct: 0.99 } })
+  h.meta.usageStats = { inputTokens: 1_000 }
+  await h.run(history(3))
+  const est = h.ctx.fixedPrefix?.lastEstTok ?? 0
+  expect(est).toBeGreaterThan(0)
+  // 首步没有可比基准 ⇒ 不编造，overhead 保持 0（= 老口径），不是把整段 inputTokens 当固定前缀
+  expect(h.ctx.fixedPrefix?.overhead).toBe(0)
+  // 上一步真实发出 = 自身估算 + 500 ⇒ 多出来的那 500 就是固定前缀
+  h.meta.usageStats = { inputTokens: 1_000 + est + 500 }
+  await h.run(history(3))
+  expect(h.ctx.fixedPrefix?.overhead).toBe(500)
+})
+
+test('B3 判据：includeFixedOverhead 开（默认）时判据与读数含固定前缀；关则逐位回到消息体口径', async () => {
+  const run = async (includeFixedOverhead: boolean) => {
+    const notices: string[] = []
+    const h = makeHarness(makeConfig(), 's1', {
+      windowGuard: { notifyPct: 0.001, forceCompressPct: 0.99, includeFixedOverhead },
+      notify: (m) => notices.push(m),
+    })
+    h.meta.usageStats = { inputTokens: 1_000 }
+    await h.run(history(3))
+    const est = h.ctx.fixedPrefix!.lastEstTok
+    h.meta.usageStats = { inputTokens: 1_000 + est + 500 }
+    await h.run(history(3))
+    const snap = h.meta['acp.occupancy.v1'] as { requestTok: number; fixedTok: number }
+    return { h, notices, body: snap.requestTok, fixed: snap.fixedTok }
+  }
+  const W = 20_000 // makeConfig() 默认窗口
+  const on = await run(true)
+  // 探针实测不受开关影响（关的是判据，不是测量）
+  expect(on.h.ctx.fixedPrefix?.overhead).toBe(500)
+  expect(on.fixed).toBe(500)
+  // 判据 = (消息体 + 固定前缀) / 窗口 —— 占用率必须体现出来，否则"含固定前缀"就只是句装饰
+  expect(on.notices.at(-1)).toContain(`占用 ${(((on.body + 500) / W) * 100).toFixed(1)}%`)
+  expect(on.notices.at(-1)).toContain('含固定前缀 500')
+
+  const off = await run(false)
+  expect(off.h.ctx.fixedPrefix?.overhead).toBe(500) // 仍在测
+  expect(off.body).toBe(on.body) // 消息体与开关无关
+  expect(off.fixed).toBe(0)
+  // 关掉之后占用率回到只算消息体（与上面那条**必然不同**，否则说明开关没接上）
+  expect(off.notices.at(-1)).toContain(`占用 ${((off.body / W) * 100).toFixed(1)}%`)
+  expect(off.notices.at(-1)).not.toContain('含固定前缀')
+})
+
+test('B3 判据：读数为 0 增量或差值为负时不许污染实测值（偏差只许往保守方向走）', async () => {
+  const h = makeHarness(makeConfig(), 's1', { windowGuard: { notifyPct: 0.001, forceCompressPct: 0.99 } })
+  h.meta.usageStats = { inputTokens: 1_000 }
+  await h.run(history(3))
+  const est = h.ctx.fixedPrefix!.lastEstTok
+  h.meta.usageStats = { inputTokens: 1_000 + est + 500 }
+  await h.run(history(3))
+  expect(h.ctx.fixedPrefix?.overhead).toBe(500)
+  // ① 读数没前进（宿主不维护 usageStats / meta 还没落盘）⇒ 保持上次实测值，不把 0 增量当实测
+  await h.run(history(3))
+  expect(h.ctx.fixedPrefix?.overhead).toBe(500)
+  // ② 增量小于自身估算（本地中文估算偏大）⇒ clamp 到 0，退回老口径，绝不算出负的固定前缀
+  h.meta.usageStats = { inputTokens: 1_000 + est + 500 + 10 }
+  await h.run(history(3))
+  expect(h.ctx.fixedPrefix?.overhead).toBe(0)
 })
 
 // ===== B3 装配：工厂把选项归一化后交给 runPreModel =====

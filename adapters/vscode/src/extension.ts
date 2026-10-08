@@ -109,6 +109,11 @@ export function activate(context: vscode.ExtensionContext): void {
     list: () => transport.control(TOOL_LIST_METHOD),
     register: (lmName, spec) =>
       vscode.lm.registerTool(lmName, makeHarnessLmTool({ transport, sessions, approvals, spec })),
+    // 声明界（见 lm-registrar.ts 文件头第 4 条）：`lm.registerTool` 只接受在
+    // `contributes.languageModelTools` 里声明过的名字，而**拒绝是同步 fire-and-forget**、
+    // 不会回到扩展宿主 ⇒ 不在这里设界的话，未声明的工具会被我们记成"注册成功"，
+    // 同时主进程日志每次激活刷一屏 error（真机 22 条）。
+    declared: () => declaredLmToolNames(context),
     log: (m) => channel?.appendLine(m),
   })
   context.subscriptions.push({ dispose: () => registrar.dispose() })
@@ -319,6 +324,29 @@ function protocolFailureText(lmName: string, e: unknown): string {
   const suffix = typeof code === 'number' ? `（code ${code}）` : ''
   return `❌ harness 工具 \`${lmName}\` 的**请求**失败（不是工具执行失败）：${message}${suffix}\n\n`
     + '_这多半是：会话已不在、工具不在注册表、或 sidecar 没起来。_'
+}
+
+/**
+ * 本扩展在 `package.json` 的 `contributes.languageModelTools` 里**声明过**的 LM 工具名。
+ *
+ * 读的是 `context.extension.packageJson`（VSCode 已经把清单解析好了，不必自己读盘）。
+ * **Fail-Closed**：认不出形状 ⇒ 空集合 ⇒ 一个都不注册。
+ *
+ * 空集合在这里是**安全**的（不是"能力凭空消失"）：VSCode 本来就会拒绝所有未声明的名字，
+ * 所以"读不出声明"这条路径上我们没有任何可失去的东西；真正的坏情况是**清单本身为空**
+ * （生成没跑 / 被手改坏），那一档由 `ToolRegistrar` 打一条显眼警示（见 `refresh`）。
+ */
+function declaredLmToolNames(context: vscode.ExtensionContext): ReadonlySet<string> {
+  const raw = (context.extension.packageJSON as {
+    contributes?: { languageModelTools?: unknown }
+  }).contributes?.languageModelTools
+  const names = new Set<string>()
+  if (!Array.isArray(raw)) return names
+  for (const entry of raw) {
+    const name = (entry as { name?: unknown } | null | undefined)?.name
+    if (typeof name === 'string' && name !== '') names.add(name)
+  }
+  return names
 }
 
 /**

@@ -120,6 +120,37 @@ describe('renderContextOccupancy', () => {
     expect(line).toContain('ACP 压缩后（未压缩为 45,000）')
   })
 
+  // 固定前缀（system + 工具 schema）是窗口闸判据的一部分：只报消息体会与告警对不上
+  // （观众拿这一行去核闸门的百分比，会觉得闸门凭空多算了占用）。有值时追加一段并给出「合计」。
+  it('ACP 口径带固定前缀时追加「含固定前缀 + 合计」，前半段（消息体口径）逐字不变', async () => {
+    const line = await renderContextOccupancy(
+      fakeHarness([], {}, { s1: 45_000 }, {
+        s1: {
+          'acp.occupancy.v1': { requestTok: 12_000, rawTok: 45_000, window: 200_000, fixedTok: 9_600 },
+        },
+      }),
+      { id: 's1' } as never,
+      compactOpts,
+    )
+    expect(line).toContain('实际发出：12,000 / 200,000 tokens（6.0%）')
+    expect(line).toContain('含固定前缀 9,600（system + 工具 schema）')
+    expect(line).toContain('合计 21,600（10.8%）')
+  })
+
+  it('fixedTok 缺失 / 为 0 / 非数 ⇒ 不追加固定前缀段（老会话与老断言逐字不变）', async () => {
+    for (const fixedTok of [undefined, 0, 'x']) {
+      const line = await renderContextOccupancy(
+        fakeHarness([], {}, { s1: 45_000 }, {
+          s1: { 'acp.occupancy.v1': { requestTok: 12_000, rawTok: 45_000, window: 200_000, fixedTok } },
+        }),
+        { id: 's1' } as never,
+        compactOpts,
+      )
+      expect(line).not.toContain('固定前缀')
+      expect(line).toContain('实际发出：12,000 / 200,000 tokens（6.0%）')
+    }
+  })
+
   it('ACP 口径缺失或结构不对 ⇒ 只有原文口径一行，不出现「实际发出」', async () => {
     const missing = await renderContextOccupancy(fakeHarness([], {}, { s1: 45_000 }), { id: 's1' } as never, compactOpts)
     expect(missing).toContain('上下文占用：45,000 / 200,000 tokens（22.5%）')

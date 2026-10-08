@@ -15,6 +15,30 @@
  *    "上次注册了谁"的镜像 —— 多一份状态就多一处失真，且失真的表现是"工具在，但调不动"。
  * 3. **单个注册失败不中断整批**。一个坏名字（超长 / 撞别人）不该让整池工具都注册不上。
  *    失败记进 `skipped` 一起报出来：「部分可用 + 可见原因」优于「全不可用 + 静默」。
+ * 4. **只注册在静态贡献点里声明过的名字**（{@link ToolRegistrarDeps.declared}）。
+ *
+ * ## 第 4 条为什么是**必须**的（真机实测，不是洁癖）
+ *
+ * `vscode.d.ts:20777` 写着 `registerTool` 的名字「must also be registered in the package.json
+ * `languageModelTools` contribution point」，而**违反它的报错回不到扩展宿主**。实测
+ * `extensionHostProcess.js`：
+ *
+ * ```js
+ * registerTool(t,e,n){ return this._registeredTools.set(e,{extension:t,tool:n}),
+ *     this._proxy.$registerTool(e, …), j(()=>{…}) }      // 没有 await：fire-and-forget
+ * ```
+ *
+ * 拒绝发生在**主进程**（`HB.registerToolImplementation` 抛 `Tool "X" was not contributed.`），
+ * 只落进主进程日志；扩展宿主这一侧的 promise 从未 reject。后果是双份的坏：
+ *
+ * - 主进程日志**每次激活刷 N 条 error**（真机 22 条）；
+ * - 我们的台账把它记成**成功** ⇒ 输出通道报「注册 32/32」，而实际能被模型调到的只有 10 个
+ *   —— 恰好违反上面第 3 条注释与 `specs` 字段注释所声明的纪律（"诊断信息不能在唯一
+ *   需要它说真话的时候撒谎"）。
+ *
+ * 差集是**必然存在**的：贡献点由 `gen:lm-tools` 从**密封**的工具池生成（默认装配，
+ * 实测 10 个），而运行期读的是**本机**池（含 optIn 插件与个人 MCP server，实测 32 个）
+ * —— 见设计稿 §14.4。既然"声明过"是 VSCode 的硬前提，注册侧就必须以它为止损界。
  */
 
 import { parseToolList, type LmToolSpec } from './lmtools'
@@ -29,6 +53,13 @@ export interface ToolRegistrarDeps {
   readonly list: () => Promise<unknown>
   /** 注册一个 LM 工具 —— 生产是 `vscode.lm.registerTool(name, tool)` */
   readonly register: (lmName: string, spec: LmToolSpec) => DisposableLike
+  /**
+   * 「本扩展在 `package.json` 的 `contributes.languageModelTools` 里声明过哪些名字」。
+   *
+   * 生产是读 `context.extension.packageJson`；**缺省 = 不设限**（全部尝试注册，
+   * 即本字段引入前的行为）—— 保留它是为了让本模块的单测不必知道贡献点长什么样。
+   */
+  readonly declared?: () => ReadonlySet<string>
   /** 日志出口（输出通道）；缺省不写 */
   readonly log?: (msg: string) => void
 }
@@ -41,6 +72,13 @@ export interface RefreshResult {
   readonly skipped: readonly string[]
   /** 出参里的**原始条目数**（与 `registered` 对比可区分"清单为空"与"解析失效"） */
   readonly listed: number
+  /**
+   * 因**未在贡献点声明**而被跳过的 LM 工具名（有序：与清单同序）。
+   *
+   * 与 `skipped` 分开的理由：这里**不是失败**（是设计上的止损界，见文件头第 4 条），
+   * 把它混进 `skipped` 会让"注册失败"这个真信号被二十几条常态条目淹掉。
+   */
+  readonly undeclared: readonly string[]
 }
 
 export class ToolRegistrar {
@@ -101,7 +139,15 @@ export class ToolRegistrar {
 
     const next: DisposableLike[] = []
     const ok: LmToolSpec[] = []
+    const undeclared: string[] = []
+    // 声明界：**只在有 `declared` 时才过滤**（缺省 = 不设限，与引入本字段前逐位一致）
+    const declared = this.deps.declared?.()
     for (const spec of specs) {
+      if (declared && !declared.has(spec.lmName)) {
+        // 不是失败：VSCode 会拒绝注册未声明的名字（且**同步不报错**，见文件头第 4 条）
+        undeclared.push(spec.lmName)
+        continue
+      }
       try {
         next.push(this.deps.register(spec.lmName, spec))
         ok.push(spec)
@@ -115,12 +161,22 @@ export class ToolRegistrar {
 
     const log = this.deps.log
     if (log) {
-      log(`[lmtools] 注册 ${next.length}/${listed} 个工具`)
+      log(
+        `[lmtools] 注册 ${next.length}/${listed} 个工具`
+          + (undeclared.length > 0 ? `（另 ${undeclared.length} 个未在贡献点声明，已跳过）` : ''),
+      )
       // 「清单有东西但一条都没解析出来」= 解析层失效，必须显眼（不能像"空清单"那样静默）
       if (listed > 0 && specs.length === 0) log('[lmtools] ⚠️ 清单非空但全部解析失败 —— 大概率是出参形状变了')
+      // 「声明集合为空但池子非空」= 贡献点丢了/生成没跑，症状是"模型侧一个 harness 工具都没有"，必须显眼
+      if (declared && declared.size === 0 && specs.length > 0) {
+        log('[lmtools] ⚠️ 贡献点里一条 languageModelTools 都没有 —— 一个 LM 工具也注册不上（跑 `bun run gen:lm-tools`）')
+      }
+      if (undeclared.length > 0) {
+        log(`[lmtools] 未声明（模型侧不可见，重跑 \`bun run gen:lm-tools\` 可纳入默认清单）：${undeclared.join(', ')}`)
+      }
       for (const s of skipped) log(`[lmtools] 跳过：${s}`)
     }
-    return { registered: next.length, skipped, listed }
+    return { registered: next.length, skipped, listed, undeclared }
   }
 
   /** 撤掉全部注册（扩展停用 / 需要彻底重置时） */

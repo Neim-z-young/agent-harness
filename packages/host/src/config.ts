@@ -313,6 +313,15 @@ export interface HarnessConfig {
       onExceedPct?: number
       /** 到硬线后：`"truncate"`（默认，交还内核静默截断）| `"refuse"`（中止本轮） */
       onExceed?: 'truncate' | 'refuse'
+      /**
+       * 判据是否计入**固定前缀**（system prompt + 工具 schema）的实测规模。默认 `true`。
+       *
+       * 占用率原本只算消息体，漏掉"不随会话增长、却实占窗口"的那部分。真机实测
+       * （32 个工具）固定前缀约 9,600 tokens：30 万窗口上让四档全部偏晚 3.2%，
+       * 3.2 万窗口上偏 30 个百分点（notify 档触发时真实请求已超窗）。数字由 ACP
+       * 用 `usageStats.inputTokens` 与自身估算相减**实测**得到，不写死在配置里。
+       */
+      includeFixedOverhead?: boolean
     }
     /**
      * **子会话档位**：对有父会话（`parentId` —— subagent / swarm 派生的会话）叠加的配置。
@@ -727,6 +736,7 @@ const COMPRESSION_WINDOW_GUARD_KEYS: Record<
   forceCompressPct: true,
   onExceedPct: true,
   onExceed: true,
+  includeFixedOverhead: true,
 }
 /** `compression.windowGuard.onExceed` 合法取值 */
 const WINDOW_GUARD_ON_EXCEED: ReadonlySet<string> = new Set(['truncate', 'refuse'])
@@ -935,6 +945,11 @@ function checkWindowGuard(guard: unknown, out: string[]): void {
   if (guard.enabled !== undefined && typeof guard.enabled !== 'boolean') {
     out.push(
       `compression.windowGuard.enabled 取值 ${JSON.stringify(guard.enabled)} 非法（应为布尔），已按 true 处理`,
+    )
+  }
+  if (guard.includeFixedOverhead !== undefined && typeof guard.includeFixedOverhead !== 'boolean') {
+    out.push(
+      `compression.windowGuard.includeFixedOverhead 取值 ${JSON.stringify(guard.includeFixedOverhead)} 非法（应为布尔），已按 true 处理`,
     )
   }
   const ladders = ['notifyPct', 'forceCompressPct', 'onExceedPct'] as const

@@ -10,7 +10,7 @@
 
 | | ACP 模型侧压缩（`compress` 工具 / 内核折叠） | 会话压缩（`compactIfNeeded` / `/compact`） |
 |---|---|---|
-| 判据 | `requestTok / modelContextLimit`（**折叠后**） | `estimateTokens(sess.messages)`（**原文口径**） |
+| 判据 | `requestTok / modelContextLimit`（**折叠后**；消费方，如窗口闸，另加固定前缀，见 §6.3 ①） | `estimateTokens(sess.messages)`（**原文口径**） |
 | 对 `sess.messages` | **不删**（只记 block 引用） | **真删**（`sess.messages = kept`） |
 | 原文可回溯 | 可以（`acp.archive.v1` / `.cmp.orig`） | 视归档链而定 |
 | 触发点 | 每轮 `core.session.preModel` | **resume / start**、`/compact auto` |
@@ -149,12 +149,14 @@ ACP 侧（`compression` 顶层；下面这段是**受检示例** —— `cli.tes
     "notifyPct": 0.75,
     "forceCompressPct": 0.90,
     "onExceedPct": 0.98,
-    "onExceed": "truncate"
+    "onExceed": "truncate",
+    "includeFixedOverhead": true
   }
 }
 ```
 
 `onExceed` 的两个取值：`"truncate"`（默认，交还内核静默截断）| `"refuse"`（中止本轮不发请求）。
+`includeFixedOverhead` 缺省 `true`：判据与读数都计入固定前缀（见 §6.3），`false` 即回到只算消息体的老口径。
 
 两点刻意的决定：
 
@@ -194,6 +196,24 @@ ACP 侧（`compression` 顶层；下面这段是**受检示例** —— `cli.tes
 **折叠后**的请求（而非"闸门看到前的压力"）。取"一份 res 贯穿下游"而不是"两个口径各记一份"
 —— 后者正是本仓反复出事的那种分裂。折叠动作本身由 `notify` 日志留痕。
 
+### 6.3 真机跑通后订正的三处（都有实证，不是推演）
+
+首次真机跑四档（`forceCompressPct` 调到 0.3 一类）暴露出三个只有真机才显现的问题，全部已修：
+
+| # | 问题 | 实证 | 修法 |
+|---|---|---|---|
+| ① | **判据漏算固定前缀**。原 `occupancy = estimateTokens(res.messages) / window` 只算消息体 | 空会话实测 `requestTok 19`（0.0063%）而同一轮真实请求 `in 10,734`（3.2%）—— 差 500 倍；`cacheRead 9,600` 正是 system prompt + 32 个工具 schema 那个跨会话复用前缀。后果：四档**全部偏晚触发**，30 万窗口偏 3.2%，3.2 万窗口偏 **30 个百分点**（notify 0.75 触发时真实请求已超窗） | 新增**实测探针** `AcpSessionCtx.fixedPrefix`：每步读引擎累计 `usageStats.inputTokens`，与上一次读数相减 = 上一步真实发出的 input tokens，再减去 ACP 当时估算的消息体，差值即固定前缀（**实测而非写死配置**，自动跟随任何模型 / 工具集）。判据改为 `(body + fixed) / window`。开关 `includeFixedOverhead`（默认 true）。三条 fail-soft：读不到 ⇒ 保持上次值；读数没前进 ⇒ 保持（不把 0 增量当实测）；差值为负（中文估算偏大）⇒ clamp 0（退回老口径，偏差只许往保守走） |
+| ② | **`foldSkipped` 把三种成因压成一句**"没有够格的可折叠内容" —— 对"没有可压原文"是误导 | 副本实测 `suggestedRanges: 1`（内核**确实推荐了**）但整批不够 `minCompressRange`（200,000 chars）⇒ `blocksCreated 0`。即 MEMORY 记的「先大后小把门关上」会原样传导：**越是需要窗口保护的会话越折不动** | `foldForWindowGuard` 返回判别式 `{ok:false, reason}`（`no-ranges` / `no-summary` / `below-threshold`），文案分三种措辞，并补**出路**（`/compact`、`decompress`、调大 `modelContextLimit`） |
+| ③ | **`folded` 分支文案两处数字错位** | 实测打印「占用 60.0% → 已强制折叠 … 折叠前 12.0%」，但 60.0% 是 `forceCompressPct`（阈值）、12.0% 是**折叠后**重算值 —— **自证矛盾**（12% 触发不了 60% 的线） | 调用点折前存档 `occupancyBefore`，文案改为「占用 <触发时> 已达强制折叠线 <阈值> → 已强制折叠（…）· 折叠后 <重算值>」 |
+
+**① 的一个副产**：闸门判据从此含固定前缀，而**遥测行仍是纯消息体口径**（有意保留）——
+遥测 `occupancy` 是"发往模型的历史 cores 体量"，用于压缩效果归因；闸门判的是"窗口还剩多少"，
+固定前缀当然要算。两者差一个固定前缀（真机约 9,600），排查"手册怎么早/晚出现了"时先认这一条。
+统计面板则**与判据同源**：前半段仍是消息体口径（既有断言钉的就是它），有固定前缀时**追加**一段
+`· 含固定前缀 N（system + 工具 schema） ⇒ 合计 M（P%）`，把判据数显式写出来，
+避免读者拿消息体去核闸门告警、误以为"闸门凭空多算了占用"；`includeFixedOverhead: false` 时
+这一段一并消失（面板与判据同开关，不留第三种口径）。
+
 
 ## 7. 验收
 
@@ -202,8 +222,8 @@ ACP 侧（`compression` 顶层；下面这段是**受检示例** —— `cli.tes
 | 1 | 单测：占用率 × 阈值 → 期望档（0.74 静默 / 0.75 notify / 0.90 forceCompress / 0.98 refuse）+ 边界 + 非单调配置 + 非法占用率 | ✅ `window-guard.test.ts` 13 例 |
 | 2 | 单测：B2 的三种输入（无键=老行为 / 键在且宽裕=不裁 / 键在且紧张=裁） | ✅ `core.test.ts` 5 例 |
 | 3 | **反向验证**：逐条确认闸门按配置走、不是常量写死 | ✅ 见下表 |
-| 4 | 回归：既有用例不因新闸漂移（唯一受影响者已显式关闸并注明原因） | ✅ 全量 **2592 pass / 0 fail** |
-| 5 | 真机：把 `forceCompressPct` 临时调低跑一轮 ⇒ 告警 + 折叠块；`decompress` 可回溯；`sess.messages` 未被删 | ⏳ **未做**（单元层已覆盖前两条；memories 未被删是 ACP 的既有性质：compress 只在 `core.prompt.preModel` 改待发副本） |
+| 4 | 回归：既有用例不因新闸漂移（唯一受影响者已显式关闸并注明原因） | ✅ 全量 **2604 pass / 0 fail** |
+| 5 | 真机：把 `forceCompressPct` 临时调低跑一轮 ⇒ 告警 + 折叠块；`decompress` 可回溯；`sess.messages` 未被删 | ✅ 已做（`/tmp/harness-wg-test` 隔离 dataDir，原件 `shasum` 未变）。折叠档实测：`占用 84.9% 已达强制折叠线 5.0% → 已强制折叠（折 3 段 / 回收约 203,758 tokens；原文可用 decompress 还原）· 折叠后 11.9% · 窗口 300,000 · 实际发出 35,703（11.9%）`；折不动档实测：`…但本会话已没有未压缩的原文可折（历史都已在折叠块里） ⇒ 本轮未折叠…` + 三条出路整行送达。`sess.messages` 未被删是 ACP 的既有性质（compress 只在 `core.prompt.preModel` 改待发副本） |
 
 ### 7.1 反向验证（每次改一处 ⇒ 只该有预期的那几条变红）
 
@@ -216,10 +236,28 @@ ACP 侧（`compression` 顶层；下面这段是**受检示例** —— `cli.tes
 | hook 去掉 `WindowGuardExceededError` 上抛 | refuse 上抛 1 例 | ✅ 恰 1 条（"其余异常仍被吞"那条**保持绿** ⇒ 证明特判是精确的） |
 | 装配行去掉 `windowGuard: compression.windowGuard` | 装配行守卫 1 例 | ✅ 恰 1 条 |
 
-变异全部还原后 `shasum -a 256` 与基线**逐字相等**。
+补档（§6.3 三处订正各自的反向验证）：
+
+| 变异 | 预期变红 | 实测 |
+|---|---|---|
+| 折叠文案退回"只留一个变量"（丢掉触发时占用率 + 折叠后） | folded 集成例 1 条 | ✅ 恰 1 条 |
+| `foldForWindowGuard` 把 `below-threshold` 混成 `no-ranges` | 门槛档 1 条 | ✅ 恰 1 条 |
+| `includeFixedOverhead` 门控失效（无视开关总计入） | 开关档 1 条 | ✅ 恰 1 条 |
+| 探针不减自身估算（`cumulative − prev.cumulative`） | 探针 / 开关 / fail-soft 3 条 | ✅ 恰 3 条 |
+| `describeFoldSkip` 把三种成因压成一句 | 成因区分 1 条 | ✅ 恰 1 条 |
+| `usagePart` 忽略 `fixed` | 通知 1 条 + 拒绝 1 条 | ✅ 恰 2 条 |
+| 面板不追加固定前缀段 | 面板固定前缀 1 条 | ✅ 恰 1 条 |
+
+变异全部还原后 `shasum -a 256` 与基线**逐字相等**（7/7）。
 
 ## 8. 开放问题
 
+- **判据口径已修**（§6.3 ①）：闸门判据含固定前缀，而遥测行 / 面板那行仍是**消息体口径**（有意，
+  两个数各守一件事）。若将来想统一展示，建议给面板加"合计"一列，而**不是**把判据改回消息体。
+- 探针依赖 `usageStats.inputTokens` 的**累计性**。多子会话共用同一 `meta` 时是否会被别的写入者扰动？
+  当前纪律是"读不到 / 没前进 / 差值为负都不改"，即失败方向保守；需要时再观察。
+- `foldSkipped` 真机上最常见的成因是 `no-ranges`（"等下去也不会好"）。当前只打印出路，
+  是否要在这一档**主动**建议或直接触发 `/compact`？涉及"窗口闸要不要动内存"，先不越界。
 - `forceCompress` 的规则摘要文本：头尾拼接在下游（工具输出为主）的会话里信息量有限。
   是否值得在将来的"agent 策略"里改为 LLM 摘要？留待观察。
 - `refuse` 档的错误文案措辞（已给出四条可执行出路，真机上是否够用待观察）。

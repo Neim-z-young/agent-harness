@@ -43,7 +43,7 @@ describe('ToolRegistrar：全量刷新', () => {
     const r = new ToolRegistrar({ list: async () => ({ tools: [tool('read_file'), tool('bash')] }), register })
 
     const res = await r.refresh()
-    expect(res).toEqual({ registered: 2, skipped: [], listed: 2 })
+    expect(res).toEqual({ registered: 2, skipped: [], listed: 2, undeclared: [] })
     expect(r.names).toEqual(['harness_bash', 'harness_read_file'])
     expect([...live].sort()).toEqual(['harness_bash', 'harness_read_file'])
   })
@@ -120,7 +120,7 @@ describe('ToolRegistrar：全量刷新', () => {
     await r.refresh()
     list = { tools: [] }
     const res = await r.refresh()
-    expect(res).toEqual({ registered: 0, skipped: [], listed: 0 })
+    expect(res).toEqual({ registered: 0, skipped: [], listed: 0, undeclared: [] })
     expect(live.size).toBe(0)
   })
 
@@ -169,5 +169,96 @@ describe('ToolRegistrar：全量刷新', () => {
     expect(live.size).toBe(0)
     expect(r.names).toEqual([])
     expect(() => r.dispose()).not.toThrow()
+  })
+})
+
+/**
+ * 第 4 条纪律（真机实测）：`lm.registerTool` 只接受在 `contributes.languageModelTools` 里
+ * **声明过**的名字，而拒绝是**同步 fire-and-forget**（不回到扩展宿主）⇒ 必须在注册侧设界。
+ *
+ * 这一组钉的是"界设在注册**之前**"：未声明的**连 `register` 都不该调** —— 调了就会在主进程
+ * 刷 error，而我们的台账还会把它记成成功（真机 22 条，"注册 32/32" 是谎报）。
+ */
+describe('ToolRegistrar：贡献点声明界', () => {
+  /** 工具池：2 个默认装配里的 + 1 个只在真实环境里有的（optIn 插件 / 个人 MCP 的形态） */
+  const pool = ['read_file', 'bash', 'task_list']
+  const all = { tools: pool.map(tool) }
+
+  it('只注册声明过的；未声明的**不调用 register**，且**不算失败**（进 undeclared 而非 skipped）', async () => {
+    const log: string[] = []
+    const { register, live } = makeRegister(log)
+    const r = new ToolRegistrar({
+      list: async () => all,
+      register,
+      declared: () => new Set(['harness_bash', 'harness_read_file']),
+    })
+
+    const res = await r.refresh()
+    expect(res.registered).toBe(2)
+    expect(res.skipped).toEqual([])
+    expect(res.undeclared).toEqual(['harness_task_list'])
+    expect(log.filter((l) => l.startsWith('+'))).toEqual(['+harness_bash', '+harness_read_file'])
+    expect([...live].sort()).toEqual(['harness_bash', 'harness_read_file'])
+  })
+
+  it('不注入 declared ⇒ 老行为逐位不变（全部尝试注册）', async () => {
+    const { register, live } = makeRegister([])
+    const r = new ToolRegistrar({ list: async () => all, register })
+
+    const res = await r.refresh()
+    expect(res).toEqual({ registered: 3, skipped: [], listed: 3, undeclared: [] })
+    expect(live.size).toBe(3)
+  })
+
+  it('声明集合变小 ⇒ 原先注册的**被撤掉**（声明界也走全量替换，不留僵尸）', async () => {
+    const log: string[] = []
+    const { register, live } = makeRegister(log)
+    let declared = new Set(['harness_bash', 'harness_read_file'])
+    const r = new ToolRegistrar({ list: async () => all, register, declared: () => declared })
+
+    await r.refresh()
+    log.length = 0
+    declared = new Set(['harness_bash'])
+    const res = await r.refresh()
+
+    expect(res.registered).toBe(1)
+    expect(res.undeclared).toEqual(['harness_read_file', 'harness_task_list'])
+    expect(log.filter((l) => l.startsWith('-')).sort()).toEqual(['-harness_bash', '-harness_read_file'])
+    expect([...live]).toEqual(['harness_bash'])
+  })
+
+  it('声明集合为空 ⇒ 一个都不注册，且打**显眼**警示（清单丢了 / 生成没跑）', async () => {
+    const lines: string[] = []
+    const { register, live } = makeRegister([])
+    const r = new ToolRegistrar({
+      list: async () => all,
+      register,
+      declared: () => new Set(),
+      log: (m) => lines.push(m),
+    })
+
+    const res = await r.refresh()
+    expect(res.registered).toBe(0)
+    expect(res.undeclared).toHaveLength(3)
+    expect(live.size).toBe(0)
+    expect(lines.some((l) => l.includes('⚠️') && l.includes('languageModelTools'))).toBe(true)
+  })
+
+  it('未声明的走**一行汇总**、不走「跳过：」逐条（否则真失败会被常态条目淹掉）', async () => {
+    const lines: string[] = []
+    const { register } = makeRegister([])
+    const r = new ToolRegistrar({
+      list: async () => all,
+      register,
+      declared: () => new Set(['harness_bash']),
+      log: (m) => lines.push(m),
+    })
+
+    await r.refresh()
+    expect(lines.some((l) => l.includes('跳过：'))).toBe(false)
+    expect(
+      lines.some((l) => l.includes('未声明') && l.includes('harness_read_file') && l.includes('harness_task_list')),
+    ).toBe(true)
+    expect(lines.some((l) => l.includes('注册 1/3 个工具（另 2 个未在贡献点声明，已跳过）'))).toBe(true)
   })
 })

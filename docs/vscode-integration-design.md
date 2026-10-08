@@ -952,8 +952,46 @@ bun run gen:lm-tools
 
 
 **已知边界（写下来，不假装没有）**：第三方插件在运行期新增的工具，其名字**不在**静态贡献点里 ⇒
-`lm.tools` 可见、`lm.invokeTool` 可调，但**模型看不见**（元信息是打包期固化的）。这与
-"不做白名单、暴露全部工具"不矛盾：暴露面仍是全部，只是"模型可见"这一格需要重跑生成脚本才刷新。
+**模型看不见**。这与"不做白名单、暴露全部工具"不矛盾：`harness/tools.list` 的暴露面仍是全部，
+`harness/tools.call` 也仍能调它们；"模型可见"这一格需要重跑生成脚本才刷新。
+
+#### 14.4.2 落地后订正：「未声明的工具仍可注册 / 仍可 `invokeTool`」是**错的**
+
+初稿在上一段写过"`lm.tools` 可见、`lm.invokeTool` 可调，但模型看不见"。真机（VSCode 1.141.0）
+实测**不成立**，而且错的方向比想象的严重：
+
+| 观察 | 事实 |
+|---|---|
+| 开发机池子 | **32 个**（`gen:lm-tools` 密封取源只有 **10 个** —— 差集 22 = 本仓 optIn 插件 + 个人 MCP server） |
+| 主进程日志 | 每次激活刷 **22 条** `Error: Tool "harness_xxx" was not contributed.` |
+| 我们的输出通道 | `[lmtools] 注册 32/32 个工具` —— **谎报**（实际生效 10 个） |
+| `lm.tools` | 未声明的那 22 个**根本不在**里面（注册就没成功，不是"注册了但模型看不见"） |
+
+**为什么我们看不见失败**（这是本条的要害）：`registerTool` 是**同步 fire-and-forget**
+（`extensionHostProcess.js` 实测源码）：
+
+```js
+registerTool(t, e, n) {
+  return this._registeredTools.set(e, { extension: t, tool: n }),
+         this._proxy.$registerTool(e, typeof n.handleToolStream === 'function'),
+         j(() => { … })
+}
+```
+
+拒绝发生在**主进程**（`HB.registerToolImplementation`），既不 throw 回扩展宿主、也不 reject
+任何 promise ⇒ `ToolRegistrar` 的逐条 `try/catch` 全绿。**这恰好违反 `lm-registrar.ts` 里
+`specs` 字段自己声明的纪律**（"注册失败的那些不能算进来，否则诊断信息会在唯一需要它说真话
+的时候撒谎"）。
+
+⇒ **纪律：运行期注册必须以静态贡献点为止损界**。实现是 `ToolRegistrarDeps.declared`
+（`extension.ts` 从 `context.extension.packageJSON` 读声明名集合）：未声明的**连
+`registerTool` 都不调**，记进 `RefreshResult.undeclared`（**不是** `skipped` —— 它不是失败，
+混进去会让真失败被二十几条常态条目淹掉），日志给一行汇总 + 一条"重跑
+`bun run gen:lm-tools` 可纳入"的指路。缺省不注入 `declared` = 老行为逐位不变（单测控制组）。
+
+副产品：既然"声明集合为空"会让模型侧一个 harness 工具都没有，`refresh` 对
+"定集会空 + 池子非空"这一档单独打警示（与既有那条"清单非空但全部解析失败"同族 ——
+两者都属"静默且看起来正常"的失败形态）。
 
 ### 14.5 不做
 

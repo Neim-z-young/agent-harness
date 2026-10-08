@@ -905,16 +905,25 @@ const ACP_OCCUPANCY_META_KEY = 'acp.occupancy.v1'
  */
 function readAcpOccupancy(
   session: StatsSessionLike | undefined,
-): { requestTok: number; rawTok: number; window?: number } | undefined {
+): { requestTok: number; rawTok: number; window?: number; fixedTok?: number } | undefined {
   const raw = session?.meta?.[ACP_OCCUPANCY_META_KEY]
   if (!raw || typeof raw !== 'object') return undefined
-  const r = raw as { requestTok?: unknown; rawTok?: unknown; window?: unknown }
+  const r = raw as { requestTok?: unknown; rawTok?: unknown; window?: unknown; fixedTok?: unknown }
   if (typeof r.requestTok !== 'number' || !Number.isFinite(r.requestTok)) return undefined
   const rawTok = typeof r.rawTok === 'number' && Number.isFinite(r.rawTok) ? r.rawTok : r.requestTok
   const win = typeof r.window === 'number' && Number.isFinite(r.window) && r.window > 0
     ? r.window
     : undefined
-  return { requestTok: r.requestTok, rawTok, ...(win != null ? { window: win } : {}) }
+  // 固定前缀（system + 工具 schema）：≤0 / 非数一律当"没测到"，不参与展示也不参与算术
+  const fixed = typeof r.fixedTok === 'number' && Number.isFinite(r.fixedTok) && r.fixedTok > 0
+    ? r.fixedTok
+    : undefined
+  return {
+    requestTok: r.requestTok,
+    rawTok,
+    ...(win != null ? { window: win } : {}),
+    ...(fixed != null ? { fixedTok: fixed } : {}),
+  }
 }
 
 /**
@@ -1014,9 +1023,20 @@ export async function renderContextOccupancy(
   const acpOcc = readAcpOccupancy(live)
   if (acpOcc) {
     const aw = acpOcc.window ?? window
+    const fixed = acpOcc.fixedTok ?? 0
+    // 固定前缀（system prompt + 工具 schema）**是窗口闸判据的一部分**：它不随会话增长、
+    // 却实占窗口。只报消息体的话，读者会拿这一行去对闸门的告警（那边算的是两者之和），
+    // 看起来像闸门凭空多算了占用 —— 故有值时追加一段，把「合计」这个判据数显式写出来。
+    // 追加而非改写：既有断言钉的是前半段（消息体口径），改语义会让它们失去判别力。
+    const fixedPart =
+      fixed > 0
+        ? ` · 含固定前缀 ${fixed.toLocaleString()}（system + 工具 schema）`
+          + ` ⇒ 合计 ${(acpOcc.requestTok + fixed).toLocaleString()}（${pctOf(acpOcc.requestTok + fixed, aw)}%）`
+        : ''
     lines.push(
       `  实际发出：${acpOcc.requestTok.toLocaleString()} / ${aw.toLocaleString()} tokens（${pctOf(acpOcc.requestTok, aw)}%）` +
-        ` · ACP 压缩后（未压缩为 ${acpOcc.rawTok.toLocaleString()}）`,
+        ` · ACP 压缩后（未压缩为 ${acpOcc.rawTok.toLocaleString()}）` +
+        fixedPart,
     )
   }
   // 子 agent 上下文：每个子会话单独一行（分母按该子会话自身端点解析 —— 解析不出才回落父会话的窗口；

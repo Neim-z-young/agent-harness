@@ -175,7 +175,7 @@ export const SESSION_MODEL_META_KEY = 'model' as const
  *
  * 写入方是 `@harness/acp-context`（`ACP_OCCUPANCY_KEY` 指向同一字符串）；
  * 消费方为 `@harness/core`（B2）。`@harness/usage` 因"零依赖"约束保留一份同名局部常量。
- * 结构：`{ requestTok: number; rawTok: number; window?: number }`。
+ * 结构：`{ requestTok: number; rawTok: number; window?: number; fixedTok?: number }`。
  */
 export const ACP_OCCUPANCY_META_KEY = 'acp.occupancy.v1' as const
 
@@ -187,6 +187,15 @@ export interface AcpOccupancySnapshot {
   rawTok: number
   /** ACP 侧分母；缺省时调用方用自己的窗口 */
   window?: number
+  /**
+   * **固定前缀**（system prompt + 工具 schema）的实测规模 —— 由 ACP 用
+   * `usageStats.inputTokens` 与自身估算相减得到（见 acp-context 的固定前缀探针）。
+   *
+   * 它不随会话增长、却实占窗口 ⇒ **窗口保护闸的判据 = requestTok + fixedTok**。
+   * 面板只报 `requestTok` 会与告警对不上（看起来像闸门凭空多算了占用）。
+   * 缺省 / 0 表示"没测到或未开启"（此时判据退化为只看 `requestTok`）。
+   */
+  fixedTok?: number
 }
 
 /**

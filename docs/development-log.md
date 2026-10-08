@@ -1,5 +1,131 @@
 # Agent Harness 开发日志
 
+## 2026-10-08（续 257）窗口保护闸的真机三处订正：判据漏了固定前缀 / 折不动只有一句话 / 折叠文案自证矛盾
+
+### 起因
+
+续 255 的 B3 入库后要做设计稿 §7 验收的第 5 项（真机）。侧栏**不能聊天**（`adapters/vscode/src/webview/panel.ts`
+文件头明写"不发对话 —— 那是 Chat 视图的事"），而 `@harness` 参与者又被平台模型解析挡死（续 256），
+**VSCode 侧根本不存在能发请求的入口** ⇒ 改走 CLI + 隔离 dataDir（`/tmp/harness-wg-test`，本机
+`~/.harness/config.json` 与 session 原件全程未动）。四档都跑通了，但跑出三个**只有真机才显形**的问题。
+
+（顺带两个 CLI 使用的坑：`run -d dir "<prompt>"` 会失败 —— 中文被 `parseCliArgs` 当短选项吃掉，
+报"用法: harness run"，**prompt 必须紧跟 `run`** 或用 `--run`；隔离 dataDir 还要 `cp -R ~/.harness/agents`，
+否则 `Fatal: Agent "lead" not registered`。）
+
+### 落地（按严重度，全部已修）
+
+| # | 问题 | 修法 |
+|---|---|---|
+| ① | **判据漏算固定前缀**。`occupancy = estimateTokens(res.messages) / window` 只算消息体 | 新增**实测探针** `AcpSessionCtx.fixedPrefix`：每步读引擎累计 `usageStats.inputTokens`，与上次读数相减 = 上一步真实发出的 input tokens，再减去 ACP 当时的消息体估算，差值即固定前缀。判据改 `(body + fixed) / window`；开关 `compression.windowGuard.includeFixedOverhead`（默认 `true`） |
+| ② | **`foldSkipped` 三种成因压成一句**"没有够格的可折叠内容"（对"没有可压原文"是误导） | `foldForWindowGuard` 返判别式 `{ok:false, reason}`（`no-ranges` / `no-summary` / `below-threshold`）；文案分三种措辞，并**补出路**（`/compact`、`decompress`、调大 `modelContextLimit`） |
+| ③ | **`folded` 分支文案两处数字错位**（自证矛盾） | 调用点折前存档 `occupancyBefore`；文案改「占用 `<触发时>` 已达强制折叠线 `<阈值>` → 已强制折叠（…）· **折叠后** `<重算值>`」 |
+
+外加：统计面板「实际发出」行在有固定前缀时追加 `· 含固定前缀 N（system + 工具 schema） ⇒ 合计 M（P%）`，
+把闸门的判据数显式写出来（否则读者拿消息体去核告警，会以为"闸门凭空多算了占用"）。
+
+### 只有真机时才暴露的发现
+
+1. **判据漏的那部分，恰恰是"跨会话复用"的那部分**。空会话实测 ACP 口径 `requestTok 19`（0.0063%），
+   而同一轮真实请求 `in 10,734`（3.2%）—— 差 **500 倍**；`cacheRead 9,600` 正是 system prompt +
+   32 个工具 schema 那个前缀。后果不是"稍晚一点"，而是**四档全部偏晚**：本机 30 万窗口偏 3.2%，
+   **3.2 万窗口偏 30 个百分点**（`notify` 0.75 触发时真实请求已超窗）。
+   ⇒ 修法刻意**用实测而非配置**：把"32 个工具 ≈ 9600"写进配置，换模型 / 换工具集就失效。
+2. **"先大后小把门关上"会原样传导到窗口闸**。副本实测 `suggestedRanges: 1`（内核**确实推荐了**），
+   但整批交 `applyCompression` 时不够 `minCompressRange`（200,000 chars）⇒ `blocksCreated 0`。
+   即：**越是需要窗口保护的会话越折不动**，只能掉到内核静默截断。这使 ② 从"文案问题"升格为
+   "必须把成因说清"—— 因为三种成因的**出路完全不同**（`no-ranges` 等下去也不会好，
+   `below-threshold` 再涨涨就会出现）。
+3. **折叠那一刻 `occupancy` 会被覆盖**，所以文案必须拿两个变量。实测打印
+   「占用 60.0% → 已强制折叠 … 折叠前 12.0%」，而 60.0% 是**阈值**、12.0% 是**折叠后**重算值 ——
+   **12% 触发不了 60% 的线**，句子自证矛盾。修后同一条真机输出：
+   `占用 84.9% 已达强制折叠线 5.0% → 已强制折叠（折 3 段 / 回收约 203,758 tokens；原文可用 decompress 还原）· 折叠后 11.9% · 窗口 300,000 · 实际发出 35,703（11.9%）`。
+4. **①的一个刻意副产**：闸门判据从此与**遥测行 / 面板**不同源（面板那行始终是消息体口径）。
+   这是**有意**的：遥测 `occupancy` 是"发往模型的历史 cores 体量"（压缩效果归因用），
+   闸门判的是"窗口还剩多少"（固定前缀当然要算）。排查"手册怎么早/晚出现了"时先认这一条。
+
+### 验证
+
+- **三段式**：根 `bun run typecheck` **0 error**；根 `bun run test` **2604 pass / 0 fail**；
+  `adapters/vscode` 未涉及（本轮零改动）。
+- **反向验证 7 个变异**（改一处 ⇒ 只该有预期的那几条变红，全部改完即还原、`shasum -a 256` 对基线逐字相等）：
+  折叠文案退回单变量 **1** / `below-threshold` 混成 `no-ranges` **1** / `includeFixedOverhead` 门控失效 **1** /
+  探针不减自身估算 **3** / 三种成因压成一句 **1** / `usagePart` 忽略 `fixed` **2** / 面板不追加固定前缀段 **1**。
+- **真机三档**（隔离 dataDir）：折叠档与折不动档输出见上；`refuse` 档此前已验（抛错中止、无 `[用量]` 行）。
+  ① 的真机多轮（要同进程两次 `preModel`）用工具调用路径时本机模型无响应（挂起），
+  改由集成测试 + 真机常数前缀（`in 9,689 / cacheRead 9,472`）佐证。
+
+## 2026-10-08（续 256）VSCode 插件首轮真机：模型解析在前、注册声明界在后，两件都不是"我们跑了但没输出"
+
+### 起因
+
+续 255 的代码入库后去窗口里验，报"执行完没回复"。输出通道里侧车那层**是好的**
+（`[lmtools] 注册 32/32 个工具`、之前的 `未知控制方法 "harness/tools.list"` 已消失 —— 那是
+`packages/cli/dist/harness-a2a` 还是 **10-02 编译**的旧产物，重编 `bun run build:sidecar` 即解），
+但 `exthost.log` / `renderer.log` 里同时躺着两批错：
+
+```
+[warning] [LanguageModelProxy](harness.harness-vscode) Could not extract vendor from model identifier 'agent-host-copilotcli:auto'.
+[error]   LanguageModelError: The selected model 'agent-host-copilotcli:auto' is not available.   ← 没回复
+Error: Tool "harness_acp_status" was not contributed.                                            ← 22 条
+```
+
+### 落地
+
+| 段 | 产出 |
+|---|---|
+| ① 定性（不改代码） | 把 VSCode 1.141 的 `extensionHostProcess.js` 挖出来读了三处实现，判定"没回复"是**平台约束**、22 条是**本仓 bug**，两者互不相干 |
+| ② 修本仓 | `ToolRegistrarDeps.declared` + `RefreshResult.undeclared`；`extension.ts` 从 `context.extension.packageJSON` 读声明名集合传入。未声明的**连 `registerTool` 都不调** |
+| ③ 落档 | 设计稿新增 §14.4.2（订正初稿那句错话 + 记下 fire-and-forget 这个要害）、AGENTS §5 |
+
+### 只有真机（+ 读平台源码）时才暴露的发现
+
+1. **chat participant 的请求在进入 handler 之前就必须能解析出一个语言模型** —— 这条推翻了
+   `participant.ts` 文件头"**不使用 `request.model`**（自带 Provider 与 agentic loop）"这句
+   设计意图的有效性。`$invokeAgent` 的实现是**无条件**先解析、且直接消费它的 `id`：
+
+   ```js
+   async $invokeAgent(e, n, o, i) {
+     …let { request: d, … } = await this._createRequest(n, o, s.extension)
+     let g = await this._languageModels.getLanguageModelForRequest(s.extension, d.userSelectedModelId)
+     let f = await this.getToolsForRequest(s.extension, d.userSelectedTools, g.id, i)   // ← g 已被解引用
+   ```
+
+   而 `getLanguageModelForRequest(ext, id)`：给了 id 就按 id 解析，解析不到 ⇒
+   `throw NotFound("The selected model '{id}' is not available.")`；没给 id 就走默认模型，
+   本机没有 ⇒ `throw new Error("Language model unavailable")`。**两条路都抛**。
+2. **`getVendorFromModelIdentifier` 是按 `/` 切的**（`t.indexOf("/")`，无 `/` 即 `undefined`），
+   而 Agents 窗口给的 id 是 `agent-host-copilotcli:auto`（**冒号**形式、来自另一个 agent host）
+   ⇒ vendor 提取失败 ⇒ 那句 warn 与紧随的 NotFound 就是同一个分支的两行。
+   **进程时间线是判据**：24.898 激活 → 24.919 抛错 → **25.7 侧车才起来**（handler 若跑过必然晚于侧车）
+   ⇒「我们跑了但没输出」这个假设可以直接排除。
+3. **`lm.registerTool` 是同步 fire-and-forget，拒绝回不到扩展宿主**：
+
+   ```js
+   registerTool(t, e, n) { return this._registeredTools.set(e, { … }), this._proxy.$registerTool(e, …), j(() => { … }) }
+   ```
+
+   拒绝发生在**主进程**（`HB.registerToolImplementation`）⇒ 我们逐条 `try/catch` 全绿 ⇒
+   输出通道"注册 **32/32**"是**谎报**（实际生效 10 个）。**这恰好违反 `lm-registrar.ts` 里
+   `specs` 字段自己写下的纪律**（"注册失败的那些不能算进来，否则诊断信息会在唯一需要它说真话
+   的时候撒谎"）—— 纪律写对了，但判据依赖了一个不成立的假设（"失败了会 throw 回来"）。
+4. **差集是必然存在的，不是配置事故**：贡献点由 `gen:lm-tools` 从**密封**池生成（默认装配
+   12 插件 / 10 工具，刻意不含个人 `config.json`），运行期读**本机**池（32 = 默认 10 +
+   本仓 optIn 插件 17 + 个人 MCP 5）⇒ 只要"密封生成"这条决策不变，注册侧就**必须**以贡献点为界。
+   顺带订正设计稿初稿的说法：未声明的工具**不在 `lm.tools` 里**（不是"可见但模型看不见"）。
+5. **同一批日志里还查出一处"过期产物"**：`packages/cli/dist/harness-a2a`（gitignore 产物、
+   79.9MB）停在 10-02，早于 P3-D 的 `harness/tools.list` ⇒ 侧车起来了但控制面不认那个方法。
+   重编后校验：三个新方法字符串齐、B2/B3 的配置键齐（`windowGuard` / `forceCompressPct` /
+   `requestPressurePct` / `acp.occupancy.v1`）、`adapters/vscode` E2E 13 pass、
+   直调 `harness/tools.list` 返回 **32 个工具**。
+
+### 验证
+
+- 扩展侧：`bun run typecheck` exit 0；`bun test` **248 pass / 0 fail**（`lm-registrar.test.ts`
+  10 → **15** 条：新增"声明界"一组 5 条，另两处 `toEqual` 期望补 `undeclared: []`）
+- 主仓：`bun run typecheck` 0 error；`bun run test` **2593 pass / 0 fail**（`adapters/*` 不在
+  workspaces，根脚本不覆盖，见 AGENTS §5）
+
 ## 2026-10-08（续 255）上下文占用的两把尺子：面板并排 + 两道闸（B2 合取条件 / B3 窗口保护）
 
 ### 起因
