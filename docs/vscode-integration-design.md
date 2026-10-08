@@ -993,6 +993,28 @@ registerTool(t, e, n) {
 "定集会空 + 池子非空"这一档单独打警示（与既有那条"清单非空但全部解析失败"同族 ——
 两者都属"静默且看起来正常"的失败形态）。
 
+#### 14.4.3 `@harness` 能不能用，由**会话类型**决定（续 258）
+
+`@harness` 还有一道**与工具注册无关**的平台前置：`$invokeAgent` 在进 handler 之前无条件
+`getLanguageModelForRequest(...)`，而它内部的 `getVendorFromModelIdentifier` **按 `/` 切**。
+实测两种会话给出的模型 id 形态不同，结果直接反转：
+
+| 会话类型 | `sessionKey` | 模型 id | 含 `/` | `@harness` |
+|---|---|---|---|---|
+| Agent 会话 | `agent-host-copilotcli` | `agent-host-copilotcli:auto` | ❌ 冒号 | **不可用**（vendor 提取失败 ⇒ `LanguageModelError`） |
+| Local 会话 | `local` | `copilot/auto` | ✅ 斜杠 | **可用** |
+
+**用户指引**：`@harness` 请**在 Local 会话**里用。Agent 会话下平台在进我们 handler 之前就抛，
+扩展侧无从补救。
+
+**已知边界（写下来，不假装没有）**：**BYOK provider 覆盖不了 Agent 会话** —— 那类会话的模型
+列表由 **agent host** 决定（`agent-host-copilotcli:auto,agent-host-copilotcli:hydrafusion`），
+扩展贡献的 `harness/<id>` **不会出现在其中**。所以本仓**不做** BYOK provider（若做，只为把
+harness 的模型贡献给 VSCode 全局 `lm` API，与"让 `@harness` 可用"无关）。详见开发日志续 258。
+
+诊断只用两行日志即可定案：`renderer.log` 的 `[ChatModelSelection] … resultModel=…`（看 id 形态）
+与 `exthost.log` 的 `[LanguageModelProxy](harness.harness-vscode)`（看是否提取失败）。
+
 ### 14.5 不做
 
 - **不写本地 `permissions.json`**：没有 `always-allow` 通道 —— 一个远端编排器不该有改写

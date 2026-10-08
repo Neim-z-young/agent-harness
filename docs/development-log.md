@@ -1,5 +1,66 @@
 # Agent Harness 开发日志
 
+## 2026-10-08（续 258）`@harness` 的真因是会话类型，不是缺 provider —— P1（BYOK provider）判决：不做
+
+### 起因
+
+续 256 记下"本机 0 个 `languageModelChatProviders` 提供者 ⇒ `selectChatModels()` 必空 ⇒ `@harness`
+结构性不可用"，并据此定了 P1（自建 BYOK provider）。P1 写到 90%（`lm-provider/` 三模块 + 贡献点 +
+注册接线）时，用户反馈"VSCode 切到本地后似乎可用了"。翻本机日志后**该推断被证伪**，P1 随之被否并删除。
+
+### 查到的证据（全部来自本机日志，可复查）
+
+日志位置：`~/Library/Application Support/Code/logs/20261008T184347/window{1,2}/`。
+
+| 时刻 | 面 | 事件 |
+|---|---|---|
+| 18:53:09（w2） | `exthost.log` | `@harness` 激活 → `[LanguageModelProxy](harness.harness-vscode) Could not extract vendor from model identifier 'agent-host-copilotcli:auto'` → `LanguageModelError: The selected model … is not available.` |
+| 19:06:16 / 19:12:24 / 19:12:46（w1） | `exthost.log` | 同一条报错，共三次，**全在 Agent 会话** |
+| 19:12:46 之后 | `exthost.log` | **再无任何 `LanguageModelProxy` 失败**（直到 22:34 日志结尾） |
+| 22:35:06 / 22:35:14 | `renderer.log` | `[ChatModelSelection] sessionKey="agent-host-copilotcli" … resultModel="agent-host-copilotcli:auto"` |
+| 22:35:47 | `renderer.log` | `[ChatModelSelection] sessionKey="local" … resultModel="copilot/auto"` ← **用户"切到本地"** |
+| 22:36:26 | `~/.harness/sessions/9743ec5e-….telemetry.jsonl` | `preModel` round1（`rawTok:3` / `overheadTok:17413`）+ `telemetry.turn.end` `finish:"stop"` ⇒ **一轮跑完** |
+
+最后那条遥测的 `sessionId` 是**裸 UUID** 且**不落 `s_xxx.json`** ⇒ 走的是 **A2A 路径（`@harness`）**，
+既不是 CLI（会写 `s_xxx` 会话文件）、也不是侧栏（`4-Agent Harness.log` 里 panel 的 resume 用的是
+`s_xxx` id）。
+
+### 真因：同一个 `@harness`，两种会话给两种模型 id
+
+| 会话类型 | `sessionKey` | 模型 id | 含 `/` | `getVendorFromModelIdentifier` | `@harness` |
+|---|---|---|---|---|---|
+| Agent 会话 | `agent-host-copilotcli` | `agent-host-copilotcli:auto` | ❌ 冒号 | 失败 | **死** |
+| Local 会话 | `local` | `copilot/auto` | ✅ 斜杠 | `copilot` | **可用** |
+
+⇒ "切到本地后可用" = 把 Chat 从 **Agent 会话**切到 **Local 会话**，**零代码即解**。
+
+### 只有实测才暴露的两条
+
+1. **"扫了哪些扩展"推不出"有没有模型"**：`~/.vscode/extensions/` 与 `adapters/` 扫下来确实 0 个
+   `languageModelChatProviders` 贡献点，但 **Copilot Chat 是特权/内置扩展、不走那个贡献点**，它提供的
+   `copilot` vendor 一直在 `selectChatModels()` 候选里（`availableModels="copilot/auto"` 全程存在）。
+   续 256 的"必空"把**贡献点扫描**当成了**候选枚举**。**判据要落在模型 id 形态上**，不落在扩展目录。
+2. **P1 覆盖不到真正的坏路径**：Agent 会话的模型列表由 **agent host** 决定
+   （`agent-host-copilotcli:auto,agent-host-copilotcli:hydrafusion`），P1 贡献的 `harness/<id>`
+   **不会出现在那里** ⇒ 即使把 P1 做完，Agent 会话照样死。
+
+### 判决：P1 不做（代码已删）
+
+P1 对"让 `@harness` 可用"这个**原目标已无价值**（Local 会话本来就通，且它救不了 Agent 会话）。
+它剩下的唯一价值是"把 harness 配置的模型（`api.deepseek.com` / `127.0.0.1:8787`）暴露给 VSCode
+全局 `lm` API（Copilot 编排、别的扩展能选到）"—— 这是**独立的新需求**，与原目标无关，需要时再写。
+**P1 全程未入库**（三模块是未跟踪新文件，注册接线与贡献点是未提交的工作区改动），已就地移除：
+`adapters/vscode/src/lm-provider/`（config / openai / provider）+ `extension.ts` 的注册接线 +
+`package.json` 的 `languageModelChatProviders` 贡献点。方法 A 的 `declaredLmToolNames` 与 P1 混在
+同一文件，**已甄别保留**（见续 256）。
+
+### 验证
+
+- 删除后 `grep -rn` 上述四个标识在 `adapters/` 下 **0 命中**；`package.json` 回到基线（不再出现在
+  `git status` 的 modified 列表里）
+- `bun run typecheck`（根）全包 `Exited with code 0`；`adapters/vscode` 单独 `typecheck` 0 error
+- `bun run test`（根）**2604 pass / 0 fail**；`adapters/vscode` **248 pass / 0 fail**
+
 ## 2026-10-08（续 257）窗口保护闸的真机三处订正：判据漏了固定前缀 / 折不动只有一句话 / 折叠文案自证矛盾
 
 ### 起因
