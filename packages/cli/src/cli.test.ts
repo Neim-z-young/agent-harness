@@ -474,6 +474,7 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
         nudge: { maxContextLimitPct: 0.75, minContextLimitPct: 0.45, emergencyThresholdPct: 0.95 },
         telemetry: { enabled: false },
         manualInjection: 'on-demand',
+        windowGuard: { enabled: true, notifyPct: 0.75, forceCompressPct: 0.9, onExceedPct: 0.98, onExceed: 'truncate' },
         subagent: {
           modelContextLimit: 200_000,
           manualInjection: 'off',
@@ -550,6 +551,42 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
       'compression.subagent.manualInjection 取值 "always-on" 未知（可选：on-demand / always / off），已按 on-demand 处理',
     )
     expect(bad.length).toBe(2)
+  })
+
+  it('checkCompressionConfig：窗口保护闸（B3）的非法阈值/取值都被点名', () => {
+    // 插件侧 resolveWindowGuard 对非法值**静默回落默认**（本闸是旁路保护，不该因一个拼错的
+    // 百分比让会话起不来）⇒ 不在这里报，用户就只会看到"配了没反应"。
+    const issues = checkCompressionConfig({
+      windowGuard: {
+        enabled: 'yes',            // 应为布尔
+        notifyPct: 0,              // (0,1] 之外
+        forceCompressPct: 1.5,     // 超过窗口
+        onExceedPct: NaN,
+        onExceed: 'abort',         // 只认 truncate / refuse
+        notifyPct2: 0.5,           // 拼错的键名
+      },
+    })
+    expect(issues).toContain('compression.windowGuard.enabled 取值 "yes" 非法（应为布尔），已按 true 处理')
+    expect(issues).toContain('compression.windowGuard.notifyPct 取值 0 非法（应为 (0, 1] 的占用率），已按默认值处理')
+    expect(issues).toContain('compression.windowGuard.forceCompressPct 取值 1.5 非法（应为 (0, 1] 的占用率），已按默认值处理')
+    expect(issues.some((m) => m.includes('compression.windowGuard.onExceedPct 取值'))).toBe(true)
+    expect(issues).toContain(
+      'compression.windowGuard.onExceed 取值 "abort" 未知（可选：truncate / refuse），已按 truncate 处理',
+    )
+    expect(issues).toContain('compression.windowGuard.notifyPct2 未被识别，该配置不会生效')
+    expect(issues.length).toBe(6)
+  })
+
+  it('checkCompressionConfig：窗口保护闸三档写反序要告警（低档永远不可达 = 配了却不生效）', () => {
+    const issues = checkCompressionConfig({ windowGuard: { notifyPct: 0.95, forceCompressPct: 0.6 } })
+    expect(issues).toHaveLength(1)
+    expect(issues[0]).toContain('compression.windowGuard.notifyPct（0.95）高于 .forceCompressPct（0.6）')
+    expect(issues[0]).toContain('永远不可达')
+    // 正序 / 只给一个键 → 零告警（不能对合法配置刷屏）
+    expect(checkCompressionConfig({ windowGuard: { notifyPct: 0.5, forceCompressPct: 0.9, onExceedPct: 0.98 } })).toEqual([])
+    expect(checkCompressionConfig({ windowGuard: { notifyPct: 0.5 } })).toEqual([])
+    expect(checkCompressionConfig({ windowGuard: {} })).toEqual([])
+    expect(checkCompressionConfig({ windowGuard: undefined })).toEqual([])
   })
 
   it('checkCompressionConfig：档位段内的未知键带作用域路径报出（含 perAgent 的 agent id）', () => {
@@ -754,6 +791,9 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     const body = src.slice(start, src.indexOf('})', start))
     expect(body).toInclude('modelContextLimit: compression.modelContextLimit')
     expect(body).toInclude('providerWindows: buildProviderWindowTable(cfg, defaultProviderId)')
+    // 窗口保护闸（B3）同理：这一行没有别的守卫能覆盖它 —— 漏传 ⇒ `resolveWindowGuard(undefined)`
+    // 仍会给出默认档，闸门看起来"在工作"、实际宿主怎么配都无效（静默失效）。
+    expect(body).toInclude('windowGuard: compression.windowGuard')
   })
 
   it('checkCompactionConfig：拼错键与非法取值都能被点名', () => {

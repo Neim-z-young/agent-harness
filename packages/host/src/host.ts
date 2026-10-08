@@ -939,6 +939,10 @@ export class HarnessHost {
         // 压缩提示注入策略（顶层）。另有一条能力判据与它叠加：该 Agent 白名单里确实没有
         // compress 时一律不注入（只读 worker 拿着手册只会去撞 TOOL_NOT_ALLOWED）。
         manualInjection: compression.manualInjection,
+        // 窗口保护闸（B3）：按**真实占用率**（折叠后）四档处置，与 autoCompact 的原文口径并存。
+        // 形状与插件侧 `WindowGuardConfig` 一致 ⇒ 直接透传，不经 `toAcpConfig`（那不是内核 config，
+        // 喂给内核只会被 `defaultConfig` 静默丢掉）。
+        windowGuard: compression.windowGuard,
         // 作用域档位：subagent（按 parentId，即子会话）/ perAgent（按 agent id）。
         // 两者都不配置时不传 ⇒ 插件侧不叠加，缺省行为与改造前逐位一致。
         subagent: toAcpScope(compression.subagent) as never,

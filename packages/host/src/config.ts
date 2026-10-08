@@ -290,6 +290,31 @@ export interface HarnessConfig {
      */
     manualInjection?: 'on-demand' | 'always' | 'off'
     /**
+     * **窗口保护闸（B3）**：按**真实占用率**（折叠后 `requestTok / window`）逐级升级处置。
+     *
+     * 为什么需要独立于会话压缩：`compaction.autoCompactThresholdPct` 判的是**原文口径**
+     * （守内存/磁盘别膨胀），ACP 启用后两把尺子分离 ⇒ **窗口保护事实上缺位**。
+     * 真机 `s_1791373374635_9hqyb`：原文口径 79.6% 撞线时真实请求只有 31.5%。
+     *
+     * 四档：`notifyPct`（告警，不改请求）→ `forceCompressPct`（**复用内核折叠**，非破坏、
+     * 可 `decompress` 还原）→ 内核 `config.truncate.threshold`（既有静默截断，有损）→
+     * `onExceedPct` + `onExceed:"refuse"`（中止本轮，不发请求）。
+     *
+     * 缺省**开启**。想恢复改造前行为（窗口保护只剩内核那三层）就写 `"enabled": false`。
+     */
+    windowGuard?: {
+      /** 总开关（默认 true）。false = 本闸完全退场 */
+      enabled?: boolean
+      /** 告警线（占用率，0~1，默认 0.75） */
+      notifyPct?: number
+      /** 强制折叠线（占用率，0~1，默认 0.90） */
+      forceCompressPct?: number
+      /** 硬线（占用率，0~1，默认 0.98） */
+      onExceedPct?: number
+      /** 到硬线后：`"truncate"`（默认，交还内核静默截断）| `"refuse"`（中止本轮） */
+      onExceed?: 'truncate' | 'refuse'
+    }
+    /**
      * **子会话档位**：对有父会话（`parentId` —— subagent / swarm 派生的会话）叠加的配置。
      *
      * 不配 = 不叠加 ⇒ 子会话逐位沿用顶层（即改造前的行为）。典型用法：子会话预算小，
@@ -337,6 +362,15 @@ export interface HarnessConfig {
      * 切到小窗口模型后阈值同样落到真实窗口之外。想临时指定窗口可用 `contextWindowTokens` 覆盖。
      */
     autoCompactThresholdPct?: number
+    /**
+     * **合取条件（B2）**：存在 ACP 的「真实发出量」口径时，还要求它也达到窗口的这个百分比才压缩。
+     *
+     * `autoCompactThresholdPct` 判的是**原文口径**（守"内存/磁盘别膨胀"）；ACP 会把真实请求压得很低，
+     * 于是原文口径先撞线、在模型端还很宽裕时就裁掉大批消息。加上本条 = 要求窗口也真的紧张。
+     *
+     * **省略 = 不启用**（老行为逐位一致）。ACP 未启用时键不存在，条件自动视为成立。
+     */
+    requestPressurePct?: number
     /** 给摘要生成预留的 tokens（默认 30000，参考 Claude Code 的 20K max output + 13K buffer） */
     reservedTokens?: number
     /**
@@ -667,6 +701,7 @@ const COMPRESSION_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>, 
   config: true,
   telemetry: true,
   manualInjection: true,
+  windowGuard: true,
   subagent: true,
   perAgent: true,
 }
@@ -682,6 +717,19 @@ const COMPRESSION_NUDGE_KEYS: Record<keyof NonNullable<HarnessConfig['compressio
 const COMPRESSION_TELEMETRY_KEYS: Record<keyof NonNullable<HarnessConfig['compression']>['telemetry'], true> = {
   enabled: true,
 }
+/** `compression.windowGuard`（B3）段合法键 */
+const COMPRESSION_WINDOW_GUARD_KEYS: Record<
+  keyof NonNullable<NonNullable<HarnessConfig['compression']>['windowGuard']>,
+  true
+> = {
+  enabled: true,
+  notifyPct: true,
+  forceCompressPct: true,
+  onExceedPct: true,
+  onExceed: true,
+}
+/** `compression.windowGuard.onExceed` 合法取值 */
+const WINDOW_GUARD_ON_EXCEED: ReadonlySet<string> = new Set(['truncate', 'refuse'])
 /** `compression.manualInjection` 合法取值 */
 const MANUAL_INJECTION_MODES: ReadonlySet<string> = new Set(['on-demand', 'always', 'off'])
 /** 作用域档位段（`compression.subagent` / `compression.perAgent[*]`）的合法键 */
@@ -862,6 +910,64 @@ function collectUnknown(obj: unknown, allowed: Iterable<string>, path: string): 
 }
 
 /**
+ * 校验 `compression.windowGuard`（B3 窗口保护闸）。
+ *
+ * 为什么不能只靠插件侧兜底：插件的 `resolveWindowGuard` 对非法阈值一律**静默回落默认值**
+ * —— 本闸是旁路保护，不该因一个拼错的百分比让会话起不来。代价就是"配了没反应"，
+ * 所以校验必须在这一侧把问题**指名到键**（与 `tokenCalibration` / `manualInjection` 同纪律）。
+ *
+ * 顺带查**三档单调性**：`notifyPct ≤ forceCompressPct ≤ onExceedPct`。写成倒序不会造成
+ * "过线却只告警"（插件的判定顺序是按严重度、不按阈值大小），但会让低档**永远不可达** ——
+ * 那正是本文件存在的理由（防"配了却不生效"）。只在两侧都**显式给出**时比较，避免把
+ * 默认值再抄一份到这个文件里（两处默认值必然漂移）。
+ */
+function checkWindowGuard(guard: unknown, out: string[]): void {
+  if (guard === undefined) return
+  if (!isPlainObject(guard)) {
+    out.push(`compression.windowGuard 取值 ${JSON.stringify(guard)} 非法（应为对象），已按默认值处理`)
+    return
+  }
+  for (const k of Object.keys(guard)) {
+    if (!(k in COMPRESSION_WINDOW_GUARD_KEYS)) {
+      out.push(`compression.windowGuard.${k} 未被识别，该配置不会生效`)
+    }
+  }
+  if (guard.enabled !== undefined && typeof guard.enabled !== 'boolean') {
+    out.push(
+      `compression.windowGuard.enabled 取值 ${JSON.stringify(guard.enabled)} 非法（应为布尔），已按 true 处理`,
+    )
+  }
+  const ladders = ['notifyPct', 'forceCompressPct', 'onExceedPct'] as const
+  const given: Array<[string, number]> = []
+  for (const key of ladders) {
+    const v = guard[key]
+    if (v === undefined) continue
+    if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0 || v > 1) {
+      out.push(
+        `compression.windowGuard.${key} 取值 ${JSON.stringify(v)} 非法（应为 (0, 1] 的占用率），已按默认值处理`,
+      )
+      continue
+    }
+    given.push([key, v])
+  }
+  for (let i = 0; i + 1 < given.length; i++) {
+    const [lowKey, low] = given[i]!
+    const [highKey, high] = given[i + 1]!
+    if (low > high) {
+      out.push(
+        `compression.windowGuard.${lowKey}（${low}）高于 .${highKey}（${high}）—— 低档阈值不得高于高档，`
+        + `否则 ${lowKey} 永远不可达（三档应逐级抬高：notify ≤ forceCompress ≤ onExceed）`,
+      )
+    }
+  }
+  if (guard.onExceed !== undefined && !WINDOW_GUARD_ON_EXCEED.has(guard.onExceed as string)) {
+    out.push(
+      `compression.windowGuard.onExceed 取值 ${JSON.stringify(guard.onExceed)} 未知（可选：truncate / refuse），已按 truncate 处理`,
+    )
+  }
+}
+
+/**
  * 校验 `config.json → compression`：未知键 + `tokenCalibration` 非法取值。
  *
  * 纯函数（无 IO），便于单测。返回**人类可读**的问题列表（空数组表示无问题）。
@@ -919,6 +1025,9 @@ export function checkCompressionConfig(c: unknown): string[] {
       `compression.manualInjection 取值 ${JSON.stringify(c.manualInjection)} 未知（可选：on-demand / always / off），已按 on-demand 处理`,
     )
   }
+  // 窗口保护闸（B3）：三档阈值都是占用率，非法取值会被插件静默回落默认（见 resolveWindowGuard），
+  // 所以这里必须指名到键 —— 否则就是"配了却不生效"的典型静默失效面。
+  checkWindowGuard(c.windowGuard, out)
   // 作用域档位
   checkCompressionScope(c.subagent, '.subagent', push)
   if (isPlainObject(c.perAgent)) {
@@ -943,6 +1052,7 @@ export function checkCompressionConfig(c: unknown): string[] {
 const COMPACTION_KEYS: Record<keyof NonNullable<HarnessConfig['compaction']>, true> = {
   strategy: true,
   autoCompactThresholdPct: true,
+  requestPressurePct: true,
   reservedTokens: true,
   contextWindowTokens: true,
   keepRecentMessages: true,
@@ -1047,6 +1157,7 @@ export function buildCompactionOptions(
     ...(k?.keepRecentMessages != null ? { keepRecentMessages: k.keepRecentMessages } : {}),
     ...(k?.summaryMaxChars != null ? { summaryMaxChars: k.summaryMaxChars } : {}),
     ...(k?.autoCompactThresholdPct != null ? { autoCompactThresholdPct: k.autoCompactThresholdPct } : {}),
+    ...(k?.requestPressurePct != null ? { requestPressurePct: k.requestPressurePct } : {}),
     ...(k?.reservedTokens != null ? { reservedTokens: k.reservedTokens } : {}),
     ...(k?.tokenCalibration != null ? { tokenCalibration: k.tokenCalibration } : {}),
     ...(k?.tokenCalibrationScale != null ? { tokenCalibrationScale: k.tokenCalibrationScale } : {}),

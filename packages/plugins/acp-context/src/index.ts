@@ -43,6 +43,8 @@ import {
   type CoreMessage,
   type CompressionState,
   type CompressionBlock,
+  type CompressibleRange,
+  type ProcessTurnResult,
   type Prompts,
   type TokenCountFn,
 } from 'acp-kernel'
@@ -58,6 +60,15 @@ import {
 } from './adapter.js'
 import { applyAutoTune, describeAutoTune, type LooseAcpConfig } from './auto-tune.js'
 import { loadPromptFiles } from './prompts.js'
+import {
+  decideWindowGuardAction,
+  formatWindowGuardNotice,
+  formatWindowGuardRefusal,
+  resolveWindowGuard,
+  WindowGuardExceededError,
+  type ResolvedWindowGuard,
+  type WindowGuardConfig,
+} from './window-guard.js'
 import type { SystemStabilityReport } from '@harness/plugin'
 import {
   createWriter as createTelemetryWriter,
@@ -411,6 +422,20 @@ export interface AcpContextPluginOptions {
    */
   manualInjection?: ManualInjectionMode
   /**
+   * **窗口保护闸（B3）**：按**真实占用率**（折叠后 `requestTok / window`）逐级升级处置。
+   *
+   * 为什么需要独立于会话压缩：`compactIfNeeded` 判的是**原文口径**（守内存/磁盘），ACP 启用后
+   * 两把尺子分离 ⇒ 窗口保护事实上缺位。真机 `s_1791373374635_9hqyb`：原文口径 79.6% 撞线时
+   * 真实请求只有 31.5%。详见 {@link ./window-guard.js}。
+   *
+   * 四档：`notifyPct`（告警）/ `forceCompressPct`（**复用内核折叠**，非破坏、可 decompress）/
+   * 内核 `truncate.threshold`（既有静默截断，破坏性）/ `onExceedPct` + `onExceed:'refuse'`（中止本轮）。
+   *
+   * **刻意不做成作用域档位**（`subagent` / `perAgent` 那一层）：阈值是**占用率**，
+   * 已随各档位自己的 `modelContextLimit` 自动缩放，再分化只会多一处口径来源。
+   */
+  windowGuard?: WindowGuardConfig
+  /**
    * **子会话档位**：对有父会话（`parentSessionId` —— `session.create({ parentId })` 写入，
    * subagent / swarm 派生）的会话叠加的配置。
    *
@@ -629,6 +654,10 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
   const optionWindow = options.modelContextLimit
   const modelContextLimit = optionWindow ?? 200_000
   const baseManualInjection: ManualInjectionMode = options.manualInjection ?? 'on-demand'
+  // 窗口保护闸（B3）：归一化一次，后续每轮直接用（决策点不做第二遍默认值）。
+  // 缺省**开启**且四档取 WINDOW_GUARD_DEFAULTS —— 见 window-guard.ts 的取舍说明；
+  // 想回到改造前行为（窗口保护只剩内核那三层）就显式配 `windowGuard.enabled: false`。
+  const windowGuard: ResolvedWindowGuard = resolveWindowGuard(options.windowGuard)
 
   /**
    * 解析某个作用域**生效**的压缩配置。
@@ -1120,6 +1149,10 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               manualInjection: scope.manualInjection,
               ...(canCompress !== undefined ? { canCompress } : {}),
               explicitSystemPrompt,
+              // 窗口保护闸（B3）：配置与告警出口。入口给日志（`notify` / `forceCompress` 两档要可见），
+              // 这也是它唯一的出口 —— 宿主若没接日志，闸门就静默降级成"只按档位动手"。
+              windowGuard,
+              notify: (msg) => plgCtx.log.warn?.(msg),
               // 统一块模型：把每轮内部折叠（tier1/2/3）的 source:'acp' 块 push 给 host，
               // host 合并进 session.blocks，供视图/loader/reconstructHistory/revert 消费
               recordBlocks: (blocks) => {
@@ -1127,7 +1160,11 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
               },
             })
           } catch (err) {
-            // 压缩是旁路优化：失败绝不阻断本轮模型请求
+            // 窗口保护闸的 refuse 档**必须上抛**：它存在的意义就是"这一轮不发请求"。
+            // 被下面那条"压缩是旁路优化"的兜底吞掉，就等于把"静默损坏"换成"静默报错"——
+            // 而本闸的全部价值就在于这个动作不能被静默。
+            if (err instanceof WindowGuardExceededError) throw err
+            // 其余失败：压缩是旁路优化，绝不阻断本轮模型请求
             plgCtx.log.warn?.('ACP preModel 处理失败，跳过本轮压缩', { err: String(err) })
           }
         },
@@ -1252,6 +1289,19 @@ interface RunPreModelDeps {
    */
   manualInjection?: ManualInjectionMode
   /**
+   * 窗口保护闸（B3）的**已归一化**配置（缺省 = 关闭该闸，行为与改造前逐位一致）。
+   *
+   * 归一化在工厂侧完成（`resolveWindowGuard`），这里只收结果 —— 决策点不该再做一遍默认值。
+   */
+  windowGuard?: ResolvedWindowGuard
+  /**
+   * 告警出口（`notify` / `forceCompress` 两档都走它）。缺省静默。
+   *
+   * 刻意复用一个出口而不是给每档一个回调：三档说的是同一条链上的事，
+   * 分开接会给宿主"这可能是三件无关的事"的错觉。
+   */
+  notify?: (message: string) => void
+  /**
    * 本会话的 Agent 是否**真的能调 `compress`**（工具白名单判据，见 {@link agentCanUseCompress}）。
    *
    * 为 `false` 时**不注入任何模型侧压缩提示**（前缀提示 / 尾部完整手册 / nudge）——
@@ -1293,6 +1343,87 @@ interface RunPreModelDeps {
     source: 'acp'
     archiveRef: string
   }[]) => void
+}
+
+/**
+ * 窗口保护闸的**折叠动作**：复用内核已经算好的可压范围与折叠入口，自己不划范围、不写折叠实现。
+ *
+ * 为什么取 `res.nudge.compressibleRanges`：那是内核 `recommendNode` 的产出
+ * （`mergeRangesToThreshold(buildCompressibleRanges(...), config.compress.minCompressRange)`），
+ * 即遥测里 `suggestedRanges` 指的东西 —— **内核已经算过一遍了**，没有理由在插件侧再划一次。
+ *
+ * 为什么调 `engine.applyCompression` 而不是插件的 `runCompacting`：后者是**为会话压缩服务**的
+ * （响应 `core.session.compacting`，输入是 core 给的待删窗口，语义是"配合别人删"），
+ * 与窗口闸"我自己觉得该压了"的目标不同。两者在**折叠动作**上本就同源
+ * （`runCompacting` 内部也调 `applyCompression`），分道的是**触发与选段**，不是折叠实现。
+ *
+ * 摘要文本复用既有纯函数 {@link defaultRuleSummary}（头/尾拼接），**不新增第二份摘要实现**：
+ * `applyCompression` 要求调用方提供 `summary`（内核不生成摘要）。范围首尾的原文从 `archive`
+ * （core.id → 原始 Message）取 —— 那些 core 都是本轮可见历史的成员，`byRef[ref]` 必然命中。
+ *
+ * 内核自身的 `minCompressRange` 门槛按**整个批次合计**字符数判定（不是每条范围），
+ * 所以这里把范围**整批**交给内核、不预先逐条过滤 —— 过滤反而会把"合起来够格"的批次拆散。
+ *
+ * @returns 折叠结果；`undefined` = 本轮没有折叠（无可折内容 / 未过内核门槛），调用方应放行到内核兜底
+ */
+function foldForWindowGuard(input: {
+  res: ProcessTurnResult
+  engine: ReturnType<typeof createCore>
+  config: AcpConfig
+  archive: Map<string, Message>
+}): { state: CompressionState; blocks: number; tokens: number } | undefined {
+  const ranges: CompressibleRange[] = input.res.nudge?.compressibleRanges ?? []
+  if (ranges.length === 0) return undefined
+  const specs: { startRef: string; endRef: string; summary: string; topic: string }[] = []
+  for (const r of ranges) {
+    const summary = windowGuardRangeSummary(input.res.state, input.archive, r)
+    if (!summary) continue
+    specs.push({ startRef: r.startRef, endRef: r.endRef, summary, topic: '窗口保护闸自动折叠' })
+  }
+  if (specs.length === 0) return undefined
+  const applied = input.engine.applyCompression({
+    ranges: specs,
+    messages: input.res.messages,
+    state: input.res.state,
+    config: input.config,
+  })
+  if (applied.result.blocksCreated === 0) return undefined
+  return {
+    state: applied.state,
+    blocks: applied.result.blocksCreated,
+    tokens: applied.result.tokensCompressed,
+  }
+}
+
+/**
+ * 给一段待折范围生成摘要文本。
+ *
+ * 取该范围**首尾**两条原始消息交给 {@link defaultRuleSummary}（它本来就只读头尾）——
+ * 复用既有纯函数，不新增摘要实现。两者都取不到时返回空串，调用方跳过该范围
+ * （宁可少折一段，也不用"无中生有"的摘要顶替 —— 摘要会被写进块并被模型长期引用）。
+ */
+function windowGuardRangeSummary(
+  state: CompressionState,
+  archive: Map<string, Message>,
+  range: CompressibleRange,
+): string {
+  const first = originalMessageForRef(state, archive, range.startRef)
+  const last = originalMessageForRef(state, archive, range.endRef)
+  const window = [first, last].filter((m): m is Message => m !== undefined)
+  if (window.length === 0) return ''
+  return defaultRuleSummary(window)
+}
+
+/** ref（mNNNNN）→ 原始 harness Message（经 state.messageRefs.byRef 反查 core id，再查归档） */
+function originalMessageForRef(
+  state: CompressionState,
+  archive: Map<string, Message>,
+  ref: string,
+): Message | undefined {
+  const coreId = state.messageRefs?.byRef?.[ref]
+  if (!coreId) return undefined
+  const m = archive.get(coreId)
+  return m && typeof m === 'object' ? m : undefined
 }
 
 /**
@@ -1378,9 +1509,10 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     // 读取失败不影响主流程
   }
   const tokenCount = estimateTokens(inflat.cores, countTokens)
-  const res = engine.processTurn({
+  // processTurn 的入参抽出成局部常量：窗口保护闸触发时要用**同一份入参**、只换 state 再跑一次
+  // （见下方 B3 段），两处各写一遍必然漂移。
+  const turnInput = {
     messages: inflat.cores,
-    state: ctx.state,
     config,
     tokenCount,
     // renderTags 取舍（compress.d.ts：'all' 默认 / 'text-only' / 'none'）：
@@ -1389,8 +1521,55 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
     // 代价：模型看不到工具结果的 ref，compress 范围若需精确落在工具结果边界上，
     // 只能用相邻文本消息的 ref 近似表达。若未来出现"必须精确压缩某段工具输出"的
     // 场景，再评估切到 'all'（标签只存在于渲染层，不进会话本体与 archive）。
-    renderTags: 'text-only',
-  })
+    renderTags: 'text-only' as const,
+  }
+  let res = engine.processTurn({ ...turnInput, state: ctx.state })
+
+  // ---- B3：窗口保护闸 ----
+  //
+  // 位置刻意在**写遥测 / 持久化 / 渲染之前**：本闸会替换 `res`（强制折叠后用新 state 重跑一次
+  // processTurn），若把它放在下游，state 持久化 / 面板的「实际发出」口径 / 原文归档 /
+  // 统一块模型 / 增量渲染缓存 / 尾部 nudge 就会各自基于**不同版本**的 res ——
+  // 正是本仓反复出事的"同一个东西两套口径"。放在这里 ⇒ 下游只有一份 res。
+  // 代价：真正触发的那一轮会跑两次 processTurn（罕见），其余轮零开销。
+  //
+  // 占用率口径与遥测/面板**同源**（`requestTok / modelContextLimit`，其中 requestTok 是
+  // 折叠后真正发往模型的量）—— 这正是"真实上下文占用率"，也是本闸独立于 `compactIfNeeded`
+  // （原文口径）的意义所在。
+  const guardWindow = Math.max(1, config.modelContextLimit)
+  let occupancy = estimateTokens(res.messages, countTokens) / guardWindow
+  if (deps.windowGuard?.enabled) {
+    const guard = deps.windowGuard
+    const action = decideWindowGuardAction({ occupancy, guard })
+    const used = (): number => estimateTokens(res.messages, countTokens)
+    if (action === 'refuse') {
+      // 抛错是**故意**的：只有调用方不吞它，本轮才会真的中止（见 hook 里的 WindowGuardExceededError 分支）。
+      throw new WindowGuardExceededError(
+        formatWindowGuardRefusal({ occupancy, window: guardWindow, used: used(), guard }),
+      )
+    }
+    if (action === 'notify') {
+      deps.notify?.(formatWindowGuardNotice({ occupancy, window: guardWindow, used: used(), guard }))
+    } else if (action === 'forceCompress') {
+      const folded = foldForWindowGuard({ res, engine, config, archive: ctx.archive })
+      if (folded) {
+        // 用折叠后的 state 重建本轮请求；tokenCount 仍传**原文口径**（与常态一致 ——
+        // 内核的 nudge 压力判据一直吃的是折叠前的量，见 window-guard.ts 头注的"三层"表）。
+        res = engine.processTurn({ ...turnInput, state: folded.state })
+        ctx.needFull = true
+        occupancy = estimateTokens(res.messages, countTokens) / guardWindow
+      }
+      deps.notify?.(
+        formatWindowGuardNotice({
+          occupancy,
+          window: guardWindow,
+          used: used(),
+          guard,
+          ...(folded ? { folded: { blocks: folded.blocks, tokens: folded.tokens } } : { foldSkipped: true }),
+        }),
+      )
+    }
+  }
 
   // 就地更新会话上下文（ctx 是 Map 里的对象引用）
   ctx.state = res.state
@@ -1561,13 +1740,12 @@ export async function runPreModel(deps: RunPreModelDeps): Promise<void> {
   // ---- 压缩手册：常量在前缀、变量在尾部 ----
   // 占用率口径与遥测一致：telemetry 的 occupancy = requestTok / window，其中 requestTok =
   // estimateTokens(res.messages)（发往模型的 history cores，不含 system）、window = config.modelContextLimit。
-  // 这里用同一公式（estimateTokens(res.messages, countTokens) / modelContextLimit）在注入点之前算一次，
-  // 不在两处写分叉的两份算法。
+  // 该值**已在函数上方（窗口保护闸处）算过一次**，这里直接复用局部变量 `occupancy` ——
+  // 不在两处写分叉的两份算法（闸门若折叠过，`occupancy` 已随最终 res 重算）。
   //
   // 前缀只放**恒定**文本：自动前缀缓存按最长公共 token 前缀命中，放在历史之前的文本一变，
   // 其后全部内容（含整段历史）都要重算（代价量化见 MANUAL_INJECT_MARGIN 的注释）。
   // 会变的完整手册一律挪到**尾部**（与 nudge 同位置），见下方 tailParts。
-  const occupancy = estimateTokens(res.messages, countTokens) / Math.max(1, deps.config.modelContextLimit)
   const manualThreshold = (deps.config.nudge?.minContextLimitPct ?? 0.35) * MANUAL_INJECT_MARGIN
   // ---- 模型侧压缩提示是否整体静默 ----
   // 两个来源，任一成立即静默：
@@ -1676,6 +1854,24 @@ function partsSignature(m: Message): string {
 
 /** 默认导出常量插件（默认配置） */
 export const acpContextPlugin: AgentPlugin = createAcpContextPlugin()
+
+/**
+ * 窗口保护闸（B3）的对外面：决策 / 归一化 / 错误类型 / 文案。
+ *
+ * 从 index 转出而非让调用方深引 `./window-guard.js`：包只有一个公开入口，
+ * 宿主侧（`@harness/host`）只按包名依赖。
+ */
+export {
+  decideWindowGuardAction,
+  formatWindowGuardNotice,
+  formatWindowGuardRefusal,
+  resolveWindowGuard,
+  WindowGuardExceededError,
+  WINDOW_GUARD_DEFAULTS,
+  type ResolvedWindowGuard,
+  type WindowGuardAction,
+  type WindowGuardConfig,
+} from './window-guard.js'
 
 /**
  * core.session.compacting hook 的处理核心（可单测纯函数）。

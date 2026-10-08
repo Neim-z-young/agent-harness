@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { ACP_OCCUPANCY_META_KEY } from '@harness/session'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -713,6 +714,73 @@ describe('@harness/core', () => {
         await h.session.addMessage(sessId, { id: `za_${i}`, role: 'assistant', parts: [{ type: 'text', text: body }], createdAt: at + 1 })
       }
     }
+
+    // ── B2 合取条件：原文口径撞线 ≠ 窗口真的紧张 ──
+    // 背景（真机 s_1791373374635_9hqyb）：ACP 把真实请求压在 31.5% 时，原文口径已到 79.6%，
+    // 只按原文判就会在模型端还很宽裕时裁掉百余条消息。
+    describe('compactIfNeeded 的 B2 合取条件（requestPressurePct）', () => {
+      /** 造一个「原文口径已超线」的会话（120 条 × 1000 字中文 ≈ 119k tokens） */
+      async function makeOverRaw(): Promise<{ h: Harness; id: string }> {
+        const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })
+        const sess = await h.session.create()
+        await fillChineseMessages(h, sess.id, 60)
+        return { h, id: sess.id }
+      }
+      // 阈值 (102400−30000)×80% = 57,920 < 119k ⇒ 条件一恒成立，差异只来自条件二
+      const base = { contextWindowTokens: 102_400, autoCompactThresholdPct: 80, reservedTokens: 30_000, keepRecentMessages: 10 }
+
+      it('键缺失（ACP 未启用）⇒ 条件二视为成立，行为与改造前一致（照裁）', async () => {
+        const { h, id } = await makeOverRaw()
+        const did = await h.session.compactIfNeeded(id, { ...base, requestPressurePct: 0.75 })
+        expect(did).toBe(true)
+        expect((await h.session.get(id))!.messages.length).toBe(10)
+        await h.stop()
+      })
+
+      it('ACP 报过真实占用量且请求仍宽裕 ⇒ 不裁（这正是 B2 要挡的那次）', async () => {
+        const { h, id } = await makeOverRaw()
+        // 真实发出 10,000 / 102,400 = 9.8% < 75%
+        await h.session.updateMeta(id, {
+          [ACP_OCCUPANCY_META_KEY]: { requestTok: 10_000, rawTok: 119_000, window: 102_400 },
+        })
+        const did = await h.session.compactIfNeeded(id, { ...base, requestPressurePct: 0.75 })
+        expect(did).toBe(false)
+        expect((await h.session.get(id))!.messages.length).toBe(120)
+        await h.stop()
+      })
+
+      it('ACP 报过真实占用量且窗口也紧张 ⇒ 裁', async () => {
+        const { h, id } = await makeOverRaw()
+        // 真实发出 90,000 / 102,400 = 87.9% ≥ 75%
+        await h.session.updateMeta(id, {
+          [ACP_OCCUPANCY_META_KEY]: { requestTok: 90_000, rawTok: 119_000, window: 102_400 },
+        })
+        const did = await h.session.compactIfNeeded(id, { ...base, requestPressurePct: 0.75 })
+        expect(did).toBe(true)
+        expect((await h.session.get(id))!.messages.length).toBe(10)
+        await h.stop()
+      })
+
+      it('省略 / 非法 requestPressurePct ⇒ 不启用条件二（老行为）', async () => {
+        for (const bad of [undefined, 0, -1, Number.NaN]) {
+          const { h, id } = await makeOverRaw()
+          await h.session.updateMeta(id, {
+            [ACP_OCCUPANCY_META_KEY]: { requestTok: 10_000, rawTok: 119_000, window: 102_400 },
+          })
+          const did = await h.session.compactIfNeeded(id, { ...base, ...(bad !== undefined ? { requestPressurePct: bad } : {}) })
+          expect(did).toBe(true)
+          await h.stop()
+        }
+      })
+
+      it('ACP 口径结构损坏（requestTok 非数）⇒ 退化为老行为，不静默卡死裁剪', async () => {
+        const { h, id } = await makeOverRaw()
+        await h.session.updateMeta(id, { [ACP_OCCUPANCY_META_KEY]: { requestTok: 'x' } })
+        const did = await h.session.compactIfNeeded(id, { ...base, requestPressurePct: 0.75 })
+        expect(did).toBe(true)
+        await h.stop()
+      })
+    })
 
     it('自动压缩的窗口来自调用方：同一会话在真实窗口 102400 下触发，在旧硬编码 200000 下永不触发', async () => {
       const h = await createHarness({ agents: [makeAgent()], chatProvider: mockChatProvider() })

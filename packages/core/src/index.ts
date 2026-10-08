@@ -235,6 +235,7 @@ import {
   COMPACT_MEMORY_KEY as COMPACT_MEMORY_KEY_VAL,
   buildView,
   countTokensCJK,
+  readAcpOccupancy,
   renderBlocksAsMessage,
   getSessionModelOverride,
   resolveCountTokens,
@@ -1452,6 +1453,7 @@ export class DefaultSessionManager implements SessionManager {
       ? sess.messages.length * options.tokensPerMessage
       : this.estimateTokensForMessages(sess.messages, countTokens)
     // 阈值计算：固定阈值优先，否则用百分比
+    const windowTokens = options.contextWindowTokens ?? 200000
     let threshold: number
     if (options.thresholdTokens != null) {
       threshold = options.thresholdTokens
@@ -1460,12 +1462,29 @@ export class DefaultSessionManager implements SessionManager {
       // 默认 Provider 的 contextWindowTokens → 200000」推导后显式传入。这里若默默用
       // 200000，小窗口模型（如 102400）会算出阈值 136000 > 窗口本身 ⇒ 永远压不到 ⇒
       // 自动压缩"配了但从不生效"，还不报错。
-      const ctx = options.contextWindowTokens ?? 200000
       const reserved = options.reservedTokens ?? 30000
       const pct = options.autoCompactThresholdPct ?? 80
-      threshold = Math.floor((ctx - reserved) * (pct / 100))
+      threshold = Math.floor((windowTokens - reserved) * (pct / 100))
     }
     if (estimated < threshold) return false
+
+    // ── B2 合取条件：窗口也得真的紧张 ──
+    // `estimated` 是**原文口径**（守"内存/磁盘别膨胀"），而 ACP 会把真实发往模型的量压得很低 ⇒
+    // 只看原文会在模型端还很宽裕时就裁掉大批消息（真机 `s_1791373374635_9hqyb`：
+    // 原文口径 79.6% 撞线时真实请求只有 31.5%）。故当 ACP 报过"真实发出量"时，
+    // 额外要求它也达到 `requestPressurePct`。
+    //
+    // 键不存在（ACP 未启用 / 尚未跑过一轮）⇒ 条件视为成立、保持老行为：那时
+    // `requestTok ≈ rawTok`，两把尺子重合，原文口径本身就是窗口闸。
+    const pct2 = options.requestPressurePct
+    if (pct2 != null && Number.isFinite(pct2) && pct2 > 0) {
+      const occ = readAcpOccupancy(sess.meta)
+      if (occ) {
+        const occWindow = occ.window ?? windowTokens
+        if (occ.requestTok < occWindow * pct2) return false
+      }
+    }
+
     await this.compact(sessionId, options.strategy ?? 'summary', options)
     return true
   }

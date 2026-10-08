@@ -32,6 +32,8 @@ import {
   TOOL_ARGS_REMINDER,
   agentCanUseCompress,
   lookupProviderWindow,
+  resolveWindowGuard,
+  WindowGuardExceededError,
 } from './index'
 import { toCores, compactHistory, idBase, baseId, estimateTokens, chars4CountTokens } from './adapter'
 import { loadPromptFiles } from './prompts'
@@ -109,7 +111,13 @@ interface Harness {
 function makeHarness(
   config: Config = makeConfig(),
   sessionId = 's1',
-  opts: { manualInjection?: 'on-demand' | 'always'; explicitSystemPrompt?: boolean; dynamicParts?: string[] } = {},
+  opts: {
+    manualInjection?: 'on-demand' | 'always'
+    explicitSystemPrompt?: boolean
+    dynamicParts?: string[]
+    windowGuard?: Parameters<typeof resolveWindowGuard>[0]
+    notify?: (message: string) => void
+  } = {},
 ): Harness {
   const engine = createCore()
   const meta: Record<string, unknown> = {}
@@ -154,6 +162,10 @@ function makeHarness(
       manualInjection: opts.manualInjection ?? 'always',
       explicitSystemPrompt: opts.explicitSystemPrompt,
       ...(opts.dynamicParts ? { dynamicParts: opts.dynamicParts } : {}),
+      // 窗口保护闸：只有用例显式给了才装 —— 直调 runPreModel 的既有用例因此逐位不变。
+      // （走工厂那条路时它总是被装上：见 createAcpContextPlugin 里的 resolveWindowGuard。）
+      ...(opts.windowGuard ? { windowGuard: resolveWindowGuard(opts.windowGuard) } : {}),
+      ...(opts.notify ? { notify: opts.notify } : {}),
     })
   }
   return h
@@ -1143,10 +1155,14 @@ test('agentCanUseCompress：三态（有 / 无 / 未知）', () => {
 
 test('能力判据：白名单里没有 compress ⇒ 极简提示 / 完整手册 / nudge 全部不注入', async () => {
   const preModel = await preModelWithScope(
-    { modelContextLimit: 2000, config: onDemandConfig(0.5) },
+    // `windowGuard.enabled: false`：本用例只考察**提示通道**（前缀提示 / 尾部手册 / nudge）。
+    // 窗口保护闸是另一条**独立**机制（按真实占用率处置，与提示开关无关），默认开启；
+    // 这里占用率约 0.925（100 条 × ~62 字符，含 ref 标签）已越过其 0.90 折叠线，
+    // 会让出站历史被折成摘要、污染本用例"历史原样"的断言。故显式关掉它，各测各的。
+    { modelContextLimit: 2000, config: onDemandConfig(0.5), windowGuard: { enabled: false } },
     { agentId: 'reader', agentTools: ['read_file', 'list_dir', 'glob', 'grep_file'] },
   )
-  // 占用率 ≈ 1600/2000 = 0.8，远超 0.5×0.9=0.45 —— 改造前这里会注入完整手册
+  // 占用率 ≈ 1850/2000 ≈ 0.93，远超 0.5×0.9=0.45 —— 改造前这里会注入完整手册
   const messages = history(100)
   await preModel(messages)
   const all = JSON.stringify(messages)
@@ -1657,4 +1673,222 @@ test('遥测：零收益压缩标 zeroYield，成功压缩不标（且 ranges.ch
   // 零收益那次：chars 为 0（ref 不可解析）+ 显式标 zeroYield
   expect(events[1].createdBlocks).toBe(0)
   expect(events[1].zeroYield).toBe(true)
+})
+
+// ===== B3 窗口保护闸（runPreModel 内的四档）=====
+
+/**
+ * 造一段"体积可控"的历史：`textLen` 个 ASCII 字符按 CJK 感知口径 ≈ `textLen/4` tokens。
+ *
+ * 为什么不用现成的 `history(n)`：它的单条体积固定，要精确落在某一档（如 0.75 vs 0.90）
+ * 就得改窗口，而窗口同时又是分母 —— 用体积调比调窗口直观。
+ */
+function bulkHistory(n: number, textLen: number): Message[] {
+  const arr: Message[] = []
+  for (let i = 0; i < n; i++) {
+    arr.push(msg(i % 2 === 0 ? 'user' : 'assistant', `M${i} ` + 'x'.repeat(textLen), i))
+  }
+  return arr
+}
+
+/** 窗口 10,000 时固定造出约 50% 占用（5 条 × 1000 tokens） */
+const OCC_50 = { config: () => makeConfig(10_000), history: () => bulkHistory(5, 4_000) }
+/** 窗口 5,000 时固定造出约 100% 占用 */
+const OCC_100 = { config: () => makeConfig(5_000), history: () => bulkHistory(5, 4_000) }
+
+test('B3：未过告警线 → 四档全静默（不改请求、不建块）', async () => {
+  const notices: string[] = []
+  const h = makeHarness(OCC_50.config(), 's1', {
+    windowGuard: { notifyPct: 0.9 },
+    notify: (m) => notices.push(m),
+  })
+  const messages = OCC_50.history()
+  await h.run(messages)
+  expect(notices).toEqual([])
+  expect(h.ctx.state.blocks).toHaveLength(0)
+})
+
+test('B3 notify 档：过告警线但未过折叠线 → 只告警、**不改请求**', async () => {
+  const notices: string[] = []
+  const plain = makeHarness(OCC_50.config())
+  const plainMsgs = OCC_50.history()
+  await plain.run(plainMsgs)
+
+  const h = makeHarness(OCC_50.config(), 's1', {
+    windowGuard: { notifyPct: 0.4, forceCompressPct: 0.99 },
+    notify: (m) => notices.push(m),
+  })
+  const messages = OCC_50.history()
+  await h.run(messages)
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toContain('超过告警线')
+  expect(notices[0]).not.toContain('已强制折叠')
+  // 告警档的定义就是"不动手"：没有折叠块，出站请求与不装闸时**逐条等长**
+  expect(h.ctx.state.blocks).toHaveLength(0)
+  expect(messages.length).toBe(plainMsgs.length)
+  expect(messages.map((m) => m.role)).toEqual(plainMsgs.map((m) => m.role))
+})
+
+test('B3 forceCompress 档：过折叠线 → 复用内核折叠一次，请求变短且状态已持久化', async () => {
+  const notices: string[] = []
+  const h = makeHarness(OCC_100.config(), 's1', {
+    windowGuard: { forceCompressPct: 0.9 },
+    notify: (m) => notices.push(m),
+  })
+  const messages = OCC_100.history()
+  await h.run(messages)
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toContain('已强制折叠')
+  // 折叠真的发生了：内核产块 + 统计计数
+  expect(h.ctx.state.blocks.length).toBeGreaterThan(0)
+  expect(h.ctx.state.stats.compressionCount).toBeGreaterThan(0)
+  // 状态已落 ACP_META_KEY（下游持久化用的是**折叠后**的 state，不是闸门看到的那份）
+  expect((h.metaOf() as CompressionState).blocks.length).toBe(h.ctx.state.blocks.length)
+})
+
+test('B3 forceCompress 档：折叠后的请求比不装闸时更短（这就是"排在截断之前"的收益）', async () => {
+  const plain = makeHarness(OCC_100.config())
+  const plainMsgs = OCC_100.history()
+  await plain.run(plainMsgs)
+
+  const guarded = makeHarness(OCC_100.config(), 's1', { windowGuard: { forceCompressPct: 0.9 } })
+  const guardedMsgs = OCC_100.history()
+  await guarded.run(guardedMsgs)
+
+  const size = (ms: Message[]) => estimateTokens(toCores(ms).cores)
+  expect(size(guardedMsgs)).toBeLessThan(size(plainMsgs))
+})
+
+test('B3 forceCompress 档：无可折内容 → 明确报"未折叠 + 交回内核截断兜底"，不静默', async () => {
+  const notices: string[] = []
+  // 把保留窗口拉满 ⇒ 所有消息都在保护区里 ⇒ 内核给不出可压范围
+  const cfg = defaultConfig(5_000, {
+    compress: { minCompressRange: 0, maxSummaryLength: 100000, minSummaryLength: 0 },
+    preserveRecentMessages: 1000,
+    preserveRecentTokens: 1_000_000,
+    promotionThreshold: 1,
+  })
+  const h = makeHarness(cfg, 's1', { windowGuard: { forceCompressPct: 0.9 }, notify: (m) => notices.push(m) })
+  await h.run(bulkHistory(5, 4_000))
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toContain('没有够格的可折叠内容')
+  expect(h.ctx.state.blocks).toHaveLength(0)
+})
+
+test('B3 forceCompress 档：有范围但过不了内核 minCompressRange 门槛 ⇒ 同样只报"未折叠"（真机常见形态）', async () => {
+  // 生产 autoTune 下 `minCompressRange` 是 200,000 chars（30 万窗口）—— 会话没攒够原文时
+  // `nudge.compressibleRanges` **非空但整批不达标**，内核 gate 会拒。这正是真机上最可能遇到的形态，
+  // 必须与"范围为空"走到同一个出口（foldSkipped），而不是静默不折叠。
+  const notices: string[] = []
+  const cfg = defaultConfig(5_000, {
+    compress: { minCompressRange: 1_000_000_000, maxSummaryLength: 100000, minSummaryLength: 0 },
+    preserveRecentMessages: 0,
+    preserveRecentTokens: 0,
+    promotionThreshold: 1,
+  })
+  const h = makeHarness(cfg, 's1', { windowGuard: { forceCompressPct: 0.9 }, notify: (m) => notices.push(m) })
+  await h.run(bulkHistory(5, 4_000))
+  expect(notices).toHaveLength(1)
+  expect(notices[0]).toContain('没有够格的可折叠内容')
+  expect(h.ctx.state.blocks).toHaveLength(0)
+})
+
+test('B3 refuse 档：到硬线直接抛错（由 hook 不吞它，本轮不发请求）', async () => {
+  const h = makeHarness(OCC_100.config(), 's1', {
+    windowGuard: { onExceed: 'refuse', onExceedPct: 0.5 },
+  })
+  await expect(h.run(OCC_100.history())).rejects.toThrow(WindowGuardExceededError)
+})
+
+test('B3 refuse 档：错误文案带出路，且错误类型可被 instanceof 判别（hook 靠它决定不吞）', async () => {
+  const h = makeHarness(OCC_100.config(), 's1', {
+    windowGuard: { onExceed: 'refuse', onExceedPct: 0.5 },
+  })
+  try {
+    await h.run(OCC_100.history())
+    throw new Error('应当抛错')
+  } catch (err) {
+    expect(err).toBeInstanceOf(WindowGuardExceededError)
+    const msg = (err as Error).message
+    expect(msg).toContain('/compact')
+    expect(msg).toContain('未向模型发起请求')
+  }
+})
+
+test('B3 enabled=false：即使严重超窗也四档全静默（= 改造前行为，可一键回退）', async () => {
+  const notices: string[] = []
+  const h = makeHarness(OCC_100.config(), 's1', {
+    windowGuard: { enabled: false },
+    notify: (m) => notices.push(m),
+  })
+  await h.run(OCC_100.history())
+  expect(notices).toEqual([])
+  expect(h.ctx.state.blocks).toHaveLength(0)
+})
+
+// ===== B3 装配：工厂把选项归一化后交给 runPreModel =====
+
+test('createAcpContextPlugin：windowGuard 选项真的接到 preModel（告警走宿主日志出口）', async () => {
+  const warns: string[] = []
+  const plugin = createAcpContextPlugin({
+    // 5 条 × 4000 ASCII ≈ 5000 tokens；窗口 10,000 ⇒ 占用约 50%
+    modelContextLimit: 10_000,
+    windowGuard: { notifyPct: 0.4, forceCompressPct: 0.99 },
+  })
+  const hooks = (await plugin.install({
+    log: { info: () => {}, warn: (m: string) => warns.push(m) },
+  } as any)) as Hooks
+  await (hooks['core.session.preModel']! as any)(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+    bulkHistory(5, 4_000),
+  )
+  expect(warns.some((w) => w.includes('ACP 窗口保护'))).toBe(true)
+  expect(warns.some((w) => w.includes('超过告警线'))).toBe(true)
+})
+
+test('createAcpContextPlugin：windowGuard 缺省即开启（默认 0.75 告警线，未过线则静默）', async () => {
+  const warns: string[] = []
+  const plugin = createAcpContextPlugin({ modelContextLimit: 200_000 })
+  const hooks = (await plugin.install({
+    log: { info: () => {}, warn: (m: string) => warns.push(m) },
+  } as any)) as Hooks
+  await (hooks['core.session.preModel']! as any)(
+    { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+    bulkHistory(5, 4_000),
+  )
+  // 5×1000 tokens / 200000 = 2.5% ⇒ 远低于任何一档
+  expect(warns).toEqual([])
+})
+
+test('createAcpContextPlugin：refuse 档的错误**不被 hook 吞掉**（吞了就是把静默损坏换成静默报错）', async () => {
+  const plugin = createAcpContextPlugin({
+    modelContextLimit: 5_000,
+    windowGuard: { onExceed: 'refuse', onExceedPct: 0.5 },
+  })
+  const hooks = (await plugin.install({
+    log: { info: () => {}, warn: () => {} },
+  } as any)) as Hooks
+  await expect(
+    (hooks['core.session.preModel']! as any)(
+      { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+      bulkHistory(5, 4_000),
+    ),
+  ).rejects.toThrow(WindowGuardExceededError)
+})
+
+test('createAcpContextPlugin：非窗口闸的异常仍被吞（旁路优化不该阻断本轮模型请求）', async () => {
+  // 与上一条成对：证明"上抛"是**只给 refuse 开的**特例，不是把整条兜底撤了。
+  const warns: string[] = []
+  const plugin = createAcpContextPlugin({ modelContextLimit: 200_000 })
+  const hooks = (await plugin.install({
+    log: { info: () => {}, warn: (m: string) => warns.push(m) },
+  } as any)) as Hooks
+  // 传个根本不是数组的东西 ⇒ runPreModel 内部抛 TypeError
+  await expect(
+    (hooks['core.session.preModel']! as any)(
+      { sessionId: 's', meta: { read: async () => undefined, patch: async () => {} }, blocksPatch: [] },
+      null as unknown as Message[],
+    ),
+  ).resolves.toBeUndefined()
+  expect(warns.some((w) => w.includes('ACP preModel 处理失败'))).toBe(true)
 })

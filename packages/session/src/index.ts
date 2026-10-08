@@ -165,6 +165,49 @@ export interface CompactMemory {
 export const COMPACT_META_KEY = 'compaction' as const
 export const COMPACT_MEMORY_KEY = 'compactMemory' as const
 export const SESSION_MODEL_META_KEY = 'model' as const
+/**
+ * ACP 写入的「上一轮**真实发出** token 口径」的 meta key（**唯一产地**）。
+ *
+ * 为什么需要它：`estimateTokens(sess.messages)` 是**原文口径**、不含压缩效果，
+ * 只用它会出现"压缩成功、占用百分比却没降"的误读，也会让按原文判的自动压缩
+ * 在模型端还很宽裕时就动手（真机 `s_1791373374635_9hqyb`：原文 79.6% vs 真实 31.5%）。
+ * `compactIfNeeded` 的合取条件（B2）与统计面板的「实际发出」行都读这个键。
+ *
+ * 写入方是 `@harness/acp-context`（`ACP_OCCUPANCY_KEY` 指向同一字符串）；
+ * 消费方为 `@harness/core`（B2）。`@harness/usage` 因"零依赖"约束保留一份同名局部常量。
+ * 结构：`{ requestTok: number; rawTok: number; window?: number }`。
+ */
+export const ACP_OCCUPANCY_META_KEY = 'acp.occupancy.v1' as const
+
+/** {@link ACP_OCCUPANCY_META_KEY} 的结构（读取方一律按可选字段防御式解析） */
+export interface AcpOccupancySnapshot {
+  /** 折叠后真正发往模型的量 */
+  requestTok: number
+  /** 同期未压缩口径，供面板展示"省了多少" */
+  rawTok: number
+  /** ACP 侧分母；缺省时调用方用自己的窗口 */
+  window?: number
+}
+
+/**
+ * 从 `session.meta` 安全读出 {@link AcpOccupancySnapshot}。
+ *
+ * 缺键 / 结构不对一律返回 `undefined` —— 语义是"没有 ACP 口径可用"，
+ * 调用方据此**回退到不启用该条件**（ACP 关闭时 `requestTok ≈ rawTok`，两把尺子重合）。
+ */
+export function readAcpOccupancy(
+  meta: Record<string, unknown> | undefined,
+): AcpOccupancySnapshot | undefined {
+  const raw = meta?.[ACP_OCCUPANCY_META_KEY]
+  if (!raw || typeof raw !== 'object') return undefined
+  const r = raw as { requestTok?: unknown; rawTok?: unknown; window?: unknown }
+  if (typeof r.requestTok !== 'number' || !Number.isFinite(r.requestTok)) return undefined
+  const rawTok = typeof r.rawTok === 'number' && Number.isFinite(r.rawTok) ? r.rawTok : r.requestTok
+  const win = typeof r.window === 'number' && Number.isFinite(r.window) && r.window > 0
+    ? r.window
+    : undefined
+  return { requestTok: r.requestTok, rawTok, ...(win != null ? { window: win } : {}) }
+}
 
 // ===== 会话级模型覆盖（会话内自由切模型）=====
 // 语义：覆盖只作用于「本会话」，不写 Agent 定义、不写 config.json。
@@ -529,6 +572,19 @@ export interface CompactOptions {
    * 默认 80（即 80% 使用率才触发），适配从 128K 到 1M 窗口的模型。
    */
   autoCompactThresholdPct?: number
+  /**
+   * **合取条件（B2）**：本会话存在 {@link ACP_OCCUPANCY_META_KEY} 时，还要求"真实发出量"
+   * 达到窗口的这个百分比才允许压缩。
+   *
+   * 为什么需要：`autoCompactThresholdPct` 判的是**原文口径**（`estimateTokens(sess.messages)`）——
+   * 它守的是"内存/磁盘别膨胀"，一旦 ACP 把真实请求压得很低，原文口径会先撞线，
+   * 于是在模型端还很宽裕时就裁掉大批消息（真机：原文 79.6% vs 真实 31.5%）。
+   * 加上这一条，等于要求"窗口也真的紧张"才动手。
+   *
+   * **省略 / 非正数 = 不启用该条件**（老行为）。键缺失（ACP 未启用）时条件自动视为成立 ——
+   * 那时 `requestTok ≈ rawTok`，原文口径本身就是窗口闸，行为与改造前逐位一致。
+   */
+  requestPressurePct?: number
   /**
    * 预留 tokens（给摘要生成留空间）。
    * 默认 30000（参考 Claude Code 的 20K max output + 13K buffer）。
