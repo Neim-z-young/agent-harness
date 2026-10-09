@@ -218,6 +218,16 @@
   - **会话寻址：控制面的 `sessionId` 就是 A2A 的 `contextId`**（`executor.ensureSession` 钉死的 `contextId = sessionId`）
     ⇒ "控制面改的是哪条会话"与"聊天在跟哪条会话说话"是同一个身份，不需要第二套映射。缺省 = sidecar boot 选中的那条。
     **读操作不 `restore`、写操作才 `restore`**：读一次状态不该在 `SessionManager` 里凭空建出一个会话。
+  - **「boot 时会话文件已存在」不是契约，别再依赖它**（续 259 拆掉的隐式前提）：
+    - 落盘的**唯一驱动是轮末 `flushDirtySessions()`**（按"标脏"走）。`host.send()` / `host.sendStream()`
+      会调它；**直连引擎层 `session.promptStream()` 的一方必须自己补一次** —— A2A `executor` 当初就漏了，
+      连带让 `ensureSession` 的"断线重连"分支永远走不到（侧车一重启，同一 `contextId` 变全新空会话）。
+    - **0 消息的新会话不落盘**；**服务端形态（`autoResume: false`）不写 `<cwd>/.harness/last-session.json`**。
+      于是控制面的当前会话可能"在内存里、不在磁盘上"：`session.list` 要补入活当前会话（否则 `isCurrent`
+      标记无处可挂），`session.resume` 要走 `requireLiveSession`（活会话优先），不能只查磁盘。
+    - ⇒ **A2A 的会话文件名是 `<contextId>.json`（UUID），这不是缺陷**：`s_` 前缀不被任何代码解析
+      （`list()` 只按 `f.endsWith('.json')` 取 id，`pathFor()` 接受任意字符串），改名只换来一张
+      `contextId → s_xxx` 映射表及其失效语义。
 
 ## 4. 硬性约束
 

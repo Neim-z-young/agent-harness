@@ -1,5 +1,62 @@
 # Agent Harness 开发日志
 
+## 2026-10-09（续 259）会话落盘与空壳治理：A2A 从不落盘 / 侧车踩掉 CLI 指针 / 499 个 194 字节空壳
+
+### 起因
+
+清点 `~/.harness/sessions/`（644 项 / 27M）时发现 **499 个 `messages: []` 的空会话**：一律 194 字节、
+无 title/meta、无同名 telemetry、合计 94.5 KB。它们不是手滑产物，且有明显突发特征（10-02 一天 201 个、
+10-08 22:42 五秒内 13 个）⇒ 顺着"谁在无消息地建会话"查下去，串出三件同源的事。
+
+### 决策与落地
+
+**一、A2A 会话从不落盘（`packages/a2a-server/src/executor.ts`）**
+
+`execute()` 直连**引擎层** `host.harness.session.promptStream()`，绕过了 `host.sendStream()`
+（宿主层，`host.ts` 里它在循环后 `flushDirtySessions()`）。后果不止"少个文件"——`ensureSession`
+的第二级回退 `sessionStore.load(contextId)`（注释写的是"落盘的持久化会话（断线重连）"）**永远走不到**：
+侧车一重启，同一个 `contextId` 拿到的是全新空会话，A2A 对话静默清空。
+落地：循环后补 `await host.flushDirtySessions()`。
+
+**二、服务端形态踩掉 CLI 的会话指针（`packages/host/src/host.ts`）**
+
+`boot()` 无条件 `rememberSession()`，而它只校验 cwd、不看宿主是不是服务端。`runA2aCli` 用
+`autoResume: false` 启动（每次新建一条一次性会话），于是**每 spawn 一次侧车就把
+`<cwd>/.harness/last-session.json` 改写成一个 0 消息空壳**——实测 `XiaoZhi-new/.harness/last-session.json`
+正指向 `s_1791382595159_sopo1`（10-07 22:16、0 条消息），下次 `harness run` 会恢复出空会话。
+落地：`rememberSession` 加闸 `autoResume !== false`。
+
+**三、boot 无条件落盘 ⇒ 空壳（`packages/host/src/host.ts` + `packages/a2a-server/src/control.ts`）**
+
+`boot()` 无条件 `sessionStore.save(session)`：只要 boot 过、没聊过，磁盘上就留下一个 194 字节空壳
+（VSCode 每 spawn 一次侧车就 boot 一次，一次一个）。落地：改为 `if (session.messages.length > 0)` ——
+真正该存的那次由轮末 `flushDirtySessions()`（按"标脏"驱动）补上，`/sessions` 从第一条消息起照常可见。
+
+### 只有实现时才暴露的发现
+
+- **「boot 时会话文件已存在」是一条没人写下来的隐式契约。** 把落盘改成条件式后，3 条既有用例立刻变红，
+  各自钉住契约的一面：`harness/session.list` 的 `isCurrent` 标记（列表来自磁盘，当前会话不在里面就
+  无处可挂）、`harness/session.resume <boot id>`（只查磁盘 ⇒ NOT_FOUND）、用量重连用例
+  （`sessionStore.load(boot id)` 期望为真）。⇒ 不绕过，把契约补正确：`session.list` 在磁盘列表里补入
+  "还没落盘的活当前会话"；`session.resume` 改走既有的 `requireLiveSession`（活会话优先，与
+  `readSessionView` 同口径）。
+- **`harness run` 也传 `autoResume: false`**（`cli/src/index.ts`），而帮助文案里早写着"run 始终新建
+  （**脚本化不该改写历史**）"——旧代码与自己的文档相反：run 一直在改写指针。第二处闸等于把文档兑现。
+- **`s_` 前缀不被任何代码解析**（`startsWith('s_')` / `/^s_/` 全仓 0 命中；`list()` 只按
+  `f.endsWith('.json')` 取 id，`pathFor()` 接受任意字符串）。⇒ A2A 用 UUID 命名会话文件是**零功能代价**；
+  "把会话落成 `s_xxx.json`"纯属外观偏好，代价反而是新增一张 `contextId → s_xxx` 映射及其失效语义。
+  维持 `contextId = sessionId`（`ensureSession` 的 `setId`）。
+- **A2A 的落盘点一处足够**：`resume()`（INPUT_REQUIRED 续答）只唤醒**原生成器**，
+  循环与 flush 仍在原 `execute()` 里，续接轮不必再补一次。
+
+### 验证
+
+- 反向验证 **5/5 恰命中**：停用 flush / 恢复无条件写指针 / 恢复无条件落盘 / list 不补当前会话 /
+  resume 只查磁盘 ⇒ 各自红了**该红的那条**（`cp` 备份还原后 shasum 一致，无变异残留）
+- 根 `bun run typecheck` 全包 0 error；根 `bun run test` **2608 pass / 0 fail**，非零退出包 0
+- 空会话真机清理：499 个 → `~/.Trash/harness-empty-sessions-20261008`（清理前存 567 条
+  `shasum -a 256` 基线，清理后剩余 68 条**逐字一致**；目录 644 项 / 27M → 145 项 / 24M）
+
 ## 2026-10-08（续 258）`@harness` 的真因是会话类型，不是缺 provider —— P1（BYOK provider）判决：不做
 
 ### 起因
