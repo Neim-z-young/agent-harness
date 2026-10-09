@@ -1,5 +1,64 @@
 # Agent Harness 开发日志
 
+## 2026-10-09（续 260）env-context：运行环境与用户信息注入（前缀静态 + 尾部易变）+ PromptInput.cwd 接缝
+
+### 起因
+
+盘点"harness 如何插入运行环境信息 / 用户信息"（上一轮只读调研）：结论是**没有任何注入器**——
+全仓搜 `<env>` / `OS Version` / `Platform:` / `Today's date` 零命中；`ToolContext` 只有 `cwd+signal`，
+`PromptInput` 不带 cwd；env 只影响行为（provider 凭据；`process.platform` 全仓唯一分支在
+workspace-shell 的 `openInFileManager`）。注入只有两条既有通道（`core.prompt.system.transform`
+前缀 / `core.prompt.dynamic.transform` 尾部），但缺「会话级 cwd」的口子。本轮补齐：
+一个插件 + 一个 hook 入参字段。
+
+### 决策与落地
+
+**一、core 接缝：`PromptInput.cwd`（`packages/plugin` + `packages/core`）**
+
+hook 入参补 `cwd?: string`，core 在 `_prepareQueryOnce` 填 `sess.cwd ?? deps.cwd` —— 与
+ToolContext 同口径（`core` 的 `tctxCwd` 一字不差）。这是 install 期 `ctx.workspace.cwd`
+（冻结值）给不了的信息：子 Agent 的 worktree 会话会拿到自己的 worktree 路径。可选字段 ⇒
+既有直调 hook 的测试零改动。
+
+**二、`@harness/env-context` 插件（`packages/plugins/env-context`）**
+
+分档纪律（位置即语义）：
+
+- **恒定段 → 前缀**：系统（platform+release+arch）/ 用户（user@hostname）/ Shell（`$SHELL`）/
+  工作目录（`PromptInput.cwd`）——会话中途不变，进前缀可吃缓存；措辞冻结（改动 = 所有历史
+  会话前缀失效一次，与 memory 插件 `MemorySectionStyle` 同一条纪律）。
+- **易变段 → 尾部**：当前时间（本地时区含半小时偏移 + 周几）、Git 分支与脏状态——时间天然
+  每轮变；**脏状态会随模型自己写文件而翻转**（放前缀 = 每轮报废整段前缀，实测一次翻转
+  ≈ 95K token-equiv）。
+- Git 一次 `git status --porcelain=v1 -b` 同时拿分支+脏标记，带 2s 超时 kill；
+  失败 / 非 git 目录 / 解析不出 ⇒ **整行省略**（宁缺毋滥）。
+- cwd 解析三级：`input.cwd`（权威）→ 缺失且主会话 → install 冻结值 → 缺失且子 Agent →
+  **省略工作目录行**（冻结值对 worktree 是错口径，不用）。
+
+**三、内置注册（optIn）**：`BUILTIN_LAZY` 静态表 + `getBuiltinRegistry()`（`optIn: true`，同
+memory 的"启用了才付代价"语义：默认零行为）+ host `package.json` deps + 根 `tsconfig.json`
+paths。启用方式：`config.json → "plugins": ["env-context"]`。
+
+### 只有实现时才暴露的发现
+
+- **`git status -b` 在零提交仓库的头行是 `## No commits yet on <branch>`**，不是 `## <branch>`：
+  不做 `replace(/^## No commits yet on /, '## ')` 前置归一，新 init 的仓库会解析失败被静默省略
+  （测试用 mkdtemp 真 init 仓库钉住，分支名用 `symbolic-ref` 动态取，不假设 init.defaultBranch）。
+- **测试聚合又踩"锚行首"坑**：逐包输出带 `<pkg> test:` 前缀，`^ *[0-9]+ pass` 聚合出 0
+  （记忆 §四早记过）；且管道里 `grep -c` 无匹配时退出码 1，会把"全绿"误报成命令失败——
+  收尾统计要么不锚行首，要么别让 `grep -c` 当最后一条。
+- **残缺用例必须真的残缺**：断言"省略用户行"的渲染用例自己带了 `user: 'u'`，首跑即红——
+  修的是 fixture 不是实现。
+
+### 验证
+
+- 新包 `env-context`：**16 pass / 0 fail**（环境事实 / 时钟 / git 读取全部可注入，真机用例
+  仅 `collectStaticEnv` 弱断言与临时 git 仓库两条）
+- 根 `bun run typecheck` 全包 0 error；根 `bun run test` **2625 pass / 0 fail**
+  （基线 2608 + 17 = 16 条 env-context + 1 条 host 登记用例，逐条对上）
+- host 双向守卫（注册点集合 ↔ 静态表键集合）随新增行自动覆盖；另补
+  `resolveBuiltinPlugins(['env-context'])` 真 import 用例与 optIn 不默认装配断言
+
 ## 2026-10-09（续 259）会话落盘与空壳治理：A2A 从不落盘 / 侧车踩掉 CLI 指针 / 499 个 194 字节空壳
 
 ### 起因
