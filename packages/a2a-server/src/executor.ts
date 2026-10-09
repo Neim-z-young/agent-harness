@@ -138,6 +138,17 @@ export class HarnessAgentExecutor implements AgentExecutor {
 
     // ---- 续接轮：上一轮停在 INPUT_REQUIRED，这条消息就是答复（模式 A）----
     if (prevState === TaskState.TASK_STATE_INPUT_REQUIRED) {
+      // ★ 必须先补发一次任务快照。原因：SDK 的 `ResultManager` 要求**每个响应的首事件
+      // 是 `task` / `message`**，而续接轮真正产出事件的是**第一轮那次 in-flight 的生成器**
+      // —— 它挂在**旧的 bus** 上（见下面 `makeAsker` 的 ALS 说明）。新 bus 若一个事件都不发，
+      // 跨 bus 流进这条响应的第一个 `statusUpdate` 就会被判
+      // "Received statusUpdate before initial 'Message'/'Task' event"（-32004）：
+      // 整条续接请求被拒、任务**永远停在 INPUT_REQUIRED**，而它仍算"活跃任务"
+      // ⇒ 该 `contextId` 之后的**每一条**消息都被 `ConcurrentTaskError` 拒（会话卡死）。
+      //
+      // 为什么单测没抓到：非流式 `SendMessage` 恰好绕过这一步（直接取终态快照），
+      // 而既有用例全走 `send()`；走 `SendStreamingMessage` 的 `streamSend()` 从没测过续接轮。
+      if (ctx.task) bus.publish(AgentEvent.task(ctx.task))
       this.resume(taskId, contextId, text, bus)
       return
     }

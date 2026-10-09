@@ -331,9 +331,13 @@ describe('HarnessAgentExecutor：权限挂起与续接', () => {
       bus,
     )
     const added = events.slice(before)
-    expect(added).toHaveLength(1)
-    expect(added[0].data.status.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED)
-    expect(added[0].data.metadata.error).toBe('UNRECOGNIZED_ANSWER')
+    // 续接轮**先补发一次任务快照**（SDK 的 `ResultManager` 要求每个响应的首事件是
+    // `task` / `message`，缺它整条续接会被判 -32004），其后才是本次的判定结果
+    expect(added).toHaveLength(2)
+    expect(added[0].kind).toBe('task')
+    expect(added[0].data.id).toBe('t3')
+    expect(added[1].data.status.state).toBe(TaskState.TASK_STATE_INPUT_REQUIRED)
+    expect(added[1].data.metadata.error).toBe('UNRECOGNIZED_ANSWER')
     // 仍挂着（可重试）
     expect(executor.suspend.size).toBe(1)
 
@@ -354,11 +358,15 @@ describe('HarnessAgentExecutor：权限挂起与续接', () => {
     const countAfterAnswer = events.length
 
     // 迟到/重复答复：桶里已没有该 task ⇒ 安全忽略
+    //（唯一追加的是那条任务快照 —— 任何响应都得有首事件，否则 SDK 判 -32004）
     await executor.execute(
       ctxOf(requestOf('allow', 'c4', 't4'), 't4', 'c4', inputRequiredTask('t4', 'c4')),
       bus,
     )
-    expect(events.length).toBe(countAfterAnswer)
+    const late = events.slice(countAfterAnswer)
+    expect(late).toHaveLength(1)
+    expect(late[0].kind).toBe('task')
+    expect(statuses(late)).toHaveLength(0) // 没有任何新状态 ⇒ 确实是"忽略"而非"重复执行"
     await first
   })
 })

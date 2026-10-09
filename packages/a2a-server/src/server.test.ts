@@ -405,6 +405,48 @@ describe('A2aServer：INPUT_REQUIRED 挂起与续接', () => {
     expect(second.status.state).toBe('TASK_STATE_COMPLETED')
     expect(calls.echo).toBe(0)
   })
+
+  // 回归（真机踩过，2026-10-09）：**流式**续接同样必须成立。
+  //
+  // 上面两个用例都走非流式 `SendMessage`，而它恰好绕过 SDK 的一条硬要求 ——
+  // `ResultManager` 要求**每个响应的首事件是 `task` / `message``**。续接轮真正产出事件的是
+  // 第一轮那次 in-flight 的生成器（挂在旧 bus 上），新 bus 一个事件都不发时，跨 bus 流进来的
+  // 第一个 `statusUpdate` 会被判 "Received statusUpdate before initial 'Message'/'Task' event"
+  // （-32004）⇒ 整条续接被拒、任务永远停在 `INPUT_REQUIRED`，且它仍算"活跃任务"
+  // ⇒ 该 `contextId` 之后的每条消息都被 `ConcurrentTaskError` 拒（VSCode 侧表现：
+  // 授权后弹 `-32004`，此后整个会话发什么都报错）。
+  it('【回归】流式续接（SendStreamingMessage）：首事件是 task，且续到 COMPLETED', async () => {
+    const { server, calls } = await makeServer({ mock: toolThenText('go', '工具说 ok'), permissionMode: 'ask' })
+
+    const first = await streamSend(server, 'go', { contextId: 'c-stream', messageId: 'ms1' })
+    const stateOf = (e: any) =>
+      e?.result?.task?.status?.state ?? e?.result?.statusUpdate?.status?.state
+    const firstTaskId = first.events[0]?.result?.task?.id as string
+    expect(firstTaskId).toBeTruthy()
+    expect(first.events.map(stateOf).at(-1)).toBe('TASK_STATE_INPUT_REQUIRED')
+    expect(calls.echo).toBe(0)
+
+    const second = await streamSend(server, 'allow', {
+      contextId: 'c-stream',
+      taskId: firstTaskId,
+      messageId: 'ms2',
+    })
+
+    // ① 不是"200 + application/json 的预流错误信封"（旧缺陷的形态）
+    expect(second.res.headers.get('content-type')).toContain('text/event-stream')
+    expect(second.events[0]?.error).toBeUndefined()
+    // ② ★ 首事件是 task —— 少了它，SDK 会对后续 statusUpdate 抛 -32004
+    expect(second.events[0]?.result?.task?.id).toBe(firstTaskId)
+    // ③ 真的续到终态，且工具已被放行执行、产物取回
+    expect(second.events.map(stateOf).at(-1)).toBe('TASK_STATE_COMPLETED')
+    expect(calls.echo).toBe(1)
+    const text = second.events
+      .map((e: any) =>
+        (e?.result?.artifactUpdate?.artifact?.parts ?? []).map((p: any) => p.text ?? '').join(''),
+      )
+      .join('')
+    expect(text).toContain('工具说 ok')
+  })
 })
 
 // ========================================================================
