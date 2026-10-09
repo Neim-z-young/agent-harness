@@ -140,6 +140,13 @@
   - **测试文件也是产物**：`config-window.test.ts` 曾因"写在最后一次 typecheck 之后"而带着 4 个类型
     错误合入。**验收口径必须跑在最后一个改动之后**（typecheck 要覆盖到新写的测试文件）。
 
+- `@harness/bench`：Benchmark 跑分框架（τ³-bench retail 域，2026-10-09 M1 落地）——直接
+  **进程内 import `HarnessHost` SDK** 驱动（不走 `harness run`，它只支持单轮执行）；三块适配
+  （域工具桥接 / user simulator 外层循环 / judge DB 终态校验）方案见 `docs/tau-bench-plan.md`。
+  注意：要独立 `ChatProvider` 实例时（如 user simulator）**直接 new provider 类**
+  （`MockChatProvider` / `AnthropicChatProvider` / `OpenAIChatProvider`），不要走
+  `createProvider*Plugin().provider`——插件的 getter 惰性创建，`install()` 前访问会抛错。
+
 - `@harness/a2a-server`：A2A（Agent2Agent）服务端**宿主/适配器层** —— 与 `@harness/cli` 同级，**不是**业务能力插件。
   只做协议翻译与装配：把 `@harness/host` 的装配暴露为 A2A v1.0 协议服务（AgentCard / SendMessage /
   SendStreamingMessage(SSE) / GetTask / CancelTask）。**不内置业务决策、不绕过权限、不直接调工具**，

@@ -1710,3 +1710,50 @@ ACP、headless）会让已跑完的结果**滞留**到用户下次发话（`s_17
 **提示词侧的对应条款**（同批落地）：`coordinator.txt` 新增「等待：有依赖的活别抢着干」、
 `subagent-tool-documentation.txt` 新增「派工后：等结果，别抢活」、`renderRoster()` 末行补一句 ——
 核心是一条：**有依赖就停手（系统会替你等），别自己做一遍（重复劳动），也别反复查状态（空转）**。
+
+## 十九、Benchmark 跑分框架（@harness/bench，M1 已落地 2026-10-09）
+
+### 19.1 定位与数据
+
+外部客观基准（τ³-bench retail 域：114 任务 / 16 域工具），给引擎与 agent 配置提供可复现、
+可对比的跑分。完整方案见 `docs/tau-bench-plan.md`。数据文件（tasks/db/policy/split/
+guidelines）从 tau2-bench main 原样落位 `packages/bench/src/data/retail/`，字段保持官方
+snake_case。
+
+### 19.2 架构：进程内 SDK 驱动 + 三块适配
+
+```
+┌─ cli.ts（任务×采样展平 → 并发 worker pool）────────────────────┐
+│                                                                │
+│  runTask（每任务一个 HarnessHost 实例，半双工循环）              │
+│  ┌──────────────────────────────────────────────────────────┐ │
+│  │ UserSimulator          host.send() ──► HarnessHost       │ │
+│  │ （独立 provider.complete，│            ├ AgentDefinition   │ │
+│  │   flip_roles 历史，       │            │  systemPrompt 完整 │ │
+│  │   STOP/TRANSFER 判定）    │            │  覆盖（官方客服     │ │
+│  │          ▲                │            │  提示词+policy）   │ │
+│  │          └── agent 文本 ◄─┘            └ extraPlugins:     │ │
+│  │                                         retail 工具插件     │ │
+│  │                                          （DB 深拷贝/任务）  │ │
+│  └──────────────────────────────────────────────────────────┘ │
+│           │ session.messages 提取 ToolCallPart                 │
+│           ▼                                                    │
+│  judgeTask：gold 回放 vs 轨迹回放 → deepEqual → reward         │
+└────────────────────────────────────────────────────────────────┘
+```
+
+三条关键设计：
+
+1. **工具与 judge 共享同一纯函数**（`executeRetailTool`）：harness 侧与 judge 侧的浮点/
+   算式路径天然一致，无需比较容差。官方疑似 bug 按原样保留（有测试钉住）。
+2. **user simulator 独立模型调用**：直接 new provider 类（不走插件装置，绕开惰性 getter），
+   不进 agent 主循环——外层半双工对齐官方 `Orchestrator.step`。
+3. **指标 = 官方 pass^k + 自有成本/延迟/步数**：agent 用量取 `harness.usage`，user sim 自记；
+   双端 tokens 都进汇总（`results.jsonl` + `summary.json` + 控制台报表）。
+
+### 19.3 与宿主体系的关系
+
+bench 是 `HarnessHost` 的**第一个纯 SDK 消费方**（此前只有 CLI/A2A/VSCode 三个宿主）：不写
+宿主适配层、不走 `harness run`（单轮执行承载不了 user sim 多轮循环），只用
+`HostOptions`（`extraPlugins` / `agents` / `providers` / `permissionMode`）进程内装配。
+这验证了「host 与具体宿主无关」的分层承诺——跑分循环本身就是一种宿主形态。

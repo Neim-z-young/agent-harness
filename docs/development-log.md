@@ -1,5 +1,56 @@
 # Agent Harness 开发日志
 
+## 2026-10-09（续 262）@harness/bench：τ³-bench retail 跑分框架（M1）
+
+### 起因
+
+方案定稿（见 docs/tau-bench-plan.md）：benchmark 选 τ-bench 系起步，在 `packages/bench`
+实现三块适配——域 API 工具桥接（走 `core.tool.pool.assemble`）、user simulator 外层循环
+（独立模型调用，不进 agent 主循环）、judge（环境 DB 终态校验，轨迹从 `session.messages` 导出）。
+指标在官方 pass^k 之上叠加自有成本/延迟/步数。
+
+### 决策与落地
+
+**一、数据源改用 τ³-bench（tau2-bench 仓库）**：原 tau-bench 仓库已弃用且任务有 bug；τ³ retail
+域（114 任务 / 50 商品 / 500 用户 / 1000 订单 / 16 工具）是官方维护的修复版。数据文件
+（tasks/db/policy/split/guidelines）从 main 分支原样落位 `src/data/retail/`，字段保持官方
+snake_case。
+
+**二、驱动方式：进程内 HarnessHost SDK**：`harness run` CLI 只支持单轮一次性执行，承载不了
+user sim 多轮循环；bench 直接 `import { HarnessHost } from '@harness/host'`，每任务一个实例
+（`extraPlugins` 注入 retail 工具插件、`permissionMode: 'allow-all'`、`agents` 注册
+`tau-retail-agent`——`systemPrompt` 完整覆盖为官方客服提示词 + policy 全文）。
+
+**三、工具与 judge 共享同一纯函数实现**：`executeRetailTool(db, name, args)` 纯调度，harness
+侧（插件）与 judge 侧（gold 回放 / 轨迹回放）都走它——浮点路径（`round2`）与算式求值天然一致，
+无需比较容差。官方疑似 bug（`modify_pending_order_items` 循环外 variant 引用）**按原样保留**，
+有专门测试钉住行为。judge 的 `deepEqualWithDiff` 键序无关、undefined≡缺失、NaN 相等。
+
+**四、半双工循环对齐官方 Orchestrator.step**：固定问候 → user sim（flip_roles：agent 文本→
+user 角色，客户发言→assistant；终止 token `###STOP###/###TRANSFER###/###OUT-OF-SCOPE###`）→
+`host.send()` → 从 `session.messages` 收集新增 `ToolCallPart`。终止：token / maxTurns（25）/
+agent 空回复（官方 communication error）。
+
+**五、踩坑：provider 插件的惰性 getter**。user sim 需要独立 `ChatProvider` 实例，最初走
+`createProviderMockPlugin().provider` —— 该 getter 在 `install()` 前访问直接抛
+`MockChatProvider not yet created`。修复：`buildUserSimProvider` 改为**直接 new provider 类**
+（`MockChatProvider` / `AnthropicChatProvider` / `OpenAIChatProvider` 三者构造函数都吃 config），
+绕开插件装置——user sim 本来就不需要 harness 的注册机制。
+
+**六、指标与 CLI**：pass^k（任务级 k 次全通过率，逐级计算）+ avgReward / 轮数 / 工具调用数 /
+延迟 / 双端 tokens（agent 取 `harness.usage.get`，user sim 自记）/ 终止分布。CLI
+（`bun packages/bench/src/cli.ts`）任务×采样展平并发，输出 `results.jsonl` + `summary.json` +
+控制台报表。NL_ASSERTION / COMMUNICATE_INFO 的 LLM judge 留 `skippedBasis` 接口（M1 不实现）。
+
+### 验证
+
+- `packages/bench`：`bunx tsc --noEmit` 0 error；`bun test` **22 pass / 0 fail**
+  （工具 15 + judge 6 + runner e2e 1）。
+- judge 总检：**全量 114 任务 golden 回放自洽**（gold 轨迹判分必得 dbMatch=true）。
+- CLI mock smoke：`--provider mock --user-provider mock --task-ids 0,1` 全链路跑通（报表 +
+  双文件落盘，mock 下双端 tokens 走真实 usage 计数）。
+- 真实模型基线跑分待做（M1 遗留，见 plan §7）。
+
 ## 2026-10-09（续 261）bash 工具补齐跨平台能力：Windows 回退 PowerShell / CMD
 
 ### 起因
