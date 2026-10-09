@@ -498,6 +498,18 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       load: async () =>
         (await lazyImport<{ createSkillForgePlugin: () => AgentPlugin }>('@harness/skill-forge')).createSkillForgePlugin(),
     })
+    // env-context：运行环境与用户信息注入（系统/用户/Shell/工作目录进前缀，时间/Git 状态走尾部）。
+    // optIn：它改 system 前缀与每轮请求尾 —— 属"启用了才付代价"的行为（与 memory 同理：默认零行为）。
+    // 工作目录经 core 的 PromptInput.cwd 取会话级口径（子 Agent worktree 拿到的是自己的路径）。
+    defaultBuiltinRegistry.register({
+      id: 'env-context',
+      name: 'Env Context',
+      description:
+        '运行环境与用户信息注入：静态环境（系统/用户/Shell/工作目录）进 system 前缀，易变信息（当前时间/Git 状态）走尾部动态区',
+      source: 'builtin',
+      optIn: true,
+      load: async () => (await lazyImport<{ createEnvContextPlugin: () => AgentPlugin }>('@harness/env-context')).createEnvContextPlugin(),
+    })
   }
   return defaultBuiltinRegistry
 }

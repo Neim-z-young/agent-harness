@@ -89,7 +89,7 @@ describe('BuiltinPluginRegistry：内置通用插件统一登记', () => {
       'tools-search', 'tools-glob', 'tools-web', 'tools-media',
       'code-intel', 'computer-use', 'mcp.server-registry', 'mcp-server',
       'subagent', 'coordinator', 'swarm',
-      'herdr', 'memory', 'skill-forge',
+      'herdr', 'memory', 'skill-forge', 'env-context',
     ]) {
       expect(reg.has(id)).toBe(true)
       expect(reg.get(id)!.source).toBe('builtin')
@@ -104,7 +104,7 @@ describe('BuiltinPluginRegistry：内置通用插件统一登记', () => {
 
   it('optIn 语义：进程内 MCP server 与编排类插件默认不自动装配', () => {
     const reg = getBuiltinRegistry()
-    for (const id of ['code-intel', 'computer-use', 'mcp.server-registry', 'mcp-server', 'subagent', 'coordinator', 'swarm', 'memory', 'skill-forge', 'herdr']) {
+    for (const id of ['code-intel', 'computer-use', 'mcp.server-registry', 'mcp-server', 'subagent', 'coordinator', 'swarm', 'memory', 'skill-forge', 'herdr', 'env-context']) {
       expect(reg.get(id)!.optIn).toBe(true)
     }
     // tools-* 是默认装配的：没有 optIn 标记
@@ -133,6 +133,16 @@ describe('resolveBuiltinPlugins / unknownBuiltinPluginIds：声明式启用路�
     // optIn：不声明就不装配 —— 它每轮往请求尾部注入计划块，是有成本的行为
     const none = await resolveBuiltinPlugins([])
     expect(none.plugins.map((p) => p.id)).not.toContain('planning-files')
+  })
+
+  it('env-context 可从 id 实例化（真 import + 真工厂调用），且 optIn 不默认装配', async () => {
+    const { plugins, unknown } = await resolveBuiltinPlugins(['env-context'])
+    expect(unknown).toEqual([])
+    expect(plugins.map((p) => p.id)).toEqual(['env-context'])
+    expect(typeof plugins[0]!.install).toBe('function')
+    // optIn：不声明就不装配 —— 它改 system 前缀与每轮请求尾，是有成本的行为
+    const none = await resolveBuiltinPlugins([])
+    expect(none.plugins.map((p) => p.id)).not.toContain('env-context')
   })
 
   it('只声明 coordinator 时经 dependsOn 自动补上 subagent', async () => {

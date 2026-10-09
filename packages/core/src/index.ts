@@ -2771,6 +2771,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
       agentId,
       sessionId,
       ...(agent.mode ? { agentMode: agent.mode } : {}),
+      // 会话级工作目录，与 ToolContext 同口径（sess.cwd 优先、回落全局 cwd）：
+      // 子 Agent 的 worktree 会话会拿到 worktree 路径。给 prompt 注入类插件用 ——
+      // install 期的 ctx.workspace.cwd 是冻结值，worktree 下会与工具实际 cwd 不一致。
+      cwd: sess.cwd ?? this.deps.cwd,
     }
     // 技能 paths 条件触发用：从本轮用户输入提取疑似文件路径（仅命中者经动态通道注入尾部）
     const involvedPaths = extractFilePaths(message)

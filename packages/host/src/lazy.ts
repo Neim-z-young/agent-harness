@@ -40,6 +40,7 @@ const BUILTIN_LAZY: Record<string, () => Promise<Record<string, unknown>>> = {
   '@harness/computer-use': () => import('@harness/computer-use'),
   '@harness/computer-use/meta': () => import('@harness/computer-use/meta'),
   '@harness/coordinator': () => import('@harness/coordinator'),
+  '@harness/env-context': () => import('@harness/env-context'),
   '@harness/herdr': () => import('@harness/herdr'),
   '@harness/manage-plugin': () => import('@harness/manage-plugin'),
   '@harness/mcp-server': () => import('@harness/mcp-server'),

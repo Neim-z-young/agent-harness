@@ -1,0 +1,21 @@
+{
+  "name": "@harness/env-context",
+  "version": "0.1.0",
+  "description": "运行环境与用户信息注入插件：静态环境（系统/用户/Shell/工作目录）进 system 前缀，易变信息（当前时间/Git 状态）走尾部动态区",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/plugin": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

@@ -21,6 +21,7 @@
     "@harness/computer-use": "workspace:*",
     "@harness/coordinator": "workspace:*",
     "@harness/core": "workspace:*",
+    "@harness/env-context": "workspace:*",
     "@harness/herdr": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-server": "workspace:*",

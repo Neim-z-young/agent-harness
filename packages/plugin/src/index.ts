@@ -136,6 +136,15 @@ export interface PromptInput {
    * 缺省表示未提供（插件不得依赖它做"无 paths 也注入"的判定）。
    */
   involvedPaths?: string[]
+  /**
+   * 本轮会话的工作目录（core 填充，与 ToolContext 同口径：`Session.cwd` 优先，缺省回落全局 cwd）。
+   *
+   * 供 prompt 注入类插件取「这个会话真正的工作目录」—— 子 Agent 的 worktree 会话会拿到
+   * worktree 路径，而 install 期的 `PluginContext.workspace.cwd` 是**冻结值**，worktree 下
+   * 与工具实际用的 cwd 不一致（正是当初缺的口子）。缺省表示宿主未提供（旧版 core / 直调 hook），
+   * 插件回落冻结值时须自行承担子 Agent 场景的口径偏差。
+   */
+  cwd?: string
 }
 
 /**
