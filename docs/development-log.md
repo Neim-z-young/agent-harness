@@ -1,5 +1,28 @@
 # Agent Harness 开发日志
 
+## 2026-10-09（续 261）bash 工具补齐跨平台能力：Windows 回退 PowerShell / CMD
+
+### 起因
+
+用户追问"win 里的 bash 用的是 PowerShell 还是 cmd？"——答案是**都不是**，`tools-builtin` 的 `runBash` 硬编码 `spawn('bash', ['-c', ...])`，Windows 上无 bash 时直接 `SPAWN_ERROR`。
+
+### 决策与落地
+
+- 新增 `resolveShell()`（导出）：
+  - 非 Windows：bash。
+  - Windows：按 `bash.exe → pwsh.exe → powershell.exe → cmd.exe` 顺序探测 PATH；全不可用时回退 `cmd.exe`。
+- `runBash` 改为按 `resolveShell()` 结果 spawn，返回的 `BashOutput` 增加 `shell` 字段。
+- 安全策略按 shell family 调整：
+  - 普通 `bash` 工具：非 bash 族系时**禁用用户配置的 allowlist**（bash 首命令白名单语义不适用于 PowerShell），保留危险检测与 cwd/env 沙箱；执行结果里附加 `[harness] 当前由 X 执行命令；bash 专用白名单/只读语义未生效。`
+  - `bash_ro` 只读哨兵：非 bash 族系时直接拒绝（`SANDBOX_RO_NO_BASH`），因为只读保证依赖 bash AST 与白名单，不能在 PowerShell 上降级为"可能只读"。
+- `env-context` 插件同步改进：Windows 上 `process.env.SHELL` 为空时，用与 tools-builtin 同口径的探测填充 `Shell:` 行。
+- `packages/cli/src/tui.test.tsx` 的长工具结果窗口测试适配新增 `shell` 字段：输出从 `seq 1 3000` 改为 `seq 1 1500`，尾部断言从 `n3000` 改为 `exitCode":0` + `shell":"Bash"`。
+
+### 验证
+
+- 根 `bun run typecheck`：0 error。
+- 根 `bun run test`：2632 pass / 0 fail / 0 skip（基线 2625 + 新增 7：tools-builtin 5 条 + env-context 2 条）。
+
 ## 2026-10-09（续 260）env-context：运行环境与用户信息注入（前缀静态 + 尾部易变）+ PromptInput.cwd 接缝
 
 ### 起因
