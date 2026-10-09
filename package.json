@@ -20,6 +20,7 @@
     "@harness/a2a-server": "workspace:*",
     "@harness/agent": "workspace:*",
     "@harness/acp-context": "workspace:*",
+    "@harness/bench": "workspace:*",
     "@harness/bus": "workspace:*",
     "@harness/code-intel": "workspace:*",
     "@harness/computer-use": "workspace:*",

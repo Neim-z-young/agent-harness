@@ -1,0 +1,34 @@
+{
+  "name": "@harness/bench",
+  "version": "0.1.0",
+  "description": "Benchmark 跑分框架：τ-bench（τ³-bench retail 域起步）适配 —— 域工具桥接（core.tool.pool.assemble）、user simulator 外层循环（独立模型调用）、judge（DB 终态校验 + 轨迹回放），指标在 pass^k 之上叠加成本/延迟/步数",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "bin": {
+    "bench": "./src/cli.ts"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/host": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/session": "workspace:*",
+    "@harness/tool": "workspace:*",
+    "@harness/usage": "workspace:*"
+  },
+  "devDependencies": {
+    "@harness/provider-anthropic": "workspace:*",
+    "@harness/provider-mock": "workspace:*",
+    "@harness/provider-openai": "workspace:*"
+  }
+}

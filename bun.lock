@@ -8,6 +8,7 @@
         "@harness/a2a-server": "workspace:*",
         "@harness/acp-context": "workspace:*",
         "@harness/agent": "workspace:*",
+        "@harness/bench": "workspace:*",
         "@harness/bus": "workspace:*",
         "@harness/code-intel": "workspace:*",
         "@harness/computer-use": "workspace:*",
@@ -69,6 +70,26 @@
     "packages/agent": {
       "name": "@harness/agent",
       "version": "0.1.0",
+    },
+    "packages/bench": {
+      "name": "@harness/bench",
+      "version": "0.1.0",
+      "bin": {
+        "bench": "./src/cli.ts",
+      },
+      "dependencies": {
+        "@harness/core": "workspace:*",
+        "@harness/host": "workspace:*",
+        "@harness/plugin": "workspace:*",
+        "@harness/session": "workspace:*",
+        "@harness/tool": "workspace:*",
+        "@harness/usage": "workspace:*",
+      },
+      "devDependencies": {
+        "@harness/provider-anthropic": "workspace:*",
+        "@harness/provider-mock": "workspace:*",
+        "@harness/provider-openai": "workspace:*",
+      },
     },
     "packages/bus": {
       "name": "@harness/bus",
@@ -563,6 +584,8 @@
     "@harness/acp-context": ["@harness/acp-context@workspace:packages/plugins/acp-context"],
 
     "@harness/agent": ["@harness/agent@workspace:packages/agent"],
+
+    "@harness/bench": ["@harness/bench@workspace:packages/bench"],
 
     "@harness/bus": ["@harness/bus@workspace:packages/bus"],
 
