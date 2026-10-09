@@ -1,5 +1,75 @@
 # Agent Harness 开发日志
 
+## 2026-10-09（续 264）@harness/tools-builtin：`bash_ro` 放行丢弃到 `/dev/null` 的重定向 —— `2>/dev/null` 不再被判成写文件
+
+### 起因
+
+spike 真机记录（`spikes/vscode-chat-sessions/README.md` §5e）：只读哨兵连续两次 `bash_ro`
+返回 `SANDBOX_RO_REDIRECT`，模型被文案带偏后反复换写法重试。最小复现：
+
+```
+checkReadOnlyCommand('git rev-parse --is-inside-work-tree 2>/dev/null')
+→ { ok:false, code:'SANDBOX_RO_REDIRECT', reason:'只读模式拒绝：输出重定向（> / >>）会写文件' }
+```
+
+`2>/dev/null` 是只读命令里最常见的「静音 stderr」惯用法，它不写任何文件 —— 判据本身错了，
+不是"被绕过"，应无条件修。
+
+### 决策与落地
+
+**一、根因：`/>>?/` 只看 `>` 这一个字符，没有"目标"这个概念。** 它分不清
+`2>err.txt`（真写文件）与 `2>/dev/null`（丢弃）。已有代码只摘掉了 fd 复制（`2>&1`），
+空设备那一路漏了。
+
+**二、修法：在写通道检查之前，再摘掉"目标为 `/dev/null`"的重定向。**
+
+```ts
+// 新增（tools-builtin/src/index.ts）
+const NULL_SINK_REDIRECT = /&?[12]?>{1,2}\s*\/dev\/null(?![\w.-])/g
+function stripNullSink(command: string): string {
+  return command.replace(NULL_SINK_REDIRECT, '')
+}
+
+// checkReadOnlyCommand 步骤 1a
+const noFdDup = stripNullSink(raw.replace(/[12]?>&[12]/g, ''))
+```
+
+三个刻意之处：
+- `[12]?>&[12]` 从 `[12]>&[12]` 放宽成 `[12]?`，顺手覆盖 `>&2` 这种省略左 fd 的写法；
+- `>{1,2}` 覆盖 `>>`（`2>>/dev/null` 同样是丢弃）；
+- **尾部 `(?![\w.-])` 是钉子** —— 没有它，`wc -l a.txt > /dev/nullx`（往一个**普通文件**里写）
+  会被当成空设备放行，等于净安全性下降。
+
+**三、文案同步修（这是误伤被放大的那一环）。** 模型看到"输出重定向会写文件"却明知道自己写的是
+`2>/dev/null`，只能猜"是不是换个写法就行" ⇒ 重试风暴。故：
+
+- `SANDBOX_RO_REDIRECT` 的 `why` → `输出重定向（> / >>）会写文件（丢弃到 /dev/null 的除外）`；
+- `bash_ro` 的 `command` schema 描述 → `不得含重定向、$()、反引号、heredoc；\`2>/dev/null\` 这类丢弃输出除外`；
+- **同一份描述在两处**：`packages/plugins/tools-builtin/src/index.ts` 与
+  `adapters/vscode/package.json` 的静态贡献点镜像 ⇒ 改一处必须同步另一处（本次已同步）。
+
+### 只有实现时才暴露的发现
+
+1. **`echo 1 > /dev/null` 里的 `1` 是 echo 的参数，不是 fd。** 正则要求数字**紧贴** `>`，
+   所以不会把参数吃掉 —— 但这条边界只有写成用例才站得住，已钉进回归（否则将来有人"优化"成
+   `[12]?\s*>` 就静默放宽了）。
+2. **两类剥离的顺序有讲究**：fd 复制（`2>&1`）必须也在空设备之前摘掉，否则
+   `ls 2>&1 > /dev/null` 这类组合会残留一个 `>`。合并成一行写，读起来是"两步都做了"。
+3. **AST 复核门不需要同步改，但"端到端真跑"因此成了必要验证。** `checkReadOnlyByAst` 只查
+   命令名与 git 子命令、**不看重定向**，所以手写门放行后它不会拦；反过来说，"手写门放行"不等于
+   "命令真跑了" —— 新增用例用一条必然失败的命令反向确认（退出码非 0 但 stderr 为空 ⇒ `2>/dev/null`
+   确实生效）。
+4. **`/dev/stderr` / `/dev/stdout` 刻意不动**：它们也是不落盘的，但不在本次真机暴露面内，
+   保持 fail-closed，留到真有人用到再说。
+
+### 验证
+
+- `packages/plugins/tools-builtin`：94 pass / 0 fail（新增 2 条：判据层 + 端到端）。
+- **反向验证**（`cp` 备份 + 字符串变异，`shasum -a 256 -c` 还原）：
+  ①去掉 `stripNullSink` ⇒ 新增 2 条**全红**；②去掉 `(?![\w.-])` ⇒ `/dev/nullx` 钉子**变红**；
+  还原后 94 pass / 0 fail、哈希一致。
+- 全量 `bun run typecheck` 39 包 0 error；全量 `bun run test` 全绿。
+
 ## 2026-10-09（续 263）@harness/a2a-server：修复流式续接（INPUT_REQUIRED 答复）——续接轮必须先补发任务快照
 
 ### 起因
