@@ -405,6 +405,24 @@ describe('HarnessAgentExecutor：取消与超时', () => {
     expect(executor.suspend.size).toBe(0)
   })
 
+  it('轮末落盘：A2A 会话写进 sessionStore，断线重连读得回来', async () => {
+    const { host, executor } = await makePair({ mock: { defaultResponse: '好了' } })
+    const bus = new DefaultExecutionEventBus()
+    const events = collect(bus)
+
+    await executor.execute(ctxOf(requestOf('hi'), 'tP', 'c-persist'), bus)
+    expect(statuses(events).at(-1)).toBe(TaskState.TASK_STATE_COMPLETED)
+
+    // executor 直连**引擎层**（`session.promptStream`），绕过了 `host.sendStream()`；
+    // 落盘全靠它在循环后补的那次 `host.flushDirtySessions()`。删掉那一步，磁盘上
+    // 只会剩 `<contextId>.telemetry.jsonl`，而 `ensureSession` 的第二级回退
+    // （`sessionStore.load(contextId)`，断线重连）就永远读不到东西。
+    const saved = await host.sessionStore.load('c-persist')
+    expect(saved).toBeDefined()
+    expect(saved!.id).toBe('c-persist')
+    expect(saved!.messages.length).toBeGreaterThan(0)
+  })
+
   it('executor 抛异常 ⇒ FAILED 且只给安全文案（不泄露堆栈）', async () => {
     // 用桩 host 造一条必然抛错的 promptStream（真实装配里很难自然触发）
     const boomHost = {

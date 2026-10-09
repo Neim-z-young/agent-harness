@@ -298,24 +298,44 @@ METHODS.set('harness/session.list', async (_p, host) => {
   const pointer = await host.sessionPointer.readIfOwnedBy(host.workspace.dataDir).catch(() => undefined)
   const cwd = host.workspace.cwd
   const currentId = host.session.id
+  const rows = list.map((s) => ({
+    id: s.id,
+    title: s.title ?? null,
+    messageCount: s.messageCount,
+    updatedAt: s.updatedAt,
+    cwd: s.cwd ?? null,
+    agentId: s.agentId ?? null,
+    /** 项目级指针指向它（`.harness/last-session.json`） */
+    isPointer: s.id === pointer?.sessionId,
+    /** 属于当前工作目录（会话目录是全局共享的，不标出来就只能猜） */
+    isCwd: !!s.cwd && resolve(s.cwd) === cwd,
+    isCurrent: s.id === currentId,
+  }))
+  // 当前会话**可能还没落盘**（0 消息的新会话不写文件，等第一条消息由轮末 flush 写出）。
+  // 不把它补进列表的话，`isCurrent` 标记就无处可挂 —— 消费方（面板）会显示成
+  // "当前会话不在列表里"，而这恰恰是启动后第一眼就会看到的状态。
+  if (!rows.some((r) => r.id === currentId)) {
+    const live = await host.harness.session.get(currentId).catch(() => undefined)
+    if (live) {
+      rows.unshift({
+        id: live.id,
+        title: live.title ?? null,
+        messageCount: live.messages.length,
+        updatedAt: live.updatedAt,
+        cwd: live.cwd ?? null,
+        agentId: live.agentId ?? null,
+        isPointer: live.id === pointer?.sessionId,
+        isCwd: !!live.cwd && resolve(live.cwd) === cwd,
+        isCurrent: true,
+      })
+    }
+  }
   return {
     cwd,
     dataDir: host.workspace.dataDir,
     pointer: pointer?.sessionId ?? null,
     current: currentId,
-    sessions: list.map((s) => ({
-      id: s.id,
-      title: s.title ?? null,
-      messageCount: s.messageCount,
-      updatedAt: s.updatedAt,
-      cwd: s.cwd ?? null,
-      agentId: s.agentId ?? null,
-      /** 项目级指针指向它（`.harness/last-session.json`） */
-      isPointer: s.id === pointer?.sessionId,
-      /** 属于当前工作目录（会话目录是全局共享的，不标出来就只能猜） */
-      isCwd: !!s.cwd && resolve(s.cwd) === cwd,
-      isCurrent: s.id === currentId,
-    })),
+    sessions: rows,
   }
 })
 
@@ -372,15 +392,17 @@ METHODS.set('harness/session.new', async (p, host) => {
 METHODS.set('harness/session.resume', async (p, host) => {
   assertBooted(host)
   const id = requireString(p, 'id')
-  const saved = await host.sessionStore.load(id).catch(() => undefined)
-  if (!saved) throw new ControlError('NOT_FOUND', `会话 "${id}" 不存在`)
-  const session = await host.restoreSession(saved)
+  // **活会话优先**（与 `readSessionView` / `requireLiveSession` 同口径）。
+  // 原来只查磁盘，隐含前提是"会话文件在 boot 时就已存在"——那条前提已不成立：
+  // 0 消息的新会话不再落盘（等第一条消息由轮末 flush 写出），所以启动后立刻
+  // `/resume` 回当前会话必须走内存，否则会得到 NOT_FOUND。
+  const session = await requireLiveSession(host, id)
   await host.rememberSession(session)
   return {
     sessionId: session.id,
     title: session.title ?? null,
     agentId: session.agentId ?? null,
-    messageCount: saved.messages.length,
+    messageCount: session.messages.length,
     model: host.resolveSessionModel(session) ?? null,
   }
 })

@@ -304,6 +304,53 @@ describe('自动恢复的会话 id 记在当前工作目录下', () => {
     await a2.app.shutdown()
   })
 
+  it('autoResume: false（服务端形态）不写指针：脚本化不该改写历史', async () => {
+    const dataDir = join(dir, 'shared')
+    const proj = join(dir, 'proj'); mkdirSync(proj, { recursive: true })
+
+    // 先正常形态跑一轮，留下「本目录上次会话」的记录
+    const a1 = mount(proj, dataDir)
+    const { harness: h1, session: s1 } = await a1.app.boot()
+    await h1.session.addMessage(s1.id, {
+      id: 'real', role: 'user', parts: [{ type: 'text', text: '真的聊过' }], createdAt: 1,
+    })
+    await a1.app.sessionStore.save((await h1.session.get(s1.id))!)
+    await a1.app.shutdown()
+    expect(readPointer(proj)?.sessionId).toBe(s1.id)
+
+    // 服务端形态 boot（A2A 侧车 / `harness run` 都传 autoResume:false）：它每次新建一条
+    // 一次性会话（会话由 contextId 或 prompt 显式寻址），**不该**把它写成「本目录上次会话」。
+    // 旧行为会写 —— 实测把 CLI 的指针指到过一个 0 消息空壳（`s_1791382595159_sopo1`），
+    // 下次交互式启动就恢复出一个空会话。
+    const a2 = mount(proj, dataDir, { autoResume: false })
+    const { session: s2 } = await a2.app.boot()
+    await a2.app.shutdown()
+    expect(s2.id).not.toBe(s1.id)
+    expect(readPointer(proj)?.sessionId).toBe(s1.id)
+  })
+
+  it('0 消息的会话不落盘：boot 不留空壳，聊过才写文件', async () => {
+    const dataDir = join(dir, 'shared')
+    const proj = join(dir, 'proj'); mkdirSync(proj, { recursive: true })
+
+    // boot 只在内存里建了会话，磁盘上不该出现文件。旧行为无条件 save，会留下一个
+    // 194 字节空壳（无 title/meta、无 telemetry）—— VSCode 每 spawn 一次 A2A 侧车
+    // 就 boot 一次，实测积到过 499 个。
+    const a1 = mount(proj, dataDir)
+    const { harness: h1, session: s1 } = await a1.app.boot()
+    expect(existsSync(a1.app.sessionStore.pathFor(s1.id))).toBe(false)
+    expect(await a1.app.sessionStore.list()).toHaveLength(0)
+
+    // 聊过之后由轮末 flushDirtySessions 补上 —— `/sessions` 从第一条消息起照常可见
+    await h1.session.addMessage(s1.id, {
+      id: 'm1', role: 'user', parts: [{ type: 'text', text: '你好' }], createdAt: 1,
+    })
+    await a1.app.flushDirtySessions()
+    expect(existsSync(a1.app.sessionStore.pathFor(s1.id))).toBe(true)
+    expect(await a1.app.sessionStore.list()).toHaveLength(1)
+    await a1.app.shutdown()
+  })
+
   it('指针失效（会话被删 / 文件损坏）退回同目录兜底，不阻断启动', async () => {
     const dataDir = join(dir, 'shared')
     const proj = join(dir, 'proj'); mkdirSync(proj, { recursive: true })

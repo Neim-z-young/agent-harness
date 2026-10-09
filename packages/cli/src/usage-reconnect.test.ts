@@ -95,6 +95,9 @@ describe('用量统计：重连不清零 + 历史可导出', () => {
     const app = makeApp(dir)
     try {
       const { session } = await app.boot()
+      // boot 只建内存会话（0 消息不落盘，等第一条消息由轮末 flush 写出）。本用例测的是
+      // "重连后能从磁盘读回用量"，所以先显式落一次 —— 与上一用例同一步。
+      await app.sessionStore.save(session)
       const cur = await app.sessionStore.load(session.id)
       expect(cur).toBeTruthy()
 

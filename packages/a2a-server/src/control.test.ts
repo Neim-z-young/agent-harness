@@ -385,6 +385,23 @@ describe('控制面：会话', () => {
     expect(cur?.isCurrent).toBe(true)
   })
 
+  it('当前会话还没落盘时也在 list 里（0 消息的新会话不写文件）', async () => {
+    const host = await makeHost()
+    // boot 出来的会话是 0 消息 ⇒ 磁盘上没有它的文件（boot 不再无条件落盘）
+    expect(await host.sessionStore.load(host.session.id)).toBeUndefined()
+
+    // 于是 list 不能只照抄磁盘目录 —— 否则 `isCurrent` 无处可挂，消费方
+    // 打开面板第一眼就是"当前会话不在列表里"。
+    const res = (await call(host, 'harness/session.list')) as {
+      current: string
+      sessions: Array<{ id: string; isCurrent: boolean; messageCount: number }>
+    }
+    const cur = res.sessions.find((s) => s.id === res.current)
+    expect(cur).toBeDefined()
+    expect(cur?.isCurrent).toBe(true)
+    expect(cur?.messageCount).toBe(0)
+  })
+
   it('get 未 boot 之外的未知会话 ⇒ NOT_FOUND', async () => {
     const host = await makeHost()
     await expectControlError(() => call(host, 'harness/session.get', { sessionId: 's_不存在' }), 'NOT_FOUND')

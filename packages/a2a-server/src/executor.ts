@@ -189,6 +189,13 @@ export class HarnessAgentExecutor implements AgentExecutor {
           // `aborted` 只出现在 done / turn_end（见 AgentStreamEvent.aborted 语义）
           if (ev.aborted) aborted = true
         }
+        // 轮末落盘。**不能省**：`host.sendStream()` 同样是"循环后 flush"（`host.ts`），
+        // 而这里直连引擎层 `session.promptStream`，绕过了那一步 —— 少了它 A2A 会话
+        // **从不落盘**（只剩 `<contextId>.telemetry.jsonl`），后果是 `ensureSession` 的
+        // 第二级回退 `sessionStore.load(contextId)`（断线重连）**永远读不到东西**：
+        // 侧车一重启，同一个 contextId 拿到的是全新空会话，对话静默清空。
+        // 另外 `flushDirtySessions` 是"只存有变化的会话"，含本轮主会话与期间产生的子会话。
+        await host.flushDirtySessions()
       })
       const { state, metadata } = this.finalize(running, aborted)
       const message = this.finalMessage(state, running)
@@ -381,6 +388,8 @@ export class HarnessAgentExecutor implements AgentExecutor {
     if (contextId) {
       const live = await host.harness.session.get(contextId)
       if (live) return live
+      // 第二级：读盘。**写盘方是 `execute()` 循环后那次 `flushDirtySessions()`** ——
+      // 少一次它就永远走到第三级（新建），同一个 contextId 重启后拿全新空会话。
       const saved = await host.sessionStore.load(contextId).catch(() => undefined)
       if (saved) return host.restoreSession(saved)
     }

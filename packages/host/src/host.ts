@@ -1100,10 +1100,26 @@ export class HarnessHost {
         this.sessionRestore = { source: 'new', sessionId: session.id, ...(pick.skipped ? { skipped: pick.skipped } : {}) }
       }
     }
-    await this.sessionStore.save(session)
+    // 落盘：**0 消息的新会话不落盘**。
+    //
+    // boot 无条件 `save` 曾让每个"启动过、没聊"的宿主在磁盘上留下一个 194 字节空壳，
+    // 实测积到 **499 个**（`/sessions` 列表被灌满，每次 `list()` 都要把它们逐个读一遍；
+    // 而它们既无 title/meta、也没有同名 telemetry —— 是纯噪音）。服务端形态尤其密集：
+    // VSCode 每 spawn 一次 A2A 侧车就 boot 一次，一次一个。
+    //
+    // 不落盘不会丢内容：真正该存的那次由每轮结束的 `flushDirtySessions()` 补上（按"标脏"
+    // 驱动，聊过就一定存），`/sessions` 从第一条消息起照常可见。恢复出来的会话本就有消息，
+    // 走的是同一个判断，行为不变。
+    if (session.messages.length > 0) await this.sessionStore.save(session)
     // 记下「本工作目录下次要恢复的会话」：无论是显式 -s、自动恢复还是新建，
     // 都要把指针指向本次实际在用的这条，否则下次启动会回到更早的会话。
-    await this.rememberSession(session)
+    //
+    // 例外：**服务端形态（`autoResume:false`，A2A / VSCode 侧车）不写指针**。这条前提
+    // 在它身上不成立 —— 这类 boot 每次都会新建一条一次性会话（会话由 A2A 的 `contextId`
+    // 显式寻址，恢复不靠 cwd 指针），却把它写成"本目录上次会话"。实测后果：侧车启动一次
+    // 就把 CLI 的指针指到一个 0 消息的空壳（`s_1791382595159_sopo1`），下次 `harness run`
+    // 自动恢复出的是空会话。`autoResume` 是宿主显式声明的"我是服务端"，正好是这条判据。
+    if (this.options.autoResume !== false) await this.rememberSession(session)
 
     // 平铺属性（Host 契约）：与 `boot()` 的返回是同一个实例的两个访问路径，
     // 供 A2A / VSCode 这样"先 createHost 再随时取"的宿主用（CLI main 仍解构 boot 的返回）。
