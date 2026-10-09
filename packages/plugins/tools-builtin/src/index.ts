@@ -899,7 +899,8 @@ export type ReadOnlyVerdict = { ok: true } | { ok: false; code: string; reason: 
 
 /** 结构性写入通道（在**去掉引号内容**的投影上检查：引号里的 `>` 是数据不是重定向） */
 const WRITE_CHANNEL_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
-  { re: />>?/, code: 'SANDBOX_RO_REDIRECT', why: '输出重定向（> / >>）会写文件' },
+  // 判据是"有没有指向真实文件的 `>`"：指向 /dev/null 的丢弃型重定向已由 stripNullSink 摘掉
+  { re: />>?/, code: 'SANDBOX_RO_REDIRECT', why: '输出重定向（> / >>）会写文件（丢弃到 /dev/null 的除外）' },
   { re: /<\(|>\(/, code: 'SANDBOX_RO_SUBST', why: '进程替换（<() / >()）会执行子命令' },
   { re: /<</, code: 'SANDBOX_RO_HEREDOC', why: 'heredoc（<<）会被当作脚本执行' },
 ]
@@ -908,6 +909,24 @@ const WRITE_CHANNEL_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: str
 const SUBSTITUTION_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
   { re: /\$\(|`/, code: 'SANDBOX_RO_SUBST', why: '命令替换（$( ) / 反引号）会执行子命令' },
 ]
+
+/**
+ * "丢弃输出"型重定向：`>` / `2>` / `&>` / `2>>` 指向 `/dev/null`。
+ *
+ * 为什么必须单独摘出来：{@link WRITE_CHANNEL_PATTERNS} 里的 `/>>?/` 只看 `>` 这一个字符，
+ * 它分不清 **`2>err.txt`（真写文件）** 与 **`2>/dev/null`（丢弃）** —— 后者是只读命令里
+ * 最常见的惯用法（实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 被直接拒绝，
+ * 只读哨兵因此把整条命令判成"会写文件"而反复重试）。把目标为**空设备**的重定向先摘掉，
+ * 剩下的 `>` 才是真正的写通道。
+ *
+ * 尾部的 `(?![\w.-])` 是钉子：没有它，`> /dev/nullx`（一个普通文件！）也会被当成空设备放行。
+ */
+const NULL_SINK_REDIRECT = /&?[12]?>{1,2}\s*\/dev\/null(?![\w.-])/g
+
+/** 摘掉目标为 `/dev/null` 的重定向（见 {@link NULL_SINK_REDIRECT}） */
+function stripNullSink(command: string): string {
+  return command.replace(NULL_SINK_REDIRECT, '')
+}
 
 /** 提权 / 系统控制 */
 const PRIV_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
@@ -978,8 +997,11 @@ export function checkReadOnlyCommand(
   if (raw.trim() === '') {
     return { ok: false, code: 'COMMAND_REQUIRED', reason: '缺少 command：请在入参 `command` 里给出要执行的只读命令' }
   }
-  // 1a. 只作用于 shell 结构的通道：先剥掉 2>&1 / 1>&2 这类 fd 复制（不写文件），再去引号
-  const noFdDup = raw.replace(/[12]>&[12]/g, '')
+  // 1a. 只作用于 shell 结构的通道：先剥掉两类**不写文件**的重定向，再去引号
+  //   ① fd 复制（`2>&1` / `1>&2` / `>&2`）—— 只是把两个 fd 接到一起，没有落盘；
+  //   ② 丢弃到空设备（`>` / `2>` / `&>` / `2>>` + `/dev/null`）—— 见 stripNullSink。
+  //   两者都必须在 `/>>?/` 之前摘掉，否则只读命令里最常见的「静音 stderr」写法会被整体拒绝。
+  const noFdDup = stripNullSink(raw.replace(/[12]?>&[12]/g, ''))
   const structural = stripQuoted(noFdDup)
   for (const p of WRITE_CHANNEL_PATTERNS) {
     if (p.re.test(structural)) {
@@ -1168,7 +1190,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
     inputSchema: fromJsonSchema<ReadOnlyBashInput>({
       type: 'object',
       properties: {
-        command: { type: 'string', description: '要执行的只读命令（不得含 >、$()、反引号、heredoc）' },
+        command: { type: 'string', description: '要执行的只读命令（不得含重定向、$()、反引号、heredoc；`2>/dev/null` 这类丢弃输出除外）' },
         cwd: { type: 'string', description: '工作目录（默认当前会话 cwd，且不得逃出它）' },
         timeoutMs: { type: 'number', description: '超时时间（毫秒，默认 15000）' },
       },

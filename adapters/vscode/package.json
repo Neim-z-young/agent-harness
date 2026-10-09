@@ -213,7 +213,7 @@
           "properties": {
             "command": {
               "type": "string",
-              "description": "要执行的只读命令（不得含 >、$()、反引号、heredoc）"
+              "description": "要执行的只读命令（不得含重定向、$()、反引号、heredoc；`2>/dev/null` 这类丢弃输出除外）"
             },
             "cwd": {
               "type": "string",

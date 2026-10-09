@@ -965,6 +965,27 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
       expect(checkReadOnlyCommand('ls -la 2>&1')).toMatchObject({ ok: true })
     })
 
+    it('丢弃到 /dev/null 的重定向放行 —— 只读命令最常写的「静音 stderr」惯用法', () => {
+      // 回归：`/>>?/` 只看 `>` 这一个字符，分不清 `2>err.txt` 与 `2>/dev/null`，
+      // 实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 被判 SANDBOX_RO_REDIRECT 整条拒绝，
+      // 只读哨兵因此反复重试（spikes/vscode-chat-sessions 真机记录：两次 bash_ro REDIRECT）。
+      for (const cmd of [
+        'git rev-parse --is-inside-work-tree 2>/dev/null',
+        'cat f 2>/dev/null; wc -l f',
+        'pwd 2>/dev/null && echo ok > /dev/null',
+        'ls 2>>/dev/null',
+        'ls > /dev/null 2>&1',
+        'echo 1 > /dev/null', // `1` 是 echo 的参数，不是 fd
+      ]) {
+        expect({ cmd, ...checkReadOnlyCommand(cmd) }).toEqual({ cmd, ok: true })
+      }
+      // 钉子：目标是**普通文件**时不能因长得像 /dev/null 而被放行
+      expect(checkReadOnlyCommand('wc -l a.txt > /dev/nullx')).toMatchObject({ ok: false, code: 'SANDBOX_RO_REDIRECT' })
+      expect(checkReadOnlyCommand('echo x > /dev/nullbackup')).toMatchObject({ ok: false, code: 'SANDBOX_RO_REDIRECT' })
+      // 钉子：真写文件的重定向照旧拒绝
+      expect(checkReadOnlyCommand('cat f 2> out.txt')).toMatchObject({ ok: false, code: 'SANDBOX_RO_REDIRECT' })
+    })
+
     it('拒绝命令替换 / 进程替换 / heredoc —— 藏在参数里的第二条命令', () => {
       expect(checkReadOnlyCommand('cat $(rm -rf /)')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SUBST' })
       expect(checkReadOnlyCommand('cat `whoami`')).toMatchObject({ ok: false, code: 'SANDBOX_RO_SUBST' })
@@ -1029,6 +1050,17 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     expect(r.ok).toBe(true)
     expect(r.output?.exitCode).toBe(0)
     expect(String(r.output?.stdout)).toContain('3 sample.txt')
+  })
+
+  it('bash_ro 端到端放行 `2>/dev/null`（两道门都不误伤，且命令真的跑了）', async () => {
+    // 端到端：手写门 + AST 复核门都过了以后，必须真的执行（ok=true），
+    // 而不是"没被拒绝但也没跑"。用一条必然失败的命令反向确认 stderr 被静音吞掉。
+    const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
+    const r = await tool.call({ command: 'wc -l definitely-not-exists.txt 2>/dev/null' }, makeCtx())
+    expect(r.error?.code).toBeUndefined()
+    // 反着验：文件不存在 ⇒ wc 退出码非 0；但 stderr 为空 ⇒ `2>/dev/null` 真的生效了
+    expect(r.output?.exitCode).not.toBe(0)
+    expect(String(r.output?.stderr)).toBe('')
   })
 
   it('checkReadOnlyByAst（AST 复核门）：间接执行 / 白名单外解码命令名拒绝，码与手写门对齐', async () => {
