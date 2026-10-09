@@ -17,6 +17,7 @@ import {
   checkReadOnlyByAst,
   analyzeBashCommand,
   DEFAULT_READONLY_COMMANDS,
+  resolveShell,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
@@ -1077,5 +1078,46 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     // 证明"没被注入"而不是"命令没跑"。
     expect(String(r.output?.stdout)).not.toContain('pwned')
     expect(r.output?.exitCode).not.toBe(0)
+  })
+})
+
+// ===== 跨平台 shell 探测 =====
+
+describe('resolveShell：跨平台 shell 探测', () => {
+  it('非 Windows 平台固定返回 bash', () => {
+    const sh = resolveShell({ platform: 'darwin' })
+    expect(sh.family).toBe('bash')
+    expect(sh.program).toBe('bash')
+    expect(sh.args).toEqual(['-c'])
+  })
+
+  it('Windows 上优先使用 PATH 里的 bash.exe', () => {
+    const exists = (p: string) => p === 'C:\\Git\\bin\\bash.exe'
+    const sh = resolveShell({ platform: 'win32', pathSep: ';', dirSep: '\\', exists, env: { PATH: 'C:\\Git\\bin' } as NodeJS.ProcessEnv })
+    expect(sh.family).toBe('bash')
+    expect(sh.program).toBe('C:\\Git\\bin\\bash.exe')
+    expect(sh.args).toEqual(['-c'])
+  })
+
+  it('Windows 无 bash 时回退 PowerShell Core', () => {
+    const exists = (p: string) => p === 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+    const sh = resolveShell({ platform: 'win32', pathSep: ';', dirSep: '\\', exists, env: { PATH: 'C:\\Program Files\\PowerShell\\7' } as NodeJS.ProcessEnv })
+    expect(sh.family).toBe('powershell')
+    expect(sh.program).toBe('C:\\Program Files\\PowerShell\\7\\pwsh.exe')
+    expect(sh.args).toEqual(['-Command'])
+  })
+
+  it('Windows 无 pwsh 时回退 Windows PowerShell', () => {
+    const exists = (p: string) => p === 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
+    const sh = resolveShell({ platform: 'win32', pathSep: ';', dirSep: '\\', exists, env: { PATH: 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0' } as NodeJS.ProcessEnv })
+    expect(sh.family).toBe('powershell')
+    expect(sh.program).toBe('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe')
+  })
+
+  it('Windows 无任何可用 shell 时回退 cmd.exe', () => {
+    const sh = resolveShell({ platform: 'win32', pathSep: ';', dirSep: '\\', exists: () => false, env: { PATH: '' } as NodeJS.ProcessEnv })
+    expect(sh.family).toBe('cmd')
+    expect(sh.program).toBe('cmd.exe')
+    expect(sh.args).toEqual(['/c'])
   })
 })

@@ -362,6 +362,89 @@ export interface BashSandboxConfig {
   requireHostApproval?: boolean
 }
 
+/** Shell 族系 */
+type ShellFamily = 'bash' | 'powershell' | 'cmd'
+
+/** 解析后的 shell 可执行文件与调用参数 */
+interface ResolvedShell {
+  /** 可执行文件路径或名称（spawn 第一参数） */
+  program: string
+  /** 传给可执行文件的固定参数（如 ['-c'] / ['-Command'] / ['/c']） */
+  args: string[]
+  /** 族系，用于决定安全策略 */
+  family: ShellFamily
+  /** 人类可读名称，用于输出与遥测 */
+  name: string
+}
+
+/** Windows 上常见 POSIX 命令到 PowerShell cmdlet/别名的映射（仅用于提示，不转换命令）。 */
+const POWERSHELL_KNOWN_ALIASES = new Map<string, string>([
+  ['ls', 'Get-ChildItem'], ['cat', 'Get-Content'], ['pwd', 'Get-Location'],
+  ['cd', 'Set-Location'], ['rm', 'Remove-Item'], ['cp', 'Copy-Item'],
+  ['mv', 'Move-Item'], ['echo', 'Write-Output'], ['ps', 'Get-Process'],
+  ['kill', 'Stop-Process'], ['sleep', 'Start-Sleep'], ['sort', 'Sort-Object'],
+  ['tee', 'Tee-Object'], ['diff', 'Compare-Object'], ['find', ''],
+])
+
+/**
+ * 解析当前平台下应使用的 shell。
+ *
+ * 策略：
+ * - 非 Windows：始终用 bash（POSIX 环境）。
+ * - Windows：优先 bash（Git Bash / WSL / MSYS2）；无 bash 则 PowerShell（pwsh → powershell）；
+ *   最后回退 cmd.exe。
+ *
+ * 探测只读 PATH，避免运行时 spawn 失败再重试的延迟。
+ */
+/** 解析当前平台下应使用的 shell（导出供测试与外部探测复用）。 */
+export function resolveShell(
+  deps: { platform?: string; pathSep?: string; dirSep?: string; exists?: (p: string) => boolean; env?: NodeJS.ProcessEnv } = {},
+): ResolvedShell {
+  const env = deps.env ?? process.env
+  const platform = deps.platform ?? process.platform
+  if (platform !== 'win32') {
+    return { program: 'bash', args: ['-c'], family: 'bash', name: 'Bash' }
+  }
+
+  const listSep = deps.pathSep ?? ';'
+  const dirSep = deps.dirSep ?? '\\'
+  const joinDir = (dir: string, file: string) => (dir.endsWith(dirSep) ? dir + file : dir + dirSep + file)
+  const exists = deps.exists ?? existsSync
+  const pathDirs = (env.PATH ?? '').split(listSep).filter(Boolean)
+
+  for (const dir of pathDirs) {
+    for (const exe of ['bash.exe', 'bash']) {
+      const candidate = joinDir(dir, exe)
+      if (exists(candidate)) {
+        return { program: candidate, args: ['-c'], family: 'bash', name: 'Git Bash' }
+      }
+    }
+  }
+
+  for (const exe of ['pwsh.exe', 'powershell.exe']) {
+    for (const dir of pathDirs) {
+      const candidate = joinDir(dir, exe)
+      if (exists(candidate)) {
+        return {
+          program: candidate,
+          args: ['-Command'],
+          family: 'powershell',
+          name: exe === 'pwsh.exe' ? 'PowerShell Core' : 'Windows PowerShell',
+        }
+      }
+    }
+  }
+
+  return { program: 'cmd.exe', args: ['/c'], family: 'cmd', name: 'CMD' }
+}
+
+/** 缓存进程级 shell 解析结果（同一进程内 platform/PATH 不变） */
+let cachedShell: ResolvedShell | undefined
+function getShell(): ResolvedShell {
+  cachedShell ??= resolveShell()
+  return cachedShell
+}
+
 /** 默认危险命令正则表（命中即拒绝执行） */
 const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\(\)\s*\{[^{}]*\|[^{}]*\}/, // fork bomb（函数体启动即时递归 fork）
@@ -499,6 +582,8 @@ export interface BashOutput {
   command: string
   /** 是否经由沙箱回退到宿主 bash 执行（fallbackToHost 触发） */
   viaHost?: boolean
+  /** 实际执行命令的 shell 名称（跨平台回退时用于告知模型） */
+  shell?: string
 }
 
 /** 默认超时 30 秒 */
@@ -546,9 +631,15 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
   const allowlist = config.allowlist
   const keepEnv = config.keepEnv ?? []
 
+  const shell = getShell()
+
   return defineTool<BashInput, BashOutput>({
     id: 'bash',
-    description: '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。',
+    description:
+      '执行 shell 命令（沙箱受限）。支持超时、工作目录和环境变量。返回 stdout/stderr/exitCode。'
+      + (shell.family === 'bash'
+        ? ''
+        : ` 当前环境未检测到 bash，实际使用 ${shell.name} 执行命令；配置的白名单与只读语义仅适用于 bash。`),
     documentation: bashDoc.trim(),
     inputSchema: bashInputSchema,
     isReadOnly: () => false,
@@ -631,11 +722,15 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       // 现在只认两种形态：
       //   1) 首命令名精确等于条目（含跳过前缀赋值后的首命令，extractFirstCommand）；
       //   2) 整串以条目开头且条目后是空白/结尾（真「片段」）—— `github` 不会命中 `git`。
-      let allowlisted = true
-      if (allowlist && allowlist.length > 0) {
-        const firstCmd = extractFirstCommand(input.command)
+      // 跨平台：白名单条目是按 bash 首命令名写的；在 PowerShell / CMD 下语义不匹配，
+      // 若强行匹配会大面积误伤（如 `ls` 在 PS 中实际解析为 Get-ChildItem）。因此非 bash
+      // 族系下禁用 allowlist，改为在执行结果里附加降级提示。
+      const allowlistActive = allowlist && allowlist.length > 0 && shell.family === 'bash'
+      let firstCmd = ''
+      if (allowlistActive) {
+        firstCmd = extractFirstCommand(input.command)
         const trimmedCommand = input.command.trim()
-        allowlisted = allowlist.some((a) => {
+        const allowlisted = allowlist.some((a) => {
           if (firstCmd === a) return true
           if (!trimmedCommand.startsWith(a)) return false
           const next = trimmedCommand[a.length]
@@ -675,6 +770,18 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
           }
         }
         return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
+      }
+
+      // 非 bash 环境：给模型一个可见提示，避免它把 exit 127/命令未找到误判为命令本身问题。
+      if (shell.family !== 'bash' && sandboxResult.ok && sandboxResult.output) {
+        const warn = `[harness] 当前由 ${shell.name} 执行命令；bash 专用白名单/只读语义未生效。`
+        return {
+          ok: true,
+          output: {
+            ...sandboxResult.output,
+            stderr: sandboxResult.output.stderr ? `${sandboxResult.output.stderr}\n${warn}` : warn,
+          },
+        }
       }
 
       return sandboxResult
@@ -1048,12 +1155,16 @@ export interface ReadOnlyBashConfig {
 export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<ReadOnlyBashInput, BashOutput> {
   const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
   const timeoutDefault = config.timeoutMs ?? 15_000
+  const shell = getShell()
 
   return defineTool<ReadOnlyBashInput, BashOutput>({
     id: 'bash_ro',
     description:
       '执行**只读** shell 命令（白名单受限：cat/head/tail/wc/grep/sed/awk/find/ls/stat/du/git log/python3 -c 等）。'
-      + '拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。',
+      + '拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。'
+      + (shell.family === 'bash'
+        ? ''
+        : ` 当前环境未检测到 bash，只读哨兵无法保证语义（实际使用 ${shell.name}），请安装 Git Bash / WSL 以启用 bash_ro。`),
     inputSchema: fromJsonSchema<ReadOnlyBashInput>({
       type: 'object',
       properties: {
@@ -1074,6 +1185,15 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
       extractDenyPatterns: (input) => splitSegments(input.command),
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
+      if (shell.family !== 'bash') {
+        return {
+          ok: false,
+          error: {
+            message: `只读 shell 需要 bash；当前环境为 ${shell.name}。请在 Windows 上安装 Git Bash、WSL 或 MSYS2 后重试。`,
+            code: 'SANDBOX_RO_NO_BASH',
+          },
+        }
+      }
       const verdict = checkReadOnlyCommand(input?.command, allowlist)
       if (!verdict.ok) {
         return { ok: false, error: { message: verdict.reason, code: verdict.code } }
@@ -1114,7 +1234,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
 /** 默认只读 bash 工具（只读哨兵用） */
 export const readOnlyBashTool: Tool<ReadOnlyBashInput, BashOutput> = createReadOnlyBashTool()
 
-/** 执行一条 bash 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
+/** 执行一条 shell 命令并采集 stdout/stderr/退出码。支持超时 kill 与 AbortSignal 中断。
  * viaHost=true 时在返回的 BashOutput 上标注，表示这次是宿主 bash 回退执行（放开白名单与 env 隔离）。
  */
 function runBash(opts: {  command: string
@@ -1123,10 +1243,12 @@ function runBash(opts: {  command: string
   timeoutMs: number
   signal?: AbortSignal
   viaHost?: boolean
+  shell?: ResolvedShell
 }): Promise<ToolResult<BashOutput>> {
+  const sh = opts.shell ?? getShell()
   const startedAt = Date.now()
   return new Promise((resolvePromise) => {
-    const child = spawn('bash', ['-c', opts.command], {
+    const child = spawn(sh.program, [...sh.args, opts.command], {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1184,6 +1306,7 @@ function runBash(opts: {  command: string
           durationMs: Date.now() - startedAt,
           command: opts.command,
           viaHost: opts.viaHost,
+          shell: sh.name,
         },
       })
     })

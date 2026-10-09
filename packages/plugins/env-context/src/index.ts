@@ -23,7 +23,9 @@
  */
 
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { hostname, release, userInfo } from 'node:os'
+import { resolve } from 'node:path'
 import type { AgentPlugin, Hooks, PromptInput } from '@harness/plugin'
 
 // ===== 数据形状 =====
@@ -117,6 +119,42 @@ export function renderNowSection(now: Date, git?: GitInfo): string {
 
 // ===== 事实读取 =====
 
+/**
+ * 探测当前交互 shell 的名称（仅用于展示）。
+ *
+ * - 非 Windows：优先 `process.env.SHELL`；为空时回退 `'bash'`（POSIX 环境默认）。
+ * - Windows：优先 `process.env.SHELL`；为空时按 `bash → pwsh → powershell → cmd`
+ *   在 PATH 中探测，与 tools-builtin 执行口径保持一致。
+ */
+export function detectShellForDisplay(
+  deps: { platform?: string; pathSep?: string; dirSep?: string; exists?: (p: string) => boolean; env?: NodeJS.ProcessEnv } = {},
+): string {
+  const env = deps.env ?? process.env
+  const sh = env.SHELL
+  if (sh) return sh
+
+  const platform = deps.platform ?? process.platform
+  if (platform !== 'win32') return 'bash'
+
+  const listSep = deps.pathSep ?? ';'
+  const dirSep = deps.dirSep ?? '\\'
+  const joinDir = (dir: string, file: string) => (dir.endsWith(dirSep) ? dir + file : dir + dirSep + file)
+  const exists = deps.exists ?? existsSync
+  const pathDirs = (env.PATH ?? '').split(listSep).filter(Boolean)
+
+  for (const dir of pathDirs) {
+    for (const exe of ['bash.exe', 'bash']) {
+      if (exists(joinDir(dir, exe))) return exe
+    }
+  }
+  for (const exe of ['pwsh.exe', 'powershell.exe']) {
+    for (const dir of pathDirs) {
+      if (exists(joinDir(dir, exe))) return exe
+    }
+  }
+  return env.ComSpec ?? 'cmd.exe'
+}
+
 /** 收集静态环境事实（os 调用逐项 try：容器 / CI 里 userInfo 等可能抛） */
 export function collectStaticEnv(): StaticEnvInfo {
   const info: StaticEnvInfo = {}
@@ -125,8 +163,7 @@ export function collectStaticEnv(): StaticEnvInfo {
   try { info.release = release() } catch { /* 沙箱里可能读不到 */ }
   try { info.user = userInfo().username } catch { /* 无用户上下文（某些 service 进程） */ }
   try { info.hostname = hostname() } catch { /* 同上 */ }
-  const sh = process.env.SHELL
-  if (sh) info.shell = sh
+  info.shell = detectShellForDisplay()
   return info
 }
 

@@ -14,6 +14,7 @@ import type { AgentPlugin, Hooks } from '@harness/plugin'
 import {
   collectStaticEnv,
   createEnvContextPlugin,
+  detectShellForDisplay,
   formatLocalNow,
   readGitInfo,
   renderEnvSection,
@@ -165,6 +166,33 @@ describe('createEnvContextPlugin：两条注入通道', () => {
     await hooks['core.prompt.dynamic.transform']!({ agentId: 'default', sessionId: 's', cwd: '/w' }, parts)
     expect(calls).toBe(0)
     expect(parts[0]).not.toInclude('Git:')
+  })
+})
+
+describe('detectShellForDisplay：跨平台 shell 名称探测', () => {
+  it('非 Windows 优先 process.env.SHELL，缺失回退 bash', () => {
+    expect(detectShellForDisplay({ platform: 'darwin', env: { SHELL: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('/bin/zsh')
+    expect(detectShellForDisplay({ platform: 'linux', env: {} as NodeJS.ProcessEnv })).toBe('bash')
+  })
+
+  it('Windows 优先 SHELL，其次 PATH 中的 bash.exe，再 PowerShell，最后 cmd', () => {
+    expect(detectShellForDisplay({ platform: 'win32', env: { SHELL: '/bin/bash' } as NodeJS.ProcessEnv })).toBe('/bin/bash')
+
+    const hasBash = (p: string) => p === 'C:\\Git\\bin\\bash.exe'
+    expect(detectShellForDisplay({ platform: 'win32', pathSep: ';', dirSep: '\\', exists: hasBash, env: { PATH: 'C:\\Git\\bin' } as NodeJS.ProcessEnv })).toBe('bash.exe')
+
+    const hasPwsh = (p: string) => p === 'C:\\pwsh.exe'
+    expect(detectShellForDisplay({ platform: 'win32', pathSep: ';', dirSep: '\\', exists: hasPwsh, env: { PATH: 'C:\\' } as NodeJS.ProcessEnv })).toBe('pwsh.exe')
+
+    expect(
+      detectShellForDisplay({
+        platform: 'win32',
+        pathSep: ';',
+        dirSep: '\\',
+        exists: () => false,
+        env: { ComSpec: 'C:\\Windows\\System32\\cmd.exe' } as NodeJS.ProcessEnv,
+      }),
+    ).toBe('C:\\Windows\\System32\\cmd.exe')
   })
 })
 

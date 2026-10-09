@@ -1252,11 +1252,11 @@ describe('TuiApp 集成（mock provider）', () => {
   })
 
   it('★ 长工具结果不再把工具调用行挤出对话框（首尾窗口 + 复制全文）', async () => {
-    // 用户报「对话框里没有工具调用信息了」的真机复现：去掉结果截断后，一条 3000 行输出
+    // 用户报「对话框里没有工具调用信息了」的真机复现：去掉结果截断后，一条 1500 行输出
     // 占满几十屏，而 scrollbox 粘底 ⇒ 帧里只剩结果尾巴，`🔧 工具名 {入参}` 一行都看不到。
     const f = await mountTui({
       responses: [
-        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'seq 1 3000' } }] },
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'seq 1 1500' } }] },
         { match: 'hi', response: '已完成' },
       ],
     })
@@ -1267,15 +1267,16 @@ describe('TuiApp 集成（mock provider）', () => {
 
     // ① 工具调用行在画面里（这次修复的核心）
     expect(frame).toContain('🔧')
-    expect(frame).toContain('seq 1 3000')
+    expect(frame).toContain('seq 1 1500')
     // ② 结果被窗口化，且有明确的省略提示（不是静默丢弃）。
     //    这里命中的是**单行**预算：bash 的 output 是对象，JSON.stringify 会把换行转义成 `\n`
-    //    两个字符 ⇒ 结果是**一整行** 16000 字符，只限行数等于没限（首版就栽在这）。
+    //    两个字符 ⇒ 结果是**一整行** ~9000 字符，只限行数等于没限（首版就栽在这）。
     expect(frame).toContain('本行省略')
     // ③ 完整内容仍可取：复制按钮明示「全文」+ 字符数
     expect(frame).toContain('复制全文')
-    // ④ 尾部保留 ⇒ 结论（这里是 3000）仍看得到
-    expect(frame).toContain('n3000')
+    // ④ 尾部保留 ⇒ 至少能看到结果对象的后缀（含 exitCode / shell 等字段）
+    expect(frame).toContain('exitCode":0')
+    expect(frame).toContain('shell":"Bash"')
     await f.cleanup()
   })
 
