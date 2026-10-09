@@ -1,5 +1,68 @@
 # Agent Harness 开发日志
 
+## 2026-10-09（续 263）@harness/a2a-server：修复流式续接（INPUT_REQUIRED 答复）——续接轮必须先补发任务快照
+
+### 起因
+
+VSCode 会话选择器 spike 真机暴露：Agent 要调工具时客户端弹四态授权框，用户选「允许一次」后，
+聊天里出现 `❌ Received statusUpdate before initial 'Message'/'Task' event.（code -32004）`。
+服务端取证（`GetTask`）显示该任务**永远停在 `TASK_STATE_INPUT_REQUIRED`**；更严重的是，
+挂起中的任务仍计入 `executor.running` ⇒ `activeTaskFor(contextId)` 命中 ⇒ 该 `contextId`
+**之后每一条消息都被 `ConcurrentTaskError` 拒**（会话整体卡死，只能重启 sidecar 恢复）。
+
+### 决策与落地
+
+**一、缺陷定位在 `execute()` 的续接分支，不在客户端。** 原实现：
+
+```ts
+if (prevState === TaskState.TASK_STATE_INPUT_REQUIRED) {
+  this.resume(taskId, contextId, text, bus)   // 只调 suspendTable.answer()，新 bus 一个事件都不发
+  return
+}
+```
+
+`resume()` 唤醒的是**第一轮那次 in-flight 的生成器**（它挂在**旧 bus** 上，见 `makeAsker` 的
+ALS 说明）。SDK 的 `ResultManager` 要求**每个响应的首事件是 `task` / `message`**；新 bus 什么都不发时，
+跨 bus 流进这条响应的第一个 `statusUpdate` 即被判违规。
+
+**二、修法：`resume()` 之前补发一次任务快照**（`ctx.task` 就是 SDK 在续接轮交给 executor 的那一份）：
+
+```ts
+if (ctx.task) bus.publish(AgentEvent.task(ctx.task))
+this.resume(taskId, contextId, text, bus)
+```
+
+只此一处、不新增状态、不动挂起表语义。**不改客户端**：那才是缺陷所在，改客户端只会把
+流式续接让位给非流式（授权后看不到工具结果的逐帧进度），并让 vendored 副本再多一处分叉。
+
+### 只有实现时才暴露的发现
+
+1. **非流式 `SendMessage` 恰好绕过这条硬要求** —— 它直接取终态快照，不走"首事件"校验。
+   而既有 32 条用例里，续接场景全走 `send()`（= `SendMessage`）；`streamSend()`
+   （= `SendStreamingMessage`）**从没测过续接轮**。缺陷因此长期隐身：测试是绿的，
+   而真实客户端（`adapters/vscode` 与本 spike 都用流式）一授权就废。**这也解释了为什么
+   这个问题从未被上游发现**。
+2. **A2A 的预流错误是 `HTTP 200 + application/json`**（`serverErrorResponse` → `Response.json`）。
+   只按 SSE 解帧的客户端会把它解成 **0 帧**，表现为"这一轮正常结束、什么都没有" ——
+   错误与"没反应"无法区分。本条虽属客户端行为，但它决定了这个服务端缺陷**是否可见**。
+3. **一次失败的续接会把整个 `contextId` 卡死**：挂起任务仍算"活跃"，后续消息全被并发闸拒。
+   即"错误可见性"之外还有一层放大效应 —— 修好这一条之前，任何一次授权失败都等价于会话报废。
+
+### 验证
+
+- 包内 `bun run typecheck` 通过；`cd packages/a2a-server && bun test` **147 pass / 0 fail**（8 个文件）。
+- **反向验证**：`cp` 备份 → 去掉补丁重跑 ⇒ **144 pass / 3 fail**，红的正好是三条与续接首事件相关的用例
+  （新增的流式续接回归 + 两条按新行为收紧的 `executor.test.ts` 断言），其余 144 条仍绿
+  ⇒ 归因精确、补丁未掩盖其它问题；`cp` 还原后重新 **147 pass / 0 fail**。
+- 新增回归用例走 `streamSend()`，断言三点：① 响应是 `text/event-stream` 而非预流错误信封；
+  ② **首事件是 `task`**（缺它即 -32004）；③ 终态 `TASK_STATE_COMPLETED` 且工具确被放行执行。
+  另两条既有用例改为断言"续接响应的首事件是任务快照"，把这条不变量钉进测试。
+- 根 `bun run typecheck`（全 workspace，15 个含 tsc 的包）通过；
+  根 `bun run test`（45 个包）**全绿、exit 0**。
+- 真机：隔离 sidecar（`a2a --json --port 0 -d /tmp/…`）上补丁前
+  `-32004` + 任务停在 INPUT_REQUIRED，补丁后
+  `INPUT_REQUIRED → tool-result(isError=false) → step 1 → step 2 → answer → COMPLETED`（6 帧 / 647ms）。
+
 ## 2026-10-09（续 262）@harness/bench：τ³-bench retail 跑分框架（M1）
 
 ### 起因
