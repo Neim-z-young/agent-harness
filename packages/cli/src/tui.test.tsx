@@ -72,6 +72,12 @@ import {
   abbrevFileRef,
   buildDiskFileTree,
   renderFileRefTree,
+  pushWidgetBlock,
+  buildDecisionCard,
+  countToolHistory,
+  SIDEBAR_TABS,
+  nextSidebarTab,
+  type SidebarTabId,
   type FileRefTreeNode,
   type SessionRow,
   type ChatBlock,
@@ -291,6 +297,40 @@ describe('applyStreamEvent 结构化流', () => {
     const s = initialChatState
     expect(applyStreamEvent(s, { type: 'tool_call_start', toolId: 't1', input: {} } as never)).toBe(s)
   })
+  it('ui_widget 工具结果 → widget 块（完整渲染 + 声明副本）', () => {
+    const ev = {
+      type: 'tool_call_result',
+      toolId: 'ui_widget',
+      result: { widgetType: 'key-value', props: { rows: [{ key: 'id', value: 'o1' }] } },
+      isError: false,
+    } as never
+    const s = applyStreamEvent(initialChatState, ev)
+    expect(s.blocks).toHaveLength(1)
+    const b = s.blocks[0]!
+    expect(b.kind).toBe('widget')
+    expect(b.widgetType).toBe('key-value')
+    expect(b.widgetProps).toEqual({ rows: [{ key: 'id', value: 'o1' }] })
+    expect(b.text).toBe('  id: o1')
+  })
+  it('ui_widget 失败结果不渲染 widget 块（原样返回）', () => {
+    const ev = {
+      type: 'tool_call_result',
+      toolId: 'ui_widget',
+      result: { widgetType: 'table' },
+      isError: true,
+    } as never
+    expect(applyStreamEvent(initialChatState, ev)).toBe(initialChatState)
+  })
+  it('非 ui_widget 的 tool_call_result 不产生块', () => {
+    const ev = { type: 'tool_call_result', toolId: 'bash', result: 'ok' } as never
+    expect(applyStreamEvent(initialChatState, ev)).toBe(initialChatState)
+  })
+  it('pushWidgetBlock：未知 widgetType 兜底 JSON 摘要文本', () => {
+    const s = pushWidgetBlock(initialChatState, 'nope', { a: 1 })
+    expect(s.blocks[0].kind).toBe('widget')
+    expect(s.blocks[0].text).toBe('[Widget: nope]\n{\n  "a": 1\n}')
+    expect(s.nextId).toBe(2)
+  })
   it('reasoning 与 text 交错各自成块，done 一并收尾，新一轮续接', () => {
     let s = applyStreamEvent(initialChatState, { type: 'reasoning_delta', text: '想' })
     s = applyStreamEvent(s, { type: 'text_delta', text: '答' })
@@ -506,6 +546,26 @@ describe('会话历史渲染（模块 B）', () => {
     )
   })
 
+  it('messagesToBlocks：widget part 还原成 widget 块（宿主注入路径，与实时块同源渲染）', () => {
+    const cs = messagesToBlocks([
+      pm('m1', 'assistant', [
+        { type: 'text', text: '结果如下：' },
+        { type: 'widget', widgetType: 'table', props: { columns: [{ key: 'a', title: 'A' }], rows: [{ a: 1 }] } },
+      ]),
+    ])
+    expect(cs.blocks.map((b) => b.kind)).toEqual(['assistant', 'widget'])
+    const w = cs.blocks[1]
+    expect(w.widgetType).toBe('table')
+    expect(w.widgetProps).toEqual({ columns: [{ key: 'a', title: 'A' }], rows: [{ a: 1 }] })
+    expect(w.text).toContain('A')
+    expect(w.text).toContain('1')
+    expect(w.msgId).toBe('m1')
+    // 未知 widgetType 兜底：JSON 摘要，不崩
+    const cs2 = messagesToBlocks([pm('m2', 'assistant', [{ type: 'widget', widgetType: 'nope', props: {} }])])
+    expect(cs2.blocks[0].kind).toBe('widget')
+    expect(cs2.blocks[0].text).toContain('[Widget: nope]')
+  })
+
   it('messagesToBlocks：正文与工具交替时按 part 顺序切块，id 顺排不撞号', () => {
     const cs = messagesToBlocks([
       pm('m1', 'assistant', [
@@ -519,6 +579,43 @@ describe('会话历史渲染（模块 B）', () => {
     expect(cs.nextId).toBe(4)
     expect(cs.blocks[0].text).toBe('先看')
     expect(cs.blocks[2].text).toBe('再看')
+  })
+
+  it('M3 buildDecisionCard：风险标签 + 参数表格 + 同类操作历史', () => {
+    const session: Session = {
+      id: 's', createdAt: 0, messages: [
+        { id: 'm1', role: 'assistant', createdAt: 0, parts: [{ type: 'tool', toolUseId: 'u', toolId: 'needs_approval', input: {}, result: 'ok' }] },
+      ],
+    } as unknown as Session
+    const req = { toolKey: 'needs_approval', patterns: ['/tmp/x'], input: { path: '/tmp/x' } }
+    const prompt = { toolKey: 'needs_approval', patterns: ['/tmp/x'], summary: '权限请求 [needs_approval] /tmp/x', text: '', riskLevel: 'high' as const }
+    const card = buildDecisionCard(req, prompt, session)
+    expect(card.riskLevel).toBe('high')
+    expect(card.inputRows).toEqual([{ key: 'path', value: '/tmp/x' }])
+    expect(card.historyCount).toBe(1)
+    expect(card.summary).toBe('权限请求 [needs_approval] /tmp/x')
+  })
+
+  it('M3 buildDecisionCard：input 非对象 / 无 input ⇒ inputRows 为空；无历史 ⇒ 0', () => {
+    const session = { id: 's', createdAt: 0, messages: [] } as unknown as Session
+    const req = { toolKey: 'bash', patterns: [], input: 'just-text' }
+    const prompt = { toolKey: 'bash', patterns: [], summary: 'x', text: '', riskLevel: 'medium' as const }
+    const card = buildDecisionCard(req, prompt, session)
+    expect(card.inputRows).toEqual([])
+    expect(card.historyCount).toBe(0)
+  })
+
+  it('M3 countToolHistory：只数 assistant 的 tool part，按 toolId 精确匹配', () => {
+    const session = {
+      id: 's', createdAt: 0, messages: [
+        { id: 'm1', role: 'assistant', createdAt: 0, parts: [{ type: 'tool', toolUseId: 'u1', toolId: 'a', input: {} }] },
+        { id: 'm2', role: 'assistant', createdAt: 0, parts: [{ type: 'tool', toolUseId: 'u2', toolId: 'a', input: {} }, { type: 'tool', toolUseId: 'u3', toolId: 'b', input: {} }] },
+        { id: 'm3', role: 'user', createdAt: 0, parts: [{ type: 'text', text: 'hi' }] },
+      ],
+    } as unknown as Session
+    expect(countToolHistory(session, 'a')).toBe(2)
+    expect(countToolHistory(session, 'b')).toBe(1)
+    expect(countToolHistory(session, 'nope')).toBe(0)
   })
 
   it('toSessionRows：title 缺失用 id 兜底', () => {
@@ -1961,6 +2058,22 @@ describe('侧栏 tab 滚动条', () => {
     }
     expect(thumbColored).toBe(true)
     await f.cleanup()
+  })
+
+  it('M4：侧栏 tab 含 audit/bench 且 ◀/▶ 循环覆盖', () => {
+    // 从 'stats' 右切到 'audit'，再右切到 'bench'，再右切回 'context'（循环）
+    const ids = SIDEBAR_TABS.map((t) => t.id)
+    expect(ids).toContain('audit')
+    expect(ids).toContain('bench')
+    let cur: SidebarTabId = 'stats'
+    cur = nextSidebarTab(cur, 1)
+    expect(cur).toBe('audit')
+    cur = nextSidebarTab(cur, 1)
+    expect(cur).toBe('bench')
+    cur = nextSidebarTab(cur, 1)
+    expect(cur).toBe('context')
+    // 左切回
+    expect(nextSidebarTab('context', -1)).toBe('bench')
   })
 })
 

@@ -22,6 +22,7 @@
  * 与 `DefaultPermissionEngine` 的 ask→deny 语义一致：**取不到答复 ⇒ deny**。
  * 这条不能反过来 —— 一个"问不到用户就放行"的默认值是安全缺陷，不是便利。
  */
+import { createHash } from 'node:crypto'
 import { DefaultPermissionEngine } from '@harness/core'
 import type { PermissionDecision, PermissionRequest } from '@harness/core'
 
@@ -42,10 +43,52 @@ export type PermissionAnswer = 'allow' | 'deny' | 'always-allow' | 'always-deny'
  * asker 就无从判断"这次询问该由谁应答"，只能靠"当前谁在忙"这类不可靠标志（并发不安全）。
  * 故它是**路由的最小必要信息**，与"引擎要读什么"是两条独立理由，不能按同一条规则裁。
  */
-export type PermissionAskInput = Pick<PermissionRequest, 'toolKey' | 'patterns' | 'sessionId'>
+export type PermissionAskInput = Pick<PermissionRequest, 'toolKey' | 'patterns' | 'sessionId'> & {
+  /**
+   * 原始工具入参（可选）。M3 决策卡片要渲染参数表格，而窄契约原本裁掉了它。
+   * core 的 `resolvePermission` 传完整 `ToolPermissionRequest`（运行时对象本就带 `input`），
+   * 这里只是把类型面补上，既有测试桩（只填 toolKey/patterns）天然兼容。
+   */
+  input?: unknown
+}
 
 /** 交互模式：`allow-all` / `deny-all` 直接短路，只有 `ask` 才走 asker */
 export type PermissionMode = 'allow-all' | 'ask' | 'deny-all'
+
+// ===== 风险分级（M3 决策卡片）=====
+
+/** 风险等级：规则引擎只打标签不决策，决策权归人工 */
+export type RiskLevel = 'low' | 'medium' | 'high'
+
+/** 已知只读/低危工具键（打到这一档的基本是查数/检索类，放行代价低） */
+const LOW_RISK_TOOL_KEYS = new Set([
+  'read', 'read_file', 'list_dir', 'grep_file', 'glob', 'search', 'query',
+  'get_order_details', 'get_product_details', 'find_user_id_by_email', 'list_all_product_types',
+])
+
+/** 已知高危工具键（写/删/执行类，默认打 high，但仍由人裁决） */
+const HIGH_RISK_TOOL_KEYS = new Set([
+  'bash', 'edit_file', 'write_file', 'delete', 'delete_file', 'rm', 'mv', 'chmod',
+  'modify_pending_order_address', 'modify_pending_order_items', 'modify_user_address',
+])
+
+/** 高危命令模式（bash 入参里的危险片段） */
+const HIGH_RISK_PATTERNS = [/rm -rf/, /\bsudo\b/, /:?\(\)/, /dd if=/, /mkfs/, /curl .*\| *sh/]
+
+/**
+ * 风险分级器（纯函数，规则引擎侧唯一出口）。
+ *
+ * 定稿语义：**白名单/黑名单可硬拦高危，中间地带只标低/中/高风险，不自动决策** ——
+ * 分级结果只作为决策卡片的标签与审计字段，放行与否永远由人工按键决定。
+ * 判据（按序）：工具只读声明 > 高危命令模式 > 已知工具键表 > 默认 medium。
+ */
+export function assessRisk(toolKey: string, patterns: string[] = [], input?: unknown): RiskLevel {
+  const blob = JSON.stringify(input ?? {})
+  if (HIGH_RISK_PATTERNS.some((re) => re.test(blob))) return 'high'
+  if (HIGH_RISK_TOOL_KEYS.has(toolKey)) return 'high'
+  if (LOW_RISK_TOOL_KEYS.has(toolKey)) return 'low'
+  return 'medium'
+}
 
 /**
  * 宿主无关的提问材料。
@@ -62,6 +105,8 @@ export interface PermissionPrompt {
   summary: string
   /** 默认完整问题（含操作说明与 `[a/d/A/D]` 提示），CLI 逐字使用 */
   text: string
+  /** M3：风险分级标签（assessRisk 产出，决策卡片呈现；向后兼容可选） */
+  riskLevel?: RiskLevel
 }
 
 /**
@@ -94,7 +139,49 @@ export function buildPermissionPrompt(req: PermissionAskInput): PermissionPrompt
     text:
       `\n⚠️  ${summary}\n` +
       `  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] `,
+    // M3：决策卡片的风险标签（分级器不决策，只打标）
+    riskLevel: assessRisk(req.toolKey, patterns, req.input),
   }
+}
+
+// ===== decision.human 审计（M3）=====
+
+/**
+ * 人工决策审计事件（零内容约束，与遥测一致）。
+ *
+ * 只记录标量与摘要哈希，**不记录工具入参原文** —— `stateHash` 是决策上下文
+ * （toolKey + patterns + 入参）的 SHA-256，可复核「这次问的是什么」而不可逆推内容。
+ * 响应耗时 `responseMs` 与放行率是衡量决策卡片 UI 辅助效果的核心指标（决策权归人工，
+ * 指标衡量"人是不是更快/更放心"，而非机器决策准确率）。
+ */
+export interface HumanDecisionEvent {
+  schema: 'harness.audit.v1'
+  kind: 'decision.human'
+  /** 毫秒时间戳 */
+  ts: number
+  /** 会话归属（PermissionAskInput.sessionId；无归属时不落审计） */
+  sessionId?: string
+  /** 决策点（M3 起步 = 权限询问） */
+  decisionPoint: 'core.permission.ask'
+  /** 工具权限键 */
+  tool: string
+  /** 决策上下文摘要哈希（SHA-256，零内容） */
+  stateHash: string
+  /** 风险分级标签（assessRisk 产出） */
+  riskLevel: RiskLevel
+  /** 人工答复（四态原文） */
+  actionTaken: 'allow' | 'deny' | 'always-allow' | 'always-deny'
+  /** 人工响应耗时（ms，进入询问到收到答复） */
+  responseMs: number
+  /** 记忆范围：always-* ⇒ 'tool'（写回规则集）；单次 ⇒ 'once' */
+  rememberScope: 'tool' | 'once'
+}
+
+/** 决策上下文摘要哈希（SHA-256，零内容：入参只进哈希不出明文） */
+export function stateHashOf(req: PermissionAskInput): string {
+  return createHash('sha256')
+    .update(JSON.stringify({ toolKey: req.toolKey, patterns: req.patterns, input: req.input ?? null }))
+    .digest('hex')
 }
 
 /**
@@ -107,6 +194,8 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
   private mode: PermissionMode
   private asker: PermissionAsker | undefined
   private readonly store: (PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }) | undefined
+  /** M3：人工决策审计 sink（宿主注入，落盘实现归宿主） */
+  private readonly auditSink: ((env: HumanDecisionEvent) => void | Promise<void>) | undefined
 
   constructor(
     rules: Record<string, unknown> = { '*': 'ask' },
@@ -114,12 +203,15 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
       store?: PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }
       mode?: PermissionMode
       asker?: PermissionAsker
+      /** M3：人工决策审计（零内容 + stateHash，见 {@link HumanDecisionEvent}） */
+      audit?: (env: HumanDecisionEvent) => void | Promise<void>
     } = {},
   ) {
     super(rules as never)
     this.store = opts.store
     this.mode = opts.mode ?? 'ask'
     this.asker = opts.asker
+    this.auditSink = opts.audit
   }
 
   /** 当前交互模式（allow-all / ask / deny-all），供 /permission 查看与切换 */
@@ -156,14 +248,43 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
   override async ask(req: PermissionAskInput): Promise<PermissionDecision> {
     if (this.mode === 'allow-all') return { behavior: 'allow', matchedRule: 'global' }
     if (this.mode === 'deny-all') return { behavior: 'deny', matchedRule: 'global' }
-    const answer = this.asker ? await this.asker(req, buildPermissionPrompt(req)) : undefined
+    const startedAt = Date.now()
+    const prompt = buildPermissionPrompt(req)
+    const answer = this.asker ? await this.asker(req, prompt) : undefined
+    const responseMs = Date.now() - startedAt
+    const decision = this.answerToDecision(req.toolKey, answer)
+    // M3 审计：只有真正拿到人工答复才记（无答复 ⇒ deny 是兜底，不是人工决策）。
+    // allow-all/deny-all 短路已在上方 return，不走这里。
+    if (answer !== undefined && this.auditSink) {
+      await this.auditSink({
+        schema: 'harness.audit.v1',
+        kind: 'decision.human',
+        ts: Date.now(),
+        sessionId: req.sessionId,
+        decisionPoint: 'core.permission.ask',
+        tool: req.toolKey,
+        stateHash: stateHashOf(req),
+        riskLevel: prompt.riskLevel ?? 'medium',
+        actionTaken: answer,
+        responseMs,
+        rememberScope: answer === 'always-allow' || answer === 'always-deny' ? 'tool' : 'once',
+      })
+    }
+    return decision
+  }
+
+  /** 四态答复 → 决策（含 always-* 的规则写回） */
+  private async answerToDecision(
+    toolKey: string,
+    answer: PermissionAnswer | undefined,
+  ): Promise<PermissionDecision> {
     switch (answer) {
       // 先判"永久"：写回规则集并置 remember，宿主重启后不再问
       case 'always-allow':
-        await this.rememberRule(req.toolKey, 'allow')
+        await this.rememberRule(toolKey, 'allow')
         return { behavior: 'allow', matchedRule: 'tool', remember: true }
       case 'always-deny':
-        await this.rememberRule(req.toolKey, 'deny')
+        await this.rememberRule(toolKey, 'deny')
         return { behavior: 'deny', matchedRule: 'tool', remember: true }
       // 单次：只影响本次
       case 'allow':

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test'
 import {
   InteractivePermissionEngine,
+  assessRisk,
   buildPermissionPrompt,
   type PermissionAnswer,
   type PermissionAsker,
@@ -148,5 +149,75 @@ describe('buildPermissionPrompt · 文案逐字（改造前 cli 内的 readline 
       '\n⚠️  权限请求 [bash] /tmp/x\n' +
       '  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] ',
     )
+  })
+})
+
+// ===== M3：风险分级 + decision.human 审计 =====
+
+describe('assessRisk · 风险分级（只打标签不决策）', () => {
+  it('高危命令模式 → high（bash 入参里的 rm -rf）', () => {
+    expect(assessRisk('bash', [], { command: 'rm -rf /tmp/x' })).toBe('high')
+  })
+  it('高危工具键 → high（写/删/执行类）', () => {
+    expect(assessRisk('edit_file', [], { path: 'a.ts' })).toBe('high')
+    expect(assessRisk('bash', [], {})).toBe('high')
+  })
+  it('已知只读工具键 → low', () => {
+    expect(assessRisk('read_file', [], {})).toBe('low')
+    expect(assessRisk('grep_file', [], {})).toBe('low')
+  })
+  it('中间地带 → medium', () => {
+    expect(assessRisk('custom_tool', [], {})).toBe('medium')
+  })
+})
+
+describe('InteractivePermissionEngine · decision.human 审计', () => {
+  it('人工答复（allow）⇒ 落审计事件：零内容 + stateHash + responseMs + rememberScope=once', async () => {
+    const events: unknown[] = []
+    const asker: PermissionAsker = async () => {
+      // 模拟人工响应耗时（模态挂起）
+      await new Promise((r) => setTimeout(r, 5))
+      return 'allow'
+    }
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', asker, audit: (env) => { events.push(env) } })
+    await e.ask({ toolKey: 'read_file', patterns: ['/tmp/a'], input: { path: '/tmp/a' }, sessionId: 's1' })
+    expect(events).toHaveLength(1)
+    const env = events[0] as { kind: string; tool: string; riskLevel: string; actionTaken: string; rememberScope: string; responseMs: number; stateHash: string; sessionId: string; decisionPoint: string }
+    expect(env.kind).toBe('decision.human')
+    expect(env.decisionPoint).toBe('core.permission.ask')
+    expect(env.tool).toBe('read_file')
+    expect(env.riskLevel).toBe('low')
+    expect(env.actionTaken).toBe('allow')
+    expect(env.rememberScope).toBe('once')
+    expect(env.sessionId).toBe('s1')
+    expect(env.responseMs).toBeGreaterThanOrEqual(5)
+    // 零内容：信封里没有入参原文，只有哈希
+    expect(JSON.stringify(env)).not.toContain('/tmp/a')
+    expect(env.stateHash).toMatch(/^[0-9a-f]{64}$/)
+  })
+
+  it('always-deny ⇒ rememberScope=tool（写回规则的永久决策）', async () => {
+    const events: unknown[] = []
+    const e = new InteractivePermissionEngine(
+      { '*': 'ask' },
+      { mode: 'ask', asker: () => Promise.resolve('always-deny'), audit: (env) => { events.push(env) } },
+    )
+    await e.ask({ toolKey: 'bash', patterns: [] })
+    expect((events[0] as { actionTaken: string }).actionTaken).toBe('always-deny')
+    expect((events[0] as { rememberScope: string }).rememberScope).toBe('tool')
+  })
+
+  it('allow-all 短路：非人工决策，不落审计', async () => {
+    const events: unknown[] = []
+    const e = new InteractivePermissionEngine({}, { mode: 'allow-all', asker: () => Promise.resolve('allow'), audit: (env) => { events.push(env) } })
+    await e.ask({ toolKey: 'bash', patterns: [] })
+    expect(events).toHaveLength(0)
+  })
+
+  it('asker 取不到答复（undefined ⇒ deny 兜底）：非人工决策，不落审计', async () => {
+    const events: unknown[] = []
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', asker: () => Promise.resolve(undefined), audit: (env) => { events.push(env) } })
+    await e.ask({ toolKey: 'bash', patterns: [] })
+    expect(events).toHaveLength(0)
   })
 })

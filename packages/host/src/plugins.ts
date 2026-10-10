@@ -510,6 +510,17 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       optIn: true,
       load: async () => (await lazyImport<{ createEnvContextPlugin: () => AgentPlugin }>('@harness/env-context')).createEnvContextPlugin(),
     })
+    // ui-widget：生成式 UI（M2）。`ui_widget` 工具让模型产出结构化 UI 声明（WidgetPart），
+    // 宿主侧渲染（TUI 组件 / headless renderText 降级）。默认启用：工具无副作用、只读声明，
+    // 是否被模型看到仍受 agent tools 白名单约束；未注册进 agent 白名单时工具不出现。
+    defaultBuiltinRegistry.register({
+      id: 'ui-widget',
+      name: 'UI Widget',
+      description: '生成式 UI：ui_widget 工具（结构化 UI 声明，WidgetPart 渲染注册表）',
+      source: 'builtin',
+      optIn: false,
+      load: async () => (await lazyImport<{ createUiWidgetPlugin: () => AgentPlugin }>('@harness/ui-widget')).createUiWidgetPlugin(),
+    })
   }
   return defaultBuiltinRegistry
 }

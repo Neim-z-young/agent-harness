@@ -145,8 +145,11 @@ import { collectTodayUsage } from './usage-today'
 import { sessionModelMetaPatch, type Message, type Session, type SessionModelOverride } from '@harness/session'
 
 import type { ToolContext, Tool } from '@harness/tool'
+import { renderWidgetText, widgetFromToolResult } from '@harness/ui-widget'
+import { createJsonlWriter, type JsonlWriter } from '@harness/telemetry'
+import type { HumanDecisionEvent } from '@harness/host'
 
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
 
 import { writeFile } from 'node:fs/promises'
 import { createInterface } from 'node:readline'
@@ -366,9 +369,16 @@ export class CliPermissionEngine extends InteractivePermissionEngine {
       /** 测试注入：替换真实 readline 交互 */
       askPrompt?: (question: string) => Promise<string>
       stdout?: NodeJS.WritableStream | { write: (s: string) => void }
+      /** M3：人工决策审计（透传给 host 引擎） */
+      audit?: (env: HumanDecisionEvent) => void | Promise<void>
     } = {}
   ) {
-    super(rules, { store: options.store, mode: options.mode, asker: cliAsker(options.askPrompt) })
+    super(rules, {
+      store: options.store,
+      mode: options.mode,
+      asker: cliAsker(options.askPrompt),
+      audit: options.audit,
+    })
   }
 
   /** 替换询问交互器（TUI 在启动后注入模态审批，替代默认 readline 行内提问） */
@@ -424,6 +434,24 @@ export interface HarnessAppOptions extends HostOptions {
   askPrompt?: (q: string) => Promise<string>
 }
 
+/**
+ * M3 审计 sink：按会话建 JSONL writer（`{dataDir}/sessions/{id}.audit.jsonl`），
+ * 复用遥测的 `createJsonlWriter`（防抖批量 + 失败静默）。零内容约束由事件信封保证
+ * （`HumanDecisionEvent` 只有标量 + stateHash）。
+ */
+export function createAuditSink(dataDir: string): (env: HumanDecisionEvent) => void {
+  const writers = new Map<string, JsonlWriter<HumanDecisionEvent>>()
+  return (env) => {
+    if (!env.sessionId) return // 无会话归属不落审计（事件本身可有可无，属审计完整性而非安全）
+    let w = writers.get(env.sessionId)
+    if (!w) {
+      w = createJsonlWriter<HumanDecisionEvent>(join(dataDir, 'sessions', `${env.sessionId}.audit.jsonl`))
+      writers.set(env.sessionId, w)
+    }
+    w.write(env)
+  }
+}
+
 export class HarnessApp extends HarnessHost {
   /**
    * 窄化基类字段的类型：boot 装的是 `CliPermissionEngine`（TUI 的 `setAskPrompt` 依赖它）。
@@ -433,6 +461,8 @@ export class HarnessApp extends HarnessHost {
 
   /** 构造期捕获：`createPermissionEngine` 在 boot() 里才被调用，那时基类私有 options 已不可见 */
   private readonly cliAskPrompt?: (q: string) => Promise<string>
+  /** M3：人工决策审计 sink（per-session writer 池） */
+  private readonly auditSink?: (env: HumanDecisionEvent) => void
 
   constructor(options: HarnessAppOptions) {
     // 未注入输出流时落到真实 stdout：否则装配期诊断与 logger 的 [WARN]/[ERROR] 会被静默丢掉
@@ -445,6 +475,7 @@ export class HarnessApp extends HarnessHost {
       asker: cliAsker(options.askPrompt),
     })
     this.cliAskPrompt = options.askPrompt
+    this.auditSink = options.dataDir ? createAuditSink(options.dataDir) : undefined
   }
 
   /**
@@ -460,6 +491,7 @@ export class HarnessApp extends HarnessHost {
       mode,
       askPrompt: this.cliAskPrompt,
       store: { ...(rules as any), save },
+      audit: this.auditSink,
     })
   }
 }
@@ -1501,12 +1533,24 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           case 'tool_call_start':
             if (inText || inReasoning) { out('\n'); inText = false; inReasoning = false }
             onEvent?.(ev)
+            // 生成式 UI：ui_widget 的结果由 TUI 经流事件渲染为 widget 块，console 文本通道
+            // 跳过调用行与结果行，避免双渲染；REPL（无 onEvent）无 widget 渲染器，
+            // 结果行给单行摘要降级（见 tool_call_result）。
+            if (ev.toolId === 'ui_widget') break
             // 入参完整打印（工具的"命令行"就是它的入参，截断即无法复核）
             out(`🔧  ${ev.toolId} ${formatToolInput(ev.input)}\n`)
             break
           case 'tool_call_result': {
             const status = ev.isError ? '❌' : '✅'
             onEvent?.(ev)
+            if (ev.toolId === 'ui_widget') {
+              // REPL/headless 降级：渲染器单行摘要；失败仍按错误可见
+              if (!onEvent) {
+                const w = widgetFromToolResult(ev.toolId, ev.result)
+                out(`${w ? renderWidgetText(w.widgetType, w.props) : formatToolResult(ev.result, false)}\n`)
+              }
+              break
+            }
             // 结果完整打印：一条工具输出的结论往往在长文本尾部，截断等于没给。
             // 多行结果的续行标记只给 TUI（它逐行分类，靠标记并回同一个 tool 块）
             out(`${status}  → ${formatToolResult(ev.result, !!onEvent)}\n`)

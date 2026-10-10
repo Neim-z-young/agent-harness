@@ -152,4 +152,7 @@ export function writeResults(results: TaskRunResult[], summary: BenchSummary, ou
     .join('\n')
   writeFileSync(join(outDir, 'results.jsonl'), jsonl + '\n')
   writeFileSync(join(outDir, 'summary.json'), JSON.stringify(summary, null, 2))
+  // M4：跑分历史追加（逐次 append，跨多次跑组成 pass^k 趋势 / 成本·延迟对比）。
+  // 单行一 summary（无换行），读取方按行解析；TUI 面板建议 `--out <dataDir>/bench` 以便可见。
+  writeFileSync(join(outDir, 'history.jsonl'), JSON.stringify(summary) + '\n', { flag: 'a' })
 }

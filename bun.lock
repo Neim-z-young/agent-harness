@@ -128,6 +128,7 @@
         "@harness/snapshot": "workspace:*",
         "@harness/subagent": "workspace:*",
         "@harness/swarm": "workspace:*",
+        "@harness/telemetry": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/tools-builtin": "workspace:*",
         "@harness/tools-glob": "workspace:*",
@@ -135,6 +136,7 @@
         "@harness/tools-media": "workspace:*",
         "@harness/tools-search": "workspace:*",
         "@harness/tools-web": "workspace:*",
+        "@harness/ui-widget": "workspace:*",
         "@harness/usage": "workspace:*",
         "@harness/workspace": "workspace:*",
         "@harness/workspace-shell": "workspace:*",
@@ -198,6 +200,7 @@
         "@harness/tools-media": "workspace:*",
         "@harness/tools-search": "workspace:*",
         "@harness/tools-web": "workspace:*",
+        "@harness/ui-widget": "workspace:*",
         "@harness/workspace": "workspace:*",
         "@harness/workspace-shell": "workspace:*",
         "acp-kernel": "^0.0.63",
@@ -506,6 +509,14 @@
         "@harness/tool": "workspace:*",
       },
     },
+    "packages/plugins/ui-widget": {
+      "name": "@harness/ui-widget",
+      "version": "0.1.0",
+      "dependencies": {
+        "@harness/core": "workspace:*",
+        "@harness/tool": "workspace:*",
+      },
+    },
     "packages/plugins/workspace-shell": {
       "name": "@harness/workspace-shell",
       "version": "0.1.0",
@@ -662,6 +673,8 @@
     "@harness/tools-search": ["@harness/tools-search@workspace:packages/plugins/tools-search"],
 
     "@harness/tools-web": ["@harness/tools-web@workspace:packages/plugins/tools-web"],
+
+    "@harness/ui-widget": ["@harness/ui-widget@workspace:packages/plugins/ui-widget"],
 
     "@harness/usage": ["@harness/usage@workspace:packages/usage"],
 

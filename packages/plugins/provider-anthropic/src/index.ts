@@ -302,6 +302,10 @@ function serializePart(part: Part, role: Message['role']): AnthropicContentBlock
       return [{ type: 'text', text: `[Patch: ${pp.path ?? 'unknown'}]\n${pp.patch ?? ''}` }]
     }
 
+    case 'widget':
+      // 生成式 UI（WidgetPart）：单行摘要（声明给宿主渲染，不回灌整份 props）
+      return [{ type: 'text', text: `[Widget: ${(part as any).widgetType ?? 'unknown'}]` }]
+
     default:
       return [{ type: 'text', text: JSON.stringify(part) }]
   }

@@ -108,7 +108,12 @@ export type {
 // ========================================================================
 // 四态答复 + 交互引擎。上移的理由是**语义只能有一份**：今天「先判永久 → 写回规则 → 再判单次」
 // 只写在 cli 的 CliPermissionEngine 里，A2A / VSCode 各起一份就是同一安全边界的第二套写法。
-export { InteractivePermissionEngine, buildPermissionPrompt } from './permission'
+export {
+  InteractivePermissionEngine,
+  buildPermissionPrompt,
+  assessRisk,
+  stateHashOf,
+} from './permission'
 export type {
   PermissionAnswer,
   PermissionAskInput,
@@ -116,6 +121,8 @@ export type {
   PermissionMode,
   PermissionPrompt,
   PermissionStoreFile,
+  RiskLevel,
+  HumanDecisionEvent,
 } from './permission'
 
 // ========================================================================

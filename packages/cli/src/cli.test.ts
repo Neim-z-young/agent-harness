@@ -2618,6 +2618,122 @@ describe('Coordinator 自动续轮 attachAutoContinue', () => {
     expect(tuiOut.join('')).toContain(`${TOOL_CONT_MARK}beta`)
     await tuiApp.shutdown()
   })
+
+  it('ui_widget 工具：TUI 模式跳过 console 行（widget 走流事件渲染），REPL 模式单行摘要降级', async () => {
+    // ui-widget 是内置插件（host 注册表默认启用，optIn:false）+ 默认 agent tools=['*']，
+    // 无需注入即可被模型调用。此测试只验证 createProcessLine 的两条输出通道：
+    // TUI（onEvent 存在）：ui_widget 的调用/结果行**不进** console 文本（防与 widget 块双渲染）；
+    // REPL（无 onEvent）：结果给渲染器单行摘要，不出现 🔧 调用行。
+    const boot = () => new HarnessApp({
+      cwd: dir, dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all', stdout: { write: () => {} },
+      mockProviderConfig: {
+        defaultResponse: '完成',
+        responses: [{
+          match: '展示卡片', once: true, response: '',
+          toolCalls: [{
+            toolUseId: 'w1', toolId: 'ui_widget',
+            input: { widgetType: 'key-value', props: { rows: [{ key: 'id', value: 'o1' }] } },
+          }],
+        }],
+      },
+    })
+
+    // ① REPL 模式：单行摘要降级，无 🔧 调用行
+    const replApp = boot()
+    const a = await replApp.boot()
+    const aSess = await a.harness.session.create()
+    const replOut: string[] = []
+    await createProcessLine({ app: replApp, harness: a.harness, session: aSess, out: (s) => { replOut.push(s) } })('展示卡片')
+    const replText = replOut.join('')
+    expect(replText).not.toContain('🔧  ui_widget')
+    expect(replText).toContain('[KV] id=o1')
+    await replApp.shutdown()
+
+    // ② TUI 模式：调用行与结果行都不进 console（widget 块由 onEvent 的 tool_call_result 驱动）
+    const tuiApp = boot()
+    const b = await tuiApp.boot()
+    const bSess = await b.harness.session.create()
+    const tuiOut: string[] = []
+    const seenEvents: string[] = []
+    await createProcessLine({
+      app: tuiApp, harness: b.harness, session: bSess,
+      out: (s) => { tuiOut.push(s) },
+      onEvent: (ev) => { if (ev.type === 'tool_call_result') seenEvents.push(ev.toolId ?? '') },
+    })('展示卡片')
+    const tuiText = tuiOut.join('')
+    expect(tuiText).not.toContain('🔧  ui_widget')
+    expect(tuiText).not.toContain('[KV]')
+    expect(seenEvents).toContain('ui_widget')
+    await tuiApp.shutdown()
+  })
+})
+
+describe('M3 decision.human 审计落盘', () => {
+  it('权限询问经人工放行 ⇒ audit.jsonl 落盘（零内容 + stateHash + riskLevel）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'audit-'))
+    const dataDir = join(dir, '.harness')
+    // 注入一个带 permission 声明（key:'write'）的工具：引擎执行前会触发权限询问
+    const NeedsApproval: AgentPlugin = {
+      id: 'needs-approval', version: '1', name: 'NeedsApproval',
+      async install() {
+        return {
+          async 'core.tool.pool.assemble'(_i: unknown, pool: unknown) {
+            (pool as { add: (t: unknown) => void }).add(defineTool({
+              id: 'needs_approval',
+              description: '需要人工审批的工具',
+              inputSchema: {
+                parse: (v: unknown) => v,
+                safeParse: (v: unknown) => ({ success: true as const, data: v }),
+                __jsonSchema: { type: 'object', properties: { path: { type: 'string' } } },
+              } as never,
+              permission: { key: 'write', extractPatterns: (input) => [String((input as { path?: unknown }).path ?? '')] },
+              async call() { return { ok: true, output: 'done' } },
+            }))
+          },
+        } as Hooks
+      },
+    }
+    const app = new HarnessApp({
+      cwd: dir, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'ask',
+      askPrompt: async () => 'allow',
+      stdout: { write: () => {} },
+      extraPlugins: [NeedsApproval],
+      mockProviderConfig: {
+        defaultResponse: '完成',
+        responses: [{
+          match: '审批', once: true, response: '',
+          toolCalls: [{ toolUseId: 'u1', toolId: 'needs_approval', input: { path: '/tmp/x' } }],
+        }],
+      },
+    })
+    const a = await app.boot()
+    const sess = await a.harness.session.create()
+    await createProcessLine({ app, harness: a.harness, session: sess, out: () => {} })('审批')
+    // createJsonlWriter 防抖 500ms，等待落盘
+    await new Promise((r) => setTimeout(r, 700))
+    const auditFiles = readdirSync(join(dataDir, 'sessions')).filter((f) => f.endsWith('.audit.jsonl'))
+    expect(auditFiles.length).toBe(1)
+    const lines = readFileSync(join(dataDir, 'sessions', auditFiles[0]!), 'utf8').trim().split('\n').filter(Boolean)
+    expect(lines.length).toBe(1)
+    const env = JSON.parse(lines[0]!) as {
+      kind: string; tool: string; riskLevel: string; actionTaken: string
+      rememberScope: string; stateHash: string; sessionId: string; decisionPoint: string
+    }
+    expect(env.kind).toBe('decision.human')
+    expect(env.decisionPoint).toBe('core.permission.ask')
+    // toolKey 是权限键（permission.key），不是工具 id
+    expect(env.tool).toBe('write')
+    expect(env.riskLevel).toBe('medium')
+    expect(env.actionTaken).toBe('allow')
+    expect(env.rememberScope).toBe('once')
+    expect(env.sessionId).toBe(sess.id)
+    expect(env.stateHash).toMatch(/^[0-9a-f]{64}$/)
+    // 零内容：信封不含入参原文
+    expect(JSON.stringify(env)).not.toContain('/tmp/x')
+    await app.shutdown()
+  })
 })
 
 describe('/revert 命令', () => {

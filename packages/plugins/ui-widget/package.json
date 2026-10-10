@@ -1,0 +1,22 @@
+{
+  "name": "@harness/ui-widget",
+  "version": "0.1.0",
+  "description": "生成式 UI（M2）：WidgetPart 渲染注册表（table / key-value / metric-cards / chart / timeline / diff）+ ui_widget 工具通道（模型产出结构化 UI 声明，经 tool 管线校验/审计）",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "import": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@harness/core": "workspace:*",
+    "@harness/tool": "workspace:*"
+  },
+  "scripts": {
+    "dev": "tsc --noEmit --watch",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  }
+}

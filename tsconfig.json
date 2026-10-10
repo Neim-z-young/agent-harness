@@ -37,6 +37,7 @@
       "@harness/tools-glob/meta": ["./packages/plugins/tools-glob/src/meta.ts"],
       "@harness/tools-web": ["./packages/plugins/tools-web/src"],
       "@harness/tools-web/meta": ["./packages/plugins/tools-web/src/meta.ts"],
+      "@harness/ui-widget": ["./packages/plugins/ui-widget/src"],
       "@harness/tools-media": ["./packages/plugins/tools-media/src"],
       "@harness/tools-media/meta": ["./packages/plugins/tools-media/src/meta.ts"],
       "@harness/tools-manager": ["./packages/plugins/tools-manager/src"],

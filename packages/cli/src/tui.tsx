@@ -31,9 +31,10 @@ import {
 } from './agent-status'
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
-import { readdirSync, statSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
+import { parseAuditLog, loadBenchHistory, auditPanelLines, benchPanelLines, type AuditSummary, type BenchRecord } from './panels'
 import { createCliRenderer, createTextAttributes, SyntaxStyle, RGBA, type CliRenderer, type TextareaRenderable } from '@opentui/core'
 import { createRoot, useKeyboard, useAppContext } from '@opentui/react'
 import { createProcessLine, attachAutoContinue, listReplCommands, describeSessionRestore, buildCompactionOptions, resolveCompactionWindow, renderContextOccupancy, formatToolInput, formatToolResult, TOOL_CONT_MARK } from './index'
@@ -41,7 +42,9 @@ import type { HarnessApp } from './index'
 import type { AgentStreamEvent, Harness } from '@harness/core'
 import type { CompactionBlock, CompactOptions, HistoryLoadRange, Message, Session } from '@harness/session'
 import type { BackgroundTaskViewLike } from '@harness/plugin'
+import type { PermissionAnswer, PermissionAskInput, PermissionPrompt } from '@harness/host'
 import { subagentCapability } from '@harness/subagent'
+import { renderWidget, widgetFromToolResult, type DecisionCardWidget } from '@harness/ui-widget'
 import { findFileReferences, collectFileRefsFromTexts, resolveEditPath, buildDiskFileTree, renderFileRefTree, anyMarked, abbrevFileRef } from '@harness/host'
 import { detectKeyboardProtocol, shiftEnterHelpLine } from './keyboard'
 import {
@@ -145,7 +148,7 @@ export const HELP_LINES: Array<{ key: string; desc: string }> = [  { key: 'Ctrl-
 // ------------------------------------------------------------------------
 // 模块 4：侧栏图标 tab（每次展示一个面板，点击图标切换）
 // ------------------------------------------------------------------------
-export type SidebarTabId = 'context' | 'sessions' | 'tasks' | 'files' | 'stats'
+export type SidebarTabId = 'context' | 'sessions' | 'tasks' | 'files' | 'stats' | 'audit' | 'bench'
 
 export const SIDEBAR_TABS: Array<{ id: SidebarTabId; icon: string; label: string }> = [
   { id: 'context', icon: '⌂', label: '会话上下文' },
@@ -153,6 +156,8 @@ export const SIDEBAR_TABS: Array<{ id: SidebarTabId; icon: string; label: string
   { id: 'tasks', icon: '⚙', label: '任务' },
   { id: 'files', icon: '🔗', label: '文件' },
   { id: 'stats', icon: '📊', label: '统计' },
+  { id: 'audit', icon: '🛡', label: '决策审计' },
+  { id: 'bench', icon: '📈', label: '跑分' },
 ]
 
 /** 侧栏 tab 索引（供 ◀/▶ 循环切换） */
@@ -166,7 +171,7 @@ export function nextSidebarTab(current: SidebarTabId, delta: 1 | -1): SidebarTab
 // 结构化块模型（纯函数可单测）
 // ------------------------------------------------------------------------
 
-export type ChatBlockKind = 'system' | 'user' | 'thinking' | 'assistant' | 'tool' | 'compact' | 'loadmore'
+export type ChatBlockKind = 'system' | 'user' | 'thinking' | 'assistant' | 'tool' | 'widget' | 'compact' | 'loadmore'
 
 export interface ChatBlock {
   id: number
@@ -181,6 +186,10 @@ export interface ChatBlock {
   blockId?: string
   /** 压缩块展开进行中 */
   loading?: boolean
+  /** 生成式 UI：widget 类型（kind==='widget'，WIDGET_RENDERERS 注册表键） */
+  widgetType?: string
+  /** 生成式 UI：widget 声明数据（text 已含 renderWidget 渲染结果，副本用于重新渲染） */
+  widgetProps?: Record<string, unknown>
 }
 
 export interface ChatState {
@@ -335,13 +344,42 @@ export function windowToolText(text: string): ToolView {
   return { lines: out, truncated, fullChars: text.length }
 }
 
-/** 处理结构化流事件：reasoning→thinking 块、text→assistant 块、done→收尾 */
+/** 追加一个 widget 块（text 预填完整渲染结果，复制/选区直接可用） */
+export function pushWidgetBlock(
+  state: ChatState,
+  widgetType: string,
+  props: Record<string, unknown>,
+): ChatState {
+  return {
+    ...state,
+    blocks: [
+      ...state.blocks,
+      {
+        id: state.nextId,
+        kind: 'widget',
+        text: renderWidget(widgetType, props),
+        widgetType,
+        widgetProps: props,
+      },
+    ],
+    nextId: state.nextId + 1,
+  }
+}
+
+/** 处理结构化流事件：reasoning→thinking 块、text→assistant 块、ui_widget 结果→widget 块、done→收尾 */
 export function applyStreamEvent(state: ChatState, ev: AgentStreamEvent): ChatState {
   switch (ev.type) {
     case 'reasoning_delta':
       return upsertStreamBlock(state, 'thinking', ev.text ?? '')
     case 'text_delta':
       return upsertStreamBlock(state, 'assistant', ev.text ?? '')
+    case 'tool_call_result': {
+      // 生成式 UI：ui_widget 工具结果 → widget 块。失败的调用不渲染（保持 tool 块可见错误）。
+      // console 文本通道对该工具已跳过输出（见 createProcessLine），不会双渲染。
+      const w = widgetFromToolResult(ev.toolId, ev.result)
+      if (w && !ev.isError) return pushWidgetBlock(state, w.widgetType, w.props)
+      return state
+    }
     case 'done':
       return finalizeStream(state)
     default:
@@ -596,6 +634,14 @@ function messageToBlocks(m: Message, idStart: number): ChatBlock[] {
     } else if (p.type === 'tool') {
       flushText()
       tools.push(...toolPartLines(p as { toolId?: string; input?: unknown; result?: unknown; isError?: boolean }))
+    } else if (p.type === 'widget') {
+      // 生成式 UI：WidgetPart → widget 块（宿主注入路径的历史还原，与实时块同源渲染）
+      flushText()
+      flushTools()
+      const wp = p as { widgetType?: string; props?: Record<string, unknown> }
+      const type = wp.widgetType ?? 'unknown'
+      const props = wp.props ?? {}
+      out.push({ id: nextId++, kind: 'widget', text: renderWidget(type, props), widgetType: type, widgetProps: props, msgId: m.id })
     }
   }
   flushText()
@@ -1010,6 +1056,45 @@ export function approvalLine(q: string): string {
   return lines.find((l) => l.includes('权限请求')) ?? lines[0] ?? q
 }
 
+/**
+ * M3 决策卡片：把权限询问的结构化信息组装为 decision-card widget 声明。
+ *
+ * - `riskLevel` 来自 host 分级器（prompt.riskLevel，规则引擎只打标签不决策）
+ * - `inputRows` 为工具入参的参数表格（给人看的，不受审计零内容约束）
+ * - `historyCount` = 本会话内同一工具已执行的次数（同类操作历史）
+ */
+export function buildDecisionCard(
+  req: PermissionAskInput,
+  prompt: PermissionPrompt,
+  session: Session,
+): DecisionCardWidget {
+  const raw = req.input
+  const inputRows =
+    raw && typeof raw === 'object' && !Array.isArray(raw)
+      ? Object.entries(raw as Record<string, unknown>).map(([key, value]) => ({ key, value }))
+      : []
+  return {
+    tool: req.toolKey,
+    patterns: req.patterns ?? [],
+    riskLevel: prompt.riskLevel ?? 'medium',
+    inputRows,
+    historyCount: countToolHistory(session, req.toolKey),
+    summary: prompt.summary,
+  }
+}
+
+/** 统计本会话内同一工具（tool part 的 toolId）已执行的次数（同类操作历史） */
+export function countToolHistory(session: Session, toolId: string): number {
+  let n = 0
+  for (const m of session.messages) {
+    if (m.role !== 'assistant') continue
+    for (const p of m.parts) {
+      if (p.type === 'tool' && (p as { toolId?: string }).toolId === toolId) n++
+    }
+  }
+  return n
+}
+
 export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (r: TuiReplExit) => void }) {
   // 工作目录取**启动时解析出的**（`-c/--cwd` 传入值，未传才是进程启动目录）。
   // TUI 里凡是「相对路径基准 / 文件树根」都必须用它，不能用 process.cwd() —— 后者
@@ -1080,9 +1165,12 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }, [])
   // 模块 D：帮助面板 + 统计面板 —— helpOpen 时输入框让出焦点（modal）
   const [helpOpen, setHelpOpen] = useState(false)
-  // 模块 E：命令审批模态 —— 权限引擎 ask() 触发时弹出，等待 allow/deny/always/never
+  // 模块 E：命令审批模态 —— 权限引擎 ask() 触发时弹出，等待 allow/deny/always/never。
+  // M3：从「文本提问」升级为「决策卡片」（结构化：风险标签 + 参数表格 + 同类操作历史），
+  // 文本 `approvalQ` 保留为无结构化信息时的兜底。
   const [approvalQ, setApprovalQ] = useState<string | null>(null)
-  const approvalResolveRef = useRef<((ans: string) => void) | null>(null)
+  const [approvalCard, setApprovalCard] = useState<DecisionCardWidget | null>(null)
+  const approvalResolveRef = useRef<((ans: PermissionAnswer) => void) | null>(null)
   // 鼠标复制（模块 D3）：正在展示「✓ 已复制」提示的块 id（临时高亮，配合 onMouseUp 复制）
   const [copiedId, setCopiedId] = useState<number | null>(null)
   /**
@@ -1116,6 +1204,26 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const [todayTotals, setTodayTotals] = useState<UsageStats | null>(null)
   // 模块 4：侧栏各模块改为顶部图标 tab + 左右切换（每次仅展示一个面板）
   const [sidebarTab, setSidebarTab] = useState<SidebarTabId>('context')
+  // M4 面板：审计（当前会话 decision.human）+ 跑分（dataDir/bench history）。切到对应 tab 时读取。
+  const [auditSummary, setAuditSummary] = useState<AuditSummary>({ total: 0, allowRate: 0, avgResponseMs: 0, medianResponseMs: 0, riskCounts: {}, timeline: [], malformed: 0 })
+  const [benchHistory, setBenchHistory] = useState<BenchRecord[]>([])
+  const [benchError, setBenchError] = useState<string | undefined>(undefined)
+  useEffect(() => {
+    if (sidebarTab !== 'audit') return
+    const sid = options.session.id
+    const p = join(options.app.workspace.dataDir, 'sessions', `${sid}.audit.jsonl`)
+    try {
+      setAuditSummary(parseAuditLog(readFileSync(p, 'utf8')))
+    } catch {
+      setAuditSummary({ total: 0, allowRate: 0, avgResponseMs: 0, medianResponseMs: 0, riskCounts: {}, timeline: [], malformed: 0 })
+    }
+  }, [sidebarTab, options.session.id, options.app.workspace.dataDir])
+  useEffect(() => {
+    if (sidebarTab !== 'bench') return
+    const { history, error } = loadBenchHistory(options.app.workspace.dataDir)
+    setBenchHistory(history)
+    setBenchError(error)
+  }, [sidebarTab, options.app.workspace.dataDir])
   // 统计面板「上下文占用」：窗口/阈值取与 /compact、/stats 同一套推导（config 加载一次即可）
   const [ctxOccOpts, setCtxOccOpts] = useState<CompactOptions | undefined>(undefined)
   // 分母**按会话端点解析**（本会话 + 各子会话各自一份）。闭包只捕获 config，会话对象在渲染时
@@ -1366,12 +1474,14 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   const flushScheduledRef = useRef(false)
   if (processLineRef.current === null) {
     // 模块 E：注入 TUI 命令审批模态 —— 替换默认 readline 行内提问。
-    // 询问由权限引擎 ask() 触发（含工具键与路径），此处把问题投递到 React 模态并挂起，
-    // 由全局按键（Y/N/Shift-Y/Shift-N）回填答案；每次仅一个待决审批。
-    options.app.permission.setAskPrompt((q) => {
-      return new Promise<string>((resolve) => {
+    // M3：改走 `setAsker`（而非 `setAskPrompt`）以拿到结构化信息（req.toolKey/patterns/input
+    // + prompt.riskLevel），渲染为决策卡片（风险标签 + 参数表格 + 同类操作历史）。
+    // 按键直接回四态（不再走文本 → parseCliAnswer 往返）；无结构化信息时回退文本模态。
+    options.app.permission.setAsker(async (req, prompt) => {
+      return new Promise<PermissionAnswer>((resolve) => {
         approvalResolveRef.current = resolve
-        setApprovalQ(typeof q === 'string' && q.length ? q : '权限请求')
+        setApprovalCard(buildDecisionCard(req, prompt, options.session))
+        setApprovalQ(prompt.text)
       })
     })
     processLineRef.current = createProcessLine({
@@ -1719,15 +1829,16 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     }
     // 模块 E：命令审批模态 —— 审批期间吞掉所有按键，仅响应审批选项
     if (approvalQ !== null) {
-      const submitApproval = (ans: string) => {
+      const submitApproval = (ans: PermissionAnswer) => {
         approvalResolveRef.current?.(ans)
         approvalResolveRef.current = null
         setApprovalQ(null)
+        setApprovalCard(null)
       }
       if (key.name === 'y') submitApproval('allow')             // 本次允许
       else if (key.name === 'n' || key.name === 'escape') submitApproval('deny') // 本次拒绝 / Esc=拒绝
-      else if (key.shift && key.name === 'y') submitApproval('always')           // 始终允许
-      else if (key.shift && key.name === 'n') submitApproval('never')            // 始终拒绝
+      else if (key.shift && key.name === 'y') submitApproval('always-allow')     // 始终允许
+      else if (key.shift && key.name === 'n') submitApproval('always-deny')      // 始终拒绝
       return true // 其余按键在审批中一律吞掉
     }
     if (key.ctrl && key.name === 'c') {
@@ -1943,10 +2054,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
   }
 
   const renderBlock = (b: ChatBlock) => {
-    // 对话消息（用户/助手/工具，非空）在正文下加一行鼠标「复制」按钮 —— 工具输出也可复制。
+    // 对话消息（用户/助手/工具/widget，非空）在正文下加一行鼠标「复制」按钮 —— 工具输出也可复制。
     // system 块（耗时行 / 元信息 / `tool` 占位等）不显示复制按钮，避免一次应答裂成多个「⧉ 复制」。
     const copyable =
-      (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool') &&
+      (b.kind === 'user' || b.kind === 'assistant' || b.kind === 'tool' || b.kind === 'widget') &&
       b.text.trim().length > 0
     // 工具块按首尾窗口渲染；被省略时复制按钮必须**明示是全文**（否则用户以为拿到的是可见那段）
     const view = b.kind === 'tool' ? toolViewOf(b) : undefined
@@ -2072,6 +2183,19 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
           <box key={b.id} flexDirection="column">
             <text attributes={createTextAttributes({ bold: true, dim: true })} wrapMode="word" {...selStyleProps}>{first}</text>
             {body && <text attributes={createTextAttributes({ dim: true })} wrapMode="word" {...selStyleProps}>{body}</text>}
+          </box>
+        )
+      }
+      case 'widget': {
+        // 生成式 UI：渲染注册表的完整渲染结果（widgetProps 存在时实时重渲，兜底用块内 text）。
+        // 视觉区分：顶部加一行「▣ 组件」标题，正文等宽输出。
+        const text = b.widgetProps
+          ? renderWidget(b.widgetType ?? 'unknown', b.widgetProps)
+          : b.text
+        return (
+          <box key={b.id} flexDirection="column">
+            <text attributes={createTextAttributes({ bold: true })} wrapMode="word">{'▣ 组件'}</text>
+            <text attributes={createTextAttributes({})} wrapMode="word" {...selStyleProps}>{text || '\u00A0'}</text>
           </box>
         )
       }
@@ -2312,6 +2436,19 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                   <text attributes={createTextAttributes({ dim: true })} wrapMode="word">── /stats 详情 · /stats-export 报告 ──</text>
                 </>
               )}
+              {/* 面板：决策审计（M4）—— decision.human 时间线 / 放行率 / responseMs */}
+              {sidebarTab === 'audit' && auditPanelLines(auditSummary).map((l, i) => (
+                <text key={`a${i}`} attributes={createTextAttributes({ dim: true })} wrapMode="word">{l}</text>
+              ))}
+              {/* 面板：跑分（M4）—— pass^k 趋势 / 成本·延迟对比 */}
+              {sidebarTab === 'bench' && (
+                <>
+                  {benchError ? <text attributes={createTextAttributes({ dim: true })} wrapMode="word">（{benchError}）</text> : null}
+                  {benchPanelLines(benchHistory).map((l, i) => (
+                    <text key={`b${i}`} attributes={createTextAttributes({ dim: true })} wrapMode="word">{l}</text>
+                  ))}
+                </>
+              )}
             </scrollbox>
           </box>
         )}
@@ -2334,15 +2471,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
             ))}
           </box>
         )}
-        {/* 模块 E：命令审批模态 —— 权限询问弹出，Y=允许 N=拒绝 Shift-Y=始终允许 Shift-N=始终拒绝 */}
+        {/* 模块 E：命令审批模态 —— 权限询问弹出，Y=允许 N=拒绝 Shift-Y=始终允许 Shift-N=始终拒绝。
+            M3：有结构化卡片（风险标签 + 参数表格 + 历史）时渲染 decision-card，否则回退文本 */}
         {approvalQ !== null && (
           <box style={{ border: true, padding: 1 }}>
             <text attributes={createTextAttributes({ bold: true, reverse: true })}>
               {' 权限审批 '.padEnd(22)}
             </text>
-            <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
-              {approvalLine(approvalQ)}
-            </text>
+            {approvalCard ? (
+              <text wrapMode="word" {...selStyleProps}>
+                {renderWidget('decision-card', approvalCard as unknown as Record<string, unknown>)}
+              </text>
+            ) : (
+              <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
+                {approvalLine(approvalQ)}
+              </text>
+            )}
             <text wrapMode="word">  [y] 允许    [n] 拒绝    [Shift-y] 始终允许    [Shift-n] 始终拒绝</text>
           </box>
         )}

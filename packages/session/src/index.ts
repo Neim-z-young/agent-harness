@@ -76,6 +76,25 @@ export interface ImagePart {
 }
 
 /**
+ * 结构化 UI 声明（生成式 UI，方案定稿 2026-10-10）
+ *
+ * 宿主无关的声明式 widget：`widgetType` 决定渲染器（table / key-value / diff / chart …），
+ * `props` 是渲染器消费的数据。双写入方共用同一通道：
+ * 1. 模型：调用 `ui_widget` 工具（产出声明，经 tool 管线校验/审计）
+ * 2. 宿主：直接向 session 追加（如 M3 决策卡片）
+ *
+ * 渲染在宿主侧完成（TUI 组件 / headless 的 renderText 降级），provider 序列化时
+ * 降级为简洁文本（见 provider-openai / provider-anthropic 的 `case 'widget'`）。
+ */
+export interface WidgetPart {
+  type: 'widget'
+  /** widget 类型（WIDGET_RENDERERS 注册表键） */
+  widgetType: string
+  /** 渲染器消费的数据（JSON 可序列化） */
+  props: Record<string, unknown>
+}
+
+/**
  * 所有 Part 类型联合
  * 支持扩展：未识别的 type 会落入兜底分支
  */
@@ -86,6 +105,7 @@ export type Part =
   | ReasoningPart
   | PatchPart
   | ImagePart
+  | WidgetPart
   | { type: string; [key: string]: unknown }
 
 // ===== Message =====

@@ -265,6 +265,11 @@ function toOpenAIMessages(messages: Message[], forceReasoningContent = false): O
           case 'patch':
             textParts.push(`[Patch: ${(part as any).path ?? 'unknown'}]\n${(part as any).patch ?? ''}`)
             break
+          case 'widget':
+            // 生成式 UI（WidgetPart）：模型侧只见单行摘要（声明是给宿主渲染的，不是给模型读的）。
+            // 未显式支持前走 default 会把整份 props 以 JSON 文本塞回上下文，徒增 token。
+            textParts.push(`[Widget: ${(part as any).widgetType ?? 'unknown'}]`)
+            break
           default:
             textParts.push(JSON.stringify(part))
             break

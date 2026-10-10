@@ -68,6 +68,7 @@ const BUILTIN_LAZY: Record<string, () => Promise<Record<string, unknown>>> = {
   '@harness/tools-search/meta': () => import('@harness/tools-search/meta'),
   '@harness/tools-web': () => import('@harness/tools-web'),
   '@harness/tools-web/meta': () => import('@harness/tools-web/meta'),
+  '@harness/ui-widget': () => import('@harness/ui-widget'),
 }
 
 /**

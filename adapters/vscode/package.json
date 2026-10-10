@@ -446,6 +446,42 @@
         }
       },
       {
+        "name": "harness_ui_widget",
+        "tags": [
+          "harness"
+        ],
+        "toolReferenceName": "ui_widget",
+        "displayName": "Ui Widget",
+        "modelDescription": "Emit a structured UI widget declaration for the current output. Use it to present data as a rendered component (table / key-value / metric-cards / chart / timeline / diff) instead of plain text. Pick the widgetType that fits the data and pass the data as props.",
+        "canBeReferencedInPrompt": true,
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "widgetType": {
+              "type": "string",
+              "enum": [
+                "key-value",
+                "table",
+                "metric-cards",
+                "chart",
+                "timeline",
+                "diff",
+                "decision-card"
+              ],
+              "description": "The widget component type (must be one of the registered set)."
+            },
+            "props": {
+              "type": "object",
+              "description": "JSON-serializable data consumed by the renderer. Shape depends on widgetType."
+            }
+          },
+          "required": [
+            "widgetType",
+            "props"
+          ]
+        }
+      },
+      {
         "name": "harness_view_image",
         "tags": [
           "harness"
