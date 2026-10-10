@@ -1,5 +1,136 @@
 # Agent Harness 开发日志
 
+## 2026-10-10（续 267）审计面板 + 跑分面板（M4）
+
+### 起因
+
+M3（决策卡片 + decision.human 审计落盘）完成后进入 M4：审计面板（决策时间线/放行率/responseMs
+等，衡量决策卡片 UI 辅助效果）+ 跑分面板（pass^k 趋势、成本/延迟对比）。两者为 TUI 侧边栏新增
+两个 tab。
+
+### 决策与落地
+
+**一、审计面板（cli/panels.ts）**：
+- 纯函数 `parseAuditLog(text)`：解析 `{dataDir}/sessions/{id}.audit.jsonl`（M3 落盘）为
+  `AuditSummary`（total / 放行率 = allow+always-allow 占比 / 平均与中位 responseMs / 风险分布 /
+  时间线按 ts 升序）。非法行与"非 decision.human"计数 malformed，不抛。
+- 指标口径延续 M3 反转：**responseMs 与放行率衡量 UI 辅助效果**，非机器准确性。
+- `auditPanelLines` 渲染行（放行率 / 响应耗时 / 风险高·中·低 / 时间线，风险🟢🟡🔴 + 放行✗✓）。
+
+**二、跑分面板（cli/panels.ts + bench/metrics.ts）**：
+- bench `writeResults` 追加写 `{outDir}/history.jsonl`（每次跑分 append 一行 summary）——
+  跨多次跑组成 pass^k 趋势 / 成本·延迟对比，不依赖约定目录。
+- `parseBenchSummary` / `parseBenchHistory`：解析单份 summary 与多份历史；`loadBenchHistory`
+  读 `{dataDir}/bench/history.jsonl`（建议跑分 `--out <dataDir>/bench`）。
+- `benchPanelLines` 渲染行（跑分次数 / 最近 pass^1 / 各次 model·split·k·pass1·reward·延迟）。
+
+**三、TUI 侧边栏集成（cli/tui.tsx）**：`SidebarTabId` + `SIDEBAR_TABS` 新增 `audit`（🛡 决策审计）
+与 `bench`（📈 跑分）；切到对应 tab 的 effect 读取磁盘（审计读当前会话 audit.jsonl，跑分读
+bench history），面板逐行 `renderWidget` 无关（纯文本行）。
+
+### 验证
+
+- panels 13 pass（审计：放行率/平均与中位 responseMs/风险分布/时间线排序/malformed；跑分：
+  单份 pass1 与 passK/历史顺序/磁盘读取；渲染行）。
+- cli 447 pass / 0 fail（新增 tab 循环测试）；bench 22 pass；根 typecheck 0 error；46 包全 exit 0。
+
+## 2026-10-10（续 266）决策卡片落地：风险分级 + TUI 权限确认升级 + decision.human 审计（M3）
+
+### 起因
+
+M2（生成式 UI 基础）完成后进入 M3：**决策卡片是生成式 UI 第一个落地场景** —— 把现有 TUI
+权限确认升级为卡片（参数表格 + 风险标签 + 同类操作历史），规则引擎**只做风险分级打标签**
+（无 JEV、决策权归人工），人工按键放行/拒绝，`decision.human` 审计落盘
+`~/.harness/sessions/{id}.audit.jsonl`。核心指标反转：responseMs 与放行率衡量**人工决策
+是否更快/更放心**，非机器决策准确率。
+
+### 决策与落地
+
+**一、风险分级器（host/permission.ts）**：`assessRisk(toolKey, patterns, input)` 纯函数。
+判据按序：高危命令模式（rm -rf / sudo / curl|sh 等）→ high；高危工具键（bash/edit_file/
+write_file/delete 等）→ high；已知只读工具键 → low；其余 → medium。**只打标签不决策**，
+结果进 `PermissionPrompt.riskLevel` 供卡片与审计用。
+
+**二、decision-card widget（@harness/ui-widget）**：注册表第 7 个组件。props 含 tool /
+riskLevel / inputRows / historyCount / summary；渲染风险标签（🟢🟡🔴）+ 参数表格 +
+同类操作历史 + 按键提示。`WIDGET_TYPES` 同步加（ui_widget 工具 schema 枚举同源）。
+
+**三、TUI 权限确认升级为卡片（cli/tui.tsx）**：
+- 模态从 `setAskPrompt`（只给文本）改走 `setAsker`（拿 `req.toolKey/patterns/input` +
+  `prompt.riskLevel`），`buildDecisionCard` 组装卡片声明（`inputRows` 来自入参、
+  `historyCount` 统计本会话同类操作），渲染 `renderWidget('decision-card', …)`；
+  无结构化信息时回退原文本模态。
+- 按键直接回四态（`allow`/`deny`/`always-allow`/`always-deny`），不再走文本 → parse 往返。
+
+**四、decision.human 审计（host 接缝 + cli 落盘）**：
+- `InteractivePermissionEngine.ask()` 内计时 responseMs、构造信封（决策点 / tool / riskLevel /
+  actionTaken / rememberScope / stateHash），**零内容**：只记标量 + SHA-256 摘要
+  （`stateHashOf`），不记入参原文。allow-all/deny-all 短路与"取不到答复"（兜底 deny）
+  **不落审计**（非人工决策）。
+- `createAuditSink(dataDir)`：按会话建 writer（`{dataDir}/sessions/{id}.audit.jsonl`），
+  复用遥测 `createJsonlWriter`（防抖批量 + 失败静默）。HarnessApp 装配时经
+  `CliPermissionEngine` 透传注入。
+
+**五、踩坑**：decision-card 加入 `WIDGET_TYPES` ⇒ ui_widget 工具 schema 的 enum 变化 ⇒
+VSCode languageModelTools 守卫必红 ⇒ 重跑 `bun run gen:lm-tools` 恢复（与 M2 同一条纪律）。
+
+### 验证
+
+- host：permission 测试 24 pass（新增 assessRisk 4 条 + 审计 4 条：零内容/stateHash/
+  responseMs/rememberScope/短路不审计）。
+- cli：433 pass / 0 fail（新增 buildDecisionCard/countToolHistory 3 条 + 端到端审计
+  落盘 1 条：真实工具 permission 询问 → 人工放行 → audit.jsonl 单行断言）。
+- ui-widget 16 / host 116 全绿；根 typecheck 0 error；46 包测试全 exit 0。
+
+## 2026-10-10（续 265）生成式 UI 基础落地：WidgetPart + ui_widget 工具 + TUI widget 渲染（M2）
+
+### 起因
+
+M1（bench 跑分）完成后按路线进入 M2：生成式 UI 基础。方案定稿（project_memory 规划决策段）：
+**声明式 widget 声明**（模型产出数据声明非代码）、产出通道走**工具调用 `ui_widget`**（工具参数
+schema 即白名单 + 校验的天然执行点，与 tool pipeline/权限/审计全打通）、`WidgetPart` 落 session、
+TUI 新增 widget 块（widgetType→注册表→组件，每渲染器带 renderText 降级）。
+
+### 决策与落地
+
+**一、`WidgetPart` 落 session（@harness/session）**：`{ type:'widget', widgetType, props }` 显式
+加进 Part 联合（原兜底分支前）。双写入方共用同一通道：模型（ui_widget 工具，声明以 tool part
+的 result 落盘）+ 宿主（直接追加 WidgetPart，M3 决策卡片）。渲染端两形态汇入同一注册表。
+
+**二、新包 `@harness/ui-widget`（packages/plugins/ui-widget）**：
+- `WIDGET_RENDERERS` 注册表：首批 6 组件（key-value / table / metric-cards / chart / timeline /
+  diff，按 M3/M4 消费倒排），每渲染器 `render`（完整多行）+ `renderText`（单行摘要降级）。
+- `ui_widget` 工具：inputSchema 即白名单（widgetType 枚举 + props 对象，`fromJsonSchema` 硬校验），
+  call 只校验并回传结构化声明，只读/并发安全。
+- `widgetFromToolResult`：tool part 的 result → widget 声明（渲染层用）。
+- 注册为**内置插件**（optIn:false 默认启用）：lazy.ts 静态表 + plugins.ts 注册表 + host deps +
+  根 tsconfig paths + cli deps，builtin-registry 守卫测试自动钉住。
+
+**三、TUI 渲染（packages/cli）**：
+- `ChatBlockKind` 加 `'widget'`；`ChatBlock` 加 `widgetType`/`widgetProps`。
+- `applyStreamEvent` 加 `tool_call_result` 分支：`ui_widget` 成功结果 → `pushWidgetBlock`
+  （text 预填完整渲染，复制/选区直接可用）。
+- `renderBlockBody` 加 `case 'widget'`：widgetType→注册表→渲染器，未知类型兜底 JSON 摘要；
+  视觉区分（「▣ 组件」标题行）。
+- `messageToBlocks` 处理 widget part（宿主注入路径的历史还原，与实时块同源渲染）。
+- `selectable`/`copyable` 纳入 widget 块。
+- **双渲染规避**：`createProcessLine` 对 `ui_widget` 的调用/结果行**不进 console 文本通道**
+  （widget 块由流事件渲染）；REPL（无 onEvent）结果给 `renderWidgetText` 单行摘要降级。
+
+**四、provider 降级**：openai/anthropic 对 `widget` part 序列化为 `[Widget: <type>]` 单行
+（不回灌整份 props 进上下文）。此前走 default `JSON.stringify(part)` 虽不崩但徒增 token。
+
+**五、踩坑**：新增内置工具 ⇒ `adapters/vscode/package.json` 的 languageModelTools 贡献点守卫
+（gen-lm-tools.test.ts）必红 —— 按 AGENTS.md 硬约束重跑 `bun run gen:lm-tools`（11 条，
+含 ui_widget）后恢复全绿。
+
+### 验证
+
+- `packages/plugins/ui-widget`：14 pass（工具 schema/执行 + 6 渲染器 + 解析 + 插件工厂）。
+- `packages/cli`：429 pass / 0 fail（新增 applyStreamEvent widget 分支 4 条 + pushWidgetBlock +
+  messagesToBlocks widget part + createProcessLine 双通道端到端 1 条；gen:lm-tools 守卫重生成后通过）。
+- host 108 / provider-openai 32 / provider-anthropic 26 / session 35 全绿；根 typecheck 0 error。
+
 ## 2026-10-09（续 264）@harness/tools-builtin：`bash_ro` 放行丢弃到 `/dev/null` 的重定向 —— `2>/dev/null` 不再被判成写文件
 
 ### 起因

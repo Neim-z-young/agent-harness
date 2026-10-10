@@ -1757,3 +1757,98 @@ bench 是 `HarnessHost` 的**第一个纯 SDK 消费方**（此前只有 CLI/A2A
 宿主适配层、不走 `harness run`（单轮执行承载不了 user sim 多轮循环），只用
 `HostOptions`（`extraPlugins` / `agents` / `providers` / `permissionMode`）进程内装配。
 这验证了「host 与具体宿主无关」的分层承诺——跑分循环本身就是一种宿主形态。
+
+## 二十、生成式 UI 基础（@harness/ui-widget，M2 已落地 2026-10-10）
+
+### 20.1 定位：声明式 widget，宿主无关
+
+模型与宿主**产出数据声明而非代码**：`WidgetPart { type:'widget', widgetType, props }` 落
+session（@harness/session Part 联合），`widgetType` 决定渲染器（table / key-value /
+metric-cards / chart / timeline / diff），`props` 是渲染器消费的 JSON 数据。任何宿主
+（TUI / headless / 未来 Web）渲染**同一份声明**，零转换；headless/REPL 用 `renderText`
+单行摘要降级。
+
+### 20.2 双写入方共用同一通道
+
+```
+模型 ── ui_widget 工具 ──► tool part result（结构化声明）
+                               │  widgetFromToolResult（渲染层解析）
+宿主 ── 直接追加 WidgetPart ──► session messages            ──► WIDGET_RENDERERS 渲染
+```
+
+- **模型路径**：`ui_widget` 工具（`@harness/ui-widget` 内置插件，optIn:false）——inputSchema
+  即白名单（widgetType 枚举 + props 对象，`fromJsonSchema` 硬校验），call 只校验并回传声明；
+  声明以 tool part 的 result 落盘。工具经 `core.tool.pool.assemble` 注入，与权限/审计全打通
+  （M3 决策卡片复用同一管线）。
+- **宿主路径**：直接向 session 追加 WidgetPart（M3 决策卡片），不依赖模型。
+
+### 20.3 渲染接入（TUI）
+
+- `ChatBlockKind` 加 `'widget'`；`applyStreamEvent` 的 `tool_call_result` 分支识别
+  `ui_widget` 成功结果 → widget 块（text 预填完整渲染，复制/选区可用）。
+- **双渲染规避**：`createProcessLine` 对 `ui_widget` 的调用/结果行不进 console 文本通道；
+  REPL（无 onEvent）结果给 `renderWidgetText` 单行摘要。规则：**widget 块只由流事件通道产生**。
+- `messageToBlocks` 还原 widget part（历史/恢复路径与实时块同源渲染）。
+- provider 序列化 widget part 降级为 `[Widget: <type>]`（不回灌整份 props）。
+
+### 20.4 扩展约定
+
+新增组件 = 改 `WIDGET_RENDERERS` + `WIDGET_TYPES` 两处（工具 schema 枚举与注册表同源，
+避免"模型能声明、宿主不能渲染"的漂移）。新增内置工具会触发 VSCode languageModelTools 守卫
+必红 ⇒ 重跑 `bun run gen:lm-tools`（AGENTS.md 硬约束）。
+
+## 二十一、决策卡片与 decision.human 审计（M3 已落地 2026-10-10）
+
+### 21.1 决策流（无 JEV、决策权归人工）
+
+```
+决策点触发（core.permission.check → engine.ask）
+  → 风险分级器 assessRisk（host，只打标签不决策：高危→high / 只读→low / 其余→medium）
+  → 生成式 UI 决策卡片（decision-card widget：风险标签 + 参数表格 + 同类操作历史）
+  → 人工按键（允许 / 拒绝 / 始终允许 / 始终拒绝）
+  → decision.human 审计落盘（零内容 + stateHash）
+```
+
+规则引擎不自动决策中间地带（白名单/黑名单可硬拦高危的判定仍归权限规则），分级只影响
+**卡片呈现与审计标签**，放行与否永远由人按键决定。
+
+### 21.2 审计接缝
+
+- 事件信封（零内容约束，与遥测一致）：`{ schema:'harness.audit.v1', kind:'decision.human',
+  ts, sessionId, decisionPoint, tool, stateHash(SHA-256), riskLevel, actionTaken,
+  responseMs, rememberScope }` —— **不记入参原文**，`stateHash` 可复核不可逆推。
+- 落盘点：host `InteractivePermissionEngine.ask()`（计时 responseMs、构造信封、调审计 sink）。
+  **非人工决策不落审计**：allow-all/deny-all 短路、asker 取不到答复（兜底 deny）。
+- 落盘：cli `createAuditSink(dataDir)` 按会话建 writer（复用遥测 `createJsonlWriter`）→
+  `{dataDir}/sessions/{id}.audit.jsonl`。三个宿主共用 host 接缝，落盘实现归宿主。
+- 核心指标反转：**responseMs（人工响应耗时）与放行率衡量决策卡片 UI 辅助效果**
+  （人是否更快/更放心），而非机器决策准确率 —— M4 审计面板据此渲染时间线。
+
+### 21.3 TUI 集成
+
+权限确认模态从 `setAskPrompt`（文本）升级为 `setAsker`（结构化 `req` + `prompt.riskLevel`），
+`buildDecisionCard` 组装声明（入参 → 参数表格；本会话同类工具调用 → 历史统计），渲染
+decision-card；按键直接回四态，不再走文本 → 解析往返。无结构化信息时回退原文本模态。
+
+## 二十二、审计面板 + 跑分面板（M4 已落地 2026-10-10）
+
+### 22.1 数据纯函数（`packages/cli/src/panels.ts`，无 React，可单测）
+
+| 面板 | 数据源 | 解析 |
+|---|---|---|
+| 审计 | `{dataDir}/sessions/{id}.audit.jsonl` | `parseAuditLog` → `AuditSummary`（放行率 = allow+始终-allow 占比 / 平均·中位 responseMs / 风险高·中·低分布 / 时间线 ts 升序；非法行计 malformed 不抛） |
+| 跑分 | `{dataDir}/bench/history.jsonl`（bench `writeResults` 每次 append 一行 summary） | `parseBenchHistory` / `parseBenchSummary` → `BenchRecord[]`（model / split / k / pass1 / passK / avgReward / avgLatencyMs），跨多次跑组成 pass^k 趋势 |
+
+两面板的行渲染（`auditPanelLines` / `benchPanelLines`）都是返回字符串数组的纯函数。
+
+### 22.2 TUI 集成
+
+侧边栏 `SidebarTabId` + `SIDEBAR_TABS` 新增 `audit`（🛡 决策审计）与 `bench`（📈 跑分）。切到
+对应 tab 的 effect 读取磁盘（审计读当前会话 audit.jsonl；跑分读 bench history），面板逐行渲染。
+跑分面板建议跑分时 `--out <dataDir>/bench` 以便 TUI 可见。
+
+### 22.3 指标口径（承接 M3）
+
+审计面板的放行率 / responseMs / 时间线即 M3 决策卡片辅助效果的**可观测面**：放行率趋稳、响应
+耗时趋短 ⇒ 卡片让"更快/更放心"；风险分布提示高危操作的频次。闭环：决策卡片（M3）→ 人工决策 →
+审计落盘（M3）→ 面板呈现（M4）。

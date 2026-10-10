@@ -112,10 +112,17 @@ bun packages/bench/src/cli.ts \
 
 ## 8. M2-M4 路线（同批定稿，摘要）
 
-- **M2 生成式 UI 基础**：`WidgetPart` 落 session + `ui_widget` 工具通道 + TUI widget 渲染
-  （声明式 widget 声明，宿主无关；headless 走 `renderText` 降级）。
-- **M3 决策卡片**：权限确认升级为卡片（参数表格/diff 预览/风险标签/同类操作历史），规则引擎
+- **~~M2 生成式 UI 基础~~**：`WidgetPart` 落 session + `ui_widget` 工具通道 + TUI widget 渲染
+  （声明式 widget 声明，宿主无关；headless 走 `renderText` 降级）。✅ **完成（2026-10-10，
+  续 265）**：`@harness/ui-widget`（注册表 6 组件 + 工具 + 内置插件）+ TUI widget 块 +
+  双渲染规避 + provider 降级，cli 429 / ui-widget 14 测试全绿。
+- **~~M3 决策卡片~~**：权限确认升级为卡片（参数表格/diff 预览/风险标签/同类操作历史），规则引擎
   只做风险分级，**无 JEV、决策权归人工**，`decision.human` 审计落
-  `~/.harness/sessions/{id}.audit.jsonl`。
-- **M4 审计面板 + 跑分面板**：决策时间线/放行率/responseMs（衡量 UI 辅助效果）；bench 结果
-  可视化（pass^k 趋势、成本/延迟对比）。
+  `~/.harness/sessions/{id}.audit.jsonl`。✅ **完成（2026-10-10，续 266）**：
+  `assessRisk` 分级器（host）+ decision-card 组件 + TUI 模态升级（setAsker）+ 审计接缝
+  （`InteractivePermissionEngine.ask()` 计时/信封 + cli `createAuditSink` 落盘），
+  host 24 / cli 433 测试全绿。遗留：A2A / VSCode 宿主的审计落盘接入（host 接缝已就绪）。
+- **~~M4 审计面板 + 跑分面板~~**：决策时间线/放行率/responseMs（衡量 UI 辅助效果）；bench 结果
+  可视化（pass^k 趋势、成本/延迟对比）。✅ **完成（2026-10-10，续 267）**：`panels.ts` 纯函数
+  （审计 `parseAuditLog` + 跑分 `parseBenchHistory`）+ TUI 侧边栏 `audit`/`bench` 两个 tab +
+  bench `history.jsonl` 追加（跨多次跑趋势）。M1-M4 全部完成，路线闭环。

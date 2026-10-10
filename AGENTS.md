@@ -147,6 +147,32 @@
   （`MockChatProvider` / `AnthropicChatProvider` / `OpenAIChatProvider`），不要走
   `createProvider*Plugin().provider`——插件的 getter 惰性创建，`install()` 前访问会抛错。
 
+- `@harness/ui-widget`：生成式 UI（2026-10-10 M2 落地）——`WIDGET_RENDERERS` 注册表
+  （widgetType → 渲染器，`render` 完整渲染 + `renderText` 单行降级）+ `ui_widget` 工具
+  （模型产出结构化 UI 声明，inputSchema 即白名单）。**双渲染纪律**：`createProcessLine` 对
+  `ui_widget` 的调用/结果行**不进 console 文本通道**（TUI 的 widget 块由流事件
+  `tool_call_result` 渲染），REPL（无 onEvent）给 `renderWidgetText` 摘要。provider 序列化
+  widget part 时降级为 `[Widget: <type>]` 单行，不回灌整份 props。**新增组件 = 改
+  `WIDGET_RENDERERS` + `WIDGET_TYPES` 两处**（工具 schema 枚举与注册表同源）。
+  新增内置工具会触发 `adapters/vscode/package.json` 的 languageModelTools 守卫必红 ⇒
+  必须重跑 `bun run gen:lm-tools`。
+
+- **人工决策审计（M3，2026-10-10）**：`decision.human` 事件信封
+  `{ schema:'harness.audit.v1', kind:'decision.human', ts, sessionId, decisionPoint, tool,
+  stateHash(SHA-256), riskLevel, actionTaken, responseMs, rememberScope }`，**零内容**（不记
+  入参原文）。分级器 `assessRisk`（host）**只打标签不决策**（高危模式/工具键→high、只读→low、
+  其余→medium），决策权永远归人工。审计落盘点在 host `InteractivePermissionEngine.ask()`：
+  allow-all/deny-all 短路与"取不到答复"（兜底 deny）**不落审计**。落盘走 cli `createAuditSink`
+  （per-session writer，复用遥测 `createJsonlWriter` → `{dataDir}/sessions/{id}.audit.jsonl`）。
+  TUI 权限确认升级为 decision-card（`setAsker` 拿结构化信息，按键直接回四态，不再走文本往返）。
+
+- **审计 + 跑分面板（M4，2026-10-10）**：`packages/cli/src/panels.ts` 是**无 React 的纯函数**层
+  （`parseAuditLog` 审计 / `parseBenchHistory`+`parseBenchSummary` 跑分 / `*PanelLines` 渲染行），
+  侧边栏 `audit`（🛡）与 `bench`（📈）两个 tab 渲染消费。**数据源约定**：审计读
+  `{dataDir}/sessions/{id}.audit.jsonl`；跑分读 `{dataDir}/bench/history.jsonl`（bench
+  `writeResults` 每次 append 一行 summary，跨多次跑组成趋势）—— 面板解析函数保持纯，TUI/
+  其他宿主各自负责磁盘读取。跑分建议 `--out <dataDir>/bench` 便于面板可见。
+
 - `@harness/a2a-server`：A2A（Agent2Agent）服务端**宿主/适配器层** —— 与 `@harness/cli` 同级，**不是**业务能力插件。
   只做协议翻译与装配：把 `@harness/host` 的装配暴露为 A2A v1.0 协议服务（AgentCard / SendMessage /
   SendStreamingMessage(SSE) / GetTask / CancelTask）。**不内置业务决策、不绕过权限、不直接调工具**，
