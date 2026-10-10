@@ -11,7 +11,7 @@
 | 能力 | macOS / Linux | Windows |
 |---|---|---|
 | 执行 shell | `bash -c` | `bash.exe` → `pwsh` → `powershell` → `cmd`（探测） |
-| 危险命令检测 | ✅ 13 条表 | ⚠️ 表里 Windows 专属只有 1 条（`format /s /f /q`） |
+| 危险命令检测 | ✅ 12 条表 | ⚠️ 表里 Windows 专属只有 1 条（`format /s /f /q`） |
 | 命令白名单（`config.allowlist`） | ✅ 生效 | ❌ **禁用**（bash 首命令语义不适用，见 §1） |
 | 只读哨兵 `bash_ro` | ✅ 白名单 + AST 双门 | ❌ **直接拒绝**（`SANDBOX_RO_NO_BASH`，见 §1） |
 | 环境信息注入（env-context） | ✅ | ✅（shell 名做了同口径探测） |
@@ -36,7 +36,7 @@
 
 | # | 缺口 | 为什么是 P0（判据） | 位置 |
 |---|---|---|---|
-| P0-1 | **危险命令表缺 Windows 原生形态** | 现有 13 条里 Windows 专属只有 `format /s /f /q`。`del /f /s /q C:\`、`rd /s /q`、`Remove-Item -Recurse -Force C:\`、`Format-Volume`、`Clear-Disk`、`Stop-Computer`、`reg delete HKLM\…` 全部**不命中** ⇒ 破坏性命令直接放行 | `DEFAULT_DANGEROUS_PATTERNS` |
+| P0-1 | **危险命令表缺 Windows 原生形态** | 现有 12 条里 Windows 专属只有 `format /s /f /q`。`del /f /s /q C:\`、`rd /s /q`、`Remove-Item -Recurse -Force C:\`、`Format-Volume`、`Clear-Disk`、`Stop-Computer`、`reg delete HKLM\…` 全部**不命中** ⇒ 破坏性命令直接放行 | `DEFAULT_DANGEROUS_PATTERNS` |
 | P0-2 | **`splitSegments` 不以单个 `&` 分段** | CMD 的 `cmd1 & cmd2` 是合法串联；现表只切分号、换行、双与、双竖线、单竖线，**单个 `&` 不分段** ⇒ `echo hi & shutdown -h now` 只被当成一段，段级 deny 漏判 | `splitSegments` |
 | P0-3 | **`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | `& 'C:\evil.exe' -x` 的首命令被提取成 `&` ⇒ 以命令名为准的白名单/deny 规则失配 | `extractFirstCommand` |
 | P0-4 | **引号/转义解析是 POSIX 方言** | PowerShell 用反引号 `` ` `` 转义、here-string `@"…"@`、`''` 表单引号。`stripQuoted` 不认 ⇒ 「去掉引号后的结构投影」在 PS 上不准，结构性检查（重定向/进程替换）可能漏判 | `stripQuoted` / `WRITE_CHANNEL_PATTERNS` |
@@ -92,4 +92,6 @@
 
 - 本文只管**平台差异**；宿主装配（`@harness/host` 一份）见 `docs/host-extraction-design.md`。
 - A2A / VSCode 宿主的接入状态见 `docs/external-integration-plan.md`（VSCode 的 sidecar 就是 `harness a2a`，故两侧同源）。
-- 本文不涉及「远程/沙箱隔离」（那是宿主职责，另议）。
+- **沙箱 / 隔离**（命令执行边界、文件系统与网络绑定、资源上限、插件代码边界）见
+  [`docs/sandbox-isolation-plan.md`](sandbox-isolation-plan.md)。⚠️ **两份计划的 P0 有交集**：
+  本文 P0-5（超时不杀进程树）、P0-6（UNC 路径）在那份里同时是隔离缺口，**修的时候一次改到位**。

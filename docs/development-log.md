@@ -1,5 +1,74 @@
 # Agent Harness 开发日志
 
+## 2026-10-10（续 269）沙箱隔离方案（盘点 + 分层目标形态）
+
+### 起因
+
+跨平台计划 §5 里写了「本文不涉及**远程/沙箱隔离**（那是宿主职责，另议）」—— 本条即那份"另议"。
+需求侧的理由：当前所有"沙箱"闸门都在**同一个 Node 进程里、以当前用户全权限**执行，
+策略能拦"模型写了什么"，拦不住"那段代码真的能干什么"。
+
+### 决策与落地
+
+**产出 `docs/sandbox-isolation-plan.md`（只出方案，不实现）**，四部分：
+
+**一、现状一句话 + 现状表**：今天的沙箱是**策略级（in-process policy）**，不是 OS 级。
+表里逐项标 ✅/⚠️/❌ 与代码位置 —— 关键结论三条：
+- ✅ 有：命令级策略（危险表 12 条 + AST 复核门 + 白名单 + cwd 边界 + env 过滤）、三模式权限引擎、
+  A2A 调用方隔离、快照回滚、subagent worktree、人工决策审计。
+- ❌ **全无**：资源上限、网络出口控制、OS 级 FS/网络绑定（无 seatbelt / bwrap / landlock / 容器）、
+  插件代码边界、**沙箱策略可配置性**。
+- ⚠️ 不成体系：`isWithinCwd` / `resolvePath` 在 6 个包各写一份。
+
+**二、分层目标形态（方案骨架）**：L0 策略层（已有，差可配置）→ **L1 进程层**（资源上限 +
+超时杀进程树 + env 默认拒绝）→ **L2 文件系统/网络绑定**（目录读写分域 + OS 原语把可写区
+真的限制住）→ **L3 平台层**（容器 / microVM / 远程 executor，与 `external-integration-plan.md`
+§9 的执行后端抽象合流）。配四条纪律：①`probeIsolation()` 与 `resolveShell()` 同范式；
+②**不模拟**（拿不到 OS 原语就显式降级+告警，绝不"看起来隔离了"）；③档位可声明
+（`sandbox.level`，宿主可要求"至少 L2 否则拒绝启动"）；④可观测（`BashOutput.isolation` +
+审计 `isolationLevel`）。
+
+**三、待补清单**（P0 7 条 / P1 8 条 / P2 4 条 / P3 4 条）—— P0 全部给了"判据"（怎么算漏了）：
+- **P0-1 沙箱策略从 `config.json` 根本设不到**：组合根用**无参单例**注册
+  （`host/src/plugins.ts:320` 的 `load: … toolsBuiltinPlugin`，而 `toolsBuiltinPlugin =
+  createToolsBuiltinPlugin()`）⇒ `allowlist` / `rootDir` / `dangerousDetection` / `sanitizeEnv` /
+  `fallbackToHost` 一条都不可配。**"在 config 里写了白名单以为生效"是静默失效**。
+- **P0-2 MCP 子进程全量继承 env**：`mcp-client/src/index.ts:147` `env: { ...process.env, … }`
+  ⇒ 同一个 `GITHUB_TOKEN`，bash 里被摘掉、**第三方 MCP server 里照样读得到**（隔离不对称）。
+- **P0-3 读侧无隔离**：`isWithinCwd` 只保证"在 cwd 里" ⇒ `cat .env` / `cat .harness/.config-key`
+  畅通；env 过滤挡不住从文件里再读一遍。
+- **P0-4 路径边界无 `realpath` ⇒ symlink 逃逸**：`isWithinCwd` 是纯字符串 `relative()` 前缀判定，
+  `resolvePath` 只用 `resolve`。cwd 内 `ln -s /etc secret` ⇒ `secret/passwd` 的 relative 是
+  `secret/passwd`，**判定通过**而 `stat/open` 跟随链接读到外部。对照：`skill` / `subagent` 已用
+  `realpathSync`，**工具侧没有**。
+- **P0-5 6 份副本** / **P0-6 超时不杀进程树**（与跨平台 P0-5 同一条，此处从隔离视角记）/
+  **P0-7 `fallbackToHost` 档位下沉无记录**（allow-all 下静默从"沙箱"降到"宿主全权"，`viaHost`
+  只在返回值里，审计不记）。
+
+**四、实施顺序 + 验收口径 + 与其它计划的关系**：先 P0-1（不先做这条后面策略用户都摸不到）→
+P0-4/P0-5/P3-1 一次改完（收敛成一份 `realpath` 版实现替换 6 处）→ P0-2/P0-3 → P0-6+P1-1 →
+L1/L2 …
+
+**顺带**：给 `cross-platform-plan.md` 补了与新文档的双向互链，并订正一处**数字笔误** ——
+危险命令表是 **12 条**（原文写 13），已按源码行数核对（`awk` 切数组 + 排注释行计数）。
+
+### 只有实现时才暴露的发现
+
+- 本仓"沙箱"一词在代码里有**三处不同含义**，读的时候必须分清：①`tools-builtin` 的
+  `BashSandboxConfig`（命令级策略）；②A2A 的调用方隔离（身份层）；③swarm 协议里的
+  `sandbox_permission_*`（**死协议**：类型与 inbox 消费都在，没有任何生产者）。本文只统管第一类，
+  第二类已具备，第三类在 P1-6 记为"要么接生产者、要么删掉类型"。
+- **BSD grep 的 `\s`**：`grep -E '^\s+/'` 在 macOS 上恒 0 命中（不报错）—— 与既有记忆里
+  "zsh + BSD grep 多模式 `\|` 静默返回空"是同一类坑。改用 `'^  /[^/]'` 才数对（而且要注意
+  `  // 注释` 也会被 `^  /` 匹配）。
+
+### 验证
+
+- 仅文档变更（新增 `docs/sandbox-isolation-plan.md`、修订 `docs/cross-platform-plan.md`）。
+- 未触碰 `compression` 白名单与任何 ` ```jsonc ` 片段 ⇒ 只重跑**受影响的**
+  `@harness/cli` 用例（它会扫 `docs/` 全目录喂 `checkCompressionConfig`）：**448 pass / 0 fail**。
+  未改任何源码 ⇒ 不重跑全仓 typecheck / test（上一轮全绿：0 error、2714 pass / 0 fail / 0 skip）。
+
 ## 2026-10-10（续 268）审计落盘上移到 host（A2A/VSCode 宿主接入）+ 跨平台补齐计划
 
 ### 起因
