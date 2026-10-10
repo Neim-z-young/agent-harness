@@ -9,12 +9,12 @@
  */
 import { describe, it, expect, afterEach } from 'bun:test'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AGENT_CARD_PATH, A2A_VERSION_HEADER, Message, TaskState } from '@a2a-js/sdk'
 import { defineTool, type Hooks } from '@harness/core'
-import { HarnessHost, type Host } from '@harness/host'
+import { HarnessHost, createAuditSink, type Host } from '@harness/host'
 import type { MockProviderConfig } from '@harness/provider-mock'
 import { CallerRegistry } from './auth'
 import { messageOf, textPart } from './mapping'
@@ -90,6 +90,8 @@ interface Fixture {
   host: Host
   server: A2aServer
   calls: { echo: number }
+  /** 本次 fixture 的数据目录（审计文件落在其 `sessions/` 下） */
+  dataDir: string
 }
 
 async function makeServer(opts: {
@@ -97,13 +99,16 @@ async function makeServer(opts: {
   permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   token?: string
   maxConcurrentTasks?: number
+  /** 装人工决策审计 sink（`createAuditSink(dataDir)`）；默认不装 */
+  audit?: boolean
 }): Promise<Fixture> {
   const dir = mkdtempSync(join(tmpdir(), 'a2a-srv-'))
   dirs.push(dir)
   const calls = { echo: 0 }
+  const dataDir = join(dir, '.harness')
   const host = new HarnessHost({
     cwd: dir,
-    dataDir: join(dir, '.harness'),
+    dataDir,
     agentId: 'default',
     provider: 'mock',
     permissionMode: opts.permissionMode ?? 'ask',
@@ -111,6 +116,7 @@ async function makeServer(opts: {
     extraPlugins: [echoPlugin(calls) as never],
     autoResume: false,
     backgroundPreload: false,
+    ...(opts.audit ? { audit: createAuditSink(dataDir) } : {}),
   })
   await host.boot()
   const server = createA2aServer({
@@ -121,7 +127,7 @@ async function makeServer(opts: {
     ...(opts.maxConcurrentTasks !== undefined ? { maxConcurrentTasks: opts.maxConcurrentTasks } : {}),
   })
   servers.push(server)
-  return { host, server, calls }
+  return { host, server, calls, dataDir }
 }
 
 // ========================================================================
@@ -404,6 +410,47 @@ describe('A2aServer：INPUT_REQUIRED 挂起与续接', () => {
     )
     expect(second.status.state).toBe('TASK_STATE_COMPLETED')
     expect(calls.echo).toBe(0)
+  })
+
+  // A2A / VSCode 宿主的审计落盘接入：远程权限点经挂起桥问到人之后，人工决策要落
+  // `{dataDir}/sessions/{id}.audit.jsonl`。这条用例同时钉住两件事：
+  //   ① 权限询问在 A2A 路径下**带 sessionId**（`ToolPipeline` 从 `ctx.sessionId` 填入），
+  //      否则 `createAuditSink` 的"无 sessionId 即丢弃"会让审计静默残缺；
+  //   ② 落盘的文件名/内容与 CLI 路径一致（同一份 `createAuditSink`）。
+  it('人工答复落 audit.jsonl（会话归属正确、零内容 + stateHash）', async () => {
+    const { server, dataDir } = await makeServer({
+      mock: toolThenText('go', '工具说 ok'),
+      permissionMode: 'ask',
+      audit: true,
+    })
+    const first = taskOf(await send(server, 'go', { contextId: 'c1', messageId: 'm1' }))
+    expect(first.status.state).toBe('TASK_STATE_INPUT_REQUIRED')
+    const second = taskOf(
+      await send(server, 'allow', { contextId: first.contextId, taskId: first.id, messageId: 'm2' }),
+    )
+    expect(second.status.state).toBe('TASK_STATE_COMPLETED')
+
+    const file = join(dataDir, 'sessions', 'c1.audit.jsonl')
+    expect(existsSync(file)).toBe(true)
+    const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+    expect(lines.length).toBe(1)
+    const evt = JSON.parse(lines[0]!) as Record<string, unknown>
+    expect(evt.schema).toBe('harness.audit.v1')
+    expect(evt.kind).toBe('decision.human')
+    expect(evt.sessionId).toBe('c1')
+    expect(evt.tool).toBe('echo')
+    expect(evt.actionTaken).toBe('allow')
+    expect(evt.rememberScope).toBe('once')
+    // 零内容：入参原文（'go'）只以 stateHash 形式体现，不落明文
+    expect(typeof evt.stateHash).toBe('string')
+    expect(lines[0]).not.toContain('"input"')
+  })
+
+  it('未装审计 sink 时不产生 audit 文件（缺省无审计，不误建空文件）', async () => {
+    const { server, dataDir } = await makeServer({ mock: toolThenText('go', 'ok'), permissionMode: 'ask' })
+    const first = taskOf(await send(server, 'go', { contextId: 'c1', messageId: 'm1' }))
+    await send(server, 'allow', { contextId: first.contextId, taskId: first.id, messageId: 'm2' })
+    expect(existsSync(join(dataDir, 'sessions', 'c1.audit.jsonl'))).toBe(false)
   })
 
   // 回归（真机踩过，2026-10-09）：**流式**续接同样必须成立。

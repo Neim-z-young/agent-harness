@@ -91,7 +91,7 @@ import type { HarnessConfig, SessionEndpoint } from './config'
 import { makeNotice, renderNotice } from './notice'
 import type { HostNotice, NoticeSink } from './notice'
 import { InteractivePermissionEngine } from './permission'
-import type { PermissionAsker, PermissionMode, PermissionStoreFile } from './permission'
+import type { HumanDecisionEvent, PermissionAsker, PermissionMode, PermissionStoreFile } from './permission'
 // 默认 Agent 提示词：独立文本文件，import 加载（Bun 原生支持文本导入；tsc 侧由 ./env.d.ts 声明）。
 // 随 `defaultAgent()` 一并自 cli 上移 —— 它是装配产物的一部分，不是终端形态。
 import defaultAgentPrompt from './prompts/default-agent.txt'
@@ -127,6 +127,14 @@ export interface HostOptions {
    * 缺省 = `InteractivePermissionEngine` 的"取不到答复 ⇒ deny"语义。
    */
   asker?: PermissionAsker
+  /**
+   * 人工决策审计落盘接缝（M3 `decision.human`，见 `./permission.ts` 的 `HumanDecisionEvent`）。
+   *
+   * 权限引擎只**产出**事件，落盘实现归宿主：CLI 传 `createAuditSink(dataDir)`，A2A 宿主
+   * （`runA2aCli` / VSCode sidecar 走的就是它）同样传一份 —— 否则「同一条人工决策换个宿主
+   * 就没有审计记录」。缺省不审计（纯 headless 场景无人工决策可记）。
+   */
+  audit?: (env: HumanDecisionEvent) => void | Promise<void>
   /** 测试注入 */
   mockProviderConfig?: MockProviderConfig
   anthropicProviderConfig?: any
@@ -319,6 +327,7 @@ export class HarnessHost {
     return new InteractivePermissionEngine(rules, {
       mode,
       asker: this.options.asker,
+      audit: this.options.audit,
       store: { ...(rules as any), save },
     })
   }

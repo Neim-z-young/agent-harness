@@ -377,15 +377,6 @@ interface ResolvedShell {
   name: string
 }
 
-/** Windows 上常见 POSIX 命令到 PowerShell cmdlet/别名的映射（仅用于提示，不转换命令）。 */
-const POWERSHELL_KNOWN_ALIASES = new Map<string, string>([
-  ['ls', 'Get-ChildItem'], ['cat', 'Get-Content'], ['pwd', 'Get-Location'],
-  ['cd', 'Set-Location'], ['rm', 'Remove-Item'], ['cp', 'Copy-Item'],
-  ['mv', 'Move-Item'], ['echo', 'Write-Output'], ['ps', 'Get-Process'],
-  ['kill', 'Stop-Process'], ['sleep', 'Start-Sleep'], ['sort', 'Sort-Object'],
-  ['tee', 'Tee-Object'], ['diff', 'Compare-Object'], ['find', ''],
-])
-
 /**
  * 解析当前平台下应使用的 shell。
  *

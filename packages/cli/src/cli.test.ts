@@ -77,6 +77,8 @@ describe('@harness/cli re-export 兼容（上移符号与 @harness/host 同源�
       'checkCompactionReachability', 'checkTelemetryConfig', 'buildConfigOverview',
       // 权限接缝（S2-②）
       'InteractivePermissionEngine',
+      // 人工决策审计落盘（M3 后上移：三个宿主共用一份）
+      'createAuditSink',
       // 装配主体（S2-③）
       'HarnessHost', 'createHost',
     ]
@@ -86,6 +88,27 @@ describe('@harness/cli re-export 兼容（上移符号与 @harness/host 同源�
       if (cli[name] !== h) throw new Error(`@harness/cli 的 ${name} 与 @harness/host 不同源（re-export 被改动）`)
       expect(cli[name]).toBe(h)
     }
+  })
+})
+
+describe('A2A 宿主审计接入（源码守卫）', () => {
+  // A2A 宿主的审计接入（M3 遗留项）。为什么用源码守卫：`runA2aCli` 会把进程挂起直到
+  // shutdown，无法在单测里跑完整装配；而"少传一个 `audit`"是**静默失效**（host 的 audit
+  // 本就可选，缺省不审计）—— 类型与运行时都不会报错，只有真机跑一轮人工放行后去翻文件
+  // 才发现"没有审计记录"。A2A 是 VSCode 扩展的 sidecar（`harness a2a --json --port 0`），
+  // 故这一行同时决定 A2A 与 VSCode 两个宿主有没有审计。
+  it('runA2aCli 的 createHost 传 audit: createAuditSink(dataDir)（防静默无审计）', () => {
+    const src = readFileSync(new URL('./index.ts', import.meta.url), 'utf8')
+    const fnStart = src.indexOf('export async function runA2aCli')
+    expect(fnStart).toBeGreaterThan(0)
+    const hostStart = src.indexOf('createHost({', fnStart)
+    expect(hostStart).toBeGreaterThan(0)
+    // 用「换行 + 2 空格 + `})`」定位调用收尾：参数体内有 `{ model } : {})` 这类片段，
+    // 直接找第一个 `})` 会在 `...({ model } : {}),` 处提前截断（实测踩过）。
+    const hostEnd = src.indexOf('\n  })', hostStart)
+    expect(hostEnd).toBeGreaterThan(hostStart)
+    const hostBody = src.slice(hostStart, hostEnd)
+    expect(hostBody).toInclude('audit: createAuditSink(dataDir)')
   })
 })
 

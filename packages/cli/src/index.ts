@@ -115,7 +115,9 @@ export {
 } from '@harness/host'
 export type { HarnessConfig, AcpScopeSection, ModelResolution, SessionEndpoint } from '@harness/host'
 // 权限接缝（P0 收尾 S2 第二步）：四态语义 / 模式短路 / 规则写回已上移到 host，cli 只留文本提问适配。
-import { InteractivePermissionEngine } from '@harness/host'
+// `createAuditSink` 与之同源（M3 后由 cli 上移到 host）—— 本地也要 import 一份供构造期使用，
+// `export ... from` 只重导出、不在本作用域引入名字（见下方 §3.5 的 re-export）。
+import { InteractivePermissionEngine, createAuditSink } from '@harness/host'
 import type { PermissionAnswer, PermissionAsker, PermissionMode, PermissionStoreFile } from '@harness/host'
 export type { PermissionAnswer, PermissionAsker, PermissionMode, PermissionStoreFile } from '@harness/host'
 export { InteractivePermissionEngine } from '@harness/host'
@@ -435,22 +437,14 @@ export interface HarnessAppOptions extends HostOptions {
 }
 
 /**
- * M3 审计 sink：按会话建 JSONL writer（`{dataDir}/sessions/{id}.audit.jsonl`），
- * 复用遥测的 `createJsonlWriter`（防抖批量 + 失败静默）。零内容约束由事件信封保证
- * （`HumanDecisionEvent` 只有标量 + stateHash）。
+ * M3 审计 sink：按会话写 `{dataDir}/sessions/{id}.audit.jsonl`。
+ *
+ * **实现已上移到 `@harness/host`**（`packages/host/src/audit.ts`）：审计落盘是**宿主无关**的
+ * 能力，而三个宿主都要用它（CLI / A2A（VSCode sidecar 走的就是 A2A）/ 将来其它）。
+ * 留在 cli 会让 A2A 宿主要么反向依赖 cli、要么各写一份 —— 后者正是"同一条人工决策换个宿主
+ * 就没有审计记录"的成因。这里保留 re-export，导出面逐字不变（见 `cli.test.ts` 的同源断言）。
  */
-export function createAuditSink(dataDir: string): (env: HumanDecisionEvent) => void {
-  const writers = new Map<string, JsonlWriter<HumanDecisionEvent>>()
-  return (env) => {
-    if (!env.sessionId) return // 无会话归属不落审计（事件本身可有可无，属审计完整性而非安全）
-    let w = writers.get(env.sessionId)
-    if (!w) {
-      w = createJsonlWriter<HumanDecisionEvent>(join(dataDir, 'sessions', `${env.sessionId}.audit.jsonl`))
-      writers.set(env.sessionId, w)
-    }
-    w.write(env)
-  }
-}
+export { createAuditSink } from '@harness/host'
 
 export class HarnessApp extends HarnessHost {
   /**
@@ -468,14 +462,19 @@ export class HarnessApp extends HarnessHost {
     // 未注入输出流时落到真实 stdout：否则装配期诊断与 logger 的 [WARN]/[ERROR] 会被静默丢掉
     // （如「未配置 ANTHROPIC_API_KEY，自动 fallback 到 Mock」——用户永远看不到）。
     const out = options.stdout ?? process.stdout
+    // M3 审计：显式注入（`options.audit`）优先；否则按 `dataDir` 默认建 `createAuditSink`。
+    // 同一个值既进 host options（基类默认路径用），又留一份给覆写的 `createPermissionEngine`
+    // —— 因为覆写**完全替代**基类工厂，基类那份 `audit: options.audit` 在 CLI 路径上不会执行。
+    const audit = options.audit ?? (options.dataDir ? createAuditSink(options.dataDir) : undefined)
     super({
       ...options,
+      audit,
       onNotice: (n) => out.write(renderNotice(n)),
       logLine: (line) => out.write(line),
       asker: cliAsker(options.askPrompt),
     })
     this.cliAskPrompt = options.askPrompt
-    this.auditSink = options.dataDir ? createAuditSink(options.dataDir) : undefined
+    this.auditSink = audit
   }
 
   /**
@@ -1920,6 +1919,10 @@ export async function runA2aCli(options: {
     verbose: args.verbose,
     snapshot,
     allowPluginCode: args.allowPluginCode ?? false,
+    // M3 审计（A2A / VSCode 宿主的落盘接入）：远程权限点经 executor 的挂起桥问到人之后，
+    // 决策同样要落 `{dataDir}/sessions/{id}.audit.jsonl`。VSCode 扩展的 sidecar 正是本命令
+    // （`harness a2a --json --port 0`），故这一处接入即覆盖 A2A 与 VSCode 两个宿主。
+    audit: createAuditSink(dataDir),
     // A2A 是服务端：不该"恢复上次会话"（会话由 contextId 显式寻址），也不该在 boot 末尾
     // 静默预加载 —— 启动提示应当是确定性的。
     autoResume: false,
