@@ -1,5 +1,83 @@
 # Agent Harness 开发日志
 
+## 2026-10-10（续 268）审计落盘上移到 host（A2A/VSCode 宿主接入）+ 跨平台补齐计划
+
+### 起因
+
+M3 把 `decision.human` 审计落盘做在 `@harness/cli` 的 `HarnessApp` 里（续 266）。但审计落盘是
+**宿主无关**能力，而 harness 有三个宿主（CLI / A2A / VSCode）—— VSCode 扩展的 sidecar 正是
+`harness a2a --json --port 0`。`runA2aCli` 走的 `createHost` 与 `HarnessApp` **不是同一条装配
+路径**，于是 A2A/VSCode 宿主下人工决策**没有任何审计记录**（`tau-bench-plan.md` 记录的 M3
+遗留项）。本轮补齐，并顺带产出跨平台能力盘点。
+
+### 决策与落地
+
+**一、审计 sink 上移到 `@harness/host`（`packages/host/src/audit.ts`，新）**：
+- `createAuditSink(dataDir)` 保留**逐字相同的导出名与签名**（`(env: HumanDecisionEvent) => void`），
+  只把实现从 cli 搬到 host —— 三宿主共用一份，根除"换个宿主就没审计"。
+- **实现细节变更**：弃用遥测的 `createJsonlWriter`（防抖批量），改**同步 `appendFileSync`**。
+  三条理由：①审计事件频率极低（一次人工决策一条），防抖收益为零；②防抖会在进程被 kill 时
+  丢尾部 —— 而"进程被 kill"恰是审计最需要留下记录的场景；③不再依赖 `@harness/telemetry`
+  （host 对它只有惰性引用，静态 import 会把"按需"变成"总是进 bundle"）。
+- 行为细节：目录惰性 `mkdirSync(recursive)` + `readyDirs` 缓存；`env.sessionId` 为空直接丢弃
+  （无会话归属不落盘）；写入整体 `try/catch` 静默（audit best-effort，不反向影响已由人做出的决策）。
+
+**二、接缝暴露（`host.ts`）**：`HostOptions` 新增 `audit?: (env: HumanDecisionEvent) => void | Promise<void>`，
+`createPermissionEngine` 透传给 `InteractivePermissionEngine`。权限引擎只**产出**事件、落盘归宿主
+（与 M3「权限语义只有一份」的分层一致）。
+
+**三、两个宿主接上**：
+- **CLI**：`HarnessApp` 构造器 `const audit = options.audit ?? (options.dataDir ? createAuditSink(options.dataDir) : undefined)`，
+  **同一个值既进 `super` 的 host options、又留一份给本类字段** —— 因为 `HarnessApp` 覆写的
+  `createPermissionEngine` **完全替代**基类工厂，基类那份 `audit: options.audit` 在 CLI 路径上
+  根本不会执行（只改 host 不足以让 CLI 落审计）。
+- **A2A（= VSCode sidecar）**：`runA2aCli` 的 `createHost({ … })` 加 `audit: createAuditSink(dataDir)`。
+  **一处接入即覆盖 A2A 与 VSCode 两个宿主**。
+- cli 保留 `export { createAuditSink } from '@harness/host'`，导出面逐字不变（`cli.test.ts` 的 MOVED
+  同源断言钉住）。
+
+**四、清掉死代码**：`tools-builtin/src/index.ts` 删 `POWERSHELL_KNOWN_ALIASES`（跨平台那轮引入但
+从未接线，属"看起来会做映射、实则不做"的噪声）。
+
+**五、跨平台补齐计划（`docs/cross-platform-plan.md`，新）**：§0 三平台 × 五能力现状表 → §1 已补齐
+7 条 → §2 待补清单 → §3 实施顺序 → §4 验收口径 → §5 与其它计划的关系。
+- **P0（安全漏判/行为错误，六条）**：危险命令表缺 Windows 原生形态（`del /f /s /q`、`rd /s /q`、
+  `Remove-Item -Recurse -Force`、`Format-Volume`、`reg delete HKLM\…` 全不命中）；`splitSegments`
+  **不切单个 `&`**（CMD 的 `cmd1 & cmd2` 是合法串联 ⇒ 段级 deny 漏判）；`extractFirstCommand`
+  不认 PS 调用运算符 `&`（`& 'C:\evil.exe'` 的首命令被提取成 `&`）；引号/转义解析是 **POSIX 方言**
+  （PS 用反引号、here-string `@"…"@`）；超时 `child.kill` **只杀直接子进程、不杀进程树**；
+  UNC 路径（`\\server\share\…`）在 `isWithinCwd` 上未验证。
+- **P1（能力缺口，六条）**：POSIX → PS/CMD 命令映射（只用于判定、不改写命令，未命中保持
+  fail-closed）、PowerShell 专用只读白名单、PS 的 AST 复核门（`checkReadOnlyByAst` 只能跑
+  tree-sitter-bash）、CRLF/BOM、CI 三平台矩阵、测试的平台假设（`seq`/`cat` 真机命令在 Windows 整片红）。
+- **P2 体验 / P3 工程**各若干条。**本轮只出计划不实现。**
+
+### 只有实现时才暴露的发现
+
+1. **`export { X } from '…'` 不把 `X` 引入本模块作用域** —— 构造器与 `runA2aCli` 都要在运行期
+   调 `createAuditSink`，只写 re-export 会 `TS2304: Cannot find name`。必须在权限接缝那行
+   **另外** `import { InteractivePermissionEngine, createAuditSink } from '@harness/host'`。
+2. **cli 源码守卫用例的 `})` 定位陷阱**：断言 `runA2aCli` 的 `createHost({ … })` 体含 `audit: …` 时，
+   `src.indexOf('})', hostStart)` 会在 `...(model !== undefined ? { model } : {}),` 处**提前命中**
+   （该片段里含 `})`）⇒ 断言失败。改找 `'\n  })'`（换行 + 两空格 + `})`，即调用的真实收尾）。
+3. **同步 append 让测试无需等防抖**：`audit.test.ts` 写完即可 `readFileSync` 断言，无需 sleep/轮询
+   （这也是"防抖 vs 同步"在测试面上的副作用）。
+4. **A2A 路径下 `sessionId` 确实被填充**（审计能落盘的前提）：`ToolPipeline` 在 Step 4 从
+   `ctx.sessionId` 填入 `PermissionRequest.sessionId`，A2A 的 `ctx.sessionId` = `contextId` 会话 id。
+   已由 `server.test.ts` 新用例断言 `evt.sessionId === 'c1'` 钉住 —— 否则 sink 的"无 sessionId 即丢弃"
+   会让 A2A 审计**静默残缺**。
+
+### 验证
+
+- `@harness/host`：新增 `audit.test.ts` **6 pass**（落盘 / 无 `sessionId` 丢弃 / 多会话分文件 /
+  目录自建 / 失败静默 / 零内容）。
+- `@harness/a2a-server`：`server.test.ts` 新增 **2 条** —— 人工答复落 `audit.jsonl`（`schema==='harness.audit.v1'`、
+  `kind==='decision.human'`、`sessionId==='c1'`、`tool==='echo'`、`actionTaken==='allow'`、
+  `stateHash` 为字符串、**不含 `"input"`**）；未装 sink 时**不产生** audit 文件。
+- `@harness/cli`：`cli.test.ts` 新增源码守卫 describe（`runA2aCli` 的 `createHost` 含
+  `audit: createAuditSink(dataDir)`）+ MOVED 清单加 `createAuditSink`（与 `@harness/host` 同源）。
+- 全仓：`bun run typecheck` **0 error**；`bun run test` **2714 pass / 0 fail / 0 skip**。
+
 ## 2026-10-10（续 267）审计面板 + 跑分面板（M4）
 
 ### 起因
