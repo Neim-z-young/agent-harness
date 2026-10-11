@@ -1,0 +1,66 @@
+# P3-3：三平台 CI 矩阵。
+#
+# ## 为什么必须有
+# 与 `cross-platform-plan.md` P1-5 是同一条：全仓测试此前**只在本机 macOS 跑过**。
+# 没有矩阵，任何一处平台相关的修复（`ulimit` 单位、进程组 kill、路径分隔符、`sandbox-exec`
+# 与 `bwrap` 的可用性、bash 语义差异）都会在下次改动里**静默回归** —— 沙箱那一批
+# （P0-6 / P1-1 / P1-2 / P1-3）尤其如此：它们的判据本来就跟平台绑着。
+#
+# ## 三档口径
+# - `ubuntu` / `macos`：**硬失败**（typecheck + 测试都必须过）。
+# - `windows`：typecheck 硬失败（TS 是平台无关的，过不了就是真问题）；
+#   测试允许"bash 语义差异"造成的失败不阻断，但**汇总数字照写 summary**，且
+#   `pass` 阈值照样判 —— 防的是"全跳过/整包炸了还绿"，不是防少量回归。
+# - 两个平台上都跑 `scripts/ci/test-summary.sh`：它负责记录跳过条数 + 阈值判定。
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# 同一分支连续推送时取消上一次 —— 矩阵三份跑起来不便宜
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          # 本仓基线 bun 1.3.x（`bun --version` 实测 1.3.14）；跟 minor 不跟 latest，
+          # 免得上游改 bun test 的汇总行格式把阈值判定打歪
+          bun-version: "1.3.x"
+
+      - name: 安装依赖
+        run: bun install --frozen-lockfile
+
+      # typecheck 是平台无关的判据（除 `adapters/*` —— 它不在根 workspaces 里，另行处理）
+      - name: typecheck
+        run: bun run typecheck
+
+      # Windows 上 shell 显式指定 bash：runner 默认是 pwsh，而脚本与
+      # `bun --filter=*` 的输出解析（grep -oE）都是 POSIX 口径
+      - name: 测试（含汇总 / 阈值判定）
+        shell: bash
+        run: bash scripts/ci/test-summary.sh /tmp/harness-ci-test.log "${{ runner.os }}"
+        # 只有 Windows 允许非零退出（平台差异白名单，见文件头）；失败条数仍进 summary
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
+
+      - name: 上传测试日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: /tmp/harness-ci-test.log
+          if-no-files-found: ignore
+          retention-days: 7
