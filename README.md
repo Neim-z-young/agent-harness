@@ -408,13 +408,18 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 
 ### sandbox 对象（隔离策略）
 
-> ⚠️ **当前隔离是「策略级」（L0/L1），不是 OS 级** —— 文件系统边界由**路径判定 + 命令白名单 +
-> env 过滤**构成，可写区**没有**被 OS 真的绑定成唯一可写区；出网是**静态门**（按命令名与参数
-> 字面量判定），不是内核边界。详细盘点与缺口清单见 `docs/sandbox-isolation-plan.md`。
+> ⚠️ **默认隔离是「策略级」（L0/L1），不是 OS 级** —— 文件系统边界由**路径判定 + 命令白名单 +
+> env 过滤**构成；出网是**静态门**（按命令名与参数字面量判定），不是内核边界。
+> 详细盘点与缺口清单见 `docs/sandbox-isolation-plan.md`。
 >
-> 需要"模型跑什么也伤不到宿主"的保证时（跑不受信代码、多人共用一台机、处理来料不可控的任务），
-> 必须上 **L2**（OS 级绑定：`sandbox-exec` / `bwrap` / Landlock）或 **L3**（容器 / microVM /
-> 远程 executor）—— 这两档**尚未接线**，写了也不会生效。
+> **L2 已可开**：`osBinding: "on"` 会把 bash / MCP 子进程包进平台原语
+> （macOS `/usr/bin/sandbox-exec`、Linux `bwrap`），可写区被 OS **真的**限制在
+> 工作目录（+ 临时目录）内 —— 这是唯一能挡住 **symlink 逃逸 / TOCTOU** 的一层。
+> 默认 `off` 的理由：它会改变命令的执行形态，必须由人显式开；拿不到原语时
+> **不模拟**（发 `sandbox.binding-unavailable` 告警，`fsBound` 如实报 false）。
+>
+> **L3（容器 / microVM / 远程 executor）仍未接线**。需要"跑什么也伤不到宿主"的强保证时，
+> 用 `osBinding: "on"` + `level: "L2"` + `onUnmet: "refuse"`（达不到就拒绝启动）。
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
@@ -429,12 +434,18 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 | `netAllow` | string[] | `allowlist` 模式的目标白名单（父域覆盖子域；元数据/私有地址**即使写进来也硬拒**） |
 | `readDeny` | object \| false | 读侧敏感文件清单（`.env` / `id_rsa*` / `*.pem` / `.ssh/**` …）；`false` = 关闭 |
 | `readMaxBytes` | number | `read_file` 单文件上限（默认 10 MiB，`0` = 不限制）。超限**拒绝**而非截断 |
+| `osBinding` | string | **OS 级绑定**（L2）：`off`（默认）/ `on`。开了才把子进程包进 `sandbox-exec` / `bwrap` |
+| `pluginCodeScan` | string | 插件代码静态扫描：`warn`（默认）/ `refuse` / `off`。⚠️ **是预警不是边界**（正则挡不住刻意绕过） |
 | `level` | string | 要求的隔离档位下限：`L0` ~ `L3` |
 | `onUnmet` | string | 达不到 `level` 时：`warn`（默认，发 notice）/ `refuse`（拒绝启动） |
 
 档位口径：**L0** 策略层（危险表 + 白名单 + 权限引擎 + 审计）→ **L1** 进程层（+ 资源上限 +
-超时杀进程树 + env 默认拒绝）→ **L2** OS 级绑定 → **L3** 平台层（容器 / microVM）。
-**当前实现上限是 L1**：`sandbox.level: "L2"` 会按 `onUnmet` 告警或拒绝启动，而不是"看起来隔离了"。
+超时杀进程树 + env 默认拒绝）→ **L2** OS 级绑定（`osBinding: "on"`）→ **L3** 平台层（容器 / microVM，**未接线**）。
+`BashOutput.isolation` 会如实回**本次执行**的档位与 `fsBound`（宿主回退 / 无原语 / 自检失败都是 false）。
+
+`mcpServers[]` 还有一个**能力声明**（P1-7）：`capabilities: { fs: "cwd" | "unrestricted", net: "none" | "unrestricted" }`。
+`fs: "cwd"` 在 `osBinding: "on"` 时是**真强制**（子进程也套同一份绑定）；`net: "none"` 目前**任何档位都强制不了**
+（静态门管不到别人的子进程）—— 声明了但强制不了的项会在启动时发 `config.mcp-inactive` 告警。
 
 ### permissions.json
 

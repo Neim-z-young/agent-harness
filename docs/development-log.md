@@ -1,6 +1,112 @@
 # Agent Harness 开发日志
 
+## 2026-10-12（续 279）OS 级绑定 L2 落地 + MCP 能力声明 + 插件代码扫描 + 三平台 CI
+
+**起因**：续 278 把 P2 整档清空后，沙箱方案只剩 **P1-3（OS 绑定）/ P1-5（插件代码边界）/
+P1-7（MCP 能力声明）/ P3-3（三平台 CI）**。用户点单"继续后几项" ⇒ 四项一次推进，按
+**D（P1-3）→ A（P1-7）→ B（P1-5）→ C（P3-3）** 的顺序（P1-7 依赖 P1-3 的产物，必须后做）。
+
+### 1. P1-3：OS 级绑定（L2 从"可声明"变成"真的绑上"）
+
+**先做实测，再写代码**。四条实测结论直接决定落地形态：
+
+| 实测（macOS `/usr/bin/sandbox-exec`） | 结论 |
+|---|---|
+| 可写区内写成功 / 区外写 `Operation not permitted` | profile 形态可用 |
+| **symlink 逃逸写被拒** | **P0-4 的 TOCTOU 只有这一层挡得住** —— 这条是"再上一道墙"的全部意义 |
+| 缺 `(allow file-write* (literal "/dev/null"))` 时连 `cmd 2>/dev/null` 都失败 | `/dev/*` 例外是**能用**的前提，不是优化 |
+| profile 语法错误 ⇒ **exit 0 且命令根本没执行** | **自检不是可选项**（否则"套失败"与"命令无输出"长得一样） |
+
+**落地形态**：
+- `@harness/isolation` 新增 `renderSandboxProfile()`（**只收紧写**：可写区 + `/dev/*` 例外 →
+  `deny file-write*` → `allow default`；**顺序即语义**，SBPL 自上而下命中即停）、
+  `buildOsBinding()`（纯函数：darwin ⇒ `sandbox-exec -p <SBPL>` 的 **argv 前缀**、
+  linux ⇒ `bwrap --ro-bind / / --bind <w> … --die-with-parent`、win32/无原语 ⇒ `null`）、
+  `verifyOsBinding()`（自检：真跑一次「原语 + shell + echo 哨兵」）、
+  `detectOsBindingFailure()`（执行期识别"内核拒了 apply"）。
+- `tools-builtin`：`runBash` 把 prefix 拼在**被包装命令之前**（不再叠一层字符串拼接 ——
+  命令文本已经有过 `ulimit` 抬头一次拼接，再叠必错）；`createBashTool` /
+  `createReadOnlyBashTool` 都接 `osBinding`（**只读判定挡不住 symlink 逃逸写**，必须一起套）。
+- `BashOutput.isolation.fsBound` 的判据**改口径**：由"这次真绑上了没有"决定，
+  **不再由档位推导**（`L2` 只说明声明，不说明绑上了）。这正是本方案反复要治的"看起来隔离了"。
+- 配置 `sandbox.osBinding: "off"（默认）/ "on"`；拿不到原语 / 自检失败 ⇒ notice
+  `sandbox.binding-unavailable`；`level:"L2"` 但没开 osBinding ⇒ `checkSandboxConfig` 装配期点名。
+
+### 2. P1-7：MCP server 能力声明（"声明 ≠ 强制"要看得见）
+
+- 配置 `mcpServers[].capabilities = { fs?: "cwd"|"unrestricted", net?: "none"|"unrestricted" }`
+  （缺省全不受限 = 逐位等于改造前）。
+- 纯函数 `resolveMcpCapabilities(caps, { osBindingAvailable })` —— 入参刻意收**布尔**而不是
+  `OsBinding` 对象：装配期要"先判定、后套用"，而判定方（host 的 `config.ts`）不持有绑定对象，
+  收对象会逼它造一个假绑定（那正是"看起来有了"的形状）。
+- **可强制的那半真强制**：`mcp-client` 的 `mcpSpawnArgv()` 把 stdio 子进程套进**同一份**
+  OS 绑定（P1-3 的产物复用），`TransportFactoryContext.osBinding` 透传；
+  只有声明了 `fs:"cwd"` 的 server 才套。
+- 强制不了的项装配期发 `config.mcp-inactive`：`net:"none"` **任何档位都强制不了**
+  （L0 静态门管不到别人的子进程）—— 不说就是一句自我安慰。
+
+### 3. P1-5：插件代码静态扫描（**预警不是边界**）
+
+- 新叶子模块 `host/src/plugin-scan.ts`：六类规则（`child-process` / `fs-write` / `env` /
+  `eval` / `network` / `process-exit`），逐行正则 + **注释行跳过** + **带行号**（给不出位置的
+  告警等于没报）。
+- `loadPluginDirs` 在 import **之前**扫；配置 `sandbox.pluginCodeScan: "warn"（默认）/
+  "refuse"（不加载该文件）/ "off"`；notice `plugins.code-scan` / `plugins.code-refused`。
+- 文案与文档**反复**写明：正则挡不住 `process["e"+"nv"]` 这类绕过 ⇒ 真边界要等 worker / WASI。
+  把它当边界用，就是新的一次"看起来隔离了"。
+
+### 4. P3-3：三平台 CI
+
+- `.github/workflows/ci.yml`：`ubuntu` / `macos` / `windows` 矩阵（`bun install --frozen-lockfile`
+  → `bun run typecheck` → `scripts/ci/test-summary.sh`），`concurrency` 取消同分支旧跑。
+- `scripts/ci/test-summary.sh`：**只读 bun 的汇总行**（数 `(fail)` 明细会双计），记录
+  `pass / fail / skip` 并写 step summary；两条阈值分开判 —— `pass ≥ 2000`（防"整包没跑起来"）
+  与 `fail > 0`（防少量回归）**不是一回事**；Windows 只放行**失败**（bash 语义差异），
+  **pass 阈值与 skip 超额照样拦**（那两条说的不是平台差异，是"这一轮没真跑"）。
+
+### 5. 只有实现时才暴露的发现（本轮最值钱的几条）
+
+1. **`spawn` 的 ENOENT 分不清"程序不存在"与"工作目录不存在"**。P1-3 的 e2e 第一次全红，
+   报 `posix_spawn '/usr/bin/sandbox-exec' ENOENT` —— 而那个文件明明在。真因是 **cwd 被删了**：
+   我复用了 P3-4 那个 describe 的 `TMP`，而它的 `afterAll` 在本 describe 之前就执行了。
+   ⇒ 新测试组要**自己建目录**，别蹭别人的生命周期。
+2. **嵌套 sandbox**：本机 `bun test` / `bun run` 派生的进程落在 WorkBuddy 的沙箱内，
+   `sandbox-exec` 再 apply 一层被内核拒（`sandbox_apply: Operation not permitted`，exit 71），
+   **而同一条命令直接在 shell 里跑是好的**。两个后果：
+   ① 测试的可用性门必须用**与宿主同一个判据**（`verifyOsBinding` 自检），只看 `existsSync`
+   会把"环境不允许"误判成"绑定没生效"，进而在并发时随机红；
+   ② 产品侧补 `detectOsBindingFailure()`：**递了绑定不等于绑上了** ⇒ `fsBound` 如实报 false
+   并标 `fsBoundFailed`（否则 stderr 里那句 `sandbox_apply` 会被读成命令自身报错）。
+3. **`BashOutput.isolation.fsBound` 的口径变更连带两条既有用例**：`tools-builtin.test.ts` 的
+   "L2 才 fsBound=true"与 host 的"递了 osBinding 才报 true"—— 前者是**旧口径的样本**（正是要
+   改掉的那个"看起来隔离了"），后者要跟着**环境**走（`verifyOsBinding` 说了算）。改的时候都要
+   在注释里写清"为什么口径变了"，否则下一个人会当回归改回去。
+4. **`sandboxToPluginOptions` 曾在"没有 sandbox 段但有绑定"时静默丢绑定**：`if (!sb) return undefined`
+   ⇒ `load({osBinding})` 不带 config 的场景退回无参单例，工具侧报 `fsBound:false` 而宿主以为递了。
+   ⇒ 前置条件收紧成"既没 sandbox 段、也没绑定"才退单例。
+5. **zsh/bash 里 `$VAR` 紧跟全角字符会被当成变量名的一部分**：`echo "...$PLATFORM）"` 在 `set -u`
+   下直接 `PLATFORM）: unbound variable`。脚本里一律 `${VAR}`。
+
+### 6. 验证
+
+- **typecheck**：真实退出码 0 / `error TS` 0（本轮实测 `bun run typecheck` 退出码为 0，不再是续 276
+  记的"恒 1"）。
+- **全量测试**：**2955 pass / 0 fail / 4 skip**（基线 2906 ⇒ **+49**）。4 条 skip 是 P1-3 的
+  macOS 真机 e2e —— 本机 bun test 落在嵌套沙箱里，见上面发现 2；它的判定逻辑由纯函数单测
+  （`renderSandboxProfile` / `buildOsBinding` / `verifyOsBinding` / `detectOsBindingFailure`）
+  与一条"自检 / 真实执行 / fsBound **三者必须一致**"的用例覆盖（该条在两种环境下都跑）。
+- **反向验证五处**（`cp` + `shasum -a 256 -c` 全 OK、`grep --include='*.ts'` 0 残留）：
+
+  | 变异 | 预测 | 实测 | 偏差归因 |
+  |---|---|---|---|
+  | `buildOsBinding` 恒 `null`（不接线） | 11 | **8** | isolation 少 3：`buildOsBinding` 里"win32 / 无原语 / 空 writable **期望 null**"三条在变异下仍 pass（预测时把它们当成期望非 null） |
+  | `mcpSpawnArgv` 不套 prefix | 2 | **3** | 多 1：`无 args 也不丢`那条同样断言了 prefix |
+  | `scanPluginCode` 恒 `[]` | 5 | **5** | — |
+  | `resolveMcpCapabilities` 删 net 分支 | 3 | **3** | — |
+  | `detectOsBindingFailure` 恒 `false` | 5 | **4** | 少 1：tools-builtin 里我只记了 2 条，实际是"detect 单测 1 + 三者一致 1" |
+
 ## 2026-10-11（续 278）档位可见 + 拒绝文案可执行 + 文档口径 + swarm 死协议收口 + 渗透用例集
+
 
 ### 起因
 
