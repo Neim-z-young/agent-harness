@@ -129,7 +129,7 @@
 | P1-3 | **无 OS 级只读绑定** | 没有把工作目录"真的"绑定成唯一可写区（macOS `sandbox-exec` profile / Linux `bwrap --ro-bind /` + `--bind cwd` / `landlock`）。L0 的策略一旦被绕过（P0-4 就是例子），没有第二道墙 | 新模块 |
 | P1-4 | ✅ **已修**（2026-10-11，见开发日志续 277）—— 原文：**无"隔离档位"概念** | 现在是"策略全开 / 全关"的布尔，宿主无法表达"我要 L2，没有就拒绝启动"。**落地形态**：`IsolationLevel = L0\|L1\|L2\|L3` + `probeIsolation()`（P3-2）+ `resolveIsolation()`；`config.json → sandbox.{level,onUnmet}` —— 达不到要求时 `warn`（notice `sandbox.isolation-degraded`，说清实际档位与缺口）或 `refuse`（`ConfigValidationError` 拒绝启动）；解析发生在**内置插件装配之前**；`BashOutput.isolation = { level, fsBound, netPolicy, viaHost }` 把**解析后的实际档位**（不是愿望值）回给模型与取证脚本 | `packages/isolation`、`host/src/{host,config,notice,plugins}.ts`、`tools-builtin` |
 | P1-5 | **插件代码开闸即进程内全权** | `allowPluginCode: true` 后 `.harness/plugins/*.ts` 以完整 Node 权限运行，无 `worker` 边界、无 API 白名单、无静态扫描。默认关闭是好的止损，但**开闸后没有任何边界** | `host/src/plugins.ts`、`host/src/host.ts:748` |
-| P1-6 | **swarm 的 `sandbox_permission_*` 是死协议** | 类型联合、`isStructuredProtocolMessage` 白名单、inbox 消费分支**都在**，但**没有任何生产者** ⇒ 多 Agent 场景下"子 Agent 越界申请授权"这条路其实不存在 | `swarm/src/index.ts:271/315/810` |
+| P1-6 | ✅ **已修**（2026-10-11，见开发日志续 278）—— 原文：**swarm 的 `sandbox_permission_*` 是死协议** | 类型联合、`isStructuredProtocolMessage` 白名单、inbox 消费分支**都在**，但**没有任何生产者** ⇒ 多 Agent 场景下"子 Agent 越界申请授权"这条路其实不存在。**落地形态**：**删**死类型（两个 `sandbox_permission_*` 从 `MailboxMessageType` 与 `STRUCTURED_PROTOCOL_TYPES` 移除，inbox 分支只收 `permission_response`），沙箱档位下沉改走**既有** `permission_request` 通道 + `data.escalation: 'host-fallback'` —— 与 host 侧 `PermissionRequest.escalation` 和审计 `sandbox.escalation` **同一词汇表**（一个概念两套名字就是下一次对不上的起点）。`requestSwarmPermission({escalation})` 透传。★为什么是删而不是"接生产者"：那条通道要表达的事**已经在 `permission_request` 里表达完了**（"请批准这次执行"），单列类型只是多一条永远等不到响应的路 —— 留着它会让"越界申请授权"看起来是通的 | `swarm/src/index.ts`（类型 / `createPermissionRequest` / `processMailboxPermissionResponse` / `requestSwarmPermission`） |
 | P1-7 | **MCP server 无能力声明** | `mcpServers` 只有名单，没有"这个 server 允许读哪些目录 / 能不能出网"的约束；第三方 server 拿到的是全量 env（见 P0-2）与完整 FS（见 P0-4） | `mcp-client` |
 | P1-8 | ✅ **已修**（2026-10-11，见开发日志续 277）—— 原文：**`read_file` 无大小 / 类型闸** | 读 2GB 日志、读块设备、读 `/dev/zero` 无任何提示。**落地形态**：`read_file` 是**整文件载入后**才切片（`offset`/`limit` 救不了），故加 `maxReadBytes`（默认 10 MiB；`sandbox.readMaxBytes` 可调，`0` = 不限制），超限**拒绝**而不是"截断读"，消息里给出人读的大小与替代路径（`grep_file` / bash 按行段读）；类型消息说清"实际是什么"（目录/块设备/字符设备/FIFO/套接字）并指出该换的工具 | `tools-builtin` 的 `createReadFileTool` |
 | P1-9 | ✅ **已修**（2026-10-11，见开发日志续 273）—— 原文：**手改规则无审计**（§8 D5） | 两条"直接改规则并写盘"的路径**都不发事件**：CLI `/permission <key>=<behavior>` / `reset` 与 A2A 控制面 `harness/permission.set`（含 `reset` / `mode` / `rules` / `key+behavior` 四形态）。审计原**只有 `decision.human` 一种 kind** ⇒ "权限是被谁、何时、从 allow 改成 deny 的"不可回溯。**落地形态**：新增 `kind: 'permission.rule.changed'`（零内容 + `stateHash` + `source: cli\|control-api\|asker`），接在 **`HarnessHost.setPermissionRules()` 这一个入口**上（两条手工路径都只调它 ⇒ 一次覆盖）；`always-*` 的自动写回走引擎侧 `rememberRule`，同一 kind。⚠️ 顺带改了 `createAuditSink` 的丢弃语义：控制面规则变更是**进程级**事件、无会话归属，原先"无 `sessionId` 即丢弃"会让它静默消失 ⇒ 改为落工作区级 `{dataDir}/audit.jsonl` | `host/src/host.ts`（`setPermissionRules`）、`host/src/permission.ts`、`host/src/audit.ts` |
@@ -138,10 +138,10 @@
 
 | # | 缺口 | 说明 |
 |---|---|---|
-| P2-1 | 档位**不可见** | `env-context` 已经在注入 `Shell:`，应并排注入 `Isolation:`（L0/L1/L2 + fs/net 策略）。模型不知道自己的边界，就会反复撞同一面墙 |
-| P2-2 | 拒绝文案要**可执行** | 延续既有纪律（`bash_ro` 的结构门带 `why`）：每条隔离拒绝都给「为什么 + 怎么改」。历史教训：文案指向给不出所需信息的工具 ⇒ 模型空转 |
-| P2-3 | `BashOutput` 加 `isolation` | `{ level, fsBound, netPolicy, viaHost }`，让模型（与取证脚本）知道这次执行的边界 |
-| P2-4 | 文档口径 | README / `AGENTS.md` 要写清「**当前隔离是策略级，不是 OS 级**」，并说明什么场景必须上 L2/L3 |
+| P2-1 | ✅ **已修**（2026-10-11，见开发日志续 278）—— 原文：**档位不可见**。`env-context` 已经在注入 `Shell:`，应并排注入 `Isolation:`（L0/L1/L2 + fs/net 策略）。模型不知道自己的边界，就会反复撞同一面墙。**落地形态**：`renderIsolationLine()` 渲染 `- 隔离: L1（进程层）｜可写区仅策略判定（非 OS 级）｜出网 deny`；宿主经 `load(ctx)` 把**解析后的实际档位**递进去（`toIsolationSummary`，`fsBound` 由 `isOsBound()` 换算、`netPolicy` 走同一份 `resolveNetPolicy`）—— 与 `BashOutput.isolation` 是同一份事实。**无加载上下文 ⇒ 整行省略**（宁缺毋滥，不猜档位）。⚠️「未做 OS 绑定」刻意写成完整一句而不是省略：省略它等于让模型以为写界外会被 OS 挡住。env-context **不 import** `@harness/isolation`（只用三个字段，结构类型即可 —— 引包会让它背上对"档位语义"的编译期依赖） | `env-context/src/index.ts`、`host/src/plugins.ts` |
+| P2-2 | ✅ **已修**（2026-10-11，见开发日志续 278）—— 原文：**拒绝文案要可执行**。延续既有纪律（`bash_ro` 的结构门带 `why`）：每条隔离拒绝都给「为什么 + 怎么改」。历史教训：文案指向给不出所需信息的工具 ⇒ 模型空转。**落地形态**：`@harness/isolation` 新增 `formatDenial({what, why, how})` 与 `DENIAL_HOW_PREFIX = '怎么改'`（**前缀是常量，因为它是可自动判的验收口径**）；`tools-builtin` / `tools-search` 全部隔离拒绝改走它（危险命令 / 网络 / cwd / 白名单 / 宿主回退 / 敏感读 / 大小闸 / 只读 / 越界），`assessNetAccess` 的 `reason` 拆出 `why` + `how` 两字段（`reason` 仍是拼好的完整文案，向后兼容）。守卫：`denial-copy.test.ts` 逐条触发十类拒绝，断言消息含「怎么改」且**后面真有内容**（空头衔比没有更糟）；只读的十余条 reason 共用一份 `READ_ONLY_HOW`（"接下来该怎么办"对它们全一样，分开写只会各自漂移） | `packages/isolation`、`tools-builtin/src/{index,denial-copy.test}.ts`、`tools-search` |
+| P2-3 | ✅ **已修**（2026-10-11，见续 277） | `{ level, fsBound, netPolicy, viaHost }`，让模型（与取证脚本）知道这次执行的边界。随 P1-4 一并落地 |
+| P2-4 | ✅ **已修**（2026-10-11，见开发日志续 278）—— 原文：**文档口径**。README / `AGENTS.md` 要写清「**当前隔离是策略级，不是 OS 级**」，并说明什么场景必须上 L2/L3。**落地形态**：README 顶层字段表加 `sandbox` 行 + 新增 `### sandbox 对象（隔离策略）` 小节（13 个键逐项说明 + 开头一段**警示块**：文件系统边界是路径判定 + 白名单 + env 过滤，**不是** OS 绑定；出网是静态门不是内核边界；要"跑什么也伤不到宿主"必须 L2/L3，而这两档**尚未接线**，写了也不生效）；`AGENTS.md` 的 bash 沙箱条目补同一口径并指向本计划 | `README.md`、`AGENTS.md` |
 | P2-5 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**风险标签失去区分度**（§8 D4） | `assessRisk` 的 `HIGH_RISK_TOOL_KEYS` 含 `bash` ⇒ **bash 恒为 `high`**，`ls` / `pwd` / `echo` 与 `rm -rf` 同一个标签；高危模式表（`rm -rf` / `sudo` / `dd if=` …）因此**只在工具键不在表里时**才有机会生效。标签不决策、但它是决策卡片的唯一提示。**落地形态**：`bash` 移出工具键表，按 `SHELL_TOOL_KEYS` **分流**先走 `assessShellRisk(command)`（高危模式 → 写入/替换元字符 → **每段**首词在只读白名单且无 `-exec`/`-delete` → 否则 medium；**拿不到命令文本 ⇒ high**，与改造前逐位一致），其余工具才走"入参高危模式 > 工具键表 > medium"；`bash_ro` 直接落 low；`ls 2>/dev/null` 复用 §九 的 `NULL_SINK_REDIRECT`（含负向前瞻）仍是 low。⚠️ **附带发现（本轮未修）**：判据 `toolKey` 实际是**权限键**（`read` / `write` / `bash` / `bash_ro`），而 `HIGH_RISK_TOOL_KEYS` 里写的是**工具 id**（`write_file` / `edit_file`）⇒ **`write` 落 medium**（写操作标中危）。⚠️ 该附带发现已于 2026-10-11 **收口**（见续 275，承 P2-7 那轮）：两张表的键改成**权限键**（`HIGH = write / edit`、`LOW = read / bash_ro`），`SHELL_PERMISSION_KEYS` 与两张表均**不再有工具 id**；并在 `permission.test.ts` 加了两条钉住"id 不是键 ⇒ medium"的用例（写侧 + 读侧各一条），`cli.test.ts` 的 `riskLevel` 断言由 `medium` 改为 `high` | `host/src/permission.ts`（`assessRisk` / `assessShellRisk`） |
 | P2-6 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**提示文案键位自相矛盾**（§8 D6） | `buildPermissionPrompt().text` 写 `allow / deny / always(a) / deny-always(d)? [a/d/A/D]` —— 前半说 `always` 是 `a`，方括号里 `a` 却是 allow、`A` 才是 always。而实际实现正是 `'A' → always-allow`、`'a' → allow`（`parseCliAnswer`）。照前面读会**把"始终允许"按成"允许一次"**（或反之）。**落地形态**：文案改成**只有一种形态 `状态(键)`** —— `allow(a) / deny(d) / always-allow(A) / always-deny(D)?`，与 `PermissionAnswer` 四态**同一词汇表**（顺带把 `deny-always` 正名为类型里的 `always-deny`）；并在 `cli.test.ts` 加守卫，从文案抓 `词(键)` 对、断言 `parseCliAnswer(键) === 词`（改文案或改解析器任一边都会红） | `host/src/permission.ts`（`buildPermissionPrompt`）、`cli/src/index.ts:397`（`parseCliAnswer`） |
 | P2-7 | ✅ **已修**（2026-10-11，见开发日志续 275）—— 原文：**`mode` 是进程级，"会话级切换"不存在**（§8 D7） | `InteractivePermissionEngine.mode` 是实例字段，一个进程内**所有会话共享**；`setMode()` 注释也写明"不影响持久化规则"。CLI 的 `/permission <mode>` 文案容易被读成"只对当前会话生效"。**落地形态**：真做成**会话级**（不选"只改文案"）—— 引擎加 `sessionModes: Map<sessionId, PermissionMode>`，`getMode(sessionId?)` 会话覆盖优先、回退进程默认，`ask()` 按 `req.sessionId` 取；CLI `/permission <mode>` **默认只改本会话**，全进程用显式 `global` 后缀（能力没丢，只是不再由一个会话静默改掉别的会话）；A2A 控制面 `harness/permission.get|set` 加**可选 `sessionId`**（不给 ⇒ 进程默认，老调用行为逐位不变）。与 `mode` 同口径：内存态、不落盘、重启复位 | `host/src/permission.ts`（`getMode` / `setMode` / `ask`）、`cli/src/index.ts`、`a2a-server/src/control.ts` |
@@ -153,7 +153,7 @@
 | P3-1 | ✅ **已修**（2026-10-11，见开发日志续 275） | 把 `resolvePath` / `isWithinCwd`（**realpath 版**）收敛进新包 **`@harness/fs-guard`**，一处实现 + **静态守卫测试双向钉住**：① 行为侧 —— `fs-guard` 自带 symlink 逃逸 / 不存在目标 / macOS `/var` 两侧真实路径用例；② 结构侧 —— 一条扫 `packages` 源码的守卫，**别处再抄一份 `function resolvePath/isWithinCwd` 就变红**（反向验证实测：塞回一份副本 ⇒ 该守卫 1 红并精确点名文件）。收敛后 `..foo` 这类目录名不再被 `startsWith('..')` 误杀（改成只认整段 `..`） | `packages/fs-guard/src/index.ts` + `src/index.test.ts` |
 | P3-2 | ✅ **已修**（2026-10-11，见开发日志续 277） | `probeIsolation({ platform, exists, osBinding })` —— 与 `resolveShell()` 同范式：**依赖全可注入**，darwin / linux / win32 行为都能纯函数单测，不需要真机。★**探到原语 ≠ 达到那一档**：有 `sandbox-exec` / `bwrap` 而没接线（P1-3）时 `maxLevel` 仍报 `'L1'` 并把"未接线"写进 reasons（§2 纪律 2「不模拟」的落点） | `packages/isolation/src/index.ts` |
 | P3-3 | **三平台 CI** | 与 `cross-platform-plan.md` P1-5 同一条：没有矩阵，任何隔离修复都会在下次改动里静默回归 |
-| P3-4 | **渗透用例集** | symlink 逃逸 / env 泄漏 / 内网探测 / fork bomb / 磁盘写满 / 进程树残留 —— 作为回归门，每条都能自动判 |
+| P3-4 | ✅ **已修**（2026-10-11，见开发日志续 278）—— 原文：**渗透用例集**。symlink 逃逸 / env 泄漏 / 内网探测 / fork bomb / 磁盘写满 / 进程树残留 —— 作为回归门，每条都能自动判。**落地形态**：`tools-builtin/src/penetration.test.ts` 十条（① symlink 读侧 ② symlink 写侧 ③ bash env 泄漏 ④ `bash_ro` 的 `input.env` 后门 ⑤ 云元数据端点在 `deny` 与 `allowlist`（**写进白名单也不放行**）下都拒 ⑥ 敏感读 ⑦ 大小闸 ⑧ 单文件配额**装到工具上**仍生效 ⑨ 超时后孙进程不残留 ⑩ `BashOutput.isolation` 自述实际档位）。★两条纪律：①**不真做破坏性操作**（不 fork bomb、不写满真实磁盘、不出网）—— 用「极小配额 + 极小超时」让同一条路径在受控条件下暴露；②**跨包条目在文件头登记落点**（MCP env 泄漏在 `mcp-client`、判定函数层在 `fs-guard`、网络目标在 `isolation`），本文件只覆盖**工具执行层** —— 策略写在代码里 ≠ 装到工具上（P0-1 的教训） | `tools-builtin/src/penetration.test.ts` |
 
 ## 4. 建议实施顺序
 
@@ -180,13 +180,16 @@
    + `config.json → sandbox.{level,onUnmet}` + notice/拒绝启动 + `BashOutput.isolation`。
    **P1-3 OS 绑定仍待做**（本机的 `sandbox-exec` / `bwrap` 探测已有，但没接线 ⇒ 档位上限仍是 L1）；
    落地时按 §2 纪律 2：**拿不到原语就显式降级告警**，绝不"看起来隔离了"。
+6.1 ~~**P2 批次 + P1-6 + P3-4**~~ ✅ **已完成**（2026-10-11，见续 278）：P2-1 档位可见（env-context 注入
+   「隔离」行）/ P2-2 拒绝文案可执行（`formatDenial` + 守卫）/ P2-4 文档口径（README + AGENTS.md
+   写明策略级非 OS 级）；P1-6 死协议删除（档位下沉并入 `permission_request` + `data.escalation`）；
+   P3-4 渗透用例集十条。**P2 至此清空**（P2-5/6/7 见续 274/275，P2-3 随 P1-4 落地）。
 7. ~~**P1-2 网络策略**~~ ✅ **已完成**（2026-10-11，见续 277）：`sandbox.net` 三态 + `netAllow`，
    与 `tools-web` 的私有地址判定收敛到 `@harness/isolation` 一份。
-   剩余：**P1-6 死协议收口**（要么接生产者、要么删掉类型）、**P2 批次**（D4/D6 见续 274、
-   D7 见续 275，**P2 仅剩 P2-1~P2-4**（P2-3 已随 P1-4 落了 `BashOutput.isolation` 的形状））、
-   **P3-3 三平台 CI**、**P3-4 渗透集**（P3-1 见续 275、P3-2 见续 277）。
+   剩余：**P3-3 三平台 CI**。
    **P0 已清空**（2026-10-11，见续 276 与续 277：P0-1~P0-9 全部完成）；
-   P1 剩 **P1-3（OS 绑定）/ P1-5（插件代码边界）/ P1-6 / P1-7（MCP 能力声明）**。
+   **P2 已清空**（2026-10-11，见续 274/275/278：P2-1~P2-7 全部完成）；
+   P1 剩 **P1-3（OS 绑定）/ P1-5（插件代码边界）/ P1-7（MCP 能力声明）**（P1-6 见续 278）。
 8. **P1-5 / P1-7 / L3**：与 `external-integration-plan.md` §9 的"执行后端抽象"合流后统一做。
 
 > **与 L2 的排期分叉**：第 5 步（授权域）与第 6 步（L2 OS 绑定）**互不阻塞**，但有先后意义 ——

@@ -1,5 +1,112 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 278）档位可见 + 拒绝文案可执行 + 文档口径 + swarm 死协议收口 + 渗透用例集
+
+### 起因
+
+用户给 **"p0 都完成的话就开始 abc"**：P0-1~P0-9 已于续 276 / 277 清空，故本轮收 P2 批次与两条
+工程项。三条落在四处互不重叠的接缝上：
+
+- **A = P2 批次收口**：P2-1（档位不可见）/ P2-2（拒绝文案不可执行）/ P2-4（文档口径）。
+- **B = P1-6**：swarm 的 `sandbox_permission_*` 是**死协议**（类型 + 白名单 + inbox 分支都在，
+  但**没有任何生产者**）。
+- **C = P3-4**：渗透用例集（回归门）。
+
+### 决策与落地
+
+**A1 — P2-1 档位可见**（`env-context` + `host`）
+
+- `renderIsolationLine()` 渲染 `- 隔离: L1（进程层）｜可写区仅策略判定（非 OS 级）｜出网 deny`，
+  与 `Shell:` 同段进 system 前缀（会话中途不变，吃前缀缓存）。
+- 宿主经 `load(ctx)` 递**解析后的实际档位**（`toIsolationSummary`：`fsBound` 由 `isOsBound()`
+  换算、`netPolicy` 走同一份 `resolveNetPolicy`）⇒ 与 `BashOutput.isolation` 同一份事实。
+  **无加载上下文 ⇒ 整行省略**（宁缺毋滥，不猜档位）。
+- ⚠️ 刻意把「未做 OS 绑定」写成完整一句而不是省略：省略它等于让模型以为写界外会被 OS 挡住 ——
+  这正是"看起来隔离了"的另一种形态。
+- env-context **不 import** `@harness/isolation`：只用三个字段，结构类型（duck typing）即可；
+  引包会让它背上一条对"档位语义"的编译期依赖。
+
+**A2 — P2-2 拒绝文案可执行**（`@harness/isolation` + `tools-builtin` + `tools-search`）
+
+- 新增 `formatDenial({ what, why, how })` 与常量 `DENIAL_HOW_PREFIX = '怎么改'`。
+  **前缀必须是常量而不是各处自写**：它是**可自动判的验收口径** —— 守卫断言"消息含这个串"。
+- 逐条改造：危险命令 / 网络 / cwd / 白名单 / 宿主回退 / 敏感读 / 大小闸 / 只读 / 路径越界
+  （`tools-search` 的两条一并改，口径只有一份）。`assessNetAccess` 的 `reason` 拆出 `why` + `how`
+  两个字段，`reason` 仍是拼好的完整文案（向后兼容，既有断言不断）。
+- 只读的十余条 reason **共用一份** `READ_ONLY_HOW`：它们各自说的是"命中了什么"，而"接下来怎么办"
+  对它们全一样 —— 分开写只会让十余份文案各自漂移。
+- 守卫 `denial-copy.test.ts`：逐条触发十类拒绝，断言消息含「怎么改」且**后面真有内容**
+  （空头衔比没有更糟：看着像给了出口，其实什么都没有）。
+
+**A3 — P2-4 文档口径**（README / AGENTS.md）
+
+- README 顶层字段表加 `sandbox` 行，新增 `### sandbox 对象（隔离策略）`：13 个键逐项说明 +
+  开头**警示块**（边界是路径判定 + 白名单 + env 过滤，不是 OS 绑定；出网是静态门不是内核边界；
+  要"跑什么也伤不到宿主"必须 L2/L3，而这两档**尚未接线**，写了也不生效）+ 档位口径表。
+- `AGENTS.md` 的 bash 沙箱条目补同一口径并指向本计划（改沙箱代码前先读它）。
+
+**B — P1-6 死协议收口**（`swarm`）
+
+- **删**：两个 `sandbox_permission_*` 从 `MailboxMessageType` 与 `STRUCTURED_PROTOCOL_TYPES` 移除，
+  inbox 分支只收 `permission_response`。
+- **接**：档位下沉改走**既有** `permission_request` + `data.escalation: 'host-fallback'`，
+  `requestSwarmPermission({ escalation })` 透传 —— 与 host 侧 `PermissionRequest.escalation`
+  和审计 `sandbox.escalation` **同一词汇表**（一个概念两套名字就是下一次对不上的起点）。
+- ★为什么是**删**而不是"接生产者"：那条通道要表达的事**已经在 `permission_request` 里表达完了**
+  （"请批准这次执行"），单列类型只是多一条永远等不到响应的路 —— 留着它会让"子 Agent 越界申请
+  授权"看起来是通的。
+
+**C — P3-4 渗透用例集**（`tools-builtin/src/penetration.test.ts`，十条）
+
+- ① symlink 逃逸（读侧）② symlink 逃逸（写侧）③ bash env 泄漏 ④ `bash_ro` 的 `input.env` 后门
+  ⑤ 云元数据端点在 `deny` 与 `allowlist`（**写进白名单也不放行**）下都拒 ⑥ 敏感读 ⑦ 大小闸
+  ⑧ 单文件配额**装到工具上**仍生效 ⑨ 超时后孙进程不残留 ⑩ `BashOutput.isolation` 自述实际档位。
+- 两条纪律写进文件头：**不真做破坏性操作**（不 fork bomb / 不写满真实磁盘 / 不出网 —— 用
+  「极小配额 + 极小超时」让同一条路径在受控条件下暴露）；**跨包条目登记落点**（MCP env 泄漏在
+  `mcp-client`、判定函数层在 `fs-guard`、网络目标在 `isolation`），本文件只覆盖**工具执行层** ——
+  策略写在代码里 ≠ 装到工具上（P0-1 的教训）。
+
+### 只有实现时才暴露的发现
+
+- ★**一条用例能把整个包的测试拖死**：escalation 用例写了 leader 响应却**没人去消费**
+  （少了 `processMailboxPermissionResponse` 这一步）⇒ `await expect(pending).resolves` 永不 settle，
+  而 bun 的表现**不是 5s 超时报错，而是 CPU 100% 空转**（实测 12 分钟不结束）。用最小脚本复现
+  时因为有显式消费步骤而秒过 —— 差值就在这一个调用。教训：mailbox 双轨的用例必须成对写
+  （发请求 + 消费响应），否则失败形态是"卡死"而不是"变红"。
+- ★**反向验证实测比预测多**（两处，都是既有断言比记账时记得的更强）：M2 预测 15 实测 17 —— 多的是
+  既有 `assessNetAccess` 用例断言 `reason` 含 `netAllow`、既有 `read_file` 大小闸用例断言消息含
+  修复指引（**旧文案里的可执行指引确实在被断言，不是摆设**）；M4 预测 1 实测 5 —— 多的 4 条是既有的
+  `buildLimitPreamble` 纯函数单测与 `ulimit -f` e2e（说明渗透集 ⑧ 覆盖的是"装到工具上之后仍生效"，
+  纯函数层原本已有覆盖）。M5 实测 4 比预测 3 多的一条是既有「超时后 timedOut=true 并 kill」——
+  孤儿子进程握住 stdout、`close` 不触发，与续 276 记的耦合是同一处。
+- ★**三处 `PATH_OUTSIDE_CWD` 文案缩进不同**，一次 `replace_all` 只替换了两处；第三处是被
+  `denial-copy` 守卫的第一条**当场抓出来**的（变红）—— 守卫的价值在写它的当天就兑现了。
+- 渗透用例 ④ 的**方向写错了**：主 bash **允许** `input.env`（那是调用方显式给的值，不是从宿主
+  env 里漏出来的，不构成泄漏）。真正的后门是 `bash_ro` 接受 env 覆盖（`PYTHONSTARTUP` /
+  `NODE_OPTIONS` 能让"只读命令"执行任意代码）⇒ 改测 `bash_ro`，并在用例注释里写明为什么主 bash
+  那条不算。
+
+### 验证
+
+- 全仓 `bun run typecheck`：真实退出码 **0**、`error TS` **0**。
+- 全仓 `bun run test`：**2906 pass / 0 fail**（上一基线 2869，**+37**）。
+- 反向验证五处（`cp` + `shasum -a 256 -c` 还原，哈希全部 OK，全仓无"反向验证临时"残留）：
+
+| 变异 | 预测 | 实测 |
+|---|---|---|
+| `toIsolationSummary` 恒返回 undefined（不递档位） | host 1 | ✅ host **1** |
+| `formatDenial` 丢掉 how 段 | isolation 4 + builtin 10 + search 1 = 15 | isolation **5** + builtin **11** + search **1** = **17**（多 2，已归因） |
+| `processMailboxPermissionResponse` 恢复接受 sandbox 响应 | swarm 1 | ✅ swarm **1** |
+| `buildLimitPreamble` 恒返回空串（资源上限抬头失效） | builtin 1 | builtin **5**（多 4，已归因） |
+| `killProcessTree` 退回单进程 kill | builtin 3 | builtin **4**（多 1，已归因） |
+
+### 落档与提交
+
+- 提交四笔（A 一笔含 P2-1/P2-2/P2-4、B 一笔、C 一笔，docs 单独一笔）。C 只新增测试文件，
+  与 A 的源码改动无交集，故可独立成笔。
+- `docs/sandbox-isolation-plan.md`：§3.1 的 P1-6、§3.2 的 P2-1/P2-2/P2-3/P2-4、§3.3 的 P3-4、
+  §4 新增第 6.1 步并改写第 7 步的剩余项（**P2 至此清空**）。
+
 ## 2026-10-11（续 277）档位下沉留痕 + 隔离档位 + 网络出口策略 + read_file 大小闸
 
 ### 起因
