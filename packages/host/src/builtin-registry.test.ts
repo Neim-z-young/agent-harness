@@ -381,6 +381,13 @@ describe('checkSandboxConfig：写了但不生效的键要有声音', () => {
     expect(checkSandboxConfig({ fallbackToHost: false })).toEqual([])
   })
 
+  it('★P0-7：fallbackToHost 与 requireHostApproval:false 同时出现要单独点名（完全静默）', () => {
+    const out = checkSandboxConfig({ fallbackToHost: true, requireHostApproval: false })
+    expect(out.some((m) => m.includes('requireHostApproval') && m.includes('sandbox.escalation'))).toBe(true)
+    // 只关确认、没开回退 ⇒ 无此告警（档位不会下沉）
+    expect(checkSandboxConfig({ fallbackToHost: false, requireHostApproval: false }).join()).not.toContain('escalation')
+  })
+
   it('空 limits 对象与缺类目的 readDeny 都会被指出', () => {
     expect(checkSandboxConfig({ limits: {} }).some((m) => m.includes('limits 是空对象'))).toBe(true)
     expect(checkSandboxConfig({ readDeny: { names: ['x'] } }).some((m) => m.includes('缺类目'))).toBe(true)

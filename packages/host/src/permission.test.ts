@@ -402,6 +402,62 @@ describe('InteractivePermissionEngine · decision.human 审计', () => {
   })
 })
 
+// ===== P0-7：档位下沉（宿主回退）留痕 =====
+
+describe('InteractivePermissionEngine · sandbox.escalation 审计（P0-7 回归）', () => {
+  it('★allow-all 下档位下沉仍留痕（改造前：静默放行且审计不记）', async () => {
+    const events: any[] = []
+    const e = new InteractivePermissionEngine({}, { mode: 'allow-all', audit: (env) => { events.push(env) } })
+    await e.check({
+      toolKey: 'bash',
+      patterns: ['host:\ncurl http://example.com'],
+      input: { command: 'curl http://example.com' },
+      sessionId: 's1',
+      escalation: 'host-fallback',
+    })
+    expect(events).toHaveLength(1)
+    const env = events[0]
+    expect(env.kind).toBe('sandbox.escalation')
+    expect(env.escalation).toBe('host-fallback')
+    expect(env.tool).toBe('bash')
+    expect(env.mode).toBe('allow-all')
+    // check 只给得出 ask（模式短路在 ask() 里）；outcome 才是折入模式后的真实结果
+    expect(env.behavior).toBe('ask')
+    expect(env.outcome).toBe('allow')
+    expect(env.sessionId).toBe('s1')
+    expect(env.stateHash).toMatch(/^[0-9a-f]{64}$/)
+    // 零内容：命令原文只进哈希，不进信封
+    expect(JSON.stringify(env)).not.toContain('curl')
+  })
+
+  it('deny-all ⇒ outcome=deny；ask 模式 ⇒ outcome 跟随 behavior', async () => {
+    const denyEvents: any[] = []
+    const denyEng = new InteractivePermissionEngine({}, { mode: 'deny-all', audit: (env) => { denyEvents.push(env) } })
+    await denyEng.check({ toolKey: 'bash', patterns: [], input: {}, escalation: 'host-fallback' })
+    expect(denyEvents[0].outcome).toBe('deny')
+
+    const askEvents: any[] = []
+    const askEng = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', audit: (env) => { askEvents.push(env) } })
+    await askEng.check({ toolKey: 'bash', patterns: [], input: {}, escalation: 'host-fallback' })
+    expect(askEvents[0].behavior).toBe('ask')
+    expect(askEvents[0].outcome).toBe('ask')
+  })
+
+  it('★普通权限请求不落此事件（只有带 escalation 标记才记）', async () => {
+    const events: unknown[] = []
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', audit: (env) => { events.push(env) } })
+    await e.check({ toolKey: 'read', patterns: ['a.ts'], input: {} })
+    await e.check({ toolKey: 'bash', patterns: ['ls'], input: {} })
+    expect(events).toHaveLength(0)
+  })
+
+  it('无 audit sink ⇒ 不炸（纯 headless 场景）', async () => {
+    const e = new InteractivePermissionEngine({}, { mode: 'allow-all' })
+    const d = await e.check({ toolKey: 'bash', patterns: [], input: {}, escalation: 'host-fallback' })
+    expect(d.behavior).toBe('ask')
+  })
+})
+
 // ===== P0-9（D2 回归）：规则按归属分层，授权不跟调用方串台 =====
 
 describe('InteractivePermissionEngine · P0-9 归属分层（D2 回归）', () => {

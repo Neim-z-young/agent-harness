@@ -528,6 +528,17 @@ export interface PermissionRequest {
    * `echo hi; rm -rf /` 这类「恶意段藏在全串中」的形态。
    */
   denyPatterns?: string[]
+  /**
+   * **沙箱档位下沉**标记（P0-7）。当前唯一取值 `'host-fallback'`：这次请求不是普通工具
+   * 授权，而是"**把命令从沙箱约束升到宿主全权执行**"（`fallbackToHost` 触发，见
+   * `tools-builtin` 的 `confirmHostRun`）。
+   *
+   * ## 为什么要单独一个字段而不是靠 `patterns` 里的 `host:` 前缀
+   * 权限引擎需要据此**无条件留一条审计**（`sandbox.escalation`）—— 包括 `allow-all`
+   * 模式下"压根没问人、自动放行"那条静默路径。前缀是**展示约定**（人看的），
+   * 让安全判定依赖一个文案前缀，等于把审计挂在了"文案不改"这个非契约上。
+   */
+  escalation?: 'host-fallback'
 }
 
 /** 权限决策（由 PermissionEngine 返回） */

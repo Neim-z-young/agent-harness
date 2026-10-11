@@ -189,6 +189,13 @@ export interface PermissionRequest {
    * deny 是任一命中即拒绝 —— 本字段只进 deny 判定，只收紧不放宽。
    */
   denyPatterns?: string[]
+  /**
+   * **沙箱档位下沉**标记（P0-7）。`'host-fallback'` = 这次不是普通工具授权，而是把命令
+   * 从沙箱约束升到**宿主全权**执行。引擎据此**无条件留审计**（`sandbox.escalation`），
+   * 覆盖 `allow-all` 下"没问人、自动放行"那条静默路径。语义与
+   * `@harness/tool` 的同名字段一致（两侧都声明是为了 core 的 cast 不丢字段）。
+   */
+  escalation?: 'host-fallback'
 }
 
 // ===== PermissionEngine 接口 =====

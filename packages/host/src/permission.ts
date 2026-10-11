@@ -344,8 +344,54 @@ export interface PermissionRuleChangedEvent {
   stateHash: string
 }
 
+/**
+ * 沙箱档位下沉审计事件（P0-7 / §3.0 P0-7）。零内容约束同 {@link HumanDecisionEvent}。
+ *
+ * ## 为什么需要它
+ * `fallbackToHost` 一旦开启，命令就从「沙箱约束」升到「**宿主全权**」：放开白名单、
+ * 放开 env 隔离、补系统 `PATH`，且回退路径**不套资源上限**（见 P1-1）。`requireHostApproval`
+ * 默认 true 是好的，但 **`allow-all` 模式下这条路径既不问人、也不留痕** —— `viaHost` 只在
+ * 工具返回值里（模型看得见、审计看不见）。而"某个时刻权限被悄悄放大到宿主全权"恰恰是
+ * 事后复盘最需要回答的问题。
+ *
+ * ## 为什么挂在 `check()` 而不是 `ask()`
+ * `ask()` 只在规则判为 `ask` 时才被调用（`allow-all` 在它开头就短路返回，规则命中
+ * `allow`/`deny` 时更不会走到它）。`check()` 则是**每个权限请求的唯一必经点** ——
+ * 只有挂在这里，才能覆盖"自动放行/自动拒绝"这些没人按按钮的形态。
+ */
+export interface SandboxEscalationEvent {
+  schema: 'harness.audit.v1'
+  kind: 'sandbox.escalation'
+  /** 毫秒时间戳 */
+  ts: number
+  /** 会话归属（无归属落工作区级 `{dataDir}/audit.jsonl`） */
+  sessionId?: string
+  /** 当前唯一取值，与 `PermissionRequest.escalation` 同步 */
+  escalation: 'host-fallback'
+  /** 工具权限键（宿主回退目前只有 bash） */
+  tool: string
+  /** 档位下沉申请上下文的摘要哈希（SHA-256，零内容：命令原文只进哈希不出明文） */
+  stateHash: string
+  /** 请求时刻的会话生效模式（`allow-all` 正是"静默放行"那档） */
+  mode: PermissionMode | undefined
+  /**
+   * **裁剪前**引擎给出的行为（`allow` / `deny` / `ask`）。
+   *
+   * ⚠️ 与 {@link outcome} 分开记：`ask` 是"要问人"而不是最终结果（随后 `decision.human`
+   * 会记人答了什么），而 `allow-all` / `deny-all` 下 `check` 只给得出 `ask`、真实结果在
+   * 模式短路里 —— 两条并记才既说得清"引擎判了什么"、又说得清"实际怎么答的"。
+   */
+  behavior: PermissionBehavior
+  /**
+   * 折入模式后的**实际**结果：`allow-all` ⇒ `allow`；`deny-all` ⇒ `deny`；
+   * `ask` 模式 ⇒ 与 {@link behavior} 相同（`ask` 表示"交给人工"，随后由
+   * `decision.human` 落实际答复）。
+   */
+  outcome: PermissionBehavior
+}
+
 /** 审计事件总集（`schema` 统一为 `harness.audit.v1`，零内容） */
-export type AuditEvent = HumanDecisionEvent | PermissionRuleChangedEvent
+export type AuditEvent = HumanDecisionEvent | PermissionRuleChangedEvent | SandboxEscalationEvent
 
 /** 规则集摘要哈希（SHA-256，零内容：规则原文只进哈希不出明文） */
 export function rulesStateHash(rules: Record<string, unknown>): string {
@@ -409,6 +455,39 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     this.asker = opts.asker
     this.auditSink = opts.audit
     this.callerResolver = opts.callerResolver
+  }
+
+  /**
+   * P0-7：**档位下沉必留痕**。
+   *
+   * 覆写 `check()`（不是 `ask()`）的理由见 {@link SandboxEscalationEvent}：`check` 是每个
+   * 权限请求的唯一必经点，而 `ask` 在 `allow-all` 与规则命中时都不经过 —— 那恰恰是"没人
+   * 按按钮"的形态，也是最需要留痕的形态。
+   *
+   * 落点是**审计**（不是拒绝）：档位下沉是 `config.sandbox.fallbackToHost` 显式打开的
+   * 能力，引擎的职责是"让它可回溯"，而不是替用户否决自己的配置。
+   */
+  override async check(req: PermissionRequest): Promise<PermissionDecision> {
+    const decision = await super.check(req)
+    if (req.escalation === 'host-fallback' && this.auditSink) {
+      const mode = this.getMode(req.sessionId)
+      // 折入模式后的实际结果：allow-all / deny-all 在 ask() 开头就短路，check 只给得出 ask。
+      const outcome: PermissionBehavior =
+        mode === 'allow-all' ? 'allow' : mode === 'deny-all' ? 'deny' : decision.behavior
+      await this.auditSink({
+        schema: 'harness.audit.v1',
+        kind: 'sandbox.escalation',
+        ts: Date.now(),
+        sessionId: req.sessionId,
+        escalation: 'host-fallback',
+        tool: req.toolKey,
+        stateHash: stateHashOf(req),
+        mode,
+        behavior: decision.behavior,
+        outcome,
+      })
+    }
+    return decision
   }
 
   /**

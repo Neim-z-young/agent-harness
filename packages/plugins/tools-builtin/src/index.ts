@@ -941,6 +941,7 @@ async function confirmHostRun(
     toolKey: 'bash',
     patterns: [`host:\n${input.command}`],
     input,
+    escalation: 'host-fallback',
   }
   const decision = await ctx.requestPermission(req)
   return decision.behavior !== 'deny'

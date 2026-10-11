@@ -641,12 +641,27 @@ describe('@harness/tools-builtin', () => {
             expect(req.toolKey).toBe('bash')
             expect(req.patterns[0]).toContain('host:')
             expect(req.patterns[0]).toContain('ls')
+            // P0-7：档位下沉标记 —— 引擎据此无条件落 `sandbox.escalation` 审计
+            // （`host:` 前缀是给人看的展示约定，判据不许靠它）
+            expect(req.escalation).toBe('host-fallback')
             return { behavior: 'deny' as const }
           },
         }),
       )
       expect(res.ok).toBe(false)
       expect(res.error!.code).toBe('SANDBOX_HOST_DENIED')
+    })
+
+    it('★P0-7：requireHostApproval=false 时不发请求（连 escalation 都没有）⇒ 由 config 告警兜底', async () => {
+      const tool = createBashTool({ allowlist: ['echo'], fallbackToHost: true, requireHostApproval: false })
+      let called = 0
+      const res = await tool.call(
+        { command: 'ls', cwd: TMP_DIR },
+        makeCtx({ requestPermission: async () => { called++; return { behavior: 'allow' as const } } }),
+      )
+      expect(res.ok).toBe(true)
+      expect(res.output!.viaHost).toBe(true)
+      expect(called).toBe(0) // 显式"不要问" ⇒ 这条路径没有可记的请求，只能靠装配期告警
     })
 
     it('sandbox 回退：requestPermission 允许时宿主回退放行并标注 viaHost', async () => {

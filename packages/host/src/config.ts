@@ -1175,6 +1175,16 @@ export function checkSandboxConfig(c: unknown): string[] {
       'sandbox.fallbackToHost=true：沙箱内失败的命令会升级到宿主 bash 全权执行'
       + '（放开白名单与 env 隔离，且不套资源上限），请确认这是你要的',
     )
+    // P0-7：真正**静默**的形态是"回退 + 连问都不问"。单开 fallbackToHost 时至少还有一次
+    // 权限确认（ask 模式问人、allow-all 由引擎落 `sandbox.escalation` 审计）；关掉
+    // requireHostApproval 后连那条审计都没有 —— 只能在这里说一声。
+    if (c.requireHostApproval === false) {
+      out.push(
+        'sandbox.fallbackToHost=true 且 sandbox.requireHostApproval=false：'
+        + '档位下沉不再产生任何权限确认与 `sandbox.escalation` 审计记录（完全静默），'
+        + '如非必要请保留 requireHostApproval',
+      )
+    }
   }
   const limits = c.limits
   if (isPlainObject(limits) && Object.keys(limits).length === 0) {
