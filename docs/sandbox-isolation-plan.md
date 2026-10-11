@@ -142,8 +142,8 @@
 | P2-2 | 拒绝文案要**可执行** | 延续既有纪律（`bash_ro` 的结构门带 `why`）：每条隔离拒绝都给「为什么 + 怎么改」。历史教训：文案指向给不出所需信息的工具 ⇒ 模型空转 |
 | P2-3 | `BashOutput` 加 `isolation` | `{ level, fsBound, netPolicy, viaHost }`，让模型（与取证脚本）知道这次执行的边界 |
 | P2-4 | 文档口径 | README / `AGENTS.md` 要写清「**当前隔离是策略级，不是 OS 级**」，并说明什么场景必须上 L2/L3 |
-| P2-5 | **风险标签失去区分度**（§8 D4） | `assessRisk` 的 `HIGH_RISK_TOOL_KEYS` 含 `bash` ⇒ **bash 恒为 `high`**，`ls` / `pwd` / `echo` 与 `rm -rf` 同一个标签。高危模式表（`rm -rf` / `sudo` / `dd if=` …）因此**只在工具键不在表里时**才有机会生效。标签不决策、但它是决策卡片的唯一提示 | `host/src/permission.ts:70/85` |
-| P2-6 | **提示文案键位自相矛盾**（§8 D6） | `buildPermissionPrompt().text` 写 `allow / deny / always(a) / deny-always(d)? [a/d/A/D]` —— 前半说 `always` 是 `a`，方括号里 `a` 却是 allow、`A` 才是 always。而实际实现正是 `'A' → always-allow`、`'a' → allow`（`parseCliAnswer`）。照前面读会**把"始终允许"按成"允许一次"**（或反之） | `host/src/permission.ts:141`、`cli/src/index.ts:396` |
+| P2-5 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**风险标签失去区分度**（§8 D4） | `assessRisk` 的 `HIGH_RISK_TOOL_KEYS` 含 `bash` ⇒ **bash 恒为 `high`**，`ls` / `pwd` / `echo` 与 `rm -rf` 同一个标签；高危模式表（`rm -rf` / `sudo` / `dd if=` …）因此**只在工具键不在表里时**才有机会生效。标签不决策、但它是决策卡片的唯一提示。**落地形态**：`bash` 移出工具键表，按 `SHELL_TOOL_KEYS` **分流**先走 `assessShellRisk(command)`（高危模式 → 写入/替换元字符 → **每段**首词在只读白名单且无 `-exec`/`-delete` → 否则 medium；**拿不到命令文本 ⇒ high**，与改造前逐位一致），其余工具才走"入参高危模式 > 工具键表 > medium"；`bash_ro` 直接落 low；`ls 2>/dev/null` 复用 §九 的 `NULL_SINK_REDIRECT`（含负向前瞻）仍是 low。⚠️ **附带发现（本轮未修）**：判据 `toolKey` 实际是**权限键**（`read` / `write` / `bash` / `bash_ro`），而 `HIGH_RISK_TOOL_KEYS` 里写的是**工具 id**（`write_file` / `edit_file`）⇒ **`write` 落 medium**（写操作标中危）。改它会动 `cli.test.ts:2752` 的既有断言，留作待决 | `host/src/permission.ts`（`assessRisk` / `assessShellRisk`） |
+| P2-6 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**提示文案键位自相矛盾**（§8 D6） | `buildPermissionPrompt().text` 写 `allow / deny / always(a) / deny-always(d)? [a/d/A/D]` —— 前半说 `always` 是 `a`，方括号里 `a` 却是 allow、`A` 才是 always。而实际实现正是 `'A' → always-allow`、`'a' → allow`（`parseCliAnswer`）。照前面读会**把"始终允许"按成"允许一次"**（或反之）。**落地形态**：文案改成**只有一种形态 `状态(键)`** —— `allow(a) / deny(d) / always-allow(A) / always-deny(D)?`，与 `PermissionAnswer` 四态**同一词汇表**（顺带把 `deny-always` 正名为类型里的 `always-deny`）；并在 `cli.test.ts` 加守卫，从文案抓 `词(键)` 对、断言 `parseCliAnswer(键) === 词`（改文案或改解析器任一边都会红） | `host/src/permission.ts`（`buildPermissionPrompt`）、`cli/src/index.ts:397`（`parseCliAnswer`） |
 | P2-7 | **`mode` 是进程级，"会话级切换"不存在**（§8 D7） | `InteractivePermissionEngine.mode` 是实例字段，一个进程内**所有会话共享**；`setMode()` 注释也写明"不影响持久化规则"。CLI 的 `/permission <mode>` 文案容易被读成"只对当前会话生效"。要么写清"进程级"、要么真做成会话级（依赖 P0-9 的分层结构） | `host/src/permission.ts:194/223`、`cli/src/index.ts:1348` |
 
 ### 3.3 P3 —— **工程与防回归**
@@ -173,7 +173,7 @@
 6. **P1-4 档位结构 + P1-3 OS 绑定**：先定义 `probeIsolation()` 与档位语义，再接第一个
    OS 原语（macOS `sandbox-exec` 最易验证）—— **拿不到原语就按 §2 纪律 2 显式降级告警**。
 7. **P1-2 网络策略**、**P1-6 死协议收口**（要么接生产者、要么删掉类型）、**P2 批次**
-   （含 D4/D6/D7 文案与判据调整）、**P3-4 渗透集**。
+   （D4/D6 已于 2026-10-11 修完，见续 274；**剩 D7** 的 `mode` 进程级口径与 P2 其余）、**P3-4 渗透集**。
 8. **P1-5 / P1-7 / L3**：与 `external-integration-plan.md` §9 的"执行后端抽象"合流后统一做。
 
 > **与 L2 的排期分叉**：第 5 步（授权域）与第 6 步（L2 OS 绑定）**互不阻塞**，但有先后意义 ——
@@ -315,9 +315,9 @@
 | **D1** | 高 | 「始终允许」粒度 = **整工具**、且**整键覆盖**已有 PathRules；写回后规则退化为 string，**段级 `denyPatterns` 从此整体失效** | **P0-8** |
 | **D2** | 高 | 授权**不跟调用方/会话**走（规则集是 dataDir 级共享），而**身份**是按 `contextId` 绑定的 ⇒ 一边隔离、一边不隔离 | **P0-9** |
 | **D3** | 中 | `allow` 之后以**宿主全权限**执行 ⇒ 「允许一次」与「始终允许」在**本次的实际危害相同** | 无需新条目 —— 就是 §2-L2 缺失的直接后果（见 §8.5） |
-| **D4** | 中 | `assessRisk` 对 `bash` **恒为 `high`**（`ls` / `pwd` 也是），标签失去区分度 | P2-5 |
+| **D4** | 中 | ✅ **已修**（P2-5）：`assessRisk` 对 `bash` **恒为 `high`**（`ls` / `pwd` 也是），标签失去区分度 | P2-5 |
 | **D5** | 中 | **手改规则无审计**：CLI `/permission <key>=<behavior>` 与 A2A 控制面 `harness/permission.set` 都直接写盘、**都不发事件** | P1-9 |
-| **D6** | 低 | 提示文案键位自相矛盾：写 `always(a)`，实际 `a` = 只放行一次、`A` = 永久 | P2-6 |
+| **D6** | 低 | ✅ **已修**（P2-6）：提示文案键位自相矛盾 —— 写 `always(a)`，实际 `a` = 只放行一次、`A` = 永久 | P2-6 |
 | **D7** | 低 | `mode` 是**进程级**（一个进程内多会话共享），"会话级切换"并不存在 | P2-7 |
 
 ### 8.3 D1 深挖：提示一套、写回另一套
@@ -400,4 +400,4 @@ asker 路由也已在用了，只差把它接进规则匹配与写回**（P0-9 �
 | **D1**（P0-8）✅ **已修** | ①`rememberRule` 改 **PathRules 增量写回**：把本次 `patterns` 并进 `allow`（或 `deny`），**保留**已有 `deny`/`ask`，不再整键覆盖；`patterns` 为空 ⇒ `**` 通配（等价旧 string，但不抹掉既有规则）。②`check()` 收紧：**全局 deny 对所有工具规则形态都有否决权** —— 实现时确认，string 形态**没有自己的 deny 列表**，所以"string allow 也过 `denyTargets`"唯一可行形态是**从全局借 deny 列表**（默认 `'*': 'ask'` 不触发 ⇒ 零行为变化，只收紧不放宽） | `permission-deny-patterns.test.ts` 补"always-allow 后段级 deny 仍生效" + "写回不丢已有 deny/ask" |
 | **D2**（P0-9）✅ **已修** | 规则键加**归属前缀**：`session:<sid>\|<tool>` / `caller:<hash>\|<tool>`；`check()` 按 `session` → `caller` → 工具 → 全局**逐层回退**；写回带归属键。实现时改了两点：①**主体必须哈希**（A2A 的调用方标识就是 Bearer token，落盘即泄凭据 ⇒ `callerScopeKey()` 取 sha256 前 16 位）；②归属靠 **`resolvePrincipalKey()` 覆写钩子**而不是给 `PermissionRequest` 加字段（只有宿主有鉴权上下文；加字段等于让 core 认识 A2A 的鉴权模型）。缺省（基类）返回 `undefined` ⇒ **无归属，行为与分层前逐位相同** | 已补："远程 caller 不继承本地 always-allow"（host 单测 + A2A 端到端各一条）、"无归属时作用域键被忽略"、"层序"、"作用域通配 deny 否决" |
 | **D5**（P1-9）✅ **已修** | 加 `kind: 'permission.rule.changed'`（零内容 + `stateHash` + 来源 `cli / control-api / asker`），沿用 `harness.audit.v1`。接在 **`HarnessHost.setPermissionRules()`**（两条手工路径的唯一入口）+ 引擎 `rememberRule`（asker 路径）。`createAuditSink` 的"无 sessionId 即丢弃"改为**落工作区级 `{dataDir}/audit.jsonl`**（控制面规则变更无会话归属，丢弃＝白做） | 已补：host 单测（source=asker、零内容、单次答复不产生）+ A2A 端到端（控制面 ⇒ 工作区级文件、source=control-api） |
-| **D4 / D6**（P2-5/P2-6） | 纯判据与文案：`assessRisk` 让 `bash` 走**模式表**（`ls` 不该是 high）；文案键位改成自洽（或直接去掉方括号里的简写）。`cli.test.ts` 钉着文案，**改要同步** | 文案用例同步更新 + `assessRisk` 补 `bash` 分级用例 |
+| **D4 / D6**（P2-5/P2-6）✅ **已修** | 纯判据与文案：`assessRisk` 让 `bash` 走**模式表**（`ls` 不该是 high）—— 实际落成 `SHELL_TOOL_KEYS` 分流 + `assessShellRisk(command)`，且**执行类判据要放在工具键表之前**（否则模式表对 bash 永远不生效）；文案键位改成**只有 `状态(键)` 一种形态**（比初稿的"去掉方括号简写"更进一步：直接与 `PermissionAnswer` 四态对齐）。`cli.test.ts` 钉着文案，**改要同步** | 文案用例已同步（host 2 处逐字）+ `assessRisk` 补 6 条 bash 分级用例 + cli 加"文案↔`parseCliAnswer`"守卫。反向验证三处变异：M1 退回一刀切 high ⇒ host 5 红；M2 退回旧文案 ⇒ host 2 + cli 1 红；M3 摘掉 `NULL_SINK_REDIRECT` 负向前瞻 ⇒ host 1 红 |

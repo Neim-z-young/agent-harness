@@ -1,5 +1,79 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 274）修复 P2-5 + P2-6：风险标签按命令分流 + 权限提示文案键位自洽
+
+### 起因
+
+承接续 273（授权域收敛已完成），清 `docs/sandbox-isolation-plan.md` §8 剩下的两条**低危但会误导人**
+的缺陷（D4 / D6，对应 §3.2 的 P2-5 / P2-6）。用户在我给的 A/B/C/D 里选 **B** —— 只要判据与文案，
+不碰沙箱主线。两条都是"**提示与事实不符**"：一条是风险标签没有区分度，一条是提示里的按键说明自相矛盾。
+它们不决策、不拦命令，但**决策卡片上只有它们**，而决策权在人手里 ⇒ 误导人按键就是实打实的风险。
+
+### 决策与落地
+
+**① P2-5（D4）：`assessRisk` 让执行类工具走命令模式表**
+
+- `assessRisk` **分流**：`SHELL_TOOL_KEYS`（= `bash`）**放在最前**，走 `assessShellRisk(command)`；
+  其余工具才走原来的"入参高危模式 > 工具键表 > 默认 medium"。
+  **顺序本身就是修复的一部分** —— 改造前 `bash` 在 `HIGH_RISK_TOOL_KEYS` 里，命中即 `return 'high'`，
+  那条高危模式表（`rm -rf` / `sudo` / `dd if=` …）**对 bash 从来没有生效过**。
+- `bash` 从 `HIGH_RISK_TOOL_KEYS` **移出**；`bash_ro` 加进 `LOW_RISK_TOOL_KEYS`（白名单 + 拒绝重定向/命令替换/
+  提权，天然不可写）。
+- `assessShellRisk(command)` 四级判据：**高危模式 → high**、**写入/替换元字符（`>` `<` 反引号 `$(`）→ medium**、
+  **每一段首词都在只读白名单且无 `-exec` / `-delete` → low**、其余 **medium**。
+  段切分用 `/&&|\|\||[;&|\n]/`；首词跳过前置环境变量赋值（`FOO=1 ls` 的 head 是 `ls`）。
+- 首词白名单**刻意收窄**（只收语义上无副作用的命令）：不收 `sort` / `sed` / `awk`（`-o` / `-i` 会写文件）、
+  不收 `env` / `xargs` / `sh`（只是跳板，动作在参数里）、不收 `git` / `npm` / `docker`（同一首词下
+  `git log` 与 `git push` 并存）。**宁可落 medium** —— 标签保守只是少一点区分度，放宽才是往错的方向偏。
+- 空设备重定向**复用 §九（`bash_ro`）的 `NULL_SINK_REDIRECT`**（含尾部负向前瞻）⇒ `ls 2>/dev/null` 仍是 `low`。
+  两处同形态是有意的：那边管"能不能执行"，这边管"打什么标签"。
+- **拿不到命令文本 ⇒ `high`**：执行类工具却不知道要跑什么，保守是唯一安全的默认，且与改造前逐位一致。
+
+**② P2-6（D6）：提示文案只剩一种键位形态**
+
+- 旧文案 `allow / deny / always(a) / deny-always(d)? [a/d/A/D]` 是**自相矛盾**的：前半说 `always` 是 `a`，
+  方括号里 `a` 却是 allow、`A` 才是 always（实现正是 `parseCliAnswer`：`a`→allow、`A`→always-allow）
+  ⇒ 照前半读会把「始终允许」按成「允许一次」。
+- 新文案 `allow(a) / deny(d) / always-allow(A) / always-deny(D)?`：**只有 `状态(键)` 一种形态**，
+  与 `PermissionAnswer` 四态**同一词汇表**（顺带把 `deny-always` 正名为类型里的 `always-deny`）。
+- `cli.test.ts` 加守卫：从文案里抓 `词(键)` 对（`/([a-z][a-z-]*)\(([a-zA-Z])\)/g`），
+  断言 `parseCliAnswer(键) === 词` —— 把**文案与解析器逐对钉住**，改任一边都红。
+
+### 只有实现时才暴露的发现
+
+- **⚠️ `assessRisk` 的判据是「权限键」（`permission.key`）而不是工具 id**。实际键是
+  `read`（read_file）/ `write`（write_file + edit_file）/ `bash` / `bash_ro`；而 `HIGH_RISK_TOOL_KEYS`
+  里写的是**工具 id**（`write_file` / `edit_file`）⇒ **`write` 落 medium**（写操作标中危）。
+  这是比 D4 更隐蔽的同族问题（D4 至少还落在 high 上，这条是**该高却中**）。**本轮未修**：
+  改它要动 `cli.test.ts:2752` 的既有断言 `expect(env.riskLevel).toBe('medium')`，属行为变更，
+  已记入方案文档的 P2-5 行作待决。
+- **纯空白 / 空串命令也要按 high**：判据写成 `command ? assessShellRisk(command) : 'high'` 即可
+  （空串 falsy）—— 不必单独判 `trim()`，但得意识到它走的是"拿不到命令文本"那条分支。
+- **`bun` 的失败计数必须只读汇总行**：`(fail)` 明细行在**文件段落**与**末尾汇总**各打一次，
+  用 `grep -c '^(fail)'` 会**双计**（M1 的 5 个失败会显示成 10 行）。判据一律用
+  `grep -E '^ *[0-9]+ fail' | awk '{print $1}' | tail -1`。
+- 文案改动的**波及面比想象小**：全仓只有 `host/src/permission.test.ts` 两处逐字断言，`cli/src/tui.tsx`
+  的 `approvalLine` 只取含「权限请求」的那一行（第二行怎么改都不影响），`tui.test.tsx` 用的是截断字面量。
+
+### 验证
+
+- **全仓 typecheck**：真实退出码 `0`；**46 包全部 `Exited with code 0`**；`grep -c "error TS"` = **0**。
+  （中途一次 `TS2769`：新增守卫里 `expect(parseCliAnswer(key)).toBe(word)` 的 `word` 是 `string`，
+  而 `toBe` 期望 `PermissionAnswer` ⇒ 把 pairs 的元素类型标注成 `[PermissionAnswer, string]` 后消失。）
+- **全仓 test**：**2747 pass / 0 fail / 0 skip**（46 包全 exit 0）。较上轮基线 2739 **+8**
+  （host `permission.test.ts` 39→45 = +6；cli `cli.test.ts` 152→154 = +2）。
+- **反向验证（三处变异 + `cp` 备份 + `shasum` 还原；文件哈希 `b6b9b242…` 逐字节一致，无「反向验证临时」残留）**：
+
+  | 变异 | 位置 | 预测 | 实测 | 还原 |
+  |---|---|---|---|---|
+  | M1 执行类退回"按工具键一刀切 high" | `host/src/permission.ts` `assessRisk` | host 5 | host **5** ✓ | 哈希一致 → 45 pass |
+  | M2 文案退回旧的自相矛盾形态 | `host/src/permission.ts` `buildPermissionPrompt` | host 2 + cli 1 | host **2** + cli **1** ✓ | 哈希一致 |
+  | M3 摘掉 `NULL_SINK_REDIRECT` 的负向前瞻 | `host/src/permission.ts` 常量 | host 1 | host **1** ✓（`Expected "medium" Received "low"`） | 哈希一致 |
+
+  M1 的 6 条用例里第 6 条（「拿不到命令文本 ⇒ high」）**应当仍绿**，实测确实仍绿 —— 这正是"分流后
+  旧行为逐位保留"的证据，不是覆盖漏洞。
+- 还原后重跑受影响两包全绿（host 45 / cli 154），再做一轮收尾全量 typecheck + test（同上）。
+
 ## 2026-10-11（续 273）修复 P0-9 + P1-9：权限规则按归属分层 + 规则变更审计（授权域收敛）
 
 ### 起因
