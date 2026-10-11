@@ -113,8 +113,8 @@
 | P0-1 | **沙箱策略从 `config.json` 根本设不到** | 组合根用**无参单例**注册：`load: async () => (…).toolsBuiltinPlugin`，而 `toolsBuiltinPlugin = createToolsBuiltinPlugin()`。于是 `allowlist` / `rootDir` / `dangerousDetection` / `sanitizeEnv` / `fallbackToHost` **一条都不可配**。用户"在 config 里写了白名单以为生效"是**静默失效**——比没写更危险 | `host/src/plugins.ts:320`、`tools-builtin/src/index.ts:1630` |
 | P0-2 | **MCP 子进程全量继承 env（与 bash 的隔离不对称）** | `spawn(command, args, { env: { ...process.env, ...config.env } })` ⇒ 同一个 `GITHUB_TOKEN`，bash 里被摘掉、**第三方 MCP server 里照样读得到**。而 MCP server 恰恰是外部代码 | `mcp-client/src/index.ts:147` |
 | P0-3 | **读侧无隔离：cwd 内的密钥文件默认可读** | `isWithinCwd` 只保证"在 cwd 里"，于是 `cat .env` / `cat .harness/.config-key` / `cat ~/.harness/permissions.json`（若 cwd 覆盖）畅通。bash 的 env 过滤挡不住**从文件里再读一遍** | `tools-builtin` 的 `read_file` / `bash` |
-| P0-4 | **路径边界只做字符串前缀，无 `realpath` 解析 ⇒ symlink 逃逸** | `isWithinCwd = !relative(cwd, p).startsWith('..')`，而 `resolvePath` 只用 `resolve`（不做符号链接解析）。cwd 内一条 `ln -s /etc secret` ⇒ `secret/passwd` 的 `relative` 是 `secret/passwd`，**判定通过**，`stat/open` 却跟随链接读到外部。对照：`skill` / `subagent` 已经用 `realpathSync` 兜底，**工具侧没有** | `tools-builtin/src/index.ts:46-52` |
-| P0-5 | **`isWithinCwd` / `resolvePath` 在 6 个包各写一份** | `tools-builtin` / `tools-glob` / `tools-search` / `tools-media` / `code-intel` / `subagent`。安全边界**修一处漏五处**，且语义已开始漂移（有的比 `resolve`、有的比真实路径） | 各包 `index.ts` / `core.ts` |
+| P0-4 | ✅ **已修**（2026-10-11，见开发日志续 275）—— 原文：**路径边界只做字符串前缀，无 `realpath` 解析 ⇒ symlink 逃逸** | `isWithinCwd = !relative(cwd, p).startsWith('..')`，而 `resolvePath` 只用 `resolve`（不做符号链接解析）。cwd 内一条 `ln -s /etc secret` ⇒ `secret/passwd` 的 `relative` 是 `secret/passwd`，**判定通过**，`stat/open` 却跟随链接读到外部。对照：`skill` / `subagent` 已经用 `realpathSync` 兜底，**工具侧没有**。**落地形态**：边界判定改到**真实路径**上比 —— 两侧都过 `realpathBestEffort()`（路径不存在时**逐级上溯到最近存在的祖先**再拼回剩余段，因此"写一个还不存在的新文件"这条路径照常被判定）；`resolvePath` 仍保持**纯字符串**（不碰文件系统），由 `isWithinCwd` 单独做真值判定。每一个有强制路径的包都补了 symlink 逃逸回归（读侧 + 写侧） | `packages/fs-guard/src/index.ts` |
+| P0-5 | ✅ **已修**（2026-10-11，见开发日志续 275） | `tools-builtin` / `tools-glob` / `tools-search` / `tools-media` / `code-intel` / `subagent` 各写一份。安全边界**修一处漏五处**，且语义已开始漂移（有的比 `resolve`、有的比真实路径）。**落地形态**：新建零依赖的 **`@harness/fs-guard`**（只引 `node:path` / `node:fs`），上述 6 包（`code-intel` 是 3 个文件）全改为引它；`@harness/tool` 放不下的原因是 `code-intel` 的 `core.ts` / `server.ts` **刻意不引 harness**（要能脱离 harness 单跑），而 fs-guard 零依赖叶子包正好两边都能引。另加**静态守卫**（扫 `packages` 下不得再有第二处 `function resolvePath/isWithinCwd` 定义） | `packages/fs-guard/`、6 包的 `package.json`、根 `tsconfig.json` paths |
 | P0-6 | **超时只杀直接子进程，不杀进程树**（沙箱视角） | `cross-platform-plan.md` P0-5 已从"跨平台"记过；从**隔离**角度更重：超时后沙箱内的 `npm run dev` 还在跑 ⇒ 隔离边界外仍在产生副作用（占端口、写文件、出网） | `runBash` 的 timer 分支 |
 | P0-7 | **`fallbackToHost` 的档位下沉没有记录** | 一旦开启，命令从"沙箱约束"升到"宿主全权"（放开白名单 + 放开 env 隔离 + 补系统 `PATH`）。`requireHostApproval` 默认 true 是好的，但 **allow-all 模式下静默放行且不留痕**（`viaHost` 只在返回值里，审计不记） | `tools-builtin` 回退分支 |
 | P0-8 | ✅ **已修**（2026-10-11，见开发日志续 272）—— 原文：「始终允许」写回是整键覆盖 ⇒ 段级 `denyPatterns` 永久失效（§8 D1） | 提示里显示的是**具体命令**，写回却是 `rules[toolKey] = 'allow'`：①粒度=**整工具**（`ls` 与 `rm -rf` 同键同命）；②**整键覆盖**已有 PathRules（`deny: ['shutdown*']` 直接丢）；③规则退化为 **string** 后 `check()` 走 `typeof toolRule === 'string'` **直接 return**，`denyTargets` **整体不再参与** ⇒ `echo hi; shutdown -h now` 被放行。**测试盲区**：`permission-deny-patterns.test.ts` 只钉了"string 规则不受 denyPatterns 影响"这一形态，**没有覆盖"always-allow 把 PathRules 变成 string"这条写回路径**。⚠️ 修复时发现 ② 的可行形态与初稿不同：string 形态**没有自己的 deny 列表**，"过 denyTargets"只能落成**全局 deny 否决权**（详见 §8.6） | `host/src/permission.ts:283/300`、`core/src/index.ts:492` |
@@ -142,15 +142,15 @@
 | P2-2 | 拒绝文案要**可执行** | 延续既有纪律（`bash_ro` 的结构门带 `why`）：每条隔离拒绝都给「为什么 + 怎么改」。历史教训：文案指向给不出所需信息的工具 ⇒ 模型空转 |
 | P2-3 | `BashOutput` 加 `isolation` | `{ level, fsBound, netPolicy, viaHost }`，让模型（与取证脚本）知道这次执行的边界 |
 | P2-4 | 文档口径 | README / `AGENTS.md` 要写清「**当前隔离是策略级，不是 OS 级**」，并说明什么场景必须上 L2/L3 |
-| P2-5 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**风险标签失去区分度**（§8 D4） | `assessRisk` 的 `HIGH_RISK_TOOL_KEYS` 含 `bash` ⇒ **bash 恒为 `high`**，`ls` / `pwd` / `echo` 与 `rm -rf` 同一个标签；高危模式表（`rm -rf` / `sudo` / `dd if=` …）因此**只在工具键不在表里时**才有机会生效。标签不决策、但它是决策卡片的唯一提示。**落地形态**：`bash` 移出工具键表，按 `SHELL_TOOL_KEYS` **分流**先走 `assessShellRisk(command)`（高危模式 → 写入/替换元字符 → **每段**首词在只读白名单且无 `-exec`/`-delete` → 否则 medium；**拿不到命令文本 ⇒ high**，与改造前逐位一致），其余工具才走"入参高危模式 > 工具键表 > medium"；`bash_ro` 直接落 low；`ls 2>/dev/null` 复用 §九 的 `NULL_SINK_REDIRECT`（含负向前瞻）仍是 low。⚠️ **附带发现（本轮未修）**：判据 `toolKey` 实际是**权限键**（`read` / `write` / `bash` / `bash_ro`），而 `HIGH_RISK_TOOL_KEYS` 里写的是**工具 id**（`write_file` / `edit_file`）⇒ **`write` 落 medium**（写操作标中危）。改它会动 `cli.test.ts:2752` 的既有断言，留作待决 | `host/src/permission.ts`（`assessRisk` / `assessShellRisk`） |
+| P2-5 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**风险标签失去区分度**（§8 D4） | `assessRisk` 的 `HIGH_RISK_TOOL_KEYS` 含 `bash` ⇒ **bash 恒为 `high`**，`ls` / `pwd` / `echo` 与 `rm -rf` 同一个标签；高危模式表（`rm -rf` / `sudo` / `dd if=` …）因此**只在工具键不在表里时**才有机会生效。标签不决策、但它是决策卡片的唯一提示。**落地形态**：`bash` 移出工具键表，按 `SHELL_TOOL_KEYS` **分流**先走 `assessShellRisk(command)`（高危模式 → 写入/替换元字符 → **每段**首词在只读白名单且无 `-exec`/`-delete` → 否则 medium；**拿不到命令文本 ⇒ high**，与改造前逐位一致），其余工具才走"入参高危模式 > 工具键表 > medium"；`bash_ro` 直接落 low；`ls 2>/dev/null` 复用 §九 的 `NULL_SINK_REDIRECT`（含负向前瞻）仍是 low。⚠️ **附带发现（本轮未修）**：判据 `toolKey` 实际是**权限键**（`read` / `write` / `bash` / `bash_ro`），而 `HIGH_RISK_TOOL_KEYS` 里写的是**工具 id**（`write_file` / `edit_file`）⇒ **`write` 落 medium**（写操作标中危）。⚠️ 该附带发现已于 2026-10-11 **收口**（见续 275，承 P2-7 那轮）：两张表的键改成**权限键**（`HIGH = write / edit`、`LOW = read / bash_ro`），`SHELL_PERMISSION_KEYS` 与两张表均**不再有工具 id**；并在 `permission.test.ts` 加了两条钉住"id 不是键 ⇒ medium"的用例（写侧 + 读侧各一条），`cli.test.ts` 的 `riskLevel` 断言由 `medium` 改为 `high` | `host/src/permission.ts`（`assessRisk` / `assessShellRisk`） |
 | P2-6 | ✅ **已修**（2026-10-11，见开发日志续 274）—— 原文：**提示文案键位自相矛盾**（§8 D6） | `buildPermissionPrompt().text` 写 `allow / deny / always(a) / deny-always(d)? [a/d/A/D]` —— 前半说 `always` 是 `a`，方括号里 `a` 却是 allow、`A` 才是 always。而实际实现正是 `'A' → always-allow`、`'a' → allow`（`parseCliAnswer`）。照前面读会**把"始终允许"按成"允许一次"**（或反之）。**落地形态**：文案改成**只有一种形态 `状态(键)`** —— `allow(a) / deny(d) / always-allow(A) / always-deny(D)?`，与 `PermissionAnswer` 四态**同一词汇表**（顺带把 `deny-always` 正名为类型里的 `always-deny`）；并在 `cli.test.ts` 加守卫，从文案抓 `词(键)` 对、断言 `parseCliAnswer(键) === 词`（改文案或改解析器任一边都会红） | `host/src/permission.ts`（`buildPermissionPrompt`）、`cli/src/index.ts:397`（`parseCliAnswer`） |
-| P2-7 | **`mode` 是进程级，"会话级切换"不存在**（§8 D7） | `InteractivePermissionEngine.mode` 是实例字段，一个进程内**所有会话共享**；`setMode()` 注释也写明"不影响持久化规则"。CLI 的 `/permission <mode>` 文案容易被读成"只对当前会话生效"。要么写清"进程级"、要么真做成会话级（依赖 P0-9 的分层结构） | `host/src/permission.ts:194/223`、`cli/src/index.ts:1348` |
+| P2-7 | ✅ **已修**（2026-10-11，见开发日志续 275）—— 原文：**`mode` 是进程级，"会话级切换"不存在**（§8 D7） | `InteractivePermissionEngine.mode` 是实例字段，一个进程内**所有会话共享**；`setMode()` 注释也写明"不影响持久化规则"。CLI 的 `/permission <mode>` 文案容易被读成"只对当前会话生效"。**落地形态**：真做成**会话级**（不选"只改文案"）—— 引擎加 `sessionModes: Map<sessionId, PermissionMode>`，`getMode(sessionId?)` 会话覆盖优先、回退进程默认，`ask()` 按 `req.sessionId` 取；CLI `/permission <mode>` **默认只改本会话**，全进程用显式 `global` 后缀（能力没丢，只是不再由一个会话静默改掉别的会话）；A2A 控制面 `harness/permission.get|set` 加**可选 `sessionId`**（不给 ⇒ 进程默认，老调用行为逐位不变）。与 `mode` 同口径：内存态、不落盘、重启复位 | `host/src/permission.ts`（`getMode` / `setMode` / `ask`）、`cli/src/index.ts`、`a2a-server/src/control.ts` |
 
 ### 3.3 P3 —— **工程与防回归**
 
 | # | 缺口 | 说明 |
 |---|---|---|
-| P3-1 | **路径边界统一到一处** | 把 `resolvePath` / `isWithinCwd`（含 `realpath` 版本）收敛进 `@harness/tool`（或新 `@harness/fs-guard`），一处实现 + 跨包守卫测试双向钉住（延续"同一语义只有一份"纪律，见 `permission.ts` 文件头的同类论证） |
+| P3-1 | ✅ **已修**（2026-10-11，见开发日志续 275） | 把 `resolvePath` / `isWithinCwd`（**realpath 版**）收敛进新包 **`@harness/fs-guard`**，一处实现 + **静态守卫测试双向钉住**：① 行为侧 —— `fs-guard` 自带 symlink 逃逸 / 不存在目标 / macOS `/var` 两侧真实路径用例；② 结构侧 —— 一条扫 `packages` 源码的守卫，**别处再抄一份 `function resolvePath/isWithinCwd` 就变红**（反向验证实测：塞回一份副本 ⇒ 该守卫 1 红并精确点名文件）。收敛后 `..foo` 这类目录名不再被 `startsWith('..')` 误杀（改成只认整段 `..`） | `packages/fs-guard/src/index.ts` + `src/index.test.ts` |
 | P3-2 | **`probeIsolation()`** | 探测本机可用的隔离原语，与 `resolveShell()` 同范式（注入 `{ platform, exists }` 即可单测，不需要真机） |
 | P3-3 | **三平台 CI** | 与 `cross-platform-plan.md` P1-5 同一条：没有矩阵，任何隔离修复都会在下次改动里静默回归 |
 | P3-4 | **渗透用例集** | symlink 逃逸 / env 泄漏 / 内网探测 / fork bomb / 磁盘写满 / 进程树残留 —— 作为回归门，每条都能自动判 |
@@ -158,8 +158,9 @@
 ## 4. 建议实施顺序
 
 1. **P0-1 可配置**（`sandbox` 段进 config + 组合根透传）—— 不先做这条，后面所有策略用户都摸不到。
-2. **P0-4 + P0-5 + P3-1 一起做**：把路径边界收敛成一份 **`realpath` 版**实现，替换 6 处副本。
-   一次改完、一次测完（可注入 `platform` 做纯函数测试）。
+2. ~~**P0-4 + P0-5 + P3-1 一起做**：把路径边界收敛成一份 **`realpath` 版**实现，替换 6 处副本。~~
+   ✅ **已完成**（2026-10-11，见开发日志续 275）：新建 `@harness/fs-guard`，7 个文件（6 包）全改为引它，
+   一次改完、一次测完；每个有强制路径的包各补了 symlink 逃逸回归（读侧 + 写侧），并加了"别处不得再有一份"的静态守卫。
 3. **P0-2 + P0-3**：env 白名单化（默认拒绝）覆盖 MCP 子进程；读侧对 `.env` / `.config-key` /
    `permissions.json` 这类**已知敏感名**加默认拒绝（可 `keepPaths` 放行）。
 4. **P0-6 + P1-1**：进程组 / 进程树 kill + `ulimit` 资源上限（真机验证，或至少 process-group 单测）。
@@ -173,13 +174,14 @@
 6. **P1-4 档位结构 + P1-3 OS 绑定**：先定义 `probeIsolation()` 与档位语义，再接第一个
    OS 原语（macOS `sandbox-exec` 最易验证）—— **拿不到原语就按 §2 纪律 2 显式降级告警**。
 7. **P1-2 网络策略**、**P1-6 死协议收口**（要么接生产者、要么删掉类型）、**P2 批次**
-   （D4/D6 已于 2026-10-11 修完，见续 274；**剩 D7** 的 `mode` 进程级口径与 P2 其余）、**P3-4 渗透集**。
+   （D4/D6 见续 274、D7 见续 275，**P2 已清空**）、**P3-4 渗透集**（P3-1 见续 275）。
 8. **P1-5 / P1-7 / L3**：与 `external-integration-plan.md` §9 的"执行后端抽象"合流后统一做。
 
 > **与 L2 的排期分叉**：第 5 步（授权域）与第 6 步（L2 OS 绑定）**互不阻塞**，但有先后意义 ——
-> **若 L2 先做**，第 2 步的 P0-4/P0-5（字符串判定）定位从"主防线"降到"纵深防御"；
-> **若 L2 要等**，P0-4 必须马上做，因为它此刻是唯一那道墙。两者都做不是重复投入，
-> 但**只做一个则另一个必须紧跟着补位** —— 详见 §8.5。
+> 第 2 步的 P0-4/P0-5 **已于 2026-10-11 完成**（realpath 版 + 全仓唯一一份，见续 275），
+> 所以"先做哪个"这个分叉**已经不存在**：字符串判定守不住 symlink 这件事已被实证并修掉，
+> 它现在是**纵深防御**那一层；L2（OS 级只读绑定）仍要单独做 —— TOCTOU（检查与打开之间换链接）
+> 只有 OS 那一层挡得住。
 
 ## 5. 验收口径（每一条都要能自动判）
 
@@ -318,7 +320,7 @@
 | **D4** | 中 | ✅ **已修**（P2-5）：`assessRisk` 对 `bash` **恒为 `high`**（`ls` / `pwd` 也是），标签失去区分度 | P2-5 |
 | **D5** | 中 | **手改规则无审计**：CLI `/permission <key>=<behavior>` 与 A2A 控制面 `harness/permission.set` 都直接写盘、**都不发事件** | P1-9 |
 | **D6** | 低 | ✅ **已修**（P2-6）：提示文案键位自相矛盾 —— 写 `always(a)`，实际 `a` = 只放行一次、`A` = 永久 | P2-6 |
-| **D7** | 低 | `mode` 是**进程级**（一个进程内多会话共享），"会话级切换"并不存在 | P2-7 |
+| **D7** | 低 | ✅ **已修**（P2-7）：`mode` 是**进程级**（一个进程内多会话共享），"会话级切换"并不存在 —— 现改为**真会话级**（`sessionModes` 覆盖 + 进程默认回退），CLI 默认只改本会话、`global` 后缀才改进程默认，A2A 控制面加可选 `sessionId` | P2-7 |
 
 ### 8.3 D1 深挖：提示一套、写回另一套
 
@@ -387,10 +389,10 @@ asker 路由也已在用了，只差把它接进规则匹配与写回**（P0-9 �
 - **P0-7（`fallbackToHost` 升权不留痕）是同一族**：授权之后的执行边界一旦失守，
   "授权"这件事本身就没有意义 —— 所以它不是小毛病。
 - **排期分叉（§4 第 5/6 步）**：
-  - 若 **L2 先做**：P0-4/P0-5（字符串路径判定）从"主防线"降为"纵深防御"，**仍要做**
-    （L2 拿不到原语降级时，它是唯一那道墙）。
-  - 若 **L2 要等**：**P0-4 必须马上做**，因为此刻它就是唯一那道墙。
-  - 两者都做不是重复投入；**只做一个则另一个必须紧跟着补位**。
+  - **P0-4/P0-5 已于 2026-10-11 做完**（见续 275）：路径边界现在是 realpath 版、且全仓只有一份。
+    这**不替代** L2 —— 真实路径判定仍可能被 TOCTOU（检查与打开之间换链接）绕过，OS 级只读绑定
+    仍是唯一挡得住那种时间窗的墙；反过来 L2 拿不到原语降级时，这份判定是唯一那道墙。
+  - 若 **L2 要等**：P0-4 已就位，不必再等。
 - **D1/D2 不依赖沙箱**：它们是纯粹的规则层缺陷，与 L0–L3 任何一档的落地无关 —— 可以现在就修。
 
 ### 8.6 修复建议（都不大）
@@ -401,3 +403,5 @@ asker 路由也已在用了，只差把它接进规则匹配与写回**（P0-9 �
 | **D2**（P0-9）✅ **已修** | 规则键加**归属前缀**：`session:<sid>\|<tool>` / `caller:<hash>\|<tool>`；`check()` 按 `session` → `caller` → 工具 → 全局**逐层回退**；写回带归属键。实现时改了两点：①**主体必须哈希**（A2A 的调用方标识就是 Bearer token，落盘即泄凭据 ⇒ `callerScopeKey()` 取 sha256 前 16 位）；②归属靠 **`resolvePrincipalKey()` 覆写钩子**而不是给 `PermissionRequest` 加字段（只有宿主有鉴权上下文；加字段等于让 core 认识 A2A 的鉴权模型）。缺省（基类）返回 `undefined` ⇒ **无归属，行为与分层前逐位相同** | 已补："远程 caller 不继承本地 always-allow"（host 单测 + A2A 端到端各一条）、"无归属时作用域键被忽略"、"层序"、"作用域通配 deny 否决" |
 | **D5**（P1-9）✅ **已修** | 加 `kind: 'permission.rule.changed'`（零内容 + `stateHash` + 来源 `cli / control-api / asker`），沿用 `harness.audit.v1`。接在 **`HarnessHost.setPermissionRules()`**（两条手工路径的唯一入口）+ 引擎 `rememberRule`（asker 路径）。`createAuditSink` 的"无 sessionId 即丢弃"改为**落工作区级 `{dataDir}/audit.jsonl`**（控制面规则变更无会话归属，丢弃＝白做） | 已补：host 单测（source=asker、零内容、单次答复不产生）+ A2A 端到端（控制面 ⇒ 工作区级文件、source=control-api） |
 | **D4 / D6**（P2-5/P2-6）✅ **已修** | 纯判据与文案：`assessRisk` 让 `bash` 走**模式表**（`ls` 不该是 high）—— 实际落成 `SHELL_TOOL_KEYS` 分流 + `assessShellRisk(command)`，且**执行类判据要放在工具键表之前**（否则模式表对 bash 永远不生效）；文案键位改成**只有 `状态(键)` 一种形态**（比初稿的"去掉方括号简写"更进一步：直接与 `PermissionAnswer` 四态对齐）。`cli.test.ts` 钉着文案，**改要同步** | 文案用例已同步（host 2 处逐字）+ `assessRisk` 补 6 条 bash 分级用例 + cli 加"文案↔`parseCliAnswer`"守卫。反向验证三处变异：M1 退回一刀切 high ⇒ host 5 红；M2 退回旧文案 ⇒ host 2 + cli 1 红；M3 摘掉 `NULL_SINK_REDIRECT` 负向前瞻 ⇒ host 1 红 |
+| **D7**（P2-7）✅ **已修** | 真做成**会话级**（而不是只把文案改成"进程级"）：引擎加 `sessionModes` 覆盖表，`getMode/setMode` 接 `sessionId?`，`ask()` 按 `req.sessionId` 取；CLI 默认**只改本会话**、`global` 后缀改进程默认；A2A 控制面加可选 `sessionId`（不给 ⇒ 进程默认，**老调用逐位不变**）。⚠️ 实现期坑：CLI 的 `arg` 是 `line.split(/\s+/, 2)[1]`，**只截到第二个 token** ⇒ `ask global` 里的 `global` 会被丢掉，必须从 `line` 自己切 | host 补 4 条（未切过回退默认 / 只改本会话 / 不给 sessionId 改进程默认 / `ask` 按会话短路）+ cli 1 条（本会话 vs `global`）+ a2a 1 条。反向验证：退回裸字段 ⇒ host 3 + cli 2 + a2a 1 红（与预测逐项一致） |
+| **P0-4 / P0-5 / P3-1** ✅ **已修**（承 D4 那轮的附带发现） | ①`assessRisk` 两张表的键由**工具 id** 改为**权限键**（`HIGH = write / edit`、`LOW = read / bash_ro`）——`toolKey` 本就是 `tool.permission.key`（`tool/src/index.ts` 的 Step 4），id 永远到不了这里，所以改造前 **`write` 落 medium**（写操作标中危，比 D4 更隐蔽：D4 至少还是 high）。②路径边界收敛成**一份 realpath 版**：新建零依赖 `@harness/fs-guard`，6 包 7 文件全改为引它，`isWithinCwd` 两侧都过 `realpathBestEffort`（不存在时逐级上溯最近存在的祖先），并加"别处不得再抄一份"的**静态守卫**；顺带修掉 `startsWith('..')` 对 `..foo` 的误杀 | `assessRisk` 补两条（写侧 + 读侧"id 不是键 ⇒ medium"）+ `cli.test.ts` 的 `riskLevel` 断言 `medium → high`；每个有强制路径的包补 symlink 逃逸回归（builtin 读+写两条）。反向验证四处：① 退回 id 表 ⇒ host 3 + cli 1 红；② 退回进程级 mode ⇒ host 3 + cli 2 + a2a 1 红；③ 退回字符串判定 ⇒ **7 红**（fs-guard 1 + builtin 2 + glob/search/media/code-intel 各 1）；④ 塞回一份副本 ⇒ 静态守卫 1 红并点名文件 |

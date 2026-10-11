@@ -1,5 +1,92 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 275）路径边界收敛为 realpath 版单实现 + 权限模式会话级 + 风险判据改权限键
+
+### 起因
+
+用户给了 **"a b 再 c"**，按序做完三件（A/B 是续 274 遗留的判据与作用域问题，C 是沙箱主线 §4 第 2 步）：
+
+- **A**：续 274 的附带发现 —— `assessRisk` 的判据其实是**权限键**（`read` / `write` / `bash` / `bash_ro`），
+  而两张风险表里写的是**工具 id**（`write_file` / `edit_file`）⇒ **`write` 落 medium**，写操作在决策卡片上
+  标"中危"。比 D4 更隐蔽（D4 至少还是 high），当轮按"先不动"记成待决，本轮收口。
+- **B**：§3.2 的 **P2-7（§8 D7）** —— `mode` 是**进程级**（一个进程内多会话共享），而 CLI 的
+  `/permission <mode>` 文案容易被读成"只对本会话生效"。要么写清、要么**真做成会话级**。
+- **C**：§4 第 2 步 **P0-4 + P0-5 + P3-1** —— 路径边界从"6 个包各写一份纯字符串判定"收敛成
+  "一份 realpath 版"。P0-4（symlink 逃逸）是当初打这个包的**唯一那道墙**。
+
+> ⚠️ 我在上一轮列 C 时把它写成"P0-5 进程树 kill"，是**编号记错**：`§3` 里 P0-5 = "边界判定 6 份副本"，
+> 进程树 kill 是 **P0-6**（不在 §4 第 2 步）。本轮按 §4 第 2 步的原文（P0-4 + P0-5 + P3-1）做。
+
+### 决策与落地
+
+**A：风险分级判据改用权限键**（`host/src/permission.ts`）
+
+- 两张表更名并改内容：`HIGH_RISK_PERMISSION_KEYS = { write, edit }`、`LOW_RISK_PERMISSION_KEYS = { read, bash_ro }`；
+  `SHELL_TOOL_KEYS` → `SHELL_PERMISSION_KEYS`；`assessRisk` 形参 `toolKey` → `permissionKey`。
+- 依据写进注释：`toolKey` 出自 `@harness/tool` 的 `tool.permission.key`（`doExecute` Step 4），
+  **工具 id 从来不经过这里**；`cli.test.ts` 的审计用例（id=`needs_approval`、key=`write`）就是现成证据。
+- 旧的 `delete` / `rm` / `mv` / `chmod` / `modify_pending_order_*` / `read_file` / `list_dir` … 全是**死条目**：
+  它们既不是权限键，也不会作为 `toolKey` 传进来。
+
+**B：权限模式（mode）真做成会话级**（`host/src/permission.ts` / `cli/src/index.ts` / `a2a-server/src/control.ts`）
+
+- 引擎：`sessionModes: Map<sessionId, PermissionMode>`；`getMode(sessionId?)` = 会话覆盖 → 进程默认；
+  `setMode(mode, sessionId?)` 给了 sessionId 只改会话、不给则改进程默认；`ask()` 按 `req.sessionId` 取。
+- CLI：`/permission <mode>` **默认只改本会话**，`/permission <mode> global` 才改进程默认（能力没丢，
+  只是不再由一个会话静默改掉别的会话 —— A2A 远程调用方尤其如此）；查看时两行都打（本会话 + 进程默认）。
+- A2A 控制面：`harness/permission.get|set` 加**可选 `sessionId`**；不给 ⇒ 进程默认（老调用逐位不变）。
+
+**C：路径边界收敛为 `@harness/fs-guard`**（新包 + 6 包 7 文件）
+
+- 新包**零依赖**（只 `node:path` / `node:fs`），导出 `resolvePath`（纯字符串，保持原语义）、
+  `realpathBestEffort`（不存在时逐级上溯最近存在的祖先再拼回剩余段）、`isWithinRoot`（纯字符串包含）、
+  `isWithinCwd`（**两侧都过 realpathBestEffort** 后再包含）。
+- **不放进 `@harness/tool`** 的原因：`code-intel` 的 `core.ts` / `server.ts` 刻意**不引 harness**
+  （要能脱离 harness 单跑），而它正是副本之一；零依赖叶子包两边都能引。
+- 替换 7 个文件（tools-builtin / tools-glob / tools-search / tools-media / code-intel×3 / subagent）；
+  `code-intel/core.ts` 保留 `export { isWithinCwd } from '@harness/fs-guard'`，公共面貌不变。
+- `subagent` 的 `isInsideDir` 一并收敛 —— 它是在**预判** `read_file` / `grep_file` 读不读得到，
+  口径必须与它们实际用的那份**同一**，否则符号链接一出现，提示就与现实相反。
+- 加**静态守卫**：`packages` 下不得再出现第二处 `function resolvePath/isWithinCwd` 定义。
+
+### 只有实现时才暴露的发现
+
+- **块注释里不能出现 `packages/plugins/*/src`** —— `*/` 会提前闭合 JSDoc，后面几行被当成代码，
+  症状是 `bun test` 报 `Expected ";" but found "read"`（不是 TS 语法错误，是 parse 错误）。
+- **CLI 的 `arg` 只截到第二个 token**：`const [cmd, arg] = line.split(/\s+/, 2)` ⇒ `/permission ask global`
+  里的 `global` 被丢掉，`isGlobal` 恒 false。要读第三个 token 必须从 `line` 自己切。
+- **旧 LOW 表里本来就含裸键 `read`**：所以 M1 变异（退回 id 表）时，两条"`read` 应落 low"的断言
+  **仍然绿** —— 预测 4 红、实测 2 红。差异不是测试写错，而是这两条在**两种口径下都成立**，
+  它们证明不了 LOW 侧的改动。⇒ 补了一条**独立**用例（"id `read_file` / `list_dir` / `glob` 不是键 ⇒ medium"），
+  M1 复跑得 3 红。**"某处摘掉也不红"要按"这条断言是否真的依赖被摘掉的东西"来归因，不能含糊成覆盖到位。**
+- **M3 变异真的把文件写到界外了**：把 `isWithinCwd` 退回字符串判定后跑测试，symlink 用例
+  `expect(res.ok).toBe(false)` 红了，同时 `packages/plugins/tools-builtin/src/evil.txt` **被真写出来**
+  （`-rw-r--r-- 1 oyoungy staff 1`，内容 `x`）。这既是"旧实现会放行"的物证，也提醒：
+  **反向验证的变异会留下副作用文件**，收尾必须 `git status --short | grep -v '^ M'` 扫一遍未跟踪产物。
+- `bun install` 对 package.json 的容忍度低：用脚本插依赖行时，**前一行必须补逗号**（它不再是最后一条），
+  而**新行只有后面还有条目时才需要逗号** —— 两头都判错一次（一次少逗号、一次双逗号），
+  各自被 `bun install` 的解析器报了出来。
+
+### 验证
+
+| 段 | 命令 | 结果 |
+|---|---|---|
+| typecheck | `bun run typecheck`（取真实退出码） | exit **0**；**47 包**全 `Exited with code 0`；`error TS` 计数 **0** |
+| 全量 test | `bun run test` | **2777 pass / 0 fail**（47 包全 exit 0），较基线 2747 **+30** |
+| 反向验证 | 四处变异，`cp` + `shasum` 还原 | 见下表，哈希 `5cd3b5e7…` / `09ef6671…` / `5be84f97…` 逐字节一致，全仓无"反向验证临时"残留 |
+
+反向验证（**预测先写、跑完对账**）：
+
+| 变异 | 位置 | 预测 | 实测 | 对账 |
+|---|---|---|---|---|
+| M1 两张风险表退回**工具 id** 口径 | `host/src/permission.ts` | host 4 + cli 1 | host **3** + cli **1** | 差异已归因：旧 LOW 表含裸键 `read`，两条 `read` 断言在两种口径下都绿；补一条独立的"id 不是键"用例后为 3 |
+| M2 `setMode`/`getMode` 忽略 sessionId、`ask` 读裸字段 | `host/src/permission.ts` | host 3 + cli 2 + a2a 1 | host **3** + cli **2** + a2a **1** | ✅ 逐项一致 |
+| M3 `isWithinCwd` 退回字符串判定 | `packages/fs-guard/src/index.ts` | 7（fs-guard 1 + builtin 2 + glob/search/media/code-intel 各 1） | **7** | ✅ 逐项一致；且每个包只有 symlink 用例红，非 symlink 越界用例仍绿 |
+| M4 给 `tools-media` 塞回一份本地副本 | `tools-media/src/index.ts` | 静态守卫 1 红 | 守卫 **1** 红（并点名该文件）+ media **1** 红 | ✅ |
+
+`+30` 用例的去向：`fs-guard` +15（新包）、host +6（A 3 + B 4 − 1 改写）、cli +2、a2a +1、
+tools-builtin +2、tools-search +2、tools-glob / tools-media / code-intel 各 +1、subagent 0（改动由既有 A1-4 用例间接覆盖）。
+
 ## 2026-10-11（续 274）修复 P2-5 + P2-6：风险标签按命令分流 + 权限提示文案键位自洽
 
 ### 起因
