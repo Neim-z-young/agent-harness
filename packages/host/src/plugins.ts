@@ -29,6 +29,7 @@ import { resolveProviderTypeFactory } from '@harness/plugin'
 import { MultiDirLoader, normalizeDirs } from '@harness/workspace'
 import { makeNotice } from './notice'
 import type { NoticeSink } from './notice'
+import type { HarnessConfig, SandboxSection } from './config'
 
 /** 插件目录加载结果：通用 AgentPlugin（Hooks 插件）列表；Provider 类型工厂已注册进 registry */
 export interface PluginLoadResult {
@@ -257,13 +258,25 @@ export function registerBuiltinProviderTypes(registry: ProviderTypeRegistry): vo
 // ------------------------------------------------------------------------
 
 /** 内置通用插件描述符：登记随应用打包的通用插件（如 tools-builtin），统一惰性加载 */
+/**
+ * 内置插件**加载上下文**（P0-1）。
+ *
+ * 存在的理由：内置插件以前一律是**无参单例**（`load: async () => (…).toolsBuiltinPlugin`），
+ * 于是 `config.json` 里的沙箱段根本递不进去 —— 用户写了 `allowlist` / `sanitizeEnv`，
+ * 一条也不会生效且无任何提示。现在 boot 把已解析的 config 递给 `load(ctx)`，
+ * 需要配置的登记项自己取用（不需要的直接忽略参数，调用点无需感知）。
+ */
+export interface BuiltinLoadContext {
+  config?: HarnessConfig
+}
+
 export interface BuiltinGeneralPlugin {
   id: string
   name: string
   description: string
   source: 'builtin'
   /** 惰性加载：首次用到（boot 装配 / /plugins 管理）才 dynamic import，返回 AgentPlugin 实例 */
-  load: () => Promise<AgentPlugin>
+  load: (ctx?: BuiltinLoadContext) => Promise<AgentPlugin>
   /**
    * 静态元信息来源（多级加载 L1）：插件自携带，惰性 dynamic import 对应 /meta 模块（纯数据、无副作用），
    * 供 /tools 等在任何运行时模块（L2）加载前展示描述/别名/安全声明/权限键。
@@ -308,6 +321,33 @@ function lazyToolMetaSource(specifier: string): () => Promise<ToolMetaSource> {
   return async () => (await lazyImport<{ toolMetaSource?: ToolMetaSource }>(specifier)).toolMetaSource!
 }
 
+/**
+ * 把 `config.json → sandbox` 翻译成内置工具插件的装配参数（P0-1）。
+ *
+ * 显式逐字段搬运（而不是整个对象丢过去）：一来类型上不会把 `readDeny` / `mcpEnv` 这类
+ * 非 bash 字段送进 `BashSandboxConfig`，二来以后哪一项没接上在这一眼能看出来。
+ */
+function sandboxToPluginOptions(sb: SandboxSection | undefined): {
+  bash: Record<string, unknown>
+  readDeny: SandboxSection['readDeny']
+  readOnlyBash: Record<string, unknown>
+} | undefined {
+  if (!sb) return undefined
+  const bash: Record<string, unknown> = {}
+  if (sb.dangerousDetection !== undefined) bash.dangerousDetection = sb.dangerousDetection
+  if (sb.rootDir !== undefined) bash.rootDir = sb.rootDir
+  if (sb.sanitizeEnv !== undefined) bash.sanitizeEnv = sb.sanitizeEnv
+  if (sb.keepEnv !== undefined) bash.keepEnv = sb.keepEnv
+  if (sb.allowlist !== undefined) bash.allowlist = sb.allowlist
+  if (sb.fallbackToHost !== undefined) bash.fallbackToHost = sb.fallbackToHost
+  if (sb.requireHostApproval !== undefined) bash.requireHostApproval = sb.requireHostApproval
+  if (sb.limits !== undefined) bash.limits = sb.limits
+  const readOnlyBash: Record<string, unknown> = {}
+  if (sb.readOnlyTimeoutMs !== undefined) readOnlyBash.timeoutMs = sb.readOnlyTimeoutMs
+  if (sb.limits !== undefined) readOnlyBash.limits = sb.limits
+  return { bash, readDeny: sb.readDeny, readOnlyBash }
+}
+
 /** 全局默认内置通用插件注册表（登记 tools-builtin 等随应用打包的插件，惰性加载） */
 export function getBuiltinRegistry(): BuiltinPluginRegistry {
   if (!defaultBuiltinRegistry) {
@@ -317,7 +357,20 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       name: 'Builtin Tools',
       description: '内置工作台工具（文件读写 + Shell）',
       source: 'builtin',
-      load: async () => (await lazyImport<{ toolsBuiltinPlugin: AgentPlugin }>('@harness/tools-builtin')).toolsBuiltinPlugin,
+      // P0-1：带 config 时用工厂重建（把 sandbox 段透传进去）；不带则退回无参单例
+      load: async (ctx) => {
+        const mod = await lazyImport<{
+          toolsBuiltinPlugin: AgentPlugin
+          createToolsBuiltinPlugin: (o: Record<string, unknown>) => AgentPlugin
+        }>('@harness/tools-builtin')
+        const opts = sandboxToPluginOptions(ctx?.config?.sandbox)
+        if (!opts) return mod.toolsBuiltinPlugin
+        return mod.createToolsBuiltinPlugin({
+          bash: opts.bash,
+          readDeny: opts.readDeny,
+          readOnlyBash: opts.readOnlyBash,
+        })
+      },
       metaSource: lazyToolMetaSource('@harness/tools-builtin/meta'),
     })
     defaultBuiltinRegistry.register({
@@ -342,7 +395,15 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       name: 'Search Tools',
       description: '搜索类工具插件：list_dir 目录列举 + grep_file 内容检索',
       source: 'builtin',
-      load: async () => (await lazyImport<{ toolsSearchPlugin: AgentPlugin }>('@harness/tools-search')).toolsSearchPlugin,
+      // P0-3：读侧敏感清单同样要递进来（grep_file 是内容读取口，不只是只读）
+      load: async (ctx) => {
+        const mod = await lazyImport<{
+          toolsSearchPlugin: AgentPlugin
+          createToolsSearchPlugin: (o: { readDeny?: SandboxSection['readDeny'] }) => AgentPlugin
+        }>('@harness/tools-search')
+        const readDeny = ctx?.config?.sandbox?.readDeny
+        return readDeny === undefined ? mod.toolsSearchPlugin : mod.createToolsSearchPlugin({ readDeny })
+      },
       metaSource: lazyToolMetaSource('@harness/tools-search/meta'),
     })
     defaultBuiltinRegistry.register({
@@ -549,6 +610,7 @@ export function unknownBuiltinPluginIds(ids: string[] | undefined, registry = ge
 export async function resolveBuiltinPlugins(
   ids: string[] | undefined,
   registry = getBuiltinRegistry(),
+  config?: HarnessConfig,
 ): Promise<{ plugins: AgentPlugin[]; unknown: string[] }> {
   const plugins: AgentPlugin[] = []
   const unknown: string[] = []
@@ -561,7 +623,7 @@ export async function resolveBuiltinPlugins(
     if (!entry) { unknown.push(id); continue }
     done.add(id)
     try {
-      const plugin = await entry.load()
+      const plugin = await entry.load({ config })
       plugins.push(plugin)
       for (const dep of plugin.dependsOn ?? []) if (!done.has(dep)) queue.push(dep)
     } catch (err) {

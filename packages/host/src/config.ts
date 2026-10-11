@@ -84,6 +84,70 @@ export interface AcpScopeSection {
   config?: Record<string, unknown>
 }
 
+/**
+ * 沙箱段（P0-1）—— 把内置工具插件的沙箱策略搬进配置。
+ *
+ * ## 为什么之前等于没有
+ * 组合根用**无参单例**注册内置插件：`load: async () => (…).toolsBuiltinPlugin`，而
+ * `toolsBuiltinPlugin = createToolsBuiltinPlugin()`。于是用户在这里写 `allowlist` /
+ * `sanitizeEnv` / `fallbackToHost` 时，**一条都不会生效、且没有任何提示** ——
+ * 比"没写"更危险：以为配了。现在 boot 把本段透传给 `createToolsBuiltinPlugin()`，
+ * 并有 {@link checkSandboxConfig} 把"写了但不生效"的键报出来。
+ */
+export interface SandboxSection {
+  /** 危险命令检测（默认 true） */
+  dangerousDetection?: boolean
+  /** 工作目录根：cwd 必须在此目录内（默认会话工作目录） */
+  rootDir?: string
+  /** 敏感环境变量隔离（默认 true） */
+  sanitizeEnv?: boolean
+  /** 隔离时额外保留的环境变量名 */
+  keepEnv?: string[]
+  /** 命令白名单（首命令名或完整命令片段；空/未设置 = 不限制） */
+  allowlist?: string[]
+  /**
+   * 非破坏性命令在沙箱内失败时，升级到宿主 bash 重跑（默认 false）。
+   * ⚠️ 开了就等于放大权限（放开白名单与 env 隔离），且回退路径**不套资源上限**（见 P0-7）。
+   */
+  fallbackToHost?: boolean
+  /** 宿主回退前是否经权限引擎确认（默认 true） */
+  requireHostApproval?: boolean
+  /** `bash_ro` 超时（毫秒，默认 15000） */
+  readOnlyTimeoutMs?: number
+  /**
+   * 资源上限（P1-1）。缺省只开"单文件大小 2 GiB"；某一项显式 `0` = 该项不限制；
+   * `false` = 全部关掉。单位见各字段名（CPU 秒 / KB / 进程数）。
+   */
+  limits?: {
+    cpuSeconds?: number
+    maxFileSizeKb?: number
+    maxProcesses?: number
+    memoryKb?: number
+  } | false
+  /**
+   * 读侧敏感文件策略（P0-3）：`read_file` / `grep_file` / `bash_ro` 默认拒读的依据。
+   * 缺省 = 内置清单；`false` = 关闭；给对象 = **整体替换**（不做浅合并）。
+   */
+  readDeny?: SensitiveReadPolicySection | false
+}
+
+/**
+ * 读侧敏感清单（P0-3）。与 `@harness/fs-guard` 的 `SensitiveReadPolicy` **同形**
+ * （五类规则都必须给全 —— 这是"整体替换"语义，避免"想少挡一项却被迫列出全表"的歧义）。
+ */
+export interface SensitiveReadPolicySection {
+  /** 文件名精确匹配 */
+  names?: string[]
+  /** 文件名前缀（如 `id_rsa`） */
+  prefixes?: string[]
+  /** 文件名后缀（含点，如 `.pem`） */
+  suffixes?: string[]
+  /** 目录段（如 `.ssh`）：路径里除文件名外任一段命中即算 */
+  dirs?: string[]
+  /** 相对工作目录的精确路径（如 `.docker/config.json`） */
+  paths?: string[]
+}
+
 export interface HarnessConfig {
   /** 默认 Agent ID */
   agentId?: string
@@ -172,6 +236,8 @@ export interface HarnessConfig {
    * 若顶层 snapshot 未填，则回退读此字段。
    */
   harness?: { snapshot?: boolean }
+  /** 沙箱策略（内置工具的 bash / 读侧边界；见 {@link SandboxSection}） */
+  sandbox?: SandboxSection
   /**
    * 通用遥测（本地采集为主 + 可选 OTLP）。**写出 `telemetry` 段才装配** `@harness/telemetry`
    * 插件（默认不启用，避免生成遥测文件）；开启后按会话写
@@ -1076,6 +1142,54 @@ const COMPACTION_KEYS: Record<keyof NonNullable<HarnessConfig['compaction']>, tr
   tokenCalibrationScale: true,
 }
 const COMPACTION_STRATEGIES: ReadonlySet<string> = new Set(['prune', 'summary', 'agent'])
+
+/** `sandbox` 段已知键（“写了但拼错”要报出来，见 checkSandboxConfig） */
+const SANDBOX_KEYS: Record<keyof NonNullable<HarnessConfig['sandbox']>, true> = {
+  dangerousDetection: true,
+  rootDir: true,
+  sanitizeEnv: true,
+  keepEnv: true,
+  allowlist: true,
+  fallbackToHost: true,
+  requireHostApproval: true,
+  readOnlyTimeoutMs: true,
+  limits: true,
+  readDeny: true,
+}
+
+/**
+ * 检查 `sandbox` 段里“写了但不会生效 / 需要显式确认”的项（与 {@link checkCompressionConfig}
+ * 同一范式）。
+ *
+ * 存在的理由跟压缩段一样：这段配置**以前整段静默失效**（组合根无参单例注册），
+ * 用户分辨不出“配了没用”与“配了有效”。现在至少写错键会有声音。
+ */
+export function checkSandboxConfig(c: unknown): string[] {
+  if (!isPlainObject(c)) return []
+  const out: string[] = []
+  for (const k of collectUnknown(c, Object.keys(SANDBOX_KEYS), 'sandbox')) {
+    out.push(`${k} 未被识别，该配置不会生效`)
+  }
+  if (c.fallbackToHost === true) {
+    out.push(
+      'sandbox.fallbackToHost=true：沙箱内失败的命令会升级到宿主 bash 全权执行'
+      + '（放开白名单与 env 隔离，且不套资源上限），请确认这是你要的',
+    )
+  }
+  const limits = c.limits
+  if (isPlainObject(limits) && Object.keys(limits).length === 0) {
+    out.push('sandbox.limits 是空对象：等价于“只保留默认的单文件大小上限”；全关请写 limits: false')
+  }
+  const readDeny = c.readDeny
+  if (isPlainObject(readDeny)) {
+    const need = ['names', 'prefixes', 'suffixes', 'dirs', 'paths']
+    const missing = need.filter((k) => readDeny[k] === undefined)
+    if (missing.length) {
+      out.push(`sandbox.readDeny 缺类目 ${missing.join(' / ')}：整体替换语义下它们会被当作空数组（不会报错，但也不匹配任何文件）`)
+    }
+  }
+  return out
+}
 
 // 上下文窗口推导（resolveContextWindowTokens / buildProviderWindowTable / isUsableWindow）已上移到
 // @harness/host —— P0 第三步（B 档）。窗口这个分母必须全进程一份口径（显示 / 压缩阈值 / ACP

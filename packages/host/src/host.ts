@@ -75,6 +75,7 @@ import {
   checkCompactionConfig,
   checkCompactionReachability,
   checkCompressionConfig,
+  checkSandboxConfig,
   checkMemoryConfig,
   checkTelemetryConfig,
   findTokenOnlyDuplicates,
@@ -918,8 +919,9 @@ export class HarnessHost {
         ? { type: defaultPc.type, model: parseModelSpec(this.options.model ?? '').modelId || defaultPc.model }
         : {}),
     }))
-    // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载
-    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load()
+    // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载。
+    // P0-1：带 config 加载 —— 内置插件以前是无参单例，config.json 里的沙箱段递不进去。
+    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load({ config: cfg })
     providerPlugins.push(toolsBuiltin)
     const toolsManager = await getBuiltinRegistry().get('tools-manager')!.load()
     providerPlugins.push(toolsManager)
@@ -934,12 +936,18 @@ export class HarnessHost {
     // 内置插件声明式启用（config.json → plugins）：与外部插件目录并列的第二条装配路径，
     // 让「只想开个内置能力」的用户改一行配置即可（依赖闭包自动补齐，如 computer-use → mcp.server-registry）。
     // 这里只解析实例，实际入列在外部插件之后（见下方按 id 去重），避免与 .harness/plugins 里的同 id 重复安装。
-    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins)
+    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins, getBuiltinRegistry(), cfg)
     if (declaredPlugins.unknown.length) {
       this.emitNotice(makeNotice('config.plugins-inactive', {
         unknown: declaredPlugins.unknown,
         available: getBuiltinRegistry().list().map((p) => p.id),
       }))
+    }
+    // 沙箱段（P0-1）：未识别键 / 需要显式确认的项报警 —— 这段配置以前整段静默失效，
+    // 用户分辨不出“配了没用”与“配了有效”。
+    const sandboxIssues = checkSandboxConfig(cfg.sandbox)
+    if (sandboxIssues.length) {
+      this.emitNotice(makeNotice('config.sandbox-inactive', { items: sandboxIssues }))
     }
     // ACP 上下文压缩：config.json → compression.enabled 为真时才惰性装配 @harness/acp-context。
     // 上下文窗口推导优先级：compression.modelContextLimit → 默认 Provider 的 contextWindowTokens → 插件默认 200_000；

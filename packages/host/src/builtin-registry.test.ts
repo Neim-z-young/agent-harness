@@ -12,8 +12,11 @@
  */
 
 import { describe, it, expect } from 'bun:test'
-import { readFileSync } from 'node:fs'
+import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { ProviderTypeRegistry } from '@harness/plugin'
+import type { AgentPlugin } from '@harness/plugin'
 import {
   lazyImport,
   registerBuiltinProviderTypes,
@@ -285,5 +288,105 @@ describe('内置包清单与 lazy.ts 静态查表一致（--compile 友好性）
       const mod = await lazyImport<Record<string, unknown>>(spec)
       expect(mod).toBeObject()
     }
+  })
+})
+
+// ===== P0-1：config.json → sandbox 段真的透传进内置工具 =====
+
+/** 从插件实例里取出它注入的工具池（走它自己声明的 core.tool.pool.assemble） */
+async function toolsOf(plugin: AgentPlugin): Promise<
+  Array<{ id: string; call: (input: unknown, ctx: unknown) => Promise<unknown> }>
+> {
+  // 只为拿 hook 的测试替身：ctx 只用到 log，故整体 cast（install 的实现不读别的字段）
+  const install = plugin.install as unknown as (ctx: unknown) => Promise<unknown>
+  const hooks = (await install({ log: { info() {}, warn() {}, error() {}, debug() {} } })) as Record<
+    string,
+    (input: unknown, pool: unknown) => Promise<void>
+  >
+  const out: Array<{ id: string; call: (input: unknown, ctx: unknown) => Promise<unknown> }> = []
+  await hooks['core.tool.pool.assemble']!({}, { add: (t: unknown) => out.push(t as never) })
+  return out
+}
+
+function toolCtx(cwd: string) {
+  return {
+    sessionId: 's1', agentId: 'default', messageId: 'm1', toolUseId: 't1',
+    signal: new AbortController().signal, variables: {}, cwd,
+    requestPermission: async () => ({ behavior: 'allow' }),
+  }
+}
+
+describe('P0-1：sandbox 段透传（配置不再静默失效）', () => {
+  it('★readDeny:false 真传到了 read_file（默认则拒读 .env）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-readdeny-'))
+    try {
+      writeFileSync(join(dir, '.env'), 'SECRET=1')
+      const withCfg = await toolsOf(
+        await getBuiltinRegistry().get('tools-builtin')!.load({ config: { sandbox: { readDeny: false } } }),
+      )
+      const rfOff = withCfg.find((t) => t.id === 'read_file')!
+      expect(((await rfOff.call({ path: '.env' }, toolCtx(dir))) as { ok: boolean }).ok).toBe(true)
+
+      // 对照：不带 config ⇒ 走内置清单，拒读
+      const noCfg = await toolsOf(await getBuiltinRegistry().get('tools-builtin')!.load())
+      const rfDef = noCfg.find((t) => t.id === 'read_file')!
+      const denied = (await rfDef.call({ path: '.env' }, toolCtx(dir))) as { ok: boolean; error?: { code?: string } }
+      expect(denied.ok).toBe(false)
+      expect(denied.error?.code).toBe('SANDBOX_READ_DENIED')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★bash.limits 也传到了（自定义值生效，且与默认值不同）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-limits-'))
+    try {
+      const tools = await toolsOf(
+        await getBuiltinRegistry().get('tools-builtin')!.load({
+          config: { sandbox: { limits: { maxFileSizeKb: 1024 } } },
+        }),
+      )
+      const bash = tools.find((t) => t.id === 'bash')!
+      const res = (await bash.call({ command: 'ulimit -f' }, toolCtx(dir))) as { output?: { stdout: string } }
+      // darwin：1 单位 = 1024B ⇒ 1024KB = 1024；linux：512B ⇒ 2048
+      expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
+
+      // 与默认（2 GiB）对照 —— 这一条才是"配置真的起作用"的证据：
+      // 只断言 limits:false ⇒ unlimited 是**无效**的，因为"根本没加抬头"也是 unlimited。
+      const dflt = (await toolsOf(await getBuiltinRegistry().get('tools-builtin')!.load())).find((t) => t.id === 'bash')!
+      const def = (await dflt.call({ command: 'ulimit -f' }, toolCtx(dir))) as { output?: { stdout: string } }
+      expect(Number(def.output!.stdout.trim())).not.toBe(Number(res.output!.stdout.trim()))
+      expect(Number(def.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 2_097_152 : 4_194_304)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('不写 sandbox 段 ⇒ 仍是默认装配（工具齐全、无副作用）', async () => {
+    const tools = await toolsOf(await getBuiltinRegistry().get('tools-builtin')!.load({ config: {} }))
+    expect(tools.map((t) => t.id).sort()).toEqual(['bash', 'bash_ro', 'edit_file', 'read_file', 'write_file'])
+  })
+})
+
+describe('checkSandboxConfig：写了但不生效的键要有声音', () => {
+  const { checkSandboxConfig } = require('./index') as { checkSandboxConfig: (c: unknown) => string[] }
+
+  it('未识别键被点名', () => {
+    const out = checkSandboxConfig({ allowList: ['ls'] })
+    expect(out.some((m) => m.includes('sandbox.allowList') && m.includes('不会生效'))).toBe(true)
+  })
+
+  it('fallbackToHost=true 需要显式确认的提示', () => {
+    expect(checkSandboxConfig({ fallbackToHost: true }).some((m) => m.includes('宿主 bash 全权'))).toBe(true)
+    expect(checkSandboxConfig({ fallbackToHost: false })).toEqual([])
+  })
+
+  it('空 limits 对象与缺类目的 readDeny 都会被指出', () => {
+    expect(checkSandboxConfig({ limits: {} }).some((m) => m.includes('limits 是空对象'))).toBe(true)
+    expect(checkSandboxConfig({ readDeny: { names: ['x'] } }).some((m) => m.includes('缺类目'))).toBe(true)
+  })
+
+  it('正常配置不报', () => {
+    expect(checkSandboxConfig({ allowlist: ['ls'], limits: { maxFileSizeKb: 1024 }, readDeny: false })).toEqual([])
   })
 })

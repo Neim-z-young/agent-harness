@@ -60,6 +60,7 @@ export interface NoticePayloads {
   'config.plugins-inactive': { unknown: string[]; available: string[] }
   'config.compression-inactive': { items: string[] }
   'config.compaction-inactive': { items: string[] }
+  'config.sandbox-inactive': { items: string[] }
   'config.memory-not-enabled': undefined
   'config.memory-inactive': { items: string[] }
   'config.telemetry-inactive': { items: string[] }
@@ -114,6 +115,7 @@ export const NOTICE_LEVEL: { readonly [C in NoticeCode]: NoticeLevel } = {
   'config.plugins-inactive': 'warn',
   'config.compression-inactive': 'warn',
   'config.compaction-inactive': 'warn',
+  'config.sandbox-inactive': 'warn',
   'config.memory-not-enabled': 'warn',
   'config.memory-inactive': 'warn',
   'config.telemetry-inactive': 'warn',
@@ -211,6 +213,13 @@ export function renderNotice(n: HostNotice): string {
     case 'config.compaction-inactive':
       return (
         '[WARN] config.json → compaction 有以下问题：\n' +
+        n.data.items.map((m) => `       - ${m}`).join('\n') +
+        '\n'
+      )
+
+    case 'config.sandbox-inactive':
+      return (
+        '[WARN] config.json → sandbox 有以下问题：\n' +
         n.data.items.map((m) => `       - ${m}`).join('\n') +
         '\n'
       )
