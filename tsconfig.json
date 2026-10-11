@@ -20,6 +20,7 @@
       "@harness/plugin": ["./packages/plugin/src"],
       "@harness/permission": ["./packages/permission/src"],
       "@harness/fs-guard": ["./packages/fs-guard/src"],
+      "@harness/isolation": ["./packages/isolation/src"],
       "@harness/skill": ["./packages/skill/src"],
       "@harness/agent": ["./packages/agent/src"],
       "@harness/session": ["./packages/session/src"],

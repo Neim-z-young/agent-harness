@@ -16,6 +16,7 @@
         "@harness/core": "workspace:*",
         "@harness/fs-guard": "workspace:*",
         "@harness/host": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-client": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
@@ -179,6 +180,7 @@
         "@harness/core": "workspace:*",
         "@harness/env-context": "workspace:*",
         "@harness/herdr": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-server": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
@@ -210,6 +212,10 @@
         "@harness/workspace-shell": "workspace:*",
         "acp-kernel": "^0.0.63",
       },
+    },
+    "packages/isolation": {
+      "name": "@harness/isolation",
+      "version": "0.1.0",
     },
     "packages/permission": {
       "name": "@harness/permission",
@@ -464,6 +470,7 @@
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/fs-guard": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
         "tree-sitter-bash": "^0.25.1",
@@ -516,6 +523,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -628,6 +636,8 @@
     "@harness/herdr": ["@harness/herdr@workspace:packages/plugins/herdr"],
 
     "@harness/host": ["@harness/host@workspace:packages/host"],
+
+    "@harness/isolation": ["@harness/isolation@workspace:packages/isolation"],
 
     "@harness/manage-plugin": ["@harness/manage-plugin@workspace:packages/plugins/manage-plugin"],
 

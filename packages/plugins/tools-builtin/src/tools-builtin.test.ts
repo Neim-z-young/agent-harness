@@ -1116,6 +1116,115 @@ describe('读侧敏感文件默认拒绝（P0-3）', () => {
   })
 })
 
+
+describe('网络出口策略（P1-2）', () => {
+  beforeEach(async () => { await mkdir(TMP_DIR, { recursive: true }) })
+  afterEach(async () => { await rm(TMP_DIR, { recursive: true, force: true }) })
+
+  it('deny：出网命令被拒（SANDBOX_NET_DENIED），非出网命令照常', async () => {
+    const tool = createBashTool({ net: 'deny' })
+    const denied = await tool.call({ command: 'curl https://example.com' }, makeCtx())
+    expect(denied.ok).toBe(false)
+    expect(denied.error!.code).toBe('SANDBOX_NET_DENIED')
+    expect(denied.error!.message).toContain('curl')
+    const ok = await tool.call({ command: 'echo hi' }, makeCtx())
+    expect(ok.ok).toBe(true)
+    expect(ok.output!.stdout.trim()).toBe('hi')
+  })
+
+  it('allowlist：白名单内放行（子域覆盖）、白名单外拒绝', async () => {
+    const tool = createBashTool({ net: 'allowlist', netAllow: ['example.com'] })
+    // 目标在白名单里 ⇒ 网络门放行（紧接着会因网络不可达而失败，但错误码不该是网络策略）
+    const allowed = await tool.call({ command: 'curl -s -m 1 https://api.example.com/x' }, makeCtx())
+    expect(allowed.error?.code).not.toBe('SANDBOX_NET_DENIED')
+    const denied = await tool.call({ command: 'curl -s https://evil.test/x' }, makeCtx())
+    expect(denied.ok).toBe(false)
+    expect(denied.error!.code).toBe('SANDBOX_NET_DENIED')
+    expect(denied.error!.message).toContain('evil.test')
+  })
+
+  it('★allowlist：云元数据端点硬拒（写进白名单也不放行）', async () => {
+    const tool = createBashTool({ net: 'allowlist', netAllow: ['169.254.169.254'] })
+    const res = await tool.call({ command: 'curl http://169.254.169.254/latest/meta-data/' }, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('SANDBOX_NET_DENIED')
+    expect(res.error!.message).toContain('元数据')
+  })
+
+  it('★allowlist：提不出目标 ⇒ fail-closed（无法核验不算已授权）', async () => {
+    const tool = createBashTool({ net: 'allowlist', netAllow: ['example.com'] })
+    const res = await tool.call({ command: 'ssh myserver' }, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('SANDBOX_NET_DENIED')
+  })
+
+  it('默认（open）：网络门不介入 —— 与改造前逐位一致', async () => {
+    const tool = createBashTool()
+    const res = await tool.call({ command: 'echo curl' }, makeCtx())
+    expect(res.ok).toBe(true)
+    expect(res.output!.stdout.trim()).toBe('curl')
+  })
+})
+
+describe('BashOutput.isolation（P1-4 / P2-3：边界自述）', () => {
+  beforeEach(async () => { await mkdir(TMP_DIR, { recursive: true }) })
+  afterEach(async () => { await rm(TMP_DIR, { recursive: true, force: true }) })
+
+  it('缺省：L1 + fsBound=false + netPolicy=open', async () => {
+    const res = await createBashTool().call({ command: 'echo hi' }, makeCtx())
+    expect(res.output!.isolation).toEqual({ level: 'L1', fsBound: false, netPolicy: 'open', viaHost: false })
+  })
+
+  it('宿主注入档位后如实回传；L2 才 fsBound=true', async () => {
+    const l2 = await createBashTool({ isolationLevel: 'L2' }).call({ command: 'echo hi' }, makeCtx())
+    expect(l2.output!.isolation!.level).toBe('L2')
+    expect(l2.output!.isolation!.fsBound).toBe(true)
+  })
+
+  it('策略一并回传；宿主回退时 viaHost 双层都为 true', async () => {
+    const res = await createBashTool({ net: 'deny' }).call({ command: 'echo hi' }, makeCtx())
+    expect(res.output!.isolation!.netPolicy).toBe('deny')
+
+    const fb = await createBashTool({ allowlist: ['echo'], fallbackToHost: true }).call(
+      { command: 'ls', cwd: TMP_DIR },
+      makeCtx({ requestPermission: async () => ({ behavior: 'allow' as const }) }),
+    )
+    expect(fb.output!.viaHost).toBe(true)
+    expect(fb.output!.isolation!.viaHost).toBe(true)
+  })
+})
+
+describe('read_file 大小/类型闸（P1-8）', () => {
+  beforeEach(async () => { await mkdir(TMP_DIR, { recursive: true }) })
+  afterEach(async () => { await rm(TMP_DIR, { recursive: true, force: true }) })
+
+  it('★超过 maxReadBytes ⇒ 拒绝（不再把整文件拉进内存）', async () => {
+    await writeFile(join(TMP_DIR, 'big.log'), 'x'.repeat(4096))
+    const tool = createReadFileTool({ maxReadBytes: 1024 })
+    const res = await tool.call({ path: 'big.log' }, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('SANDBOX_READ_TOO_LARGE')
+    expect(res.error!.message).toContain('4.0 KB')
+    expect(res.error!.message).toContain('grep_file')
+  })
+
+  it('边界内可读；maxReadBytes:0 = 不限制', async () => {
+    await writeFile(join(TMP_DIR, 'a.ts'), 'export const a = 1')
+    expect((await createReadFileTool({ maxReadBytes: 1024 }).call({ path: 'a.ts' }, makeCtx())).ok).toBe(true)
+    await writeFile(join(TMP_DIR, 'big2.log'), 'y'.repeat(4096))
+    expect((await createReadFileTool({ maxReadBytes: 0 }).call({ path: 'big2.log' }, makeCtx())).ok).toBe(true)
+  })
+
+  it('★目录路径的消息说清"是目录"并指出替代工具（原来只有一句"不是文件"）', async () => {
+    await mkdir(join(TMP_DIR, 'src-dir'), { recursive: true })
+    const res = await readFileTool.call({ path: 'src-dir' }, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('NOT_A_FILE')
+    expect(res.error!.message).toContain('目录')
+    expect(res.error!.message).toContain('list_dir')
+  })
+})
+
 describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
   // 本段是**顶层** describe（不在 `@harness/tools-builtin` 里面），所以外层的
   // beforeEach/afterEach 管不到 —— 得自己建/清 TMP_DIR。

@@ -65,6 +65,8 @@ import {
   createWorkspaceOriginalStore,
 } from '@harness/workspace'
 import type { SessionFile, Workspace } from '@harness/workspace'
+// 隔离档位（P1-4）：探测 + 折档在零依赖包，与 tools-builtin / tools-web 共用同一份口径
+import { formatIsolationLine, probeIsolation, resolveIsolation } from '@harness/isolation'
 
 // 本包内：叶子模块（不得反向 import `./index`，见各文件头）
 import { lazyImport } from './lazy'
@@ -919,9 +921,27 @@ export class HarnessHost {
         ? { type: defaultPc.type, model: parseModelSpec(this.options.model ?? '').modelId || defaultPc.model }
         : {}),
     }))
+    // P1-4：先把**隔离档位**折出来 —— 它是"我要跑在什么边界里"的声明，必须在装配内置插件
+    // **之前**定下来：①内置工具把实际档位回给模型（`BashOutput.isolation`）；
+    // ②达不到要求时 `onUnmet: 'refuse'` 要**拒绝启动**，而不是先把插件都装完再报错。
+    const isolationProbe = probeIsolation()
+    const isolationRes = resolveIsolation({ required: cfg.sandbox?.level, probe: isolationProbe })
+    if (!isolationRes.met) {
+      const line = formatIsolationLine(isolationRes)
+      if (cfg.sandbox?.onUnmet === 'refuse') {
+        // 拒绝启动：配置要求的边界做不到就不跑（而不是静默降级到 L0）
+        this.emitNotice(makeNotice('config.sandbox-inactive', { items: [line] }))
+        throw new ConfigValidationError(`${line}（sandbox.onUnmet=refuse ⇒ 拒绝启动）`)
+      }
+      this.emitNotice(makeNotice('sandbox.isolation-degraded', {
+        level: isolationRes.level,
+        required: isolationRes.required,
+        reasons: isolationRes.reasons,
+      }))
+    }
     // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载。
     // P0-1：带 config 加载 —— 内置插件以前是无参单例，config.json 里的沙箱段递不进去。
-    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load({ config: cfg })
+    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load({ config: cfg, isolationLevel: isolationRes.level })
     providerPlugins.push(toolsBuiltin)
     const toolsManager = await getBuiltinRegistry().get('tools-manager')!.load()
     providerPlugins.push(toolsManager)
@@ -936,7 +956,7 @@ export class HarnessHost {
     // 内置插件声明式启用（config.json → plugins）：与外部插件目录并列的第二条装配路径，
     // 让「只想开个内置能力」的用户改一行配置即可（依赖闭包自动补齐，如 computer-use → mcp.server-registry）。
     // 这里只解析实例，实际入列在外部插件之后（见下方按 id 去重），避免与 .harness/plugins 里的同 id 重复安装。
-    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins, getBuiltinRegistry(), cfg)
+    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins, getBuiltinRegistry(), cfg, isolationRes.level)
     if (declaredPlugins.unknown.length) {
       this.emitNotice(makeNotice('config.plugins-inactive', {
         unknown: declaredPlugins.unknown,

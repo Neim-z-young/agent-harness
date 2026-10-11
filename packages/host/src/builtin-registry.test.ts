@@ -397,3 +397,80 @@ describe('checkSandboxConfig：写了但不生效的键要有声音', () => {
     expect(checkSandboxConfig({ allowlist: ['ls'], limits: { maxFileSizeKb: 1024 }, readDeny: false })).toEqual([])
   })
 })
+
+describe('P1-2 / P1-4：net 策略与解析后的档位透传', () => {
+  it('★net=deny 与 isolationLevel 都到了 bash 工具（执行期自述可见）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-net-'))
+    try {
+      const tools = await toolsOf(
+        await getBuiltinRegistry().get('tools-builtin')!.load({
+          config: { sandbox: { net: 'deny' } },
+          isolationLevel: 'L2',
+        }),
+      )
+      const bash = tools.find((t) => t.id === 'bash')!
+      const denied = (await bash.call({ command: 'curl https://example.com' }, toolCtx(dir))) as {
+        ok: boolean; error?: { code?: string }
+      }
+      expect(denied.ok).toBe(false)
+      expect(denied.error?.code).toBe('SANDBOX_NET_DENIED')
+
+      const ok = (await bash.call({ command: 'echo hi' }, toolCtx(dir))) as {
+        output?: { isolation?: Record<string, unknown> }
+      }
+      // 档位是 boot 解析后的**事实**（这里注入 L2），netPolicy 是策略本身
+      expect(ok.output!.isolation).toEqual({ level: 'L2', fsBound: true, netPolicy: 'deny', viaHost: false })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('★readMaxBytes 透传到 read_file', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-readmax-'))
+    try {
+      writeFileSync(join(dir, 'big.log'), 'x'.repeat(4096))
+      const tools = await toolsOf(
+        await getBuiltinRegistry().get('tools-builtin')!.load({ config: { sandbox: { readMaxBytes: 1024 } } }),
+      )
+      const rf = tools.find((t) => t.id === 'read_file')!
+      const res = (await rf.call({ path: 'big.log' }, toolCtx(dir))) as { ok: boolean; error?: { code?: string } }
+      expect(res.ok).toBe(false)
+      expect(res.error?.code).toBe('SANDBOX_READ_TOO_LARGE')
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('bash_ro 也拿到档位（只读侧同样自述边界）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-ro-'))
+    try {
+      const tools = await toolsOf(
+        await getBuiltinRegistry().get('tools-builtin')!.load({
+          config: { sandbox: { level: 'L1' } },
+          isolationLevel: 'L1',
+        }),
+      )
+      const ro = tools.find((t) => t.id === 'bash_ro')!
+      const res = (await ro.call({ command: 'echo hi' }, toolCtx(dir))) as {
+        output?: { isolation?: Record<string, unknown> }
+      }
+      expect(res.output!.isolation!.level).toBe('L1')
+      expect(res.output!.isolation!.fsBound).toBe(false)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  it('checkSandboxConfig：net / level / onUnmet / readMaxBytes 的非法值与缺白名单都被点名', () => {
+    const { checkSandboxConfig } = require('./index') as { checkSandboxConfig: (c: unknown) => string[] }
+    expect(checkSandboxConfig({ net: 'allowlist' }).some((m) => m.includes('netAllow'))).toBe(true)
+    expect(checkSandboxConfig({ net: 'block' }).some((m) => m.includes('合法取值'))).toBe(true)
+    expect(checkSandboxConfig({ level: 'L9' }).some((m) => m.includes('合法档位'))).toBe(true)
+    expect(checkSandboxConfig({ onUnmet: 'explode' }).some((m) => m.includes('合法取值'))).toBe(true)
+    expect(checkSandboxConfig({ readMaxBytes: -1 }).some((m) => m.includes('非负数'))).toBe(true)
+    // 合法组合不报
+    expect(checkSandboxConfig({
+      net: 'allowlist', netAllow: ['github.com'], level: 'L1', onUnmet: 'warn', readMaxBytes: 1024,
+    })).toEqual([])
+  })
+})

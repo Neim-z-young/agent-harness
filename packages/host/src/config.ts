@@ -27,6 +27,8 @@ import type { AgentPlugin, ProviderConfig, ProviderTypeRegistry } from '@harness
 import type { McpServerEntry } from '@harness/mcp-server-registry'
 import type { MockProviderConfig } from '@harness/provider-mock'
 import type { CompactOptions } from '@harness/session'
+// 隔离档位与网络策略的**取值类型**（P1-4 / P1-2）：口径来自零依赖的 @harness/isolation
+import type { IsolationLevel, NetPolicy } from '@harness/isolation'
 import { lazyImport } from './lazy'
 import {
   buildProviderWindowTable,
@@ -129,6 +131,28 @@ export interface SandboxSection {
    * 缺省 = 内置清单；`false` = 关闭；给对象 = **整体替换**（不做浅合并）。
    */
   readDeny?: SensitiveReadPolicySection | false
+  /**
+   * `read_file` 单次可读的**文件大小**上限（字节，P1-8）。默认 10 MiB；`0` = 不限制。
+   * 超出即拒绝（不回退到"截断读"）—— 因为 `read_file` 是**整文件载入**后才切片。
+   */
+  readMaxBytes?: number
+  /**
+   * **隔离档位下限**（P1-4）：`'L0'`（默认，不要求）/ `'L1'` / `'L2'` / `'L3'`。
+   *
+   * 表达"我要跑在什么边界里"，而不是一串布尔开关。`L2` 需要 OS 级绑定（P1-3，**尚未落地**）
+   * ⇒ 现在写 `L2` 一定达不到，行为由 `onUnmet` 决定 —— 这正是这个字段的价值：
+   * **宁可拒绝启动，也不要静默跑在 L0**。
+   */
+  level?: IsolationLevel
+  /** 档位达不到时的行为（P1-4）：`'warn'`（默认，告警后按实际档位继续）或 `'refuse'`（拒绝启动） */
+  onUnmet?: 'warn' | 'refuse'
+  /**
+   * **网络出口策略**（P1-2）：`'open'`（默认，与改造前逐位一致）/ `'allowlist'` / `'deny'`。
+   * L0 **静态门**：按命令名与参数里的目标 host 判定，不是内核边界（详见 `@harness/isolation`）。
+   */
+  net?: NetPolicy
+  /** `allowlist` 模式的目标白名单（host / 域名；**子域自动覆盖**，如 `github.com` 含 `api.github.com`） */
+  netAllow?: string[]
 }
 
 /**
@@ -1155,6 +1179,11 @@ const SANDBOX_KEYS: Record<keyof NonNullable<HarnessConfig['sandbox']>, true> = 
   readOnlyTimeoutMs: true,
   limits: true,
   readDeny: true,
+  readMaxBytes: true,
+  level: true,
+  onUnmet: true,
+  net: true,
+  netAllow: true,
 }
 
 /**
@@ -1197,6 +1226,23 @@ export function checkSandboxConfig(c: unknown): string[] {
     if (missing.length) {
       out.push(`sandbox.readDeny 缺类目 ${missing.join(' / ')}：整体替换语义下它们会被当作空数组（不会报错，但也不匹配任何文件）`)
     }
+  }
+  // P1-2：allowlist 光有模式没有白名单 ⇒ 等价于"全拒"，但报错长在运行时、不在装配期
+  if (c.net === 'allowlist' && (!Array.isArray(c.netAllow) || c.netAllow.length === 0)) {
+    out.push('sandbox.net=allowlist 但没有 sandbox.netAllow：任何出网命令都会被拒（等价于 deny 的窄版），请补白名单')
+  }
+  if (c.net !== undefined && c.net !== 'open' && c.net !== 'allowlist' && c.net !== 'deny') {
+    out.push(`sandbox.net="${String(c.net)}" 不是合法取值（open / allowlist / deny），运行期按 open 处理`)
+  }
+  // P1-4：档位取值必须能识别，否则运行期按 L0 处理 —— 用户以为在要求 L2，实则没要求
+  if (c.level !== undefined && !['L0', 'L1', 'L2', 'L3'].includes(String(c.level))) {
+    out.push(`sandbox.level="${String(c.level)}" 不是合法档位（L0 / L1 / L2 / L3），运行期按 L0（不要求）处理`)
+  }
+  if (c.onUnmet !== undefined && c.onUnmet !== 'warn' && c.onUnmet !== 'refuse') {
+    out.push(`sandbox.onUnmet="${String(c.onUnmet)}" 不是合法取值（warn / refuse），运行期按 warn 处理`)
+  }
+  if (c.readMaxBytes !== undefined && (typeof c.readMaxBytes !== 'number' || c.readMaxBytes < 0)) {
+    out.push(`sandbox.readMaxBytes 应为非负数（字节，0 = 不限制），收到 ${JSON.stringify(c.readMaxBytes)}`)
   }
   return out
 }

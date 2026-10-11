@@ -61,6 +61,8 @@ export interface NoticePayloads {
   'config.compression-inactive': { items: string[] }
   'config.compaction-inactive': { items: string[] }
   'config.sandbox-inactive': { items: string[] }
+  /** 隔离档位未达要求而告警降级（P1-4）；`onUnmet: 'refuse'` 时不走这条、直接拒绝启动 */
+  'sandbox.isolation-degraded': { level: string; required: string; reasons: string[] }
   'config.memory-not-enabled': undefined
   'config.memory-inactive': { items: string[] }
   'config.telemetry-inactive': { items: string[] }
@@ -116,6 +118,7 @@ export const NOTICE_LEVEL: { readonly [C in NoticeCode]: NoticeLevel } = {
   'config.compression-inactive': 'warn',
   'config.compaction-inactive': 'warn',
   'config.sandbox-inactive': 'warn',
+  'sandbox.isolation-degraded': 'warn',
   'config.memory-not-enabled': 'warn',
   'config.memory-inactive': 'warn',
   'config.telemetry-inactive': 'warn',
@@ -222,6 +225,13 @@ export function renderNotice(n: HostNotice): string {
         '[WARN] config.json → sandbox 有以下问题：\n' +
         n.data.items.map((m) => `       - ${m}`).join('\n') +
         '\n'
+      )
+
+    case 'sandbox.isolation-degraded':
+      return (
+        `[WARN] 隔离档位未达到要求：实际 ${n.data.level}，要求 ${n.data.required}\n` +
+        n.data.reasons.map((m) => `       - ${m}`).join('\n') +
+        '\n       （现在按实际档位继续；要"达不到就不启动"请设 sandbox.onUnmet="refuse"）\n'
       )
 
     case 'config.memory-not-enabled':

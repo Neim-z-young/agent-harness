@@ -14,32 +14,13 @@
 
 import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
-import { isIP } from 'node:net'
+// SSRF 防护的私有地址判定（P1-2 收敛）：与 bash 的网络出口策略**同一份**。
+// 原来这里与 tools-builtin 各写一份（此处 isPrivateIp / 那里一份），正是"修一处漏一处"。
+import { isPrivateHost } from '@harness/isolation'
 
 // ========================================================================
 // SSRF 防护
 // ========================================================================
-
-function isPrivateIp(hostname: string): boolean {
-  if (!hostname) return false
-  // 直接 IP
-  if (isIP(hostname)) {
-    if (hostname === '127.0.0.1' || hostname === '::1') return true
-    if (hostname.startsWith('10.')) return true
-    if (hostname.startsWith('192.168.')) return true
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(hostname)) return true
-    if (hostname.startsWith('169.254.')) return true
-    if (hostname.startsWith('127.')) return true
-    if (hostname.startsWith('fd') || hostname.startsWith('fc')) return true
-    if (hostname === '0.0.0.0' || hostname === '::') return true
-    return false
-  }
-  // 常见 localhost 域名
-  if (hostname === 'localhost') return true
-  if (hostname.endsWith('.local')) return true
-  if (hostname.endsWith('.localhost')) return true
-  return false
-}
 
 // ========================================================================
 // 1. web_fetch 工具
@@ -126,7 +107,7 @@ export const webFetchTool = defineTool<WebFetchInput, WebFetchOutput>({
     }
 
     const allowPrivate = input.allowPrivateNetwork ?? false
-    if (!allowPrivate && isPrivateIp(parsed.hostname)) {
+    if (!allowPrivate && isPrivateHost(parsed.hostname)) {
       return {
         ok: false,
         error: { message: `禁止访问私有网络地址 ${parsed.hostname}（SSRF 防护），如确认安全请设置 allowPrivateNetwork=true`, code: 'SSRF_BLOCKED' },

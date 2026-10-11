@@ -28,6 +28,7 @@
     "@harness/core": "workspace:*",
     "@harness/fs-guard": "workspace:*",
     "@harness/host": "workspace:*",
+    "@harness/isolation": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-client": "workspace:*",
     "@harness/mcp-server-registry": "workspace:*",

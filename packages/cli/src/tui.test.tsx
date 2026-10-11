@@ -1371,8 +1371,12 @@ describe('TuiApp 集成（mock provider）', () => {
     expect(frame).toContain('本行省略')
     // ③ 完整内容仍可取：复制按钮明示「全文」+ 字符数
     expect(frame).toContain('复制全文')
-    // ④ 尾部保留 ⇒ 至少能看到结果对象的后缀（含 exitCode / shell 等字段）
-    expect(frame).toContain('exitCode":0')
+    // ④ 首尾都真的保留：首部贴到结果起点、尾部贴到结果终点。
+    //    原来这里断的是 `exitCode":0` —— 它恰好紧跟 stdout（结果里最长的字段），
+    //    靠的是"它后面没几个字段"这个偶然。P1-4 给 BashOutput 加了 `isolation` 之后
+    //    序列化变长，固定宽度的尾窗就够不到它了；改成断言**真正的首/尾锚点**
+    //    （第一个字符 / 最后一个字段）才不随字段增删漂移 —— 这也是"尾部保留"的原意。
+    expect(frame).toContain('{"stdout":"1\\n2\\n3')
     expect(frame).toContain('shell":"Bash"')
     await f.cleanup()
   })

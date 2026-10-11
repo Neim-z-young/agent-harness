@@ -52,6 +52,7 @@
     "@harness/ui-widget": "workspace:*",
     "@harness/workspace": "workspace:*",
     "@harness/workspace-shell": "workspace:*",
+    "@harness/isolation": "workspace:*",
     "acp-kernel": "^0.0.63"
   }
 }

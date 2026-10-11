@@ -179,6 +179,7 @@ describe('renderNotice：逐条字节快照（S2 的逐字不变判据）', () =
       ['config.compression-inactive', { items: [] }],
       ['config.compaction-inactive', { items: [] }],
       ['config.sandbox-inactive', { items: [] }],
+      ['sandbox.isolation-degraded', { level: 'L1', required: 'L2', reasons: [] }],
       ['config.memory-not-enabled', undefined],
       ['config.memory-inactive', { items: [] }],
       ['config.telemetry-inactive', { items: [] }],

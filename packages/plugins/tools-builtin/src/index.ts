@@ -38,6 +38,14 @@ import {
   resolveSensitiveReadPolicy,
   type SensitiveReadPolicyInput,
 } from '@harness/fs-guard'
+// 隔离档位与网络出口策略（P1-4 / P1-2）：与宿主、tools-web 共用同一份口径
+import {
+  assessNetAccess,
+  isOsBound,
+  resolveNetPolicy,
+  type IsolationLevel,
+  type NetPolicy,
+} from '@harness/isolation'
 import { resolve, relative } from 'node:path'
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
@@ -89,6 +97,25 @@ export interface ReadFileOutput {
 const MAX_READ_LINES = 10000
 /** 最大内容字符数（截断阈值） */
 const MAX_CONTENT_CHARS = 256 * 1024 // 256KB
+/**
+ * 单次可读的文件**总大小**上限（P1-8，默认 10 MiB）。
+ *
+ * 为什么需要：上面两条只管**输出**（1 万行 / 256KB 字符），而 `readFile(absPath, 'utf-8')` 是
+ * **整文件载入**后才切片 —— 读一个 2 GiB 的日志照样会先把 2 GiB 拉进内存（再被截到
+ * 256KB）。既是可用性问题（一次调用吃掉整个进程的内存预算），也是安全问题（把数据文件
+ * 当成源码来读）。`limit` / `offset` 也救不了这个：切片发生在载入之后。
+ *
+ * 上限而非拒绝类别：真需要大文件用 `grep_file`（流式逐文件）或 bash（`sed -n '1,80p'`）。
+ */
+export const DEFAULT_MAX_READ_BYTES = 10 * 1024 * 1024
+
+/** 人读的字节数（错误消息里说清"到底多大"—— 光给数字，模型/人都要自己换算） */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
 
 /** read_file 的入参 schema（提到模块级，供 `call()` 里的直调守卫复用同一份） */
 const readFileInputSchema = fromJsonSchema<ReadFileInput>({
@@ -111,8 +138,12 @@ const readFileInputSchema = fromJsonSchema<ReadFileInput>({
  * - isConcurrencySafe: true（并发安全）
  * - permission.key: 'read'
  */
-export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput } = {}): Tool<ReadFileInput, ReadFileOutput> {
+export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput; maxReadBytes?: number } = {}): Tool<ReadFileInput, ReadFileOutput> {
   const readDeny = resolveSensitiveReadPolicy(opts.readDeny)
+  // P1-8：`0` / 非正数 = 不限制（与 BashLimits 的 0 = 不限制同口径）
+  const maxReadBytes = opts.maxReadBytes !== undefined && opts.maxReadBytes > 0
+    ? opts.maxReadBytes
+    : DEFAULT_MAX_READ_BYTES
   return defineTool<ReadFileInput, ReadFileOutput>({
     id: 'read_file',
     /**
@@ -179,9 +210,34 @@ export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput }
       try {
         const stats = await stat(absPath)
         if (!stats.isFile()) {
+          // P1-8：原来只有一句「不是文件」—— 目录、块设备、`/dev/zero`（字符设备）、FIFO
+          // 全归同一个含糊消息，模型看不出该换什么工具（读目录该用 list_dir，读设备本就不该读）。
+          const kind = stats.isDirectory() ? '目录'
+            : stats.isBlockDevice() ? '块设备'
+              : stats.isCharacterDevice() ? '字符设备（如 /dev/zero、/dev/urandom）'
+                : stats.isFIFO() ? '命名管道（FIFO）'
+                  : stats.isSocket() ? '套接字'
+                    : stats.isSymbolicLink() ? '符号链接'
+                      : '特殊文件'
+          const hint = stats.isDirectory() ? '目录内容请用 list_dir，目录内检索请用 grep_file。' : ''
           return {
             ok: false,
-            error: { message: `"${input.path}" 不是文件`, code: 'NOT_A_FILE' },
+            error: { message: `"${input.path}" 不是普通文件（实际是${kind}），read_file 只读普通文件。${hint}`, code: 'NOT_A_FILE' },
+          }
+        }
+
+        // P1-8：大小闸。放在 `readFile` **之前** —— 它的全部意义就是不让整文件进内存。
+        if (stats.size > maxReadBytes) {
+          return {
+            ok: false,
+            error: {
+              message:
+                `拒绝读取过大的文件：${input.path} 有 ${formatBytes(stats.size)}，`
+                + `超过单次读取上限 ${formatBytes(maxReadBytes)}（config.json → sandbox.readMaxBytes 可调，0 = 不限制）。`
+                + '这个上限是为了不把整文件拉进内存（offset/limit 也救不了：切片发生在载入之后）；'
+                + '请在文件内检索改用 grep_file，或按行段读取改用 bash（如 `sed -n \'1,80p\' 文件`）。',
+              code: 'SANDBOX_READ_TOO_LARGE',
+            },
           }
         }
 
@@ -391,6 +447,22 @@ export interface BashSandboxConfig {
    * `false` 表示全部关掉。只在 **bash 族系**下经 `ulimit` 前置生效（非 bash 族系**不模拟**）。
    */
   limits?: BashLimits | false
+  /**
+   * 网络出口策略（P1-2）：`open`（默认，与改造前逐位一致）/ `allowlist` / `deny`。
+   * 见 `@harness/isolation` 的 `assessNetAccess`（**L0 静态门**，不是内核边界）。
+   */
+  net?: NetPolicy
+  /** `allowlist` 模式的目标白名单（host / 域名；子域自动覆盖） */
+  netAllow?: string[]
+  /**
+   * 本次执行实际所处的隔离档位（P1-4），由宿主在装配期解析后注入；作为
+   * `BashOutput.isolation.level` 回给模型与取证脚本。
+   *
+   * 缺省 `'L1'` 是本**工具自身**能兑现的下限（策略层 + 进程层：危险表 / 白名单 /
+   * 权限键 / 进程树 kill / 资源上限 / env 默认拒绝），与宿主能坐到哪一档无关。
+   * 注：宿主没注入时**不谎报** L2 —— L2 要 OS 级绑定（P1-3），不是这个工具能自己给的。
+   */
+  isolationLevel?: IsolationLevel
 }
 
 /**
@@ -714,6 +786,23 @@ export interface BashOutput {
   command: string
   /** 是否经由沙箱回退到宿主 bash 执行（fallbackToHost 触发） */
   viaHost?: boolean
+  /**
+   * 本次执行的**边界自述**（P1-4 / P2-3）。
+   *
+   * 存在的理由与 `env-context` 注入 `Shell:` 同源：模型不知道自己的边界，就会反复撞
+   * 同一面墙（"为什么 curl 被拒"）。四个字段都只说**事实**，不含建议：
+   * - `level`：本次生效的隔离档位；
+   * - `fsBound`：是否真的把文件系统限住了（L2 起才为 true）；
+   * - `netPolicy`：网络出口策略；
+   * - `viaHost`：这次是不是**升到宿主全权**执行的（与 `viaHost` 字段同值，放这里是为了
+   *   让"我到底在什么边界里"一次看全）。
+   */
+  isolation?: {
+    level: IsolationLevel
+    fsBound: boolean
+    netPolicy: NetPolicy
+    viaHost: boolean
+  }
   /** 实际执行命令的 shell 名称（跨平台回退时用于告知模型） */
   shell?: string
 }
@@ -764,6 +853,10 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
   const keepEnv = config.keepEnv ?? []
   // P1-1：资源上限（仅 bash 族系生效，见 buildLimitPreamble）
   const limits = resolveBashLimits(config.limits)
+  // P1-2：网络出口策略（缺省 open = 与改造前逐位一致）
+  const net = resolveNetPolicy({ net: config.net, netAllow: config.netAllow })
+  // P1-4：本次执行所处的档位（宿主注入；缺省 L1 = 本工具自身能兑现的下限）
+  const isolation = { level: config.isolationLevel ?? ('L1' as IsolationLevel), netPolicy: net.mode }
 
   const shell = getShell()
 
@@ -833,6 +926,27 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         }
       }
 
+      // ---- 沙箱防护 5：网络出口策略（P1-2）----
+      // L0 **静态门**（不是内核边界）：`net: 'deny'` 拒掉一切名字即意图的出网客户端，
+      // `'allowlist'` 只放行目标在白名单内的那些，且元数据/私有地址一律硬拒。
+      // 用 AST 的命令表（比正则准），拿不到时退文本兜底 —— 与上面危险检测同一条降级纪律。
+      if (net.mode !== 'open') {
+        const netFacts = await analyzeBashCommand(input.command)
+        const verdict = assessNetAccess(
+          netFacts?.ok
+            ? {
+              commands: netFacts.commands.map((c) => c.name),
+              args: netFacts.commands.flatMap((c) => c.args.map((a) => a.text).filter((t): t is string => t !== null)),
+              astAvailable: true,
+            }
+            : { raw: input.command, astAvailable: false },
+          net,
+        )
+        if (!verdict.ok) {
+          return { ok: false, error: { message: `网络出口策略拒绝执行：${verdict.reason}`, code: 'SANDBOX_NET_DENIED' } }
+        }
+      }
+
       // ---- 沙箱防护 1：cwd 限制（防路径逃逸；回退到宿主同样不允许逃逸工作区根） ----
       const requestedCwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : null
       if (requestedCwd && !isWithinCwd(requestedCwd, rootDir)) {
@@ -880,7 +994,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
                 error: { message: `命令不在沙箱白名单内，宿主回退被拒绝：${firstCmd}`, code: 'SANDBOX_HOST_DENIED' },
               }
             }
-            return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits })
+            return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits, isolation })
           }
           return {
             ok: false,
@@ -891,7 +1005,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
 
       // ---- 沙箱内执行 ----
       const sandboxResult = await runBash({
-        command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal, limits,
+        command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal, limits, isolation,
       })
 
       // ---- 回退兜底：非破坏性命令在沙箱内未按预期执行（spawn 失败 / env 隔离开致命令非零退出）时提升到宿主 bash ----
@@ -903,7 +1017,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
             error: { message: `命令在沙箱内执行失败，宿主回退被拒绝`, code: 'SANDBOX_HOST_DENIED' },
           }
         }
-        return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits })
+        return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits, isolation })
       }
 
       // 非 bash 环境：给模型一个可见提示，避免它把 exit 127/命令未找到误判为命令本身问题。
@@ -930,6 +1044,12 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
  * - 复用 bash 权限 key，pattern 前缀 `host:` 标识"宿主回退执行"；
  * - 权限引擎按规则/mode 决策：ask 模式会询问用户，allow 静默放行，deny 拦截；
  * - 无 requestPermission（纯工具调用）或 requireHostApproval=false 时静默放行。
+ *
+ * P0-7：请求带 `escalation: 'host-fallback'` ⇒ 权限引擎**无条件**落一条
+ * `sandbox.escalation` 审计（含 `allow-all` 下没问人的那次）。`patterns` 里的 `host:`
+ * 前缀是给人看的展示约定，**判据不靠它** —— 见 `PermissionRequest.escalation` 的说明。
+ * `requireHostApproval === false` 是显式的"不要问"，那条路径无请求可记，改由
+ * `checkSandboxConfig()` 在装配期报警（见 `host/src/config.ts`）。
  */
 async function confirmHostRun(
   input: BashInput,
@@ -1299,6 +1419,11 @@ export interface ReadOnlyBashConfig {
    * `false` 关闭；给对象则**替换**内置清单。
    */
   readDeny?: SensitiveReadPolicyInput
+  /**
+   * 本次执行实际所处的隔离档位（P1-4），宿主装配期解析后注入。缺省 `'L1'`。
+   * `bash_ro` 只做只读判定，网络不适用（白名单里本就没有出网命令），故不下发 netPolicy。
+   */
+  isolationLevel?: IsolationLevel
 }
 
 /**
@@ -1323,6 +1448,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
   const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
   const timeoutDefault = config.timeoutMs ?? 15_000
   const limits = resolveBashLimits(config.limits)
+  const isolation = { level: config.isolationLevel ?? ('L1' as IsolationLevel), netPolicy: 'open' as NetPolicy }
   const readDeny = resolveSensitiveReadPolicy(config.readDeny)
   const shell = getShell()
 
@@ -1417,6 +1543,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
         timeoutMs: input.timeoutMs ?? timeoutDefault,
         signal: ctx.signal,
         limits,
+        isolation,
       })
       return result
     },
@@ -1438,9 +1565,11 @@ function runBash(opts: {  command: string
   shell?: ResolvedShell
   /**
    * 资源上限（P1-1）。⚠️ `viaHost` 时**不套**（宿主回退＝宿主全权，与放开白名单/env 隔离
-   * 同口径）—— 这是 P0-7 记的那个已知洞，不在本次修复范围。
+   * 同口径）—— 这条路径的权限放大已由 `sandbox.escalation` 审计记下（见 P0-7）。
    */
   limits?: Required<BashLimits>
+  /** 本次执行的边界自述（P1-4 / P2-3）；缺省不上报该字段 */
+  isolation?: { level: IsolationLevel; netPolicy: NetPolicy }
 }): Promise<ToolResult<BashOutput>> {
   const sh = opts.shell ?? getShell()
   const startedAt = Date.now()
@@ -1509,6 +1638,14 @@ function runBash(opts: {  command: string
           durationMs: Date.now() - startedAt,
           command: opts.command,
           viaHost: opts.viaHost,
+          ...(opts.isolation ? {
+            isolation: {
+              level: opts.isolation.level,
+              fsBound: isOsBound(opts.isolation.level),
+              netPolicy: opts.isolation.netPolicy,
+              viaHost: opts.viaHost === true,
+            },
+          } : {}),
           shell: sh.name,
         },
       })
@@ -1791,6 +1928,11 @@ export function createToolsBuiltinPlugin(options?: {
    * 缺省 = 内置清单；`false` = 关闭；给对象 = 替换。见 {@link createReadFileTool}。
    */
   readDeny?: SensitiveReadPolicyInput
+  /**
+   * `read_file` 单次可读的文件**大小**上限（字节，P1-8）。缺省
+   * {@link DEFAULT_MAX_READ_BYTES}（10 MiB）；`0` = 不限制。见 {@link createReadFileTool}。
+   */
+  readMaxBytes?: number
 }): AgentPlugin {
   const toolIds = options?.toolIds
   const tools = toolIds
@@ -1798,7 +1940,7 @@ export function createToolsBuiltinPlugin(options?: {
     : builtinTools
         .filter((t) => !(t.id === 'bash_ro' && options?.readOnlyBash === false))
         .map((t) => {
-          if (t.id === 'read_file') return createReadFileTool({ readDeny: options?.readDeny })
+          if (t.id === 'read_file') return createReadFileTool({ readDeny: options?.readDeny, maxReadBytes: options?.readMaxBytes })
           if (t.id === 'bash' && options?.bash) return createBashTool(options.bash)
           if (t.id === 'bash_ro') {
             // 插件级 `readDeny` 合并进 bash_ro 自己的配置（⚠️ 用 `!== undefined` 区分

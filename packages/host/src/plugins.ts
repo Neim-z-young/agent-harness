@@ -30,6 +30,7 @@ import { MultiDirLoader, normalizeDirs } from '@harness/workspace'
 import { makeNotice } from './notice'
 import type { NoticeSink } from './notice'
 import type { HarnessConfig, SandboxSection } from './config'
+import type { IsolationLevel } from '@harness/isolation'
 
 /** 插件目录加载结果：通用 AgentPlugin（Hooks 插件）列表；Provider 类型工厂已注册进 registry */
 export interface PluginLoadResult {
@@ -267,6 +268,12 @@ export function registerBuiltinProviderTypes(registry: ProviderTypeRegistry): vo
  * 需要配置的登记项自己取用（不需要的直接忽略参数，调用点无需感知）。
  */
 export interface BuiltinLoadContext {
+  /**
+   * 已解析的**实际生效**隔离档位（P1-4）。boot 先按 `sandbox.level` 与本机能力折出结论，
+   * 再递给内置插件 —— 这样模型看到的 `BashOutput.isolation.level` 是**事实**，
+   * 而不是用户写在配置里的愿望值。
+   */
+  isolationLevel?: IsolationLevel
   config?: HarnessConfig
 }
 
@@ -327,9 +334,13 @@ function lazyToolMetaSource(specifier: string): () => Promise<ToolMetaSource> {
  * 显式逐字段搬运（而不是整个对象丢过去）：一来类型上不会把 `readDeny` / `mcpEnv` 这类
  * 非 bash 字段送进 `BashSandboxConfig`，二来以后哪一项没接上在这一眼能看出来。
  */
-function sandboxToPluginOptions(sb: SandboxSection | undefined): {
+function sandboxToPluginOptions(
+  sb: SandboxSection | undefined,
+  isolatedLevel: IsolationLevel,
+): {
   bash: Record<string, unknown>
   readDeny: SandboxSection['readDeny']
+  readMaxBytes: number | undefined
   readOnlyBash: Record<string, unknown>
 } | undefined {
   if (!sb) return undefined
@@ -342,10 +353,17 @@ function sandboxToPluginOptions(sb: SandboxSection | undefined): {
   if (sb.fallbackToHost !== undefined) bash.fallbackToHost = sb.fallbackToHost
   if (sb.requireHostApproval !== undefined) bash.requireHostApproval = sb.requireHostApproval
   if (sb.limits !== undefined) bash.limits = sb.limits
+  // P1-2：网络出口策略（交给 `@harness/isolation` 的 resolveNetPolicy 归一；
+  // 这里不做合法性判断 —— 那是 checkSandboxConfig 的职责，一处口径）
+  if (sb.net !== undefined) bash.net = sb.net
+  if (sb.netAllow !== undefined) bash.netAllow = sb.netAllow
+  // P1-4：**解析后的实际档位**（不是用户写的要求值）—— 模型看到的必须是事实
+  bash.isolationLevel = isolatedLevel
   const readOnlyBash: Record<string, unknown> = {}
   if (sb.readOnlyTimeoutMs !== undefined) readOnlyBash.timeoutMs = sb.readOnlyTimeoutMs
   if (sb.limits !== undefined) readOnlyBash.limits = sb.limits
-  return { bash, readDeny: sb.readDeny, readOnlyBash }
+  readOnlyBash.isolationLevel = isolatedLevel
+  return { bash, readDeny: sb.readDeny, readMaxBytes: sb.readMaxBytes, readOnlyBash }
 }
 
 /** 全局默认内置通用插件注册表（登记 tools-builtin 等随应用打包的插件，惰性加载） */
@@ -363,11 +381,12 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
           toolsBuiltinPlugin: AgentPlugin
           createToolsBuiltinPlugin: (o: Record<string, unknown>) => AgentPlugin
         }>('@harness/tools-builtin')
-        const opts = sandboxToPluginOptions(ctx?.config?.sandbox)
+        const opts = sandboxToPluginOptions(ctx?.config?.sandbox, ctx?.isolationLevel ?? 'L1')
         if (!opts) return mod.toolsBuiltinPlugin
         return mod.createToolsBuiltinPlugin({
           bash: opts.bash,
           readDeny: opts.readDeny,
+          readMaxBytes: opts.readMaxBytes,
           readOnlyBash: opts.readOnlyBash,
         })
       },
@@ -611,6 +630,7 @@ export async function resolveBuiltinPlugins(
   ids: string[] | undefined,
   registry = getBuiltinRegistry(),
   config?: HarnessConfig,
+  isolationLevel?: IsolationLevel,
 ): Promise<{ plugins: AgentPlugin[]; unknown: string[] }> {
   const plugins: AgentPlugin[] = []
   const unknown: string[] = []
@@ -623,7 +643,7 @@ export async function resolveBuiltinPlugins(
     if (!entry) { unknown.push(id); continue }
     done.add(id)
     try {
-      const plugin = await entry.load({ config })
+      const plugin = await entry.load({ config, isolationLevel })
       plugins.push(plugin)
       for (const dep of plugin.dependsOn ?? []) if (!done.has(dep)) queue.push(dep)
     } catch (err) {

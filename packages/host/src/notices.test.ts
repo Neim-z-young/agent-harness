@@ -129,3 +129,49 @@ describe('HarnessHost：装配期 notice 端到端（不依赖任何输出流）
     await host.shutdown()
   })
 })
+
+// ===== P1-4：隔离档位的装配期口径（可声明 + 不静默降级） =====
+
+describe('HarnessHost：sandbox.level 的装配期行为（P1-4）', () => {
+  let dirs: string[] = []
+  afterEach(() => { for (const d of dirs) rmSync(d, { recursive: true, force: true }); dirs = [] })
+
+  /** 造一个带 config.json 的宿主（工作区目录记入 dirs，由 afterEach 清理） */
+  const boot = (config: unknown) => {
+    const { cwd, dataDir } = fixture(config)
+    dirs.push(cwd)
+    return new HarnessHost({
+      cwd, dataDir, agentId: 'default', provider: 'mock',
+      permissionMode: 'allow-all',
+      mockProviderConfig: { defaultResponse: 'hi' },
+    })
+  }
+
+  it('★要求 L2 但本机未接线 ⇒ 告警降级（notice 说清实际档位与缺口）', async () => {
+    const host = boot({ sandbox: { level: 'L2' } })
+    await host.boot()
+    const n = host.notices.find((x) => x.code === 'sandbox.isolation-degraded') as
+      | Extract<HostNotice, { code: 'sandbox.isolation-degraded' }>
+      | undefined
+    expect(n).toBeDefined()
+    expect(n!.level).toBe('warn')
+    expect(n!.data.required).toBe('L2')
+    expect(n!.data.level).toBe('L1') // 实际档位（L2 未接线）
+    expect(n!.data.reasons.length).toBeGreaterThan(0)
+    await host.shutdown()
+  })
+
+  it('★onUnmet=refuse ⇒ 拒绝启动（而不是静默跑在 L0/L1）', async () => {
+    const host = boot({ sandbox: { level: 'L2', onUnmet: 'refuse' } })
+    await expect(host.boot()).rejects.toThrow(/未达到要求的 L2/)
+    // 拒绝启动的事实也必须可被宿主读到（A2A 要把原因回给调用方）
+    expect(host.notices.some((x) => x.code === 'config.sandbox-inactive')).toBe(true)
+  })
+
+  it('不写 level（默认 L0）⇒ 不产生降级告警（默认行为逐位不变）', async () => {
+    const host = boot({})
+    await host.boot()
+    expect(host.notices.some((x) => x.code === 'sandbox.isolation-degraded')).toBe(false)
+    await host.shutdown()
+  })
+})
