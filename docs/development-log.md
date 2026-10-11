@@ -1,5 +1,75 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 272）修复 P0-8：always-allow 写回改增量 PathRules，段级 deny 不再静默失效
+
+### 起因
+
+承接 §8 的缺陷清单（续 271）。用户在我给的 A/B/C/D 里选 **A** —— 先修 **D1**（= §3 的 P0-8）：
+`rememberRule` 改 PathRules 增量写回 + `check()` 收紧，带反向用例。这是**安全边界**上的改动，
+所以按既有纪律走"精确暂存 + 反向验证 + restore check"。
+
+### 决策与落地
+
+**① `packages/host/src/permission.ts`（写回粒度）**
+- `rememberRule(toolKey, behavior)` → **`rememberRule(toolKey, behavior, patterns)`**：不再
+  `{ ...getRules(), [toolKey]: behavior }` 整键覆盖，改成**把本次 `patterns` 并入目标列表**
+  （allow / deny），**保留**既有 `allow`/`deny`/`ask` 三个列表，去重。
+- 起点归一：既有规则若是旧 **string** 形态，转成 `**` 通配的 PathRules（语义等价，但**恢复
+  "还能被 deny 拦"的能力**）。
+- **`patterns` 为空 ⇒ `['**']` 通配**（如 `read` 这类无路径参数的工具），等价旧 string 语义，
+  但**仍保留**既有 deny/ask —— 旧实现会把它们一并抹掉。
+- `answerToDecision` 加 `patterns` 形参；`ask()` 调用点传 `req.patterns ?? []`；import 补 `PathRules`。
+
+**② `packages/core/src/index.ts`（`check()` 收紧）**
+- 抽出 `hitDeny(pr)` 供两处复用；`applyPathRule` 改用它与 `PathRules` 类型。
+- 新增**全局 deny 否决权**：`globalRule` 若是 PathRules 且其 `deny` 命中 `denyTargets` ⇒ **直接 deny**。
+  这一段在 `typeof toolRule === 'string'` 的短路**之前**，堵住"string 形态绕过一切 deny"的通道。
+- import 补 `PathRules`（**本地** import，不是 re-export —— 见下）。
+
+**③ 测试**
+- `host/src/permission.test.ts`：新增 describe「P0-8 写回粒度与保留」6 条（增量保留 deny/ask、
+  **★写回后段级 `denyPatterns` 仍生效**、旧 string 归一、`patterns` 空回退 `**`、幂等、always-deny
+  同样增量）；同步改 2 条钉住旧形态的既有断言。
+- `core/src/permission-deny-patterns.test.ts`：新增 describe「全局 deny 否决」4 条
+  （★string allow 被全局 deny 拦、**全局无 deny ⇒ 行为逐位不变**、未命中不干预、对普通 PathRules 同样有效）。
+- `cli/src/cli.test.ts`：`mode=ask 按用户答案` 的 1 条断言同步（写回形态变了）。这条**是全量测试
+  跑出来的** —— 单跑 host/core 不会发现。
+
+**④ 计划文档回写**：`sandbox-isolation-plan.md` 的 P0-8 标 ✅ 已修、§8.6 的 D1 行与 §4 第 5 步
+**订正措辞**（见下），并注明 P0-9/P1-9 仍待做。
+
+### 只有实现时才暴露的发现
+
+1. **§8.6 里"string allow 也要过 `denyTargets`"这条建议，按字面实现不了** —— string 形态
+   **没有规则侧 deny 列表**，"过 denyTargets"没有可比对的一端。唯一可行且语义安全的形态是
+   **从全局借 deny 列表**（即"全局 deny 否决权"）。已回写订正 §8.6 与 §3，避免文档与实现分叉
+   —— **写建议时的可行性与写代码时的可行性不是同一件事**。
+2. **`patterns` 为空必须回退 `['**']`**：否则 `always-allow read`（无路径参数）会写出
+   `{ allow: [] }` —— **空列表 = 什么都不放行**，比旧行为更糟（旧行为至少放行整个工具）。
+   这是实现时才撞上的边界，测试里已钉（"patterns 为空 ⇒ `**` 通配"）。
+3. **re-export 不引入本地作用域，第二次踩**：`core` 的 `export type { PathRules } from '@harness/permission'`
+   让 `PathRules` 对外可见，但**本模块内不可用** ⇒ 必须另加到 209 行的本地 `import type`。
+   （第一次是续 268 的 `export { createAuditSink } from '@harness/host'`。）
+4. **`answerToDecision` 的调用点没有 `await`**：`const decision = this.answerToDecision(...)` 拿到的是
+   Promise，于是 `rememberRule` 的落盘与 `auditSink` 的写入**并发**。**刻意没顺手改** —— 那是
+   行为时序变化（ask 会等落盘完成），不属本次修复范围，留待需要时单独讨论。
+5. **"测试钉住旧行为"会被误读成"测试坏了"**：3 条既有断言（host 2 + cli 1）钉的是旧 string 写回形态。
+   它们不是坏测试，是**把当时的实现当成了规范**。改断言时逐条确认新形态**等价或更严**，而不是
+   改到能过。
+
+### 验证
+
+- **全仓 typecheck**：`0 error`（46 包全 `Exited with code 0`）。
+- **全仓 test**：**2724 pass / 0 fail / 0 skip**（46 包全 exit 0）。较上轮基线 2714 **+10**
+  （host +6、core +4；cli 净 0 —— 只改断言未增用例）。
+- **反向验证（两处变异，`cp` 备份 + 哈希还原）**：
+  - **变异 1**：`rememberRule` 还原成整键覆盖 ⇒ host `permission.test.ts` **8 fail**
+    （22 pass / 8 fail），全部落在写回粒度相关用例。还原后哈希 `e6acd6e3…` 一致、**30 pass / 0 fail**。
+  - **变异 2**：`check()` 的全局否决置空 ⇒ core `permission-deny-patterns.test.ts` **2 fail**
+    （8 pass / 2 fail），正是 ★ 那两条；两条"不干预"用例保持 pass ⇒ **证明"只有显式 deny 才生效、
+    默认零行为变化"这条口径成立**。还原后哈希 `3e7a5add…` 一致、**10 pass / 0 fail**。
+- **受影响包完整用例**：host 30 pass / core 10 pass / cli 448 pass（逐包跑全量文件）。
+
 ## 2026-10-11（续 271）沙箱方案补「权限设计评审」§8（D1–D7）
 
 ### 起因

@@ -117,7 +117,7 @@
 | P0-5 | **`isWithinCwd` / `resolvePath` 在 6 个包各写一份** | `tools-builtin` / `tools-glob` / `tools-search` / `tools-media` / `code-intel` / `subagent`。安全边界**修一处漏五处**，且语义已开始漂移（有的比 `resolve`、有的比真实路径） | 各包 `index.ts` / `core.ts` |
 | P0-6 | **超时只杀直接子进程，不杀进程树**（沙箱视角） | `cross-platform-plan.md` P0-5 已从"跨平台"记过；从**隔离**角度更重：超时后沙箱内的 `npm run dev` 还在跑 ⇒ 隔离边界外仍在产生副作用（占端口、写文件、出网） | `runBash` 的 timer 分支 |
 | P0-7 | **`fallbackToHost` 的档位下沉没有记录** | 一旦开启，命令从"沙箱约束"升到"宿主全权"（放开白名单 + 放开 env 隔离 + 补系统 `PATH`）。`requireHostApproval` 默认 true 是好的，但 **allow-all 模式下静默放行且不留痕**（`viaHost` 只在返回值里，审计不记） | `tools-builtin` 回退分支 |
-| P0-8 | **「始终允许」写回是整键覆盖 ⇒ 段级 `denyPatterns` 永久失效**（§8 D1） | 提示里显示的是**具体命令**，写回却是 `rules[toolKey] = 'allow'`：①粒度=**整工具**（`ls` 与 `rm -rf` 同键同命）；②**整键覆盖**已有 PathRules（`deny: ['shutdown*']` 直接丢）；③规则退化为 **string** 后 `check()` 走 `typeof toolRule === 'string'` **直接 return**，`denyTargets` **整体不再参与** ⇒ `echo hi; shutdown -h now` 被放行。**测试盲区**：`permission-deny-patterns.test.ts` 只钉了"string 规则不受 denyPatterns 影响"这一形态，**没有覆盖"always-allow 把 PathRules 变成 string"这条写回路径** | `host/src/permission.ts:283/300`、`core/src/index.ts:492` |
+| P0-8 | ✅ **已修**（2026-10-11，见开发日志续 272）—— 原文：「始终允许」写回是整键覆盖 ⇒ 段级 `denyPatterns` 永久失效（§8 D1） | 提示里显示的是**具体命令**，写回却是 `rules[toolKey] = 'allow'`：①粒度=**整工具**（`ls` 与 `rm -rf` 同键同命）；②**整键覆盖**已有 PathRules（`deny: ['shutdown*']` 直接丢）；③规则退化为 **string** 后 `check()` 走 `typeof toolRule === 'string'` **直接 return**，`denyTargets` **整体不再参与** ⇒ `echo hi; shutdown -h now` 被放行。**测试盲区**：`permission-deny-patterns.test.ts` 只钉了"string 规则不受 denyPatterns 影响"这一形态，**没有覆盖"always-allow 把 PathRules 变成 string"这条写回路径**。⚠️ 修复时发现 ② 的可行形态与初稿不同：string 形态**没有自己的 deny 列表**，"过 denyTargets"只能落成**全局 deny 否决权**（详见 §8.6） | `host/src/permission.ts:283/300`、`core/src/index.ts:492` |
 | P0-9 | **授权不跟调用方走，但身份跟**（§8 D2） | 规则集落 `<dataDir>/permissions.json`（dataDir 缺省 `~/.harness`），而 A2A 与本地 TUI **在该工作区解析到同一份**。身份层做得很干净（`callerKey()` 首次使用即绑定 `contextId`，他人复用 ⇒ `ContextForbiddenError`），**权限层没有跟上**：`check()` 只读 `toolKey/patterns/denyPatterns`，`sessionId` 仅用于 asker 路由与审计归属，**不进规则匹配、也不进写回**。⇒ 本地点一次「始终允许」，同工作区的远程 A2A 调用方一并继承（反向亦成立）。控制面只听 `127.0.0.1` 是缓解、不是隔离。**本仓独有**（Codex / Claude Code 是单机单用户，不存在这个面） | `host/src/host.ts:361`、`workspace/src/index.ts:134`、`a2a-server/src/auth.ts:42/63` |
 
 ### 3.1 P1 —— **能力缺口**
@@ -163,13 +163,13 @@
 3. **P0-2 + P0-3**：env 白名单化（默认拒绝）覆盖 MCP 子进程；读侧对 `.env` / `.config-key` /
    `permissions.json` 这类**已知敏感名**加默认拒绝（可 `keepPaths` 放行）。
 4. **P0-6 + P1-1**：进程组 / 进程树 kill + `ulimit` 资源上限（真机验证，或至少 process-group 单测）。
-5. **P0-8 + P0-9 + P1-9 一起做（授权域收敛，见 §8）**：三件事共用同一处改动，分开做等于改三遍 ——
-   ①`rememberRule` 改 **PathRules 增量写回**（把本次 `patterns` 并进 `allow`，**保留**已有 `deny`/`ask`，
-   不再整键覆盖）；②`check()` 收紧：**string 形态的 `allow` 也要先过 `denyTargets`**（堵住 D1 的第③条）；
-   ③规则**按归属分层**（`session:<id>` → `caller:<key>` → 工具 → 全局，`check()` 逐层回退，写回带归属键）；
+5. ~~**P0-8**~~ ✅ **已完成**（2026-10-11，见开发日志续 272）：`rememberRule` 改 **PathRules 增量写回**；
+   `check()` 加**全局 deny 否决权**（措辞订正见 §8.6 —— string 形态**没有自己的 deny 列表**，
+   "string allow 也过 denyTargets"只能落成"从全局借 deny 列表"）。
+   **剩余 P0-9 + P1-9 一起做（授权域收敛，见 §8）**：③规则**按归属分层**
+   （`session:<id>` → `caller:<key>` → 工具 → 全局，`check()` 逐层回退，写回带归属键）；
    ④`kind: 'permission.rule.changed'`（零内容 + `stateHash` + 来源 `cli|control-api|asker`）。
-   **必须带反向验证**：`permission-deny-patterns.test.ts` 补"always-allow 之后段级 deny 仍生效"一条
-   （这是现有的测试盲区），并补"远程 caller 不继承本地 always-allow"一条。
+   **必须带反向验证**：补"远程 caller 不继承本地 always-allow"一条。
 6. **P1-4 档位结构 + P1-3 OS 绑定**：先定义 `probeIsolation()` 与档位语义，再接第一个
    OS 原语（macOS `sandbox-exec` 最易验证）—— **拿不到原语就按 §2 纪律 2 显式降级告警**。
 7. **P1-2 网络策略**、**P1-6 死协议收口**（要么接生产者、要么删掉类型）、**P2 批次**
@@ -397,7 +397,7 @@ asker 路由也已在用了，只差把它接进规则匹配与写回**（P0-9 �
 
 | 针对 | 做法 | 反向验证 |
 |---|---|---|
-| **D1**（P0-8） | ①`rememberRule` 改 **PathRules 增量写回**：把本次 `patterns` 并进 `allow`（或 `deny`），**保留**已有 `deny`/`ask`，不再整键覆盖；②`check()` 收紧：**string 形态的 `allow` 也要先过 `denyTargets`**（堵住 8.3 第 3 条） | `permission-deny-patterns.test.ts` 补"always-allow 后段级 deny 仍生效" + "写回不丢已有 deny/ask" |
+| **D1**（P0-8）✅ **已修** | ①`rememberRule` 改 **PathRules 增量写回**：把本次 `patterns` 并进 `allow`（或 `deny`），**保留**已有 `deny`/`ask`，不再整键覆盖；`patterns` 为空 ⇒ `**` 通配（等价旧 string，但不抹掉既有规则）。②`check()` 收紧：**全局 deny 对所有工具规则形态都有否决权** —— 实现时确认，string 形态**没有自己的 deny 列表**，所以"string allow 也过 `denyTargets`"唯一可行形态是**从全局借 deny 列表**（默认 `'*': 'ask'` 不触发 ⇒ 零行为变化，只收紧不放宽） | `permission-deny-patterns.test.ts` 补"always-allow 后段级 deny 仍生效" + "写回不丢已有 deny/ask" |
 | **D2**（P0-9） | 规则分层加归属维度：`session:<id>` → `caller:<key>` → 工具 → 全局，`check()` 逐层回退；写回带归属键。`PermissionRequest.sessionId` 已在传，**只差接进匹配与写回** | 补"远程 caller 不继承本地 always-allow"与"本地不继承控制面写入"两条 |
 | **D5**（P1-9） | 加 `kind: 'permission.rule.changed'`（零内容 + `stateHash` + 来源 `cli / control-api / asker`），沿用 `harness.audit.v1` schema | 两条写盘路径各断言产生一条审计 |
 | **D4 / D6**（P2-5/P2-6） | 纯判据与文案：`assessRisk` 让 `bash` 走**模式表**（`ls` 不该是 high）；文案键位改成自洽（或直接去掉方括号里的简写）。`cli.test.ts` 钉着文案，**改要同步** | 文案用例同步更新 + `assessRisk` 补 `bash` 分级用例 |
