@@ -57,8 +57,19 @@ export interface McpServerConfig {
   command?: string
   /** stdio 模式：命令参数 */
   args?: string[]
-  /** stdio 模式：环境变量 */
+  /** stdio 模式：环境变量（**总是不受白名单限制地透传** —— 这是“你需要就自己声明”的路径） */
   env?: Record<string, string>
+  /**
+   * stdio 模式：除默认白名单外，额外要从宿主环境透传的变量名（P0-2）。
+   * 例：需要 `GITHUB_TOKEN` 又不想写进配置时用。
+   */
+  envKeep?: string[]
+  /**
+   * stdio 模式：**关闭 env 隔离**，恢复“全量继承宿主环境”（P0-2）。
+   * 默认 `false` —— 第三方 server 拿全量 env 是取“同一个 `GITHUB_TOKEN`，bash 里被摘掉、
+   * MCP 里照样读得到”那个不对称。确实需要时显式打开。
+   */
+  inheritEnv?: boolean
   /** sse/http 模式：服务器 URL */
   url?: string
   /** 鉴权配置（仅 sse/http） */
@@ -136,15 +147,89 @@ export interface McpTransport {
   close(): void
 }
 
+/**
+ * 子进程环境变量的**默认白名单**（P0-2）。
+ *
+ * 选取原则：只收“…不给它就跑不起来”的东西 —— 进程启动/查找依赖（`PATH` / `SystemRoot` /
+ * `COMSPEC`）、家目录与临时目录（`HOME` / `TMPDIR`）、本地化与终端（`LANG` / `TERM`）。
+ * **凭据一律不在内**：`GITHUB_TOKEN` / `AWS_*` / `OPENAI_API_KEY` … 要传就在
+ * `mcpServers[].env` 里**显式声明**（或 `envKeep` 点名）。
+ */
+export const DEFAULT_MCP_ENV_KEEP: readonly string[] = [
+  'PATH',
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'PWD',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'LANG',
+  'LC_ALL',
+  'LC_CTYPE',
+  'TERM',
+  'TZ',
+  // Windows：MCP server 多数是 node/python，缺这几个直接启动失败
+  'SystemRoot',
+  'SYSTEMROOT',
+  'WINDIR',
+  'COMSPEC',
+  'PATHEXT',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'ProgramData',
+  'ProgramFiles',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+]
+
+/**
+ * 组装 MCP 子进程的环境变量（P0-2）。
+ *
+ * 改造前是 `{ ...process.env, ...config.env }` —— **全量继承**。同一个 `GITHUB_TOKEN`，
+ * bash 里被 `sanitizeEnv` 摘掉、第三方 MCP server 里却照样读得到，隔离不对称且没人会注意到。
+ * 现在默认只透传白名单 + 声明项：**默认拒绍，要用自己声明**。
+ *
+ * 优先级：`inheritEnv`（全量）> 白名单（+ `envKeep`）> `declared`（后盖前）。
+ */
+export function buildMcpChildEnv(opts: {
+  /** 服务声明里显式给的 env（总是生效、且优先于宿主同名变量） */
+  declared?: Record<string, string>
+  /** 额外保留的宿主变量名 */
+  keep?: string[]
+  /** 是否恢复全量继承（默认 false） */
+  inheritAll?: boolean
+  /** 宿主环境（测试注入用，默认 process.env） */
+  hostEnv?: NodeJS.ProcessEnv
+} = {}): Record<string, string> {
+  const host = opts.hostEnv ?? process.env
+  const inherited: Record<string, string> = {}
+  if (opts.inheritAll) {
+    for (const [k, v] of Object.entries(host)) if (v !== undefined) inherited[k] = v
+  } else {
+    const keep = new Set([...DEFAULT_MCP_ENV_KEEP, ...(opts.keep ?? [])])
+    for (const [k, v] of Object.entries(host)) if (v !== undefined && keep.has(k)) inherited[k] = v
+  }
+  return { ...inherited, ...(opts.declared ?? {}) }
+}
+
 /** stdio 传输：通过子进程 stdin/stdout */
 export class StdioTransport implements McpTransport {
   private proc: ChildProcessWithoutNullStreams
   private handler?: (data: string) => void
   private buffer = ''
 
-  constructor(config: { command: string; args?: string[]; env?: Record<string, string> }) {
+  constructor(config: {
+    command: string
+    args?: string[]
+    env?: Record<string, string>
+    /** P0-2：额外保留的宿主变量名 / 关闭 env 隔离（见 {@link buildMcpChildEnv}） */
+    envKeep?: string[]
+    inheritEnv?: boolean
+  }) {
     this.proc = spawn(config.command, config.args ?? [], {
-      env: { ...process.env, ...config.env },
+      env: buildMcpChildEnv({ declared: config.env, keep: config.envKeep, inheritAll: config.inheritEnv }),
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     this.proc.stdout.on('data', (chunk: Buffer) => {
@@ -430,7 +515,13 @@ export function defaultTransportFactory(
   const oauthResolver = oauthResolverFor(config, ctx)
   if (t === 'stdio') {
     if (!config.command) throw new Error(`MCP Server "${config.name}" 缺少 command（stdio 模式必填）`)
-    return new StdioTransport({ command: config.command, args: config.args, env: config.env })
+    return new StdioTransport({
+      command: config.command,
+      args: config.args,
+      env: config.env,
+      envKeep: config.envKeep,
+      inheritEnv: config.inheritEnv,
+    })
   }
   if (t === 'sse') {
     if (!config.url) throw new Error(`MCP Server "${config.name}" 缺少 url（sse 模式必填）`)

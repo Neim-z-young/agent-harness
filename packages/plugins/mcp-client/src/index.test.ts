@@ -4,6 +4,8 @@ import { tmpdir } from 'node:os'
 import {
   McpClient,
   StdioTransport,
+  buildMcpChildEnv,
+  DEFAULT_MCP_ENV_KEEP,
   HttpTransport,
   SseTransport,
   defaultTransportFactory,
@@ -923,5 +925,58 @@ describe('createMcpClientPlugin autoInjectResources', () => {
     expect(combined).not.toInclude('body-file://b.txt')
 
     await plugin.uninstall?.()
+  })
+})
+
+// ===== P0-2：MCP 子进程环境变量默认拒绝 =====
+
+describe('buildMcpChildEnv（P0-2）', () => {
+  const hostEnv = {
+    PATH: '/usr/bin',
+    HOME: '/home/u',
+    TERM: 'xterm',
+    GITHUB_TOKEN: 'ghp_secret',
+    OPENAI_API_KEY: 'sk-secret',
+    AWS_SECRET_ACCESS_KEY: 'aws-secret',
+  }
+
+  it('★默认**不透传凭据**（改造前是全量继承，第三方 server 照样读得到）', () => {
+    const env = buildMcpChildEnv({ hostEnv })
+    expect(env.PATH).toBe('/usr/bin')
+    expect(env.HOME).toBe('/home/u')
+    expect(env.TERM).toBe('xterm')
+    expect(env.GITHUB_TOKEN).toBeUndefined()
+    expect(env.OPENAI_API_KEY).toBeUndefined()
+    expect(env.AWS_SECRET_ACCESS_KEY).toBeUndefined()
+  })
+
+  it('声明项总是生效，且盖过宿主同名变量', () => {
+    const env = buildMcpChildEnv({ declared: { GITHUB_TOKEN: 'declared', FOO: '1' }, hostEnv })
+    expect(env.GITHUB_TOKEN).toBe('declared')
+    expect(env.FOO).toBe('1')
+    expect(env.OPENAI_API_KEY).toBeUndefined()
+  })
+
+  it('envKeep 点名可额外透传（不必写进配置）', () => {
+    const env = buildMcpChildEnv({ keep: ['GITHUB_TOKEN'], hostEnv })
+    expect(env.GITHUB_TOKEN).toBe('ghp_secret')
+    expect(env.OPENAI_API_KEY).toBeUndefined()
+  })
+
+  it('inheritEnv ⇒ 恢复全量继承（显式打开才生效）', () => {
+    const env = buildMcpChildEnv({ inheritAll: true, hostEnv })
+    expect(env.GITHUB_TOKEN).toBe('ghp_secret')
+    expect(env.AWS_SECRET_ACCESS_KEY).toBe('aws-secret')
+  })
+
+  it('白名单里没有 undefined 值（不往子进程塞空键）', () => {
+    const env = buildMcpChildEnv({ hostEnv: { PATH: undefined, HOME: '/h' } })
+    expect(Object.keys(env)).toEqual(['HOME'])
+  })
+
+  it('默认白名单不含任何凭据样式变量名（清单自身就是"不该传"的口径）', () => {
+    for (const k of DEFAULT_MCP_ENV_KEEP) {
+      expect(/TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL/i.test(k)).toBe(false)
+    }
   })
 })
