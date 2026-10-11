@@ -18,6 +18,7 @@ import {
   formatLocalNow,
   readGitInfo,
   renderEnvSection,
+  renderIsolationLine,
   renderNowSection,
 } from './index'
 import type { GitInfo, StaticEnvInfo } from './index'
@@ -60,8 +61,34 @@ describe('renderEnvSection：静态环境段（前缀区）', () => {
     expect(s).not.toInclude('工作目录:')
   })
 
+  it('带隔离摘要时并排渲染「隔离」行（与 Shell 行同段，进前缀缓存）', () => {
+    const s = renderEnvSection(FIXTURE, '/w/repo', { level: 'L1', fsBound: false, netPolicy: 'allowlist' })
+    expect(s).toInclude('- Shell: /bin/zsh')
+    expect(s).toInclude('- 隔离: L1（进程层）｜可写区仅策略判定（非 OS 级）｜出网 allowlist')
+  })
+
   it('一条事实都没有时返回空串（调用方据此不 push）', () => {
     expect(renderEnvSection({}, undefined)).toBe('')
+  })
+})
+
+describe('renderIsolationLine：档位自述（P2-1）', () => {
+  it('L1（默认实际档位）写明「仅策略判定」，不让人误以为是 OS 边界', () => {
+    const line = renderIsolationLine({ level: 'L1', fsBound: false, netPolicy: 'open' })
+    expect(line).toInclude('- 隔离: L1')
+    expect(line).toInclude('进程层')
+    expect(line).toInclude('仅策略判定')
+    expect(line).toInclude('出网 open')
+  })
+
+  it('L2 且 fsBound ⇒ 写明可写区已由 OS 限定（同一函数，口径只有一份）', () => {
+    const line = renderIsolationLine({ level: 'L2', fsBound: true, netPolicy: 'deny' })
+    expect(line).toInclude('已由 OS 限定')
+    expect(line).toInclude('出网 deny')
+  })
+
+  it('未知档位不静默省略（「不知道」要看得出来，不能退化成没这行）', () => {
+    expect(renderIsolationLine({ level: 'L9' })).toInclude('未知档位')
   })
 })
 
@@ -99,6 +126,18 @@ describe('createEnvContextPlugin：两条注入通道', () => {
     expect(parts).toHaveLength(1)
     expect(parts[0]).toInclude('- 系统: darwin 23.0.0（arm64）')
     expect(parts[0]).toInclude('- 工作目录: /w/repo')
+  })
+
+  it('前缀：给了 isolation 才出现「隔离」行；不给则整行省略（宁缺毋滥，不猜档位）', async () => {
+    const withIso = createEnvContextPlugin({ readStatic: () => FIXTURE, isolation: { level: 'L1', fsBound: false } })
+    const parts1: string[] = []
+    await (await hooksOf(withIso))['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's1', cwd: '/w' }, parts1)
+    expect(parts1[0]).toInclude('- 隔离: L1')
+
+    const noIso = createEnvContextPlugin({ readStatic: () => FIXTURE })
+    const parts2: string[] = []
+    await (await hooksOf(noIso))['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's1', cwd: '/w' }, parts2)
+    expect(parts2[0]).not.toInclude('隔离')
   })
 
   it('前缀：cwd 缺失 + 子 Agent ⇒ 省略工作目录行（冻结值对 worktree 是错口径，不用）', async () => {

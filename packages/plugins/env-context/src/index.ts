@@ -5,7 +5,7 @@
  *
  * ## 分档纪律（位置即语义，本仓 prompt 注入的硬约束）
  * - **恒定段（前缀 `core.prompt.system.transform`）**：系统 / 架构 / 用户 / Shell /
- *   工作目录 —— 会话中途不变，进前缀可吃前缀缓存；其中工作目录取 hook 入参
+ *   工作目录 / **隔离档位** —— 会话中途不变，进前缀可吃前缀缓存；其中工作目录取 hook 入参
  *   `PromptInput.cwd`（`Session.cwd ?? 全局 cwd`，与 ToolContext 同口径），
  *   子 Agent 的 worktree 会话会拿到自己的 worktree 路径。
  * - **易变段（尾部 `core.prompt.dynamic.transform`）**：当前时间、Git 分支与脏状态 ——
@@ -46,6 +46,23 @@ export interface StaticEnvInfo {
   shell?: string
 }
 
+/**
+ * 隔离档位摘要（P2-1：让模型知道"我现在跑在什么边界里"）。
+ *
+ * 刻意**不 import `@harness/isolation`**：这里只需要一个结构（宿主装配时把解析结果递进来），
+ * 引包会让本插件背上一条对"档位语义"的编译期依赖 —— 而它只用得上三个字段。
+ * 结构类型（duck typing）正好：`IsolationResolution` 的字段都能对上，`level` 用 `string`
+ * 是为了让宿主侧的档位枚举升级时这里不必跟着改。
+ */
+export interface IsolationSummary {
+  /** 实际生效档位（`L0` 策略层 / `L1` 进程层 / `L2` OS 绑定 / `L3` 平台层） */
+  level: string
+  /** 可写区是否**真的**被 OS 限定（L2 起为真） */
+  fsBound?: boolean
+  /** 出网策略（`open` / `allowlist` / `deny`） */
+  netPolicy?: string
+}
+
 /** Git 仓库状态（易变） */
 export interface GitInfo {
   /** 当前分支（detached 时为 'HEAD'） */
@@ -64,14 +81,44 @@ export interface EnvContextOptions {
   readGit?: (cwd: string) => Promise<GitInfo | undefined>
   /** 是否注入 Git 行，默认 true（无 git / 非 git 目录时自动省略该行） */
   includeGit?: boolean
+  /**
+   * 隔离档位摘要（P2-1）。**由宿主装配时递入**（`load(ctx)` ⇒ `ctx.isolationLevel` +
+   * 解析后的网络策略）—— 不传则不出现「隔离」行（与"读不到的事实整行省略"同一纪律）。
+   */
+  isolation?: IsolationSummary
 }
 
 // ===== 纯渲染（导出供测试与复用）=====
 
+/** 档位 → 人读标签（与 `docs/sandbox-isolation-plan.md` §2 的表一致） */
+const ISOLATION_LEVEL_LABEL: Record<string, string> = {
+  L0: '策略层',
+  L1: '进程层',
+  L2: 'OS 绑定',
+  L3: '平台层',
+}
+
+/**
+ * 渲染「隔离」行（P2-1）。
+ *
+ * 写进前缀的理由与 Shell 行同：模型不知道自己的边界，就会反复撞同一面墙（反复试
+ * `curl`、反复试写界外路径）。★这里写的是**实际档位**而不是配置里的愿望值 —— 愿望值
+ * 由宿主折完再递进来（见 `host/src/plugins.ts`），本函数不做任何"能不能达到"的判断。
+ *
+ * ⚠️ 刻意把「未做 OS 绑定」写成一句完整的话而不是省略：L0/L1 下**文件系统边界只是策略
+ * 判定**，省略它等于让模型以为写界外会被 OS 挡住。
+ */
+export function renderIsolationLine(iso: IsolationSummary): string {
+  const label = ISOLATION_LEVEL_LABEL[iso.level] ?? '未知档位'
+  const fs = iso.fsBound ? '可写区已由 OS 限定' : '可写区仅策略判定（非 OS 级）'
+  const net = `出网 ${iso.netPolicy ?? 'open'}`
+  return `- 隔离: ${iso.level}（${label}）｜${fs}｜${net}`
+}
+
 /**
  * 渲染静态环境段（前缀区）。一条事实都没有时返回空串 —— 调用方据此不 push（零噪声）。
  */
-export function renderEnvSection(info: StaticEnvInfo, cwd?: string): string {
+export function renderEnvSection(info: StaticEnvInfo, cwd?: string, isolation?: IsolationSummary): string {
   const lines: string[] = []
   if (info.platform) {
     const os = [info.platform, info.release].filter(Boolean).join(' ')
@@ -81,6 +128,7 @@ export function renderEnvSection(info: StaticEnvInfo, cwd?: string): string {
   if (who) lines.push(`- 用户: ${who}`)
   if (info.shell) lines.push(`- Shell: ${info.shell}`)
   if (cwd) lines.push(`- 工作目录: ${cwd}`)
+  if (isolation) lines.push(renderIsolationLine(isolation))
   if (lines.length === 0) return ''
   return [
     '<env>',
@@ -224,7 +272,7 @@ export function createEnvContextPlugin(options: EnvContextOptions = {}): AgentPl
   const hooks: Hooks = {
     'core.prompt.system.transform'(input: PromptInput, parts: string[]) {
       staticInfo ??= readStatic()
-      const section = renderEnvSection(staticInfo, resolveCwd(input))
+      const section = renderEnvSection(staticInfo, resolveCwd(input), options.isolation)
       if (section) parts.push(section)
     },
     async 'core.prompt.dynamic.transform'(input: PromptInput, parts: string[]) {
@@ -240,7 +288,7 @@ export function createEnvContextPlugin(options: EnvContextOptions = {}): AgentPl
     name: 'Env Context',
     version: '0.1.0',
     description:
-      '运行环境与用户信息注入：静态环境（系统/用户/Shell/工作目录）进 system 前缀，易变信息（当前时间/Git 状态）走尾部动态区',
+      '运行环境与用户信息注入：静态环境（系统/用户/Shell/工作目录/隔离档位）进 system 前缀，易变信息（当前时间/Git 状态）走尾部动态区',
     async install(ctx) {
       frozenCwd = ctx?.workspace?.cwd
       return hooks

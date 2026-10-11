@@ -5,6 +5,8 @@ import {
   NETWORK_COMMANDS,
   assessNetAccess,
   extractNetHost,
+  DENIAL_HOW_PREFIX,
+  formatDenial,
   formatIsolationLine,
   hostMatchesAllow,
   isBlockedNetTarget,
@@ -246,5 +248,53 @@ describe('resolveNetPolicy', () => {
   })
   it('白名单去空、小写化', () => {
     expect(resolveNetPolicy({ net: 'allowlist', netAllow: [' GitHub.com ', '', '  '] }).allow).toEqual(['github.com'])
+  })
+})
+
+// ===== P2-2：拒绝文案（「为什么 + 怎么改」）=====
+
+describe('formatDenial（P2-2）', () => {
+  it('三段齐全按 what｜为什么｜怎么改 拼', () => {
+    const s = formatDenial({ what: '拒绝执行 rm -rf /', why: '命中危险模式', how: '换个写法' })
+    expect(s).toBe('拒绝执行 rm -rf /｜为什么：命中危险模式｜怎么改：换个写法')
+  })
+
+  it('缺段整段省略（不给「为什么：undefined」这种空头衔）', () => {
+    expect(formatDenial({ what: '已拒绝' })).toBe('已拒绝')
+    expect(formatDenial({ why: '因为 X', how: '做 Y' })).toBe('为什么：因为 X｜怎么改：做 Y')
+  })
+
+  it('「怎么改」前缀是常量 —— 回归守卫断言的就是它（改这里，守卫会红）', () => {
+    expect(DENIAL_HOW_PREFIX).toBe('怎么改')
+    expect(formatDenial({ how: '做 Y' })).toContain(DENIAL_HOW_PREFIX)
+  })
+})
+
+describe('assessNetAccess 的 why / how 拆分（P2-2）', () => {
+  it('deny：why 说命中了什么，how 说改哪个配置键，reason 是拼好的完整文案', () => {
+    const v = assessNetAccess({ commands: ['curl'], args: [], astAvailable: true }, { mode: 'deny', allow: [] })
+    expect(v.ok).toBe(false)
+    expect(v.why).toContain('curl')
+    expect(v.how).toContain('sandbox.net')
+    expect(v.reason).toBe(formatDenial({ why: v.why, how: v.how }))
+  })
+
+  it('allowlist 未授权：how 指向 netAllow（与 reason 同源，不另写一份）', () => {
+    const v = assessNetAccess(
+      { commands: ['curl'], args: ['https://evil.com/x'], astAvailable: true },
+      { mode: 'allowlist', allow: ['github.com'] },
+    )
+    expect(v.ok).toBe(false)
+    expect(v.how).toContain('netAllow')
+    expect(v.reason).toContain('怎么改')
+  })
+
+  it('元数据/私有地址：how 说清"不受 netAllow 影响"，别让人白加白名单', () => {
+    const v = assessNetAccess(
+      { commands: ['curl'], args: ['http://169.254.169.254/latest'], astAvailable: true },
+      { mode: 'allowlist', allow: ['169.254.169.254'] },
+    )
+    expect(v.ok).toBe(false)
+    expect(v.how).toContain('不受 netAllow 影响')
   })
 })

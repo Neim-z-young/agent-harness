@@ -9,6 +9,7 @@ import {
   searchTools,
   createToolsSearchPlugin,
 } from './index'
+import { DENIAL_HOW_PREFIX } from '@harness/isolation'
 import type { ToolContext } from '@harness/tool'
 
 let dir: string
@@ -239,6 +240,17 @@ describe('读侧敏感文件默认拒绝（P0-3）', () => {
     const res = await grepFileTool.call!({ pattern: 'SECRET', path: '.env' } as any, ctx)
     expect(res.ok).toBe(false)
     if (!res.ok) expect(res.error!.code).toBe('SANDBOX_READ_DENIED')
+  })
+
+  it('P2-2：两条拒绝都带「怎么改」（与 tools-builtin 同一份口径）', async () => {
+    writeFileSync(join(dir, '.env'), 'SECRET=1')
+    const denied = await grepFileTool.call!({ pattern: 'SECRET', path: '.env' } as any, ctx)
+    expect(denied.ok).toBe(false)
+    if (!denied.ok) expect(denied.error!.message).toContain(DENIAL_HOW_PREFIX)
+
+    const outside = await grepFileTool.call!({ pattern: 'x', path: '/etc/hosts' } as any, ctx)
+    expect(outside.ok).toBe(false)
+    if (!outside.ok) expect(outside.error!.message).toContain(DENIAL_HOW_PREFIX)
   })
 
   it('★递归遍历时跳过敏感文件（只查入参路径挡不住"顺带读到"）', async () => {

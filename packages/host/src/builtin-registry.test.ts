@@ -148,6 +148,26 @@ describe('resolveBuiltinPlugins / unknownBuiltinPluginIds：声明式启用路�
     expect(none.plugins.map((p) => p.id)).not.toContain('env-context')
   })
 
+  it('env-context 拿到的是**解析后的实际档位**（P2-1：与 BashOutput.isolation 同一份事实）', async () => {
+    // 带 isolationLevel 装配 ⇒ 前缀里出现「隔离」行；fsBound 由档位换算（L1 ⇒ 非 OS 级）
+    const { plugins } = await resolveBuiltinPlugins(['env-context'], undefined, { sandbox: { net: 'deny' } } as never, 'L1')
+    const hooks = await plugins[0]!.install({ workspace: { cwd: '/w' } } as never)
+    const parts: string[] = []
+    await hooks!['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's1', cwd: '/w' } as never, parts)
+    expect(parts[0]).toInclude('- 隔离: L1')
+    expect(parts[0]).toInclude('仅策略判定')
+    // 网络策略按同一份 resolveNetPolicy 归一（与 bash 出网门同口径，不是另算一套）
+    expect(parts[0]).toInclude('出网 deny')
+  })
+
+  it('env-context 无加载上下文时不出现「隔离」行（不猜档位）', async () => {
+    const { plugins } = await resolveBuiltinPlugins(['env-context'])
+    const hooks = await plugins[0]!.install({ workspace: { cwd: '/w' } } as never)
+    const parts: string[] = []
+    await hooks!['core.prompt.system.transform']!({ agentId: 'default', sessionId: 's1', cwd: '/w' } as never, parts)
+    expect(parts[0]).not.toInclude('隔离')
+  })
+
   it('只声明 coordinator 时经 dependsOn 自动补上 subagent', async () => {
     const { plugins, unknown } = await resolveBuiltinPlugins(['coordinator'])
     expect(unknown).toEqual([])

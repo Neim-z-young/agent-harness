@@ -375,12 +375,19 @@ export interface NetScanInput {
 /** 网络策略判定结论 */
 export interface NetVerdict {
   ok: boolean
-  /** 拒绝原因（`ok=true` 时为空） */
+  /**
+   * 拒绝原因（`ok=true` 时为空）—— **已是完整可投递的文案**（含 why 与 how 两段，
+   * 由 {@link formatDenial} 拼成），调用方直接展示即可，不要再自己拼一遍。
+   */
   reason?: string
   /** 命中的出网命令 */
   commands: string[]
   /** 提取到的目标 host */
   targets: string[]
+  /** 为什么被拒（P2-2；与 `reason` 同源，供调用方按段重组） */
+  why?: string
+  /** 怎么改（P2-2；同上） */
+  how?: string
 }
 
 /** `raw` 兜底：按词扫描出网命令名（AST 不可用时用；只认词边界，不猜语义） */
@@ -433,47 +440,69 @@ export function assessNetAccess(input: NetScanInput, policy: ResolvedNetPolicy):
 
   if (policy.mode === 'deny') {
     if (netCmds.length === 0) return { ok: true, commands: [], targets: [] }
-    return {
-      ok: false,
-      commands: netCmds,
-      targets,
-      reason: `网络出口策略为 deny：命令包含出网程序 ${netCmds.join(' / ')}。`
-        + '如需放行，请在 config.json → sandbox.net 改为 open，或用 allowlist 精确放行目标。',
-    }
+    const why = `网络出口策略为 deny：命令包含出网程序 ${netCmds.join(' / ')}。`
+    const how = '如需放行，请在 config.json → sandbox.net 改为 open，或用 allowlist 精确放行目标。'
+    return { ok: false, commands: netCmds, targets, reason: formatDenial({ why, how }), why, how }
   }
 
   // allowlist
   if (netCmds.length === 0) return { ok: true, commands: [], targets: [] }
   if (targets.length === 0) {
-    return {
-      ok: false,
-      commands: netCmds,
-      targets,
-      reason: `网络出口策略为 allowlist，但无法从命令里确定目标主机（${netCmds.join(' / ')}）——`
-        + '无法核验的目标不算已授权。请把目标写清（或改用可提取 URL 的命令），'
-        + '或在 config.json → sandbox.net 下调策略。',
-    }
+    const why = `网络出口策略为 allowlist，但无法从命令里确定目标主机（${netCmds.join(' / ')}）——无法核验的目标不算已授权。`
+    const how = '请把目标写清（或改用可提取 URL 的命令），或在 config.json → sandbox.net 下调策略。'
+    return { ok: false, commands: netCmds, targets, reason: formatDenial({ why, how }), why, how }
   }
   const blocked = targets.filter((h) => isBlockedNetTarget(h))
   if (blocked.length) {
-    return {
-      ok: false,
-      commands: netCmds,
-      targets,
-      reason: `网络出口策略拒绝访问元数据/私有地址：${[...new Set(blocked)].join(' / ')}`
-        + '（云元数据端点与内网地址即使在 netAllow 里也一律不放行）。',
-    }
+    const why = `网络出口策略拒绝访问元数据/私有地址：${[...new Set(blocked)].join(' / ')}`
+      + '（云元数据端点与内网地址即使在 netAllow 里也一律不放行）。'
+    const how = '换掉目标地址；这类地址不受 netAllow 影响，只能由 L2/L3 的 OS 级边界另行约束。'
+    return { ok: false, commands: netCmds, targets, reason: formatDenial({ why, how }), why, how }
   }
   const notAllowed = targets.filter((h) => !hostMatchesAllow(h, policy.allow))
   if (notAllowed.length) {
-    return {
-      ok: false,
-      commands: netCmds,
-      targets,
-      reason: `网络出口策略 allowlist 拒绝未授权目标：${[...new Set(notAllowed)].join(' / ')}`
-        + `（当前白名单：${policy.allow.length ? policy.allow.join(' / ') : '空'}）。`
-        + '如需放行，请加进 config.json → sandbox.netAllow。',
-    }
+    const why = `网络出口策略 allowlist 拒绝未授权目标：${[...new Set(notAllowed)].join(' / ')}`
+      + `（当前白名单：${policy.allow.length ? policy.allow.join(' / ') : '空'}）。`
+    const how = '如需放行，请加进 config.json → sandbox.netAllow。'
+    return { ok: false, commands: netCmds, targets, reason: formatDenial({ why, how }), why, how }
   }
   return { ok: true, commands: netCmds, targets }
+}
+
+// ============================================================================
+// 三、拒绝文案（P2-2：每条拒绝都要「为什么 + 怎么改」）
+// ============================================================================
+
+/**
+ * 「怎么改」段的**唯一前缀**（P2-2）。
+ *
+ * 单列一个常量而不是各处自己写「怎么改：」：它是**可自动判的验收口径** —— 回归守卫
+ * 断言每条隔离拒绝消息含这个串，于是"只说被拒、不说怎么办"的文案会直接变红。
+ * 历史教训（本仓既有）：文案指向给不出所需信息的工具 ⇒ 模型空转。
+ */
+export const DENIAL_HOW_PREFIX = '怎么改'
+
+/** 拒绝文案的三段（what 必填，why / how 缺省时整段省略 —— 不给空头衔） */
+export interface DenialParts {
+  /** 被拒的是什么（含具体命令 / 路径 / 大小，别只写类别） */
+  what?: string
+  /** 为什么被拒（判定依据：哪条规则、哪个策略、命中了什么） */
+  why?: string
+  /** 怎么改（可执行：改哪个配置键、换哪个工具、走哪条审批通道） */
+  how?: string
+}
+
+/**
+ * 拼拒绝文案：`what｜为什么：why｜怎么改：how`。
+ *
+ * 统一在一个函数里的理由与 `formatIsolationLine` 相同：**口径只能有一份**。
+ * 各工具自己拼的结果必然是有的说原因、有的给办法、有的只有一句"已拒绝"——
+ * 而模型读到"已拒绝"就只能再撞一次墙（P2-2 正是要治这个）。
+ */
+export function formatDenial(p: DenialParts): string {
+  const parts: string[] = []
+  if (p.what) parts.push(p.what)
+  if (p.why) parts.push(`为什么：${p.why}`)
+  if (p.how) parts.push(`${DENIAL_HOW_PREFIX}：${p.how}`)
+  return parts.join('｜')
 }

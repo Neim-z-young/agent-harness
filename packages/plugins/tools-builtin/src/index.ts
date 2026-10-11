@@ -41,6 +41,7 @@ import {
 // 隔离档位与网络出口策略（P1-4 / P1-2）：与宿主、tools-web 共用同一份口径
 import {
   assessNetAccess,
+  formatDenial,
   isOsBound,
   resolveNetPolicy,
   type IsolationLevel,
@@ -179,9 +180,11 @@ export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput; 
           ok: false,
           error: {
           message:
-            `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
-            'read_file / write_file / edit_file 只在工作目录内工作；' +
-            '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+            formatDenial({
+              what: `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）`,
+              why: OUTSIDE_CWD_WHY,
+              how: OUTSIDE_CWD_HOW,
+            }),
           code: 'PATH_OUTSIDE_CWD',
         },
         }
@@ -196,11 +199,12 @@ export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput; 
           return {
             ok: false,
             error: {
-              message:
-                `拒绝读取敏感文件：${rel}（沙箱默认拒读凭据类文件：`
-                + '.env / id_rsa* / *.pem / .ssh/** / .aws/** / permissions.json 等）。'
-                + '确实需要时让用户确认后用 bash 读（bash 有独立的权限键与审批），'
-                + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
+              message: formatDenial({
+                what: `拒绝读取敏感文件：${rel}`,
+                why: '沙箱默认拒读凭据类文件：.env / id_rsa* / *.pem / .ssh/** / .aws/** / permissions.json 等。',
+                how: '确实需要时让用户确认后用 bash 读（bash 有独立的权限键与审批），'
+                  + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
+              }),
               code: 'SANDBOX_READ_DENIED',
             },
           }
@@ -231,11 +235,14 @@ export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput; 
           return {
             ok: false,
             error: {
-              message:
-                `拒绝读取过大的文件：${input.path} 有 ${formatBytes(stats.size)}，`
-                + `超过单次读取上限 ${formatBytes(maxReadBytes)}（config.json → sandbox.readMaxBytes 可调，0 = 不限制）。`
-                + '这个上限是为了不把整文件拉进内存（offset/limit 也救不了：切片发生在载入之后）；'
-                + '请在文件内检索改用 grep_file，或按行段读取改用 bash（如 `sed -n \'1,80p\' 文件`）。',
+              message: formatDenial({
+                what: `拒绝读取过大的文件：${input.path} 有 ${formatBytes(stats.size)}，`
+                  + `超过单次读取上限 ${formatBytes(maxReadBytes)}`,
+                why: 'read_file 是整文件载入后才切片（offset/limit 救不了），'
+                  + '这个上限就是为了不把整文件拉进内存。',
+                how: '调 config.json → sandbox.readMaxBytes（0 = 不限制）；'
+                  + '或文件内检索改用 grep_file、按行段读取改用 bash（如 `sed -n \'1,80p\' 文件`）。',
+              }),
               code: 'SANDBOX_READ_TOO_LARGE',
             },
           }
@@ -370,10 +377,11 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
       return {
         ok: false,
         error: {
-        message:
-          `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
-          'read_file / write_file / edit_file 只在工作目录内工作；' +
-          '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+        message: formatDenial({
+          what: `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）`,
+          why: OUTSIDE_CWD_WHY,
+          how: OUTSIDE_CWD_HOW,
+        }),
         code: 'PATH_OUTSIDE_CWD',
       },
       }
@@ -649,6 +657,49 @@ function getShell(): ResolvedShell {
   return cachedShell
 }
 
+/**
+ * 危险命令被拒时的「怎么改」（P2-2）。
+ *
+ * ★这里必须说清**危险检测不可豁免**：它不是权限卡能放行的东西（注释见「沙箱防护 2 前置」），
+ * 只写"换个写法"而不写"别指望批准"，模型就会反复请求审批、把人拖进无意义的确认循环。
+ */
+const DANGEROUS_HOW =
+  '危险命令检测**不可豁免**（权限卡的「允许」不覆盖它）：请改写为不触发该模式的等价命令；'
+  + '确实必须执行时，请让用户在自己的终端里跑（harness 不代跑破坏性命令），'
+  + '或由管理员在 config.json → sandbox.dangerousDetection 调整自定义条目（默认表不可整表关闭）。'
+
+/** 路径越界的「为什么 / 怎么改」（P2-2；read_file / write_file / edit_file 三处共用同一份） */
+const OUTSIDE_CWD_WHY =
+  'read_file / write_file / edit_file 只在工作目录内工作（边界经 realpath 判定，symlink 逃逸同样拦下）。'
+const OUTSIDE_CWD_HOW = '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。'
+
+/** cwd 越界的「为什么 / 怎么改」（P2-2；bash 与 bash_ro 两处共用同一份） */
+const CWD_OUTSIDE_WHY = '沙箱根（config.json → sandbox.rootDir，缺省为工作目录）之外的路径一律不允许作为执行目录。'
+const CWD_OUTSIDE_HOW =
+  '不传 `cwd`（默认就在沙箱根内执行）、改写为沙箱根内的相对路径，'
+  + '或确实要跨目录时由管理员调 sandbox.rootDir —— 逐条命令临时越界不在模型侧开放。'
+
+/** 命令不在白名单内的「怎么改」（P2-2） */
+const ALLOWLIST_HOW =
+  '把该命令加进 config.json → sandbox.allowlist（按首命令名或完整片段匹配），'
+  + '或开启 sandbox.fallbackToHost 走「人工确认后在宿主执行」（会落 sandbox.escalation 审计）。'
+
+/** 宿主回退被拒的「怎么改」（P2-2） */
+const HOST_DENIED_HOW =
+  '让人在权限卡片上批准本次回退（回退会放开白名单与 env 隔离，属档位下沉），'
+  + '或把命令加进 sandbox.allowlist 让它留在沙箱内执行。'
+
+/**
+ * 只读模式（`bash_ro`）各类拒绝的「怎么改」（P2-2）。
+ *
+ * 一处固定文案覆盖 `checkReadOnlyCommand` 的十余条 reason：那些 reason 各自说的是**具体
+ * 命中了什么**（重定向 / 命令替换 / 提权 / 非白名单命令 …），而"接下来该怎么办"对它们
+ * 全都一样 —— 分开写只会让十余份文案各自漂移。
+ */
+const READ_ONLY_HOW =
+  '要写文件 / 出网 / 执行子命令，请用主 Agent 的 `bash`（有独立权限键与人工审批）；'
+  + '确属只读但被误判，请改写命令避开上述特征（如把 `$(...)` 换成直接给参数）。'
+
 /** 默认危险命令正则表（命中即拒绝执行） */
 const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\(\)\s*\{[^{}]*\|[^{}]*\}/, // fork bomb（函数体启动即时递归 fork）
@@ -912,7 +963,11 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
               return {
                 ok: false,
                 error: {
-                  message: `命令被沙箱判定为危险并拒绝执行（${astHit}）`,
+                  message: formatDenial({
+                    what: '命令被沙箱判定为危险，已拒绝执行',
+                    why: `命中危险模式：${astHit}`,
+                    how: DANGEROUS_HOW,
+                  }),
                   code: 'SANDBOX_DANGEROUS',
                 },
               }
@@ -921,7 +976,14 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         } else {
           return {
             ok: false,
-            error: { message: `命令被沙箱判定为危险并拒绝执行（命中：${hit}）`, code: 'SANDBOX_DANGEROUS' },
+            error: {
+              message: formatDenial({
+                what: '命令被沙箱判定为危险，已拒绝执行',
+                why: `命中危险模式：${hit}`,
+                how: DANGEROUS_HOW,
+              }),
+              code: 'SANDBOX_DANGEROUS',
+            },
           }
         }
       }
@@ -943,7 +1005,13 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
           net,
         )
         if (!verdict.ok) {
-          return { ok: false, error: { message: `网络出口策略拒绝执行：${verdict.reason}`, code: 'SANDBOX_NET_DENIED' } }
+          return {
+            ok: false,
+            error: {
+              message: formatDenial({ what: '网络出口策略拒绝执行', why: verdict.why, how: verdict.how }),
+              code: 'SANDBOX_NET_DENIED',
+            },
+          }
         }
       }
 
@@ -952,7 +1020,10 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       if (requestedCwd && !isWithinCwd(requestedCwd, rootDir)) {
         return {
           ok: false,
-          error: { message: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, code: 'SANDBOX_CWD' },
+          error: {
+            message: formatDenial({ what: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, why: CWD_OUTSIDE_WHY, how: CWD_OUTSIDE_HOW }),
+            code: 'SANDBOX_CWD',
+          },
         }
       }
 
@@ -991,14 +1062,28 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
             if (!confirmed) {
               return {
                 ok: false,
-                error: { message: `命令不在沙箱白名单内，宿主回退被拒绝：${firstCmd}`, code: 'SANDBOX_HOST_DENIED' },
+                error: {
+                  message: formatDenial({
+                    what: `命令不在沙箱白名单内，宿主回退被拒绝：${firstCmd}`,
+                    why: '回退到宿主属档位下沉（放开白名单 + env 隔离），未获批准即拒绝。',
+                    how: HOST_DENIED_HOW,
+                  }),
+                  code: 'SANDBOX_HOST_DENIED',
+                },
               }
             }
             return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits, isolation })
           }
           return {
             ok: false,
-            error: { message: `命令不在沙箱白名单内，已拒绝：${firstCmd}`, code: 'SANDBOX_ALLOWLIST' },
+            error: {
+              message: formatDenial({
+                what: `命令不在沙箱白名单内，已拒绝：${firstCmd}`,
+                why: `当前白名单：${allowlist.join(' / ')}；只匹配首命令名或完整片段。`,
+                how: ALLOWLIST_HOW,
+              }),
+              code: 'SANDBOX_ALLOWLIST',
+            },
           }
         }
       }
@@ -1014,7 +1099,14 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         if (!confirmed) {
           return {
             ok: false,
-            error: { message: `命令在沙箱内执行失败，宿主回退被拒绝`, code: 'SANDBOX_HOST_DENIED' },
+            error: {
+              message: formatDenial({
+                what: '命令在沙箱内执行失败，宿主回退被拒绝',
+                why: '回退到宿主属档位下沉（放开白名单 + env 隔离），未获批准即拒绝。',
+                how: HOST_DENIED_HOW,
+              }),
+              code: 'SANDBOX_HOST_DENIED',
+            },
           }
         }
         return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits, isolation })
@@ -1484,14 +1576,19 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
         return {
           ok: false,
           error: {
-            message: `只读 shell 需要 bash；当前环境为 ${shell.name}。请在 Windows 上安装 Git Bash、WSL 或 MSYS2 后重试。`,
+            message: formatDenial({
+              what: `只读 shell 需要 bash；当前环境为 ${shell.name}`,
+              why: '只读白名单是按 bash 语义写的，其它 shell 下同样的命令名可能是别的东西（误判与漏判同时发生）。',
+              how: '请在 Windows 上安装 Git Bash / WSL / MSYS2 后重试；急用时改用 bash（有独立权限键与审批）。',
+            }),
             code: 'SANDBOX_RO_NO_BASH',
           },
         }
       }
       const verdict = checkReadOnlyCommand(input?.command, allowlist)
       if (!verdict.ok) {
-        return { ok: false, error: { message: verdict.reason, code: verdict.code } }
+        // P2-2：`verdict.reason` 说的是**具体命中了什么**，统一在这一处补「怎么改」
+        return { ok: false, error: { message: formatDenial({ what: verdict.reason, how: READ_ONLY_HOW }), code: verdict.code } }
       }
       // AST 复核门（2026-09-30）：手写解析门之上再过一道语法树复核（见 checkReadOnlyByAst）。
       // facts 为 null / ok=false（wasm 不可用 / 语法错误）时跳过 —— 手写门已放行的行为不变，
@@ -1500,7 +1597,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
       if (facts?.ok) {
         const astVerdict = checkReadOnlyByAst(facts, allowlist)
         if (!astVerdict.ok) {
-          return { ok: false, error: { message: astVerdict.reason, code: astVerdict.code } }
+          return { ok: false, error: { message: formatDenial({ what: astVerdict.reason, how: READ_ONLY_HOW }), code: astVerdict.code } }
         }
         // 读侧敏感文件（P0-3）：只读工具**不是“什么都能读”**。
         // `cat .env` / `head .ssh/id_rsa` 完全在白名单内，所以这道闸必须在只读判定**之外**。
@@ -1516,9 +1613,12 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
             return {
               ok: false,
               error: {
-                message:
-                  `只读模式拒绝：命令引用了敏感文件「${hit}」（沙箱默认拒读凭据类文件）。`
-                  + '确实需要读，让用户确认后用 bash（有独立的权限键与审批）。',
+                message: formatDenial({
+                  what: `只读模式拒绝：命令引用了敏感文件「${hit}」`,
+                  why: '沙箱默认拒读凭据类文件（.env / id_rsa* / *.pem / .ssh/** / .aws/** 等）。',
+                  how: '确实需要读，让用户确认后用 bash（有独立的权限键与审批），'
+                    + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
+                }),
                 code: 'SANDBOX_READ_DENIED',
               },
             }
@@ -1530,7 +1630,10 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
       if (requestedCwd && !isWithinCwd(requestedCwd, rootDir)) {
         return {
           ok: false,
-          error: { message: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, code: 'SANDBOX_CWD' },
+          error: {
+            message: formatDenial({ what: `cwd 超出沙箱根目录，已拒绝：${input.cwd}`, why: CWD_OUTSIDE_WHY, how: CWD_OUTSIDE_HOW }),
+            code: 'SANDBOX_CWD',
+          },
         }
       }
       // 只读工具不接受入参覆盖环境变量：ENV 是绕过只读的常见后门（PYTHONSTARTUP / NODE_OPTIONS
@@ -1793,10 +1896,11 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
       return {
         ok: false,
         error: {
-        message:
-          `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
-          'read_file / write_file / edit_file 只在工作目录内工作；' +
-          '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+        message: formatDenial({
+          what: `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）`,
+          why: OUTSIDE_CWD_WHY,
+          how: OUTSIDE_CWD_HOW,
+        }),
         code: 'PATH_OUTSIDE_CWD',
       },
       }

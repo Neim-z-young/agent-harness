@@ -28,6 +28,8 @@ import {
   resolveSensitiveReadPolicy,
   type SensitiveReadPolicyInput,
 } from '@harness/fs-guard'
+// P2-2：拒绝文案口径（「为什么 + 怎么改」）与 tools-builtin 共用同一份
+import { formatDenial } from '@harness/isolation'
 import { join } from 'node:path'
 import { stat, readFile, readdir } from 'node:fs/promises'
 
@@ -257,7 +259,15 @@ export function createGrepFileTool(opts: { readDeny?: SensitiveReadPolicyInput }
       if (!isWithinCwd(absPath, ctx.cwd)) {
         return {
           ok: false,
-          error: { message: `路径 "${relPath}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
+          // P2-2：与 tools-builtin 的三个文件工具同一份口径（为什么 + 怎么改）
+          error: {
+            message: formatDenial({
+              what: `路径 "${relPath}" 超出工作目录范围`,
+              why: 'grep_file 只在工作目录内工作（边界经 realpath 判定，symlink 逃逸同样拦下）。',
+              how: '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+            }),
+            code: 'PATH_OUTSIDE_CWD',
+          },
         }
       }
 
@@ -269,9 +279,12 @@ export function createGrepFileTool(opts: { readDeny?: SensitiveReadPolicyInput }
             return {
               ok: false,
               error: {
-                message:
-                  `拒绝检索敏感文件：${relPath}（沙箱默认拒读凭据类文件）。`
-                  + '确实需要，让用户确认后用 bash 读（有独立的权限键与审批）。',
+                message: formatDenial({
+                  what: `拒绝检索敏感文件：${relPath}`,
+                  why: '沙箱默认拒读凭据类文件（.env / id_rsa* / *.pem / .ssh/** / .aws/** 等）。',
+                  how: '确实需要，让用户确认后用 bash 读（有独立的权限键与审批），'
+                    + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
+                }),
                 code: 'SANDBOX_READ_DENIED',
               },
             }

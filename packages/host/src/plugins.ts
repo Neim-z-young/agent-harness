@@ -30,6 +30,7 @@ import { MultiDirLoader, normalizeDirs } from '@harness/workspace'
 import { makeNotice } from './notice'
 import type { NoticeSink } from './notice'
 import type { HarnessConfig, SandboxSection } from './config'
+import { isOsBound, resolveNetPolicy } from '@harness/isolation'
 import type { IsolationLevel } from '@harness/isolation'
 
 /** 插件目录加载结果：通用 AgentPlugin（Hooks 插件）列表；Provider 类型工厂已注册进 registry */
@@ -366,6 +367,21 @@ function sandboxToPluginOptions(
   return { bash, readDeny: sb.readDeny, readMaxBytes: sb.readMaxBytes, readOnlyBash }
 }
 
+/**
+ * 把加载上下文折成 env-context 的「隔离」摘要（P2-1）。
+ *
+ * 与 `sandboxToPluginOptions` 同一条纪律：**给事实、不给愿望** —— 档位由 boot 折完递进来
+ * （`ctx.isolationLevel`），网络策略按同一份 `resolveNetPolicy` 归一（与 bash 出网门同口径）。
+ * 缺 `isolationLevel` ⇒ `undefined`（调用方据此整行省略，不猜）。
+ */
+function toIsolationSummary(
+  ctx: BuiltinLoadContext | undefined,
+): { level: string; fsBound: boolean; netPolicy: string } | undefined {
+  const level = ctx?.isolationLevel
+  if (!level) return undefined
+  return { level, fsBound: isOsBound(level), netPolicy: resolveNetPolicy(ctx?.config?.sandbox).mode }
+}
+
 /** 全局默认内置通用插件注册表（登记 tools-builtin 等随应用打包的插件，惰性加载） */
 export function getBuiltinRegistry(): BuiltinPluginRegistry {
   if (!defaultBuiltinRegistry) {
@@ -588,7 +604,12 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
         '运行环境与用户信息注入：静态环境（系统/用户/Shell/工作目录）进 system 前缀，易变信息（当前时间/Git 状态）走尾部动态区',
       source: 'builtin',
       optIn: true,
-      load: async () => (await lazyImport<{ createEnvContextPlugin: () => AgentPlugin }>('@harness/env-context')).createEnvContextPlugin(),
+      // P2-1：把**解析后的实际档位**递进去 —— 与 `BashOutput.isolation` 同一份事实。
+      // 没有加载上下文（如 /plugins 单独实例化）时不传 ⇒ 无「隔离」行（宁缺毋滥，不猜档位）。
+      load: async (ctx) =>
+        (await lazyImport<{
+          createEnvContextPlugin: (o?: { isolation?: { level: string; fsBound?: boolean; netPolicy?: string } }) => AgentPlugin
+        }>('@harness/env-context')).createEnvContextPlugin({ isolation: toIsolationSummary(ctx) }),
     })
     // ui-widget：生成式 UI（M2）。`ui_widget` 工具让模型产出结构化 UI 声明（WidgetPart），
     // 宿主侧渲染（TUI 组件 / headless renderText 降级）。默认启用：工具无副作用、只读声明，

@@ -145,6 +145,7 @@ bun run typecheck           # 全部类型检查
 | `allowPluginCode` | boolean | 是否加载 `.harness/plugins/*.ts` 里的**插件代码**（默认 **false**，防代码注入）。绝大多数场景用上面那行即可，不需要开 |
 | `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
 | `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
+| `sandbox` | object | 隔离与沙箱策略（**当前是策略级，不是 OS 级**），见下节 |
 | `compression` | object | 上下文压缩（ACP）配置，见下节 |
 
 ### compression 对象（上下文压缩 ACP）
@@ -404,6 +405,36 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 - `auth`：`bearerToken` / `authorizationHeader` / `headers` / `oauth`（OAuth2 PKCE，token 加密存 `dataDir/oauth-tokens.json`）。
 - `enabled`：服务器级开关（缺省 true）；`tools`：工具级开关（key=基础工具名，value=false 停用）。
 - 经 `/mcp` 命令可即时启停并写回本字段；工具的启停统一走 `/tools` 命令。
+
+### sandbox 对象（隔离策略）
+
+> ⚠️ **当前隔离是「策略级」（L0/L1），不是 OS 级** —— 文件系统边界由**路径判定 + 命令白名单 +
+> env 过滤**构成，可写区**没有**被 OS 真的绑定成唯一可写区；出网是**静态门**（按命令名与参数
+> 字面量判定），不是内核边界。详细盘点与缺口清单见 `docs/sandbox-isolation-plan.md`。
+>
+> 需要"模型跑什么也伤不到宿主"的保证时（跑不受信代码、多人共用一台机、处理来料不可控的任务），
+> 必须上 **L2**（OS 级绑定：`sandbox-exec` / `bwrap` / Landlock）或 **L3**（容器 / microVM /
+> 远程 executor）—— 这两档**尚未接线**，写了也不会生效。
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `dangerousDetection` | boolean \| string[] | 危险命令检测。命中即拒绝，**权限卡的「允许」不覆盖它**；默认表不可整表关闭 |
+| `rootDir` | string | 沙箱根（缺省为工作目录）；命令的 `cwd` 不得逃出它 |
+| `sanitizeEnv` / `keepEnv` | boolean / string[] | env 隔离：默认过滤敏感变量，`keepEnv` 追加保留项 |
+| `allowlist` | string[] | 命令白名单（匹配首命令名或完整片段）；为空 = 不启用 |
+| `fallbackToHost` | boolean | 白名单外 / 沙箱内失败时回退宿主 bash |
+| `requireHostApproval` | boolean | 回退前要人工确认（默认 true）。回退属**档位下沉**，会落 `sandbox.escalation` 审计 |
+| `limits` | object | 资源上限：`cpuSeconds` / `maxFileSizeKb` / `maxProcesses` / `memoryKb`（`0` = 不限制、`false` = 全关） |
+| `net` | string | 出网策略：`open`（默认）/ `allowlist` / `deny` |
+| `netAllow` | string[] | `allowlist` 模式的目标白名单（父域覆盖子域；元数据/私有地址**即使写进来也硬拒**） |
+| `readDeny` | object \| false | 读侧敏感文件清单（`.env` / `id_rsa*` / `*.pem` / `.ssh/**` …）；`false` = 关闭 |
+| `readMaxBytes` | number | `read_file` 单文件上限（默认 10 MiB，`0` = 不限制）。超限**拒绝**而非截断 |
+| `level` | string | 要求的隔离档位下限：`L0` ~ `L3` |
+| `onUnmet` | string | 达不到 `level` 时：`warn`（默认，发 notice）/ `refuse`（拒绝启动） |
+
+档位口径：**L0** 策略层（危险表 + 白名单 + 权限引擎 + 审计）→ **L1** 进程层（+ 资源上限 +
+超时杀进程树 + env 默认拒绝）→ **L2** OS 级绑定 → **L3** 平台层（容器 / microVM）。
+**当前实现上限是 L1**：`sandbox.level: "L2"` 会按 `onUnmet` 告警或拒绝启动，而不是"看起来隔离了"。
 
 ### permissions.json
 

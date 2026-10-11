@@ -514,6 +514,7 @@
       "dependencies": {
         "@harness/bus": "workspace:*",
         "@harness/fs-guard": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
