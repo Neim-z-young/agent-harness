@@ -1,5 +1,104 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 273）修复 P0-9 + P1-9：权限规则按归属分层 + 规则变更审计（授权域收敛）
+
+### 起因
+
+承接续 272 的收尾（P0-8 已修），完成 §4 第 5 步剩余的 **P0-9（§8 D2）+ P1-9（§8 D5）**。
+用户在我给的 A/B/C/D 里选 **A** —— 接着做这两条。
+
+两条是同一件事的两面：**D2** 是"授权不跟调用方走"（规则集 dataDir 级共享，A2A 与本机 TUI
+解析到同一份 ⇒ 本地点一次「始终允许」，远程 A2A 调用方一并继承）；**D5** 是"规则的每次
+手工改动都没有留痕"。前者修**授权对象**，后者修**授权可追溯**。
+
+### 决策与落地
+
+**① `@harness/permission`：归属作用域键（键空间，不改规则语义）**
+
+- 规则键加保留前缀：`session:<sid>|<tool>` / `caller:<hash>|<tool>`。工具权限键是标识符、
+  不含 `|` ⇒ 无需换数据结构，`PermissionRuleset` 仍是扁平 `Record`。
+- `callerScopeKey(principal)` = `caller:` + **sha256 前 16 位**。⚠️ 必须哈希：A2A 的调用方标识
+  **就是 Bearer token 本身**（`auth.ts` 的 `callerKey()`），而规则键会**落盘** ⇒ 不哈希等于
+  把凭据写进 `permissions.json`。
+- `PermissionDecision` 加 **`matchedScope?: 'session' | 'caller'`**，而不是往 `matchedRule`
+  里塞新值：`matchedRule` 是"规则形态"（exact/glob/tool/global），归属是"给谁"，正交。
+- `PermissionRuleset['*']` 的类型由 `PermissionBehavior` 放宽到 `ToolPermissionRule`
+  —— P0-8 起全局 `*` 确实支持 PathRules 的 deny 否决权（**这是存量类型错误的修正，见下**）。
+
+**② `@harness/core`：`check()` 分层回退 + 归属钩子**
+
+- 新增 `protected resolvePrincipalKey(req): string | undefined`，基类缺省返回 `undefined`。
+  **不加字段到 `PermissionRequest`**：归属是宿主才知道的（只有宿主有鉴权上下文），而
+  `PermissionRequest` 由 `ToolPipeline` 在 `@harness/tool` 深处构造 —— 加字段就要把宿主概念
+  隧穿 core/tool/session 三层，等于让 core 认识 A2A 的鉴权模型。
+- 查找层（作用域由具体到笼统，同域内工具键先于通配）：
+  `session:<sid>|<tool>` → `session:<sid>|*` → `caller:<h>|<tool>` → `caller:<h>|*` → `<tool>` → `*`。
+  **无归属时数组只剩后两层 ⇒ 与分层前逐位相同。**
+- P0-8 的 deny 否决权**推广到"任一层通配"**（`*` / `caller:<h>|*` / `session:<sid>|*`）。
+
+**③ `@harness/host`：归属解析接缝 + 规则变更审计 + 落盘分流**
+
+- `HostOptions.permissionPrincipal`（`sessionId` → principal）+ 引擎 `setCallerResolver()`
+  （与 `setAsker` 同范式：A2A 是"先 boot host、后建 server"，归属只有 server 侧知道）。
+  **host 缺省 = `'local'`**（单机单主体）；`InteractivePermissionEngine` 缺省 = 无解析器
+  （直接构造的引擎/测试桩行为不变）。
+- `rememberRule` 写回**带归属键**（`caller:<hash>|<tool>`），无归属退回裸键；返回
+  `{ key, behavior, stateHash }` 供上层落审计。
+- 新增 `PermissionRuleChangedEvent` + `AuditEvent` 联合；`ask()` 里顺序是
+  **decision.human → permission.rule.changed**（先记"人按了什么"，再记"它把规则改成了什么"）。
+- `HarnessHost.setPermissionRules(rules, meta)` 加审计 —— 这是 CLI 斜杠命令与 A2A 控制面
+  **两条手工路径的唯一入口**，一处覆盖两条，且不随调用点增删而漏。
+- `createAuditSink`：无 `sessionId` 从"丢弃"改为落 **`{dataDir}/audit.jsonl`**（工作区级）——
+  控制面规则变更是进程级事件、没有会话上下文，"丢弃"等于 P1-9 白做。
+
+**④ 宿主接线**
+
+- CLI：`HarnessApp` 构造期捕获 `permissionPrincipal`（覆写的工厂完全替代基类，不显式传就会
+  退回裸键）；`/permission` 的 `reset` / `<key>=<v>` 带 `{ source: 'cli', sessionId: current.id }`。
+- A2A：`createA2aServer` 在 `CallerRegistry` 建好后装解析器
+  `(sid) => sid ? (callers.ownerOf(sid) ?? LOCAL_CALLER) : undefined` —— **复用**已有的
+  `contextId → 调用方` 绑定表，不新造一份归属；控制面三处 `setPermissionRules` 带 `source: 'control-api'`。
+
+### 只有实现时才暴露的发现
+
+- **⚠️ 规则键会落盘 ⇒ 调用方主体必须先哈希**。A2A 的调用方标识就是 Bearer token，
+  按 §8.6 初稿"写回带 `caller:<key>`"字面实现 = **把凭据持久化到 `permissions.json`**。
+  这层当时没被想到；现在 `callerScopeKey()` 做哈希，且测试专门断言落盘不含主体明文。
+- **归属不该走 `PermissionRequest` 加字段**，而是 core 的**覆写钩子**。加字段的代价是把
+  "宿主是谁"隧穿 core/tool/session 三层；钩子把这份知识留在宿主（与 `setAsker` 同一思路）。
+- **`export type { PathRules } from …` 不引入本模块作用域**（第三次踩）：core 里要**运行期**
+  用 `callerScopeKey` 等，必须另写 `import { … }`；且 core **不直接依赖** `@harness/permission`
+  的消费方（如 host）要从 core 取值 ⇒ 顺带把几个键构造器从 core 转出（免新增依赖）。
+- **存量类型错误**：`permission-deny-patterns.test.ts` 里 `'*': { deny: [...] }` 三处在 HEAD
+  上就报 `TS2322`（P0-8 引入，根因是 `PermissionRuleset['*']` 只声明了 `PermissionBehavior`）。
+  上一轮的"typecheck 0 error"是**误判** —— 命令是 `… | tail -15; echo TC_EXIT=$?`，`$?` 取的是
+  `tail` 的退出码（恒 0），且错误行落在 `tail` 窗口之外。**教训：管道后的 `$?` 不是被测命令的
+  退出码；报"全绿"必须取真实退出码或 grep 计数。** 本轮把 `'*'` 放宽到 `ToolPermissionRule` 后消失。
+- `createAuditSink` 的"无 sessionId 即丢弃"是 M3 的刻意取舍，但 P1-9 引入了**天然无会话**的事件
+  （控制面规则变更）⇒ 该取舍要跟着改；否则"新功能看起来接上了、实际一条都没落"。
+- CLI `/permission <key>=<v>` 分支里原有 `const current = app.permission.getRules()`，与本轮的
+  会话变量 `current` **同名遮蔽** —— 传 `sessionId: current.id` 会拿到规则对象。已把局部量改名 `rules`。
+
+### 验证
+
+- **全仓 typecheck**：真实退出码 `0`；**46 包全部 `Exited with code 0`**；`grep -c "error TS"` = **0**。
+- **全仓 test**：**2739 pass / 0 fail / 0 skip**（46 包全 exit 0）。较上轮基线 2724 **+15**
+  （core +3 归属分层、host +9（P0-9 六条 + P1-9 三条）、a2a-server +2 端到端、cli 净 0；另有若干既有断言随口径同步）。
+- **反向验证（四处变异，`cp` 备份 + `shasum` 还原，不用字符串 replace）**：
+
+  | 变异 | 位置 | 结果 | 还原 |
+  |---|---|---|---|
+  | 写回键去归属（`ruleKey = toolKey`） | `host/src/permission.ts` | host `permission.test.ts` **3 fail** | 哈希 `323e463b…` 一致 → 39 pass |
+  | `check()` 去掉 session/caller 两层 | `core/src/index.ts` | core **2 fail** + host **4 fail** | 哈希 `b945c00e…` 一致 → 13 pass |
+  | 去掉控制面规则变更审计 | `host/src/host.ts` | a2a `server.test.ts` **1 fail** | 哈希 `fcbe9296…` 一致 |
+  | 去掉 A2A 的 caller resolver | `a2a-server/src/server.ts` | a2a `server.test.ts` **1 fail**（归属键端到端） | 哈希 `8f958c9f…` 一致 |
+
+  还原后重跑受影响包全绿；四处哈希与变异前逐字节一致。
+- 新增/同步用例：core `permission-deny-patterns.test.ts` +3（归属分层：无归属忽略作用域键 /
+  会话键命中 / 作用域通配 deny 否决）；host `permission.test.ts` +9（P0-9 六条 + P1-9 三条）；
+  host `audit.test.ts` 改 1 + 增 2（工作区级分流、两类事件并存）；a2a `server.test.ts` +2
+  （`always-allow` 写回归属键端到端、控制面规则变更审计）。
+
 ## 2026-10-11（续 272）修复 P0-8：always-allow 写回改增量 PathRules，段级 deny 不再静默失效
 
 ### 起因
