@@ -41,11 +41,13 @@ import {
 // 隔离档位与网络出口策略（P1-4 / P1-2）：与宿主、tools-web 共用同一份口径
 import {
   assessNetAccess,
+  detectOsBindingFailure,
   formatDenial,
   isOsBound,
   resolveNetPolicy,
   type IsolationLevel,
   type NetPolicy,
+  type OsBinding,
 } from '@harness/isolation'
 import { resolve, relative } from 'node:path'
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
@@ -471,6 +473,14 @@ export interface BashSandboxConfig {
    * 注：宿主没注入时**不谎报** L2 —— L2 要 OS 级绑定（P1-3），不是这个工具能自己给的。
    */
   isolationLevel?: IsolationLevel
+  /**
+   * **OS 级绑定**（P1-3 / L2）：宿主在装配期构造并自检通过后递进来。
+   *
+   * 递进来 ⇒ 本次 spawn 会把命令包进原语（`sandbox-exec` / `bwrap`），可写区**真的**
+   * 被 OS 限制在声明目录内；不递（缺省）⇒ 只有 L0/L1 的策略层与进程层 —— **不模拟**
+   * （没有原语就是没有，`fsBound` 会如实报 false）。
+   */
+  osBinding?: OsBinding | null
 }
 
 /**
@@ -853,6 +863,8 @@ export interface BashOutput {
     fsBound: boolean
     netPolicy: NetPolicy
     viaHost: boolean
+    /** P1-3：**递了绑定但内核拒了 apply**（嵌套沙箱）。`fsBound` 此时为 false */
+    fsBoundFailed?: true
   }
   /** 实际执行命令的 shell 名称（跨平台回退时用于告知模型） */
   shell?: string
@@ -907,7 +919,14 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
   // P1-2：网络出口策略（缺省 open = 与改造前逐位一致）
   const net = resolveNetPolicy({ net: config.net, netAllow: config.netAllow })
   // P1-4：本次执行所处的档位（宿主注入；缺省 L1 = 本工具自身能兑现的下限）
-  const isolation = { level: config.isolationLevel ?? ('L1' as IsolationLevel), netPolicy: net.mode }
+  // P1-3：OS 绑定（宿主构造并自检通过后递入）。`fsBound` 说**这次真的绑上了没有**，
+  // 而不是"档位叫 L2 所以算绑上了" —— 后者正是"看起来隔离了"。
+  const osBinding = config.osBinding ?? null
+  const isolation = {
+    level: config.isolationLevel ?? ('L1' as IsolationLevel),
+    netPolicy: net.mode,
+    fsBound: osBinding != null,
+  }
 
   const shell = getShell()
 
@@ -1091,6 +1110,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       // ---- 沙箱内执行 ----
       const sandboxResult = await runBash({
         command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal, limits, isolation,
+        osBinding,
       })
 
       // ---- 回退兜底：非破坏性命令在沙箱内未按预期执行（spawn 失败 / env 隔离开致命令非零退出）时提升到宿主 bash ----
@@ -1516,6 +1536,8 @@ export interface ReadOnlyBashConfig {
    * `bash_ro` 只做只读判定，网络不适用（白名单里本就没有出网命令），故不下发 netPolicy。
    */
   isolationLevel?: IsolationLevel
+  /** OS 级绑定（P1-3）。只读工具**同样套**：只读判定是策略层，它挡不住 symlink 逃逸写 */
+  osBinding?: OsBinding | null
 }
 
 /**
@@ -1540,7 +1562,12 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
   const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
   const timeoutDefault = config.timeoutMs ?? 15_000
   const limits = resolveBashLimits(config.limits)
-  const isolation = { level: config.isolationLevel ?? ('L1' as IsolationLevel), netPolicy: 'open' as NetPolicy }
+  const osBinding = config.osBinding ?? null
+  const isolation = {
+    level: config.isolationLevel ?? ('L1' as IsolationLevel),
+    netPolicy: 'open' as NetPolicy,
+    fsBound: osBinding != null,
+  }
   const readDeny = resolveSensitiveReadPolicy(config.readDeny)
   const shell = getShell()
 
@@ -1647,6 +1674,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
         signal: ctx.signal,
         limits,
         isolation,
+        osBinding,
       })
       return result
     },
@@ -1672,14 +1700,24 @@ function runBash(opts: {  command: string
    */
   limits?: Required<BashLimits>
   /** 本次执行的边界自述（P1-4 / P2-3）；缺省不上报该字段 */
-  isolation?: { level: IsolationLevel; netPolicy: NetPolicy }
+  isolation?: { level: IsolationLevel; netPolicy: NetPolicy; fsBound?: boolean }
+  /**
+   * OS 绑定（P1-3 / L2）。⚠️ `viaHost` 时**不套**（宿主回退＝宿主全权，与放开白名单 /
+   * env 隔离 / 资源上限同口径 —— 这条路径的权限放大已由 `sandbox.escalation` 审计记下）。
+   */
+  osBinding?: OsBinding | null
 }): Promise<ToolResult<BashOutput>> {
   const sh = opts.shell ?? getShell()
   const startedAt = Date.now()
   // P1-1：ulimit 抬头只加在**真正要发出去的**命令上；`output.command` 仍是原文（遥测/展示不被污染）。
   const command = opts.viaHost ? opts.command : `${buildLimitPreamble(opts.limits, sh.family)}${opts.command}`
+  // P1-3：绑定是 **argv 前缀**（`sandbox-exec -p <profile>` / `bwrap --ro-bind …`），被包装的
+  // shell program 落到 prefix 之后 —— 不做字符串拼接（命令文本已经过一次拼接，再叠必错）。
+  const prefix = opts.viaHost ? [] : (opts.osBinding?.prefix ?? [])
+  const [program, ...preArgs] = prefix.length > 0 ? prefix : [sh.program]
+  const argv = prefix.length > 0 ? [...preArgs, sh.program, ...sh.args, command] : [...sh.args, command]
   return new Promise((resolvePromise) => {
-    const child = spawn(sh.program, [...sh.args, command], {
+    const child = spawn(program, argv, {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -1744,7 +1782,14 @@ function runBash(opts: {  command: string
           ...(opts.isolation ? {
             isolation: {
               level: opts.isolation.level,
-              fsBound: isOsBound(opts.isolation.level),
+              // P1-3：**这次真的绑上了没有**（不是"档位叫 L2 就算"）—— 宿主回退 / 无原语
+              // / 自检失败 / **内核把 apply 拒了**（嵌套沙箱）四种形态下都是 false，
+              // 模型读到的是事实而不是愿望。
+              fsBound: (opts.isolation.fsBound ?? isOsBound(opts.isolation.level))
+                && !detectOsBindingFailure(stderr),
+              // 绑了但被内核拒 ⇒ 显式标注（否则 stderr 里那句 sandbox_apply 会被当成命令自身的报错）
+              ...((opts.isolation.fsBound && detectOsBindingFailure(stderr))
+                ? { fsBoundFailed: true as const } : {}),
               netPolicy: opts.isolation.netPolicy,
               viaHost: opts.viaHost === true,
             },

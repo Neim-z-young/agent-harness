@@ -8,7 +8,7 @@
  * - 网络目标判定（`isPrivateHost` / `isBlockedNetTarget`）被 `tools-builtin`（bash 出网门）
  *   与 `tools-web`（SSRF 防护）共用 —— 两者原来各写一份 `isPrivateIp`，正是"修一处漏一处"。
  *
- * 与 `@harness/fs-guard` 同样的定位：**零依赖叶子包**（只 `node:path`），谁都能引，
+ * 与 `@harness/fs-guard` 同样的定位：**零依赖叶子包**（只 `node:path` / `node:fs` / `node:os`），谁都能引，
  * 不需要任何一方认识 harness 的其它部分。
  *
  * ## 档位口径（与 `docs/sandbox-isolation-plan.md` §2 的表一致）
@@ -16,17 +16,25 @@
  * |---|---|
  * | L0 | 策略层：危险表 + AST 门 + 白名单 + 权限引擎 + 段级 deny + 审计 |
  * | L1 | 进程层：资源上限 + 超时杀进程树 + env 默认拒绝 |
- * | L2 | 文件系统/网络**绑定**：OS 原语把可写区真的限制在声明目录内 + 网络策略 |
+ * | L2 | 文件系统/网络**绑定**：OS 原语把可写区真的限制在声明目录内 + 网络策略（**P1-3 已接线，默认不开**） |
  * | L3 | 平台层：容器 / microVM / 远程 executor |
  *
- * ⚠️ **L2/L3 尚未接线**（P1-3 是"新模块"）。所以 {@link probeIsolation} 即便探测到
- * `sandbox-exec` / `bwrap` 存在，`maxLevel` 也**只报 L1**，并在 `reasons` 里写明
- * "原语可用但未接线"。这是本方案最容易悄悄退化成"看起来隔离了"的地方，纪律是
- * **不模拟**（拿不到就显式降级，见 §2 纪律 2）。
+ * ## L2 的状态（P1-3 已落地，2026-10-12）
+ * OS 绑定**已接线**（{@link buildOsBinding} / {@link verifyOsBinding}），但**默认不开**：
+ * `config.json → sandbox.osBinding: "on"` 才启用。理由写在 {@link buildOsBinding} 上 ——
+ * 它会改变命令的执行形态（profile 配错＝命令全线失败），必须由人显式开。
+ *
+ * 三态的判据（纪律 2「不模拟」的落点）：
+ * - 有原语 + 已启用 + 自检通过 ⇒ L2；
+ * - 有原语但没启用 ⇒ **L1**（`reasons` 写明没启用）；
+ * - 没原语 ⇒ L1，且 {@link buildOsBinding} 返回 `null`（绝不"假装绑上了"）。
  */
 
-import { existsSync } from 'node:fs'
+import { existsSync, realpathSync } from 'node:fs'
 import { basename } from 'node:path'
+import { tmpdir } from 'node:os'
+// 只被 `verifyOsBinding` 的默认路径用到（自检要真跑一次原语）；单测走可注入的 `run`，不碰进程
+import { spawnSync } from 'node:child_process'
 
 // ============================================================================
 // 一、档位（P1-4 / P3-2）
@@ -124,14 +132,17 @@ export function probeIsolation(deps: IsolationProbeDeps = {}): IsolationProbe {
   }
 
   const reasons: string[] = []
+  const howToEnable = '（要启用：config.json → sandbox.osBinding="on"）'
   if (platform === 'darwin') {
     reasons.push(primitives.sandboxExec
-      ? '本机有 sandbox-exec，但尚未接线（P1-3）：可写区未被 OS 真正限制'
+      ? `本机有 sandbox-exec，但 OS 绑定未启用${howToEnable}：可写区未被 OS 真正限制`
       : '本机没有 sandbox-exec，无法做 OS 级只读绑定')
   } else if (platform === 'linux') {
-    reasons.push(primitives.bwrap ? '本机有 bwrap，但尚未接线（P1-3）' : '本机没有 bwrap，无法做 OS 级只读绑定')
+    reasons.push(primitives.bwrap
+      ? `本机有 bwrap，但 OS 绑定未启用${howToEnable}`
+      : '本机没有 bwrap，无法做 OS 级只读绑定')
   } else {
-    reasons.push(`平台 ${platform} 暂无已接线的 OS 隔离原语`)
+    reasons.push(`平台 ${platform} 暂无可用的 OS 隔离原语`)
   }
   return { platform, primitives, maxLevel: 'L1', reasons }
 }
@@ -505,4 +516,203 @@ export function formatDenial(p: DenialParts): string {
   if (p.why) parts.push(`为什么：${p.why}`)
   if (p.how) parts.push(`${DENIAL_HOW_PREFIX}：${p.how}`)
   return parts.join('｜')
+}
+
+// ===== OS 级绑定（P1-3 / L2）=====
+
+/**
+ * 平台原语的可执行文件路径（可注入，便于纯函数单测）。
+ *
+ * 与 {@link probeIsolation} 的 `exists` 同范式：**路径不写死在判定分支里**，
+ * 否则单测要么碰真机、要么只能测"代码长什么样"。
+ */
+export interface OsBindingBin {
+  /** macOS Seatbelt（`/usr/bin/sandbox-exec`） */
+  sandboxExec?: string
+  /** Linux bubblewrap（`/usr/bin/bwrap`） */
+  bwrap?: string
+}
+
+/** 原语默认路径 */
+export const DEFAULT_OS_BINDING_BIN: Required<OsBindingBin> = {
+  sandboxExec: '/usr/bin/sandbox-exec',
+  bwrap: '/usr/bin/bwrap',
+}
+
+/**
+ * 构造出的 OS 绑定（拿不到原语 ⇒ {@link buildOsBinding} 返回 `null`）。
+ *
+ * `prefix` 是 spawn 时拼在**被包装命令之前**的 argv —— 刻意做成 argv 前缀而不是
+ * 「把命令塞进 `-c` 字符串里」：字符串拼接要处理引号/转义，而这条链路上已经有
+ * `${buildLimitPreamble()} + 用户命令` 一次拼接了（P1-1），再叠一层必然出错。
+ */
+export interface OsBinding {
+  /** 恒为 `'L2'`（能构造出来就说明真的拿到了 OS 原语） */
+  level: 'L2'
+  platform: string
+  /** spawn 的 argv 前缀（不含被包装的 shell program） */
+  prefix: string[]
+  /** 人读：走的是哪个原语（进 notice / 日志） */
+  via: string
+  /** 真正可写的区（realpath 后；由调用方保证） */
+  writable: string[]
+}
+
+export interface OsBindingRequest {
+  platform?: string
+  /**
+   * **可写区**（必须是绝对路径；调用方负责 realpath）。
+   *
+   * 空的 ⇒ 返回 `null`：连"能写哪"都不知道就谈不上绑定，这时**不猜**（§2 纪律 2）。
+   */
+  writable: string[]
+  /** 临时目录（多数命令要写它；缺省取 `os.tmpdir()` 的 realpath） */
+  tmpDir?: string
+  /** 已探测到的原语（缺省内部按平台探一次） */
+  primitives?: IsolationPrimitives
+  /** 原语路径覆盖 */
+  bin?: OsBindingBin
+}
+
+/**
+ * SBPL 里必须放行写的 `/dev/*` 字面量。
+ *
+ * 实测（macOS）：profile 不含 `/dev/null` 时，连 `cmd 2>/dev/null` 都会以
+ * `Operation not permitted` 失败 —— 一个"看起来只收紧了写"的规则，能让**常用命令全线报错**。
+ * 所以这一组例外不是可选优化，是**能用**的前提。
+ */
+export const DEV_WRITE_LITERALS = ['/dev/null', '/dev/dull', '/dev/zero', '/dev/tty']
+
+/** SBPL 字符串字面量转义（只有 `"` 与 `\` 需要；路径里出现它们会截断 profile） */
+function escapeSbpl(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+/**
+ * 渲染 macOS Seatbelt profile（**只收紧写**，读与执行保持放行）。
+ *
+ * ⚠️ **顺序即语义**（实测得来，改顺序会直接改变结果）：SBPL 自上而下匹配，命中即停。
+ * 所以形态固定为「可写区例外 → `/dev` 例外 → `deny file-write*` → `allow default`」：
+ * 把 `deny` 放最后就成了"没匹配到的都拒绝"（连 dylib 加载都拒），放最前则是全拒。
+ *
+ * 实测已验证的四条（2026-10-12，macOS `/usr/bin/sandbox-exec`）：
+ * ① 可写区内写成功；② 区外写 `Operation not permitted`；③ **symlink 逃逸写被挡**
+ * （P0-4 的 TOCTOU 只有这一层挡得住）；④ 读任意 / fork / 解释器加载不受影响。
+ */
+export function renderSandboxProfile(writable: string[], tmpDir?: string): string {
+  const lines = ['(version 1)']
+  for (const w of [...new Set(writable)]) lines.push(`(allow file-write* (subpath "${escapeSbpl(w)}"))`)
+  if (tmpDir) lines.push(`(allow file-write* (subpath "${escapeSbpl(tmpDir)}"))`)
+  for (const d of DEV_WRITE_LITERALS) lines.push(`(allow file-write* (literal "${d}"))`)
+  lines.push('(allow file-write* (subpath "/dev/fd"))')
+  lines.push('(deny file-write*)')
+  lines.push('(allow default)')
+  return lines.join('\n')
+}
+
+/** 构造 OS 绑定；拿不到原语 ⇒ `null`（**不模拟**，由调用方降级告警） */
+export function buildOsBinding(req: OsBindingRequest): OsBinding | null {
+  const platform = req.platform ?? process.platform
+  const writable = [...new Set(req.writable.filter((w) => typeof w === 'string' && w.length > 0))]
+  if (writable.length === 0) return null
+  const primitives = req.primitives ?? probeIsolation({ platform }).primitives
+  const bin = { ...DEFAULT_OS_BINDING_BIN, ...req.bin }
+
+  if (platform === 'darwin' && primitives.sandboxExec) {
+    const tmp = req.tmpDir ?? resolveRealTmp()
+    return {
+      level: 'L2',
+      platform,
+      prefix: [bin.sandboxExec, '-p', renderSandboxProfile(writable, tmp)],
+      via: 'sandbox-exec（Seatbelt）',
+      writable,
+    }
+  }
+  if (platform === 'linux' && primitives.bwrap) {
+    const tmp = req.tmpDir ?? resolveRealTmp()
+    const dirs = [...new Set([...writable, ...(tmp ? [tmp] : [])])]
+    return {
+      level: 'L2',
+      platform,
+      prefix: [
+        bin.bwrap,
+        '--ro-bind', '/', '/',
+        ...dirs.flatMap((d) => ['--bind', d, d]),
+        '--dev', '/dev',
+        '--proc', '/proc',
+        // 父进程没了就把整棵树带走（与 P0-6 的进程组 kill 同诉求，这里是原语侧的兜底）
+        '--die-with-parent',
+      ],
+      via: 'bwrap（bubblewrap）',
+      writable,
+    }
+  }
+  // Windows 与"没有原语"的平台：**不套**、不模拟 —— 假装绑上了比不绑更危险
+  return null
+}
+
+/** `os.tmpdir()` 的 realpath（macOS 上 `/var/folders` 的真身是 `/private/var/folders`） */
+function resolveRealTmp(): string | undefined {
+  try {
+    return realpathSync(tmpdir())
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * 自检哨兵：profile 有语法错误时 `sandbox-exec` **exit 0 且不执行任何命令**
+ * （实测：stdout 为空，错误打到 stderr，退出码仍是 0）—— 这正是自检存在的理由，
+ * 否则"套失败了"看起来和"套成功了但命令没输出"一模一样。
+ */
+export const OS_BINDING_SELFTEST_SENTINEL = '__HARNESS_OS_BINDING_OK__'
+
+/**
+ * 验证这条绑定**真的能跑起来**（而不是 profile 写成了一坨空转）。
+ *
+ * `run` 可注入 ⇒ 三平台与"自检失败"形态都能单测，不必真跑 `sandbox-exec`。
+ */
+export function verifyOsBinding(
+  binding: OsBinding,
+  opts: { run?: (argv: string[]) => string } = {},
+): boolean {
+  const isWin = binding.platform === 'win32'
+  const shell = isWin ? 'cmd.exe' : '/bin/sh'
+  const shArgs = isWin ? ['/c'] : ['-c']
+  const argv = [...binding.prefix, shell, ...shArgs, `echo ${OS_BINDING_SELFTEST_SENTINEL}`]
+  const out = opts.run ? opts.run(argv) : defaultRun(argv)
+  return out.includes(OS_BINDING_SELFTEST_SENTINEL)
+}
+
+function defaultRun(argv: string[]): string {
+  try {
+    const r = spawnSync(argv[0]!, argv.slice(1), { encoding: 'utf-8', timeout: 5_000 })
+    return `${r.stdout ?? ''}${r.stderr ?? ''}`
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 执行期识别"绑定**没生效**"（P1-3 的最后一公里）。
+ *
+ * 自检（{@link verifyOsBinding}）管的是**装配期**"本机能不能用原语"；
+ * 这条管的是**已经套上了、但内核把它拒了**——最典型的形态是自己跑在别人的沙箱里
+ * （嵌套 sandbox），`sandbox-exec` 再 apply 一层会失败：
+ *
+ * ```text
+ * sandbox-exec: sandbox_apply: Operation not permitted   （exit 71）
+ * ```
+ *
+ * 实测（2026-10-12）：`bun test` / `bun run` 派生的进程落在宿主沙箱内时就是这种形态 ——
+ * 而**同一条命令直接在 shell 里跑却是好的**。不识别它，`BashOutput.isolation.fsBound`
+ * 就会在"其实没绑上"的情况下报 true，正是本方案反复要治的那类"看起来隔离了"。
+ */
+export function detectOsBindingFailure(stderr: string, platform?: string): boolean {
+  const p = platform ?? process.platform
+  if (p === 'darwin') return /sandbox_apply:\s*Operation not permitted/.test(stderr)
+  if (p === 'linux') {
+    return /bwrap:.*(?:Creating new namespace failed|Failed to create new namespace|Operation not permitted)/.test(stderr)
+  }
+  return false
 }

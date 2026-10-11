@@ -3,10 +3,16 @@ import {
   ISOLATION_LEVELS,
   METADATA_HOSTS,
   NETWORK_COMMANDS,
+  OS_BINDING_SELFTEST_SENTINEL,
+  DEV_WRITE_LITERALS,
   assessNetAccess,
+  buildOsBinding,
+  detectOsBindingFailure,
   extractNetHost,
   DENIAL_HOW_PREFIX,
   formatDenial,
+  renderSandboxProfile,
+  verifyOsBinding,
   formatIsolationLine,
   hostMatchesAllow,
   isBlockedNetTarget,
@@ -27,7 +33,7 @@ describe('probeIsolation（P3-2：注入 platform/exists，不需真机）', () 
     expect(p.primitives.bwrap).toBe(false)
     // ★不模拟：探到原语 ≠ 达到 L2
     expect(p.maxLevel).toBe('L1')
-    expect(p.reasons.join()).toContain('未接线')
+    expect(p.reasons.join()).toContain('未启用')
   })
 
   it('darwin：没有 sandbox-exec ⇒ 理由说清"没有原语"', () => {
@@ -296,5 +302,145 @@ describe('assessNetAccess 的 why / how 拆分（P2-2）', () => {
     )
     expect(v.ok).toBe(false)
     expect(v.how).toContain('不受 netAllow 影响')
+  })
+})
+
+// ===== P1-3：OS 级绑定（L2）=====
+
+describe('renderSandboxProfile（P1-3）', () => {
+  it('顺序即语义：可写区 → /dev 例外 → deny file-write* → allow default', () => {
+    const p = renderSandboxProfile(['/work'], '/tmp')
+    const lines = p.split('\n')
+    expect(lines[0]).toBe('(version 1)')
+    expect(lines[1]).toBe('(allow file-write* (subpath "/work"))')
+    expect(lines[2]).toBe('(allow file-write* (subpath "/tmp"))')
+    // deny 必须在**所有 allow 之后、allow default 之前**
+    expect(lines.filter((l) => l === '(deny file-write*)')).toHaveLength(1)
+    expect(lines[lines.length - 1]).toBe('(allow default)')
+    expect(lines.indexOf('(deny file-write*)')).toBe(lines.length - 2)
+  })
+
+  it('/dev/null 例外必须有：缺了它连 `cmd 2>/dev/null` 都会 Operation not permitted（实测）', () => {
+    const p = renderSandboxProfile(['/work'])
+    expect(p).toContain('(allow file-write* (literal "/dev/null"))')
+    for (const d of DEV_WRITE_LITERALS) expect(p).toContain(`(literal "${d}")`)
+  })
+
+  it('路径里的引号/反斜杠会转义（否则 profile 被截断 ⇒ 静默失效）', () => {
+    const p = renderSandboxProfile(['/a"b\\c'])
+    expect(p).toContain('/a\\"b\\\\c')
+  })
+
+  it('可写区去重（同一目录重复不会让 profile 长一倍）', () => {
+    expect(renderSandboxProfile(['/w', '/w']).match(/\(subpath "\/w"\)/g)).toHaveLength(1)
+  })
+})
+
+describe('buildOsBinding（P1-3）', () => {
+  const prim = { sandboxExec: true, bwrap: true, landlock: false }
+
+  it('darwin + sandboxExec ⇒ 拿到 sandbox-exec 前缀，档位 L2', () => {
+    const b = buildOsBinding({ platform: 'darwin', writable: ['/work'], primitives: prim, tmpDir: '/tmp' })
+    expect(b?.level).toBe('L2')
+    expect(b?.prefix[0]).toBe('/usr/bin/sandbox-exec')
+    expect(b?.prefix[1]).toBe('-p')
+    expect(b?.prefix[2]).toContain('(allow file-write* (subpath "/work"))')
+    expect(b?.via).toContain('sandbox-exec')
+  })
+
+  it('linux + bwrap ⇒ ro-bind / 后逐个 bind 可写区与 tmp', () => {
+    const b = buildOsBinding({ platform: 'linux', writable: ['/work'], primitives: prim, tmpDir: '/tmp' })
+    expect(b?.prefix[0]).toBe('/usr/bin/bwrap')
+    expect(b?.prefix.slice(1, 4)).toEqual(['--ro-bind', '/', '/'])
+    expect(b?.prefix).toContain('--bind')
+    expect(b?.prefix).toContain('/work')
+    expect(b?.prefix).toContain('/tmp')
+    expect(b?.prefix).toContain('--die-with-parent')
+  })
+
+  it('win32 ⇒ null（没有原语就不模拟 —— 假装绑上了比不绑更危险）', () => {
+    expect(buildOsBinding({ platform: 'win32', writable: ['C:\\w'], primitives: prim })).toBeNull()
+  })
+
+  it('有平台但探不到原语 ⇒ null', () => {
+    const none = { sandboxExec: false, bwrap: false, landlock: false }
+    expect(buildOsBinding({ platform: 'darwin', writable: ['/w'], primitives: none })).toBeNull()
+    expect(buildOsBinding({ platform: 'linux', writable: ['/w'], primitives: none })).toBeNull()
+  })
+
+  it('可写区为空 ⇒ null（不知道能写哪就无从绑定）', () => {
+    expect(buildOsBinding({ platform: 'darwin', writable: [], primitives: prim })).toBeNull()
+  })
+
+  it('原语路径可注入（单测不必碰真机路径）', () => {
+    const b = buildOsBinding({ platform: 'darwin', writable: ['/w'], primitives: prim, bin: { sandboxExec: '/opt/sbx' } })
+    expect(b?.prefix[0]).toBe('/opt/sbx')
+  })
+})
+
+describe('verifyOsBinding（P1-3 自检）', () => {
+  it('跑通 ⇒ true（哨兵出现在输出里）', () => {
+    const b = buildOsBinding({ platform: 'darwin', writable: ['/w'], primitives: { sandboxExec: true, bwrap: false, landlock: false }, tmpDir: '/tmp' })!
+    expect(verifyOsBinding(b, { run: () => `${OS_BINDING_SELFTEST_SENTINEL}\n` })).toBe(true)
+  })
+
+  it('profile 被拒（语法错误 ⇒ 命令根本没执行、退出码还是 0）⇒ false', () => {
+    const b = buildOsBinding({ platform: 'darwin', writable: ['/w'], primitives: { sandboxExec: true, bwrap: false, landlock: false }, tmpDir: '/tmp' })!
+    expect(verifyOsBinding(b, { run: () => 'sbpl1:37:4: error\n' })).toBe(false)
+    expect(verifyOsBinding(b, { run: () => '' })).toBe(false)
+  })
+
+  it('自检跑的是「原语 + shell + echo 哨兵」这条完整链（不是只跑原语）', () => {
+    const b = buildOsBinding({ platform: 'linux', writable: ['/w'], primitives: { sandboxExec: false, bwrap: true, landlock: false }, tmpDir: '/tmp' })!
+    let seen: string[] = []
+    verifyOsBinding(b, { run: (argv) => { seen = argv; return OS_BINDING_SELFTEST_SENTINEL } })
+    expect(seen[0]).toBe('/usr/bin/bwrap')
+    expect(seen).toContain('/bin/sh')
+    expect(seen).toContain('-c')
+    expect(seen[seen.length - 1]).toBe(`echo ${OS_BINDING_SELFTEST_SENTINEL}`)
+  })
+})
+
+describe('probeIsolation 的 osBinding 与 P1-3 接线（纪律 2：不模拟）', () => {
+  it('osBinding 未接线 ⇒ 有原语也只报 L1，并把"未接线"写进 reasons', () => {
+    const p = probeIsolation({ platform: 'darwin', exists: () => true })
+    expect(p.primitives.sandboxExec).toBe(true)
+    expect(p.maxLevel).toBe('L1')
+    expect(p.reasons.join()).toContain('未启用')
+  })
+
+  it('osBinding: true ⇒ 报 L2（只有"真构造出来了"才允许传 true）', () => {
+    const p = probeIsolation({ platform: 'darwin', exists: () => true, osBinding: true })
+    expect(p.maxLevel).toBe('L2')
+  })
+
+  it('要求 L2 且已接线 ⇒ met；要求 L2 但没接线 ⇒ downgraded', () => {
+    const on = probeIsolation({ platform: 'linux', exists: () => true, osBinding: true })
+    expect(resolveIsolation({ required: 'L2', probe: on }).met).toBe(true)
+    const off = probeIsolation({ platform: 'linux', exists: () => true })
+    const r = resolveIsolation({ required: 'L2', probe: off })
+    expect(r.met).toBe(false)
+    expect(r.downgraded).toBe(true)
+    expect(r.level).toBe('L1') // 实际档位恒为本机上限，不是愿望值
+  })
+})
+
+describe('detectOsBindingFailure（P1-3 执行期）', () => {
+  it('darwin：sandbox_apply 被拒 ⇒ 命中（嵌套沙箱的形态）', () => {
+    expect(detectOsBindingFailure('sandbox-exec: sandbox_apply: Operation not permitted', 'darwin')).toBe(true)
+  })
+
+  it('linux：bwrap 建不了 namespace ⇒ 命中', () => {
+    expect(detectOsBindingFailure('bwrap: Creating new namespace failed: Operation not permitted', 'linux')).toBe(true)
+  })
+
+  it('★不吞别的失败（普通命令报错不能被当成"绑定没生效"）', () => {
+    expect(detectOsBindingFailure('bash: nope: command not found', 'darwin')).toBe(false)
+    expect(detectOsBindingFailure('Operation not permitted', 'darwin')).toBe(false) // 少了 sandbox_apply 前缀
+    expect(detectOsBindingFailure('', 'darwin')).toBe(false)
+  })
+
+  it('未知平台恒 false（不猜）', () => {
+    expect(detectOsBindingFailure('sandbox_apply: Operation not permitted', 'win32')).toBe(false)
   })
 })

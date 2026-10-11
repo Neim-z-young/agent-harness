@@ -1175,10 +1175,12 @@ describe('BashOutput.isolation（P1-4 / P2-3：边界自述）', () => {
     expect(res.output!.isolation).toEqual({ level: 'L1', fsBound: false, netPolicy: 'open', viaHost: false })
   })
 
-  it('宿主注入档位后如实回传；L2 才 fsBound=true', async () => {
+  it('宿主注入档位后如实回传；★fsBound 由"这次真递了 OS 绑定没有"决定（不再由档位推导）', async () => {
+    // P1-3 起的口径：`isolationLevel: 'L2'` 只说明**档位声明**，不说明真的绑上了 ——
+    // 后者要看有没有递 `osBinding`。这条曾按旧口径断言 true，正是"看起来隔离了"的样本。
     const l2 = await createBashTool({ isolationLevel: 'L2' }).call({ command: 'echo hi' }, makeCtx())
     expect(l2.output!.isolation!.level).toBe('L2')
-    expect(l2.output!.isolation!.fsBound).toBe(true)
+    expect(l2.output!.isolation!.fsBound).toBe(false)
   })
 
   it('策略一并回传；宿主回退时 viaHost 双层都为 true', async () => {
