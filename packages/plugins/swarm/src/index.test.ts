@@ -38,6 +38,7 @@ import {
   hasPendingPermissionCallback,
   hasPendingPlanApproval,
   isStructuredProtocolMessage,
+  registerPermissionCallback,
   processMailboxPermissionResponse,
   processMailboxPlanApprovalRequests,
   processMailboxPlanApprovalResponse,
@@ -380,7 +381,10 @@ describe('mailbox 协作协议', () => {
     const base = { from: 'a', to: 'b', text: '', timestamp: 't' }
     expect(isStructuredProtocolMessage({ ...base, type: 'permission_request' })).toBe(true)
     expect(isStructuredProtocolMessage({ ...base, type: 'permission_response' })).toBe(true)
-    expect(isStructuredProtocolMessage({ ...base, type: 'sandbox_permission_request' })).toBe(true)
+    // P1-6：sandbox_permission_* 是**死协议** —— 类型已从联合里删掉，故用 cast 断言
+    // "这条不再被当作结构化协议路由"（它从来没有任何生产者，留着只会让人以为通道是通的）
+    expect(isStructuredProtocolMessage({ ...base, type: 'sandbox_permission_request' } as never)).toBe(false)
+    expect(isStructuredProtocolMessage({ ...base, type: 'sandbox_permission_response' } as never)).toBe(false)
     expect(isStructuredProtocolMessage({ ...base, type: 'plan_approval_request' })).toBe(true)
     expect(isStructuredProtocolMessage({ ...base, type: 'shutdown_request' })).toBe(true)
     expect(isStructuredProtocolMessage({ ...base, type: 'shutdown_approved' })).toBe(true)
@@ -499,6 +503,60 @@ describe('权限 mailbox fallback', () => {
     const handled = await processMailboxPermissionResponse(mb, 'alpha', 'bob')
     expect(handled).toBe(false)
     expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+  })
+
+  it('P1-6：档位下沉走 permission_request + data.escalation（不再单列 sandbox 类型）', async () => {
+    // 与 host 侧 PermissionRequest.escalation / 审计 sandbox.escalation 同一词汇表：
+    // "沙箱升到宿主"是一次权限请求，不是一种新消息
+    const req = createPermissionRequest({
+      from: 'bob', to: 'lead', toolName: 'bash', input: { command: 'ls' }, escalation: 'host-fallback',
+    })
+    expect(req.type).toBe('permission_request')
+    expect(req.data).toMatchObject({ toolName: 'bash', escalation: 'host-fallback' })
+    // 不给 escalation 时 data 里不该出现这个键（"没有标记"与"标记为空"是两回事）
+    const plain = createPermissionRequest({ from: 'bob', to: 'lead', toolName: 'bash' })
+    expect(plain.data).not.toHaveProperty('escalation')
+  })
+
+  it('P1-6：escalation 经 requestSwarmPermission 透传到 leader inbox', async () => {
+    unregisterLeaderConfirmQueue()
+    const dir = await makeDir('swarm-esc-')
+    const mb = new TeammateMailbox(dir)
+    const pending = requestSwarmPermission({
+      from: 'bob', toolName: 'bash', input: { command: 'ls' },
+      escalation: 'host-fallback', mailbox: mb, team: 'alpha', leaderName: 'lead',
+    })
+    let inbox: MailboxMessage[] = []
+    for (let i = 0; i < 20 && inbox.length === 0; i++) {
+      inbox = await mb.readMailbox('alpha', 'lead')
+      if (inbox.length === 0) await new Promise((r) => setTimeout(r, 5))
+    }
+    expect(inbox[0]!.type).toBe('permission_request')
+    expect(inbox[0]!.data?.escalation).toBe('host-fallback')
+    // 收尾：teammate 侧消费响应后 pending 才 settle（少了这一步 promise 会永远挂着）
+    const requestId = inbox[0]!.requestId!
+    await mb.writeToMailbox('alpha', 'bob', createPermissionResponse({ from: 'lead', to: 'bob', requestId, allow: false }))
+    expect(await processMailboxPermissionResponse(mb, 'alpha', 'bob')).toBe(true)
+    await expect(pending).resolves.toEqual({ allow: false, forever: false })
+  })
+
+  it('P1-6：sandbox_permission_response 不再被 consume（死协议分支已删）', async () => {
+    const dir = await makeDir('swarm-dead-')
+    const mb = new TeammateMailbox(dir)
+    const requestId = 'dead-1'
+    await mb.writeToMailbox('alpha', 'bob', {
+      from: 'lead', text: '', timestamp: new Date().toISOString(),
+      type: 'sandbox_permission_response' as never, replyTo: requestId, data: { allow: true },
+    })
+    let resolveCalled = false
+    registerPermissionCallback(requestId, () => { resolveCalled = true })
+    const handled = await processMailboxPermissionResponse(mb, 'alpha', 'bob')
+    expect(handled).toBe(false)
+    expect(resolveCalled).toBe(false)
+    // 清理：补一条**真**响应把挂起回调消费掉（否则它会挂到下一个用例）
+    await mb.writeToMailbox('alpha', 'bob', createPermissionResponse({ from: 'lead', to: 'bob', requestId, allow: false }))
+    expect(await processMailboxPermissionResponse(mb, 'alpha', 'bob')).toBe(true)
+    expect(hasPendingPermissionCallback(requestId)).toBe(false)
   })
 
   it('requestSwarmPermission 双轨皆不可用 → fail-closed 拒绝', async () => {

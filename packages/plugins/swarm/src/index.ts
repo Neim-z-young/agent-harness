@@ -266,10 +266,8 @@ export class TeamManager {
 /** mailbox 协作协议消息类型（对齐 Claude Code MailboxMessage 协议；isStructuredProtocolMessage 用于路由分流） */
 export type MailboxMessageType =
   | 'message' // 普通文本
-  | 'permission_request' // 权限请求（teammate → leader）
+  | 'permission_request' // 权限请求（teammate → leader；沙箱档位下沉走它 + `data.escalation`，见 P1-6）
   | 'permission_response' // 权限响应（leader → teammate）
-  | 'sandbox_permission_request' // sandbox 权限请求
-  | 'sandbox_permission_response' // sandbox 权限响应
   | 'plan_approval_request' // plan 审批请求
   | 'plan_approval_response' // plan 审批响应
   | 'shutdown_request' // 关停请求（leader → teammate）
@@ -312,8 +310,6 @@ export interface MailboxMessage {
 const STRUCTURED_PROTOCOL_TYPES: ReadonlySet<MailboxMessageType> = new Set([
   'permission_request',
   'permission_response',
-  'sandbox_permission_request',
-  'sandbox_permission_response',
   'plan_approval_request',
   'plan_approval_response',
   'shutdown_request',
@@ -360,6 +356,11 @@ export function createPermissionRequest(opts: {
   input?: unknown
   requestId?: string
   summary?: string
+  /**
+   * 沙箱档位下沉标记（P1-6）：`'host-fallback'` 表示这次请求是"命令要从沙箱升到宿主执行"
+   * （放开白名单 + env 隔离）。走既有 `permission_request` 通道，不单列消息类型。
+   */
+  escalation?: 'host-fallback'
 }): Omit<MailboxMessage, 'to'> & { to: string } {
   const requestId = opts.requestId ?? generateRequestId('perm')
   return {
@@ -370,7 +371,10 @@ export function createPermissionRequest(opts: {
     timestamp: new Date().toISOString(),
     type: 'permission_request',
     requestId,
-    data: { toolName: opts.toolName, input: opts.input },
+    // P1-6：`escalation` 取代了原先单列的 `sandbox_permission_request` 类型 —— 沙箱档位
+    // 下沉**也是一次权限请求**，只是多带一个"这次是升档"的标记（与 host 侧
+    // `PermissionRequest.escalation` / 审计 `sandbox.escalation` 同一词汇表）。
+    data: { toolName: opts.toolName, input: opts.input, ...(opts.escalation ? { escalation: opts.escalation } : {}) },
   }
 }
 
@@ -783,7 +787,7 @@ export async function sendPermissionRequestViaMailbox(
   mailbox: TeammateMailbox,
   team: string,
   recipientName: string,
-  req: { from: string; toolName: string; input?: unknown; requestId?: string },
+  req: { from: string; toolName: string; input?: unknown; requestId?: string; escalation?: 'host-fallback' },
 ): Promise<void> {
   await mailbox.writeToMailbox(team, recipientName, createPermissionRequest({
     from: req.from,
@@ -791,13 +795,19 @@ export async function sendPermissionRequestViaMailbox(
     toolName: req.toolName,
     input: req.input,
     requestId: req.requestId,
+    escalation: req.escalation,
   }))
 }
 
 /**
- * 处理 teammate inbox 中的权限响应（permission_response / sandbox_permission_response）：
+ * 处理 teammate inbox 中的权限响应（`permission_response`）：
  * 命中挂起回调则 resolve 并标记已读；返回是否处理了响应。
  * teammate poller / 执行循环空闲时调用。
+ *
+ * P1-6：原先这里还接受 `sandbox_permission_response`，但那条通道**从来没有生产者**
+ * （没有任何代码发出 sandbox_* 消息）—— 一个只被消费、从不产生的协议分支会让
+ * "子 Agent 越界申请授权"看起来是通的，实际上永远等不到响应。档位下沉现在走
+ * `permission_request` + `data.escalation`，与 host 侧的审计同词汇表。
  */
 export async function processMailboxPermissionResponse(
   mailbox: TeammateMailbox,
@@ -807,7 +817,7 @@ export async function processMailboxPermissionResponse(
   const unread = await mailbox.readUnreadMessages(team, agentName)
   let handled = false
   for (const msg of unread) {
-    if (msg.type !== 'permission_response' && msg.type !== 'sandbox_permission_response') continue
+    if (msg.type !== 'permission_response') continue
     const requestId = msg.replyTo
     if (requestId && pendingPermissionCallbacks.has(requestId)) {
       const resolve = pendingPermissionCallbacks.get(requestId)!
@@ -832,6 +842,11 @@ export async function requestSwarmPermission(opts: {
   toolName: string
   input?: unknown
   workerBadge?: { name: string; color?: string }
+  /**
+   * 沙箱档位下沉标记（P1-6）：`'host-fallback'` = 这次请求是"要从沙箱升到宿主执行"。
+   * 与 host 侧 `PermissionRequest.escalation` 同名词 —— 同一个概念不该有两套词汇。
+   */
+  escalation?: 'host-fallback'
   /** 无 leader 桥时的 mailbox 降级参数（都提供才降级） */
   mailbox?: TeammateMailbox
   team?: string
@@ -850,6 +865,7 @@ export async function requestSwarmPermission(opts: {
       toolName: opts.toolName,
       input: opts.input,
       requestId,
+      escalation: opts.escalation,
     })
     return decision
   }
