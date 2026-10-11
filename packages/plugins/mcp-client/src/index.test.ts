@@ -9,6 +9,7 @@ import {
   HttpTransport,
   SseTransport,
   defaultTransportFactory,
+  mcpSpawnArgv,
   convertMcpToolToHarnessTool,
   createMcpClientPlugin,
   type McpTransport,
@@ -978,5 +979,36 @@ describe('buildMcpChildEnv（P0-2）', () => {
     for (const k of DEFAULT_MCP_ENV_KEEP) {
       expect(/TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL/i.test(k)).toBe(false)
     }
+  })
+})
+
+// ===== P1-7：MCP server 能力声明的**可强制**部分 =====
+
+describe('mcpSpawnArgv（P1-7）', () => {
+  const binding = { level: 'L2' as const, platform: 'darwin', prefix: ['/usr/bin/sandbox-exec', '-p', '(version 1)'], via: 'sandbox-exec', writable: ['/w'] }
+
+  it('没绑定 ⇒ 与改造前逐位一致（program=command，argv=args）', () => {
+    expect(mcpSpawnArgv({ command: 'npx', args: ['-y', 'srv'] })).toEqual({ program: 'npx', argv: ['-y', 'srv'] })
+    expect(mcpSpawnArgv({ command: 'npx', args: ['-y'], osBinding: null })).toEqual({ program: 'npx', argv: ['-y'] })
+  })
+
+  it('有绑定 ⇒ 原语作 program，server 命令整体落到 prefix 之后（不拼接字符串）', () => {
+    const r = mcpSpawnArgv({ command: 'npx', args: ['-y', 'srv'], osBinding: binding })
+    expect(r.program).toBe('/usr/bin/sandbox-exec')
+    expect(r.argv).toEqual(['-p', '(version 1)', 'npx', '-y', 'srv'])
+  })
+
+  it('无 args 也不丢（argv 里不能冒出 undefined）', () => {
+    const r = mcpSpawnArgv({ command: 'srv', osBinding: binding })
+    expect(r.argv).toEqual(['-p', '(version 1)', 'srv'])
+  })
+})
+
+describe('defaultTransportFactory 透传 osBinding（P1-7）', () => {
+  it('stdio 且传了绑定 ⇒ transport 里带着它（不是"写了但没递进去"）', () => {
+    const binding = { level: 'L2' as const, platform: 'darwin', prefix: ['/usr/bin/sandbox-exec', '-p', 'P'], via: 'sandbox-exec', writable: ['/w'] }
+    const t: any = defaultTransportFactory({ name: 's', transport: 'stdio', command: 'npx' }, { osBinding: binding })
+    // 判定只看**装上了没有**（内部字段），不真起进程
+    expect(t.proc?.spawnargs?.[0] ?? t.proc?.spawnfile).toBe('/usr/bin/sandbox-exec')
   })
 })

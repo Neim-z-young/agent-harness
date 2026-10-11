@@ -21,6 +21,7 @@ import type { AgentPlugin, Hooks } from '@harness/plugin'
 import type { Tool, ToolResult, Schema, ToolContext } from '@harness/tool'
 import { withJsonSchema } from '@harness/tool'
 import { defaultUserDir } from '@harness/workspace'
+import type { OsBinding } from '@harness/isolation'
 import { OAuthFlow, type McpOauthConfig } from './oauth'
 import { OAuthTokenStore, oauthServerKey } from './token-store'
 // MCP 资源注入模板（prompts/mcp-resources.txt，import 加载，参考 opencode）
@@ -214,6 +215,22 @@ export function buildMcpChildEnv(opts: {
   return { ...inherited, ...(opts.declared ?? {}) }
 }
 
+/**
+ * 拼 stdio 子进程的 `program` 与 `argv`（P1-7）。
+ *
+ * 抽成纯函数的理由与 {@link buildMcpChildEnv} 相同：**能不能真的把第三方 server 关进
+ * 原语里**，靠读 spawn 那一行是看不出来的（和 P0-1 的"写了但没递进去"同一类病）。
+ */
+export function mcpSpawnArgv(opts: {
+  command: string
+  args?: string[]
+  osBinding?: OsBinding | null
+}): { program: string; argv: string[] } {
+  const prefix = opts.osBinding?.prefix ?? []
+  if (prefix.length === 0) return { program: opts.command, argv: opts.args ?? [] }
+  return { program: prefix[0]!, argv: [...prefix.slice(1), opts.command, ...(opts.args ?? [])] }
+}
+
 /** stdio 传输：通过子进程 stdin/stdout */
 export class StdioTransport implements McpTransport {
   private proc: ChildProcessWithoutNullStreams
@@ -227,8 +244,11 @@ export class StdioTransport implements McpTransport {
     /** P0-2：额外保留的宿主变量名 / 关闭 env 隔离（见 {@link buildMcpChildEnv}） */
     envKeep?: string[]
     inheritEnv?: boolean
+    /** P1-7：OS 绑定（声明了受限能力且本机可用时才传） */
+    osBinding?: OsBinding | null
   }) {
-    this.proc = spawn(config.command, config.args ?? [], {
+    const argv = mcpSpawnArgv({ command: config.command, args: config.args, osBinding: config.osBinding })
+    this.proc = spawn(argv.program, argv.argv, {
       env: buildMcpChildEnv({ declared: config.env, keep: config.envKeep, inheritAll: config.inheritEnv }),
       stdio: ['pipe', 'pipe', 'pipe'],
     })
@@ -481,6 +501,13 @@ export class SseTransport implements McpTransport {
 export interface TransportFactoryContext {
   /** token 加密持久化目录；缺省用 defaultUserDir() */
   dataDir?: string
+  /**
+   * OS 绑定（P1-3 / P1-7）：传了就把 stdio 子进程**真的**包进平台原语。
+   *
+   * 只有 server 声明了受限的能力（见 `McpServerCapabilities`）时才该传 —— 这是目前**唯一
+   * 能强制**住第三方 server 的手段（L0 的静态门管不到别人的子进程）。
+   */
+  osBinding?: OsBinding | null
   /** 替换全局 fetch（测试注入） */
   fetchImpl?: typeof fetch
   /** 授权码读取器（缺省读 stdin 一行） */
@@ -521,6 +548,7 @@ export function defaultTransportFactory(
       env: config.env,
       envKeep: config.envKeep,
       inheritEnv: config.inheritEnv,
+      osBinding: ctx.osBinding ?? null,
     })
   }
   if (t === 'sse') {

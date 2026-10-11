@@ -9,6 +9,7 @@ import {
   createMcpServerRegistry,
   createMcpServerRegistryPlugin,
   type McpServerRegistration,
+  resolveMcpCapabilities,
 } from './index'
 import type { PluginContext } from '@harness/plugin'
 import type { Bus } from '@harness/bus'
@@ -391,5 +392,39 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     }))
     expect(saved2[0].map((e: any) => e.name)).not.toContain('new')
     await plugin.uninstall?.()
+  })
+})
+// ===== P1-7：MCP server 能力声明 —— 声明 ≠ 强制 =====
+
+describe('resolveMcpCapabilities（P1-7）', () => {
+  test('没声明 ⇒ 没有不可强制项，也不绑（与改造前逐位一致）', () => {
+    const r = resolveMcpCapabilities(undefined, { osBindingAvailable: true })
+    expect(r.unenforceable).toEqual([])
+    expect(r.bound).toBe(false)
+  })
+
+  test('声明 fs:"cwd" 且有 OS 绑定 ⇒ **真强制**（bound=true，无告警）', () => {
+    const r = resolveMcpCapabilities({ fs: 'cwd' }, { osBindingAvailable: true })
+    expect(r.bound).toBe(true)
+    expect(r.unenforceable).toEqual([])
+  })
+
+  test('★声明 fs:"cwd" 但没有绑定 ⇒ 只声明、不强制（必须说出来）', () => {
+    const r = resolveMcpCapabilities({ fs: 'cwd' }, { osBindingAvailable: false })
+    expect(r.bound).toBe(false)
+    expect(r.unenforceable.join()).toContain('fs:"cwd"')
+    expect(r.unenforceable.join()).toContain('只声明、不强制')
+  })
+
+  test('★net:"none" 任何档位都强制不了（L0 静态门管不到别人的子进程）', () => {
+    for (const available of [true, false]) {
+      const r = resolveMcpCapabilities({ net: 'none' }, { osBindingAvailable: available })
+      expect(r.unenforceable.join()).toContain('强制不了子进程出网')
+    }
+  })
+
+  test('两项都声明、都没法强制 ⇒ 两条都在（不合并成一句）', () => {
+    const r = resolveMcpCapabilities({ fs: 'cwd', net: 'none' }, { osBindingAvailable: false })
+    expect(r.unenforceable).toHaveLength(2)
   })
 })

@@ -11,9 +11,10 @@
   },
   "dependencies": {
     "@harness/core": "workspace:*",
+    "@harness/isolation": "workspace:*",
     "@harness/mcp-client": "workspace:*",
-    "@harness/tool": "workspace:*",
-    "@harness/plugin": "workspace:*"
+    "@harness/plugin": "workspace:*",
+    "@harness/tool": "workspace:*"
   },
   "scripts": {
     "dev": "tsc --noEmit --watch",

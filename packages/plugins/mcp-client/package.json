@@ -10,10 +10,11 @@
     }
   },
   "dependencies": {
-    "@harness/core": "workspace:*",
-    "@harness/tool": "workspace:*",
-    "@harness/plugin": "workspace:*",
     "@harness/bus": "workspace:*",
+    "@harness/core": "workspace:*",
+    "@harness/isolation": "workspace:*",
+    "@harness/plugin": "workspace:*",
+    "@harness/tool": "workspace:*",
     "@harness/workspace": "workspace:*"
   },
   "scripts": {

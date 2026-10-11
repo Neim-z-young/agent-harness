@@ -309,6 +309,7 @@
       "dependencies": {
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
         "@harness/workspace": "workspace:*",
@@ -331,6 +332,7 @@
       "version": "0.3.0",
       "dependencies": {
         "@harness/core": "workspace:*",
+        "@harness/isolation": "workspace:*",
         "@harness/mcp-client": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",

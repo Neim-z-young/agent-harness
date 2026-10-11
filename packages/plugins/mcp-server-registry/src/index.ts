@@ -23,6 +23,7 @@ import {
   type McpServerConfig,
   type McpTransport,
 } from '@harness/mcp-client'
+import type { OsBinding } from '@harness/isolation'
 
 // ===== 注册类型 =====
 
@@ -93,14 +94,68 @@ interface McpServerRuntime {
 }
 
 /**
+ * MCP server 的**能力声明**（P1-7）。
+ *
+ * 只有两个维度，且每个维度只有"受限 / 不限"两档 —— 刻意不做细粒度路径清单：
+ * server 是外部代码，声明得越细、越容易变成"以为约束住了"的假象。
+ *
+ * ⚠️ **声明 ≠ 强制**（这是本方案最容易自欺的地方）：
+ * - `fs: 'cwd'` + 本机有 OS 绑定 ⇒ **真强制**（子进程被包进原语）；
+ * - `fs: 'cwd'` 但没有 OS 绑定 ⇒ **只声明**，装配期发 `config.mcp-inactive` 告警；
+ * - `net: 'none'` ⇒ 目前**任何档位都强制不了**（L0 静态门管不到别人的子进程），
+ *   只会告警。别把这条当成隔离 —— 要真断网得等 L3（容器/远程 executor）。
+ */
+export interface McpServerCapabilities {
+  /** 文件系统：`'cwd'` = 只在会话工作目录内；`'unrestricted'`（默认，逐位等于改造前） */
+  fs?: 'cwd' | 'unrestricted'
+  /** 网络：`'none'` = 不该出网；`'unrestricted'`（默认） */
+  net?: 'none' | 'unrestricted'
+}
+
+/** server 声明的能力**与当前档位下能不能强制**的对照（装配期算一次，进 notice） */
+export interface McpCapabilityResolution {
+  /** 声明了但**强制不了**的项（人读，逐条一个维度） */
+  unenforceable: string[]
+  /** 该 server 是否真的被套上 OS 绑定 */
+  bound: boolean
+}
+
+/**
+ * 把「声明」与「本机实际能给的」折成结论（与 `resolveIsolation` 同范式：只给结论、不决定后果）。
+ *
+ * 入参刻意只收 `osBindingAvailable`（布尔）而不是 `OsBinding` 本身：装配期要**先判定、
+ * 后套用**，而 host 的 `config.ts` 只做判定（它不持有绑定对象）—— 收对象会逼着判定方
+ * 造一个假绑定，那正是"看起来有了"的形状。
+ */
+export function resolveMcpCapabilities(
+  caps: McpServerCapabilities | undefined,
+  opts: { osBindingAvailable?: boolean } = {},
+): McpCapabilityResolution {
+  const unenforceable: string[] = []
+  const wantFs = caps?.fs === 'cwd'
+  const bound = wantFs && opts.osBindingAvailable === true
+  if (wantFs && !bound) {
+    unenforceable.push(
+      `声明了 fs:"cwd"，但本次没有 OS 绑定（config.json → sandbox.osBinding="on" 且本机有原语才生效）⇒ 只声明、不强制`,
+    )
+  }
+  if (caps?.net === 'none') {
+    unenforceable.push('声明了 net:"none"，但当前任何档位都强制不了子进程出网（L0 静态门管不到外部进程）⇒ 只声明、不强制')
+  }
+  return { unenforceable, bound }
+}
+
+/**
  * 配置文件里的 MCP Server 条目。由 config.json 的 `mcpServers` 数组提供：
- * 复用 @harness/mcp-client 的 McpServerConfig 字段，并附加两级启停开关。
+ * 复用 @harness/mcp-client 的 McpServerConfig 字段，并附加两级启停开关与能力声明（P1-7）。
  */
 export type McpServerEntry = McpServerConfig & {
   /** 服务器级开关（缺省 true） */
   enabled?: boolean
   /** 工具级开关：key=工具名（不带 mcp__<server>__ 前缀），value=false 表示停用单个工具（缺省全开） */
   tools?: Record<string, boolean>
+  /** 能力声明（P1-7）：不写 = 全不受限（与改造前逐位一致） */
+  capabilities?: McpServerCapabilities
 }
 
 /** 托管（可由 /mcp 启停的）配置条目运行态 */
@@ -117,6 +172,11 @@ export interface McpServerRegistryPluginOptions {
   registry?: McpServerRegistry
   /** 透传给 mcp-client defaultTransportFactory 的默认 dataDir（OAuth token 持久化；单项可覆盖） */
   dataDir?: string
+  /**
+   * OS 绑定（P1-3 / P1-7）：由宿主在装配期构造并自检通过后递入。
+   * 只有 server **声明**了 `capabilities.fs:"cwd"` 才套到它的子进程上。
+   */
+  osBinding?: OsBinding | null
 }
 
 /**
@@ -139,6 +199,10 @@ export interface McpCliStore {
 export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOptions = {}): AgentPlugin {
   const reg = options.registry ?? defaultRegistry
   const dataDir = options.dataDir
+  // P1-7：OS 绑定只对**声明了 fs 受限**的 server 生效（没声明 = 不受限，与改造前一致）
+  const osBinding = options.osBinding ?? null
+  const bindingFor = (entry?: McpServerEntry): OsBinding | null =>
+    resolveMcpCapabilities(entry?.capabilities, { osBindingAvailable: osBinding != null }).bound ? osBinding : null
   const runtimes: McpServerRuntime[] = []
   /** name → 托管配置条目；来自 config.json mcpServers */
   const managed = new Map<string, ManagedEntry>()
@@ -168,7 +232,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   /** 根据一个 server 配置建立运行时（不落 entries，调用方 push；建立后登记归属索引） */
   function makeRuntime(serverName: string, cfg: McpServerConfig, entry?: McpServerEntry): Promise<McpServerRuntime | undefined> {
     return (async () => {
-      const transport = defaultTransportFactory(cfg, { dataDir })
+      const transport = defaultTransportFactory(cfg, { dataDir, osBinding: bindingFor(entry) })
       const client = new McpClient(serverName, transport, cfg)
       await client.connect()
       const tools = await client.listTools()
