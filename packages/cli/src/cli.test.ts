@@ -40,7 +40,9 @@ import {
   formatToolInput,
   formatToolResult,
   TOOL_CONT_MARK,
+  parseCliAnswer,
 } from './index'
+import { buildPermissionPrompt, type PermissionAnswer } from '@harness/host'
 import { SubagentEvents } from '@harness/subagent'
 import { CoordinatorEvents } from '@harness/coordinator'
 import { defineTool } from '@harness/tool'
@@ -2690,6 +2692,30 @@ describe('Coordinator 自动续轮 attachAutoContinue', () => {
     expect(tuiText).not.toContain('[KV]')
     expect(seenEvents).toContain('ui_widget')
     await tuiApp.shutdown()
+  })
+})
+
+// ===== P2-6（D6）：权限提示的键位必须与解析器同一词汇表 =====
+
+describe('权限提示文案 ↔ parseCliAnswer（D6 回归）', () => {
+  it('文案里每个 `状态(键)` 对：parseCliAnswer(键) 必须解出同一个状态', () => {
+    const text = buildPermissionPrompt({ toolKey: 'bash', patterns: [] }).text
+    // 只认 `小写词(单个字母)` 这种形态 —— `(无路径)` 这类括号不参与
+    const re = /([a-z][a-z-]*)\(([a-zA-Z])\)/g
+    const pairs: Array<[PermissionAnswer, string]> = []
+    for (let m = re.exec(text); m; m = re.exec(text)) pairs.push([m[1]! as PermissionAnswer, m[2]!])
+    expect(pairs).toEqual([
+      ['allow', 'a'], ['deny', 'd'], ['always-allow', 'A'], ['always-deny', 'D'],
+    ])
+    // 双向：文案说 `词(键)` ⇒ 按那个键必须解出那个词（旧文案 `always(a)` 在这条上变红）
+    for (const [word, key] of pairs) expect(parseCliAnswer(key)).toBe(word)
+  })
+
+  it('大小写是语义的一部分：`a` 只放行一次，`A` 才写回规则', () => {
+    expect(parseCliAnswer('a')).toBe('allow')
+    expect(parseCliAnswer('A')).toBe('always-allow')
+    expect(parseCliAnswer('d')).toBe('deny')
+    expect(parseCliAnswer('D')).toBe('always-deny')
   })
 })
 

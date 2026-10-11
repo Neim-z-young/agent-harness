@@ -72,12 +72,21 @@ export type RiskLevel = 'low' | 'medium' | 'high'
 /** 已知只读/低危工具键（打到这一档的基本是查数/检索类，放行代价低） */
 const LOW_RISK_TOOL_KEYS = new Set([
   'read', 'read_file', 'list_dir', 'grep_file', 'glob', 'search', 'query',
+  // P2-5：只读 shell 变体与 `bash` 同族，但**天然不可写**（白名单 + 拒绝重定向/命令
+  // 替换/提权，见 `tools-builtin` 的 `checkReadOnlyCommand`）⇒ 直接落 low，不进命令表。
+  'bash_ro',
   'get_order_details', 'get_product_details', 'find_user_id_by_email', 'list_all_product_types',
 ])
 
-/** 已知高危工具键（写/删/执行类，默认打 high，但仍由人裁决） */
+/**
+ * 已知高危工具键（写/删类，默认打 high，但仍由人裁决）。
+ *
+ * ⚠️ P2-5 把 `bash` 从这里**移出**：执行类工具的风险**取决于要跑的那条命令**，按工具键
+ * 一刀切会让 `ls` / `pwd` 与 `rm -rf` 拿到同一个标签（D4），而下面的高危模式表也就
+ * **再没有机会为 bash 生效**。`bash` 改走 {@link assessShellRisk}。
+ */
 const HIGH_RISK_TOOL_KEYS = new Set([
-  'bash', 'edit_file', 'write_file', 'delete', 'delete_file', 'rm', 'mv', 'chmod',
+  'edit_file', 'write_file', 'delete', 'delete_file', 'rm', 'mv', 'chmod',
   'modify_pending_order_address', 'modify_pending_order_items', 'modify_user_address',
 ])
 
@@ -85,13 +94,106 @@ const HIGH_RISK_TOOL_KEYS = new Set([
 const HIGH_RISK_PATTERNS = [/rm -rf/, /\bsudo\b/, /:?\(\)/, /dd if=/, /mkfs/, /curl .*\| *sh/]
 
 /**
+ * 执行类工具键：入参里带一条 shell 命令，风险按**命令内容**分级（P2-5 / D4）。
+ * 只有 `bash` —— 只读变体已在 {@link LOW_RISK_TOOL_KEYS} 里直接落 low。
+ */
+const SHELL_TOOL_KEYS = new Set(['bash'])
+
+/**
+ * 只读命令首词白名单：**整条命令的每一段**（按 `&&` / `||` / `;` / `|` / `&` / 换行切段）
+ * 首词都在这里、且没有 {@link SHELL_DANGEROUS_FLAGS}，`bash` 才落 `low`。
+ *
+ * 收录原则：只收**语义上不产生副作用**的命令。以下刻意**不收**（宁可落 medium —— 标签
+ * 保守只是少一点区分度，放宽才是往错的方向偏）：
+ * - `sort` / `sed` / `awk` —— 有写文件开关（`sort -o` / `sed -i`）；
+ * - `env` / `xargs` / `sh` / `bash` —— 只是"跳板"，真正的动作在参数里；
+ * - `git` / `npm` / `docker` —— 同一首词下读（`git log`）与写（`git push`）并存；
+ * - `find` 收录，但用 {@link SHELL_DANGEROUS_FLAGS} 挡掉 `-exec` / `-delete`。
+ */
+const LOW_RISK_COMMAND_HEADS = new Set([
+  'ls', 'pwd', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'grep', 'rg', 'find',
+  'which', 'whoami', 'id', 'date', 'uname', 'hostname', 'printenv',
+  'stat', 'file', 'du', 'df', 'tree', 'basename', 'dirname', 'realpath', 'readlink', 'type', 'true',
+])
+
+/**
+ * "把只读命令变成写命令"的开关（`find … -exec rm {} \;` / `find . -delete`）。
+ * 命中即该段不算只读。
+ */
+const SHELL_DANGEROUS_FLAGS = /(?:^|\s)(?:-exec|-execdir|-ok|-okdir|-delete|--exec)(?:\s|$)/
+
+/**
+ * 写入 / 内联执行的 shell 元字符：重定向（`>` / `<`）、命令替换（反引号 / `$(`）。
+ * 命中即不可能是"纯只读" ⇒ 至少 medium。
+ *
+ * ⚠️ 不要在这里加 `2>` 之类的补丁 —— 空设备重定向由 {@link NULL_SINK_REDIRECT} 先摘掉。
+ */
+const SHELL_WRITE_HINT = /[<>`]|\$\(/
+
+/**
+ * 空设备重定向（`2>/dev/null`、`>/dev/null`、`&>/dev/null`）：不落盘，不算写。
+ *
+ * 与 `tools-builtin` 的 `NULL_SINK_REDIRECT` **同一形态**（那边管只读判定，这边管风险标签）：
+ * 不摘掉的话 `git status 2>/dev/null` 会被 {@link SHELL_WRITE_HINT} 判成写，白丢一个 low。
+ * 尾部的负向前瞻是钉子 —— 没有它 `> /dev/nullx` 也会被当成空设备。
+ */
+const NULL_SINK_REDIRECT = /&?[12]?>{1,2}\s*\/dev\/null(?![\w.-])/g
+
+/** 取命令段的第一个"真正的词"，跳过前置的环境变量赋值（`FOO=1 ls` ⇒ `ls`）。 */
+function shellHead(segment: string): string {
+  const words = segment.split(/\s+/).filter(Boolean)
+  let i = 0
+  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) i += 1
+  return words[i] ?? ''
+}
+
+/** 从工具入参里取命令文本；取不到返回 `undefined`（调用方按保守档处理）。 */
+function shellCommandText(input: unknown): string | undefined {
+  if (typeof input === 'string') return input
+  if (input && typeof input === 'object') {
+    const c = (input as { command?: unknown }).command
+    if (typeof c === 'string') return c
+  }
+  return undefined
+}
+
+/**
+ * 执行类命令的分级器（P2-5 / D4）。
+ *
+ * 判据（按序）：高危模式 → `high`；写入/替换元字符 → `medium`；**每一段**首词都在
+ * {@link LOW_RISK_COMMAND_HEADS} 且无 {@link SHELL_DANGEROUS_FLAGS} → `low`；其余 → `medium`。
+ *
+ * 空命令文本（`''` / 纯空白）⇒ `high`：执行类工具却拿不到要跑什么，按高危处理是唯一
+ * 安全的默认。
+ */
+function assessShellRisk(command: string): RiskLevel {
+  if (HIGH_RISK_PATTERNS.some((re) => re.test(command))) return 'high'
+  const inspected = command.replace(NULL_SINK_REDIRECT, ' ')
+  if (SHELL_WRITE_HINT.test(inspected)) return 'medium'
+  const segments = inspected.split(/&&|\|\||[;&|\n]/).map((s) => s.trim()).filter(Boolean)
+  if (segments.length === 0) return 'high'
+  const allReadOnly = segments.every((seg) =>
+    !SHELL_DANGEROUS_FLAGS.test(seg) && LOW_RISK_COMMAND_HEADS.has(shellHead(seg)))
+  return allReadOnly ? 'low' : 'medium'
+}
+
+/**
  * 风险分级器（纯函数，规则引擎侧唯一出口）。
  *
  * 定稿语义：**白名单/黑名单可硬拦高危，中间地带只标低/中/高风险，不自动决策** ——
  * 分级结果只作为决策卡片的标签与审计字段，放行与否永远由人工按键决定。
- * 判据（按序）：工具只读声明 > 高危命令模式 > 已知工具键表 > 默认 medium。
+ *
+ * 判据（按序，P2-5 起分流）：**执行类工具**（`bash`）→ {@link assessShellRisk}（看命令内容）；
+ * **其余工具** → 入参高危模式 > 已知工具键表 > 默认 medium。
+ * 执行类放到最前，是为了让高危模式表**为 bash 真正生效**（改造前 bash 命中工具键表就
+ * 直接 return high，模式表对它形同虚设 —— 那正是 D4）。
  */
 export function assessRisk(toolKey: string, patterns: string[] = [], input?: unknown): RiskLevel {
+  if (SHELL_TOOL_KEYS.has(toolKey)) {
+    const command = shellCommandText(input)
+    // 拿不到命令文本 ⇒ 保守 high（与改造前逐位一致）
+    return command ? assessShellRisk(command) : 'high'
+  }
   const blob = JSON.stringify(input ?? {})
   if (HIGH_RISK_PATTERNS.some((re) => re.test(blob))) return 'high'
   if (HIGH_RISK_TOOL_KEYS.has(toolKey)) return 'high'
@@ -112,7 +214,7 @@ export interface PermissionPrompt {
   sessionId?: string
   /** 一句话摘要，如 `权限请求 [bash] rm -rf /tmp/x`（CLI 的 readline 首行就是它） */
   summary: string
-  /** 默认完整问题（含操作说明与 `[a/d/A/D]` 提示），CLI 逐字使用 */
+  /** 默认完整问题（含操作说明与 `[a/d/A/D]` 键位提示），CLI 逐字使用 */
   text: string
   /** M3：风险分级标签（assessRisk 产出，决策卡片呈现；向后兼容可选） */
   riskLevel?: RiskLevel
@@ -147,7 +249,13 @@ export function buildPermissionPrompt(req: PermissionAskInput): PermissionPrompt
     summary,
     text:
       `\n⚠️  ${summary}\n` +
-      `  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] `,
+      // P2-6 / D6：文案与 `PermissionAnswer` **同一词汇表**，且每个词后面紧跟它的按键。
+      // 旧文案 `allow / deny / always(a) / deny-always(d)? [a/d/A/D]` 是**自相矛盾**的 ——
+      // 前半说 `always` 是 `a`，方括号里 `a` 却是 allow、`A` 才是 always（实际实现是
+      // `parseCliAnswer`：`a`→allow、`A`→always-allow）⇒ 照前半读会把「始终允许」
+      // 按成「允许一次」。现在只有 `状态(键)` 一种形态，`cli.test.ts` 有一条守卫把
+      // 「文案里的词」与「parseCliAnswer(那个键)」逐对钉住。
+      `  操作: allow(a) / deny(d) / always-allow(A) / always-deny(D)? `,
     // M3：决策卡片的风险标签（分级器不决策，只打标）
     riskLevel: assessRisk(req.toolKey, patterns, req.input),
   }

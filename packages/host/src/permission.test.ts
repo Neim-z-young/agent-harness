@@ -190,12 +190,12 @@ describe('InteractivePermissionEngine · 取不到答复一律 deny（反向验�
 })
 
 describe('buildPermissionPrompt · 文案逐字（改造前 cli 内的 readline 问题串）', () => {
-  it('含工具名与前 3 个 pattern，开头换行、⚠️ 后两空格、结尾带 [a/d/A/D] 提示', () => {
+  it('含工具名与前 3 个 pattern，开头换行、⚠️ 后两空格、结尾带 `状态(键)` 提示', () => {
     const p = buildPermissionPrompt({ toolKey: 'bash', patterns: ['a', 'b', 'c', 'd'] })
     expect(p.summary).toBe('权限请求 [bash] a, b, c')
     expect(p.text).toBe(
       '\n⚠️  权限请求 [bash] a, b, c\n' +
-      '  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] ',
+      '  操作: allow(a) / deny(d) / always-allow(A) / always-deny(D)? ',
     )
   })
 
@@ -224,7 +224,7 @@ describe('buildPermissionPrompt · 文案逐字（改造前 cli 内的 readline 
     await e.ask({ toolKey: 'bash', patterns: ['/tmp/x'] })
     expect(seen[0]).toBe(
       '\n⚠️  权限请求 [bash] /tmp/x\n' +
-      '  操作: allow / deny / always(a) / deny-always(d)? [a/d/A/D] ',
+      '  操作: allow(a) / deny(d) / always-allow(A) / always-deny(D)? ',
     )
   })
 })
@@ -234,17 +234,69 @@ describe('buildPermissionPrompt · 文案逐字（改造前 cli 内的 readline 
 describe('assessRisk · 风险分级（只打标签不决策）', () => {
   it('高危命令模式 → high（bash 入参里的 rm -rf）', () => {
     expect(assessRisk('bash', [], { command: 'rm -rf /tmp/x' })).toBe('high')
+    expect(assessRisk('bash', [], { command: 'sudo rm -rf /tmp/x' })).toBe('high')
+    expect(assessRisk('bash', [], { command: 'dd if=/dev/zero of=/dev/sda' })).toBe('high')
   })
-  it('高危工具键 → high（写/删/执行类）', () => {
+  it('高危工具键 → high（写/删类）', () => {
     expect(assessRisk('edit_file', [], { path: 'a.ts' })).toBe('high')
-    expect(assessRisk('bash', [], {})).toBe('high')
+    expect(assessRisk('write_file', [], { path: 'a.ts' })).toBe('high')
   })
   it('已知只读工具键 → low', () => {
     expect(assessRisk('read_file', [], {})).toBe('low')
     expect(assessRisk('grep_file', [], {})).toBe('low')
+    // P2-5：只读 shell 变体天然不可写 ⇒ low
+    expect(assessRisk('bash_ro', [], { command: 'ls' })).toBe('low')
   })
   it('中间地带 → medium', () => {
     expect(assessRisk('custom_tool', [], {})).toBe('medium')
+    // 权限键与工具 id 不同名：实际询问用的键是 `write`（不是 `write_file`）
+    expect(assessRisk('write', [], { path: 'a.ts' })).toBe('medium')
+  })
+})
+
+// ===== P2-5（D4）=====
+
+describe('assessRisk · bash 走命令模式表（D4 回归：不再恒为 high）', () => {
+  it('整条命令都是只读命令 ⇒ low（`ls` 与 `rm -rf` 不再同标签）', () => {
+    expect(assessRisk('bash', [], { command: 'ls -la /tmp' })).toBe('low')
+    expect(assessRisk('bash', [], { command: 'pwd' })).toBe('low')
+    expect(assessRisk('bash', [], { command: 'echo hello' })).toBe('low')
+    expect(assessRisk('bash', [], { command: 'FOO=1 ls' })).toBe('low') // 前置环境变量赋值
+    expect(assessRisk('bash', [], { command: 'cat a.txt | grep -i foo' })).toBe('low') // 管道两边都只读
+    expect(assessRisk('bash', [], { command: 'ls && pwd; echo ok' })).toBe('low') // 多段
+  })
+
+  it('空设备重定向不算写 ⇒ low（`2>/dev/null` 不该把标签顶到 medium）', () => {
+    expect(assessRisk('bash', [], { command: 'ls -la 2>/dev/null' })).toBe('low')
+    expect(assessRisk('bash', [], { command: 'cat x &>/dev/null' })).toBe('low')
+    expect(assessRisk('bash', [], { command: 'cat x 2> /dev/null' })).toBe('low')
+    // 钉子：`> /dev/nullx` 不是空设备（负向前瞻）；且这里有真的 `>` ⇒ 至少 medium
+    expect(assessRisk('bash', [], { command: 'cat x 2>/dev/nullx' })).toBe('medium')
+  })
+
+  it('写入 / 命令替换 ⇒ medium', () => {
+    expect(assessRisk('bash', [], { command: 'ls > out.txt' })).toBe('medium')
+    expect(assessRisk('bash', [], { command: 'echo `whoami`' })).toBe('medium')
+    expect(assessRisk('bash', [], { command: 'echo $(ls)' })).toBe('medium')
+  })
+
+  it('首词不在只读白名单 ⇒ medium（跳板与读/写同词的工具一律不收）', () => {
+    expect(assessRisk('bash', [], { command: 'npm test' })).toBe('medium')
+    expect(assessRisk('bash', [], { command: 'git status' })).toBe('medium')
+    expect(assessRisk('bash', [], { command: 'ls | xargs rm' })).toBe('medium')
+    expect(assessRisk('bash', [], { command: 'env FOO=1 ls' })).toBe('medium')
+  })
+
+  it('只读首词带危险开关 ⇒ medium（`-exec` / `-delete` 是写）', () => {
+    expect(assessRisk('bash', [], { command: 'find . -name "*.ts"' })).toBe('low')
+    expect(assessRisk('bash', [], { command: 'find . -delete' })).toBe('medium')
+    expect(assessRisk('bash', [], { command: 'find . -exec echo {} +' })).toBe('medium')
+  })
+
+  it('拿不到命令文本 ⇒ high（保守默认，与改造前逐位一致）', () => {
+    expect(assessRisk('bash', [], {})).toBe('high')
+    expect(assessRisk('bash', [], { command: '' })).toBe('high')
+    expect(assessRisk('bash', [])).toBe('high')
   })
 })
 
