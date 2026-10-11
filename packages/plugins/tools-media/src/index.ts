@@ -12,19 +12,9 @@
 import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
-import { resolve, isAbsolute, relative } from 'node:path'
+// 路径边界收敛到 @harness/fs-guard（P0-4/P0-5/P3-1；原来是本包自带的**纯字符串**判定）
+import { resolvePath, isWithinCwd } from '@harness/fs-guard'
 import { readFile, stat, open } from 'node:fs/promises'
-
-// ===== 共享 helper =====
-
-function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
-}
-
-function isWithinCwd(filePath: string, cwd: string): boolean {
-  const rel = relative(cwd, filePath)
-  return !rel.startsWith('..') && !isAbsolute(rel)
-}
 
 /** 从文件头识别 MIME 类型（已知格式） */
 function detectMimeAndDim(buf: Uint8Array): { mime: string; width?: number; height?: number } {

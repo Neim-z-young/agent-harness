@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { rm, mkdir, writeFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
+import { existsSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import {
   readFileTool,
@@ -110,6 +110,14 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
     })
 
+    it('★经符号链接逃逸 ⇒ PATH_OUTSIDE_CWD（P0-4：旧实现只比字符串，这里**会通过**）', async () => {
+      // `up` 指向 cwd 的父目录 ⇒ 字符串视角下 `up/package.json` 在 cwd 内，真实位置在外面
+      symlinkSync(join(TMP_DIR, '..'), join(TMP_DIR, 'up'))
+      const res = await readFileTool.call({ path: 'up/package.json' }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+    })
+
     it('目录路径返回 NOT_A_FILE', async () => {
       const res = await readFileTool.call({ path: '.' }, makeCtx())
       expect(res.ok).toBe(false)
@@ -178,6 +186,14 @@ describe('@harness/tools-builtin', () => {
       const res = await writeFileTool.call({ path: '../../tmp/evil.txt', content: 'x' }, makeCtx())
       expect(res.ok).toBe(false)
       expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+    })
+
+    it('★经符号链接写文件 ⇒ PATH_OUTSIDE_CWD（写路径同样要挡，且目标还不存在）', async () => {
+      symlinkSync(join(TMP_DIR, '..'), join(TMP_DIR, 'up'))
+      const res = await writeFileTool.call({ path: 'up/evil.txt', content: 'x' }, makeCtx())
+      expect(res.ok).toBe(false)
+      expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+      expect(existsSync(join(TMP_DIR, '..', 'evil.txt'))).toBe(false)
     })
 
     it('安全声明：isReadOnly=false, isConcurrencySafe=false', () => {

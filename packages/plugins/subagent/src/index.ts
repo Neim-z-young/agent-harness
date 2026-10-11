@@ -39,9 +39,11 @@ import type { AgentRuntime, SessionManager } from '@harness/core'
 import type { Message } from '@harness/session'
 import { BusEvent, type Bus } from '@harness/bus'
 import { matchGlob } from '@harness/permission'
+// P0-5/P3-1：边界判定与 read_file / grep_file 用**同一份**（见 isInsideDir 的说明）
+import { isWithinCwd } from '@harness/fs-guard'
 import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync, rmSync } from 'node:fs'
 import { mkdir, writeFile, appendFile } from 'node:fs/promises'
-import { join, dirname, resolve as resolvePath, sep } from 'node:path'
+import { join, dirname, resolve as resolvePath } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWorktree } from './worktree'
 // SubagentTool 提示词文本（prompts/*.txt，import 加载，参考 opencode）
@@ -576,12 +578,14 @@ function writeResultFile(text: string, kind: 'output' | 'diff', resultsDir?: str
  * 判断路径是否落在给定目录内（含目录本身）。
  * 用于回答「read_file / grep_file 到底读不读得到这个文件」——工作目录外的路径它们会被
  * `PATH_OUTSIDE_CWD` 拒绝，所以提示里绝不能承诺可读。
+ *
+ * P0-5/P3-1：判定改用 `@harness/fs-guard`（realpath 版）—— 这段是**预判**上面两个工具
+ * 的行为，口径必须与它们实际使用的那一份**同一**，否则提示会与现实相反（符号链接一出现
+ * 就分叉）。原来是本文件自带的一份纯字符串比较。
  */
 function isInsideDir(p: string, dir?: string): boolean {
   if (!dir) return false
-  const a = resolvePath(p)
-  const b = resolvePath(dir)
-  return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep)
+  return isWithinCwd(resolvePath(p), dir)
 }
 
 // ===== 长任务中途草稿（观察点 7）=====

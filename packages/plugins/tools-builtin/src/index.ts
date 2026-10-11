@@ -27,7 +27,11 @@ import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // ===== 路径解析工具 =====
 
-import { resolve, isAbsolute, relative } from 'node:path'
+// 路径边界（resolvePath / isWithinCwd）：P0-4/P0-5/P3-1 收敛到 @harness/fs-guard **一处**
+// —— 原来这 6 个包各写一份，且是**纯字符串**判定（不解析符号链接）⇒ cwd 里一条
+// `ln -s /etc secret` 就让 `secret/passwd` 通过边界检查、实际却读到界外。
+import { resolvePath, isWithinCwd } from '@harness/fs-guard'
+import { resolve } from 'node:path'
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { spawn } from 'node:child_process'
@@ -41,17 +45,6 @@ import { analyzeBashCommand, type BashCommandFacts } from './bash-ast'
 /** bash 命令 AST 分析（公共 API；见 {@link analyzeBashCommand}） */
 export { analyzeBashCommand } from './bash-ast'
 export type { BashAstCommand, BashAstRedirect, BashCommandFacts } from './bash-ast'
-
-/** 将路径解析为绝对路径（相对 cwd），并返回归一化结果 */
-function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
-}
-
-/** 检查路径是否在 cwd 内（防止逃逸） */
-function isWithinCwd(filePath: string, cwd: string): boolean {
-  const rel = relative(cwd, filePath)
-  return !rel.startsWith('..') && !isAbsolute(rel)
-}
 
 // ========================================================================
 // 1. read_file 工具

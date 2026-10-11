@@ -26,6 +26,7 @@
     "@harness/computer-use": "workspace:*",
     "@harness/coordinator": "workspace:*",
     "@harness/core": "workspace:*",
+    "@harness/fs-guard": "workspace:*",
     "@harness/host": "workspace:*",
     "@harness/manage-plugin": "workspace:*",
     "@harness/mcp-client": "workspace:*",

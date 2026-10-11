@@ -15,8 +15,13 @@ import traverse, { type NodePath } from '@babel/traverse'
 import * as t from '@babel/types'
 import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
 import { existsSync, statSync } from 'node:fs'
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { collectJavaModuleInfo, collectJavaRenameSites, extractMulti, MULTI_EXT, verifyJavaSource } from './multi'
+// 路径边界（P0-5/P3-1）：收敛到 @harness/fs-guard 一处。引它**不破坏**本模块
+// "与 harness 解耦"的约定 —— fs-guard 是零依赖叶子包（只引 node:path / node:fs）。
+import { isWithinCwd, resolvePath } from '@harness/fs-guard'
+// 对外仍从 core 导出 `isWithinCwd`（`tools.ts` 在用；也避免改动公共面貌）
+export { isWithinCwd } from '@harness/fs-guard'
 
 // ===== 数据类型 =====
 
@@ -466,17 +471,7 @@ function collectRenameSites(ast: t.File, content: string, name: string): RenameS
   return [...sites.values()].sort((a, b) => a.start - b.start)
 }
 
-// ===== 共享 helper（自包含，避免跨包依赖）=====
-
-function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
-}
-
-/** 文件/目录是否在 cwd 范围内 */
-export function isWithinCwd(filePath: string, cwd: string): boolean {
-  const rel = relative(cwd, filePath)
-  return !rel.startsWith('..') && !isAbsolute(rel)
-}
+// ===== 共享 helper =====
 
 function isFile(p: string): boolean {
   try {

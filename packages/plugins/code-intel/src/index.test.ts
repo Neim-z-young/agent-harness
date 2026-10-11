@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -382,6 +382,20 @@ describe('code_symbols 工具', () => {
     expect(res.ok).toBe(false)
     if (res.ok) return
     expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+
+  it('★经符号链接逃逸 ⇒ PATH_OUTSIDE_CWD（P0-4：字符串判定会放行）', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'harness-codeintel-out-'))
+    try {
+      writeFileSync(join(outside, 'linked-out.ts'), 'export const x = 1\n')
+      symlinkSync(outside, join(dir, 'up'))
+      const res = await codeSymbolsTool(new CodeIntelIndex()).call!({ path: 'up' }, ctx)
+      expect(res.ok).toBe(false)
+      if (res.ok) return
+      expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 
   it('安全声明：只读 + 并发安全 + read 权限', () => {

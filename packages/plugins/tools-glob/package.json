@@ -16,7 +16,8 @@
   "dependencies": {
     "@harness/tool": "workspace:*",
     "@harness/plugin": "workspace:*",
-    "@harness/bus": "workspace:*"
+    "@harness/bus": "workspace:*",
+    "@harness/fs-guard": "workspace:*"
   },
   "scripts": {
     "dev": "tsc --noEmit --watch",

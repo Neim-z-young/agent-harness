@@ -6,12 +6,12 @@
  * 与权限/只读/并发安全声明，供直接装配或 REPL `/tools` 展示；MCP 路径见 `server.ts`。
  */
 
-import { resolve, isAbsolute } from 'node:path'
+// 路径边界收敛到 @harness/fs-guard（P0-5/P3-1）：本文件原来又抄了一份 resolvePath
+import { resolvePath, isWithinCwd } from '@harness/fs-guard'
 import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import {
   CodeIntelIndex,
   execSemanticEdit,
-  isWithinCwd,
   MAX_RESULTS,
   type CodeSymbol,
   type CodeReference,
@@ -24,12 +24,6 @@ import codeSymbolsPrompt from './prompts/code-symbols.txt'
 import codeReferencePrompt from './prompts/code-reference.txt'
 import codeDefinitionPrompt from './prompts/code-definition.txt'
 import codeSemanticEditPrompt from './prompts/code-semantic-edit.txt'
-
-// ===== 共享 helper =====
-
-function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
-}
 
 /** 结果中返回的最多条目数（与 core 一致） */
 

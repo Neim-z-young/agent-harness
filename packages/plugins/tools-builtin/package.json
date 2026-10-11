@@ -18,6 +18,7 @@
     "@harness/tool": "workspace:*",
     "@harness/plugin": "workspace:*",
     "@harness/bus": "workspace:*",
+    "@harness/fs-guard": "workspace:*",
     "tree-sitter-bash": "^0.25.1",
     "web-tree-sitter": "^0.27.0"
   },

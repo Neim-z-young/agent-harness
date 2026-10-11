@@ -19,19 +19,10 @@
 import { defineTool, Tool, ToolResult, ToolContext, fromJsonSchema, guardInput } from '@harness/tool'
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
-import { resolve, isAbsolute, relative, join } from 'node:path'
+// 路径边界收敛到 @harness/fs-guard（P0-4/P0-5/P3-1；原来是本包自带的**纯字符串**判定）
+import { resolvePath, isWithinCwd } from '@harness/fs-guard'
+import { relative, join } from 'node:path'
 import { stat, readdir } from 'node:fs/promises'
-
-// ===== 共享 helper（自包含）=====
-
-function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
-}
-
-function isWithinCwd(filePath: string, cwd: string): boolean {
-  const rel = relative(cwd, filePath)
-  return !rel.startsWith('..') && !isAbsolute(rel)
-}
 
 /**
  * glob 转 RegExp（支持 ** / * / ?）。

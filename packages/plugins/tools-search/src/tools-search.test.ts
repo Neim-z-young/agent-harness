@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -201,6 +201,33 @@ describe('grepFileTool', () => {
     expect(res.ok).toBe(true)
     if (!res.ok) return
     expect(res.output!.count).toBe(1)
+  })
+})
+
+describe('路径边界（P0-4/P0-5/P3-1：realpath 版 + 与全仓唯一一份）', () => {
+  it('绝对路径越界 ⇒ PATH_OUTSIDE_CWD', async () => {
+    const a = await listDirTool.call!({ path: '/etc' } as any, ctx)
+    expect(a.ok).toBe(false)
+    if (!a.ok) expect(a.error!.code).toBe('PATH_OUTSIDE_CWD')
+    const b = await grepFileTool.call!({ pattern: 'x', path: '/etc/hosts' } as any, ctx)
+    expect(b.ok).toBe(false)
+    if (!b.ok) expect(b.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+
+  it('★经符号链接逃逸 ⇒ 被拒（字符串判定会放行，realpath 判定挡住）', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'harness-search-out-'))
+    try {
+      writeFileSync(join(outside, 'linked-out.txt'), 'SEARCH_ME')
+      symlinkSync(outside, join(dir, 'up'))
+      const a = await listDirTool.call!({ path: 'up' } as any, ctx)
+      expect(a.ok).toBe(false)
+      if (!a.ok) expect(a.error!.code).toBe('PATH_OUTSIDE_CWD')
+      const b = await grepFileTool.call!({ pattern: 'SEARCH_ME', path: 'up/linked-out.txt' } as any, ctx)
+      expect(b.ok).toBe(false)
+      if (!b.ok) expect(b.error!.code).toBe('PATH_OUTSIDE_CWD')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 })
 

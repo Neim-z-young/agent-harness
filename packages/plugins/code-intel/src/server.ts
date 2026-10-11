@@ -10,8 +10,10 @@
  * `path` 相对该 cwd 解析（可绝对路径）。返回文本（便于 LLM 直接阅读）。
  */
 
-import { isAbsolute, resolve } from 'node:path'
 import { CodeIntelIndex, execSemanticEdit, MAX_RESULTS } from './core'
+// 路径边界：改用 @harness/fs-guard 的 realpath 版（P0-4/P0-5/P3-1）。
+// 它不在上面的"不 import harness"名单里 —— 零依赖叶子包，不是 harness 的一部分。
+import { resolvePath } from '@harness/fs-guard'
 
 // ===== MCP 结构（与 @harness/mcp-client 的 McpToolDef 同构，自包含避免跨包依赖）=====
 
@@ -254,12 +256,6 @@ export class CodeIntelMcpServer {
       respondError(-32603, String((err as Error)?.message ?? err))
     }
   }
-}
-
-// ===== 路径工具（自包含，不依赖 harness）=====
-
-function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
 }
 
 // ===== 与 registry / mcp-client 对接的 Transport =====

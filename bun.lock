@@ -14,6 +14,7 @@
         "@harness/computer-use": "workspace:*",
         "@harness/coordinator": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/fs-guard": "workspace:*",
         "@harness/host": "workspace:*",
         "@harness/manage-plugin": "workspace:*",
         "@harness/mcp-client": "workspace:*",
@@ -163,6 +164,10 @@
         "@harness/workspace": "workspace:*",
       },
     },
+    "packages/fs-guard": {
+      "name": "@harness/fs-guard",
+      "version": "0.1.0",
+    },
     "packages/host": {
       "name": "@harness/host",
       "version": "0.1.0",
@@ -235,6 +240,7 @@
         "@babel/parser": "^7.25.0",
         "@babel/traverse": "^7.25.0",
         "@babel/types": "^7.25.0",
+        "@harness/fs-guard": "workspace:*",
         "@harness/mcp-server-registry": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
@@ -424,6 +430,7 @@
         "@harness/agent": "workspace:*",
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/fs-guard": "workspace:*",
         "@harness/permission": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/session": "workspace:*",
@@ -456,6 +463,7 @@
       "dependencies": {
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
+        "@harness/fs-guard": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
         "tree-sitter-bash": "^0.25.1",
@@ -467,6 +475,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
+        "@harness/fs-guard": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -487,6 +496,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
+        "@harness/fs-guard": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -496,6 +506,7 @@
       "version": "0.1.0",
       "dependencies": {
         "@harness/bus": "workspace:*",
+        "@harness/fs-guard": "workspace:*",
         "@harness/plugin": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -611,6 +622,8 @@
     "@harness/core": ["@harness/core@workspace:packages/core"],
 
     "@harness/env-context": ["@harness/env-context@workspace:packages/plugins/env-context"],
+
+    "@harness/fs-guard": ["@harness/fs-guard@workspace:packages/fs-guard"],
 
     "@harness/herdr": ["@harness/herdr@workspace:packages/plugins/herdr"],
 

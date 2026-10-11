@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -125,6 +125,20 @@ describe('globTool', () => {
     expect(res.ok).toBe(false)
     if (res.ok) return
     expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+
+  it('★经符号链接逃逸 ⇒ 被拒（P0-4：字符串判定会放行，realpath 判定挡住）', async () => {
+    const outside = mkdtempSync(join(tmpdir(), 'harness-glob-out-'))
+    try {
+      writeFileSync(join(outside, 'linked-out.ts'), '')
+      symlinkSync(outside, join(dir, 'up'))
+      const res = await globTool.call!({ pattern: '*.ts', path: 'up' } as any, ctx)
+      expect(res.ok).toBe(false)
+      if (res.ok) return
+      expect(res.error!.code).toBe('PATH_OUTSIDE_CWD')
+    } finally {
+      rmSync(outside, { recursive: true, force: true })
+    }
   })
 
   it('非目录路径返回错误', async () => {

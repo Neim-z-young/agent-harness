@@ -20,6 +20,7 @@
     "@harness/mcp-server-registry": "workspace:*",
     "@harness/plugin": "workspace:*",
     "@harness/tool": "workspace:*",
+    "@harness/fs-guard": "workspace:*",
     "@types/babel__traverse": "^7.20.6",
     "tree-sitter-go": "^0.25.0",
     "tree-sitter-java": "^0.23.5",
