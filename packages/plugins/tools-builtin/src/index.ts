@@ -30,11 +30,18 @@ import type { AgentPlugin, Hooks } from '@harness/plugin'
 // 路径边界（resolvePath / isWithinCwd）：P0-4/P0-5/P3-1 收敛到 @harness/fs-guard **一处**
 // —— 原来这 6 个包各写一份，且是**纯字符串**判定（不解析符号链接）⇒ cwd 里一条
 // `ln -s /etc secret` 就让 `secret/passwd` 通过边界检查、实际却读到界外。
-import { resolvePath, isWithinCwd } from '@harness/fs-guard'
-import { resolve } from 'node:path'
+import {
+  resolvePath,
+  isWithinCwd,
+  isSensitiveReadPath,
+  findSensitiveReadPath,
+  resolveSensitiveReadPolicy,
+  type SensitiveReadPolicyInput,
+} from '@harness/fs-guard'
+import { resolve, relative } from 'node:path'
 import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 // 4 个原语工具的完整文档（documentation，参考 Claude Code / opencode），prompts/*.txt 加载
 import readFileDoc from './prompts/read-file.txt'
 import writeFileDoc from './prompts/write-file.txt'
@@ -104,108 +111,134 @@ const readFileInputSchema = fromJsonSchema<ReadFileInput>({
  * - isConcurrencySafe: true（并发安全）
  * - permission.key: 'read'
  */
-export const readFileTool = defineTool<ReadFileInput, ReadFileOutput>({
-  id: 'read_file',
-  /**
-   * 描述里**带一个可直接照抄的完整调用示例**，不只是字段说明。
-   *
-   * 为什么：真机（会话 `s_1790592617954_axqkk`）里 `read_file` 被发出 **14 次 `input: {}`**
-   * （`jeha1` 6 / `rra6h` 6 / `goggv` 2），每次都触发一轮「入参自愈」回喂 ——
-   * 自愈不吃步数，但**每一轮都是一次完整 prompt**（全 run 约 0.68M token ≈ 10%）。
-   * 规律是"重度用 read_file 的会话才丢"（以 grep 为主的 n6fl0 一次没丢），
-   * 且失败率随上下文变长而陡升 ⇒ 模型在长上下文里整段丢了 arguments。
-   * 字段清单说明了"要什么"，示例说明了"长什么样" —— 后者才是可照抄的形状。
-   */
-  description: '读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。'
-    + '调用示例：read_file({"path":"src/index.ts"})、read_file({"path":"src/index.ts","offset":1,"limit":80})；'
-    + 'path 是必填项，只给路径即可，不要省略 arguments。',
-  documentation: readFileDoc.trim(),
-  inputSchema: readFileInputSchema,
-  isReadOnly: () => true,
-  isConcurrencySafe: () => true,
-  permission: {
-    key: 'read',
-    extractPatterns: (input) => [input.path],
-  },
-  async call(input, ctx): Promise<ToolResult<ReadFileOutput>> {
-    // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardInput 的文档
-    const guard = guardInput(readFileInputSchema, input, 'path', 'PATH_REQUIRED')
-    if (!guard.ok) return { ok: false, error: guard.error }
-    const absPath = resolvePath(input.path, ctx.cwd)
+export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput } = {}): Tool<ReadFileInput, ReadFileOutput> {
+  const readDeny = resolveSensitiveReadPolicy(opts.readDeny)
+  return defineTool<ReadFileInput, ReadFileOutput>({
+    id: 'read_file',
+    /**
+     * 描述里**带一个可直接照抄的完整调用示例**，不只是字段说明。
+     *
+     * 为什么：真机（会话 `s_1790592617954_axqkk`）里 `read_file` 被发出 **14 次 `input: {}`**
+     * （`jeha1` 6 / `rra6h` 6 / `goggv` 2），每次都触发一轮「入参自愈」回喂 ——
+     * 自愈不吃步数，但**每一轮都是一次完整 prompt**（全 run 约 0.68M token ≈ 10%）。
+     * 规律是"重度用 read_file 的会话才丢"（以 grep 为主的 n6fl0 一次没丢），
+     * 且失败率随上下文变长而陡升 ⇒ 模型在长上下文里整段丢了 arguments。
+     * 字段清单说明了"要什么"，示例说明了"长什么样" —— 后者才是可照抄的形状。
+     */
+    description: '读取本地文件内容。支持行号范围、行号前缀和截断。只能读取工作目录内的文件。'
+      + '调用示例：read_file({"path":"src/index.ts"})、read_file({"path":"src/index.ts","offset":1,"limit":80})；'
+      + 'path 是必填项，只给路径即可，不要省略 arguments。',
+    documentation: readFileDoc.trim(),
+    inputSchema: readFileInputSchema,
+    isReadOnly: () => true,
+    isConcurrencySafe: () => true,
+    permission: {
+      key: 'read',
+      extractPatterns: (input) => [input.path],
+    },
+    async call(input, ctx): Promise<ToolResult<ReadFileOutput>> {
+      // 直调路径的结构守卫（管道路径已由 Step 1 拦过）——见 guardInput 的文档
+      const guard = guardInput(readFileInputSchema, input, 'path', 'PATH_REQUIRED')
+      if (!guard.ok) return { ok: false, error: guard.error }
+      const absPath = resolvePath(input.path, ctx.cwd)
 
-    // 路径安全检查
-    if (!isWithinCwd(absPath, ctx.cwd)) {
-      return {
-        ok: false,
-        error: {
-        message:
-          `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
-          'read_file / write_file / edit_file 只在工作目录内工作；' +
-          '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
-        code: 'PATH_OUTSIDE_CWD',
-      },
-      }
-    }
-
-    try {
-      const stats = await stat(absPath)
-      if (!stats.isFile()) {
+      // 路径安全检查
+      if (!isWithinCwd(absPath, ctx.cwd)) {
         return {
           ok: false,
-          error: { message: `"${input.path}" 不是文件`, code: 'NOT_A_FILE' },
+          error: {
+          message:
+            `路径 "${input.path}" 超出工作目录范围（工作目录：${ctx.cwd}）。` +
+            'read_file / write_file / edit_file 只在工作目录内工作；' +
+            '工作目录外请先在会话里说明要访问哪个路径及其用途，由用户确认后再处理。',
+          code: 'PATH_OUTSIDE_CWD',
+        },
         }
       }
 
-      const raw = await readFile(absPath, 'utf-8')
-      const allLines = raw.split('\n')
-      const totalLines = allLines.length
-
-      // 行范围
-      const startLine = Math.max(1, input.offset ?? 1)
-      const maxLines = input.limit ? Math.min(input.limit, MAX_READ_LINES) : MAX_READ_LINES
-      const endLine = Math.min(startLine + maxLines - 1, totalLines)
-      const selectedLines = allLines.slice(startLine - 1, endLine)
-
-      // 行号前缀
-      let content: string
-      if (input.showLineNumbers) {
-        const width = String(endLine).length
-        content = selectedLines
-          .map((line, i) => `${String(startLine + i).padStart(width, ' ')}→${line}`)
-          .join('\n')
-      } else {
-        content = selectedLines.join('\n')
+      // 读侧敏感文件（P0-3）：**边界内**的密钥/凭据默认拒读。
+      // “只能读工作目录内”只保证了边界，cwd 里的 `.env` / `id_rsa` 原本畅通。
+      // 判据用**相对 cwd 的路径**（与策略的匹配口径一致）；命中项写进消息，便于解释为何被拒。
+      if (readDeny) {
+        const rel = relative(ctx.cwd, absPath)
+        if (isSensitiveReadPath(rel, readDeny)) {
+          return {
+            ok: false,
+            error: {
+              message:
+                `拒绝读取敏感文件：${rel}（沙箱默认拒读凭据类文件：`
+                + '.env / id_rsa* / *.pem / .ssh/** / .aws/** / permissions.json 等）。'
+                + '确实需要时让用户确认后用 bash 读（bash 有独立的权限键与审批），'
+                + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
+              code: 'SANDBOX_READ_DENIED',
+            },
+          }
+        }
       }
 
-      // 截断
-      let truncated = false
-      if (content.length > MAX_CONTENT_CHARS) {
-        content = content.slice(0, MAX_CONTENT_CHARS) + '\n... [内容已截断，超过 256KB]'
-        truncated = true
-      }
-      if (endLine < totalLines) {
-        truncated = true
-      }
+      try {
+        const stats = await stat(absPath)
+        if (!stats.isFile()) {
+          return {
+            ok: false,
+            error: { message: `"${input.path}" 不是文件`, code: 'NOT_A_FILE' },
+          }
+        }
 
-      return {
-        ok: true,
-        output: {
-          path: absPath,
-          content,
-          totalLines,
-          linesRead: [startLine, endLine],
-          truncated,
-          size: stats.size,
-        },
+        const raw = await readFile(absPath, 'utf-8')
+        const allLines = raw.split('\n')
+        const totalLines = allLines.length
+
+        // 行范围
+        const startLine = Math.max(1, input.offset ?? 1)
+        const maxLines = input.limit ? Math.min(input.limit, MAX_READ_LINES) : MAX_READ_LINES
+        const endLine = Math.min(startLine + maxLines - 1, totalLines)
+        const selectedLines = allLines.slice(startLine - 1, endLine)
+
+        // 行号前缀
+        let content: string
+        if (input.showLineNumbers) {
+          const width = String(endLine).length
+          content = selectedLines
+            .map((line, i) => `${String(startLine + i).padStart(width, ' ')}→${line}`)
+            .join('\n')
+        } else {
+          content = selectedLines.join('\n')
+        }
+
+        // 截断
+        let truncated = false
+        if (content.length > MAX_CONTENT_CHARS) {
+          content = content.slice(0, MAX_CONTENT_CHARS) + '\n... [内容已截断，超过 256KB]'
+          truncated = true
+        }
+        if (endLine < totalLines) {
+          truncated = true
+        }
+
+        return {
+          ok: true,
+          output: {
+            path: absPath,
+            content,
+            totalLines,
+            linesRead: [startLine, endLine],
+            truncated,
+            size: stats.size,
+          },
+        }
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          return { ok: false, error: { message: `文件不存在: ${input.path}`, code: 'FILE_NOT_FOUND' } }
+        }
+        return { ok: false, error: { message: err.message ?? String(err), code: 'READ_ERROR' } }
       }
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        return { ok: false, error: { message: `文件不存在: ${input.path}`, code: 'FILE_NOT_FOUND' } }
-      }
-      return { ok: false, error: { message: err.message ?? String(err), code: 'READ_ERROR' } }
-    }
-  },
-})
+    },
+  })
+}
+
+/** 默认 read_file：内置敏感读清单（见 createReadFileTool） */
+export const readFileTool: Tool<ReadFileInput, ReadFileOutput> = createReadFileTool()
 
 // ========================================================================
 // 2. write_file 工具
@@ -353,6 +386,121 @@ export interface BashSandboxConfig {
   fallbackToHost?: boolean
   /** 宿主回退前是否经权限引擎确认：ask 模式会询问用户，allow 静默放行，deny 拦截。默认 true。 */
   requireHostApproval?: boolean
+  /**
+   * 资源上限（P1-1 / L1）。未设的项取 {@link DEFAULT_BASH_LIMITS}，**显式 `0` 表示该项不限制**，
+   * `false` 表示全部关掉。只在 **bash 族系**下经 `ulimit` 前置生效（非 bash 族系**不模拟**）。
+   */
+  limits?: BashLimits | false
+}
+
+/**
+ * 资源上限（P1-1）。全部单位见字段注释；**0 = 不限制**。
+ *
+ * 实现走 `ulimit` 抬头（子 shell 内生效），不依赖任何 native 模块。三条实测得来的约束
+ * 见 {@link buildLimitPreamble} 的注释（`-f` 的单位不统一、`-v` 在 macOS 不支持、
+ * 合并形态会互相连累）。
+ */
+export interface BashLimits {
+  /** CPU 秒数（`ulimit -t`）。wall-clock 超时（`timeoutMs`）已覆盖大部分场景，默认不设 */
+  cpuSeconds?: number
+  /** 单文件大小上限（KB，`ulimit -f`）。默认 2 GiB */
+  maxFileSizeKb?: number
+  /** 进程/线程数上限（`ulimit -u`，fork bomb 防线）。默认不设（理由见 DEFAULT_BASH_LIMITS） */
+  maxProcesses?: number
+  /** 虚拟内存上限（KB，`ulimit -v`）。⚠️ macOS 不支持（EINVAL）+ 会挡住 Node/npm ⇒ 默认不设 */
+  memoryKb?: number
+}
+
+// ===== 资源上限与进程树 kill（P0-6 / P1-1）=====
+
+/**
+ * 默认资源上限。**只开"单文件大小 2 GiB"** 一项，其余按需开 —— 理由是每一项的取舍不同：
+ *
+ * - `maxFileSizeKb`（**默认开**）：正常开发几乎不会写单个 >2 GiB 的文件，而"把磁盘写满"是最廉价
+ *   的一种破坏。默认 2 GiB。
+ * - `maxProcesses`（默认不设）：`ulimit -u` 在 macOS 上**按用户计**（还把线程算进去），本机默认
+ *   已经是 2666；压到 1024 之类的"安全值"会让忙碌机器上的**正常构建 fork 失败**，而症状是
+ *   "莫名其妙的报错"。宁可少挡一点，也不制造无法归因的失败。
+ * - `memoryKb`（默认不设）：`ulimit -v` 在 macOS 上**根本不支持**（实测 `Invalid argument`），
+ *   在 Linux 上也会挡住 Node/npm（V8 预留大块虚拟内存）。
+ * - `cpuSeconds`（默认不设）：`timeoutMs` 的 wall-clock 超时已经能杀，而 `-t` 会误伤长构建。
+ */
+export const DEFAULT_BASH_LIMITS: Required<BashLimits> = {
+  cpuSeconds: 0,
+  maxFileSizeKb: 2 * 1024 * 1024,
+  maxProcesses: 0,
+  memoryKb: 0,
+}
+
+/** 把配置解析成"四项都有值"的形态（`0` = 不限制）；`false` ⇒ 全部关掉（四项全 0）。 */
+export function resolveBashLimits(cfg: BashSandboxConfig['limits']): Required<BashLimits> {
+  if (cfg === false) return { cpuSeconds: 0, maxFileSizeKb: 0, maxProcesses: 0, memoryKb: 0 }
+  const l = cfg ?? {}
+  return {
+    cpuSeconds: l.cpuSeconds ?? DEFAULT_BASH_LIMITS.cpuSeconds,
+    maxFileSizeKb: l.maxFileSizeKb ?? DEFAULT_BASH_LIMITS.maxFileSizeKb,
+    maxProcesses: l.maxProcesses ?? DEFAULT_BASH_LIMITS.maxProcesses,
+    memoryKb: l.memoryKb ?? DEFAULT_BASH_LIMITS.memoryKb,
+  }
+}
+
+/**
+ * 组装 `ulimit` 抬头（P1-1）。**非 bash 族系返回空串**（原则是"不模拟"），`0` 的项不出现。
+ *
+ * 两个实测得来的坑（都不是想当然能对的）：
+ *
+ * 1. **`ulimit -f` 的单位不统一**：macOS 的 bash 是 **1 = 1024 字节**（`ulimit -f 100` ⇒
+ *    `RLIMIT_FSIZE` = 102400，实测），而 Linux/POSIX 是 **1 = 512 字节块**。对外只暴露
+ *    `maxFileSizeKb`，这里按平台换算 —— 不换算的话，2 GiB 的默认值在 macOS 上会缩成 2 MiB
+ *    （每次写文件都超限），在 Linux 上会放大 512 倍（等于没设）。
+ * 2. **每个选项各起一次 `ulimit`**，不用合并形态：合并时任一项失败会**连累其它项**。macOS 上
+ *    `ulimit -v` 直接 `Invalid argument`，写成 `ulimit -t 5 -v 100 2>/dev/null` 会把 `-t`
+ *    一起丢掉，而且因为 `2>/dev/null` 而毫无声音。分开写，失败只影响它自己。
+ */
+export function buildLimitPreamble(
+  limits: Required<BashLimits> | undefined,
+  family: ShellFamily,
+  platform: string = process.platform,
+): string {
+  if (!limits || family !== 'bash') return ''
+  const unitBytes = platform === 'darwin' ? 1024 : 512
+  const stmts: string[] = []
+  if (limits.cpuSeconds > 0) stmts.push(`ulimit -t ${Math.floor(limits.cpuSeconds)}`)
+  if (limits.maxFileSizeKb > 0) stmts.push(`ulimit -f ${Math.ceil((limits.maxFileSizeKb * 1024) / unitBytes)}`)
+  if (limits.maxProcesses > 0) stmts.push(`ulimit -u ${Math.floor(limits.maxProcesses)}`)
+  if (limits.memoryKb > 0) stmts.push(`ulimit -v ${Math.floor(limits.memoryKb)}`)
+  if (stmts.length === 0) return ''
+  return stmts.map((s) => `${s} 2>/dev/null; `).join('')
+}
+
+/**
+ * 杀**整棵进程树**（P0-6）。
+ *
+ * 为什么不能只 `child.kill()`：那只把信号发给 shell 自己。`npm run dev` / `vite` / 后台
+ * `sleep &` 这类命令的**子孙进程会成为孤儿继续跑**（占端口、写文件、出网）—— 超时了而沙箱里
+ * 的东西还活着，"隔离"就名存实亡。
+ *
+ * - POSIX：spawn 时带 `detached: true` 让子进程成为**新进程组的组长**，于是 `kill(-pid)`
+ *   一次覆盖全组（含所有后代）。
+ * - Windows：没有"进程组信号"，走 `taskkill /T /F`。
+ * - 两者都不可用（如组已消失）⇒ 退回杀直接子进程，至少不比改造前差。
+ */
+export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGKILL'): void {
+  const pid = child.pid
+  if (typeof pid === 'number' && pid > 0) {
+    if (process.platform === 'win32') {
+      try {
+        spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' })
+        return
+      } catch { /* taskkill 不可用 ⇒ 退回单进程 */ }
+    } else {
+      try {
+        process.kill(-pid, signal)
+        return
+      } catch { /* 组不存在 / 已退出 ⇒ 退回单进程 */ }
+    }
+  }
+  try { child.kill(signal) } catch { /* 已退出 */ }
 }
 
 /** Shell 族系 */
@@ -614,6 +762,8 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
     : [...DEFAULT_DANGEROUS_PATTERNS, ...(config.additionalDangerous ?? [])]
   const allowlist = config.allowlist
   const keepEnv = config.keepEnv ?? []
+  // P1-1：资源上限（仅 bash 族系生效，见 buildLimitPreamble）
+  const limits = resolveBashLimits(config.limits)
 
   const shell = getShell()
 
@@ -730,7 +880,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
                 error: { message: `命令不在沙箱白名单内，宿主回退被拒绝：${firstCmd}`, code: 'SANDBOX_HOST_DENIED' },
               }
             }
-            return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
+            return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits })
           }
           return {
             ok: false,
@@ -741,7 +891,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
 
       // ---- 沙箱内执行 ----
       const sandboxResult = await runBash({
-        command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal,
+        command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal, limits,
       })
 
       // ---- 回退兜底：非破坏性命令在沙箱内未按预期执行（spawn 失败 / env 隔离开致命令非零退出）时提升到宿主 bash ----
@@ -753,7 +903,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
             error: { message: `命令在沙箱内执行失败，宿主回退被拒绝`, code: 'SANDBOX_HOST_DENIED' },
           }
         }
-        return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true })
+        return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits })
       }
 
       // 非 bash 环境：给模型一个可见提示，避免它把 exit 127/命令未找到误判为命令本身问题。
@@ -1138,6 +1288,16 @@ export interface ReadOnlyBashConfig {
   rootDir?: string
   /** 超时（毫秒，默认 15000 —— 只读命令通常很快，卡住多半是错的） */
   timeoutMs?: number
+  /**
+   * 资源上限（P1-1）。只读**不等于**资源安全：白名单里有 `python3 -c` / `find`，一样能跑飞。
+   * 默认同 {@link DEFAULT_BASH_LIMITS}。
+   */
+  limits?: BashLimits | false
+  /**
+   * 读侧敏感文件策略（P0-3）。缺省用内置清单（`cat .env` / `head .ssh/id_rsa` 这类被拒）；
+   * `false` 关闭；给对象则**替换**内置清单。
+   */
+  readDeny?: SensitiveReadPolicyInput
 }
 
 /**
@@ -1161,6 +1321,8 @@ export interface ReadOnlyBashConfig {
 export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<ReadOnlyBashInput, BashOutput> {
   const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
   const timeoutDefault = config.timeoutMs ?? 15_000
+  const limits = resolveBashLimits(config.limits)
+  const readDeny = resolveSensitiveReadPolicy(config.readDeny)
   const shell = getShell()
 
   return defineTool<ReadOnlyBashInput, BashOutput>({
@@ -1213,6 +1375,28 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
         if (!astVerdict.ok) {
           return { ok: false, error: { message: astVerdict.reason, code: astVerdict.code } }
         }
+        // 读侧敏感文件（P0-3）：只读工具**不是“什么都能读”**。
+        // `cat .env` / `head .ssh/id_rsa` 完全在白名单内，所以这道闸必须在只读判定**之外**。
+        // 判据落在**参数里的路径字面量**上（与 read_file 同一份策略）；`facts?.ok` 不成立时
+        // （wasm 不可用 / 语法错误）本闸与上面的 AST 门**同时失效** —— 口径一致，不假装摸到了。
+        if (readDeny) {
+          const operands: string[] = []
+          for (const cmd of facts.commands) {
+            for (const a of cmd.args) if (a.text !== null) operands.push(a.text)
+          }
+          const hit = findSensitiveReadPath(operands, readDeny)
+          if (hit !== undefined) {
+            return {
+              ok: false,
+              error: {
+                message:
+                  `只读模式拒绝：命令引用了敏感文件「${hit}」（沙箱默认拒读凭据类文件）。`
+                  + '确实需要读，让用户确认后用 bash（有独立的权限键与审批）。',
+                code: 'SANDBOX_READ_DENIED',
+              },
+            }
+          }
+        }
       }
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
       const requestedCwd = input.cwd ? resolvePath(input.cwd, ctx.cwd) : null
@@ -1231,6 +1415,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
         env,
         timeoutMs: input.timeoutMs ?? timeoutDefault,
         signal: ctx.signal,
+        limits,
       })
       return result
     },
@@ -1250,14 +1435,25 @@ function runBash(opts: {  command: string
   signal?: AbortSignal
   viaHost?: boolean
   shell?: ResolvedShell
+  /**
+   * 资源上限（P1-1）。⚠️ `viaHost` 时**不套**（宿主回退＝宿主全权，与放开白名单/env 隔离
+   * 同口径）—— 这是 P0-7 记的那个已知洞，不在本次修复范围。
+   */
+  limits?: Required<BashLimits>
 }): Promise<ToolResult<BashOutput>> {
   const sh = opts.shell ?? getShell()
   const startedAt = Date.now()
+  // P1-1：ulimit 抬头只加在**真正要发出去的**命令上；`output.command` 仍是原文（遥测/展示不被污染）。
+  const command = opts.viaHost ? opts.command : `${buildLimitPreamble(opts.limits, sh.family)}${opts.command}`
   return new Promise((resolvePromise) => {
-    const child = spawn(sh.program, [...sh.args, opts.command], {
+    const child = spawn(sh.program, [...sh.args, command], {
       cwd: opts.cwd,
       env: opts.env,
       stdio: ['ignore', 'pipe', 'pipe'],
+      // P0-6：让子进程成为新进程组的组长 ⇒ 超时/中断时 `kill(-pid)` 一次覆盖整棵树。
+      // 不影响终端 Ctrl-C —— CLI 的中断走 AbortController（repl 的 SIGINT / TUI 的 Ctrl-C
+      // 都调 `activeAbort.current.abort()`，再经 ctx.signal 传到下面那个 abort 监听）。
+      detached: process.platform !== 'win32',
     })
 
     let stdout = ''
@@ -1268,7 +1464,7 @@ function runBash(opts: {  command: string
     const timer = setTimeout(() => {
       if (!settled) {
         timedOut = true
-        child.kill('SIGKILL')
+        killProcessTree(child)
       }
     }, opts.timeoutMs)
 
@@ -1322,7 +1518,7 @@ function runBash(opts: {  command: string
         if (!settled) {
           settled = true
           clearTimeout(timer)
-          child.kill('SIGKILL')
+          killProcessTree(child)
           resolvePromise({
             ok: false,
             error: { message: '操作被中断', code: 'ABORTED' },
@@ -1334,7 +1530,7 @@ function runBash(opts: {  command: string
           if (!settled) {
             settled = true
             clearTimeout(timer)
-            child.kill('SIGKILL')
+            killProcessTree(child)
             resolvePromise({
               ok: false,
               error: { message: '操作被中断', code: 'ABORTED' },
@@ -1589,6 +1785,11 @@ export function createToolsBuiltinPlugin(options?: {
   toolIds?: string[]
   bash?: BashSandboxConfig
   readOnlyBash?: ReadOnlyBashConfig | false
+  /**
+   * 读侧敏感文件策略（P0-3），同时作用于 `read_file` 与 `bash_ro`（两者共用同一份判据）。
+   * 缺省 = 内置清单；`false` = 关闭；给对象 = 替换。见 {@link createReadFileTool}。
+   */
+  readDeny?: SensitiveReadPolicyInput
 }): AgentPlugin {
   const toolIds = options?.toolIds
   const tools = toolIds
@@ -1596,8 +1797,16 @@ export function createToolsBuiltinPlugin(options?: {
     : builtinTools
         .filter((t) => !(t.id === 'bash_ro' && options?.readOnlyBash === false))
         .map((t) => {
+          if (t.id === 'read_file') return createReadFileTool({ readDeny: options?.readDeny })
           if (t.id === 'bash' && options?.bash) return createBashTool(options.bash)
-          if (t.id === 'bash_ro' && options?.readOnlyBash) return createReadOnlyBashTool(options.readOnlyBash)
+          if (t.id === 'bash_ro') {
+            // 插件级 `readDeny` 合并进 bash_ro 自己的配置（⚠️ 用 `!== undefined` 区分
+            // “没配”与“显式 false 关闭”—— 前者用默认清单，后者要真的关掉）。
+            if (options?.readOnlyBash === undefined && options?.readDeny === undefined) return t
+            const ro: ReadOnlyBashConfig = { ...(options?.readOnlyBash ?? {}) }
+            if (options?.readDeny !== undefined) ro.readDeny = options.readDeny
+            return createReadOnlyBashTool(ro)
+          }
           return t
         })
 

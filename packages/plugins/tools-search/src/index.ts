@@ -21,7 +21,13 @@ import { defineTool, Tool, ToolResult, ToolContext, fromJsonSchema } from '@harn
 import type { AgentPlugin, Hooks } from '@harness/plugin'
 
 // 路径边界收敛到 @harness/fs-guard（P0-4/P0-5/P3-1；原来是本包自带的**纯字符串**判定）
-import { resolvePath, isWithinCwd } from '@harness/fs-guard'
+import {
+  resolvePath,
+  isWithinCwd,
+  isSensitiveReadPath,
+  resolveSensitiveReadPolicy,
+  type SensitiveReadPolicyInput,
+} from '@harness/fs-guard'
 import { join } from 'node:path'
 import { stat, readFile, readdir } from 'node:fs/promises'
 
@@ -213,159 +219,182 @@ export function escapeRegExp(text: string): string {
   return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 }
 
-export const grepFileTool = defineTool<GrepFileInput, GrepFileOutput>({
-  id: 'grep_file',
-  description:
-    '在文件或目录中搜索文本。pattern 默认按**正则**解释；编译失败会自动退化为字面量搜索并在结果里注明。' +
-    '要搜纯文本（如 `](`、`![`、`.*` 这类符号）请显式传 literal:true。支持 glob 过滤、大小写、递归。',
-  inputSchema: fromJsonSchema<GrepFileInput>({
-    type: 'object',
-    properties: {
-      // ⚠️ 这条描述曾经写的是「要搜索的文本（字面量）」，与实现（按正则编译）矛盾 ——
-      // 模型信了描述、传 `](` `![` 这类 Markdown 片段，真机实测该工具 113 次调用里 43 次
-      // 以 INVALID_REGEX 告终（38%），并把子 Agent 拖到 120s 硬超时。描述即契约，别写反。
-      pattern: { type: 'string', description: '搜索模式：默认按正则解释；literal:true 时按纯文本' },
-      path: { type: 'string', description: '搜索根目录或文件（默认 "."）' },
-      recursive: { type: 'boolean', description: '是否递归子目录（默认 true）' },
-      // 实现是 `caseSensitive === false ? 'gi' : 'g'` ⇒ 缺省=区分大小写。原描述写「默认 false」是反的。
-      caseSensitive: { type: 'boolean', description: '是否区分大小写（默认 true = 区分；传 false 则忽略大小写）' },
-      include: { type: 'string', description: '文件名过滤 glob（如 "*.ts"）' },
-      maxResults: { type: 'number', description: '最大匹配数' },
-      literal: { type: 'boolean', description: '按纯文本搜索，不做正则解释（默认 false）' },
+export function createGrepFileTool(opts: { readDeny?: SensitiveReadPolicyInput } = {}): Tool<GrepFileInput, GrepFileOutput> {
+  const readDeny = resolveSensitiveReadPolicy(opts.readDeny)
+  return defineTool<GrepFileInput, GrepFileOutput>({
+    id: 'grep_file',
+    description:
+      '在文件或目录中搜索文本。pattern 默认按**正则**解释；编译失败会自动退化为字面量搜索并在结果里注明。' +
+      '要搜纯文本（如 `](`、`![`、`.*` 这类符号）请显式传 literal:true。支持 glob 过滤、大小写、递归。',
+    inputSchema: fromJsonSchema<GrepFileInput>({
+      type: 'object',
+      properties: {
+        // ⚠️ 这条描述曾经写的是「要搜索的文本（字面量）」，与实现（按正则编译）矛盾 ——
+        // 模型信了描述、传 `](` `![` 这类 Markdown 片段，真机实测该工具 113 次调用里 43 次
+        // 以 INVALID_REGEX 告终（38%），并把子 Agent 拖到 120s 硬超时。描述即契约，别写反。
+        pattern: { type: 'string', description: '搜索模式：默认按正则解释；literal:true 时按纯文本' },
+        path: { type: 'string', description: '搜索根目录或文件（默认 "."）' },
+        recursive: { type: 'boolean', description: '是否递归子目录（默认 true）' },
+        // 实现是 `caseSensitive === false ? 'gi' : 'g'` ⇒ 缺省=区分大小写。原描述写「默认 false」是反的。
+        caseSensitive: { type: 'boolean', description: '是否区分大小写（默认 true = 区分；传 false 则忽略大小写）' },
+        include: { type: 'string', description: '文件名过滤 glob（如 "*.ts"）' },
+        maxResults: { type: 'number', description: '最大匹配数' },
+        literal: { type: 'boolean', description: '按纯文本搜索，不做正则解释（默认 false）' },
+      },
+      required: ['pattern'],
+      additionalProperties: false,
+    }),
+    isReadOnly: () => true,
+    isConcurrencySafe: () => true,
+    permission: {
+      key: 'read',
+      extractPatterns: (input) => [input.path ?? '.'],
     },
-    required: ['pattern'],
-    additionalProperties: false,
-  }),
-  isReadOnly: () => true,
-  isConcurrencySafe: () => true,
-  permission: {
-    key: 'read',
-    extractPatterns: (input) => [input.path ?? '.'],
-  },
-  async call(input, ctx): Promise<ToolResult<GrepFileOutput>> {
-    const relPath = input.path ?? '.'
-    const absPath = resolvePath(relPath, ctx.cwd)
+    async call(input, ctx): Promise<ToolResult<GrepFileOutput>> {
+      const relPath = input.path ?? '.'
+      const absPath = resolvePath(relPath, ctx.cwd)
 
-    if (!isWithinCwd(absPath, ctx.cwd)) {
-      return {
-        ok: false,
-        error: { message: `路径 "${relPath}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
+      if (!isWithinCwd(absPath, ctx.cwd)) {
+        return {
+          ok: false,
+          error: { message: `路径 "${relPath}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' },
+        }
       }
-    }
 
-    try {
-      // pattern 的解释口径 —— 这里曾是全仓失败率最高的工具问题。
-      // 过去：schema 写「字面量」、实现按正则编译，且编译失败**硬报错**。模型要搜 Markdown 链接
-      // 语法（`](` / `![` / `../`）时必失败，43/113 = 38%，重试风暴还把子 Agent 拖到硬超时。
-      // 现在：literal=true 直接纯文本；否则先试正则，**编译失败自动退化为字面量**，
-      // 并在输出里用 notify 说清"我改了什么" —— 不静默改口径，也不为可恢复的输入让整轮报废。
-      const literal = input.literal === true
-      const flags = input.caseSensitive === false ? 'gi' : 'g'
-      let regex: RegExp
-      let literalFallback: string | undefined
-      if (literal) {
-        regex = new RegExp(escapeRegExp(input.pattern), flags)
-      } else {
-        try {
-          regex = new RegExp(input.pattern, flags)
-        } catch (e: any) {
-          literalFallback = e?.message ?? String(e)
+      try {
+        //        try {
+          // 读侧敏感文件（P0-3）：边界内的凭据文件（`.env` / `id_rsa` / `.ssh/**` …）默认拒读。
+          // 入参路径本身命中就直接拒；递归遍历时还会逐文件跳（见 searchFile）。
+          if (readDeny && isSensitiveReadPath(relPath, readDeny)) {
+            return {
+              ok: false,
+              error: {
+                message:
+                  `拒绝检索敏感文件：${relPath}（沙箱默认拒读凭据类文件）。`
+                  + '确实需要，让用户确认后用 bash 读（有独立的权限键与审批）。',
+                code: 'SANDBOX_READ_DENIED',
+              },
+            }
+          }
+          // pattern 的解释口径 —— 这里曾是全仓失败率最高的工具问题。
+        // 过去：schema 写「字面量」、实现按正则编译，且编译失败**硬报错**。模型要搜 Markdown 链接
+        // 语法（`](` / `![` / `../`）时必失败，43/113 = 38%，重试风暴还把子 Agent 拖到硬超时。
+        // 现在：literal=true 直接纯文本；否则先试正则，**编译失败自动退化为字面量**，
+        // 并在输出里用 notify 说清"我改了什么" —— 不静默改口径，也不为可恢复的输入让整轮报废。
+        const literal = input.literal === true
+        const flags = input.caseSensitive === false ? 'gi' : 'g'
+        let regex: RegExp
+        let literalFallback: string | undefined
+        if (literal) {
           regex = new RegExp(escapeRegExp(input.pattern), flags)
-        }
-      }
-
-      const recursive = input.recursive ?? true
-      const includeGlob = input.include ?? '*'
-      const maxResults = input.maxResults ?? 100
-      const matches: GrepMatch[] = []
-      let filesSearched = 0
-      let truncated = false
-
-      async function searchFile(filePath: string, relFilePath: string): Promise<void> {
-        if (truncated) return
-        filesSearched++
-        if (filesSearched > MAX_GREP_FILES) { truncated = true; return }
-
-        try {
-          const content = await readFile(filePath, 'utf-8')
-          const lines = content.split('\n')
-          for (let i = 0; i < lines.length; i++) {
-            if (matches.length >= maxResults) { truncated = true; return }
-            regex.lastIndex = 0
-            const m = regex.exec(lines[i])
-            if (m) {
-              matches.push({
-                filePath,
-                relativePath: relFilePath,
-                line: i + 1,
-                content: lines[i],
-                match: m[1] ?? m[0],
-              })
-            }
+        } else {
+          try {
+            regex = new RegExp(input.pattern, flags)
+          } catch (e: any) {
+            literalFallback = e?.message ?? String(e)
+            regex = new RegExp(escapeRegExp(input.pattern), flags)
           }
-        } catch {
-          // 跳过无法读取的文件
         }
-      }
 
-      async function scanDir(dirPath: string, relBase: string): Promise<void> {
-        if (truncated) return
-        const items = await readdir(dirPath, { withFileTypes: true })
-        for (const item of items) {
+        const recursive = input.recursive ?? true
+        const includeGlob = input.include ?? '*'
+        const maxResults = input.maxResults ?? 100
+        const matches: GrepMatch[] = []
+        let filesSearched = 0
+        let truncated = false
+
+        async function searchFile(filePath: string, relFilePath: string): Promise<void> {
           if (truncated) return
-          if (item.name.startsWith('.') && !includeGlob.startsWith('.')) continue
+          // 读侧敏感文件（P0-3）：**递归遍历时也要跳过** —— 只查入参路径挡不住
+          // `grep -r 'KEY' .` 这类把 `.env` 当普通文件读到的形态。
+          if (readDeny && isSensitiveReadPath(relFilePath, readDeny)) return
+          filesSearched++
+          if (filesSearched > MAX_GREP_FILES) { truncated = true; return }
 
-          const itemAbs = join(dirPath, item.name)
-          const itemRel = relBase ? `${relBase}/${item.name}` : item.name
+          try {
+            const content = await readFile(filePath, 'utf-8')
+            const lines = content.split('\n')
+            for (let i = 0; i < lines.length; i++) {
+              if (matches.length >= maxResults) { truncated = true; return }
+              regex.lastIndex = 0
+              const m = regex.exec(lines[i])
+              if (m) {
+                matches.push({
+                  filePath,
+                  relativePath: relFilePath,
+                  line: i + 1,
+                  content: lines[i],
+                  match: m[1] ?? m[0],
+                })
+              }
+            }
+          } catch {
+            // 跳过无法读取的文件
+          }
+        }
 
-          if (item.isDirectory()) {
-            if (recursive) await scanDir(itemAbs, itemRel)
-          } else if (item.isFile()) {
-            if (globMatch(includeGlob, item.name)) {
-              await searchFile(itemAbs, itemRel)
+        async function scanDir(dirPath: string, relBase: string): Promise<void> {
+          if (truncated) return
+          const items = await readdir(dirPath, { withFileTypes: true })
+          for (const item of items) {
+            if (truncated) return
+            if (item.name.startsWith('.') && !includeGlob.startsWith('.')) continue
+
+            const itemAbs = join(dirPath, item.name)
+            const itemRel = relBase ? `${relBase}/${item.name}` : item.name
+
+            if (item.isDirectory()) {
+              if (recursive) await scanDir(itemAbs, itemRel)
+            } else if (item.isFile()) {
+              if (globMatch(includeGlob, item.name)) {
+                await searchFile(itemAbs, itemRel)
+              }
             }
           }
         }
-      }
 
-      const stats = await stat(absPath)
-      if (stats.isFile()) {
-        await searchFile(absPath, relPath)
-      } else if (stats.isDirectory()) {
-        await scanDir(absPath, '')
-      } else {
-        return { ok: false, error: { message: `路径不是文件或目录: ${relPath}`, code: 'INVALID_PATH' } }
-      }
+        const stats = await stat(absPath)
+        if (stats.isFile()) {
+          await searchFile(absPath, relPath)
+        } else if (stats.isDirectory()) {
+          await scanDir(absPath, '')
+        } else {
+          return { ok: false, error: { message: `路径不是文件或目录: ${relPath}`, code: 'INVALID_PATH' } }
+        }
 
-      return {
-        ok: true,
-        output: {
-          pattern: input.pattern,
-          path: absPath,
-          matches,
-          count: matches.length,
-          filesSearched,
-          truncated,
-          ...(literal
-            ? { mode: 'literal' as const }
-            : literalFallback
-              ? {
-                  mode: 'literal' as const,
-                  notify:
-                    `pattern 不是合法正则（${literalFallback}），已按**字面量**搜索 "${input.pattern}"。` +
-                    `若你要的是正则，请修正后重试；若本意就是纯文本，下次传 literal:true。`,
-                }
-              : {}),
-        },
+        return {
+          ok: true,
+          output: {
+            pattern: input.pattern,
+            path: absPath,
+            matches,
+            count: matches.length,
+            filesSearched,
+            truncated,
+            ...(literal
+              ? { mode: 'literal' as const }
+              : literalFallback
+                ? {
+                    mode: 'literal' as const,
+                    notify:
+                      `pattern 不是合法正则（${literalFallback}），已按**字面量**搜索 "${input.pattern}"。` +
+                      `若你要的是正则，请修正后重试；若本意就是纯文本，下次传 literal:true。`,
+                  }
+                : {}),
+          },
+        }
+      } catch (err: any) {
+        if (err.code === 'ENOENT') {
+          return { ok: false, error: { message: `路径不存在: ${relPath}`, code: 'PATH_NOT_FOUND' } }
+        }
+        return { ok: false, error: { message: err.message ?? String(err), code: 'GREP_ERROR' } }
       }
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        return { ok: false, error: { message: `路径不存在: ${relPath}`, code: 'PATH_NOT_FOUND' } }
-      }
-      return { ok: false, error: { message: err.message ?? String(err), code: 'GREP_ERROR' } }
-    }
-  },
-})
+    },
+  })
+}
+
+/** 默认 grep_file：内置敏感读清单（见 createGrepFileTool） */
+export const grepFileTool: Tool<GrepFileInput, GrepFileOutput> = createGrepFileTool()
 
 // ========================================================================
 // 3. AgentPlugin 入口
@@ -382,11 +411,13 @@ export const searchTools: Tool[] = [listDirTool, grepFileTool]
  */
 export function createToolsSearchPlugin(options?: {
   toolIds?: string[]
+  /** 读侧敏感文件策略（P0-3），作用于 `grep_file`。缺省 = 内置清单；`false` = 关闭。 */
+  readDeny?: SensitiveReadPolicyInput
 }): AgentPlugin {
   const toolIds = options?.toolIds
   const tools = toolIds
     ? searchTools.filter((t) => toolIds.includes(t.id))
-    : searchTools
+    : searchTools.map((t) => (t.id === 'grep_file' ? createGrepFileTool({ readDeny: options?.readDeny }) : t))
 
   return {
     id: 'tools.search',

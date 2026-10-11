@@ -4,7 +4,14 @@ import { tmpdir } from 'node:os'
 import { join, dirname, sep } from 'node:path'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 
-import { resolvePath, realpathBestEffort, isWithinRoot, isWithinCwd } from './index'
+import {
+  resolvePath,
+  realpathBestEffort,
+  isWithinRoot,
+  isWithinCwd,
+  isSensitiveReadPath,
+  findSensitiveReadPath,
+} from './index'
 
 // ===== 工具 =====
 
@@ -187,5 +194,76 @@ describe('P3-1 守卫：resolvePath / isWithinCwd 全仓只有这一份', () => 
       if (dup.test(readFileSync(f, 'utf8'))) hits.push(f.slice(repoRoot.length + 1))
     }
     expect(hits).toEqual([])
+  })
+})
+
+// ===== P0-3：读侧敏感文件策略 =====
+
+describe('isSensitiveReadPath', () => {
+  const hit = (p: string) => expect(isSensitiveReadPath(p)).toBe(true)
+  const miss = (p: string) => expect(isSensitiveReadPath(p)).toBe(false)
+
+  it('凭据文件名命中（含子目录里的同名文件）', () => {
+    hit('.env')
+    hit('.env.local')
+    hit('.env.production.local')
+    hit('apps/web/.env')
+    hit('.npmrc')
+    hit('id_rsa')
+    hit('id_ed25519')
+    hit('deploy/client.key')
+    hit('certs/server.pem')
+    hit('permissions.json')
+    hit('.harness/permissions.json')
+    hit('.harness/.config-key')
+    hit('credentials.json')
+  })
+
+  it('凭据目录段命中', () => {
+    hit('.ssh/config')
+    hit('.ssh/id_rsa')
+    hit('.aws/credentials')
+    hit('.gnupg/secring.gpg')
+    hit('.kube/config')
+    hit('.docker/config.json')
+    hit('.config/gh/hosts.yml')
+    hit('home/.aws/credentials')
+  })
+
+  it('★例外优先：公钥与裸模板不算敏感（否则模型连"该配哪些键"都看不到）', () => {
+    miss('.env.example')
+    miss('.env.sample')
+    miss('.env.template')
+    miss('apps/web/.env.example')
+    miss('id_rsa.pub')
+    miss('id_ed25519.pub')
+  })
+
+  it('普通文件不误伤', () => {
+    miss('src/index.ts')
+    miss('README.md')
+    miss('env.ts')          // 不是点开头的 `.env`
+    miss('docs/keys.md')
+    miss('key.ts')
+    miss('package.json')
+    miss('src/ssh/client.ts')
+    miss('.')
+    miss('')
+  })
+
+  it('Windows 风格反斜杠也归一', () => {
+    hit('.ssh\\config')
+    hit('apps\\web\\.env')
+  })
+
+  it('自定义策略整体替换内置清单', () => {
+    const custom = { names: ['secret.txt'], prefixes: [], suffixes: [], dirs: [], paths: [] }
+    expect(isSensitiveReadPath('secret.txt', custom)).toBe(true)
+    expect(isSensitiveReadPath('.env', custom)).toBe(false)
+  })
+
+  it('findSensitiveReadPath 指出第一个命中项', () => {
+    expect(findSensitiveReadPath(['a.ts', '.env', 'b.ts'])).toBe('.env')
+    expect(findSensitiveReadPath(['a.ts', 'b.ts'])).toBeUndefined()
   })
 })

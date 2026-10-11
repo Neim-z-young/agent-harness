@@ -95,3 +95,109 @@ export function isWithinRoot(p: string, root: string): boolean {
 export function isWithinCwd(filePath: string, cwd: string): boolean {
   return isWithinRoot(realpathBestEffort(filePath), realpathBestEffort(cwd))
 }
+
+// ============================================================================
+// 读侧敏感文件策略（P0-3）
+// ============================================================================
+
+/**
+ * 读侧敏感文件策略（P0-3）。
+ *
+ * 为什么**不用 glob**：这里要表达的是"哪些名字属于凭据"，用五类显式规则比通配更可审计，
+ * 也能把"公钥/模板不算敏感"这类**例外**写在一处（见 {@link NOT_SENSITIVE}）。
+ * 通配版本最容易出的错是"顺手写成 `.env.*`，把 `.env.example` 一起挡掉"—— 那是误伤。
+ *
+ * 所有字段按**相对 cwd 的 POSIX 风格路径**匹配（`\` 会被归一成 `/`，前导 `./` 忽略）。
+ */
+export interface SensitiveReadPolicy {
+  /** 文件名精确匹配（basename） */
+  names: string[]
+  /** 文件名前缀（如 `id_rsa` 覆盖 `id_rsa` / `id_rsa.pub` 之外的同族） */
+  prefixes: string[]
+  /** 文件名后缀（含点，如 `.pem`） */
+  suffixes: string[]
+  /** **目录**段：路径里除最后一段（文件名）以外的任一段命中即算（如 `.ssh` / `.aws`） */
+  dirs: string[]
+  /** 相对 cwd 的精确路径（如 `.docker/config.json`） */
+  paths: string[]
+}
+
+/**
+ * 明确**不敏感**的形态（先于其它规则判定，命中即放行）：
+ * - `*.pub`：公钥，不是凭据；
+ * - `.env.example` / `.env.sample` / `.env.template`：模板，按定义不含真凭据 —— 而模型经常
+ *   需要读它来知道该配哪些键（`.env` 一旦被 `prefixes: ['.env']` 覆盖，这几个会被一起挡掉）。
+ */
+const NOT_SENSITIVE = {
+  names: ['.env.example', '.env.sample', '.env.template'],
+  suffixes: ['.pub'],
+}
+
+/**
+ * 默认敏感读清单。**刻意"逐类列清楚"而不是扫全盘**：只覆盖"业界公认的凭据文件名"，
+ * 不做内容嗅探（那会误伤普通配置）。
+ */
+export const DEFAULT_SENSITIVE_READ_POLICY: SensitiveReadPolicy = {
+  // `permissions.json` 是权限规则本体、`.config-key` 是遥测里的匿名 user id 派生源
+  names: ['.npmrc', '.netrc', '.pgpass', 'permissions.json', '.config-key', 'credentials.json'],
+  // `.env` 前缀覆盖 `.env` / `.env.local` / `.env.production.local`；模板形态由 NOT_SENSITIVE 放行
+  prefixes: ['.env', 'id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa', 'id_xmss'],
+  suffixes: ['.pem', '.p12', '.pfx', '.p8', '.jks', '.keystore', '.key'],
+  dirs: ['.ssh', '.aws', '.gnupg', '.kube'],
+  paths: ['.docker/config.json', '.config/gh/hosts.yml'],
+}
+
+/**
+ * `relPath`（相对 cwd）是否命中敏感读清单。
+ *
+ * 判据顺序：**例外优先**（公钥 / 模板）→ 精确路径 → 文件名（精确 / 前缀 / 后缀）→ 目录段。
+ * 顺序不是随意的：`id_rsa.pub` 会同时命中 `prefixes: ['id_rsa']` 与例外 `.pub`，
+ * 例外必须排前面，否则公钥被误杀。
+ */
+export function isSensitiveReadPath(
+  relPath: string,
+  policy: SensitiveReadPolicy = DEFAULT_SENSITIVE_READ_POLICY,
+): boolean {
+  const norm = relPath.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\//, '')
+  if (!norm || norm === '.') return false
+  const segs = norm.split('/').filter((s) => s !== '' && s !== '.')
+  const base = segs[segs.length - 1] ?? ''
+  if (NOT_SENSITIVE.names.includes(base) || NOT_SENSITIVE.suffixes.some((s) => base.endsWith(s))) return false
+  if (policy.paths.includes(norm)) return true
+  if (policy.names.includes(base)) return true
+  if (policy.prefixes.some((p) => base.startsWith(p))) return true
+  if (policy.suffixes.some((s) => base.endsWith(s))) return true
+  return segs.slice(0, -1).some((s) => policy.dirs.includes(s))
+}
+
+/** 在一组路径里找第一个命中项（便于报错信息指明"是哪个"；无命中返回 `undefined`）。 */
+export function findSensitiveReadPath(
+  relPaths: readonly string[],
+  policy: SensitiveReadPolicy = DEFAULT_SENSITIVE_READ_POLICY,
+): string | undefined {
+  return relPaths.find((p) => isSensitiveReadPath(p, policy))
+}
+
+/** 配置侧形态：五类规则都可省（缺的按空数组归一，见 {@link resolveSensitiveReadPolicy}） */
+export type SensitiveReadPolicyInput = Partial<SensitiveReadPolicy> | false
+
+/**
+ * 解析读侧策略配置（三个工具共用这一处口径）：
+ * - `false` ⇒ **关闭**（返回 `undefined`，调用方跳过检查）；
+ * - 缺省（`undefined`）⇒ 内置清单 {@link DEFAULT_SENSITIVE_READ_POLICY}；
+ * - 对象 ⇒ **整体替换**内置清单（不做合并），**缺的类目按空数组归一** ——
+ *   config.json 里少写一个字段不该把运行时直接炸掉（`undefined.includes` 会抛）。
+ */
+export function resolveSensitiveReadPolicy(
+  cfg?: SensitiveReadPolicyInput,
+): SensitiveReadPolicy | undefined {
+  if (cfg === false) return undefined
+  if (cfg === undefined) return DEFAULT_SENSITIVE_READ_POLICY
+  return {
+    names: cfg.names ?? [],
+    prefixes: cfg.prefixes ?? [],
+    suffixes: cfg.suffixes ?? [],
+    dirs: cfg.dirs ?? [],
+    paths: cfg.paths ?? [],
+  }
+}

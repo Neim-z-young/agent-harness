@@ -8,6 +8,7 @@ import {
   editFileTool,
   bashTool,
   createBashTool,
+  createReadFileTool,
   createToolsBuiltinPlugin,
   toolsBuiltinPlugin,
   builtinTools,
@@ -18,6 +19,8 @@ import {
   analyzeBashCommand,
   DEFAULT_READONLY_COMMANDS,
   resolveShell,
+  buildLimitPreamble,
+  resolveBashLimits,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
@@ -942,6 +945,162 @@ describe('@harness/tools-builtin', () => {
 // 在报告开头自述「本轮工具集无命令执行能力（白名单仅 read_file / list_dir / glob / grep_file），
 // 无法运行 wc/python3」，它的统计章节只能标注"未覆盖" —— 量化盘点类任务天生残废。
 // 这里固定"只读哨兵能拿到一个被约束住的只读 shell"。
+// ===== P0-6 / P1-1：进程树 kill + 资源上限 =====
+
+/** pid 是否还活着（0 号信号只做存在性探测，不发信号） */
+function isAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true } catch { return false }
+}
+
+/** 轮询等 pid 消失（SIGKILL 之后内核回收/重父化要一点点时间） */
+async function waitGone(pid: number, ms = 2_000): Promise<boolean> {
+  const deadline = Date.now() + ms
+  for (;;) {
+    if (!isAlive(pid)) return true
+    if (Date.now() > deadline) return false
+    await new Promise((r) => setTimeout(r, 50))
+  }
+}
+
+describe('buildLimitPreamble / resolveBashLimits（P1-1 纯函数）', () => {
+  it('未设/`false`/全 0 ⇒ 空串；缺省只开单文件大小', () => {
+    expect(buildLimitPreamble(resolveBashLimits(false), 'bash')).toBe('')
+    expect(buildLimitPreamble({ cpuSeconds: 0, maxFileSizeKb: 0, maxProcesses: 0, memoryKb: 0 }, 'bash')).toBe('')
+    expect(buildLimitPreamble(resolveBashLimits(undefined), 'bash')).toBe('ulimit -f 2097152 2>/dev/null; ')
+  })
+
+  it('非 bash 族系 ⇒ 空串（不模拟）', () => {
+    const l = resolveBashLimits({ cpuSeconds: 5 })
+    expect(buildLimitPreamble(l, 'powershell')).toBe('')
+    expect(buildLimitPreamble(l, 'cmd')).toBe('')
+  })
+
+  it('★`ulimit -f` 单位按平台换算：darwin 1024B/单位、其它 512B/单位', () => {
+    const l = resolveBashLimits({ maxFileSizeKb: 1024 })
+    expect(buildLimitPreamble(l, 'bash', 'darwin')).toBe('ulimit -f 1024 2>/dev/null; ')
+    expect(buildLimitPreamble(l, 'bash', 'linux')).toBe('ulimit -f 2048 2>/dev/null; ')
+  })
+
+  it('★每项各起一次 ulimit（合并形态会被失败项连累）', () => {
+    const p = buildLimitPreamble({ cpuSeconds: 5, maxFileSizeKb: 0, maxProcesses: 256, memoryKb: 0 }, 'bash')
+    expect(p).toBe('ulimit -t 5 2>/dev/null; ulimit -u 256 2>/dev/null; ')
+  })
+})
+
+describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => {
+  // 本 describe 在顶层（不在 @harness/tools-builtin 那个大 describe 里）⇒ 自己建临时目录
+  beforeEach(async () => { await mkdir(TMP_DIR, { recursive: true }) })
+  afterEach(async () => { await rm(TMP_DIR, { recursive: true, force: true }) })
+
+  it('limits 真的进了子 shell（`ulimit -f` 回读）', async () => {
+    const tool = createBashTool({ limits: { maxFileSizeKb: 1024 } })
+    const res = await tool.call({ command: 'ulimit -f' }, makeCtx())
+    expect(res.ok).toBe(true)
+    // darwin：1 单位 = 1024B ⇒ 1024KB = 1024 单位；linux：512B ⇒ 2048
+    expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
+  })
+
+  it('limits:false ⇒ 不加任何抬头（回读为 unlimited）', async () => {
+    const tool = createBashTool({ limits: false })
+    const res = await tool.call({ command: 'ulimit -f' }, makeCtx())
+    expect(res.output!.stdout.trim()).toBe('unlimited')
+  })
+
+  it('★output.command 仍是原文（ulimit 抬头不污染遥测/展示）', async () => {
+    const res = await bashTool.call({ command: 'echo hi' }, makeCtx())
+    expect(res.output!.command).toBe('echo hi')
+    expect(res.output!.stdout.trim()).toBe('hi')
+  })
+
+  it('★超时杀掉整棵进程树：后台孙进程不能活下来（P0-6 回归）', async () => {
+    const pidFile = join(TMP_DIR, 'grandchild.pid')
+    const res = await bashTool.call({
+      // 后台起一个长命孙进程并记下它的 pid，然后自己挂住
+      command: `sleep 30 & echo $! > "${pidFile}"; sleep 30`,
+      timeoutMs: 400,
+    }, makeCtx())
+    expect(res.output!.timedOut).toBe(true)
+    const gpid = Number((await Bun.file(pidFile).text()).trim())
+    expect(Number.isInteger(gpid)).toBe(true)
+    expect(await waitGone(gpid)).toBe(true)
+  })
+
+  it('★中断（AbortSignal）同样杀整棵树', async () => {
+    const pidFile = join(TMP_DIR, 'grandchild2.pid')
+    const ac = new AbortController()
+    const promise = bashTool.call(
+      { command: `sleep 30 & echo $! > "${pidFile}"; sleep 30` },
+      makeCtx({ signal: ac.signal }),
+    )
+    setTimeout(() => ac.abort(), 400)
+    const res = await promise
+    expect(res.interrupted).toBe(true)
+    const gpid = Number((await Bun.file(pidFile).text()).trim())
+    expect(await waitGone(gpid)).toBe(true)
+  })
+})
+
+
+describe('读侧敏感文件默认拒绝（P0-3）', () => {
+  beforeEach(async () => { await mkdir(TMP_DIR, { recursive: true }) })
+  afterEach(async () => { await rm(TMP_DIR, { recursive: true, force: true }) })
+
+  it('read_file 拒读 .env（默认清单）', async () => {
+    await writeFile(join(TMP_DIR, '.env'), 'SECRET=1')
+    const res = await readFileTool.call({ path: '.env' }, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('SANDBOX_READ_DENIED')
+  })
+
+  it('★但 .env.example / id_rsa.pub 不挡（模板与公钥不是凭据）', async () => {
+    await writeFile(join(TMP_DIR, '.env.example'), 'SECRET=')
+    await writeFile(join(TMP_DIR, 'id_rsa.pub'), 'ssh-rsa AAAA')
+    expect((await readFileTool.call({ path: '.env.example' }, makeCtx())).ok).toBe(true)
+    expect((await readFileTool.call({ path: 'id_rsa.pub' }, makeCtx())).ok).toBe(true)
+  })
+
+  it('子目录里的凭据同样挡、普通文件照常读', async () => {
+    await mkdir(join(TMP_DIR, 'deploy'), { recursive: true })
+    await writeFile(join(TMP_DIR, 'deploy', 'server.pem'), 'x')
+    await writeFile(join(TMP_DIR, 'ok.ts'), 'export const a = 1')
+    const denied = await readFileTool.call({ path: 'deploy/server.pem' }, makeCtx())
+    expect(denied.ok).toBe(false)
+    expect(denied.error!.code).toBe('SANDBOX_READ_DENIED')
+    expect((await readFileTool.call({ path: 'ok.ts' }, makeCtx())).ok).toBe(true)
+  })
+
+  it('readDeny:false 关闭这道闸；给对象则整体替换清单', async () => {
+    await writeFile(join(TMP_DIR, '.env'), 'SECRET=1')
+    await writeFile(join(TMP_DIR, 'secret.txt'), 'x')
+    const off = createReadFileTool({ readDeny: false })
+    expect((await off.call({ path: '.env' }, makeCtx())).ok).toBe(true)
+    const custom = createReadFileTool({ readDeny: { names: ['secret.txt'], prefixes: [], suffixes: [], dirs: [], paths: [] } })
+    const hit = await custom.call({ path: 'secret.txt' }, makeCtx())
+    expect(hit.ok).toBe(false)
+    expect(hit.error!.code).toBe('SANDBOX_READ_DENIED')
+    expect((await custom.call({ path: '.env' }, makeCtx())).ok).toBe(true) // 内置清单已被替换掉
+  })
+
+  it('★bash_ro 也挡：`cat .env` 在只读白名单内，但属于敏感读', async () => {
+    await writeFile(join(TMP_DIR, '.env'), 'SECRET=1')
+    await writeFile(join(TMP_DIR, 'a.txt'), 'hi')
+    const ro = createReadOnlyBashTool()
+    const denied = await ro.call({ command: 'cat .env' }, makeCtx())
+    expect(denied.ok).toBe(false)
+    expect(denied.error!.code).toBe('SANDBOX_READ_DENIED')
+    const ok = await ro.call({ command: 'cat a.txt' }, makeCtx())
+    expect(ok.ok).toBe(true)
+    expect(ok.output!.stdout.trim()).toBe('hi')
+  })
+
+  it('bash_ro readDeny:false ⇒ 不挡', async () => {
+    await writeFile(join(TMP_DIR, '.env'), 'SECRET=1')
+    const ro = createReadOnlyBashTool({ readDeny: false })
+    const res = await ro.call({ command: 'cat .env' }, makeCtx())
+    expect(res.ok).toBe(true)
+  })
+})
+
 describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
   // 本段是**顶层** describe（不在 `@harness/tools-builtin` 里面），所以外层的
   // beforeEach/afterEach 管不到 —— 得自己建/清 TMP_DIR。

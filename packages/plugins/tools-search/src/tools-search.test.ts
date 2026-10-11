@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import {
   listDirTool,
   grepFileTool,
+  createGrepFileTool,
   searchTools,
   createToolsSearchPlugin,
 } from './index'
@@ -228,6 +229,35 @@ describe('路径边界（P0-4/P0-5/P3-1：realpath 版 + 与全仓唯一一份�
     } finally {
       rmSync(outside, { recursive: true, force: true })
     }
+  })
+})
+
+
+describe('读侧敏感文件默认拒绝（P0-3）', () => {
+  it('grep_file 直接指到 .env ⇒ 拒绝', async () => {
+    writeFileSync(join(dir, '.env'), 'SECRET=1')
+    const res = await grepFileTool.call!({ pattern: 'SECRET', path: '.env' } as any, ctx)
+    expect(res.ok).toBe(false)
+    if (!res.ok) expect(res.error!.code).toBe('SANDBOX_READ_DENIED')
+  })
+
+  it('★递归遍历时跳过敏感文件（只查入参路径挡不住"顺带读到"）', async () => {
+    // `id_rsa` 不是点开头 ⇒ 会被正常遍历到，因此能证明是**敏感清单**在拦，而不是"点文件本来就不搜"
+    writeFileSync(join(dir, 'id_rsa'), 'NEEDLE here')
+    writeFileSync(join(dir, 'a.ts'), 'const NEEDLE = 1')
+    const res = await grepFileTool.call!({ pattern: 'NEEDLE', path: '.' } as any, ctx)
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    expect(res.output!.matches.map((m) => m.relativePath)).toEqual(['a.ts'])
+    // 普通文件仍在正常命中
+    expect(res.output!.count).toBe(1)
+  })
+
+  it('readDeny:false ⇒ 关闭这道闸', async () => {
+    writeFileSync(join(dir, '.env'), 'SECRET=1')
+    const tool = createGrepFileTool({ readDeny: false })
+    const res = await tool.call!({ pattern: 'SECRET', path: '.env' } as any, ctx)
+    expect(res.ok).toBe(true)
   })
 })
 
