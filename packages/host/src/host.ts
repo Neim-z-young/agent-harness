@@ -66,7 +66,15 @@ import {
 } from '@harness/workspace'
 import type { SessionFile, Workspace } from '@harness/workspace'
 // 隔离档位（P1-4）：探测 + 折档在零依赖包，与 tools-builtin / tools-web 共用同一份口径
-import { formatIsolationLine, probeIsolation, resolveIsolation } from '@harness/isolation'
+import {
+  buildOsBinding,
+  formatIsolationLine,
+  probeIsolation,
+  resolveIsolation,
+  verifyOsBinding,
+  type OsBinding,
+} from '@harness/isolation'
+import { realpathSync } from 'node:fs'
 
 // 本包内：叶子模块（不得反向 import `./index`，见各文件头）
 import { lazyImport } from './lazy'
@@ -77,6 +85,7 @@ import {
   checkCompactionConfig,
   checkCompactionReachability,
   checkCompressionConfig,
+  checkMcpCapabilities,
   checkSandboxConfig,
   checkMemoryConfig,
   checkTelemetryConfig,
@@ -319,6 +328,46 @@ export class HarnessHost {
   /** 宿主文本行出口：装配期 notice 无 sink 时的兜底 + 运行期 emitLog 的兜底 */
   private writeLine(line: string): void {
     this.options.logLine?.(line)
+  }
+
+  /**
+   * 构造并**自检** OS 绑定（P1-3 / L2）。
+   *
+   * 三条出路都落在同一个返回值上（`null` = 没绑），但**成因不同、notice 不同**：
+   * - 没写 `osBinding:"on"` ⇒ `null`，**不发 notice**（默认 off 是设计值，不是失效）；
+   * - 写了但没有原语 / 可写区算不出来 ⇒ `no-primitive`；
+   * - 有原语但自检没跑通 ⇒ `self-test-failed`（最危险：profile 不被接受时宿主**命令根本
+   *   不会执行**，而 `sandbox-exec` 的退出码还是 0 —— 不自检就是彻底的静默失效）。
+   */
+  private resolveOsBinding(cfg: HarnessConfig): OsBinding | null {
+    if (cfg.sandbox?.osBinding !== 'on') return null
+    const probe = probeIsolation()
+    const root = cfg.sandbox?.rootDir ?? this.options.cwd
+    let writable: string[] = []
+    try {
+      writable = [realpathSync(root)]
+    } catch {
+      writable = [root]
+    }
+    const binding = buildOsBinding({ writable, primitives: probe.primitives })
+    if (!binding) {
+      this.emitNotice(makeNotice('sandbox.binding-unavailable', {
+        reason: 'no-primitive',
+        detail: `平台 ${probe.platform}；已探到：${[
+          probe.primitives.sandboxExec ? 'sandbox-exec' : '',
+          probe.primitives.bwrap ? 'bwrap' : '',
+        ].filter(Boolean).join(' / ') || '（无）'}`,
+      }))
+      return null
+    }
+    if (!verifyOsBinding(binding)) {
+      this.emitNotice(makeNotice('sandbox.binding-unavailable', {
+        reason: 'self-test-failed',
+        detail: `${binding.via} 拒绝了本次 profile（命令不会被执行）；已按未绑定继续，可写区只有策略层判定`,
+      }))
+      return null
+    }
+    return binding
   }
 
   /** 本次装配发出的 notice（环形缓冲，≤ HOST_NOTICE_LIMIT 条）——供启动自检事后回读 */
@@ -793,6 +842,8 @@ export class HarnessHost {
       { dir: this.workspace.project.plugins, source: 'project' },
     ], undefined, {
       allowCode: this.options.allowPluginCode ?? cfg.allowPluginCode ?? false,
+      // P1-5：开闸后的静态扫描档位（缺省 warn —— 只预警不拦截，见 plugin-scan.ts）
+      pluginCodeScan: cfg.sandbox?.pluginCodeScan ?? 'warn',
       // 装配期诊断改走结构化出口（文案字节由 renderNotice 复刻，逐字不变）
       onNotice: (n) => this.emitNotice(n),
     })
@@ -924,7 +975,15 @@ export class HarnessHost {
     // P1-4：先把**隔离档位**折出来 —— 它是"我要跑在什么边界里"的声明，必须在装配内置插件
     // **之前**定下来：①内置工具把实际档位回给模型（`BashOutput.isolation`）；
     // ②达不到要求时 `onUnmet: 'refuse'` 要**拒绝启动**，而不是先把插件都装完再报错。
-    const isolationProbe = probeIsolation()
+    // P1-3：OS 绑定（L2）。顺序是刻意的 —— **先构造、再自检、最后才折档位**：
+    // 反过来（先按 `osBinding:"on"` 折出 L2 再构造）会让"写了 on 但没原语"报成 L2，
+    // 那正是 §2 纪律 2「不模拟」要防的形态。自检不通过 ⇒ 绑定作废，档位仍按实际算。
+    const osBinding = this.resolveOsBinding(cfg)
+    // P1-7：MCP server 的**能力声明**里，凡是"声明了但当前档位强制不了"的都要出声 ——
+    // 声明写出来像约束，不告警就成了自我安慰（跟"写了配置以为生效"是同一类病）。
+    const mcpItems = checkMcpCapabilities(cfg.mcpServers, { osBindingAvailable: osBinding != null })
+    if (mcpItems.length) this.emitNotice(makeNotice('config.mcp-inactive', { items: mcpItems }))
+    const isolationProbe = probeIsolation({ osBinding: osBinding != null })
     const isolationRes = resolveIsolation({ required: cfg.sandbox?.level, probe: isolationProbe })
     if (!isolationRes.met) {
       const line = formatIsolationLine(isolationRes)
@@ -941,7 +1000,7 @@ export class HarnessHost {
     }
     // 内置（随应用打包）通用插件：经 BuiltinPluginRegistry 统一惰性加载。
     // P0-1：带 config 加载 —— 内置插件以前是无参单例，config.json 里的沙箱段递不进去。
-    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load({ config: cfg, isolationLevel: isolationRes.level })
+    const toolsBuiltin = await getBuiltinRegistry().get('tools-builtin')!.load({ config: cfg, isolationLevel: isolationRes.level, osBinding })
     providerPlugins.push(toolsBuiltin)
     const toolsManager = await getBuiltinRegistry().get('tools-manager')!.load()
     providerPlugins.push(toolsManager)
@@ -956,7 +1015,7 @@ export class HarnessHost {
     // 内置插件声明式启用（config.json → plugins）：与外部插件目录并列的第二条装配路径，
     // 让「只想开个内置能力」的用户改一行配置即可（依赖闭包自动补齐，如 computer-use → mcp.server-registry）。
     // 这里只解析实例，实际入列在外部插件之后（见下方按 id 去重），避免与 .harness/plugins 里的同 id 重复安装。
-    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins, getBuiltinRegistry(), cfg, isolationRes.level)
+    const declaredPlugins = await resolveBuiltinPlugins(cfg.plugins, getBuiltinRegistry(), cfg, isolationRes.level, osBinding)
     if (declaredPlugins.unknown.length) {
       this.emitNotice(makeNotice('config.plugins-inactive', {
         unknown: declaredPlugins.unknown,

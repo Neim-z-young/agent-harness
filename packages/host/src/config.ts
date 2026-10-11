@@ -25,6 +25,7 @@
 import type { ChatProvider } from '@harness/core'
 import type { AgentPlugin, ProviderConfig, ProviderTypeRegistry } from '@harness/plugin'
 import type { McpServerEntry } from '@harness/mcp-server-registry'
+import { resolveMcpCapabilities } from '@harness/mcp-server-registry'
 import type { MockProviderConfig } from '@harness/provider-mock'
 import type { CompactOptions } from '@harness/session'
 // 隔离档位与网络策略的**取值类型**（P1-4 / P1-2）：口径来自零依赖的 @harness/isolation
@@ -153,6 +154,29 @@ export interface SandboxSection {
   net?: NetPolicy
   /** `allowlist` 模式的目标白名单（host / 域名；**子域自动覆盖**，如 `github.com` 含 `api.github.com`） */
   netAllow?: string[]
+  /**
+   * **OS 级绑定**（P1-3 / L2）：`'off'`（默认，与改造前逐位一致）/ `'on'`。
+   *
+   * 开了才会把 bash / MCP 子进程包进平台原语（macOS `sandbox-exec` / Linux `bwrap`），
+   * 让**可写区真的被 OS 限制**在声明目录内 —— 这是 L0/L1 的策略层做不到的（symlink 逃逸写
+   * 与 TOCTOU 只有这一层挡得住）。
+   *
+   * 默认 `off` 的两个理由：①它会改变命令的执行形态（profile 配错＝命令全线失败），
+   * 必须显式开；②拿不到原语（Windows / 没装 bwrap）时**不模拟**，行为与 `off` 一致但会告警。
+   *
+   * 要"必须有 L2，没有就不跑"：配 `level: 'L2'` + `onUnmet: 'refuse'`（与 `osBinding` 是
+   * 两件事 —— 前者是要求，后者是"允许用原语"）。
+   */
+  osBinding?: 'off' | 'on'
+  /**
+   * **插件代码静态扫描**（P1-5）：`'warn'`（默认，命中即告警）/ `'refuse'`（命中的文件不加载）/
+   * `'off'`（不扫）。
+   *
+   * ⚠️ 这是**预警不是边界**：正则扫的是源码字面，挡不住 `process['e'+'nv']` 这类绕过。
+   * 它能治的是"顺手写了个 `spawn` 自己没意识到"，不是恶意代码 —— 真边界要等 worker / WASI。
+   * 只在 `allowPluginCode` 开闸后才扫（没开闸根本不加载，扫它没意义）。
+   */
+  pluginCodeScan?: 'warn' | 'refuse' | 'off'
 }
 
 /**
@@ -1184,6 +1208,8 @@ const SANDBOX_KEYS: Record<keyof NonNullable<HarnessConfig['sandbox']>, true> = 
   onUnmet: true,
   net: true,
   netAllow: true,
+  osBinding: true,
+  pluginCodeScan: true,
 }
 
 /**
@@ -1243,6 +1269,46 @@ export function checkSandboxConfig(c: unknown): string[] {
   }
   if (c.readMaxBytes !== undefined && (typeof c.readMaxBytes !== 'number' || c.readMaxBytes < 0)) {
     out.push(`sandbox.readMaxBytes 应为非负数（字节，0 = 不限制），收到 ${JSON.stringify(c.readMaxBytes)}`)
+  }
+  // P1-3：osBinding 是显式开关（会改变命令的执行形态），写错值必须出声 —— 否则用户以为开了
+  if (c.osBinding !== undefined && c.osBinding !== 'on' && c.osBinding !== 'off') {
+    out.push(`sandbox.osBinding="${String(c.osBinding)}" 不是合法取值（on / off），运行期按 off 处理`)
+  }
+  // P1-5：扫描档位写错值 ⇒ 静默退回默认，必须出声
+  if (c.pluginCodeScan !== undefined && !['warn', 'refuse', 'off'].includes(String(c.pluginCodeScan))) {
+    out.push(`sandbox.pluginCodeScan="${String(c.pluginCodeScan)}" 不是合法取值（warn / refuse / off），运行期按 warn 处理`)
+  }
+  // 要求 L2 却没开 osBinding ⇒ 一定达不到（原语不给用）
+  if (c.level === 'L2' && c.osBinding !== 'on') {
+    out.push('sandbox.level="L2" 但 sandbox.osBinding 不是 "on"：OS 原语不给用 ⇒ 一定达不到 L2，配 onUnmet="refuse" 会直接拒绝启动')
+  }
+  return out
+}
+
+/**
+ * 检查 `mcpServers` 里**声明了能力但强制不了**的项（P1-7）。
+ *
+ * 与 {@link checkSandboxConfig} 同一范式：这一段最怕的不是"没配"，而是**配了、看着生效、
+ * 其实没有**。`capabilities` 天生就是这种形状 —— 它描述的是"这个第三方 server 应该
+ * 受到什么约束"，而能不能真的约束住取决于当前档位：
+ * - `fs:"cwd"`：只在有 OS 绑定（P1-3）时才**真强制**；
+ * - `net:"none"`：目前任何档位都强制不了（L0 静态门管不到别人的子进程）。
+ *
+ * 两条都必须在装配期说出来，否则"我声明了它不能出网"就是一句自我安慰。
+ */
+export function checkMcpCapabilities(
+  servers: unknown,
+  opts: { osBindingAvailable?: boolean } = {},
+): string[] {
+  if (!Array.isArray(servers)) return []
+  const out: string[] = []
+  for (const s of servers) {
+    if (!isPlainObject(s)) continue
+    const name = typeof s.name === 'string' ? s.name : '(未命名 server)'
+    const r = resolveMcpCapabilities(s.capabilities as never, {
+      osBindingAvailable: opts.osBindingAvailable === true,
+    })
+    for (const u of r.unenforceable) out.push(`mcpServers[${name}]：${u}`)
   }
   return out
 }

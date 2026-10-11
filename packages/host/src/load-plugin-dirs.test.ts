@@ -55,6 +55,69 @@ describe('loadPluginDirs：代码注入闸门', () => {
     const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, { allowCode: true })
     expect(result.plugins.map((p) => p.id)).toEqual(['ext.optin'])
   })
+
+  it('★P1-5：开闸 + 命中规则 ⇒ 照常加载，但把命中的调用摆出来（预警不是边界）', async () => {
+    const pluginDir = join(dir, 'scanwarn', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'risky.ts'), `
+      import { spawn } from 'node:child_process'
+      export const plugins = [{ id: 'ext.risky', version: '1', name: 'r', async install() { return {} } }]
+    `)
+
+    const notes: { code: string; data: unknown }[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, {
+      allowCode: true,
+      onNotice: (n) => notes.push(n as never),
+    })
+
+    expect(result.plugins.map((p) => p.id)).toEqual(['ext.risky']) // 默认 warn：不拦
+    const scan = notes.find((n) => n.code === 'plugins.code-scan')
+    expect(scan).toBeDefined()
+    expect((scan!.data as { items: string[] }).items.join()).toContain('[child-process]')
+  })
+
+  it('★P1-5：pluginCodeScan="refuse" ⇒ 命中的文件不加载（其余照常）', async () => {
+    const pluginDir = join(dir, 'scanrefuse', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'risky.ts'), `
+      import { spawn } from 'node:child_process'
+      export const plugins = [{ id: 'ext.risky', version: '1', name: 'r', async install() { return {} } }]
+    `)
+    writeFileSync(join(pluginDir, 'clean.ts'), `
+      export const plugins = [{ id: 'ext.clean', version: '1', name: 'c', async install() { return {} } }]
+    `)
+
+    const notes: { code: string; data: unknown }[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, {
+      allowCode: true,
+      pluginCodeScan: 'refuse',
+      onNotice: (n) => notes.push(n as never),
+    })
+
+    expect(result.plugins.map((p) => p.id)).toEqual(['ext.clean'])
+    const refused = notes.find((n) => n.code === 'plugins.code-refused')
+    expect(refused).toBeDefined()
+    expect((refused!.data as { file: string }).file).toContain('risky.ts')
+  })
+
+  it('★P1-5：pluginCodeScan="off" ⇒ 不扫、不出告警（但这个开关本身不是安全边界）', async () => {
+    const pluginDir = join(dir, 'scanoff', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'risky.ts'), `
+      import { spawn } from 'node:child_process'
+      export const plugins = [{ id: 'ext.risky', version: '1', name: 'r', async install() { return {} } }]
+    `)
+
+    const notes: { code: string }[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, {
+      allowCode: true,
+      pluginCodeScan: 'off',
+      onNotice: (n) => notes.push(n as never),
+    })
+
+    expect(result.plugins.map((p) => p.id)).toEqual(['ext.risky'])
+    expect(notes.some((n) => n.code === 'plugins.code-scan')).toBe(false)
+  })
 })
 
 describe('loadPluginDirs：多形态导出与多级覆盖', () => {

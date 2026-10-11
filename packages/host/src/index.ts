@@ -48,6 +48,9 @@ export {
   preloadBuiltinToolMetas,
 } from './plugins'
 export type { PluginLoadResult, BuiltinGeneralPlugin } from './plugins'
+// P1-5：插件代码静态扫描（纯函数 —— 判定归这里，装配在 `./plugins.ts` 的 loadPluginDirs 里）
+export { PLUGIN_CODE_RULES, scanPluginCode, formatPluginScanFindings } from './plugin-scan'
+export type { PluginCodeFinding } from './plugin-scan'
 
 
 // ========================================================================

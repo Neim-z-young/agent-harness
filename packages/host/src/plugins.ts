@@ -15,6 +15,7 @@
  */
 
 import { pathToFileURL } from 'node:url'
+import { readFileSync } from 'node:fs'
 import type {
   AgentPlugin,
   ProviderConfig,
@@ -31,7 +32,7 @@ import { makeNotice } from './notice'
 import type { NoticeSink } from './notice'
 import type { HarnessConfig, SandboxSection } from './config'
 import { isOsBound, resolveNetPolicy } from '@harness/isolation'
-import type { IsolationLevel } from '@harness/isolation'
+import type { IsolationLevel, OsBinding } from '@harness/isolation'
 
 /** 插件目录加载结果：通用 AgentPlugin（Hooks 插件）列表；Provider 类型工厂已注册进 registry */
 export interface PluginLoadResult {
@@ -123,7 +124,15 @@ export async function loadPluginDirs(
   registry: ProviderTypeRegistry,
   dirs: Array<string | { dir: string; source?: 'user' | 'project' }>,
   log?: (s: string) => void,
-  opts: { allowCode?: boolean; onNotice?: NoticeSink } = {},
+  opts: {
+    allowCode?: boolean
+    onNotice?: NoticeSink
+    /**
+     * P1-5：插件代码扫描档位（`'warn'` / `'refuse'` / `'off'`）。
+     * 缺省 `'warn'` —— 只在开闸后生效，且**只预警不拦截**（见 `./plugin-scan.ts` 文件头）。
+     */
+    pluginCodeScan?: 'warn' | 'refuse' | 'off'
+  } = {},
 ): Promise<PluginLoadResult> {
   const out = log ?? ((s: string) => { if (typeof process !== 'undefined') process.stderr.write(s + '\n') })
   // 装配期诊断的两条出口（见 `./notice.ts` 文件头）：
@@ -158,8 +167,38 @@ export async function loadPluginDirs(
   }
   // 通用插件按 id 去重：后加载覆盖先加载（project 覆盖 user，扫描顺序即覆盖顺序）
   const byId = new Map<string, AgentPlugin>()
+  const scanMode = opts.pluginCodeScan ?? 'warn'
   for (const item of items) {
     const full = item.full
+    // P1-5：开闸＝进程内全权，至少在**装载之前**把命中的危险调用摆出来。
+    // 读文件失败不阻断加载（扫描是附加价值，不该让它变成新的故障点）。
+    let findings: PluginCodeFinding[] = []
+    if (scanMode !== 'off') {
+      try {
+        findings = scanPluginCode(readFileSync(full, 'utf-8'))
+      } catch {
+        findings = []
+      }
+    }
+    if (findings.length && scanMode === 'refuse') {
+      emit(
+        makeNotice('plugins.code-refused', { file: full, items: formatPluginScanFindings(full, findings) }),
+        () => {
+          out(`已拒绝加载插件代码 ${full}（命中静态扫描规则，sandbox.pluginCodeScan="refuse"）：\n`)
+          for (const l of formatPluginScanFindings(full, findings)) out(`  - ${l}\n`)
+        },
+      )
+      continue
+    }
+    if (findings.length) {
+      emit(
+        makeNotice('plugins.code-scan', { file: full, items: formatPluginScanFindings(full, findings) }),
+        () => {
+          out(`插件代码 ${full} 命中静态扫描规则（**预警不是边界**，见 sandbox.pluginCodeScan）：\n`)
+          for (const l of formatPluginScanFindings(full, findings)) out(`  - ${l}\n`)
+        },
+      )
+    }
     try {
       const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
       // 1) 通用 AgentPlugin
@@ -200,6 +239,7 @@ export async function loadPluginDirs(
 // 具体 provider-* 包；具体 Provider 包通过导出 providerTypeFactory 实现该契约。
 
 import { lazyImport } from './lazy'
+import { formatPluginScanFindings, scanPluginCode, type PluginCodeFinding } from './plugin-scan'
 
 // 统一惰性加载入口已单独成文件（`./lazy.ts`）：`./config.ts` 与 `./provider.ts` 都要用它，
 // 留在本文件会让它们反向 import index 而形成环。这里 import + re-export 保持导出面不变。
@@ -275,6 +315,14 @@ export interface BuiltinLoadContext {
    * 而不是用户写在配置里的愿望值。
    */
   isolationLevel?: IsolationLevel
+  /**
+   * **已构造且自检通过**的 OS 绑定（P1-3 / L2）。
+   *
+   * 只有"自检真的跑通了"才会递进来 —— 没原语 / 自检失败时是 `undefined`/`null`，
+   * 消费方据此报 `fsBound: false`。**不递半成品**：让插件自己猜该不该套，等于把
+   * "看起来隔离了"的判定分散到每个插件里。
+   */
+  osBinding?: OsBinding | null
   config?: HarnessConfig
 }
 
@@ -338,33 +386,39 @@ function lazyToolMetaSource(specifier: string): () => Promise<ToolMetaSource> {
 function sandboxToPluginOptions(
   sb: SandboxSection | undefined,
   isolatedLevel: IsolationLevel,
+  osBinding?: OsBinding | null,
 ): {
   bash: Record<string, unknown>
   readDeny: SandboxSection['readDeny']
   readMaxBytes: number | undefined
   readOnlyBash: Record<string, unknown>
 } | undefined {
-  if (!sb) return undefined
+  // ⚠️ 只在"既没有 sandbox 段、也没有绑定"时才退回无参单例 —— 否则 `load({osBinding})`
+  // 不带 config 的场景会把绑定静默丢掉（工具侧报 fsBound:false，而宿主以为递了）。
+  if (!sb && osBinding == null) return undefined
   const bash: Record<string, unknown> = {}
-  if (sb.dangerousDetection !== undefined) bash.dangerousDetection = sb.dangerousDetection
-  if (sb.rootDir !== undefined) bash.rootDir = sb.rootDir
-  if (sb.sanitizeEnv !== undefined) bash.sanitizeEnv = sb.sanitizeEnv
-  if (sb.keepEnv !== undefined) bash.keepEnv = sb.keepEnv
-  if (sb.allowlist !== undefined) bash.allowlist = sb.allowlist
-  if (sb.fallbackToHost !== undefined) bash.fallbackToHost = sb.fallbackToHost
-  if (sb.requireHostApproval !== undefined) bash.requireHostApproval = sb.requireHostApproval
-  if (sb.limits !== undefined) bash.limits = sb.limits
+  if (sb?.dangerousDetection !== undefined) bash.dangerousDetection = sb!.dangerousDetection
+  if (sb?.rootDir !== undefined) bash.rootDir = sb!.rootDir
+  if (sb?.sanitizeEnv !== undefined) bash.sanitizeEnv = sb!.sanitizeEnv
+  if (sb?.keepEnv !== undefined) bash.keepEnv = sb!.keepEnv
+  if (sb?.allowlist !== undefined) bash.allowlist = sb!.allowlist
+  if (sb?.fallbackToHost !== undefined) bash.fallbackToHost = sb!.fallbackToHost
+  if (sb?.requireHostApproval !== undefined) bash.requireHostApproval = sb!.requireHostApproval
+  if (sb?.limits !== undefined) bash.limits = sb!.limits
   // P1-2：网络出口策略（交给 `@harness/isolation` 的 resolveNetPolicy 归一；
   // 这里不做合法性判断 —— 那是 checkSandboxConfig 的职责，一处口径）
-  if (sb.net !== undefined) bash.net = sb.net
-  if (sb.netAllow !== undefined) bash.netAllow = sb.netAllow
+  if (sb?.net !== undefined) bash.net = sb!.net
+  if (sb?.netAllow !== undefined) bash.netAllow = sb!.netAllow
   // P1-4：**解析后的实际档位**（不是用户写的要求值）—— 模型看到的必须是事实
   bash.isolationLevel = isolatedLevel
+  // P1-3：OS 绑定（构造 + 自检通过才有值；否则 undefined ⇒ 工具侧报 fsBound:false，不模拟）
+  bash.osBinding = osBinding ?? null
   const readOnlyBash: Record<string, unknown> = {}
-  if (sb.readOnlyTimeoutMs !== undefined) readOnlyBash.timeoutMs = sb.readOnlyTimeoutMs
-  if (sb.limits !== undefined) readOnlyBash.limits = sb.limits
+  if (sb?.readOnlyTimeoutMs !== undefined) readOnlyBash.timeoutMs = sb!.readOnlyTimeoutMs
+  if (sb?.limits !== undefined) readOnlyBash.limits = sb!.limits
   readOnlyBash.isolationLevel = isolatedLevel
-  return { bash, readDeny: sb.readDeny, readMaxBytes: sb.readMaxBytes, readOnlyBash }
+  readOnlyBash.osBinding = osBinding ?? null
+  return { bash, readDeny: sb?.readDeny, readMaxBytes: sb?.readMaxBytes, readOnlyBash }
 }
 
 /**
@@ -379,7 +433,12 @@ function toIsolationSummary(
 ): { level: string; fsBound: boolean; netPolicy: string } | undefined {
   const level = ctx?.isolationLevel
   if (!level) return undefined
-  return { level, fsBound: isOsBound(level), netPolicy: resolveNetPolicy(ctx?.config?.sandbox).mode }
+  return {
+    level,
+    // P1-3：绑定**真的套上了**才报 true（档位叫 L2 但没原语 / 自检失败 ⇒ false）
+    fsBound: ctx?.osBinding != null,
+    netPolicy: resolveNetPolicy(ctx?.config?.sandbox).mode,
+  }
 }
 
 /** 全局默认内置通用插件注册表（登记 tools-builtin 等随应用打包的插件，惰性加载） */
@@ -397,7 +456,7 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
           toolsBuiltinPlugin: AgentPlugin
           createToolsBuiltinPlugin: (o: Record<string, unknown>) => AgentPlugin
         }>('@harness/tools-builtin')
-        const opts = sandboxToPluginOptions(ctx?.config?.sandbox, ctx?.isolationLevel ?? 'L1')
+        const opts = sandboxToPluginOptions(ctx?.config?.sandbox, ctx?.isolationLevel ?? 'L1', ctx?.osBinding)
         if (!opts) return mod.toolsBuiltinPlugin
         return mod.createToolsBuiltinPlugin({
           bash: opts.bash,
@@ -500,7 +559,10 @@ export function getBuiltinRegistry(): BuiltinPluginRegistry {
       description: 'MCP Server 注册表（连接进程内/外部 MCP server 并暴露其工具，提供 /mcp 命令）',
       source: 'builtin',
       optIn: true,
-      load: async () => (await lazyImport<{ createMcpServerRegistryPlugin: () => AgentPlugin }>('@harness/mcp-server-registry')).createMcpServerRegistryPlugin(),
+      // P1-7：把装配期构造好的 OS 绑定递进去 —— server 声明 `capabilities.fs:"cwd"` 才套用
+      load: async (ctx) => (await lazyImport<{
+        createMcpServerRegistryPlugin: (o: { dataDir?: string; osBinding?: OsBinding | null }) => AgentPlugin
+      }>('@harness/mcp-server-registry')).createMcpServerRegistryPlugin({ osBinding: ctx?.osBinding ?? null }),
     })
     // mcp.server：把 harness 工具集经 MCP（Streamable HTTP）**暴露给外部客户端**
     //（IDE 侧 Copilot Chat / Continue / Cline）。与上面 `mcp.server-registry` 方向相反 ——
@@ -652,6 +714,8 @@ export async function resolveBuiltinPlugins(
   registry = getBuiltinRegistry(),
   config?: HarnessConfig,
   isolationLevel?: IsolationLevel,
+  /** P1-3：已构造且自检通过的 OS 绑定（透传给需要起子进程的内置插件） */
+  osBinding?: OsBinding | null,
 ): Promise<{ plugins: AgentPlugin[]; unknown: string[] }> {
   const plugins: AgentPlugin[] = []
   const unknown: string[] = []
@@ -664,7 +728,7 @@ export async function resolveBuiltinPlugins(
     if (!entry) { unknown.push(id); continue }
     done.add(id)
     try {
-      const plugin = await entry.load({ config, isolationLevel })
+      const plugin = await entry.load({ config, isolationLevel, osBinding })
       plugins.push(plugin)
       for (const dep of plugin.dependsOn ?? []) if (!done.has(dep)) queue.push(dep)
     } catch (err) {

@@ -52,6 +52,14 @@ export interface NoticePayloads {
   'plugins.load-failed': { file: string; message: string; bareDependency: boolean }
   /** 模块既没导出通用 AgentPlugin、也没导出有效 Provider 类型工厂 ⇒ 已忽略 */
   'plugins.not-a-plugin': { file: string }
+  /**
+   * 插件代码命中**静态扫描**规则（P1-5）。`allowPluginCode` 开闸后才会出现 —— 开闸
+   * 等于让外部代码以完整 Node 权限在宿主进程里跑，所以至少要把它动了什么说出来。
+   * ⚠️ 文案里必须带"预警不是边界"，否则这条告警会被读成"扫过就是安全的"。
+   */
+  'plugins.code-scan': { file: string; items: string[] }
+  /** 扫描命中且 `sandbox.pluginCodeScan="refuse"` ⇒ 该文件不加载 */
+  'plugins.code-refused': { file: string; items: string[] }
 
   // ── 配置校验（前两条随后 throw）──
   'config.providers-invalid': { issues: string[] }
@@ -61,8 +69,19 @@ export interface NoticePayloads {
   'config.compression-inactive': { items: string[] }
   'config.compaction-inactive': { items: string[] }
   'config.sandbox-inactive': { items: string[] }
+  /**
+   * MCP server **声明了能力但强制不了**（P1-7）：`capabilities` 写出来像约束，
+   * 实际能不能约束住取决于档位。不说就是一句自我安慰 —— 与 `sandbox-inactive` 同范式。
+   */
+  'config.mcp-inactive': { items: string[] }
   /** 隔离档位未达要求而告警降级（P1-4）；`onUnmet: 'refuse'` 时不走这条、直接拒绝启动 */
   'sandbox.isolation-degraded': { level: string; required: string; reasons: string[] }
+  /**
+   * OS 绑定**没套上**（P1-3）：写了 `sandbox.osBinding="on"` 但拿不到原语，或自检没跑通。
+   * 与 `isolation-degraded` 的区别：那条说"档位达不到要求"，这条说"你要求用的那个原语
+   * 实际上没生效" —— 后者是**静默失效**的形态，必须单独出声。
+   */
+  'sandbox.binding-unavailable': { reason: 'no-primitive' | 'self-test-failed' | 'not-enabled'; detail: string }
   'config.memory-not-enabled': undefined
   'config.memory-inactive': { items: string[] }
   'config.telemetry-inactive': { items: string[] }
@@ -108,6 +127,8 @@ export const NOTICE_LEVEL: { readonly [C in NoticeCode]: NoticeLevel } = {
   'plugins.code-skipped': 'notice',
   'plugins.load-failed': 'notice',
   'plugins.not-a-plugin': 'notice',
+  'plugins.code-scan': 'warn',
+  'plugins.code-refused': 'warn',
   'config.providers-invalid': 'notice',
   'config.secret-unresolved': 'notice',
   'provider.construct-failed': 'notice',
@@ -118,7 +139,9 @@ export const NOTICE_LEVEL: { readonly [C in NoticeCode]: NoticeLevel } = {
   'config.compression-inactive': 'warn',
   'config.compaction-inactive': 'warn',
   'config.sandbox-inactive': 'warn',
+  'config.mcp-inactive': 'warn',
   'sandbox.isolation-degraded': 'warn',
+  'sandbox.binding-unavailable': 'warn',
   'config.memory-not-enabled': 'warn',
   'config.memory-inactive': 'warn',
   'config.telemetry-inactive': 'warn',
@@ -174,6 +197,21 @@ export function renderNotice(n: HostNotice): string {
   const outLines = (...parts: string[]): string => parts.filter(Boolean).map((p) => p + '\n').join('')
 
   switch (n.code) {
+    case 'plugins.code-scan':
+      return outLines(
+        `[WARN] 插件代码命中静态扫描规则：${n.data.file}\n`,
+        ...n.data.items.map((m) => `  - ${m}\n`),
+        '  ⚠️ 这是**预警不是边界**：正则挡不住刻意绕过的写法。要真正的边界得等 worker / WASI。\n',
+        '  不想看到这些告警：config.json → sandbox.pluginCodeScan（warn / refuse / off）。\n',
+      )
+
+    case 'plugins.code-refused':
+      return outLines(
+        `[WARN] 已拒绝加载插件代码（命中静态扫描，sandbox.pluginCodeScan="refuse"）：${n.data.file}\n`,
+        ...n.data.items.map((m) => `  - ${m}\n`),
+        '  放行请改 sandbox.pluginCodeScan="warn"，或修正该文件里的调用。\n',
+      )
+
     case 'plugins.code-skipped':
       return outLines(
         `已跳过 ${n.data.count} 个插件代码文件（默认不加载外部插件代码，防止代码注入）：\n`,
@@ -220,6 +258,13 @@ export function renderNotice(n: HostNotice): string {
         '\n'
       )
 
+    case 'config.mcp-inactive':
+      return (
+        '[WARN] config.json → mcpServers 的能力声明有以下项**强制不了**：\n' +
+        n.data.items.map((m) => `       - ${m}`).join('\n') +
+        '\n'
+      )
+
     case 'config.sandbox-inactive':
       return (
         '[WARN] config.json → sandbox 有以下问题：\n' +
@@ -233,6 +278,19 @@ export function renderNotice(n: HostNotice): string {
         n.data.reasons.map((m) => `       - ${m}`).join('\n') +
         '\n       （现在按实际档位继续；要"达不到就不启动"请设 sandbox.onUnmet="refuse"）\n'
       )
+
+    case 'sandbox.binding-unavailable': {
+      const why = n.data.reason === 'no-primitive'
+        ? '本机没有可用的 OS 隔离原语'
+        : n.data.reason === 'self-test-failed'
+          ? '原语在，但自检没跑通（profile 未被接受 ⇒ 命令不会被执行）'
+          : 'sandbox.osBinding 不是 "on"'
+      return (
+        `[WARN] 本次没有套上 OS 级绑定（L2）：${why}\n` +
+        `       ${n.data.detail}\n` +
+        '       现在按 L1（策略层 + 进程层）继续：路径判定仍在、但**不是 OS 级强制**。\n'
+      )
+    }
 
     case 'config.memory-not-enabled':
       return '[WARN] config.json 写了 memory 段，但没有启用记忆（plugins 里加 "memory"）⇒ 该段不会生效\n'

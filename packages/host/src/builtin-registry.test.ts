@@ -15,6 +15,7 @@ import { describe, it, expect } from 'bun:test'
 import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { buildOsBinding, verifyOsBinding } from '@harness/isolation'
 import { ProviderTypeRegistry } from '@harness/plugin'
 import type { AgentPlugin } from '@harness/plugin'
 import {
@@ -416,6 +417,49 @@ describe('checkSandboxConfig：写了但不生效的键要有声音', () => {
   it('正常配置不报', () => {
     expect(checkSandboxConfig({ allowlist: ['ls'], limits: { maxFileSizeKb: 1024 }, readDeny: false })).toEqual([])
   })
+
+  it('★P1-3：osBinding 写错值要出声（默认 off，写错也按 off ⇒ 静默失效）', () => {
+    expect(checkSandboxConfig({ osBinding: true }).some((m) => m.includes('osBinding') && m.includes('按 off 处理'))).toBe(true)
+    expect(checkSandboxConfig({ osBinding: 'on' })).toEqual([])
+  })
+
+  it('★P1-3：要求 L2 却不给用原语 ⇒ 一定达不到（提前说，别等启动时才发现）', () => {
+    const out = checkSandboxConfig({ level: 'L2' })
+    expect(out.some((m) => m.includes('L2') && m.includes('osBinding'))).toBe(true)
+    // 给了原语就不报
+    expect(checkSandboxConfig({ level: 'L2', osBinding: 'on' }).join()).not.toContain('osBinding')
+  })
+})
+
+describe('checkMcpCapabilities：声明了但强制不了的要出声（P1-7）', () => {
+  const { checkMcpCapabilities } = require('./index') as {
+    checkMcpCapabilities: (s: unknown, o?: { osBindingAvailable?: boolean }) => string[]
+  }
+
+  it('没声明 ⇒ 不报（默认不受限，与改造前逐位一致）', () => {
+    expect(checkMcpCapabilities([{ name: 'a', command: 'x' }], { osBindingAvailable: true })).toEqual([])
+  })
+
+  it('★有绑定 + 声明 fs:"cwd" ⇒ 真强制，不报', () => {
+    expect(checkMcpCapabilities([{ name: 'a', capabilities: { fs: 'cwd' } }], { osBindingAvailable: true })).toEqual([])
+  })
+
+  it('★没绑定 + 声明 fs:"cwd" ⇒ 报（否则"我声明了"就是自我安慰）', () => {
+    const out = checkMcpCapabilities([{ name: 'a', capabilities: { fs: 'cwd' } }], { osBindingAvailable: false })
+    expect(out.some((m) => m.includes('a') && m.includes('只声明、不强制'))).toBe(true)
+  })
+
+  it('★net:"none" 在两种档位下都报（任何档位都强制不了子进程出网）', () => {
+    for (const avail of [true, false]) {
+      const out = checkMcpCapabilities([{ name: 'a', capabilities: { net: 'none' } }], { osBindingAvailable: avail })
+      expect(out.some((m) => m.includes('强制不了子进程出网'))).toBe(true)
+    }
+  })
+
+  it('非数组 / 非对象元素不炸', () => {
+    expect(checkMcpCapabilities(undefined)).toEqual([])
+    expect(checkMcpCapabilities([null, 3, {}])).toEqual([])
+  })
 })
 
 describe('P1-2 / P1-4：net 策略与解析后的档位透传', () => {
@@ -438,8 +482,32 @@ describe('P1-2 / P1-4：net 策略与解析后的档位透传', () => {
       const ok = (await bash.call({ command: 'echo hi' }, toolCtx(dir))) as {
         output?: { isolation?: Record<string, unknown> }
       }
-      // 档位是 boot 解析后的**事实**（这里注入 L2），netPolicy 是策略本身
-      expect(ok.output!.isolation).toEqual({ level: 'L2', fsBound: true, netPolicy: 'deny', viaHost: false })
+      // 档位是 boot 解析后的**事实**（这里注入 L2），netPolicy 是策略本身。
+      // ★P1-3 起的口径：`fsBound` 由"这次真递了 OS 绑定没有"决定，**不再由档位推导** ——
+      // 只注入档位而不递绑定 ⇒ false（不模拟：档位叫 L2 不等于真的绑上了）。
+      expect(ok.output!.isolation).toEqual({ level: 'L2', fsBound: false, netPolicy: 'deny', viaHost: false })
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // 真跑原语 ⇒ 只在 darwin 有 sandbox-exec 时执行（构造出的绑定在别的平台上 spawn 不到）
+  it.skipIf(process.platform !== 'darwin')('★P1-3：递了 osBinding 才报 fsBound=true（档位与绑定是两件独立的事实）', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sbx-osb-'))
+    try {
+      const binding = buildOsBinding({ platform: 'darwin', writable: [dir], primitives: { sandboxExec: true, bwrap: false, landlock: false } })
+      const tools = await toolsOf(
+        await getBuiltinRegistry().get('tools-builtin')!.load({ isolationLevel: 'L2', osBinding: binding }),
+      )
+      const bash = tools.find((t) => t.id === 'bash_ro')!
+      const res = (await bash.call({ command: 'echo hi' }, toolCtx(dir))) as {
+        output?: { isolation?: Record<string, unknown> }
+      }
+      // ★判据要跟着环境走：递了绑定**不等于**绑上了 —— 嵌套沙箱（如本机 bun test 落在
+      // WorkBuddy 沙箱内）下内核会拒 apply，此时 `fsBound` 必须是 false（并标 `fsBoundFailed`）。
+      // 也就是"工具如实回传"这件事，两种环境都成立。
+      const reallyBound = verifyOsBinding(binding!)
+      expect(res.output!.isolation?.fsBound).toBe(reallyBound)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
