@@ -237,20 +237,32 @@ describe('assessRisk · 风险分级（只打标签不决策）', () => {
     expect(assessRisk('bash', [], { command: 'sudo rm -rf /tmp/x' })).toBe('high')
     expect(assessRisk('bash', [], { command: 'dd if=/dev/zero of=/dev/sda' })).toBe('high')
   })
-  it('高危工具键 → high（写/删类）', () => {
-    expect(assessRisk('edit_file', [], { path: 'a.ts' })).toBe('high')
-    expect(assessRisk('write_file', [], { path: 'a.ts' })).toBe('high')
+  it('高危权限键 → high（write / edit）', () => {
+    expect(assessRisk('write', [], { path: 'a.ts' })).toBe('high')
+    expect(assessRisk('edit', [], { path: 'a.ts' })).toBe('high')
   })
-  it('已知只读工具键 → low', () => {
-    expect(assessRisk('read_file', [], {})).toBe('low')
-    expect(assessRisk('grep_file', [], {})).toBe('low')
+  it('★判据是权限键而不是工具 id：写文件在改造前正是被这条漏掉的', () => {
+    // `write_file` / `edit_file` 是**工具 id**，永远不会作为 toolKey 传进来
+    // （toolKey 来自 `tool.permission.key`）⇒ 它们落到 medium。这**正是**改造前
+    // `write` 的遭遇：写操作在决策卡片上标「中危」。这条断言同时钉住"表里不许再写 id"。
+    expect(assessRisk('write_file', [], { path: 'a.ts' })).toBe('medium')
+    expect(assessRisk('edit_file', [], { path: 'a.ts' })).toBe('medium')
+  })
+  it('★只读侧同理：id `read_file` / `list_dir` 不是键 ⇒ medium（LOW 表里只有 `read` / `bash_ro`）', () => {
+    expect(assessRisk('read_file', [], {})).toBe('medium')
+    expect(assessRisk('list_dir', [], {})).toBe('medium')
+    expect(assessRisk('glob', [], {})).toBe('medium')
+  })
+  it('已知只读权限键 → low', () => {
+    expect(assessRisk('read', [], {})).toBe('low')
     // P2-5：只读 shell 变体天然不可写 ⇒ low
     expect(assessRisk('bash_ro', [], { command: 'ls' })).toBe('low')
   })
   it('中间地带 → medium', () => {
     expect(assessRisk('custom_tool', [], {})).toBe('medium')
-    // 权限键与工具 id 不同名：实际询问用的键是 `write`（不是 `write_file`）
-    expect(assessRisk('write', [], { path: 'a.ts' })).toBe('medium')
+    // 真实存在但不进两张表的键（出网 / 派工）：刻意保持 medium
+    expect(assessRisk('network', [], { url: 'https://example.com' })).toBe('medium')
+    expect(assessRisk('agent', [], { prompt: 'x' })).toBe('medium')
   })
 })
 
@@ -309,12 +321,13 @@ describe('InteractivePermissionEngine · decision.human 审计', () => {
       return 'allow'
     }
     const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', asker, audit: (env) => { events.push(env) } })
-    await e.ask({ toolKey: 'read_file', patterns: ['/tmp/a'], input: { path: '/tmp/a' }, sessionId: 's1' })
+    // 注意这里给的是**权限键** `read`（不是工具 id `read_file`）—— 见 assessRisk 的键表说明
+    await e.ask({ toolKey: 'read', patterns: ['/tmp/a'], input: { path: '/tmp/a' }, sessionId: 's1' })
     expect(events).toHaveLength(1)
     const env = events[0] as { kind: string; tool: string; riskLevel: string; actionTaken: string; rememberScope: string; responseMs: number; stateHash: string; sessionId: string; decisionPoint: string }
     expect(env.kind).toBe('decision.human')
     expect(env.decisionPoint).toBe('core.permission.ask')
-    expect(env.tool).toBe('read_file')
+    expect(env.tool).toBe('read')
     expect(env.riskLevel).toBe('low')
     expect(env.actionTaken).toBe('allow')
     expect(env.rememberScope).toBe('once')

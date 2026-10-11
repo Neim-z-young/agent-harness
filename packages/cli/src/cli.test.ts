@@ -2773,9 +2773,11 @@ describe('M3 decision.human 审计落盘', () => {
     }
     expect(env.kind).toBe('decision.human')
     expect(env.decisionPoint).toBe('core.permission.ask')
-    // toolKey 是权限键（permission.key），不是工具 id
+    // toolKey 是权限键（permission.key = 'write'），不是工具 id（'needs_approval'）
     expect(env.tool).toBe('write')
-    expect(env.riskLevel).toBe('medium')
+    // 风险标签按**权限键**分级 ⇒ 写文件 = high（改造前表里写的是工具 id `write_file`，
+    // 于是 `write` 落到中间档 medium —— 写操作被标成"中危"）
+    expect(env.riskLevel).toBe('high')
     expect(env.actionTaken).toBe('allow')
     expect(env.rememberScope).toBe('once')
     expect(env.sessionId).toBe(sess.id)

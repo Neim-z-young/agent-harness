@@ -69,35 +69,50 @@ export const DEFAULT_PERMISSION_PRINCIPAL = 'local'
 /** 风险等级：规则引擎只打标签不决策，决策权归人工 */
 export type RiskLevel = 'low' | 'medium' | 'high'
 
-/** 已知只读/低危工具键（打到这一档的基本是查数/检索类，放行代价低） */
-const LOW_RISK_TOOL_KEYS = new Set([
-  'read', 'read_file', 'list_dir', 'grep_file', 'glob', 'search', 'query',
-  // P2-5：只读 shell 变体与 `bash` 同族，但**天然不可写**（白名单 + 拒绝重定向/命令
-  // 替换/提权，见 `tools-builtin` 的 `checkReadOnlyCommand`）⇒ 直接落 low，不进命令表。
+/**
+ * ⚠️ 下面两张表的键是**权限键**（`ToolDefinition.permission.key`），**不是工具 id**。
+ *
+ * 依据：`assessRisk` 唯一的生产调用点是 `buildPermissionPrompt`，传的是 `req.toolKey`，
+ * 而它出自 `@harness/tool` 的 `tool.permission.key`（`tool/src/index.ts` 的 `doExecute` Step 4：
+ * `toolKey: tool.permission.key`）—— 工具 id 从来不经过这里。`cli.test.ts` 的权限审计用例
+ * 把这条钉死：工具的 id 是 `needs_approval`，而落到审计里的 `tool` 是 `write`。
+ *
+ * 本仓真实存在的权限键（`grep -rn "key: '" packages/plugins`）：
+ * `read` / `write` / `edit` / `bash` / `bash_ro` / `network` / `agent`，以及 swarm 的
+ * `task_*` / `team_*` / `send_*`。
+ *
+ * ## 为什么专门写这一段（P2-5 的附带发现）
+ * 改造前这两张表里写的是**工具 id**（`write_file` / `edit_file` / `delete` / `rm` / `modify_*` …），
+ * 它们**一个都不会到达这里** ⇒ 真正的键 `write` 落不到 high，**写文件的决策卡片标的是「中危」**。
+ * 比 D4 更隐蔽：D4 是"全打 high、没有区分度"，这里却是高危档**整个空转**。
+ */
+const LOW_RISK_PERMISSION_KEYS = new Set([
+  'read',
+  // 只读 shell 变体与 `bash` 同族，但**天然不可写**（白名单 + 拒绝重定向/命令替换/提权，
+  // 见 `tools-builtin` 的 `checkReadOnlyCommand`）⇒ 直接落 low，不进命令表。
   'bash_ro',
-  'get_order_details', 'get_product_details', 'find_user_id_by_email', 'list_all_product_types',
 ])
 
 /**
- * 已知高危工具键（写/删类，默认打 high，但仍由人裁决）。
+ * 已知高危权限键（写/改类，默认打 high，但仍由人裁决）。
  *
- * ⚠️ P2-5 把 `bash` 从这里**移出**：执行类工具的风险**取决于要跑的那条命令**，按工具键
+ * ⚠️ P2-5 把 `bash` 从这里**移出**：执行类工具的风险**取决于要跑的那条命令**，按权限键
  * 一刀切会让 `ls` / `pwd` 与 `rm -rf` 拿到同一个标签（D4），而下面的高危模式表也就
  * **再没有机会为 bash 生效**。`bash` 改走 {@link assessShellRisk}。
  */
-const HIGH_RISK_TOOL_KEYS = new Set([
-  'edit_file', 'write_file', 'delete', 'delete_file', 'rm', 'mv', 'chmod',
-  'modify_pending_order_address', 'modify_pending_order_items', 'modify_user_address',
+const HIGH_RISK_PERMISSION_KEYS = new Set([
+  'write',      // write_file / edit_file（<data-dir> 之外的文件改写）
+  'edit',       // code-intel 的 code_semantic_edit（语义改名/替换，直接改源码）
 ])
 
 /** 高危命令模式（bash 入参里的危险片段） */
 const HIGH_RISK_PATTERNS = [/rm -rf/, /\bsudo\b/, /:?\(\)/, /dd if=/, /mkfs/, /curl .*\| *sh/]
 
 /**
- * 执行类工具键：入参里带一条 shell 命令，风险按**命令内容**分级（P2-5 / D4）。
- * 只有 `bash` —— 只读变体已在 {@link LOW_RISK_TOOL_KEYS} 里直接落 low。
+ * 执行类权限键：入参里带一条 shell 命令，风险按**命令内容**分级（P2-5 / D4）。
+ * 只有 `bash` —— 只读变体已在 {@link LOW_RISK_PERMISSION_KEYS} 里直接落 low。
  */
-const SHELL_TOOL_KEYS = new Set(['bash'])
+const SHELL_PERMISSION_KEYS = new Set(['bash'])
 
 /**
  * 只读命令首词白名单：**整条命令的每一段**（按 `&&` / `||` / `;` / `|` / `&` / 换行切段）
@@ -183,21 +198,24 @@ function assessShellRisk(command: string): RiskLevel {
  * 定稿语义：**白名单/黑名单可硬拦高危，中间地带只标低/中/高风险，不自动决策** ——
  * 分级结果只作为决策卡片的标签与审计字段，放行与否永远由人工按键决定。
  *
- * 判据（按序，P2-5 起分流）：**执行类工具**（`bash`）→ {@link assessShellRisk}（看命令内容）；
- * **其余工具** → 入参高危模式 > 已知工具键表 > 默认 medium。
- * 执行类放到最前，是为了让高危模式表**为 bash 真正生效**（改造前 bash 命中工具键表就
+ * 判据（按序，P2-5 起分流）：**执行类权限键**（`bash`）→ {@link assessShellRisk}（看命令内容）；
+ * **其余** → 入参高危模式 > 已知权限键表 > 默认 medium。
+ * 执行类放到最前，是为了让高危模式表**为 bash 真正生效**（改造前 bash 命中键表就
  * 直接 return high，模式表对它形同虚设 —— 那正是 D4）。
+ *
+ * ⚠️ 第一个参数是**权限键**（`permission.key`），不是工具 id —— 见
+ * {@link HIGH_RISK_PERMISSION_KEYS} 上方的说明。
  */
-export function assessRisk(toolKey: string, patterns: string[] = [], input?: unknown): RiskLevel {
-  if (SHELL_TOOL_KEYS.has(toolKey)) {
+export function assessRisk(permissionKey: string, patterns: string[] = [], input?: unknown): RiskLevel {
+  if (SHELL_PERMISSION_KEYS.has(permissionKey)) {
     const command = shellCommandText(input)
     // 拿不到命令文本 ⇒ 保守 high（与改造前逐位一致）
     return command ? assessShellRisk(command) : 'high'
   }
   const blob = JSON.stringify(input ?? {})
   if (HIGH_RISK_PATTERNS.some((re) => re.test(blob))) return 'high'
-  if (HIGH_RISK_TOOL_KEYS.has(toolKey)) return 'high'
-  if (LOW_RISK_TOOL_KEYS.has(toolKey)) return 'low'
+  if (HIGH_RISK_PERMISSION_KEYS.has(permissionKey)) return 'high'
+  if (LOW_RISK_PERMISSION_KEYS.has(permissionKey)) return 'low'
   return 'medium'
 }
 
