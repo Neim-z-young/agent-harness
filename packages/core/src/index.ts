@@ -105,6 +105,14 @@ export type {
 
 export {
   matchGlob,
+  // P0-9：归属作用域键的构造与判定。转出给宿主层（`@harness/host` 的 `rememberRule` 要拼
+  // 写回键、`@harness/host` 的审计要判通配层）。host 不直接依赖 `@harness/permission`，
+  // 从 core 取值可少一个依赖（口径与 `matchGlob` 一致）。
+  sessionScopeKey,
+  callerScopeKey,
+  scopedRuleKey,
+  hashPrincipal,
+  isScopeWildcardKey,
 } from '@harness/permission'
 export type {
   Awaitable as PermissionAwaitable,
@@ -142,6 +150,16 @@ export type {
   CompactionStrategy,
   SessionManager,
 } from '@harness/session'
+// P0-9：归属作用域键的构造（`session:<sid>` / `caller:<hash>`）。core 的 `check()` 要按层查规则，
+// 写回侧（host 的 rememberRule）要用同一套键 ⇒ 构造逻辑只此一份，两边共用不会漂移。
+// 注意：上面是 `export type { … } from '@harness/permission'`（只转出类型、**不引入本模块作用域**），
+// 运行期使用必须单独 import —— 与 `export { createAuditSink } from …` 同一条坑。
+import {
+  callerScopeKey,
+  scopedRuleKey,
+  sessionScopeKey,
+  isScopeWildcardKey,
+} from '@harness/permission'
 import { createHash } from 'node:crypto'
 
 // ===== 内部依赖 =====
@@ -447,10 +465,53 @@ export class DefaultPermissionEngine implements PermissionEngine {
     return { ...this.rules }
   }
 
+  /**
+   * 归属主体解析（P0-9 接缝）。
+   *
+   * 返回**主体标识**（principal），由它推导调用方作用域键 `caller:<hash>`；同时 `req.sessionId`
+   * 推导会话作用域键 `session:<sid>`。基类缺省返回 `undefined` ⇒ **无归属**，
+   * 规则只在 `<toolKey>` / `*` 两层里找 —— 与分层前逐位相同。
+   *
+   * ## 为什么用"覆写钩子"而不是给 `PermissionRequest` 加字段
+   * 归属是**宿主才知道的**：只有宿主有鉴权上下文（CLI 是本机单主体；A2A 是 Bearer 调用方）。
+   * 而 `PermissionRequest` 由 `ToolPipeline` 在 `@harness/tool` 深处构造 —— 给它加 `callerKey`
+   * 就得把宿主概念一路隧穿 core/tool/session「三层」，等于让 core 认识 A2A 的鉴权模型。
+   * 钩子把这份知识留在宿主：`InteractivePermissionEngine`（@harness/host）覆写它即可。
+   *
+   * ⚠️ 返回值会被 {@link callerScopeKey} **哈希**后用于持久化 ⇒ 即便宿主误传凭据，落盘也无明文。
+   */
+  protected resolvePrincipalKey(_req: PermRequest): string | undefined {
+    return undefined
+  }
+
   async check(req: PermRequest): Promise<PermDecision> {
-    const { toolKey, patterns, denyPatterns } = req
-    const toolRule = this.rules[toolKey]
-    const globalRule = this.rules['*']
+    const { toolKey, patterns, denyPatterns, sessionId } = req
+
+    // ---- 归属作用域（P0-9）----
+    const sessionScope = sessionId ? sessionScopeKey(sessionId) : undefined
+    const principal = this.resolvePrincipalKey(req)
+    const callerScope = principal ? callerScopeKey(principal) : undefined
+
+    /**
+     * 查找层：**作用域由具体到笼统**，同域内**工具键先于通配**：
+     * `session:<sid>|<tool>` → `session:<sid>|*` → `caller:<h>|<tool>` → `caller:<h>|*`
+     * → `<tool>` → `*`。
+     *
+     * 无归属（既无 sessionId 又无 principal）时数组只剩后两层 —— **逐位等于分层前的实现**。
+     */
+    const layers: Array<{ key: string; matchedRule: PermDecision['matchedRule']; scope?: 'session' | 'caller'; wildcard: boolean }> = []
+    const push = (key: string, scope: 'session' | 'caller' | undefined, wildcard: boolean) =>
+      layers.push({ key, matchedRule: wildcard ? 'global' : 'tool', ...(scope ? { scope } : {}), wildcard })
+    if (sessionScope) {
+      push(scopedRuleKey(sessionScope, toolKey), 'session', false)
+      push(scopedRuleKey(sessionScope, '*'), 'session', true)
+    }
+    if (callerScope) {
+      push(scopedRuleKey(callerScope, toolKey), 'caller', false)
+      push(scopedRuleKey(callerScope, '*'), 'caller', true)
+    }
+    push(toolKey, undefined, false)
+    push('*', undefined, true)
 
     // behavior ask 时的默认匹配：tool/global
     let behavior: PermDecision['behavior'] | undefined
@@ -493,26 +554,39 @@ export class DefaultPermissionEngine implements PermissionEngine {
       return false
     }
 
-    // **全局 deny 有否决权**（P0-8 配套）：无论工具规则是什么形态 —— 包括**手写**的 string
-    // `'allow'`（`/permission bash=allow`、控制面 `harness/permission.set`）—— 全局声明的
-    // `deny` 都必须先过。理由：string 形态**没有自己的 deny 列表**，若不在这一层兜底，
+    // **全局 deny 有否决权**（P0-8 配套，P0-9 推广到"任一层通配"）：无论工具规则是什么形态
+    // —— 包括**手写**的 string `'allow'`（`/permission bash=allow`、控制面
+    // `harness/permission.set`）—— 任何一层通配规则（`*` / `caller:<h>|*` / `session:<sid>|*`）
+    // 声明的 `deny` 都必须先过。理由：string 形态**没有自己的 deny 列表**，若不在这一层兜底，
     // 它就是一条"绕过一切 deny"的通道。默认全局是 `'*': 'ask'`（string）⇒ 不触发、
-    // 行为逐位不变；只有显式把全局写成 PathRules 且带 `deny` 时才生效（**只收紧不放宽**）。
-    const globalDenied = typeof globalRule === 'object' && globalRule ? hitDeny(globalRule) : undefined
-    if (globalDenied !== undefined) {
-      return { behavior: 'deny', matchedRule: 'global', matchedPattern: globalDenied }
-    }
-
-    if (typeof toolRule === 'object' && toolRule) {
-      if (applyPathRule(toolRule)) {
-        return { behavior: behavior!, matchedRule: matched, matchedPattern }
+    // 行为逐位不变；只有显式把某层通配写成 PathRules 且带 `deny` 时才生效（**只收紧不放宽**）。
+    for (const { key, wildcard } of layers) {
+      if (!wildcard || !isScopeWildcardKey(key)) continue
+      const starRule = this.rules[key]
+      if (typeof starRule === 'object' && starRule) {
+        const denied = hitDeny(starRule)
+        if (denied !== undefined) {
+          return { behavior: 'deny', matchedRule: 'global', matchedPattern: denied }
+        }
       }
     }
-    if (typeof toolRule === 'string') {
-      return { behavior: toolRule, matchedRule: 'tool', matchedPattern: toolKey }
-    }
-    if (typeof globalRule === 'string') {
-      return { behavior: globalRule, matchedRule: 'global', matchedPattern: '*' }
+
+    for (const { key, matchedRule, scope, wildcard } of layers) {
+      const rule = this.rules[key]
+      if (typeof rule === 'object' && rule) {
+        if (applyPathRule(rule)) {
+          return { behavior: behavior!, matchedRule: matched, ...(scope ? { matchedScope: scope } : {}), matchedPattern }
+        }
+        continue
+      }
+      if (typeof rule === 'string') {
+        return {
+          behavior: rule,
+          matchedRule,
+          ...(scope ? { matchedScope: scope } : {}),
+          matchedPattern: wildcard ? '*' : toolKey,
+        }
+      }
     }
     return { behavior: 'ask', matchedRule: 'global', matchedPattern: '*' }
   }

@@ -13,10 +13,10 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AGENT_CARD_PATH, A2A_VERSION_HEADER, Message, TaskState } from '@a2a-js/sdk'
-import { defineTool, type Hooks } from '@harness/core'
+import { defineTool, hashPrincipal, type Hooks } from '@harness/core'
 import { HarnessHost, createAuditSink, type Host } from '@harness/host'
 import type { MockProviderConfig } from '@harness/provider-mock'
-import { CallerRegistry } from './auth'
+import { CallerRegistry, LOCAL_CALLER } from './auth'
 import { messageOf, textPart } from './mapping'
 import { DEFAULT_A2A_HOSTNAME, createA2aServer, type A2aServer } from './server'
 
@@ -451,6 +451,50 @@ describe('A2aServer：INPUT_REQUIRED 挂起与续接', () => {
     const first = taskOf(await send(server, 'go', { contextId: 'c1', messageId: 'm1' }))
     await send(server, 'allow', { contextId: first.contextId, taskId: first.id, messageId: 'm2' })
     expect(existsSync(join(dataDir, 'sessions', 'c1.audit.jsonl'))).toBe(false)
+  })
+
+  // P0-9 / §8 D2：A2A 宿主**必须**把"调用方是谁"接进权限归属，否则本机 `always-allow`
+  // 会被同一 dataDir 的远程 A2A 调用方继承。这条用例走完整 HTTP：答复 `a`（always-allow）
+  // ⇒ 读 `permissions.json` 断言写回键是 `caller:<hash>|echo`（不是裸 `echo`）。
+  it('★always-allow 写回带归属键（A2A 装了 caller resolver：caller:<hash>|echo，无明文）', async () => {
+    const { server, dataDir } = await makeServer({ mock: toolThenText('go', '工具说 ok'), permissionMode: 'ask' })
+    const first = taskOf(await send(server, 'go', { contextId: 'c1', messageId: 'm1' }))
+    expect(first.status.state).toBe('TASK_STATE_INPUT_REQUIRED')
+    // 'a' ⇒ parsePermissionAnswer ⇒ always-allow ⇒ 写回
+    const second = taskOf(await send(server, 'a', { contextId: first.contextId, taskId: first.id, messageId: 'm2' }))
+    expect(second.status.state).toBe('TASK_STATE_COMPLETED')
+
+    const { rules } = JSON.parse(readFileSync(join(dataDir, 'permissions.json'), 'utf8')) as {
+      rules: Record<string, unknown>
+    }
+    // 无 token ⇒ 匿名调用方 = LOCAL_CALLER，规则键是它的**哈希**（落盘不留明文）
+    const key = `caller:${hashPrincipal(LOCAL_CALLER)}|echo`
+    expect(rules[key]).toEqual({ allow: ['go'] })
+    expect(Object.keys(rules)).not.toContain('echo')
+  })
+
+  // P1-9 / §8 D5：控制面 `harness/permission.set` 是**进程级**规则写盘，没有会话上下文
+  // ⇒ 审计落工作区级 `{dataDir}/audit.jsonl`（不是 sessions/ 下），source=control-api。
+  it('控制面 harness/permission.set 落 permission.rule.changed 审计（工作区级、零内容）', async () => {
+    const { server, dataDir } = await makeServer({ audit: true })
+    const res = await control(server, 'harness/permission.set', { key: 'bash', behavior: 'deny' })
+    expect(res.status).toBe(200)
+
+    const file = join(dataDir, 'audit.jsonl')
+    expect(existsSync(file)).toBe(true)
+    const lines = readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)
+    expect(lines.length).toBe(1)
+    const evt = JSON.parse(lines[0]!) as Record<string, unknown>
+    expect(evt.schema).toBe('harness.audit.v1')
+    expect(evt.kind).toBe('permission.rule.changed')
+    expect(evt.source).toBe('control-api')
+    expect(evt.key).toBe('bash')
+    expect(evt.behavior).toBe('deny')
+    expect(evt.stateHash).toMatch(/^[0-9a-f]{64}$/)
+    // 零内容：不含规则原文/入参
+    expect(lines[0]).not.toContain('"input"')
+    // 进程级事件不落会话目录
+    expect(existsSync(join(dataDir, 'sessions'))).toBe(false)
   })
 
   // 回归（真机踩过，2026-10-09）：**流式**续接同样必须成立。

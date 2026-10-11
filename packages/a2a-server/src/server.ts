@@ -40,7 +40,7 @@ import {
   type ServerCallContext,
 } from '@a2a-js/sdk/server'
 import type { Host } from '@harness/host'
-import { CallerRegistry, callerKey, verifyBearer } from './auth'
+import { CallerRegistry, LOCAL_CALLER, callerKey, verifyBearer } from './auth'
 import { JSONRPC_BINDING, buildAgentCard, cardToJSON } from './card'
 import { ControlError, DEFAULT_CONTROL_PATH, dispatchControl } from './control'
 import { wrapAskerWithControlApproval } from './control-approval'
@@ -314,6 +314,25 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
   const messageIndex = new Map<string, string>()
   const inflight = new Set<string>()
   const callers = new CallerRegistry()
+
+  // 权限归属接线（P0-9 / §8 D2）。
+  //
+  // 与上面第 305 行的 `setAsker` 同一条理由：**权限规则的归属只有 server 侧知道**。规则集
+  // 落 `{dataDir}/permissions.json`（dataDir 级共享），若不区分归属，"本机点一次始终允许"
+  // 会被同一工作区的远程 A2A 调用方继承（反向亦成立）。`callers` 已经在做 `contextId → 调用方`
+  // 的绑定（隔离），这里把它**复用**成权限归属：同一个 contextId 的会话，规则作用域就是它的调用方。
+  //
+  // `ownerOf` 为空（未认领的 contextId / 未带 contextId）时回落到 `LOCAL_CALLER` —— 与
+  // `callerKey()` 的匿名口径一致（`'local'`），也与 host 缺省主体同值（见
+  // `@harness/host` 的 `DEFAULT_PERMISSION_PRINCIPAL`）：匿名 A2A = 本机调用方 = CLI 本机主体，
+  // 三者本就是同一个主体，共用一个归属是**正确**的。真正的隔离在**带 token 的远程调用方**，
+  // 它们的主体标识各不相同，天然分开。
+  //
+  // ⚠️ 返回的是**原始调用方标识（可能 = Bearer token）**：引擎侧 `callerScopeKey()` 会先哈希
+  // 再写进规则键，落盘无明文（见该函数说明）。这里不要自行"脱敏"，否则跨重启就不稳定了。
+  host.permission.setCallerResolver((sessionId) =>
+    sessionId ? (callers.ownerOf(sessionId) ?? LOCAL_CALLER) : undefined,
+  )
 
   let card!: AgentCard
   /** 卡片的**线上字节**（与 `ETag` 一一对应：ETag 就是对它取的哈希） */

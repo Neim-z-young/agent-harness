@@ -599,7 +599,7 @@ METHODS.set('harness/permission.set', async (p, host) => {
   }
 
   if (reset) {
-    await host.setPermissionRules({ '*': 'ask' })
+    await host.setPermissionRules({ '*': 'ask' }, { source: 'control-api', behavior: 'reset' })
     host.permission.setMode('ask')
   }
   if (mode !== undefined) host.permission.setMode(mode)
@@ -607,7 +607,7 @@ METHODS.set('harness/permission.set', async (p, host) => {
     if (rawRules === null || typeof rawRules !== 'object' || Array.isArray(rawRules)) {
       throw new ControlError('INVALID_PARAMS', 'params.rules 必须是对象（{ 工具键: allow|deny|ask }）')
     }
-    await host.setPermissionRules(rawRules as Record<string, unknown>)
+    await host.setPermissionRules(rawRules as Record<string, unknown>, { source: 'control-api' })
   }
   if (key !== undefined) {
     const behavior = requireString(p, 'behavior')
@@ -615,7 +615,7 @@ METHODS.set('harness/permission.set', async (p, host) => {
       throw new ControlError('INVALID_PARAMS', `behavior 只能是 allow / deny / ask（收到 ${JSON.stringify(behavior)}）`)
     }
     const current = host.permission.getRules() as Record<string, unknown>
-    await host.setPermissionRules({ ...current, [key]: behavior })
+    await host.setPermissionRules({ ...current, [key]: behavior }, { source: 'control-api', key, behavior })
   }
 
   return {

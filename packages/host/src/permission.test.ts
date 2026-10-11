@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'bun:test'
+import { callerScopeKey, hashPrincipal, scopedRuleKey, sessionScopeKey } from '@harness/core'
 import {
   InteractivePermissionEngine,
   assessRisk,
   buildPermissionPrompt,
+  rulesStateHash,
   type PermissionAnswer,
   type PermissionAsker,
 } from './permission'
@@ -294,5 +296,157 @@ describe('InteractivePermissionEngine · decision.human 审计', () => {
     const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', asker: () => Promise.resolve(undefined), audit: (env) => { events.push(env) } })
     await e.ask({ toolKey: 'bash', patterns: [] })
     expect(events).toHaveLength(0)
+  })
+})
+
+// ===== P0-9（D2 回归）：规则按归属分层，授权不跟调用方串台 =====
+
+describe('InteractivePermissionEngine · P0-9 归属分层（D2 回归）', () => {
+  /** 造一个带归属解析器 + 落盘的引擎 */
+  const scoped = (
+    principal: string | undefined,
+    rules: Record<string, unknown> = { '*': 'ask' },
+    answer: PermissionAnswer = 'always-allow',
+  ) => {
+    let saved: Record<string, unknown> | undefined
+    const e = new InteractivePermissionEngine(rules, {
+      mode: 'ask',
+      asker: () => Promise.resolve(answer),
+      store: { rules: {}, save: async (r) => { saved = r } },
+      ...(principal !== undefined ? { callerResolver: () => principal } : {}),
+    })
+    return { e, saved: () => saved }
+  }
+
+  it('装了归属解析器 ⇒ 写回键带 `caller:<hash>|`，且**落盘不含主体明文**', async () => {
+    const token = 'super-secret-token'
+    const { e, saved } = scoped(token)
+    await e.ask({ toolKey: 'bash', patterns: ['npm test'] })
+    const key = scopedRuleKey(callerScopeKey(token), 'bash')
+    expect(e.getRules()).toMatchObject({ [key]: { allow: ['npm test'] } })
+    expect(saved()).toMatchObject({ [key]: { allow: ['npm test'] } })
+    // ★零明文：主体（= 凭据本身）绝不落盘
+    expect(JSON.stringify(saved())).not.toContain(token)
+    expect(key).toBe(`caller:${hashPrincipal(token)}|bash`)
+  })
+
+  it('未装归属解析器 ⇒ 退回裸工具键（与分层前逐位相同）', async () => {
+    const { e, saved } = scoped(undefined)
+    await e.ask({ toolKey: 'bash', patterns: ['ls'] })
+    expect(saved()).toMatchObject({ bash: { allow: ['ls'] } })
+  })
+
+  it('★远程调用方**不继承**本机 always-allow（D2 的正向证据）', async () => {
+    const { e } = scoped('local')
+    // 本机点一次「始终允许 npm test」⇒ 写进 caller:local|bash
+    await e.ask({ toolKey: 'bash', patterns: ['npm test'], sessionId: 'local-1' })
+    // 同一个引擎换成远程调用方（同一份 dataDir 级规则集）
+    e.setCallerResolver(() => 'remote-token')
+    const remote = await e.check({ toolKey: 'bash', patterns: ['npm test'], input: {}, sessionId: 'remote-1' })
+    // 落到全局兜底 ask，而不是本机那条 allow
+    expect(remote.behavior).toBe('ask')
+    // 反过来：本机自己仍然命中（归属稳定）
+    e.setCallerResolver(() => 'local')
+    const local = await e.check({ toolKey: 'bash', patterns: ['npm test'], input: {}, sessionId: 'local-1' })
+    expect(local.behavior).toBe('allow')
+    expect(local.matchedScope).toBe('caller')
+  })
+
+  it('层序：session 工具 > session 通配 > caller 工具 > caller 通配 > 工具 > 全局', async () => {
+    const h = callerScopeKey('local')
+    const e = new InteractivePermissionEngine(
+      {
+        bash: 'deny',                                // 全局工具层
+        [`${h}|bash`]: { allow: ['npm test'] },      // 调用方工具层
+        [`${sessionScopeKey('s9')}|bash`]: { ask: ['npm test'] }, // 会话工具层（最具体）
+      } as Record<string, unknown>,
+      { mode: 'ask', callerResolver: () => 'local' },
+    )
+    // 会话层最具体 ⇒ 命中 ask（压过 caller 层 allow）
+    const sess = await e.check({ toolKey: 'bash', patterns: ['npm test'], input: {}, sessionId: 's9' })
+    expect(sess.behavior).toBe('ask')
+    expect(sess.matchedScope).toBe('session')
+    // 别的会话 ⇒ 落到 caller 工具层 allow
+    const other = await e.check({ toolKey: 'bash', patterns: ['npm test'], input: {}, sessionId: 's2' })
+    expect(other.behavior).toBe('allow')
+    expect(other.matchedScope).toBe('caller')
+    // 未命中 caller allow 的命令 ⇒ 落到全局工具层 deny（管理员规则不被架空）
+    const denied = await e.check({ toolKey: 'bash', patterns: ['rm -rf /'], input: {}, sessionId: 's2' })
+    expect(denied.behavior).toBe('deny')
+    expect(denied.matchedRule).toBe('tool')
+  })
+
+  it('会话归属键：只有该会话命中，其它会话不受影响（不需要 resolver）', async () => {
+    const e = new InteractivePermissionEngine(
+      { bash: 'deny', [`${sessionScopeKey('sA')}|bash`]: { allow: ['ls'] } } as Record<string, unknown>,
+      { mode: 'ask' },
+    )
+    expect((await e.check({ toolKey: 'bash', patterns: ['ls'], input: {}, sessionId: 'sA' })).behavior).toBe('allow')
+    expect((await e.check({ toolKey: 'bash', patterns: ['ls'], input: {}, sessionId: 'sB' })).behavior).toBe('deny')
+  })
+
+  it('作用域通配层也能否决：`caller:<h>|*` 的 deny 拦住同层 string allow', async () => {
+    const h = callerScopeKey('local')
+    const e = new InteractivePermissionEngine(
+      { [`${h}|bash`]: 'allow', [`${h}|*`]: { deny: ['shutdown*'] } } as Record<string, unknown>,
+      { mode: 'ask', callerResolver: () => 'local' },
+    )
+    const res = await e.check({
+      toolKey: 'bash',
+      patterns: ['echo hi; shutdown -h now'],
+      input: {},
+      sessionId: 's1',
+      denyPatterns: ['echo hi', 'shutdown -h now'],
+    })
+    expect(res.behavior).toBe('deny')
+    expect(res.matchedRule).toBe('global')
+    expect(res.matchedPattern).toBe('shutdown -h now')
+  })
+})
+
+// ===== P1-9（D5 回归）：规则变更留痕 =====
+
+describe('InteractivePermissionEngine · P1-9 规则变更审计（D5 回归）', () => {
+  it('always-allow 写回 ⇒ 决策事件之后跟一条 `permission.rule.changed`（source=asker，零内容）', async () => {
+    const events: Array<Record<string, unknown>> = []
+    const token = 'tok-xyz'
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, {
+      mode: 'ask',
+      asker: () => Promise.resolve('always-allow'),
+      audit: (env) => { events.push(env as unknown as Record<string, unknown>) },
+      callerResolver: () => token,
+    })
+    await e.ask({ toolKey: 'bash', patterns: ['npm test'], sessionId: 's1' })
+
+    expect(events.map((e) => e.kind)).toEqual(['decision.human', 'permission.rule.changed'])
+    const changed = events[1]!
+    expect(changed.source).toBe('asker')
+    expect(changed.sessionId).toBe('s1')
+    expect(changed.key).toBe(scopedRuleKey(callerScopeKey(token), 'bash'))
+    expect(changed.behavior).toBe('allow')
+    expect(changed.stateHash).toMatch(/^[0-9a-f]{64}$/)
+    // 零内容：不含主体明文，也不含命令原文
+    expect(JSON.stringify(changed)).not.toContain(token)
+    expect(JSON.stringify(changed)).not.toContain('npm test')
+  })
+
+  it('单次答复（allow / deny）**不**产生规则变更事件（没写回就没变更）', async () => {
+    const events: Array<Record<string, unknown>> = []
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, {
+      mode: 'ask',
+      asker: () => Promise.resolve('allow'),
+      audit: (env) => { events.push(env as unknown as Record<string, unknown>) },
+    })
+    await e.ask({ toolKey: 'bash', patterns: [], sessionId: 's1' })
+    expect(events.map((e) => e.kind)).toEqual(['decision.human'])
+  })
+
+  it('rulesStateHash 对同一规则集稳定，对新增键敏感（零内容摘要）', () => {
+    const a = rulesStateHash({ '*': 'ask', bash: { allow: ['ls'] } })
+    const b = rulesStateHash({ '*': 'ask', bash: { allow: ['ls'] } })
+    const c = rulesStateHash({ '*': 'ask', bash: { allow: ['ls', 'pwd'] } })
+    expect(a).toBe(b)
+    expect(a).not.toBe(c)
+    expect(a).toMatch(/^[0-9a-f]{64}$/)
   })
 })

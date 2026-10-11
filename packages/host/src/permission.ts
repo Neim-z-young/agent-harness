@@ -23,8 +23,8 @@
  * 这条不能反过来 —— 一个"问不到用户就放行"的默认值是安全缺陷，不是便利。
  */
 import { createHash } from 'node:crypto'
-import { DefaultPermissionEngine } from '@harness/core'
-import type { PathRules, PermissionDecision, PermissionRequest } from '@harness/core'
+import { DefaultPermissionEngine, callerScopeKey, scopedRuleKey } from '@harness/core'
+import type { PathRules, PermissionBehavior, PermissionDecision, PermissionRequest } from '@harness/core'
 
 /** 规范答复四态。`always-*` 会写回规则集并置 `remember=true` */
 export type PermissionAnswer = 'allow' | 'deny' | 'always-allow' | 'always-deny'
@@ -54,6 +54,15 @@ export type PermissionAskInput = Pick<PermissionRequest, 'toolKey' | 'patterns' 
 
 /** 交互模式：`allow-all` / `deny-all` 直接短路，只有 `ask` 才走 asker */
 export type PermissionMode = 'allow-all' | 'ask' | 'deny-all'
+
+/**
+ * 缺省归属主体（P0-9）：未配 `HostOptions.permissionPrincipal` 的宿主视作**单机单主体**。
+ *
+ * 与 `a2a-server/src/auth.ts` 的 `LOCAL_CALLER` **同值同义**：匿名 A2A（不配 token、只听
+ * 127.0.0.1）= 本机调用方，与本机 CLI 本就是同一个主体，共用一个归属是**正确**的。
+ * 真正的隔离诉求在**远程（带 token）调用方** —— 它们的主体标识各不相同，天然分开。
+ */
+export const DEFAULT_PERMISSION_PRINCIPAL = 'local'
 
 // ===== 风险分级（M3 决策卡片）=====
 
@@ -177,6 +186,46 @@ export interface HumanDecisionEvent {
   rememberScope: 'tool' | 'once'
 }
 
+/**
+ * 规则变更审计事件（P1-9 / §8 D5）。零内容约束同 {@link HumanDecisionEvent}。
+ *
+ * ## 为什么需要它
+ * 审计原本**只有 `decision.human` 一种 kind** ⇒ 规则被改动这件事本身不可回溯：
+ * "权限是被谁、何时、从 `allow` 改成 `deny` 的"没有记录。而权限是安全边界，
+ * **静默的规则变更**比"没人按过那个按钮"更危险 —— 尤其是授权已经按归属分层（P0-9）之后。
+ *
+ * 三条写回路径都发这个事件（`source` 区分）：CLI 斜杠命令、A2A 控制面、以及权限询问的
+ * `always-*` 写回（`asker`）。
+ */
+export interface PermissionRuleChangedEvent {
+  schema: 'harness.audit.v1'
+  kind: 'permission.rule.changed'
+  /** 毫秒时间戳 */
+  ts: number
+  /** 变更来源：`cli` = 斜杠命令；`control-api` = A2A 控制面；`asker` = 权限询问的 always-* 写回 */
+  source: 'cli' | 'control-api' | 'asker'
+  /** 会话归属（有则落该会话的审计文件，无则落工作区级 `{dataDir}/audit.jsonl`） */
+  sessionId?: string
+  /** 被改动的规则键（工具键或归属规则键；`reset` 整份重写时为 undefined） */
+  key?: string
+  /** 该键的新行为；`reset` 表示整份重置 */
+  behavior?: PermissionBehavior | 'reset'
+  /**
+   * 变更**之后**规则集的摘要哈希（SHA-256，零内容）。
+   * ⚠️ 只哈希**不落规则原文** —— 归属规则键里含的是**调用方主体的哈希**（见
+   * `callerScopeKey`），规则原文本身可能含敏感路径/命令。
+   */
+  stateHash: string
+}
+
+/** 审计事件总集（`schema` 统一为 `harness.audit.v1`，零内容） */
+export type AuditEvent = HumanDecisionEvent | PermissionRuleChangedEvent
+
+/** 规则集摘要哈希（SHA-256，零内容：规则原文只进哈希不出明文） */
+export function rulesStateHash(rules: Record<string, unknown>): string {
+  return createHash('sha256').update(JSON.stringify(rules)).digest('hex')
+}
+
 /** 决策上下文摘要哈希（SHA-256，零内容：入参只进哈希不出明文） */
 export function stateHashOf(req: PermissionAskInput): string {
   return createHash('sha256')
@@ -194,8 +243,10 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
   private mode: PermissionMode
   private asker: PermissionAsker | undefined
   private readonly store: (PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }) | undefined
-  /** M3：人工决策审计 sink（宿主注入，落盘实现归宿主） */
-  private readonly auditSink: ((env: HumanDecisionEvent) => void | Promise<void>) | undefined
+  /** M3：审计 sink（宿主注入，落盘实现归宿主） */
+  private readonly auditSink: ((env: AuditEvent) => void | Promise<void>) | undefined
+  /** P0-9：归属主体解析（宿主注入；缺省 ⇒ 无归属，规则只在工具键/全局键两层匹配） */
+  private callerResolver: ((sessionId?: string) => string | undefined) | undefined
 
   constructor(
     rules: Record<string, unknown> = { '*': 'ask' },
@@ -203,8 +254,13 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
       store?: PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }
       mode?: PermissionMode
       asker?: PermissionAsker
-      /** M3：人工决策审计（零内容 + stateHash，见 {@link HumanDecisionEvent}） */
-      audit?: (env: HumanDecisionEvent) => void | Promise<void>
+      /** M3：审计 sink（零内容 + stateHash；`decision.human` 与 `permission.rule.changed` 共用） */
+      audit?: (env: AuditEvent) => void | Promise<void>
+      /**
+       * P0-9：归属主体解析（`sessionId` → principal；缺省 ⇒ 无归属）。
+       * 见 `setCallerResolver` 与基类 `resolvePrincipalKey` 的说明。
+       */
+      callerResolver?: (sessionId?: string) => string | undefined
     } = {},
   ) {
     super(rules as never)
@@ -212,6 +268,7 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     this.mode = opts.mode ?? 'ask'
     this.asker = opts.asker
     this.auditSink = opts.audit
+    this.callerResolver = opts.callerResolver
   }
 
   /** 当前交互模式（allow-all / ask / deny-all），供 /permission 查看与切换 */
@@ -242,6 +299,28 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
   }
 
   /**
+   * 注入归属主体解析（P0-9）。`fn` 给 `sessionId` 返回**主体标识**（principal），
+   * 缺省/返回 `undefined` ⇒ **无归属**（规则只在工具键 / 全局键两层匹配，行为与分层前一致）。
+   *
+   * ## 为什么是"启动后注入"而不是构造参数
+   * 与 `setAsker` 同一条理由：A2A 宿主是**先 boot host、后建 server**，而"调用方是谁"只有
+   * server 侧的鉴权上下文（Bearer 头 + `CallerRegistry`）才知道。`createA2aServer` 建完后
+   * 把这条解析器装回来即可。
+   *
+   * ## ⚠️ 契约：返回值会被**哈希**后落盘
+   * A2A 的主体标识就是 Bearer token（见 `callerScopeKey` 的说明）。返回**原始标识**即可，
+   * `callerScopeKey()` 会把它转成 16 位摘要再进规则键 —— 落盘不留明文。
+   */
+  setCallerResolver(fn?: (sessionId?: string) => string | undefined): void {
+    this.callerResolver = fn
+  }
+
+  /** 覆写基类钩子：把宿主注入的解析器接进 `check()` 的作用域回退（见基类 `resolvePrincipalKey`） */
+  protected override resolvePrincipalKey(req: PermissionRequest): string | undefined {
+    return this.callerResolver?.(req.sessionId)
+  }
+
+  /**
    * 询问：`allow-all` / `deny-all` 直接短路；否则经 `asker` 取四态答复。
    * 无法识别的答复与取不到答复一律 deny（与改造前逐位一致）。
    */
@@ -252,9 +331,10 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     const prompt = buildPermissionPrompt(req)
     const answer = this.asker ? await this.asker(req, prompt) : undefined
     const responseMs = Date.now() - startedAt
-    const decision = this.answerToDecision(req.toolKey, answer, req.patterns ?? [])
+    const { decision, ruleChange } = await this.answerToDecision(req, answer)
     // M3 审计：只有真正拿到人工答复才记（无答复 ⇒ deny 是兜底，不是人工决策）。
     // allow-all/deny-all 短路已在上方 return，不走这里。
+    // 顺序刻意是「决策 → 其后果」：先记人工按了什么，再记它把规则改成了什么。
     if (answer !== undefined && this.auditSink) {
       await this.auditSink({
         schema: 'harness.audit.v1',
@@ -270,30 +350,44 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
         rememberScope: answer === 'always-allow' || answer === 'always-deny' ? 'tool' : 'once',
       })
     }
+    // P1-9：always-* 的规则写回同样是"规则变更"，必须留痕（source=asker）。
+    if (ruleChange && this.auditSink) {
+      await this.auditSink({
+        schema: 'harness.audit.v1',
+        kind: 'permission.rule.changed',
+        ts: Date.now(),
+        source: 'asker',
+        sessionId: req.sessionId,
+        key: ruleChange.key,
+        behavior: ruleChange.behavior,
+        stateHash: ruleChange.stateHash,
+      })
+    }
     return decision
   }
 
-  /** 四态答复 → 决策（含 always-* 的规则写回） */
+  /** 四态答复 → 决策（含 always-* 的规则写回）；`ruleChange` 供上层落 `permission.rule.changed` 审计 */
   private async answerToDecision(
-    toolKey: string,
+    req: PermissionAskInput,
     answer: PermissionAnswer | undefined,
-    patterns: string[],
-  ): Promise<PermissionDecision> {
+  ): Promise<{ decision: PermissionDecision; ruleChange?: { key: string; behavior: 'allow' | 'deny'; stateHash: string } }> {
     switch (answer) {
       // 先判"永久"：写回规则集并置 remember，宿主重启后不再问
-      case 'always-allow':
-        await this.rememberRule(toolKey, 'allow', patterns)
-        return { behavior: 'allow', matchedRule: 'tool', remember: true }
-      case 'always-deny':
-        await this.rememberRule(toolKey, 'deny', patterns)
-        return { behavior: 'deny', matchedRule: 'tool', remember: true }
+      case 'always-allow': {
+        const ruleChange = await this.rememberRule(req, 'allow')
+        return { decision: { behavior: 'allow', matchedRule: 'tool', remember: true }, ruleChange }
+      }
+      case 'always-deny': {
+        const ruleChange = await this.rememberRule(req, 'deny')
+        return { decision: { behavior: 'deny', matchedRule: 'tool', remember: true }, ruleChange }
+      }
       // 单次：只影响本次
       case 'allow':
-        return { behavior: 'allow', matchedRule: 'tool' }
+        return { decision: { behavior: 'allow', matchedRule: 'tool' } }
       case 'deny':
-        return { behavior: 'deny', matchedRule: 'tool' }
+        return { decision: { behavior: 'deny', matchedRule: 'tool' } }
       default:
-        return { behavior: 'deny', matchedRule: 'global' }
+        return { decision: { behavior: 'deny', matchedRule: 'global' } }
     }
   }
 
@@ -316,10 +410,27 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
    * `patterns` 为空（如 `read` 这类无路径参数的工具）⇒ 用 `['**']` 通配，**等价于旧的 string
    * 语义**，但仍保留既有 `deny`/`ask`（旧实现会把它们一并抹掉）。旧数据里已是 string 的规则
    * 同样归一成 `**` —— 不丢语义，只补回"还能被 deny 拦"的能力。
+   *
+   * ## 写回**带归属键**（P0-9）
+   * 有归属主体时，规则键写成 `caller:<hash>|<toolKey>` 而不是裸 `<toolKey>`。理由见
+   * `callerScopeKey` 与 `DefaultPermissionEngine.resolvePrincipalKey`：规则集是 **dataDir 级共享**的，
+   * 裸键会让"本机点一次始终允许"被同一工作区的**远程 A2A 调用方**继承（反向亦成立）。
+   * 无归属（宿主没装解析器）时退回裸键 —— 与分层前逐位相同。
+   *
+   * 返回写回键与行为，供上层落 `permission.rule.changed` 审计（P1-9）。
    */
-  private async rememberRule(toolKey: string, behavior: 'allow' | 'deny', patterns: string[]): Promise<void> {
+  private async rememberRule(
+    req: PermissionAskInput,
+    behavior: 'allow' | 'deny',
+  ): Promise<{ key: string; behavior: 'allow' | 'deny'; stateHash: string }> {
+    const patterns = req.patterns ?? []
+    const toolKey = req.toolKey
+    // 归属键：主体经 callerScopeKey 哈希（**落盘无明文**，见该函数的说明）
+    const principal = this.callerResolver?.(req.sessionId)
+    const ruleKey = principal ? scopedRuleKey(callerScopeKey(principal), toolKey) : toolKey
+
     const current = this.getRules()
-    const existing = current[toolKey]
+    const existing = current[ruleKey]
     // 归一成 PathRules：旧 string 形态只描述"整个工具"，落成 `**` 通配（语义等价，可再被 deny 拦）
     const base: PathRules =
       typeof existing === 'string'
@@ -335,8 +446,9 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     for (const p of patterns.length > 0 ? patterns : ['**']) {
       if (!list.includes(p)) list.push(p)
     }
-    const updated = { ...current, [toolKey]: { ...base, [behavior]: list } }
+    const updated = { ...current, [ruleKey]: { ...base, [behavior]: list } }
     this.updateRules(updated as never)
     await this.store?.save?.(updated)
+    return { key: ruleKey, behavior, stateHash: rulesStateHash(updated as Record<string, unknown>) }
   }
 }

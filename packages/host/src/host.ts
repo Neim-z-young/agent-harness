@@ -90,8 +90,8 @@ import {
 import type { HarnessConfig, SessionEndpoint } from './config'
 import { makeNotice, renderNotice } from './notice'
 import type { HostNotice, NoticeSink } from './notice'
-import { InteractivePermissionEngine } from './permission'
-import type { HumanDecisionEvent, PermissionAsker, PermissionMode, PermissionStoreFile } from './permission'
+import { DEFAULT_PERMISSION_PRINCIPAL, InteractivePermissionEngine, rulesStateHash } from './permission'
+import type { AuditEvent, PermissionAsker, PermissionMode, PermissionStoreFile } from './permission'
 // 默认 Agent 提示词：独立文本文件，import 加载（Bun 原生支持文本导入；tsc 侧由 ./env.d.ts 声明）。
 // 随 `defaultAgent()` 一并自 cli 上移 —— 它是装配产物的一部分，不是终端形态。
 import defaultAgentPrompt from './prompts/default-agent.txt'
@@ -128,13 +128,22 @@ export interface HostOptions {
    */
   asker?: PermissionAsker
   /**
-   * 人工决策审计落盘接缝（M3 `decision.human`，见 `./permission.ts` 的 `HumanDecisionEvent`）。
+   * 审计落盘接缝（`decision.human` / `permission.rule.changed`，见 `./permission.ts` 的
+   * `AuditEvent`）。
    *
    * 权限引擎只**产出**事件，落盘实现归宿主：CLI 传 `createAuditSink(dataDir)`，A2A 宿主
    * （`runA2aCli` / VSCode sidecar 走的就是它）同样传一份 —— 否则「同一条人工决策换个宿主
    * 就没有审计记录」。缺省不审计（纯 headless 场景无人工决策可记）。
    */
-  audit?: (env: HumanDecisionEvent) => void | Promise<void>
+  audit?: (env: AuditEvent) => void | Promise<void>
+  /**
+   * 权限归属主体解析（P0-9，见 `./permission.ts` 的 `setCallerResolver`）。
+   *
+   * `sessionId` → principal；缺省 ⇒ **本机单主体** `'local'`（CLI / 嵌入式）。
+   * **A2A 宿主必须覆写**（`createA2aServer` 建完 server 后把"调用方是谁"装回去），
+   * 否则所有远程调用方与本机共用一个归属 ⇒ §8 D2 的串台照旧。
+   */
+  permissionPrincipal?: (sessionId?: string) => string | undefined
   /** 测试注入 */
   mockProviderConfig?: MockProviderConfig
   anthropicProviderConfig?: any
@@ -328,6 +337,8 @@ export class HarnessHost {
       mode,
       asker: this.options.asker,
       audit: this.options.audit,
+      // P0-9：归属主体解析。缺省 = 本机单主体（CLI / 嵌入式）；A2A 建完 server 后覆写。
+      callerResolver: this.options.permissionPrincipal ?? (() => DEFAULT_PERMISSION_PRINCIPAL),
       store: { ...(rules as any), save },
     })
   }
@@ -371,10 +382,38 @@ export class HarnessHost {
     await mkdir(this.workspace.dataDir, { recursive: true })
     await writeFile(this.permissionStorePath, JSON.stringify({ rules }, null, 2))
   }
-  /** 更新权限引擎规则并落盘（/permission 使用） */
-  async setPermissionRules(rules: Record<string, unknown>): Promise<void> {
+  /**
+   * 更新权限引擎规则并落盘（`/permission` 与管理面使用）。
+   *
+   * ## 这是**三条写盘路径的统一入口** ⇒ P1-9 的审计接在这里
+   * CLI 斜杠命令（`/permission`）与 A2A 控制面（`harness/permission.set`）都只调本方法
+   * （`always-*` 的自动写回走引擎的 `rememberRule`，见 `./permission.ts`）。在这里发
+   * `permission.rule.changed` 即可**一次覆盖两条手工路径**，且不会随调用点增删而漏。
+   *
+   * @param meta.source    变更来源标识（缺省 `'cli'`，即斜杠命令；控制面显式传 `'control-api'`）
+   * @param meta.key       被改动的规则键（整份替换/重置时可省）
+   * @param meta.behavior  该键的新行为（整份替换/重置时可省）
+   * @param meta.sessionId 会话归属（有则审计落该会话的文件）
+   */
+  async setPermissionRules(
+    rules: Record<string, unknown>,
+    meta: { source?: 'cli' | 'control-api'; key?: string; behavior?: string; sessionId?: string } = {},
+  ): Promise<void> {
     this.permission.updateRules(rules as any)
     await this.saveRules(rules)
+    // 审计是旁路：sink 缺省（headless）或写入失败都不影响规则已生效的事实
+    if (this.options.audit) {
+      await this.options.audit({
+        schema: 'harness.audit.v1',
+        kind: 'permission.rule.changed',
+        ts: Date.now(),
+        source: meta.source ?? 'cli',
+        ...(meta.sessionId !== undefined ? { sessionId: meta.sessionId } : {}),
+        ...(meta.key !== undefined ? { key: meta.key } : {}),
+        ...(meta.behavior !== undefined ? { behavior: meta.behavior as never } : {}),
+        stateHash: rulesStateHash(rules),
+      })
+    }
   }
 
   /** 默认 Agent 定义（无 agent 指定时使用）；含 CLI/config 解析出的默认模型。

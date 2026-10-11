@@ -117,7 +117,7 @@ export type { HarnessConfig, AcpScopeSection, ModelResolution, SessionEndpoint }
 // 权限接缝（P0 收尾 S2 第二步）：四态语义 / 模式短路 / 规则写回已上移到 host，cli 只留文本提问适配。
 // `createAuditSink` 与之同源（M3 后由 cli 上移到 host）—— 本地也要 import 一份供构造期使用，
 // `export ... from` 只重导出、不在本作用域引入名字（见下方 §3.5 的 re-export）。
-import { InteractivePermissionEngine, createAuditSink } from '@harness/host'
+import { InteractivePermissionEngine, createAuditSink, DEFAULT_PERMISSION_PRINCIPAL } from '@harness/host'
 import type { PermissionAnswer, PermissionAsker, PermissionMode, PermissionStoreFile } from '@harness/host'
 export type { PermissionAnswer, PermissionAsker, PermissionMode, PermissionStoreFile } from '@harness/host'
 export { InteractivePermissionEngine } from '@harness/host'
@@ -149,7 +149,7 @@ import { sessionModelMetaPatch, type Message, type Session, type SessionModelOve
 import type { ToolContext, Tool } from '@harness/tool'
 import { renderWidgetText, widgetFromToolResult } from '@harness/ui-widget'
 import { createJsonlWriter, type JsonlWriter } from '@harness/telemetry'
-import type { HumanDecisionEvent } from '@harness/host'
+import type { AuditEvent } from '@harness/host'
 
 import { join, resolve } from 'node:path'
 
@@ -371,8 +371,10 @@ export class CliPermissionEngine extends InteractivePermissionEngine {
       /** 测试注入：替换真实 readline 交互 */
       askPrompt?: (question: string) => Promise<string>
       stdout?: NodeJS.WritableStream | { write: (s: string) => void }
-      /** M3：人工决策审计（透传给 host 引擎） */
-      audit?: (env: HumanDecisionEvent) => void | Promise<void>
+      /** M3：审计（`decision.human` + `permission.rule.changed`，透传给 host 引擎） */
+      audit?: (env: AuditEvent) => void | Promise<void>
+      /** P0-9：归属主体解析（透传给 host 引擎；缺省 ⇒ 无归属，写回裸工具键） */
+      callerResolver?: (sessionId?: string) => string | undefined
     } = {}
   ) {
     super(rules, {
@@ -380,6 +382,7 @@ export class CliPermissionEngine extends InteractivePermissionEngine {
       mode: options.mode,
       asker: cliAsker(options.askPrompt),
       audit: options.audit,
+      callerResolver: options.callerResolver,
     })
   }
 
@@ -455,8 +458,10 @@ export class HarnessApp extends HarnessHost {
 
   /** 构造期捕获：`createPermissionEngine` 在 boot() 里才被调用，那时基类私有 options 已不可见 */
   private readonly cliAskPrompt?: (q: string) => Promise<string>
-  /** M3：人工决策审计 sink（per-session writer 池） */
-  private readonly auditSink?: (env: HumanDecisionEvent) => void
+  /** M3：审计 sink（per-session writer 池） */
+  private readonly auditSink?: (env: AuditEvent) => void
+  /** P0-9：归属主体解析（构造期捕获；覆写的 createPermissionEngine 在 boot 里才被调用） */
+  private readonly permissionPrincipal?: (sessionId?: string) => string | undefined
 
   constructor(options: HarnessAppOptions) {
     // 未注入输出流时落到真实 stdout：否则装配期诊断与 logger 的 [WARN]/[ERROR] 会被静默丢掉
@@ -475,6 +480,7 @@ export class HarnessApp extends HarnessHost {
     })
     this.cliAskPrompt = options.askPrompt
     this.auditSink = audit
+    this.permissionPrincipal = options.permissionPrincipal
   }
 
   /**
@@ -491,6 +497,9 @@ export class HarnessApp extends HarnessHost {
       askPrompt: this.cliAskPrompt,
       store: { ...(rules as any), save },
       audit: this.auditSink,
+      // P0-9：CLI 缺省 = 本机单主体。覆写工厂完全替代基类，故这里必须显式给 —— 否则
+      // `always-allow` 会退回**裸工具键**，同一 dataDir 下的远程 A2A 调用方一并继承（§8 D2）。
+      callerResolver: this.permissionPrincipal ?? (() => DEFAULT_PERMISSION_PRINCIPAL),
     })
   }
 }
@@ -1328,7 +1337,7 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           }
           const t = arg.trim()
           if (t === 'reset') {
-            await app.setPermissionRules({ '*': 'ask' })
+            await app.setPermissionRules({ '*': 'ask' }, { source: 'cli', behavior: 'reset', sessionId: current.id })
             app.permission.setMode('ask')
             out('已重置权限：规则清空（全局 ask），交互模式=ask，并写回 permissions.json。\n')
             return 'continue'
@@ -1340,9 +1349,11 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             if (!['allow', 'deny', 'ask'].includes(val)) {
               out(`非法行为 "${val}"（allow / deny / ask）。\n`); return 'continue'
             }
-            const current = app.permission.getRules() as Record<string, unknown>
-            const updated = { ...current, [key]: val }
-            await app.setPermissionRules(updated)
+            // 局部变量叫 `rules` 而不是 `current`：`current` 是本轮会话（上面几处都在用
+            // `current.id`），若在这里 shadow 成规则对象，下面传 sessionId 就会拿到规则集。
+            const rules = app.permission.getRules() as Record<string, unknown>
+            const updated = { ...rules, [key]: val }
+            await app.setPermissionRules(updated, { source: 'cli', key, behavior: val, sessionId: current.id })
             out(`已设置规则 ${key}=${val} 并写回 permissions.json。\n`)
             return 'continue'
           }

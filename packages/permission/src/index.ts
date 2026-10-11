@@ -10,6 +10,8 @@
  * 4. 全局通配（*: "ask"）
  */
 
+import { createHash } from 'node:crypto'
+
 /** 支持 Promise 或同步值的类型 */
 export type Awaitable<T> = T | Promise<T>
 
@@ -47,6 +49,15 @@ export type ToolPermissionRule = PermissionBehavior | PathRules
  * 值 = 行为（简写）或路径级规则（详细）
  * '*' = 全局默认行为（兜底）
  *
+ * ## 归属作用域键（P0-9）
+ * 除工具键外，键还可以带**归属作用域前缀**，把同一工具规则按"给谁"分开：
+ * - `session:<sid>|<toolKey>` —— 只对某个会话生效（见 {@link sessionScopeKey}）
+ * - `caller:<hash>|<toolKey>` —— 只对某个调用方生效（见 {@link callerScopeKey}）
+ *
+ * 匹配优先级（`DefaultPermissionEngine.check`）：
+ * `session:<sid>|<toolKey>` → `session:<sid>|*` → `caller:<hash>|<toolKey>` → `caller:<hash>|*`
+ * → `<toolKey>` → `*`，逐层回退。**无归属（两面都拿不到）时只剩后两层 ⇒ 行为与分层前逐位相同。**
+ *
  * @example
  * const rules: PermissionRuleset = {
  *   read: 'allow',                           // 所有读操作放行
@@ -56,13 +67,66 @@ export type ToolPermissionRule = PermissionBehavior | PathRules
  *     deny: ['node_modules/**'],
  *   },
  *   bash: 'ask',                             // 所有 bash 命令询问
+ *   'caller:9f2a1c8e7b3d05a4|bash': { allow: ['npm test'] },  // 仅该调用方免问
  *   '*': 'ask',                              // 其他工具默认询问
  * }
  */
 export interface PermissionRuleset {
   [toolKey: string]: ToolPermissionRule | undefined
-  /** 全局默认行为（兜底） */
-  '*'?: PermissionBehavior
+  /**
+   * 全局默认规则（兜底）。**不限于简写**：自 P0-8 起，全局也可以是 **PathRules**，
+   * 其 `deny` 对所有形态的工具规则行使**否决权**（string 工具规则没有自己的 deny 列表，
+   * 不在这层兜底就是一条"绕过一切 deny"的通道）。见 `DefaultPermissionEngine.check`。
+   */
+  '*'?: ToolPermissionRule
+}
+
+// ===== 归属作用域键（P0-9）=====
+
+/** 作用域与工具键的分隔符（工具权限键是标识符，不含 `|`） */
+export const SCOPE_SEPARATOR = '|'
+
+/** 会话作用域前缀 */
+export const SESSION_SCOPE_PREFIX = 'session:'
+
+/** 调用方作用域前缀 */
+export const CALLER_SCOPE_PREFIX = 'caller:'
+
+/** 会话作用域键：`session:<sessionId>` */
+export function sessionScopeKey(sessionId: string): string {
+  return `${SESSION_SCOPE_PREFIX}${sessionId}`
+}
+
+/**
+ * 调用方作用域键：`caller:<principalHash>`（principal 先经 {@link hashPrincipal}）。
+ *
+ * ## ⚠️ 为什么必须哈希，不能直接用调用方标识
+ * A2A 的调用方标识**就是 Bearer token 本身**（`a2a-server/src/auth.ts` 的 `callerKey()`：
+ * 「配了 token ⇒ 用 token 本身当键」，且该注释明确要求"绝不落日志 / 不回报"）。
+ * 而作用域键会**落盘**到 `<dataDir>/permissions.json` —— 直接把 token 写进去等于
+ * **把凭据持久化**。哈希后不可逆（token 高熵，无需加盐），既保持"跨重启稳定"，
+ * 又不留任何明文。这也是 `PermissionDecision.matchedPattern` 从不回填作用域键的原因。
+ */
+export function callerScopeKey(principal: string): string {
+  return `${CALLER_SCOPE_PREFIX}${hashPrincipal(principal)}`
+}
+
+/** 主体标识 → 16 位十六进制摘要（sha256 前缀，零明文；见 {@link callerScopeKey}） */
+export function hashPrincipal(principal: string): string {
+  return createHash('sha256').update(principal).digest('hex').slice(0, 16)
+}
+
+/**
+ * 拼归属规则键：`<scope>|<toolKey>`。
+ * `scope` 取自 {@link sessionScopeKey} / {@link callerScopeKey}。
+ */
+export function scopedRuleKey(scope: string, toolKey: string): string {
+  return `${scope}${SCOPE_SEPARATOR}${toolKey}`
+}
+
+/** 该规则键是否是"作用域通配"（`*` 或 `<scope>|*`）—— 全局 deny 否决权只扫这些键 */
+export function isScopeWildcardKey(key: string): boolean {
+  return key === '*' || key.endsWith(`${SCOPE_SEPARATOR}*`)
 }
 
 // ===== PermissionDecision =====
@@ -80,6 +144,15 @@ export interface PermissionDecision {
   remember?: boolean
   /** 匹配的规则来源（精确路径/glob/工具级/全局） */
   matchedRule?: 'exact' | 'glob' | 'tool' | 'global'
+  /**
+   * 命中的**归属作用域**（P0-9，见 {@link sessionScopeKey} / {@link callerScopeKey}）。
+   * 缺省 `undefined` = 命中未分归属的规则（工具键 / `*`）。
+   *
+   * 为什么单独一个字段而不是塞进 `matchedRule`：`matchedRule` 描述的是**规则的形态**
+   * （精确 / glob / 工具级 / 全局），归属描述的是**给谁**。两者是正交维度，混进同一个
+   * 联合类型后，"caller 层的一条 glob 规则"就无处安放。
+   */
+  matchedScope?: 'session' | 'caller'
   /** 匹配的模式（用于日志/调试） */
   matchedPattern?: string
 }

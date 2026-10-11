@@ -113,6 +113,8 @@ export {
   buildPermissionPrompt,
   assessRisk,
   stateHashOf,
+  rulesStateHash,
+  DEFAULT_PERMISSION_PRINCIPAL,
 } from './permission'
 export type {
   PermissionAnswer,
@@ -123,10 +125,13 @@ export type {
   PermissionStoreFile,
   RiskLevel,
   HumanDecisionEvent,
+  PermissionRuleChangedEvent,
+  AuditEvent,
 } from './permission'
 
-// 人工决策审计落盘（M3 `decision.human`）。单独成文件（`./audit.ts`）：它是权限接缝的
-// **宿主侧实现**（权限引擎只产出事件，落盘归宿主），与 permission.ts 的"语义只有一份"分开。
+// 审计落盘（M3 `decision.human` + P1-9 `permission.rule.changed`）。单独成文件（`./audit.ts`）：
+// 它是权限接缝的**宿主侧实现**（权限引擎只产出事件，落盘归宿主），与 permission.ts 的
+// "语义只有一份"分开。
 export { createAuditSink } from './audit'
 
 // ========================================================================

@@ -1,7 +1,7 @@
 /**
- * `createAuditSink` 单元测试（M3 `decision.human` 落盘）。
+ * `createAuditSink` 单元测试（`decision.human` / `permission.rule.changed` 落盘）。
  *
- * 覆盖点对应文件头的四条语义：按会话落盘 / 无 sessionId 丢弃 / 目录自建 / 失败静默。
+ * 覆盖点对应文件头的语义：按会话落盘 / 无归属落工作区级文件 / 目录自建 / 失败静默 / 零内容。
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
@@ -9,7 +9,7 @@ import { mkdtempSync, readFileSync, existsSync, readdirSync, writeFileSync } fro
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createAuditSink } from './audit'
-import type { HumanDecisionEvent } from './permission'
+import type { AuditEvent, HumanDecisionEvent, PermissionRuleChangedEvent } from './permission'
 
 function evt(over: Partial<HumanDecisionEvent> = {}): HumanDecisionEvent {
   return {
@@ -24,6 +24,17 @@ function evt(over: Partial<HumanDecisionEvent> = {}): HumanDecisionEvent {
     actionTaken: 'allow',
     responseMs: 1200,
     rememberScope: 'once',
+    ...over,
+  }
+}
+
+function ruleEvt(over: Partial<PermissionRuleChangedEvent> = {}): PermissionRuleChangedEvent {
+  return {
+    schema: 'harness.audit.v1',
+    kind: 'permission.rule.changed',
+    ts: 1_700_000_000_001,
+    source: 'control-api',
+    stateHash: 'f00d',
     ...over,
   }
 }
@@ -45,10 +56,25 @@ describe('createAuditSink', () => {
     expect(parsed.schema).toBe('harness.audit.v1')
   })
 
-  it('无 sessionId 的事件直接丢弃（不建任何文件）', () => {
+  it('无 sessionId 的事件落**工作区级** {dataDir}/audit.jsonl（不再丢弃：规则变更可能无会话归属）', () => {
     const sink = createAuditSink(dir)
-    sink(evt({ sessionId: undefined }))
+    sink(ruleEvt({ key: 'bash', behavior: 'deny' }))
+    expect(existsSync(join(dir, 'audit.jsonl'))).toBe(true)
+    // 不建 sessions/（该事件不可归属到任何会话）
     expect(existsSync(join(dir, 'sessions'))).toBe(false)
+    const parsed = JSON.parse(readFileSync(join(dir, 'audit.jsonl'), 'utf8').trim()) as PermissionRuleChangedEvent
+    expect(parsed.kind).toBe('permission.rule.changed')
+    expect(parsed.source).toBe('control-api')
+    expect(parsed.key).toBe('bash')
+    expect(parsed.stateHash).toBe('f00d')
+  })
+
+  it('同一 sink 同时服务两类事件：有归属进会话文件、无归属进工作区文件', () => {
+    const sink = createAuditSink(dir)
+    const events: AuditEvent[] = [evt({ sessionId: 's1' }), ruleEvt(), evt({ sessionId: 's1' }), ruleEvt({ source: 'cli' })]
+    for (const e of events) sink(e)
+    expect(readFileSync(join(dir, 'sessions', 's1.audit.jsonl'), 'utf8').trim().split('\n').length).toBe(2)
+    expect(readFileSync(join(dir, 'audit.jsonl'), 'utf8').trim().split('\n').length).toBe(2)
   })
 
   it('多会话各写各的文件（同一 sink 实例）', () => {
@@ -75,6 +101,7 @@ describe('createAuditSink', () => {
     const sink = createAuditSink(asFile)
     // 关键：不抛。审计是旁路，写不进去不该让已经做出的决策失败。
     expect(() => sink(evt({ sessionId: 's' }))).not.toThrow()
+    expect(() => sink(ruleEvt())).not.toThrow()
   })
 
   it('零内容约束：写入行不含入参原文（事件信封只有标量 + stateHash）', () => {

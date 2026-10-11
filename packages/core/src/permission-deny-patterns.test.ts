@@ -137,3 +137,53 @@ describe('DefaultPermissionEngine · 全局 deny 否决 string 形态（P0-8 配
     expect(res.matchedPattern).toBe('shutdown -h now')
   })
 })
+
+/**
+ * 归属分层（P0-9）：`session:<sid>|<tool>` / `caller:<hash>|<tool>` 只在**匹配到归属**时才参与。
+ *
+ * 基类 `resolvePrincipalKey` 缺省返回 `undefined` ⇒ 只有工具键 / 全局键两层参与 —— 与分层前
+ * 逐位相同。这里钉死的是一条**安全性质**：无归属时，别人（别的会话/调用方）的作用域规则
+ * **绝不能**被误用（宁可不命中、回落到全局 ask 问人，也不能放行）。
+ */
+describe('DefaultPermissionEngine · 归属分层（P0-9）', () => {
+  it('★无 sessionId / 无主体时，作用域键被忽略（不误用别人的规则）', async () => {
+    const e = new DefaultPermissionEngine({
+      'caller:deadbeefdeadbeef|bash': { allow: ['ls'] },
+      'session:s-other|bash': { allow: ['ls'] },
+      '*': 'ask',
+    })
+    const res = await e.check({ toolKey: 'bash', patterns: ['ls'], input: {} })
+    expect(res.behavior).toBe('ask') // 不是 allow
+    expect(res.matchedRule).toBe('global')
+  })
+
+  it('会话键命中：匹配到 sessionId 才生效，且 `matchedScope=session`', async () => {
+    const e = new DefaultPermissionEngine({
+      bash: 'deny',
+      'session:sA|bash': { allow: ['ls'] },
+    })
+    const hit = await e.check({ toolKey: 'bash', patterns: ['ls'], input: {}, sessionId: 'sA' })
+    expect(hit.behavior).toBe('allow')
+    expect(hit.matchedScope).toBe('session')
+    // 另一个会话 ⇒ 落回全局工具层 deny
+    const miss = await e.check({ toolKey: 'bash', patterns: ['ls'], input: {}, sessionId: 'sB' })
+    expect(miss.behavior).toBe('deny')
+    expect(miss.matchedScope).toBeUndefined()
+  })
+
+  it('作用域通配的 deny 有否决权：`session:<sid>|*` 拦下同会话的 string allow', async () => {
+    const e = new DefaultPermissionEngine({
+      'session:sA|bash': 'allow',
+      'session:sA|*': { deny: ['shutdown*'] },
+    })
+    const res = await e.check({
+      toolKey: 'bash',
+      patterns: ['echo hi; shutdown -h now'],
+      input: {},
+      sessionId: 'sA',
+      denyPatterns: ['echo hi', 'shutdown -h now'],
+    })
+    expect(res.behavior).toBe('deny')
+    expect(res.matchedPattern).toBe('shutdown -h now')
+  })
+})
