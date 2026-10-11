@@ -209,6 +209,7 @@ import { basename, extname, resolve } from 'node:path'
 import type {
   PermissionRuleset,
   PermissionEngine,
+  PathRules,
   PermissionRequest as PermRequest,
   PermissionDecision as PermDecision,
 } from '@harness/permission'
@@ -461,15 +462,23 @@ export class DefaultPermissionEngine implements PermissionEngine {
     // pattern 混进 patterns，否则 `echo hi; rm -rf /` 会被 `echo*` 的 allow 放走）
     const denyTargets = denyPatterns?.length ? [...patterns, ...denyPatterns] : patterns
 
-    const applyPathRule = (pr: { allow?: string[]; deny?: string[]; ask?: string[] }) => {
+    /** 规则侧 deny 列表命中 `denyTargets` ⇒ 返回命中的请求 pattern；未命中 undefined */
+    const hitDeny = (pr: PathRules | undefined): string | undefined => {
+      if (!pr?.deny?.length) return undefined
+      for (const pat of denyTargets) {
+        if (pr.deny.some((p) => defaultGlob(p, pat))) return pat
+      }
+      return undefined
+    }
+
+    const applyPathRule = (pr: PathRules) => {
       // deny 先于 allow（2026-09-30 调整）：deny 的语义是"命中即不可执行"，若 allow 先判，
       // 全串级 allow 规则会短路 deny —— `allow: ['src/**']` + `deny: ['src/secrets/**']`
       // 会让 secrets 被放走，denyPatterns（bash 段级命令）更会被整串 allow 完全架空。
       // 收紧方向的判定先行，fail-closed。
-      for (const pat of denyTargets) {
-        if (pr.deny?.some((p) => defaultGlob(p, pat))) {
-          behavior = 'deny'; matched = 'glob'; matchedPattern = pat; return true
-        }
+      const denied = hitDeny(pr)
+      if (denied !== undefined) {
+        behavior = 'deny'; matched = 'glob'; matchedPattern = denied; return true
       }
       for (const pat of patterns) {
         if (pr.allow?.some((p) => defaultGlob(p, pat))) {
@@ -482,6 +491,16 @@ export class DefaultPermissionEngine implements PermissionEngine {
         }
       }
       return false
+    }
+
+    // **全局 deny 有否决权**（P0-8 配套）：无论工具规则是什么形态 —— 包括**手写**的 string
+    // `'allow'`（`/permission bash=allow`、控制面 `harness/permission.set`）—— 全局声明的
+    // `deny` 都必须先过。理由：string 形态**没有自己的 deny 列表**，若不在这一层兜底，
+    // 它就是一条"绕过一切 deny"的通道。默认全局是 `'*': 'ask'`（string）⇒ 不触发、
+    // 行为逐位不变；只有显式把全局写成 PathRules 且带 `deny` 时才生效（**只收紧不放宽**）。
+    const globalDenied = typeof globalRule === 'object' && globalRule ? hitDeny(globalRule) : undefined
+    if (globalDenied !== undefined) {
+      return { behavior: 'deny', matchedRule: 'global', matchedPattern: globalDenied }
     }
 
     if (typeof toolRule === 'object' && toolRule) {

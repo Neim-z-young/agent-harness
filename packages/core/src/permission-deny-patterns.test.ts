@@ -86,3 +86,54 @@ describe('DefaultPermissionEngine.denyPatterns', () => {
     expect(res.matchedRule).toBe('tool')
   })
 })
+
+/**
+ * 全局 deny 的否决权（P0-8 配套）。
+ *
+ * 起因：工具规则是 **string `'allow'`** 时（手写 `/permission bash=allow`、控制面
+ * `harness/permission.set`，或旧版本 `rememberRule` 的写回产物），`check()` 会走
+ * `typeof toolRule === 'string'` **直接 return** —— string 形态**没有自己的 deny 列表**，
+ * 于是它就是一条"绕过一切 deny"的通道。写回路径已由
+ * `InteractivePermissionEngine.rememberRule` 修为不再产生 string；这一层兜住**手写**的 string。
+ *
+ * 语义边界：**只收紧不放宽**。默认全局是 `'*': 'ask'`（string）⇒ 不触发，逐位不变；
+ * 只有显式把全局写成 PathRules 且带 `deny` 时才生效。
+ */
+describe('DefaultPermissionEngine · 全局 deny 否决 string 形态（P0-8 配套）', () => {
+  it('★工具规则是 string allow 时，全局 deny 仍能拦下段级命令', async () => {
+    const e = new DefaultPermissionEngine({ bash: 'allow', '*': { deny: ['shutdown*'] } })
+    const res = await e.check({
+      toolKey: 'bash',
+      patterns: ['echo hi; shutdown -h now'],
+      input: {},
+      denyPatterns: ['echo hi', 'shutdown -h now'],
+    })
+    expect(res.behavior).toBe('deny')
+    expect(res.matchedRule).toBe('global')
+    expect(res.matchedPattern).toBe('shutdown -h now')
+  })
+
+  it('工具规则是 string allow 且全局无 deny ⇒ 仍 allow（默认 `*: ask` 行为逐位不变）', async () => {
+    const e = new DefaultPermissionEngine({ bash: 'allow', '*': 'ask' })
+    const res = await e.check({ toolKey: 'bash', patterns: ['anything'], input: {}, denyPatterns: ['anything'] })
+    expect(res.behavior).toBe('allow')
+  })
+
+  it('全局 deny 未命中时不干预：工具 PathRules 的 allow 照常生效', async () => {
+    const e = new DefaultPermissionEngine({ bash: { allow: ['ls*'] }, '*': { deny: ['shutdown*'] } })
+    const res = await e.check({ toolKey: 'bash', patterns: ['ls -la'], input: {} })
+    expect(res.behavior).toBe('allow')
+  })
+
+  it('全局 deny 对**普通 PathRules** 工具规则同样有效（不只针对 string）', async () => {
+    const e = new DefaultPermissionEngine({ bash: { allow: ['echo*'] }, '*': { deny: ['shutdown*'] } })
+    const res = await e.check({
+      toolKey: 'bash',
+      patterns: ['echo hi; shutdown -h now'],
+      input: {},
+      denyPatterns: ['echo hi', 'shutdown -h now'],
+    })
+    expect(res.behavior).toBe('deny')
+    expect(res.matchedPattern).toBe('shutdown -h now')
+  })
+})

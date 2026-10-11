@@ -1175,11 +1175,12 @@ describe('CliPermissionEngine（CLI 适配器：文本提问 → 四态）', () 
     const a = await e.ask({ toolKey: 'bash', patterns: [] }) as PermissionDecision
     expect(a.behavior).toBe('allow')
     expect(a.remember).toBe(true)
-    expect(saved).toMatchObject({ bash: 'allow' })
+    // P0-8：写回是 PathRules 增量形态（patterns 为空 ⇒ `**` 通配），不再是整工具简写 'allow'
+    expect(saved).toMatchObject({ bash: { allow: ['**'] } })
     const b = await e.ask({ toolKey: 'foo', patterns: [] }) as PermissionDecision
     expect(b.behavior).toBe('deny')
     expect(b.remember).toBe(true)
-    expect(saved).toMatchObject({ bash: 'allow', foo: 'deny' })
+    expect(saved).toMatchObject({ bash: { allow: ['**'] }, foo: { deny: ['**'] } })
   })
 })
 

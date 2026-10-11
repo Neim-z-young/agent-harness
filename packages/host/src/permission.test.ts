@@ -39,13 +39,14 @@ describe('InteractivePermissionEngine · 模式短路', () => {
 })
 
 describe('InteractivePermissionEngine · 四态', () => {
-  it('always-allow：写回规则 + remember + 落盘', async () => {
+  it('always-allow：写回 **本次命令**（命令级粒度）+ remember + 落盘', async () => {
     let saved: Record<string, unknown> | undefined
     const { e } = engineWith('always-allow', { save: async (r) => { saved = r } })
     const d = await e.ask({ toolKey: 'bash', patterns: ['rm -rf /tmp/x'] })
     expect(d).toEqual({ behavior: 'allow', matchedRule: 'tool', remember: true })
-    expect(e.getRules()).toMatchObject({ bash: 'allow' })
-    expect(saved).toMatchObject({ bash: 'allow' })
+    // P0-8：不再是整工具简写 `'allow'`，而是把**具体命令**并进 allow 列表
+    expect(e.getRules()).toMatchObject({ bash: { allow: ['rm -rf /tmp/x'] } })
+    expect(saved).toMatchObject({ bash: { allow: ['rm -rf /tmp/x'] } })
   })
 
   it('always-deny：写回 deny + remember + 落盘', async () => {
@@ -53,7 +54,8 @@ describe('InteractivePermissionEngine · 四态', () => {
     const { e } = engineWith('always-deny', { save: async (r) => { saved = r } })
     const d = await e.ask({ toolKey: 'foo', patterns: [] })
     expect(d).toEqual({ behavior: 'deny', matchedRule: 'tool', remember: true })
-    expect(saved).toMatchObject({ foo: 'deny' })
+    // patterns 为空 ⇒ `**` 通配（语义等价旧的 string `'deny'`，但保留既有 allow/ask 列表）
+    expect(saved).toMatchObject({ foo: { deny: ['**'] } })
   })
 
   it('单次 allow / deny：remember 不置位、不落盘', async () => {
@@ -67,6 +69,79 @@ describe('InteractivePermissionEngine · 四态', () => {
   it('deny（单次）', async () => {
     const { e } = engineWith('deny')
     expect(await e.ask({ toolKey: 'write', patterns: [] })).toEqual({ behavior: 'deny', matchedRule: 'tool' })
+  })
+})
+
+// ===== P0-8（D1 回归）：写回不再吞掉已有规则，段级 deny 不会静默消失 =====
+
+describe('InteractivePermissionEngine · P0-8 写回粒度与保留（D1 回归）', () => {
+  /** 组装一个用固定四态答复的引擎（可带初始规则与落盘计数） */
+  const answering = (
+    answer: PermissionAnswer,
+    rules: Record<string, unknown> = {},
+  ): { e: InteractivePermissionEngine; saved: () => Record<string, unknown> | undefined } => {
+    let last: Record<string, unknown> | undefined
+    const e = new InteractivePermissionEngine(rules, {
+      mode: 'ask',
+      asker: () => Promise.resolve(answer),
+      store: { rules: {}, save: async (r) => { last = r } },
+    })
+    return { e, saved: () => last }
+  }
+
+  it('已有 PathRules（含 deny/ask）时，always-allow **增量并入** allow 且**一个都不丢**', async () => {
+    const { e, saved } = answering('always-allow', {
+      bash: { allow: ['ls*'], deny: ['shutdown*'], ask: ['git*'] },
+    })
+    await e.ask({ toolKey: 'bash', patterns: ['cat /etc/passwd'] })
+    const bash = (e.getRules() as Record<string, unknown>).bash as { allow?: string[]; deny?: string[]; ask?: string[] }
+    // 增量：新命令进 allow；旧的 allow / deny / ask 全部保留（旧实现会把整键替换成 'allow'）
+    expect(bash.allow).toEqual(['ls*', 'cat /etc/passwd'])
+    expect(bash.deny).toEqual(['shutdown*'])
+    expect(bash.ask).toEqual(['git*'])
+    expect(saved()).toMatchObject({ bash: { deny: ['shutdown*'], ask: ['git*'] } })
+  })
+
+  it('★写回之后段级 `denyPatterns` **仍然生效**（旧实现退化成 string ⇒ 整条防线消失）', async () => {
+    const { e } = answering('always-allow', { bash: { allow: ['echo*'], deny: ['shutdown*'] } })
+    // 先「始终允许」一条普通命令
+    await e.ask({ toolKey: 'bash', patterns: ['echo hi'] })
+    // 再跑同键的**拼接命令**：整串会被 allow 的 `echo*` 匹配，必须靠段级 denyPatterns 拦下
+    const res = await e.check({
+      toolKey: 'bash',
+      patterns: ['echo hi; shutdown -h now'],
+      input: {},
+      denyPatterns: ['echo hi', 'shutdown -h now'],
+    })
+    expect(res.behavior).toBe('deny')
+    expect(res.matchedPattern).toBe('shutdown -h now')
+  })
+
+  it('旧 string 规则再次被写回时归一成 PathRules（不丢语义，且恢复"可被 deny 拦"）', async () => {
+    const { e } = answering('always-allow', { bash: 'deny' })
+    await e.ask({ toolKey: 'bash', patterns: ['ls'] })
+    expect(e.getRules()).toMatchObject({ bash: { deny: ['**'], allow: ['ls'] } })
+  })
+
+  it('patterns 为空 ⇒ `**` 通配（等价旧 string，但仍保留既有 deny/ask）', async () => {
+    const { e } = answering('always-allow', { bash: { deny: ['shutdown*'] } })
+    await e.ask({ toolKey: 'bash', patterns: [] })
+    const bash = (e.getRules() as Record<string, unknown>).bash as { allow?: string[]; deny?: string[] }
+    expect(bash.allow).toEqual(['**'])
+    expect(bash.deny).toEqual(['shutdown*'])
+  })
+
+  it('重复写同一条命令是幂等的（不产生重复项）', async () => {
+    const { e } = answering('always-allow')
+    await e.ask({ toolKey: 'bash', patterns: ['ls'] })
+    await e.ask({ toolKey: 'bash', patterns: ['ls'] })
+    expect(((e.getRules() as Record<string, unknown>).bash as { allow?: string[] }).allow).toEqual(['ls'])
+  })
+
+  it('always-deny 同样增量：不改粒度、不动既有 allow', async () => {
+    const { e } = answering('always-deny', { bash: { allow: ['ls*'] } })
+    await e.ask({ toolKey: 'bash', patterns: ['rm -rf /'] })
+    expect(e.getRules()).toMatchObject({ bash: { allow: ['ls*'], deny: ['rm -rf /'] } })
   })
 })
 

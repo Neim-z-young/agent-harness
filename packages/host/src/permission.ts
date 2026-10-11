@@ -24,7 +24,7 @@
  */
 import { createHash } from 'node:crypto'
 import { DefaultPermissionEngine } from '@harness/core'
-import type { PermissionDecision, PermissionRequest } from '@harness/core'
+import type { PathRules, PermissionDecision, PermissionRequest } from '@harness/core'
 
 /** 规范答复四态。`always-*` 会写回规则集并置 `remember=true` */
 export type PermissionAnswer = 'allow' | 'deny' | 'always-allow' | 'always-deny'
@@ -252,7 +252,7 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     const prompt = buildPermissionPrompt(req)
     const answer = this.asker ? await this.asker(req, prompt) : undefined
     const responseMs = Date.now() - startedAt
-    const decision = this.answerToDecision(req.toolKey, answer)
+    const decision = this.answerToDecision(req.toolKey, answer, req.patterns ?? [])
     // M3 审计：只有真正拿到人工答复才记（无答复 ⇒ deny 是兜底，不是人工决策）。
     // allow-all/deny-all 短路已在上方 return，不走这里。
     if (answer !== undefined && this.auditSink) {
@@ -277,14 +277,15 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
   private async answerToDecision(
     toolKey: string,
     answer: PermissionAnswer | undefined,
+    patterns: string[],
   ): Promise<PermissionDecision> {
     switch (answer) {
       // 先判"永久"：写回规则集并置 remember，宿主重启后不再问
       case 'always-allow':
-        await this.rememberRule(toolKey, 'allow')
+        await this.rememberRule(toolKey, 'allow', patterns)
         return { behavior: 'allow', matchedRule: 'tool', remember: true }
       case 'always-deny':
-        await this.rememberRule(toolKey, 'deny')
+        await this.rememberRule(toolKey, 'deny', patterns)
         return { behavior: 'deny', matchedRule: 'tool', remember: true }
       // 单次：只影响本次
       case 'allow':
@@ -296,9 +297,45 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     }
   }
 
-  /** 把「永久」答复写回规则集并落盘（`updateRules` 改内存，`save` 落盘，两者必须一起） */
-  private async rememberRule(toolKey: string, behavior: 'allow' | 'deny'): Promise<void> {
-    const updated = { ...this.getRules(), [toolKey]: behavior }
+  /**
+   * 把「永久」答复写回规则集并落盘（`updateRules` 改内存，`save` 落盘，两者必须一起）。
+   *
+   * ## 为什么是「增量并入 PathRules」而不是整键覆盖（P0-8）
+   * 旧实现是 `{ ...getRules(), [toolKey]: behavior }` —— 写回**只按 toolKey**、且**整键覆盖**，
+   * 于是三件事同时发生：
+   * 1. **粒度失控**：提示卡片里显示的是**具体命令**（`buildPermissionPrompt` 的 `patterns`），
+   *    但按一次「始终允许」记的是**整个工具** —— `always-allow bash` 等于放行所有 bash；
+   * 2. **丢规则**：把用户已配的 `{ allow, deny, ask }` 整键替换掉（`deny: ['shutdown*']` 直接消失）；
+   * 3. **段级防线消失**：规则退化成 **string** 形态后，`DefaultPermissionEngine.check()` 走
+   *    `typeof toolRule === 'string'` **直接 return**，`denyTargets`（含 bash 的段级
+   *    `denyPatterns`，唯一能拦 `echo hi; shutdown -h now` 的判据）**整体不再参与判定**。
+   *
+   * 改成"把本次 `patterns` **并入**目标列表、**保留**既有列表"后：①粒度回到**命令级**；
+   * ②原来配的 `deny`/`ask` 还在；③规则始终是**对象**形态，段级 deny 照常执行。
+   *
+   * `patterns` 为空（如 `read` 这类无路径参数的工具）⇒ 用 `['**']` 通配，**等价于旧的 string
+   * 语义**，但仍保留既有 `deny`/`ask`（旧实现会把它们一并抹掉）。旧数据里已是 string 的规则
+   * 同样归一成 `**` —— 不丢语义，只补回"还能被 deny 拦"的能力。
+   */
+  private async rememberRule(toolKey: string, behavior: 'allow' | 'deny', patterns: string[]): Promise<void> {
+    const current = this.getRules()
+    const existing = current[toolKey]
+    // 归一成 PathRules：旧 string 形态只描述"整个工具"，落成 `**` 通配（语义等价，可再被 deny 拦）
+    const base: PathRules =
+      typeof existing === 'string'
+        ? existing === 'allow'
+          ? { allow: ['**'] }
+          : existing === 'deny'
+            ? { deny: ['**'] }
+            : { ask: ['**'] }
+        : existing && typeof existing === 'object'
+          ? { ...existing }
+          : {}
+    const list = [...((behavior === 'allow' ? base.allow : base.deny) ?? [])]
+    for (const p of patterns.length > 0 ? patterns : ['**']) {
+      if (!list.includes(p)) list.push(p)
+    }
+    const updated = { ...current, [toolKey]: { ...base, [behavior]: list } }
     this.updateRules(updated as never)
     await this.store?.save?.(updated)
   }
