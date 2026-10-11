@@ -1322,24 +1322,27 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           return 'continue'
         }
         case '/permission': {
-          // 查看：/permission；设置：/permission <mode> 或 /permission <key>=<behavior>
+          // 查看：/permission；设置：/permission <mode> [global] 或 /permission <key>=<behavior>
           if (!arg || arg.trim() === '?') {
-            out(`权限交互模式：${app.permission.getMode()}（allow-all / ask / deny-all）\n`)
+            out(`权限交互模式：${app.permission.getMode(current.id)}（本会话；allow-all / ask / deny-all）\n`)
+            out(`进程默认模式：${app.permission.getMode()}（新会话的初值；/permission <mode> global 可改）\n`)
             out('当前规则（permissions.json）：\n')
             const rules = app.permission.getRules() as Record<string, unknown>
             const keys = Object.keys(rules)
             if (keys.length === 0) { out('  （无规则，全局默认 ask）\n'); return 'continue' }
             for (const k of keys) out(`  ${k.padEnd(14)}: ${JSON.stringify(rules[k])}\n`)
-            out('\n用法：/permission <allow-all|ask|deny-all>   切换交互模式\n')
-            out('      /permission <key>=<behavior>           设置工具规则，如 /permission bash=deny、/permission write=ask\n')
-            out('      /permission reset                      恢复为全局 ask 并清空规则\n')
+            out('\n用法：/permission <allow-all|ask|deny-all>          切换本会话交互模式\n')
+            out('      /permission <allow-all|ask|deny-all> global 切换进程默认模式（影响未单独切换的会话）\n')
+            out('      /permission <key>=<behavior>                设置工具规则，如 /permission bash=deny、/permission write=ask\n')
+            out('      /permission reset                          恢复为全局 ask 并清空规则\n')
             return 'continue'
           }
           const t = arg.trim()
           if (t === 'reset') {
             await app.setPermissionRules({ '*': 'ask' }, { source: 'cli', behavior: 'reset', sessionId: current.id })
-            app.permission.setMode('ask')
-            out('已重置权限：规则清空（全局 ask），交互模式=ask，并写回 permissions.json。\n')
+            // P2-7：模式是**会话级**的，重置也只重置本会话这一层（进程默认不动）
+            app.permission.setMode('ask', current.id)
+            out('已重置权限：规则清空（全局 ask），本会话模式=ask，并写回 permissions.json。\n')
             return 'continue'
           }
           const eq = t.indexOf('=')
@@ -1357,12 +1360,21 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
             out(`已设置规则 ${key}=${val} 并写回 permissions.json。\n`)
             return 'continue'
           }
-          if (['allow-all', 'ask', 'deny-all'].includes(t)) {
-            app.permission.setMode(t as 'allow-all' | 'ask' | 'deny-all')
-            out(`已切换权限交互模式为 ${t}（作用于「询问型」请求；规则文件不变）。\n`)
+          // P2-7（§8 D7）：模式本来只写清了"进程级"的实情，却被读成"只对本会话生效"。
+          // 现在**默认本会话**（与读法一致），要全进程用显式的 `global` 后缀 —— 能力没丢，
+          // 只是不再由一个会话静默改掉别的会话（A2A 远程调用方尤其如此）。
+          // ⚠️ 不能用上面的 `arg`：它是 `line.split(/\s+/, 2)[1]`，只截到第二个 token，
+          //    `ask global` 里的 `global` 会被丢掉。这里从 `line` 自己切。
+          const parts = line.split(/\s+/).slice(1)
+          const modeArg = parts[0]
+          const isGlobal = parts.length === 2 && parts[1] === 'global'
+          if (modeArg && ['allow-all', 'ask', 'deny-all'].includes(modeArg)) {
+            app.permission.setMode(modeArg as 'allow-all' | 'ask' | 'deny-all', isGlobal ? undefined : current.id)
+            const scope = isGlobal ? '进程默认：影响所有未单独切换的会话' : '仅本会话'
+            out(`已切换权限交互模式为 ${modeArg}（${scope}；作用于「询问型」请求，规则文件不变）。\n`)
             return 'continue'
           }
-          out(`无法解析 "${t}"。/permission 查看，/permission <mode> 或 /permission <key>=<behavior> 设置。\n`)
+          out(`无法解析 "${t}"。/permission 查看，/permission <mode> [global] 或 /permission <key>=<behavior> 设置。\n`)
           return 'continue'
         }
         case '/skills': {

@@ -192,6 +192,22 @@ describe('控制面：权限', () => {
     expect(res.rules['bash']).toBe('deny')
   })
 
+  it('mode 带 sessionId ⇒ 只改该会话（P2-7）；不带 ⇒ 改进程默认', async () => {
+    const host = await makeHost()
+    const sid = host.session.id
+    // 会话级：本会话变 allow-all，进程默认不动
+    const r1 = (await call(host, 'harness/permission.set', { mode: 'allow-all', sessionId: sid })) as {
+      mode: string
+    }
+    expect(r1.mode).toBe('allow-all')
+    expect(host.permission.getMode()).toBe('ask')
+    // 读也按会话读：给了 sessionId 读该会话，不给读进程默认
+    const g = (await call(host, 'harness/permission.get', { sessionId: sid })) as { mode: string }
+    expect(g.mode).toBe('allow-all')
+    const d = (await call(host, 'harness/permission.get')) as { mode: string }
+    expect(d.mode).toBe('ask')
+  })
+
   it('rules 整份替换（CLI 表达不了的"删掉某条"）', async () => {
     const host = await makeHost()
     await call(host, 'harness/permission.set', { key: 'bash', behavior: 'deny' })

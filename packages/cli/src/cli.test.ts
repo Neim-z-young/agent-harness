@@ -2940,7 +2940,9 @@ describe('/plugins 插件管理', () => {
     expect(out).toInclude('权限交互模式：allow-all')
     // 切换 deny-all
     expect(out).toInclude('已切换权限交互模式为 deny-all')
-    expect(app.permission.getMode()).toBe('deny-all')
+    // P2-7：模式是**会话级**的 —— 切换只改本会话，进程默认原样（旧行为是全进程一起改）
+    expect(app.permission.getMode(session.id)).toBe('deny-all')
+    expect(app.permission.getMode()).toBe('allow-all')
     // 设置规则 bash=deny 已落盘
     expect(out).toInclude('已设置规则 bash=deny')
     expect((app.permission.getRules() as Record<string, unknown>).bash).toBe('deny')
@@ -2955,8 +2957,23 @@ describe('/plugins 插件管理', () => {
     await startRepl({ app, harness, session, stdout, scriptedStdin: ['/permission reset', '/exit'] })
     const out = chunks.join('')
     expect(out).toInclude('已重置权限')
-    expect(app.permission.getMode()).toBe('ask')
+    expect(app.permission.getMode(session.id)).toBe('ask')
     expect(app.permission.getRules()).toEqual({ '*': 'ask' })
+    await app.shutdown()
+  })
+
+  it('/permission <mode> 只影响本会话；`global` 后缀才改进程默认（P2-7 回归）', async () => {
+    const { app, harness, session, stdout, chunks } = await bootApp()
+    await startRepl({
+      app, harness, session, stdout,
+      scriptedStdin: ['/permission deny-all', '/permission ask global', '/exit'],
+    })
+    const out = chunks.join('')
+    expect(out).toInclude('（仅本会话；作用于「询问型」请求，规则文件不变）')
+    expect(out).toInclude('（进程默认：影响所有未单独切换的会话；作用于「询问型」请求，规则文件不变）')
+    // 第一步只改了本会话；第二步改的是进程默认 —— **本会话的覆盖不被它改写**
+    expect(app.permission.getMode(session.id)).toBe('deny-all')
+    expect(app.permission.getMode()).toBe('ask')
     await app.shutdown()
   })
 

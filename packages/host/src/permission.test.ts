@@ -312,6 +312,44 @@ describe('assessRisk · bash 走命令模式表（D4 回归：不再恒为 high�
   })
 })
 
+describe('InteractivePermissionEngine · mode 是会话级（P2-7 / D7 回归）', () => {
+  it('未切过模式 ⇒ 回退进程默认（新建会话的初值）', () => {
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'allow-all' })
+    expect(e.getMode()).toBe('allow-all')
+    expect(e.getMode('s1')).toBe('allow-all')
+  })
+
+  it('★只改本会话：s1 切 deny-all 不影响 s2，也不改进程默认', () => {
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask' })
+    e.setMode('deny-all', 's1')
+    expect(e.getMode('s1')).toBe('deny-all')
+    expect(e.getMode('s2')).toBe('ask')
+    expect(e.getMode()).toBe('ask') // 进程默认没被改写（改造前这里会被改成 deny-all）
+  })
+
+  it('不给 sessionId ⇒ 改进程默认：新会话取到它，已单独切换的会话不受影响', () => {
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask' })
+    e.setMode('allow-all', 's1')
+    e.setMode('deny-all')
+    expect(e.getMode()).toBe('deny-all') // 进程默认
+    expect(e.getMode('s1')).toBe('allow-all') // 会话覆盖优先
+    expect(e.getMode('s3')).toBe('deny-all') // 没切过的会话取进程默认
+  })
+
+  it('ask 按会话取模式：s1=allow-all 直接短路，s2 仍走 asker', async () => {
+    const seen: string[] = []
+    const asker: PermissionAsker = async (req) => { seen.push(req.toolKey); return 'deny' }
+    const e = new InteractivePermissionEngine({ '*': 'ask' }, { mode: 'ask', asker })
+    e.setMode('allow-all', 's1')
+    const d1 = await e.ask({ toolKey: 'bash', patterns: [], sessionId: 's1' })
+    expect(d1.behavior).toBe('allow')
+    expect(seen).toEqual([]) // 短路成功，没问人
+    const d2 = await e.ask({ toolKey: 'bash', patterns: [], sessionId: 's2' })
+    expect(d2.behavior).toBe('deny') // s2 仍问人（asker 答 deny）
+    expect(seen).toEqual(['bash'])
+  })
+})
+
 describe('InteractivePermissionEngine · decision.human 审计', () => {
   it('人工答复（allow）⇒ 落审计事件：零内容 + stateHash + responseMs + rememberScope=once', async () => {
     const events: unknown[] = []

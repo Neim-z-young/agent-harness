@@ -366,7 +366,21 @@ export function stateHashOf(req: PermissionAskInput): string {
  * 三个宿主共用这一份；宿主差异全部收在 `asker` 里。
  */
 export class InteractivePermissionEngine extends DefaultPermissionEngine {
+  /** 进程级默认模式（构造期来自配置；未给 `sessionId` 的 `setMode` 改的就是它） */
   private mode: PermissionMode
+  /**
+   * P2-7（§8 D7）：**会话级**模式覆盖。
+   *
+   * 一个进程内多个会话共享同一个引擎，改造前 `mode` 是**裸字段** ⇒ 任一会话（含 A2A
+   * 的远程调用方）切模式都会改到全进程，而 CLI 的 `/permission <mode>` 文案又容易被
+   * 读成"只对本会话生效"。现在两者一致了：
+   * - 会话切过 ⇒ 在本表里；
+   * - 没切过 ⇒ 回退 {@link mode}（进程默认）。
+   *
+   * 与 `mode` 同样的口径：**内存态、不落盘、重启复位**（有意如此 —— 模式是"当下怎么答"，
+   * 不是授权策略；策略在 `permissions.json`）。
+   */
+  private readonly sessionModes = new Map<string, PermissionMode>()
   private asker: PermissionAsker | undefined
   private readonly store: (PermissionStoreFile & { save?: (r: Record<string, unknown>) => Promise<void> }) | undefined
   /** M3：审计 sink（宿主注入，落盘实现归宿主） */
@@ -397,13 +411,31 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
     this.callerResolver = opts.callerResolver
   }
 
-  /** 当前交互模式（allow-all / ask / deny-all），供 /permission 查看与切换 */
-  getMode(): PermissionMode {
+  /**
+   * 当前交互模式（allow-all / ask / deny-all），供 `/permission` 查看与切换。
+   *
+   * `sessionId` 给了 ⇒ 该会话的**生效**模式（会话覆盖优先，否则进程默认）；
+   * 不给 ⇒ 进程默认（新建会话的初值）。
+   */
+  getMode(sessionId?: string): PermissionMode {
+    if (sessionId) {
+      const scoped = this.sessionModes.get(sessionId)
+      if (scoped) return scoped
+    }
     return this.mode
   }
 
-  /** 切换交互模式（不影响持久化规则，仅影响「询问型请求」的自动答复） */
-  setMode(mode: PermissionMode): void {
+  /**
+   * 切换交互模式（不影响持久化规则，仅影响「询问型请求」的自动答复）。
+   *
+   * - `sessionId` 给了 ⇒ **只对该会话生效**（P2-7：多会话共存时不再互相影响）；
+   * - 不给 ⇒ 改进程默认，影响所有**未单独切换过**的会话（含之后新建的会话）。
+   */
+  setMode(mode: PermissionMode, sessionId?: string): void {
+    if (sessionId) {
+      this.sessionModes.set(sessionId, mode)
+      return
+    }
     this.mode = mode
   }
 
@@ -451,8 +483,10 @@ export class InteractivePermissionEngine extends DefaultPermissionEngine {
    * 无法识别的答复与取不到答复一律 deny（与改造前逐位一致）。
    */
   override async ask(req: PermissionAskInput): Promise<PermissionDecision> {
-    if (this.mode === 'allow-all') return { behavior: 'allow', matchedRule: 'global' }
-    if (this.mode === 'deny-all') return { behavior: 'deny', matchedRule: 'global' }
+    // P2-7：取**本会话**的生效模式（会话覆盖 → 进程默认），而不是裸字段
+    const mode = this.getMode(req.sessionId)
+    if (mode === 'allow-all') return { behavior: 'allow', matchedRule: 'global' }
+    if (mode === 'deny-all') return { behavior: 'deny', matchedRule: 'global' }
     const startedAt = Date.now()
     const prompt = buildPermissionPrompt(req)
     const answer = this.asker ? await this.asker(req, prompt) : undefined

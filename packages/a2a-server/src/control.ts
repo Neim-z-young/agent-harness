@@ -564,22 +564,29 @@ METHODS.set('harness/model.set', async (p, host) => {
 // ---- 权限 ----------------------------------------------------------------
 
 /** `harness/permission.get` —— 对应 `/permission`（查看） */
-METHODS.set('harness/permission.get', async (_p, host) => {
+METHODS.set('harness/permission.get', async (p, host) => {
   assertBooted(host)
+  // P2-7：给了 sessionId ⇒ 返回该会话的**生效**模式；不给 ⇒ 进程默认
+  const sessionId = optionalString(p, 'sessionId')
   return {
-    mode: host.permission.getMode() satisfies PermissionMode,
+    mode: host.permission.getMode(sessionId) satisfies PermissionMode,
     rules: host.permission.getRules() as Record<string, unknown>,
   }
 })
 
 /**
- * `harness/permission.set` —— 对应 `/permission <mode>` / `/permission <key>=<behavior>` / `reset`。
+ * `harness/permission.set` —— 对应 `/permission <mode> [global]` / `/permission <key>=<behavior>` / `reset`。
  *
  * 四种入参形态（互斥性由方法自己校验，客户端不必猜）：
  * - `{ reset: true }` 清空规则、模式回 `ask`；
  * - `{ mode }` 切换交互模式（只作用于"询问型"请求，规则文件不变）；
  * - `{ rules }` 整份替换（用于"删掉某条规则"这类 CLI 表达不了的操作）；
  * - `{ key, behavior }` 单条增改（`behavior ∈ allow|deny|ask`）。
+ *
+ * **`sessionId`（可选，P2-7）**：`mode` / `reset` 的**作用域**。给了 ⇒ 只改该会话的模式
+ * （CLI 的 `/permission <mode>` 默认走这条）；不给 ⇒ 改进程默认（等价于 CLI 的 `global` 后缀）。
+ * `rules` / `key` 永远是进程级 —— 规则集本就在 `permissions.json` 一处，其"归属"由规则键
+ * 前缀（P0-9）表达，不由本参数表达。
  *
  * ⚠️ 安全边界：本方法会**写盘** `permissions.json`。控制面默认只监听 `127.0.0.1`，
  * 且与 `/a2a` 共用同一个 Bearer —— "持有 token 者即管理员"是显式的信任模型（见文件头表格）。
@@ -590,6 +597,7 @@ METHODS.set('harness/permission.set', async (p, host) => {
   const mode = optionalEnum(p, 'mode', ['allow-all', 'ask', 'deny-all'] as const)
   const rawRules = p['rules']
   const key = optionalString(p, 'key')
+  const sessionId = optionalString(p, 'sessionId')
 
   if (!reset && mode === undefined && rawRules === undefined && key === undefined) {
     throw new ControlError(
@@ -600,9 +608,9 @@ METHODS.set('harness/permission.set', async (p, host) => {
 
   if (reset) {
     await host.setPermissionRules({ '*': 'ask' }, { source: 'control-api', behavior: 'reset' })
-    host.permission.setMode('ask')
+    host.permission.setMode('ask', sessionId)
   }
-  if (mode !== undefined) host.permission.setMode(mode)
+  if (mode !== undefined) host.permission.setMode(mode, sessionId)
   if (rawRules !== undefined) {
     if (rawRules === null || typeof rawRules !== 'object' || Array.isArray(rawRules)) {
       throw new ControlError('INVALID_PARAMS', 'params.rules 必须是对象（{ 工具键: allow|deny|ask }）')
@@ -620,7 +628,7 @@ METHODS.set('harness/permission.set', async (p, host) => {
 
   return {
     ok: true,
-    mode: host.permission.getMode(),
+    mode: host.permission.getMode(sessionId),
     rules: host.permission.getRules() as Record<string, unknown>,
   }
 })
