@@ -1,5 +1,100 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 277）档位下沉留痕 + 隔离档位 + 网络出口策略 + read_file 大小闸
+
+### 起因
+
+用户给 **"d a b"**：D = P0-7 + P1-8，A = P1-4，B = P1-2。四条落在沙箱方案的三处不同接缝上：
+
+- **P0-7**（§3.0 最后一条 P0）：`fallbackToHost` 一旦开启，命令从"沙箱约束"升到"宿主全权"，
+  而 **`allow-all` 模式下这条升级既不问人也不留痕**（`viaHost` 只在工具返回值里）。
+- **P1-8**：`read_file` 没有任何大小闸 —— 而它是**整文件载入后**才切片（`offset`/`limit`
+  救不了），读一个 2 GiB 日志就是把 2 GiB 拉进内存再截到 256KB。
+- **P1-4**：没有"隔离档位"概念，宿主无法表达"我要 L2，没有就拒绝启动"（§2 说的核心结构）。
+- **P1-2**：`bash` 里的 `curl` / `wget` 出网完全不受限，包括云元数据端点 `169.254.169.254`。
+
+### 决策与落地
+
+**P0-7：档位下沉必留痕**（`tool` / `permission` / `host` / `tools-builtin`）
+
+- `PermissionRequest` 加 `escalation?: 'host-fallback'`（两侧包都声明，core 的 cast 不丢字段）。
+  **不靠** `patterns` 里的 `host:` 前缀做判据：那是给人看的**展示约定**，让安全判定依赖一个
+  文案前缀等于把审计挂在"文案不改"这个非契约上。
+- 新增审计事件 `sandbox.escalation`（零内容 + `stateHash`），由引擎**覆写 `check()`** 落盘。
+  这是关键选择：`ask()` 只在规则判为 `ask` 时走到（`allow-all` 在开头短路、规则命中
+  `allow`/`deny` 更不经过它），**只有 `check()` 是每个权限请求的唯一必经点**。
+  事件同时记 `behavior`（引擎判了什么）与 `outcome`（折入模式后的真实结果）。
+- `requireHostApproval: false` 是显式"不要问"——那条路径**没有请求可记**，改由
+  `checkSandboxConfig()` 在装配期点名这个组合（回退 + 关确认 = 完全静默）。
+
+**P1-8：`read_file` 大小闸 + 说清类型**（`tools-builtin`）
+
+- `maxReadBytes`（默认 10 MiB，`sandbox.readMaxBytes` 可调，`0` = 不限制）。超限**拒绝**而不是
+  "截断读"：截断读仍要先把整文件载入，等于没治。消息里给人读的大小 + 替代路径。
+- 顺手把 `NOT_A_FILE` 的消息从"不是文件"细化为"实际是什么"（目录 / 块设备 / 字符设备 /
+  FIFO / 套接字），目录还指出该换 `list_dir`。
+
+**P1-4 + P3-2：档位与探测**（新包 `@harness/isolation` + `host` + `tools-builtin`）
+
+- 新零依赖叶子包（只 `node:fs` / `node:path`）：档位判定被 host（装配期）与 tools-builtin
+  （执行期自述）共用；私有地址判定被 tools-builtin（出网门）与 tools-web（SSRF）共用。
+- `probeIsolation({platform, exists, osBinding})` 与 `resolveShell()` 同范式（依赖全可注入）。
+  ★**探到原语 ≠ 达到那一档**：有 `sandbox-exec` / `bwrap` 但没接线（P1-3）时 `maxLevel` 仍报
+  `'L1'`，并把"未接线"写进 reasons —— §2 纪律 2「不模拟」的落点。
+- `config.json → sandbox.{level,onUnmet}`：达不到要求时 `warn`（notice
+  `sandbox.isolation-degraded`）或 `refuse`（`ConfigValidationError` 拒绝启动）。解析放在
+  **内置插件装配之前** —— 达不到要求就不该先把插件都装完再报错。
+- `BashOutput.isolation = { level, fsBound, netPolicy, viaHost }`，写的是**解析后的实际档位**
+  （宿主注入），不是用户写的愿望值。
+
+**P1-2：网络出口策略**（`@harness/isolation` + `tools-builtin` + `tools-web`）
+
+- `sandbox.net = open | allowlist | deny` + `netAllow`；默认 `open` ⇒ 逐位等于改造前。
+- `deny` 表**刻意不含** `git`（本地/远端双用途）与包管理器/解释器（目标写在配置里、静态提不出来；
+  列进去只会造成"以为挡住了"）—— 注释里写明了这条边界，以及这类通道的答案在 L2/L3。
+- `allowlist`：父域覆盖子域，但**不做裸后缀匹配**（`evil-github.com` 不以 `github.com` 放行）；
+  **提不出目标一律 fail-closed**；**元数据/私有地址硬拒**（写进白名单也不放行）。
+- 判定走 AST（`analyzeBashCommand` 的命令名 + 参数字面量），拿不到时退**文本兜底**
+  —— 与危险检测同一条降级纪律。
+- `tools-web` 的 `isPrivateIp` **收敛**到 `isPrivateHost`：原来两处各写一份，正是"修一处漏一处"。
+
+### 只有实现时才暴露的发现
+
+- ★**新增 `BashOutput.isolation` 把一条既有 TUI 用例的断言挤出了窗口**：那条断的是
+  `exitCode":0`，它恰好紧跟 `stdout`（结果里最长的字段），靠的是"它后面没几个字段"这个**偶然**。
+  序列化变长后固定宽度的尾窗够不到了。判据改成断言**真正的首/尾锚点**（结果的第一个字符
+  + 最后一个字段）—— 既不随字段增删漂移，也比原来更强。**这是"既有断言可能依赖巧合"的又一例**。
+- 引擎 `check()` 的形参是**完整** `PermissionRequest`（`input` 必填），而 `ask()` 用的是收窄过的
+  `PermissionAskInput`。照 `ask` 的写法写 `check` 的用例会编译失败 —— 这不是笔误，正是
+  "两个接缝的输入面本就不同"（`check` 要判 deny 规则，得看 patterns + denyPatterns）。
+- `allowlist` 模式下的"提不出目标"必须 fail-closed：`ssh myserver`（用 `~/.ssh/config` 里的别名）
+  字面量里根本没有可提取的 host —— 把它当"无目标 ⇒ 放行"就是把"无法核验"读成"已授权"。
+- 反向验证 M4 的**实测比预测多 1 条**：predict 12、实测 13。多的是"白名单内放行"用例里对
+  `targets` 的断言（网门失效后 `targets` 为空）—— 断言比我记账时记得的更强，如实记下。
+
+### 验证
+
+- 全仓 `bun run typecheck`：真实退出码 **0**、**48 包**（新增 `@harness/isolation`）全
+  `Exited with code 0`、`error TS` **0**。
+- 全仓 `bun run test`：**2869 pass / 0 fail**（上一基线 2815，**+54**）。
+- 反向验证三处（`cp` + `shasum -a 256 -c` 还原；哈希 `54da6c0a…` / `903b7fcc…` /
+  `5bdd410f…` / `5ef93778…` 一致；全仓无"反向验证临时"残留）：
+
+| 变异 | 预测 | 实测 |
+|---|---|---|
+| `check()` 里的留痕条件置为恒假 | host 2 | ✅ host **2**（另两条应仍绿，实测仍绿） |
+| 去掉 `read_file` 大小闸 | builtin 1 + host 1 | ✅ builtin **1** + host **1** |
+| `probeIsolation` 改成"探到原语就升 L2" | isolation 6 + host 2 | ✅ isolation **6** + host **2**（builtin **0**，符合预期：工具侧默认档位不经探测） |
+| 网络门恒放行 | 12 | isolation **8** + builtin **4** + host **1** = **13**（多的一条已归因） |
+
+### 落档与提交
+
+- 提交两笔（feature 按主题，docs 单独一笔）：`fabc218`（P0-7）、`562a53e`（P1-4/P3-2/P1-2/P1-8），
+  后接 docs。P0-7 的 hunk 与 P1-4/P1-2/P1-8 在 `config.ts` / `tools-builtin/index.ts` **同区域交错**
+  （`SANDBOX_KEYS`、`checkSandboxConfig`、`BashOutput`），故后三者合成一笔（共用同一张配置面
+  与同一个新包）——hunk 级拆分反而会造出编译不过的中间态。
+- `docs/sandbox-isolation-plan.md`：§2 的 L2 行、§3.0/§3.1/§3.3 五条、§4 第 6/7 步、§8.6 新行。
+
 ## 2026-10-11（续 276）沙箱五件：进程树 kill + 资源上限 + 沙箱可配置 + MCP env 默认拒绝 + 读侧敏感默认拒绝
 
 ### 起因
