@@ -9,6 +9,9 @@
 >
 > **排法**：「静默失效或安全漏判」→「能力缺口」→「体验一致」→「工程防回归」四档。
 > 每条给**现有代码位置**与**判据**，便于逐条开工与验收。
+>
+> **§7 是调研附录**（业界方案光谱 / 共识 / 采纳建议），用来把下面的 L0–L3 锚定到业界坐标；
+> 它**不引入新待办**，待办一律以 §3 为准。
 
 ## 0. 现状一句话
 
@@ -179,3 +182,89 @@
   本方案只**新增**档位与执行边界，**不改**权限语义（"决策权归人工"这条不动）。
 - **多 Agent 隔离**（subagent worktree / swarm）见 `agent-harness-architecture.md` §九；
   P1-6 是那里留下的一个空壳。
+
+## 7. 业界方案对照（光谱 · 共识 · 采纳建议）
+
+> 本节是调研附录，用来把 §2 的 L0–L3 **锚定到业界坐标**上：我们现在在哪一格、每一格
+> 别人是怎么做的、哪一格可以直接抄。**不引入新待办**（待办仍以 §3 的 P0/P1/P2/P3 为准）。
+
+### 7.1 一条主线：边界由谁强制
+
+不是"用哪个工具"，而是"**谁不让做**"——是应用自己拦 API，还是内核/硬件不让做。
+
+| 层 | 边界由谁守 | 代表方案 | 谁在真用 | 越狱成本 |
+|---|---|---|---|---|
+| 进程内 | 应用自己（拦 API） | Node `vm`、`vm2`✝、`isolated-vm`、QuickJS-Wasm、Deno `--allow-*` | 插件 / 表达式求值 | 极低（vm2 已因无法修补的逃逸**停止维护**） |
+| WASM | 运行时 + 能力句柄 | Wasmtime、Wasmer、wasmCloud、Wassette、Pyodide | Envoy 插件、多租户插件、微软 Wassette（跑 MCP） | 中（线性内存 + 无 ambient authority） |
+| OS 原语 | 内核 | macOS Seatbelt、Linux bubblewrap / Landlock+seccomp、Win AppContainer+WFP | **Anthropic `srt`**、**OpenAI Codex CLI** | 中高（要内核漏洞） |
+| 容器 / 强化容器 | 命名空间+cgroup（共享内核）→ gVisor/Kata 才破共享 | Docker·Podman 加固、Sysbox、gVisor(`runsc`)、Kata Containers | Modal、GKE、企业多租户 | 高 |
+| MicroVM | 硬件虚拟化 | Firecracker、Cloud Hypervisor、microsandbox | E2B、Vercel Sandbox、Fly、GKE Agent Sandbox | 极高 |
+
+对应到本文：**今天我们全部落在第 1 格的最弱形态**（甚至不是"拦截 API"，而是"写完命令后检查字符串"），
+§2 的 L2 才是往第 3 格走，L3 是第 4/5 格。
+
+### 7.2 冷启动量级（差三到四个数量级，这是选型的核心权衡）
+
+| 方案 | 冷启动（量级） | 每实例内存 |
+|---|---|---|
+| WASM（Wasmtime AOT） | ~0.04 ms | 1–5 MB |
+| V8 isolate（Cloudflare Workers / Dynamic Workers） | ~1.5 ms | 3–10 MB |
+| 容器（gVisor） | ~50 ms | 20–50 MB |
+| 容器（`runc`） | ~100 ms | 30–100 MB |
+| microVM（Firecracker） | ~125 ms | 5–20 MB |
+| 云沙箱（预热池：Daytona 90ms / E2B ~150ms） | 90–150 ms | — |
+
+数字来源见 §7.6 各实现文档；此处只需记住**量级**。
+
+### 7.3 三条可直接采纳的业界共识
+
+1. **默认拒绝**，三个面同构：网络 `allow-only` 域名表 + **宿主侧 HTTP/SOCKS 代理**（沙箱内进程
+   根本没有网络命名空间）；写 `allow-only` 路径表；读 `deny-then-allow`。加固容器侧对应
+   `--cap-drop ALL --security-opt no-new-privileges --read-only --network none --pids-limit`
+   + 只挂一个 Unix socket 走代理。**这正是我们 §2-L2 的目标口径**。
+2. **违规要"可读"**：`srt` 把拦截事件转成**结构化 JSON 反馈**交给 agent，让它自己改道，而不是
+   静默杀进程。与我们既有的 P2-2（拒绝文案必须可执行）是同一纪律；落地时它同时喂
+   `BashOutput.isolation`（P2-3）与审计信封。
+3. **不自研隔离原语**：各平台一律用系统自带（Seatbelt / bubblewrap·Landlock+seccomp /
+   AppContainer+WFP），产品层只做**探测 + 编排 + 降级**。这正是 §2 纪律 1/2（`probeIsolation()`
+   与"拿不到就显式降级"）的行业依据。
+
+### 7.4 我们与业界的差异（三点，**不要照抄**）
+
+1. **业界不做"命令级白名单"**。`srt` / Codex 的边界是 **FS + 网络绑定**，它们不解析命令字符串。
+   我们今天的危险表 + bash 白名单 + AST 门，是"**因为还没有 L2**"的替代品。⇒ **L2 落地后，
+   L0 的命令白名单应从"主边界"退到"纵深防御"**（P0-4 的 symlink 逃逸恰恰证明字符串判定守不住）。
+2. **我们必须在"无常驻进程"约束下工作**。云沙箱与 Docker Sandboxes 都以"装一个
+   daemon / hypervisor"为前提；我们是本地插件式 harness（CLI / A2A / VSCode 三宿主）。
+   ⇒ 默认路线只能落在**第 3 格（OS 原语）**，容器 / microVM 是 **L3 可选**而非默认；这与 §2
+   纪律 2「不模拟」一致——拿不到原语就降级告警，不硬凑。
+3. **我们的策略层是独有的**。三模式权限引擎 + 四态答复 + 规则写回 + 零内容审计信封，
+   业界（`srt` / Codex）只有"permissive / restricted"两档。**这块不抄**——"决策权归人工"是本仓
+   的一等公民，本方案只**新增**执行边界，不动权限语义（§6 已钉）。
+
+### 7.5 采纳建议（按我们的档位）
+
+| 我们的档 | 抄谁 | 说明 |
+|---|---|---|
+| **L0** | （自研，无对标） | 命令级策略是我们的差异项；L2 到位后退居纵深 |
+| **L1** | `ulimit` / `setrlimit` + 进程组 kill | 业界共识做法；同时解 P1-1 与 P0-6 |
+| **L2** | **`@anthropic-ai/sandbox-runtime`（`srt`）** | 三平台差异已被它抹平：macOS Seatbelt / Linux bubblewrap·Landlock+seccomp / Windows 专用本地账户 + WFP，网络走宿主侧 HTTP+SOCKS 代理 + 域名 allowlist。Apache-2.0，可对标甚至 vendored |
+| **L3** | Firecracker 系 | E2B / Vercel Sandbox / GKE Agent Sandbox 同一底座；与 `external-integration-plan.md` §9 合流 |
+
+**Linux 上有一个真实分叉**：`srt` 选 **bubblewrap**（需系统预装 `bwrap`），Codex 选
+**Landlock + seccomp**（内核原生 5.13+，**无外部依赖**）。⇒ **我们倾向 Landlock + seccomp**，
+因为"无外部依赖"更贴合我们"开箱可用 + 探测降级"的口径；bubblewrap 作为可选增强（探测到才用）。
+这条会直接决定 P3-2 `probeIsolation()` 的探测项。
+
+### 7.6 外部参考实现
+
+- **Anthropic `srt`**：`github.com/anthropic-experimental/sandbox-runtime`，
+  npm `@anthropic-ai/sandbox-runtime`（Apache-2.0）。**本方案 L2 的首选对标**。
+- **OpenAI Codex CLI 沙箱**：macOS 12+ Seatbelt（`codex debug seatbelt`）/ Linux Landlock+seccomp
+  （`codex debug landlock`）/ Windows restricted token；默认 `workspace-write` 且网络默认关。
+- **gVisor / Kata Containers / Firecracker**：第 4/5 格（L3 候选）。
+- **WASI（Wasmtime）能力模型**：若未来要给**插件代码**（P1-5）划边界，这是比 `worker` 更强的答案
+  ——默认零能力、显式导入才可达。
+- ⚠️ **`vm2` 已停止维护**（作者明确"不应作为安全边界"），且**在 Bun 上明确"不是安全边界"**
+  （其威胁模型基于 V8 内部，Bun 用 JSC、未审计）。**本仓跑在 Bun 上 ⇒ 这条尤其要记**：
+  任何"在同一个进程里跑不可信 JS"的方案，在本仓都不成立。
