@@ -1,5 +1,105 @@
 # Agent Harness 开发日志
 
+## 2026-10-11（续 276）沙箱五件：进程树 kill + 资源上限 + 沙箱可配置 + MCP env 默认拒绝 + 读侧敏感默认拒绝
+
+### 起因
+
+用户给 **"a b"**：A = §4 第 4 步的 **P0-6 + P1-1**（超时/中断杀进程树 + 资源上限），
+B = §4 第 1 步的 **P0-1**（沙箱策略可配置）+ 第 3 步的 **P0-2 + P0-3**（MCP 子进程 env 默认拒绝、
+读侧敏感文件默认拒绝）。做完这五条，`§3` 的 **P0 整档清空**。
+
+### 决策与落地
+
+**A1 — P0-6 进程树 kill**（`tools-builtin/src/index.ts`）
+
+- 新增 `killProcessTree()`：POSIX 下 spawn 带 `detached: true`（子进程成为**新进程组组长**）⇒
+  `process.kill(-pid, SIGKILL)` 一次覆盖全组；Windows 走 `spawnSync('taskkill', ['/pid',pid,'/T','/F'])`；
+  两者都不可用才退回 `child.kill()`（不比改造前差）。
+- 三处调用点（timeout / signal 已 aborted / abort 监听）统一走它。
+- Ctrl-C **不受影响**：CLI 的中断走 `AbortController`（REPL 的 SIGINT / TUI 的 Ctrl-C 都调
+  `activeAbort.current.abort()`）→ `ctx.signal` → 上面那个 abort 监听。`detached` 只是拿掉了
+  "终端信号顺带传给子进程"这条路径，而那条路径本来就没被依赖。
+
+**A2 — P1-1 资源上限**（同文件 + `host/src/config.ts`）
+
+- `BashLimits`（`cpuSeconds` / `maxFileSizeKb` / `maxProcesses` / `memoryKb`，**0 = 不限制**）
+  + `resolveBashLimits()`（缺省只开单文件 2 GiB）+ `buildLimitPreamble()`（bash 族系才发抬头，
+  非 bash 族系**不模拟**；宿主回退路径不套，与放开白名单/env 隔离同口径）。
+- 顺手给 `bash_ro` 也接上 `limits`（只读≠资源安全：白名单里有 `python3 -c` / `find`）。
+
+**B1 — P0-1 沙箱可配置**（`host/src/config.ts` / `plugins.ts` / `notice.ts`）
+
+- `config.json → sandbox` 段（10 键：危险检测 / rootDir / env 隔离 / 白名单 / 宿主回退 / 只读超时 /
+  limits / readDeny）。
+- `BuiltinGeneralPlugin.load` 由**无参**改为 `load(ctx?: BuiltinLoadContext)`，boot 把已解析的
+  `cfg` 递给内置插件登记项；`tools-builtin` / `tools-search` 两个登记项改走工厂重建。
+- `checkSandboxConfig()` + `config.sandbox-inactive` 告警（与 `checkCompressionConfig` 同范式）：
+  拼错键、空 `limits`、缺类目的 `readDeny`、`fallbackToHost: true` 都会说话。
+
+**B2 — P0-2 MCP env 默认拒绝**（`mcp-client/src/index.ts`）
+
+- `buildMcpChildEnv()`：默认只透传白名单（`PATH` / `HOME` / `TMPDIR` / `LANG` / `TERM` +
+  Windows 启动必需项），凭据**必须显式**（服务自己的 `env`，或 `mcpServers[].envKeep` 点名）；
+  要恢复全量继承得写 `inheritEnv: true`。
+- 白名单自身也被一条断言钉住：**不含任何 `TOKEN|KEY|SECRET|PASSWORD|CREDENTIAL` 样式名**。
+
+**B3 — P0-3 读侧敏感默认拒绝**（`fs-guard` + `tools-builtin` + `tools-search`）
+
+- 清单落在零依赖的 `@harness/fs-guard`：`DEFAULT_SENSITIVE_READ_POLICY`（五类规则：
+  名 / 前缀 / 后缀 / 目录段 / 相对路径，**刻意不用 glob** —— 通配最容易顺手写成 `.env.*`
+  而把 `.env.example` 一起挡掉）+ `isSensitiveReadPath()` + `resolveSensitiveReadPolicy()`。
+- **例外优先**：`.env.example` / `.env.sample` / `.env.template`（模板）与 `*.pub`（公钥）先判
+  "不敏感" —— `id_rsa.pub` 同时命中 `prefixes:['id_rsa']` 与例外 `.pub`，例外必须排前面。
+- 三个读口共用：`read_file`（入参路径；`createReadFileTool` 工厂）、
+  `grep_file`（入参路径 + **递归遍历逐文件跳**）、
+  `bash_ro`（AST 参数里的路径字面量）。`bash`（主工具）不在其列 —— 它有自己的权限键与审批。
+
+### 只有实现时才暴露的发现
+
+- **★`ulimit` 抬头会让 `bash -c '<单命令>'` 失去 exec 优化**。改造前 `bash -c 'sleep 10'` 会被
+  bash 直接 `exec` 成 `sleep`（shell 进程本身就是目标进程），所以"只杀 shell"看起来能杀掉一切；
+  加上 `ulimit …; sleep 10` 前缀后 bash 不再替换自己 ⇒ 必须 fork 子进程 ⇒ **只杀 shell 会留下
+  孤儿子进程握住 stdout 管道，`close` 永不触发**（反向验证里那条既有用例直接 5s 超时）。
+  即 **P1-1 反而放大对 P0-6 的依赖**：两条不是可选的组合，是一起才成立。
+- **`ulimit -f` 的单位不统一**（实测）：macOS 的 bash 是 **1 单位 = 1024 字节**
+  （`ulimit -f 100` ⇒ `RLIMIT_FSIZE` = 102400），Linux/POSIX 是 **512 字节块**。不换算的话
+  2 GiB 的默认值在 macOS 上会缩成 2 MiB（每次写文件都超限）。
+- **`ulimit -v` 在 macOS 直接 `Invalid argument`**（内核不支持 `RLIMIT_AS`）⇒ 必须**逐项各起一次
+  `ulimit`**：合并成 `ulimit -t 5 -v 100 2>/dev/null` 时，`-v` 失败会把 `-t` 一起丢掉，
+  而且因为 `2>/dev/null` 而毫无声音。
+- **默认只开"单文件 2 GiB"**：`ulimit -u` 在 macOS 上**按用户计**（还算线程），本机默认 2666；
+  压到 1024 之类的"安全值"会让忙碌机器上的正常构建 fork 失败，症状是"莫名其妙的报错"——
+  宁可少挡一点，也不制造无法归因的失败。
+- **一条无效断言（自己写的，被反向验证抓出来）**：host 侧"`limits:false` ⇒ `ulimit -f` 读到
+  `unlimited`"**证明不了配置透传** —— "根本没加抬头"同样是 unlimited（M2 下这条仍绿）。
+  改成断言**自定义值生效且异于默认**（1024 vs 默认 2097152）后才真正可证伪。
+  ⇒ 负向用例的判据必须落在"被改动的那个字段"上，落在"结果恰好相同"的另一个字段上等于没测。
+- **反向验证的还原与下一个变异不能并行发**：一次 `cp` 还原与下一次 Edit 变异同时下发，
+  还原把刚打上的变异覆盖掉了（M2 首轮 0 红，白跑一次）。
+- **`grep -rn` 不加 `--include` 会递归进 `node_modules`**（几百行 `Is a directory` 噪声）；
+  这个仓里搜源码用 Grep 工具，别用 shell 的 `-r`。
+
+### 验证
+
+| 段 | 命令 | 结果 |
+|---|---|---|
+| typecheck | `bun run typecheck`（取真实退出码） | exit **0**；**47 包**全 `Exited with code 0`；`error TS` 计数 **0** |
+| 全量 test | `bun run test` | **2815 pass / 0 fail**（47 包全 exit 0），较基线 2777 **+38** |
+| 反向验证 | 五处变异（+1 补测），`cp` + `shasum` 还原 | 见下表，四处源码哈希逐字节一致、全仓无"反向验证临时"残留 |
+
+反向验证（**预测先写、跑完对账**）：
+
+| 变异 | 位置 | 预测 | 实测 | 对账 |
+|---|---|---|---|---|
+| 退回只杀直接子进程（`detached:false` + `child.kill`） | `tools-builtin/src/index.ts` | builtin 2 | builtin **3** | 差异已归因：多出的那条是**既有**的"超时后 kill"，因失去 exec 优化而 5s 超时（见上） |
+| `buildLimitPreamble` 恒返回空串 | 同上 | builtin 4 + host 1 | **一致** | ✅ |
+| registry 无视 ctx（退回无参单例） | `host/src/plugins.ts` | host 2 | **一致** | ✅ |
+| `buildMcpChildEnv` 退回全量继承 | `mcp-client/src/index.ts` | mcp-client 2 | **3** | 差异：`envKeep` 那条也断言了"未被点名的凭据不出现"，比我记得的更强 |
+| `isSensitiveReadPath` 恒 `false` | `fs-guard/src/index.ts` | 13 | **11** | 差异：fs-guard 里**只断言"不敏感"**的两条按构造抓不到这个方向 |
+| （补测）`isSensitiveReadPath` 恒 `true` | 同上 | —— | **4**（含上条漏掉的那两条） | ✅ 两个方向互为补集 ⇒ 两侧断言都不是死断言 |
+
+`+38` 用例的去向：tools-builtin +15（9 条 P0-6/P1-1 + 6 条 P0-3）、fs-guard +7、host +7、mcp-client +6、tools-search +3。
+
 ## 2026-10-11（续 275）路径边界收敛为 realpath 版单实现 + 权限模式会话级 + 风险判据改权限键
 
 ### 起因

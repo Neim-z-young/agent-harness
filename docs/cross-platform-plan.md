@@ -40,7 +40,7 @@
 | P0-2 | **`splitSegments` 不以单个 `&` 分段** | CMD 的 `cmd1 & cmd2` 是合法串联；现表只切分号、换行、双与、双竖线、单竖线，**单个 `&` 不分段** ⇒ `echo hi & shutdown -h now` 只被当成一段，段级 deny 漏判 | `splitSegments` |
 | P0-3 | **`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | `& 'C:\evil.exe' -x` 的首命令被提取成 `&` ⇒ 以命令名为准的白名单/deny 规则失配 | `extractFirstCommand` |
 | P0-4 | **引号/转义解析是 POSIX 方言** | PowerShell 用反引号 `` ` `` 转义、here-string `@"…"@`、`''` 表单引号。`stripQuoted` 不认 ⇒ 「去掉引号后的结构投影」在 PS 上不准，结构性检查（重定向/进程替换）可能漏判 | `stripQuoted` / `WRITE_CHANNEL_PATTERNS` |
-| P0-5 | **超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁 | `runBash` 的 timer 分支 |
+| P0-5 | ✅ **已修**（2026-10-11，见 `sandbox-isolation-plan.md` 续 276）—— 原文：**超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁 | `runBash` 的 timer 分支 |
 | P0-6 | **UNC 路径未验证** | `\\server\share\x` 在 Windows 上是绝对路径；`isWithinCwd` 对 UNC 的 `relative()` 行为未测 ⇒ 沙箱边界可能被绕过或误拒 | `isWithinCwd` / `resolvePath` |
 
 ### 2.1 P1 —— **能力缺口**（Windows 上少一块功能）
@@ -76,7 +76,7 @@
 ## 3. 建议实施顺序
 
 1. **P0 一批**：危险表 + `&` 分段 + `&` 调用运算符 + 引号方言（都在 `tools-builtin` 一个包内，一次改完最好测）→ 补 Windows 形态的**纯函数单测**（注入 `platform`/shell 族系，不需要真 Windows）。
-2. **P0-5 进程树**：`taskkill /T /F` / 进程组 kill；这一条要真机验证（或至少 process-group 单测）。
+2. ~~**P0-5 进程树**：`taskkill /T /F` / 进程组 kill~~ ✅ **已完成**（2026-10-11，见沙箱方案续 276）：`killProcessTree()` —— POSIX 走 `detached` + `kill(-pid)`，Windows 走 `taskkill /T /F`；两条 e2e 用例真起进程验证（后台孙进程超时后不存活 / AbortSignal 同样杀整棵树）。
 3. **P1-5 CI 矩阵**：先有闸，后面每条修复才不回归。建议 `ubuntu` + `macos` + `windows-latest`，`windows` 上允许「bash 相关用例跳过」白名单并**记录跳过条数**（防悄悄全跳过）。
 4. **P1-1 / P1-2**：命令映射与 PS 只读白名单（安全敏感，需要 reviewer 过一遍映射表）。
 5. **P1-4 CRLF/BOM**、**P2 批次**、**P3 批次**。

@@ -88,8 +88,8 @@
 
 | 档 | 名字 | 内容 | 现状 |
 |---|---|---|---|
-| **L0** | **策略层** | 危险表 + AST 门 + 白名单 + 权限引擎 + 段级 deny + 审计 | ✅ 已有，只差"可配置"（见 P0-1） |
-| **L1** | **进程层** | 资源上限（CPU / 内存 / 文件大小 / 进程数）、**超时杀进程树**、env **默认拒绝**（不是默认放行） | ❌ 全缺 |
+| **L0** | **策略层** | 危险表 + AST 门 + 白名单 + 权限引擎 + 段级 deny + 审计 | ✅ 已有**且已可配置**（P0-1 已修） |
+| **L1** | **进程层** | 资源上限（CPU / 内存 / 文件大小 / 进程数）、**超时杀进程树**、env **默认拒绝**（不是默认放行） | ✅ 三项已修（P0-6 / P1-1 / P0-2）；原生 `setrlimit` 档位仍缺 |
 | **L2** | **文件系统 / 网络绑定** | 目录读/写**分域白名单**；用 OS 原语把可写区**真的**限制在声明目录内（macOS `sandbox-exec` / Linux `bwrap`·`landlock`）；网络策略 `deny` / `allowlist` / `open` | ❌ 全缺 |
 | **L3** | **平台层** | 容器 / microVM / 远程 executor（A2A 远程场景的终态） | ❌ 未做（与 `external-integration-plan.md` §9 的"执行后端"合流） |
 
@@ -110,12 +110,12 @@
 
 | # | 缺口 | 为什么是 P0（判据） | 位置 |
 |---|---|---|---|
-| P0-1 | **沙箱策略从 `config.json` 根本设不到** | 组合根用**无参单例**注册：`load: async () => (…).toolsBuiltinPlugin`，而 `toolsBuiltinPlugin = createToolsBuiltinPlugin()`。于是 `allowlist` / `rootDir` / `dangerousDetection` / `sanitizeEnv` / `fallbackToHost` **一条都不可配**。用户"在 config 里写了白名单以为生效"是**静默失效**——比没写更危险 | `host/src/plugins.ts:320`、`tools-builtin/src/index.ts:1630` |
-| P0-2 | **MCP 子进程全量继承 env（与 bash 的隔离不对称）** | `spawn(command, args, { env: { ...process.env, ...config.env } })` ⇒ 同一个 `GITHUB_TOKEN`，bash 里被摘掉、**第三方 MCP server 里照样读得到**。而 MCP server 恰恰是外部代码 | `mcp-client/src/index.ts:147` |
-| P0-3 | **读侧无隔离：cwd 内的密钥文件默认可读** | `isWithinCwd` 只保证"在 cwd 里"，于是 `cat .env` / `cat .harness/.config-key` / `cat ~/.harness/permissions.json`（若 cwd 覆盖）畅通。bash 的 env 过滤挡不住**从文件里再读一遍** | `tools-builtin` 的 `read_file` / `bash` |
+| P0-1 | ✅ **已修**（2026-10-11，见开发日志续 276）—— 原文：**沙箱策略从 `config.json` 根本设不到** | 组合根用**无参单例**注册：`load: async () => (…).toolsBuiltinPlugin`，而 `toolsBuiltinPlugin = createToolsBuiltinPlugin()`。于是 `allowlist` / `rootDir` / `dangerousDetection` / `sanitizeEnv` / `fallbackToHost` **一条都不可配**。用户"在 config 里写了白名单以为生效"是**静默失效**——比没写更危险。**落地形态**：`config.json → sandbox` 段（10 个键）+ `BuiltinGeneralPlugin.load(ctx?)` 接**加载上下文**（原来是无参），boot 把已解析的 config 递进去；`tools-builtin` 与 `tools-search` 两个登记项改走工厂重建（`createToolsBuiltinPlugin({bash, readDeny, readOnlyBash})`）。另加 `checkSandboxConfig()` 未生效项告警（`config.sandbox-inactive`，与压缩段同范式）⇒ **配错至少会有声音** | `host/src/config.ts`、`host/src/plugins.ts`、`host/src/notice.ts` |
+| P0-2 | ✅ **已修**（2026-10-11，见开发日志续 276）—— 原文：**MCP 子进程全量继承 env（与 bash 的隔离不对称）** | `spawn(command, args, { env: { ...process.env, ...config.env } })` ⇒ 同一个 `GITHUB_TOKEN`，bash 里被摘掉、**第三方 MCP server 里照样读得到**。而 MCP server 恰恰是外部代码。**落地形态**：`buildMcpChildEnv()` —— 默认只透传**白名单**（`PATH` / `HOME` / `TMPDIR` / `LANG` / `TERM` + Windows 启动必需项，**不含任何凭据样式名**）+ 服务自己声明的 `env`；要额外透传用 `mcpServers[].envKeep`，真要不隔离用 `mcpServers[].inheritEnv: true`（显式） | `mcp-client/src/index.ts`（`buildMcpChildEnv` / `StdioTransport`） |
+| P0-3 | ✅ **已修**（2026-10-11，见开发日志续 276）—— 原文：**读侧无隔离：cwd 内的密钥文件默认可读** | `isWithinCwd` 只保证"在 cwd 里"，于是 `cat .env` / `cat .harness/.config-key` / `cat ~/.harness/permissions.json`（若 cwd 覆盖）畅通。bash 的 env 过滤挡不住**从文件里再读一遍**。**落地形态**：清单落在零依赖的 `@harness/fs-guard`（`DEFAULT_SENSITIVE_READ_POLICY` + `isSensitiveReadPath`，五类规则：名 / 前缀 / 后缀 / 目录段 / 相对路径，**不用 glob**），三个读口共用：`read_file`（入参路径）、`grep_file`（入参路径 + **递归遍历逐文件跳** —— 只查入参挡不住"顺带读到"）、`bash_ro`（AST 参数里的路径字面量 —— `cat .env` 本来完全在只读白名单内）。⚠️ **例外优先**：`.env.example` / `.env.sample` / `.env.template`（模板）与 `*.pub`（公钥）**不挡** —— 否则模型连"该配哪些键"都看不到 | `packages/fs-guard/src/index.ts`、`tools-builtin`（`read_file` / `bash_ro`）、`tools-search`（`grep_file`） |
 | P0-4 | ✅ **已修**（2026-10-11，见开发日志续 275）—— 原文：**路径边界只做字符串前缀，无 `realpath` 解析 ⇒ symlink 逃逸** | `isWithinCwd = !relative(cwd, p).startsWith('..')`，而 `resolvePath` 只用 `resolve`（不做符号链接解析）。cwd 内一条 `ln -s /etc secret` ⇒ `secret/passwd` 的 `relative` 是 `secret/passwd`，**判定通过**，`stat/open` 却跟随链接读到外部。对照：`skill` / `subagent` 已经用 `realpathSync` 兜底，**工具侧没有**。**落地形态**：边界判定改到**真实路径**上比 —— 两侧都过 `realpathBestEffort()`（路径不存在时**逐级上溯到最近存在的祖先**再拼回剩余段，因此"写一个还不存在的新文件"这条路径照常被判定）；`resolvePath` 仍保持**纯字符串**（不碰文件系统），由 `isWithinCwd` 单独做真值判定。每一个有强制路径的包都补了 symlink 逃逸回归（读侧 + 写侧） | `packages/fs-guard/src/index.ts` |
 | P0-5 | ✅ **已修**（2026-10-11，见开发日志续 275） | `tools-builtin` / `tools-glob` / `tools-search` / `tools-media` / `code-intel` / `subagent` 各写一份。安全边界**修一处漏五处**，且语义已开始漂移（有的比 `resolve`、有的比真实路径）。**落地形态**：新建零依赖的 **`@harness/fs-guard`**（只引 `node:path` / `node:fs`），上述 6 包（`code-intel` 是 3 个文件）全改为引它；`@harness/tool` 放不下的原因是 `code-intel` 的 `core.ts` / `server.ts` **刻意不引 harness**（要能脱离 harness 单跑），而 fs-guard 零依赖叶子包正好两边都能引。另加**静态守卫**（扫 `packages` 下不得再有第二处 `function resolvePath/isWithinCwd` 定义） | `packages/fs-guard/`、6 包的 `package.json`、根 `tsconfig.json` paths |
-| P0-6 | **超时只杀直接子进程，不杀进程树**（沙箱视角） | `cross-platform-plan.md` P0-5 已从"跨平台"记过；从**隔离**角度更重：超时后沙箱内的 `npm run dev` 还在跑 ⇒ 隔离边界外仍在产生副作用（占端口、写文件、出网） | `runBash` 的 timer 分支 |
+| P0-6 | ✅ **已修**（2026-10-11，见开发日志续 276）—— 原文：**超时只杀直接子进程，不杀进程树**（沙箱视角） | `cross-platform-plan.md` P0-5 已从"跨平台"记过；从**隔离**角度更重：超时后沙箱内的 `npm run dev` 还在跑 ⇒ 隔离边界外仍在产生副作用（占端口、写文件、出网）。**落地形态**：`killProcessTree()` —— POSIX 下 spawn 带 `detached: true` 让子进程成为**新进程组组长**，`kill(-pid)` 一次覆盖全组；Windows 走 `taskkill /T /F`；都不可用才退回单进程 kill。三处调用点（timeout / signal 已 aborted / abort 监听）统一走它。⚠️ 与 P1-1 的耦合见日志：`ulimit` 抬头会让 `bash -c '<单命令>'` 失去 exec 优化（shell 不再被替换成目标进程）⇒ **没有进程组 kill 时连 `sleep` 都杀不掉**（孤儿子进程握住 stdout 管道、`close` 永不触发） | `tools-builtin/src/index.ts`（`runBash` / `killProcessTree`） |
 | P0-7 | **`fallbackToHost` 的档位下沉没有记录** | 一旦开启，命令从"沙箱约束"升到"宿主全权"（放开白名单 + 放开 env 隔离 + 补系统 `PATH`）。`requireHostApproval` 默认 true 是好的，但 **allow-all 模式下静默放行且不留痕**（`viaHost` 只在返回值里，审计不记） | `tools-builtin` 回退分支 |
 | P0-8 | ✅ **已修**（2026-10-11，见开发日志续 272）—— 原文：「始终允许」写回是整键覆盖 ⇒ 段级 `denyPatterns` 永久失效（§8 D1） | 提示里显示的是**具体命令**，写回却是 `rules[toolKey] = 'allow'`：①粒度=**整工具**（`ls` 与 `rm -rf` 同键同命）；②**整键覆盖**已有 PathRules（`deny: ['shutdown*']` 直接丢）；③规则退化为 **string** 后 `check()` 走 `typeof toolRule === 'string'` **直接 return**，`denyTargets` **整体不再参与** ⇒ `echo hi; shutdown -h now` 被放行。**测试盲区**：`permission-deny-patterns.test.ts` 只钉了"string 规则不受 denyPatterns 影响"这一形态，**没有覆盖"always-allow 把 PathRules 变成 string"这条写回路径**。⚠️ 修复时发现 ② 的可行形态与初稿不同：string 形态**没有自己的 deny 列表**，"过 denyTargets"只能落成**全局 deny 否决权**（详见 §8.6） | `host/src/permission.ts:283/300`、`core/src/index.ts:492` |
 | P0-9 | ✅ **已修**（2026-10-11，见开发日志续 273）—— 原文：**授权不跟调用方走，但身份跟**（§8 D2）。修复见下条注 | 规则集落 `<dataDir>/permissions.json`（dataDir 缺省 `~/.harness`），而 A2A 与本地 TUI **在该工作区解析到同一份**。身份层做得很干净（`callerKey()` 首次使用即绑定 `contextId`，他人复用 ⇒ `ContextForbiddenError`），**权限层没有跟上**：`check()` 只读 `toolKey/patterns/denyPatterns`，`sessionId` 仅用于 asker 路由与审计归属，**不进规则匹配、也不进写回**。⇒ 本地点一次「始终允许」，同工作区的远程 A2A 调用方一并继承（反向亦成立）。控制面只听 `127.0.0.1` 是缓解、不是隔离。**本仓独有**（Codex / Claude Code 是单机单用户，不存在这个面）。**落地形态**：规则键加归属前缀 `session:<sid>\|<tool>` / `caller:<hash>\|<tool>`，`check()` 按 `session` → `caller` → 工具 → 全局逐层回退；写回带 `caller:<hash>` 键。⚠️ 两处与初稿不同：①**调用方主体必须哈希** —— A2A 的调用方标识就是 Bearer token，直接写进规则键等于把凭据落盘（`callerScopeKey`）；②归属**不是给 `PermissionRequest` 加字段**，而是 core 的 `resolvePrincipalKey()` 覆写钩子 —— 只有宿主有鉴权上下文，加字段会让 core 认识 A2A 的鉴权模型 | `host/src/host.ts:361`、`workspace/src/index.ts:134`、`a2a-server/src/auth.ts:42/63` |
@@ -124,7 +124,7 @@
 
 | # | 缺口 | 说明 | 位置 |
 |---|---|---|---|
-| P1-1 | **无资源上限** | 没有 CPU / 内存 / 文件大小 / 进程数限制。一条 `yes > /dev/null`、一次 `npm install` 打满内存即可拖垮宿主；`ulimit` / `setrlimit` 可解（L1） | `runBash` |
+| P1-1 | ✅ **已修**（2026-10-11，见开发日志续 276）—— 原文：**无资源上限** | 没有 CPU / 内存 / 文件大小 / 进程数限制。一条 `yes > /dev/null`、一次 `npm install` 打满内存即可拖垮宿主。**落地形态**：`BashSandboxConfig.limits`（`cpuSeconds` / `maxFileSizeKb` / `maxProcesses` / `memoryKb`，**0 = 不限制**、`false` = 全关）+ `buildLimitPreamble()` 在 bash 族系前置 `ulimit` 抬头（**非 bash 族系不模拟**；宿主回退路径不套，与放开白名单 / env 隔离同口径）。⚠️ 两个实测坑：①`ulimit -f` **单位不统一**（macOS 1 单位 = 1024B、Linux/POSIX = 512B 块）⇒ 按平台换算；②`ulimit -v` 在 macOS **直接 EINVAL** ⇒ 必须**逐项各起一次 `ulimit`**（合并形态会被失败项连累且 `2>/dev/null` 吞掉）。默认**只开单文件 2 GiB**，其余按需（`-u` 在 macOS 按用户计、压小会让正常构建 fork 失败） | `tools-builtin/src/index.ts`（`buildLimitPreamble` / `resolveBashLimits`）、`host/src/config.ts`（`sandbox.limits`） |
 | P1-2 | **无网络出口策略** | `tools-web` 有 SSRF 防护，但 **`bash` 里的 `curl` / `wget` 出网完全不受限**（含访问云元数据端点 `169.254.169.254`）。需要 `sandbox.net = deny \| allowlist \| open` | `tools-builtin` |
 | P1-3 | **无 OS 级只读绑定** | 没有把工作目录"真的"绑定成唯一可写区（macOS `sandbox-exec` profile / Linux `bwrap --ro-bind /` + `--bind cwd` / `landlock`）。L0 的策略一旦被绕过（P0-4 就是例子），没有第二道墙 | 新模块 |
 | P1-4 | **无"隔离档位"概念** | 现在是"策略全开 / 全关"的布尔，宿主无法表达"我要 L2，没有就拒绝启动"。**这是 §2 要补的核心结构** | `HostOptions` / `config.json` |
@@ -157,13 +157,18 @@
 
 ## 4. 建议实施顺序
 
-1. **P0-1 可配置**（`sandbox` 段进 config + 组合根透传）—— 不先做这条，后面所有策略用户都摸不到。
+1. ~~**P0-1 可配置**（`sandbox` 段进 config + 组合根透传）~~ ✅ **已完成**（2026-10-11，见续 276）：
+   `sandbox` 段（10 键）+ `load(ctx)` 加载上下文 + `checkSandboxConfig()` 未生效项告警。
 2. ~~**P0-4 + P0-5 + P3-1 一起做**：把路径边界收敛成一份 **`realpath` 版**实现，替换 6 处副本。~~
    ✅ **已完成**（2026-10-11，见开发日志续 275）：新建 `@harness/fs-guard`，7 个文件（6 包）全改为引它，
    一次改完、一次测完；每个有强制路径的包各补了 symlink 逃逸回归（读侧 + 写侧），并加了"别处不得再有一份"的静态守卫。
-3. **P0-2 + P0-3**：env 白名单化（默认拒绝）覆盖 MCP 子进程；读侧对 `.env` / `.config-key` /
-   `permissions.json` 这类**已知敏感名**加默认拒绝（可 `keepPaths` 放行）。
-4. **P0-6 + P1-1**：进程组 / 进程树 kill + `ulimit` 资源上限（真机验证，或至少 process-group 单测）。
+3. ~~**P0-2 + P0-3**：env 白名单化（默认拒绝）覆盖 MCP 子进程；读侧对 `.env` / `.config-key` /
+   `permissions.json` 这类**已知敏感名**加默认拒绝。~~ ✅ **已完成**（2026-10-11，见续 276）：
+   MCP 走 `buildMcpChildEnv()` 白名单（`envKeep` / `inheritEnv` 两个**显式**出口）；读侧清单落在
+   `@harness/fs-guard`，`read_file` / `grep_file` / `bash_ro` 三个读口共用（放行方式是 `sandbox.readDeny`）。
+4. ~~**P0-6 + P1-1**：进程组 / 进程树 kill + `ulimit` 资源上限~~ ✅ **已完成**（2026-10-11，见续 276）：
+   `killProcessTree()`（POSIX 进程组 / Windows `taskkill`）+ `buildLimitPreamble()`；两条 e2e 用例
+   **真起进程**验证（后台孙进程超时后不存活 / AbortSignal 同样杀整棵树）。
 5. ~~**P0-8 / P0-9 / P1-9（授权域收敛）**~~ ✅ **全部完成**（2026-10-11；P0-8 见续 272，P0-9 + P1-9 见续 273）。
    三件事共用同一处改动，一次做完了：① `rememberRule` 改 **PathRules 增量写回**；② `check()` 加
    **deny 否决权**（全局，P0-9 起推广到**任一层通配**）；③ 规则**按归属分层**
@@ -175,6 +180,8 @@
    OS 原语（macOS `sandbox-exec` 最易验证）—— **拿不到原语就按 §2 纪律 2 显式降级告警**。
 7. **P1-2 网络策略**、**P1-6 死协议收口**（要么接生产者、要么删掉类型）、**P2 批次**
    （D4/D6 见续 274、D7 见续 275，**P2 已清空**）、**P3-4 渗透集**（P3-1 见续 275）。
+   **P0 已清空**（2026-10-11，见续 276：P0-1 / P0-2 / P0-3 / P0-6 全部完成）；
+   P1 剩 P1-2（网络策略）/ P1-3（OS 绑定）/ P1-4（隔离档位）/ P1-5（插件代码边界）/ P1-6 / P1-7 / P1-8。
 8. **P1-5 / P1-7 / L3**：与 `external-integration-plan.md` §9 的"执行后端抽象"合流后统一做。
 
 > **与 L2 的排期分叉**：第 5 步（授权域）与第 6 步（L2 OS 绑定）**互不阻塞**，但有先后意义 ——
@@ -405,3 +412,4 @@ asker 路由也已在用了，只差把它接进规则匹配与写回**（P0-9 �
 | **D4 / D6**（P2-5/P2-6）✅ **已修** | 纯判据与文案：`assessRisk` 让 `bash` 走**模式表**（`ls` 不该是 high）—— 实际落成 `SHELL_TOOL_KEYS` 分流 + `assessShellRisk(command)`，且**执行类判据要放在工具键表之前**（否则模式表对 bash 永远不生效）；文案键位改成**只有 `状态(键)` 一种形态**（比初稿的"去掉方括号简写"更进一步：直接与 `PermissionAnswer` 四态对齐）。`cli.test.ts` 钉着文案，**改要同步** | 文案用例已同步（host 2 处逐字）+ `assessRisk` 补 6 条 bash 分级用例 + cli 加"文案↔`parseCliAnswer`"守卫。反向验证三处变异：M1 退回一刀切 high ⇒ host 5 红；M2 退回旧文案 ⇒ host 2 + cli 1 红；M3 摘掉 `NULL_SINK_REDIRECT` 负向前瞻 ⇒ host 1 红 |
 | **D7**（P2-7）✅ **已修** | 真做成**会话级**（而不是只把文案改成"进程级"）：引擎加 `sessionModes` 覆盖表，`getMode/setMode` 接 `sessionId?`，`ask()` 按 `req.sessionId` 取；CLI 默认**只改本会话**、`global` 后缀改进程默认；A2A 控制面加可选 `sessionId`（不给 ⇒ 进程默认，**老调用逐位不变**）。⚠️ 实现期坑：CLI 的 `arg` 是 `line.split(/\s+/, 2)[1]`，**只截到第二个 token** ⇒ `ask global` 里的 `global` 会被丢掉，必须从 `line` 自己切 | host 补 4 条（未切过回退默认 / 只改本会话 / 不给 sessionId 改进程默认 / `ask` 按会话短路）+ cli 1 条（本会话 vs `global`）+ a2a 1 条。反向验证：退回裸字段 ⇒ host 3 + cli 2 + a2a 1 红（与预测逐项一致） |
 | **P0-4 / P0-5 / P3-1** ✅ **已修**（承 D4 那轮的附带发现） | ①`assessRisk` 两张表的键由**工具 id** 改为**权限键**（`HIGH = write / edit`、`LOW = read / bash_ro`）——`toolKey` 本就是 `tool.permission.key`（`tool/src/index.ts` 的 Step 4），id 永远到不了这里，所以改造前 **`write` 落 medium**（写操作标中危，比 D4 更隐蔽：D4 至少还是 high）。②路径边界收敛成**一份 realpath 版**：新建零依赖 `@harness/fs-guard`，6 包 7 文件全改为引它，`isWithinCwd` 两侧都过 `realpathBestEffort`（不存在时逐级上溯最近存在的祖先），并加"别处不得再抄一份"的**静态守卫**；顺带修掉 `startsWith('..')` 对 `..foo` 的误杀 | `assessRisk` 补两条（写侧 + 读侧"id 不是键 ⇒ medium"）+ `cli.test.ts` 的 `riskLevel` 断言 `medium → high`；每个有强制路径的包补 symlink 逃逸回归（builtin 读+写两条）。反向验证四处：① 退回 id 表 ⇒ host 3 + cli 1 红；② 退回进程级 mode ⇒ host 3 + cli 2 + a2a 1 红；③ 退回字符串判定 ⇒ **7 红**（fs-guard 1 + builtin 2 + glob/search/media/code-intel 各 1）；④ 塞回一份副本 ⇒ 静态守卫 1 红并点名文件 |
+| **P0-1 / P0-2 / P0-3 / P0-6 / P1-1** ✅ **已修**（2026-10-11，续 276） | ①**P0-1 可配置**：`load(ctx)` 加载上下文把 `config.json → sandbox` 递进内置插件（原来是无参单例 ⇒ 整段静默失效），外加 `checkSandboxConfig()` 把"写了不生效"报出来。②**P0-2 MCP env**：`buildMcpChildEnv()` 默认白名单 + 声明项（凭据必须显式；开关是 `envKeep` / `inheritEnv`）。③**P0-3 读侧**：`@harness/fs-guard` 的敏感清单被 `read_file` / `grep_file`（含遍历逐文件跳）/ `bash_ro`（AST 参数）共用，例外（模板 / 公钥）优先。④**P0-6 进程树**：`detached` + `kill(-pid)`（Windows `taskkill /T /F`）。⑤**P1-1 资源上限**：`ulimit` 抬头，逐项各起一次（合并会被 macOS 的 `-v` EINVAL 连累）、`-f` 单位按平台换算。⚠️ 实现期发现：`ulimit` 抬头会让 `bash -c "<单命令>"` 失去 exec 优化 ⇒ **P1-1 反而放大对 P0-6 的依赖** | 反向验证五处（+1 补测）：退回只杀直接子进程 ⇒ builtin **3** 红（含既有那条，因失去 exec 优化而 5s 超时）；`buildLimitPreamble` 恒空 ⇒ builtin **4** + host **1** 红；registry 无视 ctx ⇒ host **2** 红；`buildMcpChildEnv` 退回全量继承 ⇒ mcp-client **3** 红；`isSensitiveReadPath` 恒 false ⇒ **11** 红（fs-guard 5 + builtin 4 + search 2）、恒 true ⇒ **4** 红（两侧互为补集，证明不是死断言） |
