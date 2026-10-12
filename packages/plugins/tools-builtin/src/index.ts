@@ -710,8 +710,13 @@ const READ_ONLY_HOW =
   '要写文件 / 出网 / 执行子命令，请用主 Agent 的 `bash`（有独立权限键与人工审批）；'
   + '确属只读但被误判，请改写命令避开上述特征（如把 `$(...)` 换成直接给参数）。'
 
-/** 默认危险命令正则表（命中即拒绝执行） */
-const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
+/**
+ * 默认危险命令正则表（命中即拒绝执行）。
+ *
+ * 导出是**为单测**（与 `checkReadOnlyCommand` / `resolveShell` 同风格）：判定口径要能被逐条钉住，
+ * 而"跑一条真命令看是否被拒"既慢又依赖平台。
+ */
+export const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\(\)\s*\{[^{}]*\|[^{}]*\}/, // fork bomb（函数体启动即时递归 fork）
   /\brm\s+(?:-[a-z]*f[a-z]*\s+)*\/\s*(?:\*|$|--)/m, // rm -rf / 或 rm -rf /*
   // `~\s` 曾要求波浪号后必须有空白 —— `rm -rf ~`（行尾无空白）在原文上直接漏过。
@@ -729,7 +734,23 @@ const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   // 刻意不含 fdisk（`-l` 是常见只读查看，误拒会直接卡住正常使用）。
   /\b(shred|wipefs|sgdisk|sfdisk|mkswap|badblocks|blockdev|mkfs|parted)\b[^|;&\n]*\/dev\/(sd|hd|rdisk|disk|vd|nvme)\w*/,
   /\bshutdown\b|\breboot\b|\bhalt\b|\bpoweroff\b/, // 关机/重启
-  /format\s+\/\s*\/s\s*\/f\/q/i, // Windows format /s /f /q（清盘）
+  // ⚠️ 2026-10-12 实测：原正则 `/format\s+\/\s*\/s\s*\/f\/q/i` **匹配不到目标串** ——
+  // `format /s /f /q` 里 `/f` 与 `/q` 之间有空格，而它要求 `/f/q` 紧邻。也就是说这条从落地起
+  // 就一直是死的（典型的"写了但没生效"）。改为按**危险开关**判定：`/q` = 快速格式化。
+  /\bformat\s+(?=[^|;&\n]*\/q\b)/i, // Windows format <盘> /q（快速格式化）
+  // ---- Windows 原生破坏形态（P0-1，2026-10-12）----
+  // 判据：**递归/强制语义**才拦 —— `del /q foo.txt` 这类单文件删除是正常用法，拦了会大面积误伤。
+  // 每条都用 `[^|;&\n]*` 限定在同一段内，与既有 `shred|wipefs|…` 那条同一纪律：
+  // 不限定会让"只是提到它"（如 `echo del /s`）也被判危险。
+  /\b(?:del|erase)\s+[^|;&\n]*\/s\b/i, // del /f /s /q <dir>（/s = 连子目录一起删）
+  /\b(?:rd|rmdir)\s+[^|;&\n]*\/s\b/i, // rd /s /q <dir>
+  /\bRemove-Item\b[^|;&\n]*-Recurse\b/i, // PowerShell Remove-Item -Recurse -Force
+  /\b(?:Format-Volume|Clear-Disk|Initialize-Disk|Remove-Partition)\b/i, // 磁盘/分区级操作
+  /\b(?:Stop-Computer|Restart-Computer)\b/i, // 关机/重启（PowerShell 形态）
+  /\breg\s+delete\s+(?:HKLM|HKEY_LOCAL_MACHINE|HKCR|HKEY_CLASSES_ROOT|HKU\b|HKEY_USERS)/i, // 系统级注册表
+  /\bbcdedit\b/i, // 改引导配置（可能直接让机器起不来）
+  /\bvssadmin\s+delete\s+shadows\b/i, // 删卷影副本（勒索软件标志动作，同时毁掉回滚能力）
+  /\b(?:takeown|icacls)\b[^|;&\n]*\/t\b/i, // 递归改属主/权限（/t = 递归）
   // 注：曾有一条 `>\s*\/dev\/null\b|\/dev\/sda`，已删除 ——
   // - `>/dev/null` / `2>/dev/null` 是最常见的**无害**重定向（丢弃输出），把它判为危险会
   //   大面积误伤正常命令（实测：`git rev-parse --is-inside-work-tree 2>/dev/null` 直接被拒）；
@@ -740,14 +761,33 @@ const DEFAULT_DANGEROUS_PATTERNS: RegExp[] = [
   /\bsudo\s+rm\s+-rf\s+(\/|\*)/, // sudo rm -rf /
 ]
 
-/** 默认敏感环境变量名（隔离时从继承环境移除） */
-const DEFAULT_SENSITIVE_ENV = [
-  /AWS_ACCESS_KEY|AWS_SECRET|AWS_SESSION_TOKEN/,
-  /GITHUB_TOKEN|GITLAB_TOKEN|GH_TOKEN/,
+/**
+ * 默认敏感环境变量名（隔离时从继承环境移除）。
+ *
+ * P2-3（2026-10-12）三处修正，都来自"Windows 上键名大小写不固定"这条事实：
+ * ① **全部加 `/i`** —— 原来六条里只有两条有，于是 `github_token` / `Github_Token` 这类
+ *    真实存在的写法**直接漏过**（Windows 的环境变量名大小写不敏感，用户/工具写哪种都有）；
+ * ② 补**后缀型与专用名**：上面按子串枚举漏掉了 `NPM_TOKEN` / `SLACK_TOKEN` / `SENTRY_DSN` …
+ *    这类"不以已知前缀开头、也不含已枚举子串"的名字；
+ * ③ 反之，`USERPROFILE` / `APPDATA` / `LOCALAPPDATA` / `TEMP` / `TMP` **刻意不进表** ——
+ *    它们是**路径**不是凭据，摘掉会让依赖它们的命令直接坏掉（Windows 上尤其明显）。
+ *    这条纪律由用例钉住（见 `tools-builtin.test.ts` 的 P2-3 组）。
+ */
+export const DEFAULT_SENSITIVE_ENV = [
+  /AWS_ACCESS_KEY|AWS_SECRET|AWS_SESSION_TOKEN/i,
+  /GITHUB_TOKEN|GITLAB_TOKEN|GH_TOKEN/i,
   /OPENAI|ANTHROPIC|DEEPSEEK|GOOGLE|AZURE|BEDROCK|GEMINI|MISTRAL|COHERE/i,
-  /API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN/,
+  /API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|REFRESH_TOKEN/i,
   /PASSWORD|PASSWD|CREDENTIAL/i,
-  /PRIVATE_KEY|PEM\b/,
+  /PRIVATE_KEY|PEM\b/i,
+  // 后缀型（`*_KEY` / `*_TOKEN` / `KEY`）—— 用 `(?:^|_)` 与 `(?:_|$)` 夹住，
+  // 免得 `MONKEY` / `KEYBOARD` 这类**结尾或开头含 KEY** 的普通名被误摘。
+  /(?:^|_)TOKEN(?:_|$)|(?:^|_)KEY(?:_|$)/i,
+  // 专用名（不以已知前缀开头，也不含上面任何子串）
+  /NPM_TOKEN|PYPI_TOKEN|NUGET_API_KEY|SLACK_TOKEN|DISCORD_TOKEN|TELEGRAM_TOKEN/i,
+  // ⚠️ 这里**不能**写 `\bDSN\b`：`_` 属于词字符，`SENTRY_DSN` 里的 `DSN` 前一个字符是 `_`
+  // ⇒ 形不成词边界，规则等于没写（实测踩过）。`DSN` 作为子串极少出现在非凭据名里，直接匹配。
+  /DATABASE_URL|CONNECTION_STRING|DSN|MONGO_URL|REDIS_URL|AMQP_URL/i,
 ]
 
 /** 危险命令检测：返回命中的模式描述，未命中返回 null */
@@ -784,8 +824,8 @@ function detectAstDangerous(facts: BashCommandFacts, patterns: RegExp[]): string
   return null
 }
 
-/** 环境隔离：过滤掉敏感变量，保留必要与 keepEnv 指定的变量 */
-function sanitizeEnv(env: NodeJS.ProcessEnv, keepEnv: string[]): Record<string, string> {
+/** 环境隔离：过滤掉敏感变量，保留必要与 keepEnv 指定的变量（导出为单测，见 P2-3） */
+export function sanitizeEnv(env: NodeJS.ProcessEnv, keepEnv: string[]): Record<string, string> {
   const result: Record<string, string> = {}
   for (const key of Object.keys(env)) {
     const value = env[key]
@@ -800,12 +840,37 @@ function sanitizeEnv(env: NodeJS.ProcessEnv, keepEnv: string[]): Record<string, 
   return result
 }
 
-/** 从命令提取首个命令名（用于白名单匹配） */
-function extractFirstCommand(command: string): string {
-  const trimmed = command.trim().replace(/^[;&|\s]*/, '')
-  // 跳过前缀赋值（VAR=x cmd）与 sudo/env 前缀
-  let m = trimmed.match(/^(?:[A-Za-z_][\w]*=[^\s]*\s+)*(?:sudo\s+|env\s+)?([^\s|;&<>]+)/)
-  return m ? m[1] : trimmed.split(/\s+/)[0] ?? ''
+/**
+ * 从命令提取**首个命令名**（用于白名单匹配与只读判定）。
+ *
+ * P0-3（2026-10-12）：三种形态都要取对 ——
+ * ① POSIX：`VAR=x sudo rm -rf` ⇒ `rm`（前缀赋值 / `sudo` / `env` 都跳过）；
+ * ② **PowerShell 调用运算符**：`& 'C:\\Program Files\\x.exe' -x` ⇒ `C:\\Program Files\\x.exe`
+ *    —— `&` 是调用运算符**不是分隔符**，而且这种形态的命令**几乎总被引号包住**，
+ *    原实现会把引号一起返回（`'C:\\...x.exe'`），于是永远匹配不上白名单里写的字面量；
+ * ③ CMD：分段后段首残留的 `&` 同样跳过（`cmd1 & cmd2` 的第二段）。
+ */
+export function extractFirstCommand(command: string): string {
+  // 前导分隔符（**不含 `&`** —— 它可能是调用运算符）
+  let s = command.trim().replace(/^[;|\s]+/, '')
+  // 段首 `&`：PS 调用运算符 / CMD 串联残留 —— 两种情况下后面才是真命令
+  s = s.replace(/^&\s*/, '')
+  // 跳过前缀赋值（`VAR=x cmd`）与 `sudo` / `env` 前缀 —— **三者要能交替重复**：
+  // `env FOO=1 BAR=2 ls` 里 `env` 之后还有赋值，只吃一种会把 `FOO=1` 当成命令名。
+  const m = s.match(/^(?:(?:[A-Za-z_]\w*=[^\s]*|sudo|env)\s+)*(.+)$/)
+  const head = (m ? m[1]! : s).trim()
+  const token = head.match(/^("[^"]*"|'[^']*'|[^\s|;&<>]+)/)?.[1] ?? ''
+  return unquoteOnce(token)
+}
+
+/** 去掉**一层**包裹引号（白名单里写的是不含引号的字面量，而 PS 常常写带引号的路径） */
+function unquoteOnce(s: string): string {
+  if (s.length >= 2) {
+    const a = s[0]
+    const b = s[s.length - 1]
+    if ((a === '"' && b === '"') || (a === "'" && b === "'")) return s.slice(1, -1)
+  }
+  return s
 }
 
 /** bash 输入 */
@@ -1323,7 +1388,7 @@ function stripQuoted(command: string): string {
 }
 
 /** 按 shell 分段符切段，**引号内的分隔符不算** */
-function splitSegments(command: string): string[] {
+export function splitSegments(command: string): string[] {
   const out: string[] = []
   let buf = ''
   let q: string | null = null
@@ -1337,6 +1402,18 @@ function splitSegments(command: string): string[] {
     if (ch === '"' || ch === "'") { q = ch; buf += ch; continue }
     if (ch === '\n' || ch === ';') { out.push(buf); buf = ''; continue }
     if (ch === '&' && command[i + 1] === '&') { out.push(buf); buf = ''; i++; continue }
+    // `&>file`（bash 的 stdout+stderr 重定向）—— `&` 后面紧跟 `>`，不是分隔符
+    if (ch === '&' && command[i + 1] === '>') { buf += ch; continue }
+    // P0-2（2026-10-12）：CMD 的**单个** `&` 是串联符（`cmd1 & cmd2`），必须分段。
+    // ⚠️ 但 `2>&1` / `>&2` / `<&` 里的 `&` 是**文件描述符重定向**，不是分隔符 ——
+    // 判据是"紧邻的前一个非空白字符是 `>` 或 `<`"。切错了会把 `1` 变成独立段，
+    // 段级 deny 与只读判定都会跟着错（`curl x 2>&1 | bash` 这类正好是危险形态）。
+    if (ch === '&') {
+      const prev = buf.replace(/\s+$/, '').slice(-1)
+      if (prev === '>' || prev === '<') { buf += ch; continue }
+      out.push(buf); buf = ''
+      continue
+    }
     if (ch === '|' && command[i + 1] === '|') { out.push(buf); buf = ''; i++; continue }
     if (ch === '|') { out.push(buf); buf = ''; continue }
     buf += ch
