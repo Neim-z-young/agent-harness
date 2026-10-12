@@ -59,9 +59,13 @@ import writeFileDoc from './prompts/write-file.txt'
 import editFileDoc from './prompts/edit-file.txt'
 import bashDoc from './prompts/bash.txt'
 import { analyzeBashCommand, type BashCommandFacts } from './bash-ast'
+import { buildQuotedMask, projectWithoutQuoted, scanQuotedSpans, type ShellDialect } from './shell-quoting'
 
 /** bash 命令 AST 分析（公共 API；见 {@link analyzeBashCommand}） */
 export { analyzeBashCommand } from './bash-ast'
+// P0-4：引号方言解析（纯函数；导出为单测，三层判定共用同一份口径）
+export { scanQuotedSpans, projectWithoutQuoted, buildQuotedMask } from './shell-quoting'
+export type { ShellDialect, QuotedSpan } from './shell-quoting'
 export type { BashAstCommand, BashAstRedirect, BashCommandFacts } from './bash-ast'
 
 // ========================================================================
@@ -594,7 +598,7 @@ export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'S
 }
 
 /** Shell 族系 */
-type ShellFamily = 'bash' | 'powershell' | 'cmd'
+type ShellFamily = ShellDialect
 
 /** 解析后的 shell 可执行文件与调用参数 */
 interface ResolvedShell {
@@ -850,28 +854,40 @@ export function sanitizeEnv(env: NodeJS.ProcessEnv, keepEnv: string[]): Record<s
  *    原实现会把引号一起返回（`'C:\\...x.exe'`），于是永远匹配不上白名单里写的字面量；
  * ③ CMD：分段后段首残留的 `&` 同样跳过（`cmd1 & cmd2` 的第二段）。
  */
-export function extractFirstCommand(command: string): string {
-  // 前导分隔符（**不含 `&`** —— 它可能是调用运算符）
-  let s = command.trim().replace(/^[;|\s]+/, '')
+export function extractFirstCommand(command: string, dialect: ShellDialect = 'bash'): string {
+  const spans = scanQuotedSpans(command, dialect)
+  // 前导分隔符（**不含 `&`** —— 它可能是 PS 的调用运算符）
+  let k = 0
+  while (k < command.length && /[;|\s]/.test(command[k]!)) k++
   // 段首 `&`：PS 调用运算符 / CMD 串联残留 —— 两种情况下后面才是真命令
-  s = s.replace(/^&\s*/, '')
-  // 跳过前缀赋值（`VAR=x cmd`）与 `sudo` / `env` 前缀 —— **三者要能交替重复**：
+  if (command[k] === '&') { k++; while (k < command.length && /\s/.test(command[k]!)) k++ }
+  // 前缀赋值（`VAR=x cmd`）与 `sudo` / `env` 前缀 —— **三者要能交替重复**：
   // `env FOO=1 BAR=2 ls` 里 `env` 之后还有赋值，只吃一种会把 `FOO=1` 当成命令名。
-  const m = s.match(/^(?:(?:[A-Za-z_]\w*=[^\s]*|sudo|env)\s+)*(.+)$/)
-  const head = (m ? m[1]! : s).trim()
-  const token = head.match(/^("[^"]*"|'[^']*'|[^\s|;&<>]+)/)?.[1] ?? ''
-  return unquoteOnce(token)
+  for (;;) {
+    const rest = command.slice(k)
+    const m = rest.match(/^(?:[A-Za-z_]\w*=[^\s]*|sudo|env)\s+/)
+    if (!m) break
+    k += m[0].length
+  }
+  while (k < command.length && /\s/.test(command[k]!)) k++
+  if (k >= command.length) return ''
+  // 引号包裹的整块 ⇒ 取区间内容（去引号）；here-string 另去首尾 `@` 与引号
+  const span = spans.find((sp) => sp.start === k)
+  if (span) {
+    if (span.here) return command.slice(span.start + 2, span.end - 1)
+    return command.slice(span.start + 1, span.end)
+  }
+  // 否则取到下一个空白 / 分隔符 / 引号起点
+  let e = k
+  while (e < command.length) {
+    const c = command[e]!
+    if (/\s/.test(c) || c === ';' || c === '|' || c === '&' || c === '<' || c === '>') break
+    if (c === '"' || (c === "'" && dialect !== 'cmd')) break
+    e++
+  }
+  return command.slice(k, e)
 }
 
-/** 去掉**一层**包裹引号（白名单里写的是不含引号的字面量，而 PS 常常写带引号的路径） */
-function unquoteOnce(s: string): string {
-  if (s.length >= 2) {
-    const a = s[0]
-    const b = s[s.length - 1]
-    if ((a === '"' && b === '"') || (a === "'" && b === "'")) return s.slice(1, -1)
-  }
-  return s
-}
 
 /** bash 输入 */
 export interface BashInput {
@@ -1014,7 +1030,8 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       // 段级 pattern 绝不能混进 patterns（会放宽 allow）；deny 是任一命中即拒绝，
       // 收紧无害 —— 让 `deny: ['shutdown*']` 能拦住 `echo hi; shutdown -h now` 这类
       // 「恶意段藏在全串中」的形态。切段用引号感知的 splitSegments（与 bash_ro 同源）。
-      extractDenyPatterns: (input) => splitSegments(input.command),
+      // P0-4：段级判定也按**本机实际 shell** 的方言解析引号（否则 PS 机器上会切错段）
+      extractDenyPatterns: (input) => splitSegments(input.command, shell.family),
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       const rootDir = config.rootDir ? resolvePath(config.rootDir, ctx.cwd) : ctx.cwd
@@ -1131,7 +1148,7 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       const allowlistActive = allowlist && allowlist.length > 0 && shell.family === 'bash'
       let firstCmd = ''
       if (allowlistActive) {
-        firstCmd = extractFirstCommand(input.command)
+        firstCmd = extractFirstCommand(input.command, shell.family)
         const trimmedCommand = input.command.trim()
         const allowlisted = allowlist.some((a) => {
           if (firstCmd === a) return true
@@ -1371,35 +1388,30 @@ const PRIV_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = 
  * 为什么必须这么做：`python3 -c "import os; os.remove('x')"` 里的 `;` 是**脚本内容**，
  * 不是 shell 的分段符；不做这一步就会把它切段，然后把 `os.remove(...)` 当成首命令报
  * "不在白名单"——错误码和真实原因完全对不上（写出来的是"命令不白名单"，实际是"脚本在写文件"）。
+ *
+ * P0-4（2026-10-12）：**按方言解析**（见 `./shell-quoting.ts`）。此前只认 POSIX 的
+ * `"`/`'` 两字符配对，于是 PowerShell 的 `` ` `` 转义与 `''` 表单引号会让投影**提前闭合**，
+ * 引号后面的 `>` / `;` 被当成 shell 结构 ⇒ 结构性检查漏判或误判。
  */
-function stripQuoted(command: string): string {
-  let out = ''
-  let q: string | null = null
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i]!
-    if (q) {
-      if (ch === q) { q = null; out += '""' }
-      continue
-    }
-    if (ch === '"' || ch === "'") { q = ch; continue }
-    out += ch
-  }
-  return out
+function stripQuoted(command: string, dialect: ShellDialect = 'bash'): string {
+  return projectWithoutQuoted(command, dialect)
 }
 
-/** 按 shell 分段符切段，**引号内的分隔符不算** */
-export function splitSegments(command: string): string[] {
+/**
+ * 按 shell 分段符切段，**引号内的分隔符不算**。
+ *
+ * P0-4（2026-10-12）：引号区间交给 `./shell-quoting.ts` 按**方言**算（POSIX / PowerShell / CMD
+ * 各一套），这里只消费 mask —— 口径只能有一份，否则"切段"与"去引号投影"会各自漂移，
+ * 而它们必须对同一段字符串给出同一个结论（只读判定同时用这两者）。
+ */
+export function splitSegments(command: string, dialect: ShellDialect = 'bash'): string[] {
+  const quoted = buildQuotedMask(command, scanQuotedSpans(command, dialect))
   const out: string[] = []
   let buf = ''
-  let q: string | null = null
   for (let i = 0; i < command.length; i++) {
     const ch = command[i]!
-    if (q) {
-      buf += ch
-      if (ch === q) q = null
-      continue
-    }
-    if (ch === '"' || ch === "'") { q = ch; buf += ch; continue }
+    // 引号内（含引号字符本身）一律不切
+    if (quoted[i]) { buf += ch; continue }
     if (ch === '\n' || ch === ';') { out.push(buf); buf = ''; continue }
     if (ch === '&' && command[i + 1] === '&') { out.push(buf); buf = ''; i++; continue }
     // `&>file`（bash 的 stdout+stderr 重定向）—— `&` 后面紧跟 `>`，不是分隔符
@@ -1436,6 +1448,12 @@ export function splitSegments(command: string): string[] {
 export function checkReadOnlyCommand(
   command: string,
   allowlist: readonly string[] = DEFAULT_READONLY_COMMANDS,
+  /**
+   * shell 方言（P0-4）：默认 `'bash'` ⇒ 既有行为逐位不变。
+   * 只读判定里的三处判定（结构投影 / 切段 / 首命令）**必须同一方言**，
+   * 否则会出现"投影按 PS、切段按 POSIX"这种半套解析 —— 那比不解析更危险。
+   */
+  dialect: ShellDialect = 'bash',
 ): ReadOnlyVerdict {
   const raw = String(command ?? '')
   if (raw.trim() === '') {
@@ -1446,7 +1464,7 @@ export function checkReadOnlyCommand(
   //   ② 丢弃到空设备（`>` / `2>` / `&>` / `2>>` + `/dev/null`）—— 见 stripNullSink。
   //   两者都必须在 `/>>?/` 之前摘掉，否则只读命令里最常见的「静音 stderr」写法会被整体拒绝。
   const noFdDup = stripNullSink(raw.replace(/[12]?>&[12]/g, ''))
-  const structural = stripQuoted(noFdDup)
+  const structural = stripQuoted(noFdDup, dialect)
   for (const p of WRITE_CHANNEL_PATTERNS) {
     if (p.re.test(structural)) {
       return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
@@ -1464,8 +1482,8 @@ export function checkReadOnlyCommand(
     }
   }
   // 2. 逐段校验首命令
-  const segments = splitSegments(stripQuoted(raw))
-  const rawSegments = splitSegments(raw)
+  const segments = splitSegments(stripQuoted(raw, dialect), dialect)
+  const rawSegments = splitSegments(raw, dialect)
   if (segments.length === 0) {
     return { ok: false, code: 'COMMAND_REQUIRED', reason: '只读模式拒绝：命令为空' }
   }
@@ -1473,7 +1491,7 @@ export function checkReadOnlyCommand(
     const seg = segments[si]!
     // 引号被剥掉后，段内只剩结构与命令名；脚本内容从对应的原文段取
     const rawSeg = rawSegments[si] ?? seg
-    const cmd = extractFirstCommand(seg)
+    const cmd = extractFirstCommand(seg, dialect)
     if (!allowlist.includes(cmd)) {
       return {
         ok: false,
@@ -1673,7 +1691,8 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
       key: 'bash_ro',
       extractPatterns: (input) => [input.command],
       // 段级 deny：与 bash 同理（只进 deny 判定，不碰 allow/ask 语义）
-      extractDenyPatterns: (input) => splitSegments(input.command),
+      // P0-4：段级判定也按**本机实际 shell** 的方言解析引号（否则 PS 机器上会切错段）
+      extractDenyPatterns: (input) => splitSegments(input.command, shell.family),
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
       if (shell.family !== 'bash') {
@@ -1689,7 +1708,7 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
           },
         }
       }
-      const verdict = checkReadOnlyCommand(input?.command, allowlist)
+      const verdict = checkReadOnlyCommand(input?.command, allowlist, shell.family)
       if (!verdict.ok) {
         // P2-2：`verdict.reason` 说的是**具体命中了什么**，统一在这一处补「怎么改」
         return { ok: false, error: { message: formatDenial({ what: verdict.reason, how: READ_ONLY_HOW }), code: verdict.code } }
