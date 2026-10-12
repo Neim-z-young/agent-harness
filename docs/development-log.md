@@ -1,5 +1,119 @@
 # Agent Harness 开发日志
 
+## 2026-10-12（续 283）跨平台：P0-6（UNC/路径方言）+ P1-1/2/3/4/6 全收
+
+用户"先 p0 再 p1" ⇒ 先收 P0 最后一项（P0-6），再把 P1 剩余五项一次推完（P1-5 已在续 279 完成）。
+
+### 一、P0-6 UNC / 路径语义（`fs-guard`）
+
+**起因**：`fs-guard` 直接用 `node:path` 的**平台默认**函数 ⇒ "跑在 Windows 上就是 win32 语义、跑在别处是 posix"，
+**两套语义的判定无法被单测钉住**（在 macOS 上写不出针对 UNC / 盘符的用例）。判据只说"未验证"，但真问题是
+**不可验证**。
+
+**落地**：`PathDialect = 'posix' | 'win32'` + `defaultPathDialect()`，四个判定函数各加一个**可选** `dialect`
+（缺省＝当前平台 ⇒ 既有行为逐位不变），`realpathBestEffort` / `isWithinCwd` 还可注入 `realpath`（纯函数用例不必碰真机路径）。
+
+**四条由实测钉住的方言差异**（node 26 / Bun，写在代码注释里）：
+1. **UNC 是绝对路径**：`win32.isAbsolute('\\srv\share\x')` 为 `true`，而 `posix` 同串为 `false`
+   （反斜杠在 posix 里是普通字符）⇒ **不能"看到反斜杠就当 Windows"**；
+2. 跨 server ⇒ `relative` 直接给**绝对路径**（走 `isAbsolute` 那一支）；
+3. 同 server 跨 share ⇒ `relative` 给 `..\..\s2\b`（走"以 `..` 开头"那一支）；
+4. **大小写折叠是 `node:path` win32 自带行为**（`win32.relative('c:\work','C:\Work\a')` ⇒ `'a'`）⇒ 本包**不需要再折一次**
+   （折两次会把 posix 侧语义带歪）。
+
+判据：P0-6 组 **10 条**（fs-guard 32 → 42），纯函数、注入 `dialect` / `realpath`，**不需要真 Windows**；
+**每条 win32 断言都配一条"同串在 posix 下的相反结论"** —— 只断言 win32 侧的话，一个两边都写死的实现也能全绿。
+
+⚠️ **未覆盖**：Windows 的 8.3 短名（`PROGRA~1`）/ 盘符大小写归一 / `\\?\` 前缀 —— 本机 macOS 无法覆盖，已写进代码注释与文档。
+
+### 二、P1-1 / P1-2 / P1-3（同一件事的三面，收在一个新模块）
+
+**起因**：白名单与只读集都是**按 POSIX 命令名**写的，PS/CMD 下"同名命令可能是别的东西"，于是改造前的做法是
+**整片禁用**（`bash_ro` 在非 bash 下直接 `SANDBOX_RO_NO_BASH` 拒绝）。
+
+**落地**：新建 `packages/plugins/tools-builtin/src/shell-commands.ts` —— 一层实现、三处消费：
+
+| 消费方 | 用什么 |
+|---|---|
+| `createBashTool`（白名单） | `isCommandAllowed()`：条目按方言**翻译**后再比首命令名 |
+| `createReadOnlyBashTool`（只读集） | `readonlyCommandsFor(dialect)` + `checkReadOnlyCommand(.., dialect)` |
+| `checkReadOnlyCommand`（逐段判定 + 结构门） | `dialectStructurePatterns()` + `isCommandAllowed()` |
+
+三条纪律（都落在代码注释里）：① **翻译只用于判定**（`isCommandAllowed` 只返回布尔 ⇒ 接口层面就无法改写命令文本）；
+② **只映射语义确实等价的只读类**（`rm`/`cp`/`mv` **刻意不进表** —— `rm -rf` 与 `Remove-Item -Recurse -Force`
+风险面不同，把"允许 rm"自动放大成"允许 Remove-Item 全参数形态"超出用户原意）；③ **PS/CMD 命令名大小写不敏感**
+（判定必须折叠），bash 侧保持敏感。
+
+**P1-3 的结论是"明确不做"**：不引入 PS 解析器，PS / CMD **不做 AST 复核** —— 这条被写成常量
+`AST_REVIEW_DIALECTS = ['bash']`（用例钉住），代价（**PS/CMD 的只读保证弱于 bash**）如实写进注释与文档。
+结构门因此必须承担更多，于是 PS 多挡四类（**都在"命令名看着没问题、实际能执行/能写"的边缘**）：
+脚本块 `{ }`（`Where-Object { Remove-Item x }` 是合法 PS **且真的会执行**）/ 调用运算符 `&` / here-string `@"…"@` /
+.NET 静态写调用；CMD 一条：`%COMSPEC%` 展开。另有三处按方言修正：`SUBSTITUTION_PATTERNS`（PS 的反引号是**转义符**
+不是命令替换，按原文检查会大面积误伤）/ `splitSegments`（PS 的 `&` 是调用运算符 ⇒ **不切段**）/
+readDeny 在无 AST 方言下退到**文本级近似**（`tokenLikePaths`：会把 `-Pattern '.env'` 误当路径 ⇒ **宁可误拒、不可漏放**）。
+
+### 三、P1-4 CRLF / BOM（`line-endings.ts`）
+
+**核实阶段的一个纠正**：判据说 `edit_file` 的行尾处理"未做"，实际**早已有**（就地写死的
+`content.includes('\r\n') ? '\r\n' : '\n'`）—— 教训是**核实要读实现，不能只信文档**。本轮的真实增量是三件事：
+- **抽出共用口径**：`detectEol` / `preferredEol` / `normalizeEol` / `applyEol` / `detectBom` / `stripBom` / `withBom` / `planWrite`；
+- **BOM**：`read_file` 展示时**剥掉**（否则模型会把它当首行内容）+ 如实报告；`write_file` / `edit_file` **写回保留**；
+  `edit_file` 还容忍 `old_string` **自带 BOM**（模型可能从旧版 read_file 里复制出来的形态 —— 改造前能匹配、改造后会失败，
+  这是我自己引入的回归面，先堵住）；
+- **`write_file` 按目标既有风格写回**：覆盖 CRLF 文件时不再把整文件拉成 LF（否则"改一行"在 diff 里是"整文件改动"）。
+  只读**头部 64KB** 做检测（BOM 在开头，行尾风格在前 64KB 内基本可判），不为检测把大文件整读一遍。
+
+⚠️ **顺带纠正判据里的一条错误描述**：P1-4 原文说"`read_file` 的 `totalLines`/行号也会偏移"—— 实现层面**不成立**：
+`allLines` 按 `\n` 切，CRLF 只让每行尾部多一个 `\r`，**不产生额外行**。用例把"LF 与 CRLF 同内容 ⇒ `totalLines` 与
+`linesRead` 一致"钉住，免得后人照文档去"修"一个不存在的问题。
+
+### 四、P1-6 测试的平台假设
+
+`tools-builtin.test.ts` 的 **31 个"真跑命令"用例**改用 `posixIt = it.skipIf(!HAS_POSIX_SHELL)`，其中
+**`HAS_POSIX_SHELL = resolveShell().family === 'bash'`** —— ★判据刻意**不是** `process.platform !== 'win32'`，
+而是**与运行时同一份**：装了 Git Bash / MSYS2 / WSL 的 Windows runner 会**真跑**这些用例（拿到真实覆盖），
+只有确实没有 bash 的环境才跳过；跳过条数进 bun 汇总行，由 CI 的 `skip ≤ 200` 闸看着。
+其余四个含 POSIX 字面量的测试文件经**抽查**是纯函数输入（喂 `assessRisk` / 解析器 / 格式化函数，不真执行）——
+**未逐一核查**，如实记在计划文档里。
+
+### 五、只有实现时才暴露的发现
+
+1. **★`allowlistNamesFor` 的查找比较写反了**：原写法 `CROSS_DIALECT_COMMANDS.find((e) => e.posix === normalizeCommandName(e.posix, dialect))`
+   —— 右值恒等于左值 ⇒ **永远命中第一条**（`cat` 被翻译成 `ls` 的等价集）。是"变体测试"（断言 `cat` → `type`）抓到的，
+   不是靠读代码。这是"看起来对、实际全错"的典型样本。
+2. **★PS 调用运算符的判定漏掉"`&` 前有空格"**：`[^<>&\s]&` 要求 `&` **紧邻**非空白字符，而
+   `Get-Item x & 'C:\tmp\evil.exe'`（最常见写法）`&` 前是空格 ⇒ **漏判**。改为 `(?:^|[^<>&|])\s*&(?![&>])`。
+3. **★`.env` 被自己的"点文件判据"漏掉**：原写成"点开头**且除首字符外还有 `.`**" ⇒ `.env`（最常见的凭据名）不命中；
+   同时 CMD 的 `/s` `/b` 开关含 `/` 会被误当路径。改为 `^\.[^.]` + 排除单字母开关。
+4. **CRLF 重复计数**：`detectEol` 若直接数 `\n`，`\r\n` 里的 `\n` 会被算成裸 LF ⇒ **CRLF 文件恒判 mixed**
+   （写用例时才发现，这类"两个集合相交"的计数错误很常见）。
+5. **`PlatformPath` 不是 `node:path` 的导出名** ⇒ 用 `type PathModule = typeof posix`。
+6. **`realpathBestEffort` 对相对路径拼的是 `process.cwd()`**（内部 `resolve(p)`），不是调用方传的 `cwd` ——
+   这是**既有契约**（工具层的顺序是"先 `resolvePath`、再 `isWithinCwd`"）。写 P0-6 用例时踩到才看清，已补注释与用例。
+7. **测试标题里写 `\\'` 是 TS 语法错误**（`Unexpected escaped backslash`）—— 标题里别嵌引号转义（我写用例时踩到）。
+8. `edit_file` 的 `old_string` 在**剥 BOM 之后**匹配，所以要**同时**剥 `old_string` 的 BOM —— 否则会把一个
+   原本能用的调用变成"未找到匹配的文本"（改造引入的回归面）。
+
+### 六、验证
+
+- **typecheck**：`bun run typecheck` 真实退出码 **0** / `error TS` **0**。
+- **全量测试**（走 `scripts/ci/test-summary.sh`）：**pass=3111 / fail=0 / skip=4**（本机 `HAS_POSIX_SHELL=true` ⇒ 31 条照跑）。
+  本轮新增用例 **77** 条：`fs-guard` +10（P0-6）、`shell-commands.test.ts` 43、`line-endings.test.ts` 24。
+- **反向验证六处**（`cp` 备份 → 变异 → 子集测试 → `shasum -a 256 -c` 还原；0 残留）：
+
+| # | 变异 | 预测 | 实测 | 偏差归因 |
+|---|---|---|---|---|
+| M1 | `allowlistNamesFor` 不做翻译 | 8 | **4** | PS 只读集自带别名、`Get-ChildItem` 逐字用例两条不受影响 |
+| M2 | PS 结构门置空 | 5 | **5** | — |
+| M3 | `detectEol` 不扣 CRLF | 4 | **4** | — |
+| M4 | `applyEol` 恒等 | 4 | **5** | 多的那条是"反复转换不叠字"（它也断言了转换结果） |
+| M5 | `stripBom` 恒等 | 3 | **2** | 少的是一条"自带 BOM 的 old_string"（两边都含 BOM 时仍能匹配） |
+| M6 | `fs-guard` 忽略方言 | 8 | **6** | 跨 share / 跨 server / 盘符 / 兄弟前缀那四条断言的是 `false`，posix 语义殊途同归也给 `false` |
+
+- **遗留**：⚠️ **整批 PS / CMD 分支未在真机验证**（开发机 macOS 无 `pwsh` / `cmd.exe`）。用例钉的是**判定算法**
+  （纯函数、逐条正反例），不是真机行为 —— 这条已写进 `docs/cross-platform-plan.md` 的"已修口径"一节，
+  是整份文档的已知可信度边界。剩下 **P2-1/2/4/5 与 P3-1~4**。
+
 ## 2026-10-12（续 282）跨平台 P0-4：引号方言解析（P0 一批收口）
 
 **起因**：续 281 收掉 P0-1/P0-2/P0-3 后，P0 只剩 **P0-4 引号/转义是 POSIX 方言**。本轮收它。

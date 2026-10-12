@@ -41,18 +41,18 @@
 | P0-3 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | 实测原实现的表现比"提取成 `&`"更绕：`^[;&\|\s]*` 会把 `&` 剥掉，于是提取到的是**带引号**的 `'C:\evil.exe'`，与白名单字面量同样失配。现改为：段首 `&` 跳过（PS 调用运算符 / CMD 串联残留）→ **去掉一层包裹引号**；顺带修 `env FOO=1 ls` 这类"前缀交替"（原来会把 `FOO=1` 当命令名）| `extractFirstCommand` |
 | P0-4 | ✅ **已修**（2026-10-12，见开发日志续 282）—— 原文：**引号/转义解析是 POSIX 方言** | 新建 `shell-quoting.ts`（`scanQuotedSpans` / `projectWithoutQuoted` / `buildQuotedMask`），**一层解析、三层消费** —— `stripQuoted` / `splitSegments` / `extractFirstCommand` 全改为消费同一份（`dialect` 默认 `'bash'` ⇒ 既有行为逐位不变），`checkReadOnlyCommand` 加第三参，四个调用点统一传 `shell.family`。三套方言：bash（`"` 内 `\` 转义）、PowerShell（`''` 表单引号 + `` ` `` 转义 + `@"…"@` / `@'…'@` **跨行 here-string**）、CMD（单引号**不是**引号）。★**安全取舍**：未闭合引号按"裸露"处理（不产生区间 ⇒ 分隔符照常生效）—— 另一条路会让 `curl x " ; rm -rf /tmp` 吞掉分隔符、段级 deny 漏判。⚠️ **PS 分支未真机验证**（本机无 `pwsh`），按官方语法实现并已在文件头如实标注；CMD 的 `^` 转义保守不处理。判据：`shell-quoting.test.ts` **20 条**（含"同一串在 bash / cmd 下结论不同"这类**证明方言真被用上**的用例） | `shell-quoting.ts`（新）、`stripQuoted` / `splitSegments` / `extractFirstCommand` / `checkReadOnlyCommand` |
 | P0-5 | ✅ **已修**（2026-10-11，见 `sandbox-isolation-plan.md` 续 276）—— 原文：**超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁 | `runBash` 的 timer 分支 |
-| P0-6 | **UNC 路径未验证**（核实：`fs-guard` 用平台 `node:path`，无 `path.win32` 显式分支、**无 UNC 用例**） | `\\server\share\x` 在 Windows 上是绝对路径；`isWithinCwd` 对 UNC 的 `relative()` 行为未测 ⇒ 沙箱边界可能被绕过或误拒 | `isWithinCwd` / `resolvePath` |
+| P0-6 | ✅ **已修**（2026-10-12，见开发日志续 283）—— 原文：**UNC 路径未验证** | **路径方言显式化**：`fs-guard` 新增 `PathDialect`（`'posix'｜'win32'`）与 `defaultPathDialect()`，四个判定函数各加一个可选 `dialect`（缺省＝当前平台 ⇒ **既有行为逐位不变**），`realpathBestEffort` / `isWithinCwd` 还可注入 `realpath`。四条由实测（node 26 / Bun）钉住的方言差异：① **UNC 是绝对路径**（`win32.isAbsolute('\\\\srv\\share\\x')` 为 `true`，而 `posix` 同串为 `false` —— 反斜杠在 posix 里是普通字符）；② 跨 server ⇒ `relative` 给**绝对路径**（走 `isAbsolute` 那支）；③ 同 server 跨 share ⇒ `relative` 给 `..\\..\\s2\\b`（走"以 `..` 开头"那支）；④ **大小写折叠是 `node:path` 的 win32 自带行为**（不需要本包再折一次）。判据：`fs-guard` 的 P0-6 组 **10 条**（纯函数、注入 `dialect`/`realpath`，**不需要真 Windows**），每条都配"同串在 posix 下的相反结论"。⚠️ **未覆盖**：Windows 的 8.3 短名 / 盘符大小写归一 / `\\?\` 前缀（本机 macOS 无法覆盖，真机接入时补） | `packages/fs-guard/src/index.ts` |
 
 ### 2.1 P1 —— **能力缺口**（Windows 上少一块功能）
 
 | # | 缺口 | 说明 | 位置 |
 |---|---|---|---|
-| P1-1 | **POSIX → PowerShell / CMD 命令映射** | 现在非 bash 直接禁用 allowlist。可做「首命令名 → cmdlet」映射表（`ls`→`Get-ChildItem`、`cat`→`Get-Content`…），把白名单**翻译**而非禁用。⚠️ 映射必须**只用于判定**（不改写命令），且未命中映射时的默认行为要保持 fail-closed | `createBashTool` |
-| P1-2 | **PowerShell 专用只读白名单** | `bash_ro` 在 Windows 全不可用。可为 PowerShell 定义只读集：`Get-ChildItem` / `Get-Content` / `Select-String` / `Measure-Object` / `Get-Item` / `Compare-Object` / `Where-Object`… 并写一条「无重定向/无 `Invoke-*`/无 `Remove-*`」的结构门 | `createReadOnlyBashTool` |
-| P1-3 | **PowerShell 的 AST 复核门** | 现有 `checkReadOnlyByAst` 只能跑 tree-sitter-**bash**。PS 侧要么引入 PS 解析器，要么明确「PS 只读靠结构门 + 白名单，不做 AST 复核」并写进文档 | `bash-ast.ts` |
-| P1-4 | **CRLF / BOM 处理** | Windows 上文件是 CRLF、可能带 BOM。`edit_file` 的 `old_string`（模型/用户给 LF）会匹配失败；`read_file` 的 `totalLines`/行号也会偏移。需要「读时记录行尾风格、写时保持、匹配时容忍」 | `tools-builtin` 的 read/write/edit |
+| P1-1 | ✅ **已修**（2026-10-12，见续 283）—— 原文：**POSIX → PowerShell / CMD 命令映射** | 新建 `shell-commands.ts`：`CROSS_DIALECT_COMMANDS`（posix / powershell / cmd 三列等价表）+ `allowlistNamesFor()`（把白名单条目翻译到目标方言）+ `isCommandAllowed()`。`createBashTool` 的 `allowlistActive` **去掉了 `family === 'bash'` 这个前置条件**。三条纪律（都写进代码注释）：① **翻译只用于判定**（`isCommandAllowed` 只返回布尔，接口层面就无法改写命令文本）；② **只映射语义确实等价的只读类**（`rm`/`cp`/`mv` 等写操作**刻意不进表** —— `rm -rf` 与 `Remove-Item -Recurse -Force` 风险面不同，自动放大超出用户原意）；③ **PS/CMD 命令名大小写不敏感**（判定必须折叠，否则 `DIR` 会被当未知命令），bash 侧保持敏感。未命中映射 ⇒ 该条目在目标方言下**不匹配** ⇒ 拒绝（fail-closed） | `shell-commands.ts`（新）、`createBashTool` |
+| P1-2 | ✅ **已修**（2026-10-12，见续 283）—— 原文：**PowerShell 专用只读白名单** | `POWERSHELL_READONLY_COMMANDS` / `CMD_READONLY_COMMANDS` + `readonlyCommandsFor(dialect)`；`createReadOnlyBashTool` **删掉了"非 bash 直接拒绝"**（`SANDBOX_RO_NO_BASH` 这个错误码已无生产路径）。结构门：PS 三条 + CMD 一条（见 P1-3）。收录判据是"只读取、只计算、只展示，且**不带能执行代码的参数**"——`ForEach-Object` / `Invoke-*` / `Start-*` / `New-Object` / `Add-Type` / `Measure-Command` **刻意不收**（与 POSIX 侧排除 `xargs` 同理）；CMD 侧 `date`/`time`（不带参数是**询问修改**）、`set`（带参数即写）、`attrib`/`chkdsk`/`label` **刻意不收** | `shell-commands.ts`（新）、`createReadOnlyBashTool` |
+| P1-3 | ✅ **已修**（2026-10-12，见续 283）—— 原文：**PowerShell 的 AST 复核门** | **结论：不引入 PS 解析器，PS / CMD 明确不做 AST 复核** —— 成本远高于收益，而只读哨兵的目标是挡"顺手写一下"（协作式只读）。这条被显式化成常量 **`AST_REVIEW_DIALECTS = ['bash']`**（用例钉住，避免以后有人以为"所有方言都有第二道门"），并在 `createReadOnlyBashTool` 里 `facts = AST_REVIEW_DIALECTS.includes(family) ? await analyzeBashCommand(...) : null`。**代价如实记着**：PS / CMD 的只读保证**弱于 bash**，因此结构门必须承担更多 —— PS 四条：脚本块 `{ }`（`Where-Object { Remove-Item x }` 是合法 PS **且真的会执行**）/ 调用运算符 `&`（`& $cmd` 是间接执行）/ here-string `@"…"@` / .NET 写静态调用（`[System.IO.File]::WriteAllText(…)` 绕过 cmdlet 白名单）；CMD 一条：`%COMSPEC%` 展开。另外三处按方言修正：`SUBSTITUTION_PATTERNS`（PS 的反引号是**转义符**不是命令替换）/ `splitSegments`（PS 的 `&` 是调用运算符，**不切段**）/ readDeny 在无 AST 方言下退到**文本级近似**（`tokenLikePaths`，宁可误拒不可漏放） | `shell-commands.ts`（新）、`index.ts` |
+| P1-4 | ✅ **已修**（2026-10-12，见续 283）—— 原文：**CRLF / BOM 处理** | 新建 `line-endings.ts`（`detectEol` / `preferredEol` / `normalizeEol` / `applyEol` / `detectBom` / `stripBom` / `withBom` / `planWrite`），三处工具共用一份口径。**核实时发现 `edit_file` 早已有 CRLF 容忍**（旧实现就地写死的 `content.includes('\r\n') ? '\r\n' : '\n'`）—— 本轮的增量是把它抽成共用口径 + 补 BOM + 补另两处：`read_file` 新增 `lineEnding` / `bom` 字段（**如实报告**；`content` **剥掉 BOM**，行尾**保留原样**）；`write_file` 覆盖已有文件时**按其行尾与 BOM 写回**（只读头部 64KB 检测；不改的话"改一行"会被 diff 显示成"整文件改动"）；`edit_file` 匹配在**剥 BOM** 的文本上做、写回时拼回，且 `old_string` **自带 BOM 也认**（模型可能从旧版 read_file 里复制）。判据：`line-endings.test.ts` **24 条**（含"LF 文件逐位不变"这类回归钉子）。⚠️ **顺带纠正判据点名的"行号偏移"**：`allLines` 按 `\n` 切 ⇒ CRLF **不会**产生额外行，`totalLines` / `linesRead` 与同内容 LF 文件一致（用例钉住） | `line-endings.ts`（新）、read/write/edit 三处 |
 | P1-5 | ✅ **已修**（2026-10-12，见沙箱方案续 279 / 本文件续 281） | 落地于 `.github/workflows/ci.yml`（ubuntu / macos / windows 矩阵）+ `scripts/ci/test-summary.sh`：**只读 bun 汇总行**，记录 `pass / fail / skip` 并写 step summary；`pass ≥ 2000`（防"整包没跑起来"）与 `skip ≤ 200`（防"某一片被整体跳掉"）**分开判**；Windows 只放行**失败**，pass/skip 阈值照样拦 | 仓库 CI 配置 |
-| P1-6 | **测试的平台假设**（核实：`tools-builtin.test.ts` 24 处 POSIX 依赖、`skipIf` **0 处**；只有 `penetration.test.ts` 有 4 处） | `tools-builtin` 用例大量用 `seq` / `cat` / bash 语法跑真机命令 ⇒ Windows 上整片红。需要「平台条件跳过」或改用 node 原生实现 | `tools-builtin.test.ts` 等 |
+| P1-6 | ⚠️ **主要部分已修**（2026-10-12，见续 283） | `tools-builtin.test.ts` 顶上加平台门：**`HAS_POSIX_SHELL = resolveShell().family === 'bash'`** + `posixIt = it.skipIf(!HAS_POSIX_SHELL)`，**31 个"真跑命令"的用例**换成 `posixIt`。★判据刻意**不是** `process.platform !== 'win32'`，而是**与运行时同一份**（`resolveShell`）：装了 Git Bash / MSYS2 / WSL 的 Windows runner 会**真跑**这些用例（拿到真实覆盖），只有确实没有 bash 的环境才跳过；跳过条数进 bun 汇总行 ⇒ 由 CI 的 `skip ≤ 200` 闸看着。**其余四个含 POSIX 字面量的测试文件经抽查是纯函数输入**（喂给 `assessRisk` / 解析器 / 格式化函数，不真执行）：`host/src/permission.test.ts`（6 处，`2>/dev/null` 字符串）、`cli/src/cli.test.ts`（2 处，命令字符串进 `formatToolInput`）、`bash-ast.test.ts`（8 处，喂解析器）、`isolation/src/index.test.ts`（3 处）—— **未逐一核查是否真执行**（如实记着） | `tools-builtin.test.ts` |
 
 ### 2.2 P2 —— **体验一致性**（不影响正确性，但口径不齐）
 
@@ -84,8 +84,25 @@
 3. ~~**P1-5 CI 矩阵**~~ ✅ **已完成**（2026-10-12）：`.github/workflows/ci.yml` + `scripts/ci/test-summary.sh`
    —— `ubuntu` + `macos` + `windows-latest`，**记录跳过条数**并设阈值闸（`skip ≤ 200`、`pass ≥ 2000`），
    Windows 白名单只放行失败。**P0-1 / P0-2 / P0-3 / P0-4 / P2-3 也已完成**（同批，见续 281/282）。
-4. **P1-1 / P1-2**：命令映射与 PS 只读白名单（安全敏感，需要 reviewer 过一遍映射表）。
-5. **P1-4 CRLF/BOM**、**P2 批次**、**P3 批次**。
+4. ~~**P1-1 / P1-2**：命令映射与 PS 只读白名单~~ ✅ **已完成**（2026-10-12，见续 283）：等价表 +
+   只读集 + 结构门统一收在 `shell-commands.ts`（一层实现、三处消费：`createBashTool` 的白名单、
+   `createReadOnlyBashTool` 的只读集、`checkReadOnlyCommand` 的逐段判定）。
+   ⚠️ **这条里"需要 reviewer 过一遍映射表"的要求仍然成立且未被满足** —— 而且范围比原判据更大：
+   **整批 PS / CMD 判定都没在真机上验证过**（本机 macOS 无 `pwsh` / `cmd.exe`）。用例钉的是
+   **判定算法**（纯函数、逐条正反例），不是真机行为。**Windows CI 与真机复核是必要的下一步**（见第 8 条）。
+5. ~~**P1-3：AST 复核门的结论**~~ ✅ **已完成**：不引入 PS 解析器，PS / CMD **明确不做 AST 复核** ——
+   这条被写成常量 **`AST_REVIEW_DIALECTS = ['bash']`**（用例钉住），代价（PS/CMD 的只读保证弱于 bash）
+   如实记在 §2 的 P1-3 行与代码注释里。结构门因此承担更多（PS 四条：脚本块 / 调用运算符 / here-string /
+   .NET 写调用）。
+6. ~~**P1-4 CRLF/BOM**~~ ✅ **已完成**（2026-10-12，见续 283）：抽出 `line-endings.ts` 供三处共用
+   —— 读时如实报告、写时保持、匹配时容忍；BOM 展示剥掉、写回保留。
+7. ~~**P1-6 测试的平台假设**~~ ⚠️ **主要部分已完成**（2026-10-12，见续 283）：`tools-builtin.test.ts`
+   的 **31 个"真跑命令"用例**改用 `posixIt`（`it.skipIf(!HAS_POSIX_SHELL)`，判据＝**与运行时同一份**
+   `resolveShell().family === 'bash'`，因此装了 Git Bash 的 Windows runner 会真跑）。其余四个含 POSIX
+   字面量的测试文件经抽查是**纯函数输入**（喂 `assessRisk` / 解析器 / 格式化函数），**未逐一核查**。
+8. **剩余**：**P2-1 / P2-2 / P2-4 / P2-5**（env-context 的 Windows 细节、注入 `env` 的键名健壮性、
+   README 口径、`openInFileManager` 真机）与 **P3-1 ~ P3-4**（`bun build --compile` 的 Windows 目标 /
+   VSCode 端到端 / A2A 路径与端口 / 插件跨平台约定）；**外加本轮所有 PS / CMD 分支的真机复核**（第 4 条）。
 
 ## 4. 验收口径（每一条都要能自动判）
 
@@ -103,3 +120,7 @@
   本文 P0-5（超时不杀进程树，✅ 已修）、P0-6（UNC 路径，待做）在那份里同时是隔离缺口，**修的时候一次改到位**。
 - **L3（容器 / microVM / 远程执行）与平台差异强相关**（容器运行时三平台各不相同、Windows 无 Seatbelt/bwrap）
   —— 见 [`docs/execution-backend-design.md`](execution-backend-design.md)。
+- **本文件的"已修"口径（2026-10-12 起）**：标 ✅ 的项表示**判定逻辑已落地且被纯函数用例覆盖**；
+  ⚠️ **凡涉及 PowerShell / CMD 真机行为的，都还没有真机证据**（开发机是 macOS）。要升级成"真机已验证"，
+  需要 Windows 机器上跑一遍：`pwsh -Command` 下的只读集与结构门、`cmd.exe /c` 下的只读集、
+  UNC 路径的 `realpath`、CRLF 文件的 read/write/edit 往返。**这条是整份文档的已知可信度边界。**

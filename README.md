@@ -451,6 +451,23 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 `fs: "cwd"` 在 `osBinding: "on"` 时是**真强制**（子进程也套同一份绑定）；`net: "none"` 目前**任何档位都强制不了**
 （静态门管不到别人的子进程）—— 声明了但强制不了的项会在启动时发 `config.mcp-inactive` 告警。
 
+### 跨平台（bash / PowerShell / CMD）
+
+`bash` 与 `bash_ro` 的命令白名单与只读判定**按当前 shell 方言**工作（`packages/plugins/tools-builtin/src/shell-commands.ts`）：
+
+- **白名单会被翻译**：`allowlist: ["ls"]` 在 PowerShell 下认 `Get-ChildItem` / `gci` / `dir`，在 CMD 下认 `dir`。
+  **翻译只用于判定，绝不改写要下发的命令文本**。表里**只有语义等价的只读命令** —— `rm` / `cp` / `mv` 等
+  写操作**刻意不映射**（要放行请写方言名，如 `allowlist: ["Remove-Item"]`，逐字匹配）。未命中映射 ⇒ 不匹配 ⇒ 拒绝。
+- **`bash_ro` 在非 bash 下也可用**：按方言选只读集（`POWERSHELL_READONLY_COMMANDS` / `CMD_READONLY_COMMANDS`），
+  外加方言专属结构门 —— PS 禁**脚本块 `{ }`**（`Where-Object { Remove-Item x }` 是合法 PS **且真的会执行**）、
+  **调用运算符 `&`**、**here-string `@"…"@`**、**.NET 写静态调用**（`[System.IO.File]::WriteAllText(…)`）；CMD 禁 `%COMSPEC%` 展开。
+- ⚠️ **PS / CMD 不做语法树复核**（常量 `AST_REVIEW_DIALECTS = ["bash"]`）⇒ 这两个方言的只读保证**弱于 bash**，
+  更多责任落在结构门上。要完整语义请装 Git Bash / WSL。
+- **文件读写按平台**：`read_file` 如实报告 `lineEnding`（`lf` / `crlf` / `mixed`）与 `bom`；`edit_file` 用 LF 的
+  `old_string` 也能匹配 CRLF 文件，写回**保持原风格**（`old_string` 自带 BOM 也认）；`write_file` 覆盖已有文件时
+  同样保持其行尾与 BOM —— 不然"改一行"会被 diff 显示成"整文件改动"。**路径边界**判定按平台方言（UNC / 盘符 / 大小写不敏感）。
+- ⚠️ **以上 PS / CMD 分支与其真机行为尚未在 Windows 上验证**（开发机 macOS）：用例钉的是判定算法（纯函数、逐条正反例）。
+
 ### 执行后端（L3，设计稿）
 
 L0~L2 都在**同一内核**里做约束；需要"跑不受信代码也伤不到宿主"的强保证时，终态是把执行挪到
