@@ -15,6 +15,7 @@ import {
   DEFAULT_DANGEROUS_PATTERNS,
   DEFAULT_SENSITIVE_ENV,
   extractFirstCommand,
+  resolveShell,
   sanitizeEnv,
   splitSegments,
 } from './index'
@@ -174,5 +175,52 @@ describe('P2-3 · sanitizeEnv：大小写不固定 + 只摘凭据不摘路径', 
   it('规则表本身也是导出面：每条都是 RegExp（防"表被清空"这类静默退化）', () => {
     expect(DEFAULT_SENSITIVE_ENV.length).toBeGreaterThan(5)
     for (const re of DEFAULT_SENSITIVE_ENV) expect(re).toBeInstanceOf(RegExp)
+  })
+})
+
+// ===== P2-2：注入 env 时键名大小写（与 env-context 的用例成对）=====
+//
+// 注入普通对象（单测 / 其它宿主 / A2A 远端）时 `env` **不是** `process.env` 那个大小写不敏感代理，
+// 于是 `env.PATH` 取不到 `{ Path: … }` ⇒ 本机装了 Git Bash 也会静默落到 cmd.exe。
+// ⚠️ 本组与 `@harness/env-context` 的 `detectShellForDisplay` 用例**成对**（一个管执行、一个管展示）。
+
+describe('P2-2 resolveShell：键名大小写不敏感', () => {
+  const existsIn = (paths: string[]) => (p: string) => paths.includes(p)
+
+  it('★`Path` 也能被认到 ⇒ 走 Git Bash（而不是静默落到 cmd）', () => {
+    const sh = resolveShell({
+      platform: 'win32',
+      env: { Path: 'C:\\tools\\git\\bin' } as NodeJS.ProcessEnv,
+      exists: existsIn(['C:\\tools\\git\\bin\\bash.exe']),
+    })
+    expect(sh.family).toBe('bash')
+    expect(sh.name).toBe('Git Bash')
+  })
+
+  it('`PATH` 既有行为逐位不变', () => {
+    const sh = resolveShell({
+      platform: 'win32',
+      env: { PATH: 'C:\\g\\bin' } as NodeJS.ProcessEnv,
+      exists: existsIn(['C:\\g\\bin\\bash.exe']),
+    })
+    expect(sh.family).toBe('bash')
+  })
+
+  it('★`ComSpec` 大小写两种写法都认（末位回退）', () => {
+    const exists = () => false
+    expect(resolveShell({ platform: 'win32', env: { COMSPEC: 'D:\\cmd.exe' } as NodeJS.ProcessEnv, exists }).program).toBe('D:\\cmd.exe')
+    expect(resolveShell({ platform: 'win32', env: { ComSpec: 'D:\\cmd.exe' } as NodeJS.ProcessEnv, exists }).program).toBe('D:\\cmd.exe')
+  })
+
+  it('★同一份输入下，两处探测的"是否命中 bash"必须一致（成对用例的钉子）', () => {
+    // 这里只断言**执行侧**；展示侧的同名断言在
+    // `packages/plugins/env-context/src/index.test.ts` 的 P2-2 组 —— 两侧形状相同，
+    // 一侧改了另一侧没改时，那侧会红（这是"两条口径必须一致"的可维护落实方式）。
+    const deps = { platform: 'win32' as const, env: { Path: 'C:\\g\\bin' } as NodeJS.ProcessEnv, exists: existsIn(['C:\\g\\bin\\bash.exe']) }
+    expect(resolveShell(deps).family).toBe('bash')
+  })
+
+  it('POSIX 平台不受影响', () => {
+    expect(resolveShell({ platform: 'linux', env: {} as NodeJS.ProcessEnv }).family).toBe('bash')
   })
 })

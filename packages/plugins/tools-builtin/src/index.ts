@@ -673,6 +673,31 @@ export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'S
 /** Shell 族系 */
 type ShellFamily = ShellDialect
 
+/**
+ * **大小写不敏感**地取环境变量（P2-2）。
+ *
+ * 为什么需要：`process.env` 在 Windows 上是**大小写不敏感代理**（Node 特性）⇒ `env.PATH` 能取到 `Path`；
+ * 但**注入普通对象**时（单测、其它宿主、A2A 远端）它就是普通对象 ⇒ `env.PATH` 取不到 `{ Path: … }`，
+ * 于是"本机明明装了 Git Bash 却探测不到"，静默落到 `cmd.exe` 分支。
+ *
+ * 顺序：**先精确匹配**（绝大多数场景一次命中、零开销），再退到大小写不敏感扫描。
+ * 空串也继续找（Windows 上可能同时存在空的 `PATH` 与有效的 `Path`）。
+ *
+ * ⚠️ 与 `@harness/env-context` 的 `detectShellForDisplay` 是**同一份口径的两个落点**
+ * （一个管执行、一个管展示，判据要求两者一致）—— 改这里时那边也要改。
+ */
+function lookupEnvCI(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const direct = env[name]
+  if (typeof direct === 'string' && direct !== '') return direct
+  const upper = name.toUpperCase()
+  for (const k of Object.keys(env)) {
+    if (k.toUpperCase() !== upper) continue
+    const v = env[k]
+    if (typeof v === 'string' && v !== '') return v
+  }
+  return direct
+}
+
 /** 解析后的 shell 可执行文件与调用参数 */
 interface ResolvedShell {
   /** 可执行文件路径或名称（spawn 第一参数） */
@@ -709,7 +734,8 @@ export function resolveShell(
   const dirSep = deps.dirSep ?? '\\'
   const joinDir = (dir: string, file: string) => (dir.endsWith(dirSep) ? dir + file : dir + dirSep + file)
   const exists = deps.exists ?? existsSync
-  const pathDirs = (env.PATH ?? '').split(listSep).filter(Boolean)
+  // P2-2：注入的 env 是普通对象 ⇒ 必须大小写不敏感地取（Windows 上键名常写作 `Path`）
+  const pathDirs = (lookupEnvCI(env, 'PATH') ?? '').split(listSep).filter(Boolean)
 
   for (const dir of pathDirs) {
     for (const exe of ['bash.exe', 'bash']) {
@@ -734,7 +760,8 @@ export function resolveShell(
     }
   }
 
-  return { program: 'cmd.exe', args: ['/c'], family: 'cmd', name: 'CMD' }
+  // P2-2：`ComSpec` 在 Windows 上大小写写法都有（`ComSpec` / `COMSPEC`）
+  return { program: lookupEnvCI(env, 'ComSpec') ?? 'cmd.exe', args: ['/c'], family: 'cmd', name: 'CMD' }
 }
 
 /** 缓存进程级 shell 解析结果（同一进程内 platform/PATH 不变） */

@@ -38,7 +38,10 @@ export interface StaticEnvInfo {
   arch?: string
   /** 内核版本（os.release()） */
   release?: string
-  /** 用户名（os.userInfo().username） */
+  /**
+   * 用户名。POSIX 下是 `os.userInfo().username`；**Windows 下是 `DOMAIN\user`**
+   * （P2-1：只看 `alice` 在域环境里不可定位 —— 同名用户在域 / 本机 / 其它域都存在）。
+   */
   user?: string
   /** 主机名（os.hostname()） */
   hostname?: string
@@ -174,11 +177,31 @@ export function renderNowSection(now: Date, git?: GitInfo): string {
  * - Windows：优先 `process.env.SHELL`；为空时按 `bash → pwsh → powershell → cmd`
  *   在 PATH 中探测，与 tools-builtin 执行口径保持一致。
  */
+/**
+ * **大小写不敏感**地取环境变量（P2-2）。
+ *
+ * 与 `@harness/tools-builtin` 的 `resolveShell` 使用**同一份口径**（一个管执行、一个管展示，
+ * 两者必须一致 —— 否则提示里说用 Git Bash、实际执行却走 cmd）。
+ *
+ * 顺序：先精确匹配，再退到大小写不敏感扫描；空串继续找（Windows 上可能同时有空的 `PATH` 与有效的 `Path`）。
+ */
+function lookupEnvCI(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const direct = env[name]
+  if (typeof direct === 'string' && direct !== '') return direct
+  const upper = name.toUpperCase()
+  for (const k of Object.keys(env)) {
+    if (k.toUpperCase() !== upper) continue
+    const v = env[k]
+    if (typeof v === 'string' && v !== '') return v
+  }
+  return direct
+}
+
 export function detectShellForDisplay(
   deps: { platform?: string; pathSep?: string; dirSep?: string; exists?: (p: string) => boolean; env?: NodeJS.ProcessEnv } = {},
 ): string {
   const env = deps.env ?? process.env
-  const sh = env.SHELL
+  const sh = lookupEnvCI(env, 'SHELL')
   if (sh) return sh
 
   const platform = deps.platform ?? process.platform
@@ -188,7 +211,8 @@ export function detectShellForDisplay(
   const dirSep = deps.dirSep ?? '\\'
   const joinDir = (dir: string, file: string) => (dir.endsWith(dirSep) ? dir + file : dir + dirSep + file)
   const exists = deps.exists ?? existsSync
-  const pathDirs = (env.PATH ?? '').split(listSep).filter(Boolean)
+  // P2-2：注入的 env 是普通对象 ⇒ 必须大小写不敏感地取（Windows 上键名常写作 `Path`）
+  const pathDirs = (lookupEnvCI(env, 'PATH') ?? '').split(listSep).filter(Boolean)
 
   for (const dir of pathDirs) {
     for (const exe of ['bash.exe', 'bash']) {
@@ -200,16 +224,35 @@ export function detectShellForDisplay(
       if (exists(joinDir(dir, exe))) return exe
     }
   }
-  return env.ComSpec ?? 'cmd.exe'
+  return lookupEnvCI(env, 'ComSpec') ?? 'cmd.exe'
 }
 
 /** 收集静态环境事实（os 调用逐项 try：容器 / CI 里 userInfo 等可能抛） */
-export function collectStaticEnv(): StaticEnvInfo {
+export function collectStaticEnv(
+  /**
+   * P2-1/P2-2：可注入 `platform` / `env`，让"Windows 上的用户名形态"这类分支能被**纯函数**钉住
+   * （缺省＝当前进程，既有调用不变）。
+   */
+  deps: { platform?: string; env?: NodeJS.ProcessEnv } = {},
+): StaticEnvInfo {
   const info: StaticEnvInfo = {}
-  try { info.platform = process.platform } catch { /* 不可能，但保持逐项独立 */ }
+  const platform = deps.platform ?? process.platform
+  const env = deps.env ?? process.env
+  try { info.platform = platform } catch { /* 不可能，但保持逐项独立 */ }
   try { info.arch = process.arch } catch { /* 同上 */ }
   try { info.release = release() } catch { /* 沙箱里可能读不到 */ }
-  try { info.user = userInfo().username } catch { /* 无用户上下文（某些 service 进程） */ }
+  // P2-1：Windows 上把 `DOMAIN\user` 形态带上 —— 只看 `alice` 在域环境里是**不可定位**的
+  // （同名用户在域/本机/其它域都存在），而模型经常需要用它去拼路径或判断权限归属。
+  // 判据：`USERDOMAIN` 与 `USERNAME`（Windows 上大小写写法都有 ⇒ 走 `lookupEnvCI`）。
+  try {
+    if (platform === 'win32') {
+      const domain = lookupEnvCI(env, 'USERDOMAIN')
+      const name = lookupEnvCI(env, 'USERNAME')
+      info.user = domain && name ? `${domain}\\${name}` : (name ?? userInfo().username)
+    } else {
+      info.user = userInfo().username
+    }
+  } catch { /* 无用户上下文（某些 service 进程） */ }
   try { info.hostname = hostname() } catch { /* 同上 */ }
   info.shell = detectShellForDisplay()
   return info

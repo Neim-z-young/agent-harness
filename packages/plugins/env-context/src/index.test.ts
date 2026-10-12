@@ -262,3 +262,93 @@ describe('collectStaticEnv / readGitInfo：真机读取', () => {
     expect(await readGitInfo(dir)).toEqual({ branch, dirty: false })
   })
 })
+
+// ===== P2-2：注入 env 时的键名大小写（Windows 上常写作 `Path` / `ComSpec`）=====
+//
+// ⚠️ 本组与 `@harness/tools-builtin` 的 `resolveShell` 用例**成对**（`platform-dialect.test.ts` 的
+// P2-2 组）：那是**执行口径**、这是**展示口径**，两者必须对同一输入给同一答案
+// （否则提示里说用 Git Bash、实际执行却走 cmd）—— 改一处要改两处。
+
+describe('P2-2 detectShellForDisplay：键名大小写不敏感', () => {
+  const existsIn = (paths: string[]) => (p: string) => paths.includes(p)
+
+  it('★`Path`（而非 `PATH`）也能被认到 —— 注入普通对象时就是这种形态', () => {
+    expect(
+      detectShellForDisplay({
+        platform: 'win32',
+        env: { Path: 'C:\\tools\\git\\bin' } as NodeJS.ProcessEnv,
+        exists: existsIn(['C:\\tools\\git\\bin\\bash.exe']),
+      }),
+    ).toBe('bash.exe')
+  })
+
+  it('`PATH` 原样仍走精确匹配（既有行为逐位不变）', () => {
+    expect(
+      detectShellForDisplay({
+        platform: 'win32',
+        env: { PATH: 'C:\\tools\\git\\bin' } as NodeJS.ProcessEnv,
+        exists: existsIn(['C:\\tools\\git\\bin\\bash.exe']),
+      }),
+    ).toBe('bash.exe')
+  })
+
+  it('空串不算命中（Windows 上可能同时有空的 `PATH` 与有效的 `Path`）', () => {
+    expect(
+      detectShellForDisplay({
+        platform: 'win32',
+        env: { PATH: '', Path: 'C:\\g\\bin' } as NodeJS.ProcessEnv,
+        exists: existsIn(['C:\\g\\bin\\bash.exe']),
+      }),
+    ).toBe('bash.exe')
+  })
+
+  it('★`ComSpec` 大小写两种写法都认（末位回退）', () => {
+    const exists = () => false
+    expect(detectShellForDisplay({ platform: 'win32', env: { COMSPEC: 'D:\\cmd.exe' } as NodeJS.ProcessEnv, exists })).toBe('D:\\cmd.exe')
+    expect(detectShellForDisplay({ platform: 'win32', env: { ComSpec: 'D:\\cmd.exe' } as NodeJS.ProcessEnv, exists })).toBe('D:\\cmd.exe')
+  })
+
+  it('POSIX 平台不受影响（`SHELL` 大小写两种写法）', () => {
+    expect(detectShellForDisplay({ platform: 'linux', env: { shell: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('/bin/zsh')
+  })
+})
+
+// ===== P2-1：Windows 用户名形态（DOMAIN\user）=====
+
+describe('P2-1 collectStaticEnv：Windows 用户名带域', () => {
+  it('★win32 + USERDOMAIN/USERNAME ⇒ `DOMAIN\\user`（只看 alice 在域环境里不可定位）', () => {
+    const info = collectStaticEnv({
+      platform: 'win32',
+      env: { USERDOMAIN: 'CORP', USERNAME: 'alice' } as NodeJS.ProcessEnv,
+    })
+    expect(info.user).toBe('CORP\\alice')
+    expect(info.platform).toBe('win32')
+  })
+
+  it('★小写键名也认（`userdomain` / `username`）', () => {
+    const info = collectStaticEnv({
+      platform: 'win32',
+      env: { userdomain: 'CORP', username: 'bob' } as NodeJS.ProcessEnv,
+    })
+    expect(info.user).toBe('CORP\\bob')
+  })
+
+  it('win32 只有 USERNAME（无域）⇒ 退到裸名', () => {
+    const info = collectStaticEnv({ platform: 'win32', env: { USERNAME: 'carol' } as NodeJS.ProcessEnv })
+    expect(info.user).toBe('carol')
+  })
+
+  it('非 win32 ⇒ 仍是 `os.userInfo()` 的形态（不会凭空冒出 `DOMAIN\\`）', () => {
+    const info = collectStaticEnv({
+      platform: 'darwin',
+      env: { USERDOMAIN: 'CORP', USERNAME: 'alice' } as NodeJS.ProcessEnv,
+    })
+    expect(info.user === undefined || !String(info.user).includes('\\')).toBe(true)
+  })
+
+  it('不传 deps ⇒ 走当前进程（既有调用不变）', () => {
+    const info = collectStaticEnv()
+    expect(info.platform).toBe(process.platform)
+    expect(info.shell).toBeTruthy()
+  })
+})
