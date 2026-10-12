@@ -31,6 +31,24 @@ import { ToolPipeline, ToolSchemaError } from '@harness/tool'
 
 const TMP_DIR = join(import.meta.dir, '.tmp-test')
 
+/**
+ * 平台门（P1-6）：本文件里"**真跑一条命令**"的用例依赖 POSIX shell
+ * （`seq` / `wc` / `ulimit` / `2>/dev/null` / `$( )` / `kill` …），这些在 PowerShell / CMD 下
+ * 没有等价物 —— 不设门的话，Windows 上会**整片红**（而不是"少跑几条"）。
+ *
+ * ⚠️ 判据刻意**不是** `process.platform !== 'win32'`，而是**与运行时同一份**：
+ * {@link resolveShell} 只有真的解析到 bash（Windows 上的 Git Bash / MSYS2/WSL，或 POSIX 平台）
+ * 才给 `'bash'`。于是装了 Git Bash 的 Windows runner 会**真跑**这些用例（拿到真实覆盖），
+ * 只有确实没有 bash 的环境才跳过。
+ *
+ * 跳过条数会进 bun 的汇总行 ⇒ 由 CI 的 `scripts/ci/test-summary.sh` 的 `skip ≤ 200` 闸看着
+ * （它防的是"某一片悄悄整体跳掉"，这正是本条纪律要留意的）。
+ */
+const HAS_POSIX_SHELL = resolveShell().family === 'bash'
+
+/** ≡ `it`，但在没有 POSIX shell 的环境跳过（见 {@link HAS_POSIX_SHELL}） */
+const posixIt = it.skipIf(!HAS_POSIX_SHELL)
+
 function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
   return {
     sessionId: 's1',
@@ -362,7 +380,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.stderr.length).toBeGreaterThan(0)
     })
 
-    it('超时后 timedOut=true 并 kill', async () => {
+    posixIt('超时后 timedOut=true 并 kill', async () => {
       const res = await bashTool.call({
         command: 'sleep 10',
         timeoutMs: 100,
@@ -372,7 +390,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.durationMs).toBeGreaterThanOrEqual(90)
     })
 
-    it('cwd 参数指定工作目录', async () => {
+    posixIt('cwd 参数指定工作目录', async () => {
       const sub = join(TMP_DIR, 'subdir')
       await mkdir(sub, { recursive: true })
       const res = await bashTool.call({ command: 'pwd', cwd: sub }, makeCtx())
@@ -380,7 +398,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.stdout.trim()).toBe(sub)
     })
 
-    it('env 参数注入环境变量', async () => {
+    posixIt('env 参数注入环境变量', async () => {
       const res = await bashTool.call({
         command: 'echo $MY_VAR',
         env: { MY_VAR: 'injected' },
@@ -389,7 +407,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.stdout.trim()).toBe('injected')
     })
 
-    it('多行命令（管道）', async () => {
+    posixIt('多行命令（管道）', async () => {
       const res = await bashTool.call({
         command: 'printf "a\\nb\\nc\\n" | grep b',
       }, makeCtx())
@@ -408,7 +426,7 @@ describe('@harness/tools-builtin', () => {
       expect(bashTool.permission?.extractPatterns({ command: 'rm -rf /' })).toEqual(['rm -rf /'])
     })
 
-    it('AbortSignal 中断', async () => {
+    posixIt('AbortSignal 中断', async () => {
       const ac = new AbortController()
       const promise = bashTool.call({ command: 'sleep 5' }, makeCtx({ signal: ac.signal }))
       setTimeout(() => ac.abort(), 50)
@@ -422,7 +440,7 @@ describe('@harness/tools-builtin', () => {
   // ===== bash 沙箱 =====
 
   describe('bash 沙箱防护', () => {
-    it('危险命令检测：命中 rm -rf / 拒绝执行', async () => {
+    posixIt('危险命令检测：命中 rm -rf / 拒绝执行', async () => {
       const tool = createBashTool()
       const res = await tool.call({ command: 'rm -rf /' }, makeCtx())
       expect(res.ok).toBe(false)
@@ -448,7 +466,7 @@ describe('@harness/tools-builtin', () => {
       }
     })
 
-    it('AST 层：命令名含展开的间接执行被拒（fail-closed）', async () => {
+    posixIt('AST 层：命令名含展开的间接执行被拒（fail-closed）', async () => {
       // $R 在运行期才解析，字面量不可审计 —— 结构性拒绝，不走危险表匹配
       const tool = createBashTool()
       for (const command of ['R=rm; $R -rf /', 'rm$IFS-rf$IFS/', '$(echo rm) -rf /']) {
@@ -459,7 +477,7 @@ describe('@harness/tools-builtin', () => {
       }
     })
 
-    it('AST 层放行路径解析惯用法：$(which x) / $(command -v x)（输出语义固定为可执行路径）', async () => {
+    posixIt('AST 层放行路径解析惯用法：$(which x) / $(command -v x)（输出语义固定为可执行路径）', async () => {
       const tool = createBashTool()
       for (const command of ['$(which definitely-not-exists-cmd) --help', '$(command -v also-not-exists) --help']) {
         const res = await tool.call({ command, cwd: TMP_DIR }, makeCtx())
@@ -467,7 +485,7 @@ describe('@harness/tools-builtin', () => {
       }
     })
 
-    it('AST 层不误伤：参数级展开 / 子 shell / fd 重定向等正常命令放行', async () => {
+    posixIt('AST 层不误伤：参数级展开 / 子 shell / fd 重定向等正常命令放行', async () => {
       const tool = createBashTool()
       const benign = [
         'ls $HOME',
@@ -483,7 +501,7 @@ describe('@harness/tools-builtin', () => {
       }
     })
 
-    it('无害重定向不被误拦：`2>/dev/null` / `>/dev/null` 正常放行', async () => {
+    posixIt('无害重定向不被误拦：`2>/dev/null` / `>/dev/null` 正常放行', async () => {
       // 回归：曾有一条 `>\s*\/dev\/null\b` 危险模式，把最常见的「丢弃输出」写法判为危险，
       // 实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 这类命令会被直接拒绝。
       const tool = createBashTool()
@@ -494,7 +512,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
     })
 
-    it('裸设备写入全部被拦截（重定向的四种形态 + 破坏性命令直写）', async () => {
+    posixIt('裸设备写入全部被拦截（重定向的四种形态 + 破坏性命令直写）', async () => {
       // 回归：修 `echo x > /dev/sda` 漏报时曾把规则写成 `(?:^|\s)>>?`，
       // 结果 `1>/dev/sda` / `2>/dev/sda` / `hi>/dev/sda` 这三种形态**反而被放行**
       // —— 它们在旧规则 `\b>` 下是能拦住的，等于净安全性下降。四种形态必须全拦。
@@ -526,7 +544,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.error?.code).not.toBe('SANDBOX_DANGEROUS')
     })
 
-    it('危险命令检测可关闭（dangerousDetection=false）', async () => {
+    posixIt('危险命令检测可关闭（dangerousDetection=false）', async () => {
       const tool = createBashTool({ dangerousDetection: false })
       // dangerously rm 一个临时文件确认可执行（沙箱关闭）
       const file = join(TMP_DIR, 'x.txt')
@@ -564,7 +582,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.error!.code).toBe('SANDBOX_ALLOWLIST')
     })
 
-    it('命令白名单：includes() 子串判据回归——命令含白名单子串不得放行', async () => {
+    posixIt('命令白名单：includes() 子串判据回归——命令含白名单子串不得放行', async () => {
       // 回归（2026-09-30）：旧判据 `input.command.includes(a)` 子串命中即放行，
       // allowlist=['git'] 时 `echo git && rm -rf /` 直接过闸（实际执行的是 rm，不是 git）。
       const tool = createBashTool({ allowlist: ['git'] })
@@ -595,7 +613,7 @@ describe('@harness/tools-builtin', () => {
       expect(no.error!.code).toBe('SANDBOX_ALLOWLIST')
     })
 
-    it('权限 pattern：extractDenyPatterns 上报段级命令（只进 deny 判定）', () => {
+    posixIt('权限 pattern：extractDenyPatterns 上报段级命令（只进 deny 判定）', () => {
       const tool = createBashTool()
       expect(tool.permission!.extractPatterns({ command: 'echo hi; rm -rf x' } as never))
         .toEqual(['echo hi; rm -rf x'])
@@ -611,14 +629,14 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.viaHost).toBe(true)
     })
 
-    it('sandbox 回退：危险命令即使 fallbackToHost 也硬性拒绝（不可豁免）', async () => {
+    posixIt('sandbox 回退：危险命令即使 fallbackToHost 也硬性拒绝（不可豁免）', async () => {
       const tool = createBashTool({ fallbackToHost: true })
       const res = await tool.call({ command: 'rm -rf /', cwd: TMP_DIR }, makeCtx())
       expect(res.ok).toBe(false)
       expect(res.error!.code).toBe('SANDBOX_DANGEROUS')
     })
 
-    it('sandbox 回退：沙箱内非零退出（env 被隔离）时回退宿主 bash 后成功并标注 viaHost', async () => {
+    posixIt('sandbox 回退：沙箱内非零退出（env 被隔离）时回退宿主 bash 后成功并标注 viaHost', async () => {
       const tool = createBashTool({ fallbackToHost: true })
       // 该变量名命中敏感 /API_KEY/，在沙箱内被隔离；宿主 bash 回退时用户完备 env 可读到
       process.env.__FALLBACK_TEST_API_KEY = 'present'
@@ -688,7 +706,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.viaHost).toBe(true)
     })
 
-    it('env 隔离：过滤敏感变量，保留必要变量', async () => {
+    posixIt('env 隔离：过滤敏感变量，保留必要变量', async () => {
       const tool = createBashTool()
       // 模拟敏感 + 保留变量
       process.env.__SANDBOX_MY_SECRET_KEY = 'should-be-removed'
@@ -703,7 +721,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.stdout).toInclude('PATH=/')
     })
 
-    it('env 隔离：keepEnv 指定变量被保留', async () => {
+    posixIt('env 隔离：keepEnv 指定变量被保留', async () => {
       const tool = createBashTool({ keepEnv: ['MY_KEEP_VAR'] })
       process.env.MY_KEEP_VAR = 'kept'
       const res = await tool.call(
@@ -715,7 +733,7 @@ describe('@harness/tools-builtin', () => {
       expect(res.output!.stdout.trim()).toBe('keep=kept')
     })
 
-    it('additionalDangerous 追加自定义危险模式', async () => {
+    posixIt('additionalDangerous 追加自定义危险模式', async () => {
       const tool = createBashTool({
         additionalDangerous: [/touch\s+custom-danger/],
       })
@@ -1007,7 +1025,7 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
   beforeEach(async () => { await mkdir(TMP_DIR, { recursive: true }) })
   afterEach(async () => { await rm(TMP_DIR, { recursive: true, force: true }) })
 
-  it('limits 真的进了子 shell（`ulimit -f` 回读）', async () => {
+  posixIt('limits 真的进了子 shell（`ulimit -f` 回读）', async () => {
     const tool = createBashTool({ limits: { maxFileSizeKb: 1024 } })
     const res = await tool.call({ command: 'ulimit -f' }, makeCtx())
     expect(res.ok).toBe(true)
@@ -1015,19 +1033,19 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
   })
 
-  it('limits:false ⇒ 不加任何抬头（回读为 unlimited）', async () => {
+  posixIt('limits:false ⇒ 不加任何抬头（回读为 unlimited）', async () => {
     const tool = createBashTool({ limits: false })
     const res = await tool.call({ command: 'ulimit -f' }, makeCtx())
     expect(res.output!.stdout.trim()).toBe('unlimited')
   })
 
-  it('★output.command 仍是原文（ulimit 抬头不污染遥测/展示）', async () => {
+  posixIt('★output.command 仍是原文（ulimit 抬头不污染遥测/展示）', async () => {
     const res = await bashTool.call({ command: 'echo hi' }, makeCtx())
     expect(res.output!.command).toBe('echo hi')
     expect(res.output!.stdout.trim()).toBe('hi')
   })
 
-  it('★超时杀掉整棵进程树：后台孙进程不能活下来（P0-6 回归）', async () => {
+  posixIt('★超时杀掉整棵进程树：后台孙进程不能活下来（P0-6 回归）', async () => {
     const pidFile = join(TMP_DIR, 'grandchild.pid')
     const res = await bashTool.call({
       // 后台起一个长命孙进程并记下它的 pid，然后自己挂住
@@ -1040,7 +1058,7 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     expect(await waitGone(gpid)).toBe(true)
   })
 
-  it('★中断（AbortSignal）同样杀整棵树', async () => {
+  posixIt('★中断（AbortSignal）同样杀整棵树', async () => {
     const pidFile = join(TMP_DIR, 'grandchild2.pid')
     const ac = new AbortController()
     const promise = bashTool.call(
@@ -1108,7 +1126,7 @@ describe('读侧敏感文件默认拒绝（P0-3）', () => {
     expect(ok.output!.stdout.trim()).toBe('hi')
   })
 
-  it('bash_ro readDeny:false ⇒ 不挡', async () => {
+  posixIt('bash_ro readDeny:false ⇒ 不挡', async () => {
     await writeFile(join(TMP_DIR, '.env'), 'SECRET=1')
     const ro = createReadOnlyBashTool({ readDeny: false })
     const res = await ro.call({ command: 'cat .env' }, makeCtx())
@@ -1158,7 +1176,7 @@ describe('网络出口策略（P1-2）', () => {
     expect(res.error!.code).toBe('SANDBOX_NET_DENIED')
   })
 
-  it('默认（open）：网络门不介入 —— 与改造前逐位一致', async () => {
+  posixIt('默认（open）：网络门不介入 —— 与改造前逐位一致', async () => {
     const tool = createBashTool()
     const res = await tool.call({ command: 'echo curl' }, makeCtx())
     expect(res.ok).toBe(true)
@@ -1183,7 +1201,7 @@ describe('BashOutput.isolation（P1-4 / P2-3：边界自述）', () => {
     expect(l2.output!.isolation!.fsBound).toBe(false)
   })
 
-  it('策略一并回传；宿主回退时 viaHost 双层都为 true', async () => {
+  posixIt('策略一并回传；宿主回退时 viaHost 双层都为 true', async () => {
     const res = await createBashTool({ net: 'deny' }).call({ command: 'echo hi' }, makeCtx())
     expect(res.output!.isolation!.netPolicy).toBe('deny')
 
@@ -1345,7 +1363,7 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     })
   })
 
-  it('bash_ro 真跑一条只读命令并回 stdout', async () => {
+  posixIt('bash_ro 真跑一条只读命令并回 stdout', async () => {
     await writeFile(join(TMP_DIR, 'sample.txt'), 'l1\nl2\nl3\n', 'utf-8')
     const r = await readOnlyBashTool.call({ command: 'wc -l sample.txt' }, makeCtx())
     expect(r.ok).toBe(true)
@@ -1353,7 +1371,7 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     expect(String(r.output?.stdout)).toContain('3 sample.txt')
   })
 
-  it('bash_ro 端到端放行 `2>/dev/null`（两道门都不误伤，且命令真的跑了）', async () => {
+  posixIt('bash_ro 端到端放行 `2>/dev/null`（两道门都不误伤，且命令真的跑了）', async () => {
     // 端到端：手写门 + AST 复核门都过了以后，必须真的执行（ok=true），
     // 而不是"没被拒绝但也没跑"。用一条必然失败的命令反向确认 stderr 被静音吞掉。
     const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
@@ -1382,7 +1400,7 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     expect(checkReadOnlyByAst(f3!).ok).toBe(true)
   })
 
-  it('bash_ro AST 门不误伤：既有白名单命令在两道门下都放行', async () => {
+  posixIt('bash_ro AST 门不误伤：既有白名单命令在两道门下都放行', async () => {
     const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
     await writeFile(join(TMP_DIR, 'a.txt'), 'x\n', 'utf-8')
     const r = await tool.call({ command: 'cat a.txt && wc -c a.txt' }, makeCtx())
@@ -1398,7 +1416,7 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     expect(existsSync(outPath)).toBe(false)
   })
 
-  it('bash_ro 不接受入参覆盖环境变量（ENV 是绕过只读的后门）', async () => {
+  posixIt('bash_ro 不接受入参覆盖环境变量（ENV 是绕过只读的后门）', async () => {
     const tool = createReadOnlyBashTool({ rootDir: TMP_DIR })
     const r = await tool.call(
       // schema 里本就没有 env 字段；这里模拟模型硬塞
