@@ -28,5 +28,8 @@
     "build": "bun build src/index.ts --outdir dist --target bun",
     "test": "bun test",
     "typecheck": "tsc --noEmit"
+  },
+  "harness": {
+    "shellRequirement": "posix"
   }
 }
