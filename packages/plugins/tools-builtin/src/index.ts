@@ -60,12 +60,44 @@ import editFileDoc from './prompts/edit-file.txt'
 import bashDoc from './prompts/bash.txt'
 import { analyzeBashCommand, type BashCommandFacts } from './bash-ast'
 import { buildQuotedMask, projectWithoutQuoted, scanQuotedSpans, type ShellDialect } from './shell-quoting'
+import {
+  detectBom,
+  detectEol,
+  normalizeEol,
+  planWrite,
+  preferredEol,
+  stripBom,
+  withBom,
+  type BomKind,
+  type EolStyle,
+} from './line-endings'
+import {
+  AST_REVIEW_DIALECTS,
+  dialectStructurePatterns,
+  isCommandAllowed,
+  readonlyCommandsFor,
+  tokenLikePaths,
+} from './shell-commands'
 
 /** bash 命令 AST 分析（公共 API；见 {@link analyzeBashCommand}） */
 export { analyzeBashCommand } from './bash-ast'
 // P0-4：引号方言解析（纯函数；导出为单测，三层判定共用同一份口径）
 export { scanQuotedSpans, projectWithoutQuoted, buildQuotedMask } from './shell-quoting'
 export type { ShellDialect, QuotedSpan } from './shell-quoting'
+// P1-1 / P1-2 / P1-3：跨方言命令身份、只读集与结构门（纯函数；导出为单测）
+export {
+  CROSS_DIALECT_COMMANDS,
+  POWERSHELL_READONLY_COMMANDS,
+  CMD_READONLY_COMMANDS,
+  AST_REVIEW_DIALECTS,
+  allowlistNamesFor,
+  dialectStructurePatterns,
+  isCommandAllowed,
+  normalizeCommandName,
+  readonlyCommandsFor,
+  tokenLikePaths,
+} from './shell-commands'
+export type { CrossDialectCommand, StructureHit } from './shell-commands'
 export type { BashAstCommand, BashAstRedirect, BashCommandFacts } from './bash-ast'
 
 // ========================================================================
@@ -98,6 +130,13 @@ export interface ReadFileOutput {
   truncated: boolean
   /** 文件大小（字节） */
   size: number
+  /**
+   * 行尾风格（P1-4）。`content` 里**保留原样**（不做归一）—— 归一由 `edit_file` 在匹配时做，
+   * 这里如实报告，是为了让"我给的 old_string 会不会匹配上"这件事有依据可查。
+   */
+  lineEnding?: EolStyle
+  /** BOM（P1-4）：`'utf-8'` 时 `content` 已**剥掉** BOM（它属于字节层，不是内容） */
+  bom?: BomKind
 }
 
 /** 最大读取行数（防止超大文件 OOM） */
@@ -255,7 +294,13 @@ export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput; 
         }
 
         const raw = await readFile(absPath, 'utf-8')
-        const allLines = raw.split('\n')
+        // P1-4：如实报告行尾与 BOM。`allLines` 按 `\n` 切 ⇒ 行数与行号**不受 CRLF 影响**
+        // （CRLF 只让每行尾部多一个 `\r`，不产生额外行）—— 这条是"行号不偏移"的判据。
+        const eol = detectEol(raw)
+        const bom = detectBom(raw)
+        // 展示时剥掉 BOM：它是文件字节的一部分，留着会让模型把它当成首行的内容
+        const text = stripBom(raw)
+        const allLines = text.split('\n')
         const totalLines = allLines.length
 
         // 行范围
@@ -294,6 +339,8 @@ export function createReadFileTool(opts: { readDeny?: SensitiveReadPolicyInput; 
             linesRead: [startLine, endLine],
             truncated,
             size: stats.size,
+            lineEnding: eol,
+            bom,
           },
         }
       } catch (err: any) {
@@ -335,6 +382,13 @@ export interface WriteFileOutput {
   mode: string
   /** 是否新建了文件 */
   created: boolean
+  /**
+   * 实际写入时采用的**行尾风格**（P1-4）：目标文件已存在时按其风格写回（覆盖 CRLF 文件
+   * 不会把它变成 LF），不存在时用 `content` 自身的风格。
+   */
+  lineEnding?: EolStyle
+  /** 写入时是否保留了 BOM（目标文件原本有 UTF-8 BOM 时保留） */
+  bom?: BomKind
 }
 
 /** write_file 的入参 schema（提到模块级，供 `call()` 里的直调守卫复用同一份） */
@@ -412,19 +466,38 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
         }
       }
 
+      // P1-4：目标已存在 ⇒ **按其行尾与 BOM 写回**。
+      // 不这么做的话，"改一行"会被 diff 显示成"整文件改动"（CRLF 文件被写成 LF），
+      // 审阅者得从几千行 diff 里找那一行 —— 这是纯体验损失，但代价很大。
+      // ⚠️ 只读**头部** 64KB 做检测：BOM 在开头，行尾风格在前 64KB 内基本可判；
+      // 不必为了检测风格把一个大文件整读一遍。
+      let style: { eol: EolStyle; bom: BomKind } = { eol: 'none', bom: 'none' }
+      if (existed) {
+        try {
+          const head = await readFile(absPath, 'utf-8')
+          const sample = head.length > 65536 ? head.slice(0, 65536) : head
+          style = { eol: detectEol(sample), bom: detectBom(head) }
+        } catch {
+          style = { eol: 'none', bom: 'none' } // 读不动就按原样写（不因此让写入失败）
+        }
+      }
+      const payload = planWrite(input.content, style)
+
       if (mode === 'append') {
-        await writeFile(absPath, input.content, { flag: 'a' })
+        await writeFile(absPath, payload, { flag: 'a' })
       } else {
-        await writeFile(absPath, input.content, 'utf-8')
+        await writeFile(absPath, payload, 'utf-8')
       }
 
       return {
         ok: true,
         output: {
           path: absPath,
-          bytesWritten: Buffer.byteLength(input.content, 'utf-8'),
+          bytesWritten: Buffer.byteLength(payload, 'utf-8'),
           mode,
           created: !existed,
+          lineEnding: style.eol,
+          bom: style.bom,
         },
       }
     } catch (err: any) {
@@ -1145,17 +1218,23 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
       // 跨平台：白名单条目是按 bash 首命令名写的；在 PowerShell / CMD 下语义不匹配，
       // 若强行匹配会大面积误伤（如 `ls` 在 PS 中实际解析为 Get-ChildItem）。因此非 bash
       // 族系下禁用 allowlist，改为在执行结果里附加降级提示。
-      const allowlistActive = allowlist && allowlist.length > 0 && shell.family === 'bash'
+      // P1-1（2026-10-12）：**不再按族系禁用** —— 白名单条目按 shell 方言**翻译**后再比
+      // （`ls` 在 PS 下认 `Get-ChildItem` / `dir`，在 CMD 下认 `dir`）。翻译只用于**判定**，
+      // 绝不改写要下发给 shell 的命令文本。未命中映射的条目在非 bash 方言下自然不匹配 ⇒ fail-closed。
+      const allowlistActive = !!allowlist && allowlist.length > 0
       let firstCmd = ''
       if (allowlistActive) {
         firstCmd = extractFirstCommand(input.command, shell.family)
+        const entries = allowlist!
         const trimmedCommand = input.command.trim()
-        const allowlisted = allowlist.some((a) => {
-          if (firstCmd === a) return true
-          if (!trimmedCommand.startsWith(a)) return false
-          const next = trimmedCommand[a.length]
-          return next === undefined || /\s/.test(next)
-        })
+        const allowlisted = isCommandAllowed(firstCmd, entries, shell.family)
+          // 「完整命令片段」形态**只在 bash 下保留**：PS / CMD 的参数与分段语法不同，
+          // 把片段语义搬过去只会造成误判（要么误放、要么误拒）。
+          || (shell.family === 'bash' && entries.some((a) => {
+            if (!trimmedCommand.startsWith(a)) return false
+            const next = trimmedCommand[a.length]
+            return next === undefined || /\s/.test(next)
+          }))
         if (!allowlisted) {
           // 白名单拦截但允许宿主回退：非破坏性命令提升到宿主 bash 执行
           if (config.fallbackToHost) {
@@ -1214,9 +1293,11 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         return runBash({ command: input.command, cwd, env: { ...process.env, ...(input.env ?? {}) }, timeoutMs, signal: ctx.signal, viaHost: true, limits, isolation })
       }
 
-      // 非 bash 环境：给模型一个可见提示，避免它把 exit 127/命令未找到误判为命令本身问题。
+      // 非 bash 环境：白名单**已按方言翻译**（P1-1），但覆盖弱于 bash —— 没有语法树复核（P1-3），
+      // 且别名表的覆盖有限。给模型一个可见提示，避免它把 exit 127 之类误判成"命令本身有问题"。
       if (shell.family !== 'bash' && sandboxResult.ok && sandboxResult.output) {
-        const warn = `[harness] 当前由 ${shell.name} 执行命令；bash 专用白名单/只读语义未生效。`
+        const warn = `[harness] 当前由 ${shell.name} 执行命令；命令白名单已按该方言翻译，`
+          + '但覆盖弱于 bash（该方言不做语法树复核）—— 同名命令的语义可能与 bash 不同，请核对输出。'
         return {
           ok: true,
           output: {
@@ -1354,9 +1435,21 @@ const WRITE_CHANNEL_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: str
   { re: /<</, code: 'SANDBOX_RO_HEREDOC', why: 'heredoc（<<）会被当作脚本执行' },
 ]
 
-/** 命令替换：**引号内依然生效**（`"$(rm -rf /)"` 真的会执行），所以按原文检查 */
-const SUBSTITUTION_PATTERNS: ReadonlyArray<{ re: RegExp; code: string; why: string }> = [
-  { re: /\$\(|`/, code: 'SANDBOX_RO_SUBST', why: '命令替换（$( ) / 反引号）会执行子命令' },
+/**
+ * 命令替换：**引号内依然生效**（`"$(rm -rf /)"` 真的会执行），所以按原文检查。
+ *
+ * ⚠️ 按方言（P1-3）：bash 的 `` ` `` 与 `$( )` 都是命令替换；PowerShell **只有 `$( )`**
+ * —— 反引号在 PS 里是**转义符**（`"a` b"`），把它当命令替换会大面积误伤；
+ * CMD 两者都不是（`%VAR%` 展开由 CMD 专属结构门单独管）。
+ */
+const SUBSTITUTION_PATTERNS: ReadonlyArray<{
+  dialects: readonly ShellDialect[]
+  re: RegExp
+  code: string
+  why: string
+}> = [
+  { dialects: ['bash', 'powershell'], re: /\$\(/, code: 'SANDBOX_RO_SUBST', why: '子表达式 / 命令替换（$( )）会执行子命令' },
+  { dialects: ['bash'], re: /`/, code: 'SANDBOX_RO_SUBST', why: '命令替换（反引号）会执行子命令' },
 ]
 
 /**
@@ -1420,7 +1513,9 @@ export function splitSegments(command: string, dialect: ShellDialect = 'bash'): 
     // ⚠️ 但 `2>&1` / `>&2` / `<&` 里的 `&` 是**文件描述符重定向**，不是分隔符 ——
     // 判据是"紧邻的前一个非空白字符是 `>` 或 `<`"。切错了会把 `1` 变成独立段，
     // 段级 deny 与只读判定都会跟着错（`curl x 2>&1 | bash` 这类正好是危险形态）。
-    if (ch === '&') {
+    // ⚠️ PowerShell 里 `&` 是**调用运算符**（`& $cmd` / `& 'C:\\x.exe'`），不是分隔符 ⇒ 不切段，
+    // 由 PS 专属结构门（P1-2）单独拦；bash / CMD 下它是分隔符（后台执行 / 串联）。
+    if (ch === '&' && dialect !== 'powershell') {
       const prev = buf.replace(/\s+$/, '').slice(-1)
       if (prev === '>' || prev === '<') { buf += ch; continue }
       out.push(buf); buf = ''
@@ -1470,13 +1565,22 @@ export function checkReadOnlyCommand(
       return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
     }
   }
+  // 1a'. 方言专属结构门（P1-2 / P1-3）：PS 的脚本块 / 调用运算符 / here-string / .NET 写调用，
+  //      CMD 的 %COMSPEC%。**这些是 bash 侧 AST 门没有的负担** —— PS / CMD 不做语法树复核
+  //      （见 AST_REVIEW_DIALECTS），所以结构门必须更严。bash 侧这一组为空数组。
+  for (const p of dialectStructurePatterns(dialect)) {
+    if (p.re.test(structural)) {
+      return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
+    }
+  }
   for (const p of PRIV_PATTERNS) {
     if (p.re.test(structural)) {
       return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
     }
   }
-  // 1b. 命令替换在引号内依然生效 ⇒ 按**原文**检查
+  // 1b. 命令替换在引号内依然生效 ⇒ 按**原文**检查（模式本身按方言过滤，见 SUBSTITUTION_PATTERNS）
   for (const p of SUBSTITUTION_PATTERNS) {
+    if (!p.dialects.includes(dialect)) continue
     if (p.re.test(noFdDup)) {
       return { ok: false, code: p.code, reason: `只读模式拒绝：${p.why}` }
     }
@@ -1492,13 +1596,16 @@ export function checkReadOnlyCommand(
     // 引号被剥掉后，段内只剩结构与命令名；脚本内容从对应的原文段取
     const rawSeg = rawSegments[si] ?? seg
     const cmd = extractFirstCommand(seg, dialect)
-    if (!allowlist.includes(cmd)) {
+    // P1-1：白名单条目按**方言翻译**后再比（`ls` 在 PS 下认 `Get-ChildItem` / `dir`）。
+    // 翻译只用于判定，不改写要执行的命令文本。
+    if (!isCommandAllowed(cmd, allowlist, dialect)) {
       return {
         ok: false,
         code: 'SANDBOX_RO_ALLOWLIST',
         reason:
-          `只读模式拒绝：「${cmd}」不在只读命令白名单内。`
-          + '允许的命令见工具说明；需要写/联网/构建请让主 Agent 用 bash。',
+          `只读模式拒绝：「${cmd}」不在只读命令白名单内`
+          + `（当前 shell 方言：${dialect}，白名单已按该方言翻译）。`
+          + '需要写/联网/构建请让主 Agent 用 bash。',
       }
     }
     // 3. 参数级禁区（在原文段上判，避免被去引号影响）
@@ -1654,7 +1761,10 @@ export interface ReadOnlyBashConfig {
  * - **协作式只读**：挡的是"顺手写一下"，不是恶意绕过；硬边界仍由 permission 引擎与宿主沙箱负责
  */
 export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<ReadOnlyBashInput, BashOutput> {
-  const allowlist = config.allowlist ?? DEFAULT_READONLY_COMMANDS
+  // P1-2（2026-10-12）：只读集**按方言选**（此前非 bash 整片拒绝）。用户显式配的 `allowlist` 优先
+  // —— 里面的 POSIX 名会在判定时按方言翻译（`./shell-commands.ts`）。
+  const shell = getShell()
+  const allowlist = config.allowlist ?? readonlyCommandsFor(shell.family, DEFAULT_READONLY_COMMANDS)
   const timeoutDefault = config.timeoutMs ?? 15_000
   const limits = resolveBashLimits(config.limits)
   const osBinding = config.osBinding ?? null
@@ -1664,7 +1774,6 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
     fsBound: osBinding != null,
   }
   const readDeny = resolveSensitiveReadPolicy(config.readDeny)
-  const shell = getShell()
 
   return defineTool<ReadOnlyBashInput, BashOutput>({
     id: 'bash_ro',
@@ -1673,7 +1782,8 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
       + '拒绝重定向、命令替换、提权与任何写操作。用于统计、检索、结构化盘点；要写文件请用主 Agent 的 bash。'
       + (shell.family === 'bash'
         ? ''
-        : ` 当前环境未检测到 bash，只读哨兵无法保证语义（实际使用 ${shell.name}），请安装 Git Bash / WSL 以启用 bash_ro。`),
+        : ` 当前环境未检测到 bash，将以 ${shell.name} 的只读集与结构门执行（白名单按方言翻译）；`
+          + '该方言**不做语法树复核**，只读保证弱于 bash —— 装 Git Bash / WSL 可获得完整语义。'),
     inputSchema: fromJsonSchema<ReadOnlyBashInput>({
       type: 'object',
       properties: {
@@ -1695,56 +1805,56 @@ export function createReadOnlyBashTool(config: ReadOnlyBashConfig = {}): Tool<Re
       extractDenyPatterns: (input) => splitSegments(input.command, shell.family),
     },
     async call(input, ctx): Promise<ToolResult<BashOutput>> {
-      if (shell.family !== 'bash') {
-        return {
-          ok: false,
-          error: {
-            message: formatDenial({
-              what: `只读 shell 需要 bash；当前环境为 ${shell.name}`,
-              why: '只读白名单是按 bash 语义写的，其它 shell 下同样的命令名可能是别的东西（误判与漏判同时发生）。',
-              how: '请在 Windows 上安装 Git Bash / WSL / MSYS2 后重试；急用时改用 bash（有独立权限键与审批）。',
-            }),
-            code: 'SANDBOX_RO_NO_BASH',
-          },
-        }
-      }
+      // P1-2（2026-10-12）：**不再对非 bash 整片拒绝**。判定本身已经方言化（只读集按方言选 +
+      // 白名单按方言翻译 + 方言专属结构门），比"直接拒绝"更有用。
+      // ⚠️ 代价如实记着：PS / CMD 的只读保证**弱于 bash**（无 AST 复核，见 AST_REVIEW_DIALECTS）。
       const verdict = checkReadOnlyCommand(input?.command, allowlist, shell.family)
       if (!verdict.ok) {
         // P2-2：`verdict.reason` 说的是**具体命中了什么**，统一在这一处补「怎么改」
         return { ok: false, error: { message: formatDenial({ what: verdict.reason, how: READ_ONLY_HOW }), code: verdict.code } }
       }
       // AST 复核门（2026-09-30）：手写解析门之上再过一道语法树复核（见 checkReadOnlyByAst）。
-      // facts 为 null / ok=false（wasm 不可用 / 语法错误）时跳过 —— 手写门已放行的行为不变，
-      // 不因 AST 层缺失而拒绝；语法错误本身 bash 也会报错，无额外风险。
-      const facts = await analyzeBashCommand(input.command)
+      //
+      // P1-3（2026-10-12）：**只对支持 AST 的方言做**（目前仅 bash —— 走 tree-sitter-bash）。
+      // PS / CMD 没有解析器，**第二道门不存在**；这份代价由 P1-2 的方言结构门承担（那组门更严：
+      // PS 禁脚本块 / 调用运算符 / here-string / .NET 写调用）。不引 PS 解析器的理由：
+      // 成本远高于收益，而只读哨兵的目标是挡"顺手写一下"（协作式只读），不是恶意绕过。
+      // facts 为 null / ok=false（wasm 不可用 / 语法错误 / 非 AST 方言）时跳过 ——
+      // 手写门已放行的行为不变，也不因 AST 层缺失而拒绝（口径一致，不假装摸到了）。
+      const facts = AST_REVIEW_DIALECTS.includes(shell.family)
+        ? await analyzeBashCommand(input.command)
+        : null
+      // 读侧敏感文件（P0-3）：只读工具**不是"什么都能读"**。
+      // `cat .env` / `head .ssh/id_rsa` 完全在白名单内，所以这道闸必须在只读判定**之外**。
+      // bash：候选来自语法树的**真参数**；非 AST 方言：退到**文本级近似**（`tokenLikePaths`，
+      // 会把 `-Pattern '.env'` 这类参数值误当路径 —— 宁可误拒、不可漏放）。
+      let operands: string[] | undefined
       if (facts?.ok) {
         const astVerdict = checkReadOnlyByAst(facts, allowlist)
         if (!astVerdict.ok) {
           return { ok: false, error: { message: formatDenial({ what: astVerdict.reason, how: READ_ONLY_HOW }), code: astVerdict.code } }
         }
-        // 读侧敏感文件（P0-3）：只读工具**不是“什么都能读”**。
-        // `cat .env` / `head .ssh/id_rsa` 完全在白名单内，所以这道闸必须在只读判定**之外**。
-        // 判据落在**参数里的路径字面量**上（与 read_file 同一份策略）；`facts?.ok` 不成立时
-        // （wasm 不可用 / 语法错误）本闸与上面的 AST 门**同时失效** —— 口径一致，不假装摸到了。
-        if (readDeny) {
-          const operands: string[] = []
-          for (const cmd of facts.commands) {
-            for (const a of cmd.args) if (a.text !== null) operands.push(a.text)
-          }
-          const hit = findSensitiveReadPath(operands, readDeny)
-          if (hit !== undefined) {
-            return {
-              ok: false,
-              error: {
-                message: formatDenial({
-                  what: `只读模式拒绝：命令引用了敏感文件「${hit}」`,
-                  why: '沙箱默认拒读凭据类文件（.env / id_rsa* / *.pem / .ssh/** / .aws/** 等）。',
-                  how: '确实需要读，让用户确认后用 bash（有独立的权限键与审批），'
-                    + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
-                }),
-                code: 'SANDBOX_READ_DENIED',
-              },
-            }
+        operands = []
+        for (const cmd of facts.commands) {
+          for (const a of cmd.args) if (a.text !== null) operands.push(a.text)
+        }
+      } else if (!AST_REVIEW_DIALECTS.includes(shell.family)) {
+        operands = tokenLikePaths(input.command, shell.family)
+      }
+      if (readDeny && operands) {
+        const hit = findSensitiveReadPath(operands, readDeny)
+        if (hit !== undefined) {
+          return {
+            ok: false,
+            error: {
+              message: formatDenial({
+                what: `只读模式拒绝：命令引用了敏感文件「${hit}」`,
+                why: '沙箱默认拒读凭据类文件（.env / id_rsa* / *.pem / .ssh/** / .aws/** 等）。',
+                how: '确实需要读，让用户确认后用 bash（有独立的权限键与审批），'
+                  + '或把该形态从 config.json → sandbox.readDeny 里去掉。',
+              }),
+              code: 'SANDBOX_READ_DENIED',
+            },
           }
         }
       }
@@ -2061,15 +2171,22 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
         return { ok: false, error: { message: `文件不存在: ${input.path}`, code: 'FILE_NOT_FOUND' } }
       }
 
-      const content = await readFile(absPath, 'utf-8')
-
-      // 归一化换行风格：读取文件的换行，把 old/new string 归一化到同样风格再匹配，
-      // 避免 CRLF 文件因模型传入 \n 而匹配失败（参考 opencode 的 line-ending 处理）。
-      const lineEnding = content.includes('\r\n') ? '\r\n' : '\n'
-      const toLf = (s: string) => s.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
-      const toFileEnding = (s: string) => (lineEnding === '\r\n' ? s.replaceAll('\n', '\r\n') : s)
-      const oldNorm = toFileEnding(toLf(input.oldString))
-      const newNorm = toFileEnding(toLf(input.newString))
+      const rawContent = await readFile(absPath, 'utf-8')
+      // P1-4：BOM 与行尾都走 `./line-endings.ts` 同一份口径（此前是就地写死的一行三元式）。
+      // - **BOM**：匹配在**剥掉 BOM** 的文本上做（否则带 BOM 的文件里，"首行开头"的位置
+      //   会因为多一个不可见字符而与模型的 old_string 对不上），写回时再拼回去；
+      // - **行尾**：两侧都归一到 LF 再找，写回时按文件的风格（`preferredEol` 对 mixed 取
+      //   `\r\n`，与改造前的 `includes('\r\n')` 判据**逐位等价**）。
+      const bom = detectBom(rawContent)
+      const content = stripBom(rawContent)
+      const eol = preferredEol(detectEol(content))
+      const toLf = normalizeEol
+      const toFileEnding = (s: string) => (eol === '\r\n' ? normalizeEol(s).replaceAll('\n', '\r\n') : s)
+      // ⚠️ 两侧都先 `stripBom`：改造前 `content` 里带着 BOM，模型从旧 read_file 里复制出来的
+      // old_string **可能带 BOM**（那时能匹配）；现在 content 剥了 BOM，若不一起剥就会把一个
+      // 原本能用的调用变成"未找到匹配的文本"。两种形态都要认。
+      const oldNorm = toFileEnding(toLf(stripBom(input.oldString)))
+      const newNorm = toFileEnding(toLf(stripBom(input.newString)))
 
       // 定位文件里真正匹配的片段：先精确，匹配失败再引号归一（花引号→直引号）
       const actualOld = findActualString(content, oldNorm)
@@ -2085,8 +2202,8 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
       const deleteWholeLine =
         newNorm === '' &&
         !actualOld.endsWith('\n') &&
-        content.includes(actualOld + lineEnding)
-      const oldForReplace = deleteWholeLine ? actualOld + lineEnding : actualOld
+        content.includes(actualOld + eol)
+      const oldForReplace = deleteWholeLine ? actualOld + eol : actualOld
 
       // 查找匹配
       let replacementCount = 0
@@ -2119,7 +2236,8 @@ export const editFileTool = defineTool<EditFileInput, EditFileOutput>({
         replacementCount = 1
       }
 
-      await writeFile(absPath, newContent, 'utf-8')
+      // P1-4：写回时把 BOM 拼回去（文件原本有 ⇒ 保留；原本没有 ⇒ 不新增）
+      await writeFile(absPath, withBom(newContent, bom === 'utf-8'), 'utf-8')
 
       // 生成上下文片段（替换位置前后各 3 行）
       const beforeLines = content.split('\n')
