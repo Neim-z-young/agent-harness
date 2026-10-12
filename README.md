@@ -436,6 +436,10 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 | `readMaxBytes` | number | `read_file` 单文件上限（默认 10 MiB，`0` = 不限制）。超限**拒绝**而非截断 |
 | `osBinding` | string | **OS 级绑定**（L2）：`off`（默认）/ `on`。开了才把子进程包进 `sandbox-exec` / `bwrap` |
 | `pluginCodeScan` | string | 插件代码静态扫描：`warn`（默认）/ `refuse` / `off`。⚠️ **是预警不是边界**（正则挡不住刻意绕过） |
+| `pluginRunner` | string | 插件装载后端：`in-process`（默认）/ `worker`。worker 给**资源与故障边界**（内存上限 / 加载死循环不阻塞主线程 / 加载崩溃不拖垮宿主），⚠️ **不是安全边界**（worker 内 env / pid / fs 与宿主一致），且**只登记不装载**（拿不到 hooks） |
+| `pluginWorkerMemoryMb` | number | worker 模式内存上限（MB，默认 256；`0` = 不限制） |
+| `pluginWorkerTimeoutMs` | number | worker 模式装载超时（ms，默认 10000；`0` = 不限制）。加载期死循环只能靠它拦 |
+| `pluginCapabilities` | object | 按插件 id（`"*"` 为模板）声明可用 `ctx` 的哪几件：`bus` / `config` / `log` / `workspace`；未声明的**取用即抛**。⚠️ 是**授予面收窄，不是安全边界**（插件仍能 `import("node:fs")`）；缺省 = 全给 |
 | `level` | string | 要求的隔离档位下限：`L0` ~ `L3` |
 | `onUnmet` | string | 达不到 `level` 时：`warn`（默认，发 notice）/ `refuse`（拒绝启动） |
 
@@ -446,6 +450,14 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 `mcpServers[]` 还有一个**能力声明**（P1-7）：`capabilities: { fs: "cwd" | "unrestricted", net: "none" | "unrestricted" }`。
 `fs: "cwd"` 在 `osBinding: "on"` 时是**真强制**（子进程也套同一份绑定）；`net: "none"` 目前**任何档位都强制不了**
 （静态门管不到别人的子进程）—— 声明了但强制不了的项会在启动时发 `config.mcp-inactive` 告警。
+
+### 执行后端（L3，设计稿）
+
+L0~L2 都在**同一内核**里做约束；需要"跑不受信代码也伤不到宿主"的强保证时，终态是把执行挪到
+另一个内核或另一台机器上（容器 / microVM / 远程 executor）。**本仓尚未实现，设计稿已出**：
+`docs/execution-backend-design.md`（接口 `ExecutionBackend`、探测与自检纪律、与 `osBinding` /
+`fallbackToHost` 的关系、8 个挂点、可自动判的验收口径、五期分期 —— 建议先做 L3-a：探测 + 声明 +
+可观测，零运行时依赖）。
 
 ### permissions.json
 

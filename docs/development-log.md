@@ -1,6 +1,86 @@
 # Agent Harness 开发日志
 
+## 2026-10-12（续 280）P1-5 另一半（装载后端 + 能力收窄）+ L3 执行后端设计稿
+
+**起因**：续 279 把 P1-3/P1-7/P1-5（扫描那半）/P3-3 做完后，用户点单"继续后两项"；经确认两项是
+**P1-5 的另一半**与 **L3**，且 L3 **只出设计稿**。于是：**A = 代码（P1-5 收口）**、**B = 文档（L3）**。
+
+### A. P1-5 的另一半：装载后端 + 能力面收窄
+
+**先实测六条**（Bun 1.3.14，`node:worker_threads`），结论直接决定形态 —— 也直接决定**哪些话不能说**：
+
+| 实测 | 结论 |
+|---|---|
+| worker 里能 `import('*.ts')` | 装载可行 |
+| `resourceLimits.maxOldGenerationSizeMb` 真拦住内存炸弹（worker `Out of memory`、宿主存活） | **资源上限是真能力** |
+| worker 里 `while(true){}` 期间主线程 tick 照常 | **事件循环隔离是真能力** |
+| worker 里未捕获异常 ⇒ 错误回传 + 宿主存活 | **崩溃隔离是真能力** |
+| worker 里 `process.env` 键数 / `process.pid` 与宿主**完全一致** | **不是 env 边界** |
+| worker 里 `writeFileSync` 照常成功 | **不是文件系统边界**（也不是网络边界） |
+
+⇒ 一句话定调：**worker 是资源与故障边界，不是安全边界**。两处文案（notice 与文档）都照这个写。
+
+**落地形态**：
+
+1. **装载后端**（`plugin-runner.ts` / `plugin-worker-protocol.ts` / `plugin-worker-entry.ts`）：
+   `sandbox.pluginRunner: 'in-process'（默认）| 'worker'` + `pluginWorkerMemoryMb`（默认 256）+
+   `pluginWorkerTimeoutMs`（默认 10000）。worker 模式**只登记不装载** —— hooks 是宿主在 agent 循环里
+   **同步**调的，跨线程拿不到函数；硬接会得到"看起来装了、实际没生效"的插件，比不装更糟。
+   失败（起不来 / 超时 / 装载期 OOM / 模块报错）**不回退 in-process**：用户要求收窄却拿到最宽的那条路，
+   是最坏的一种降级 ⇒ 记 `workerFailures` + notice `plugins.worker-failed`。
+2. **能力面收窄**（`plugin-context.ts`）：`sandbox.pluginCapabilities` 按插件 id（`"*"` 为模板）声明
+   `ctx` 的哪几件（`bus` / `config` / `log` / `workspace`），未声明的通道 **Proxy 拦访问即抛**并给
+   可执行指引（`formatDenial` 口径）。缺省 = 全给 ⇒ **逐位等于改造前**（且四通道全给时**不包 Proxy**，
+   零开销）。包装点在宿主侧（`applyPluginCapabilities` 包 `install`），不下沉进 core ——
+   能力表是**宿主的配置语义**，让内核认识它等于把策略下沉。
+3. 新增 notice 三条：`plugins.worker-loaded`（log，**文案必须说清"只登记不装载"**）、
+   `plugins.worker-failed`（warn）、`plugins.capabilities` 口径写进 README/AGENTS。
+
+**只有实现时才暴露的发现**：
+
+1. **bun 的 worker OOM 有进程级副作用**。内存炸弹用例单跑绿、放进 host 包全量跑时**打红了另外 5 条
+   无关用例**（内置插件递归装配 / `limits` 透传 / lazy 查表一致性）。⇒ 造 OOM 的用例**必须放子进程里跑**
+   （本仓做法：`spawnSync(process.execPath, ['run', script])`）。⚠️ 这条同时修正了一句**我说得太满**的话：
+   实测能支持的是"**宿主进程存活**"，**不支持**"宿主不受任何影响" —— 文案已按前者收口。
+2. **`PluginContext` 只有四件**（`bus`/`config`/`log`/`workspace`），所以"API 白名单"的**能力面就这么大**。
+   把它写成"插件沙箱"会是夸大 —— 它管的是"宿主主动递出去的东西"，插件照样 `import('node:fs')`。
+
+### B. L3 执行后端设计稿（只出文档）
+
+`docs/execution-backend-design.md`。**核心不是接口，是接缝**：全文最重的一节是 §2 的 8 个挂点清单
+（`probeIsolation` / `resolveIsolation` / `BashOutput.isolation` / `sandbox.osBinding` / MCP
+`capabilities` / `pluginRunner` / `tools-web` 出网 / 审计）—— 这些是前两轮沙箱工作留下的，
+**L3 的工作量主要在"把它们逐个接对"，不在"设计一个漂亮接口"**。
+
+几处刻意定死的判断：
+
+- **容器算 L3，但不能与 microVM 共用一个字母**：容器共享宿主内核，逃逸面更大 ⇒
+  `BashOutput.isolation.backend` 就是防"L3 被当成一个同义词"的。
+- **`backend !== 'host'` 时 `osBinding` 被忽略**（容器挂载视图比 Seatbelt profile 更硬），
+  但**必须发 notice** —— 否则又是"写了没生效"。
+- **默认禁止跨档回退**：`backend: 'container'` 失败**不静默退回宿主**（那会抹掉用户选容器的全部动机），
+  要回退得显式配 `onBackendFailure: 'fallback-host'`。
+- **`net:"none"` 的真断网**（P1-7 留的缺口）在后端里第一次成为可能（无网卡 ⇒ 从"声明"变"事实"）。
+- **建议先做 L3-a**（探测 + 声明 + 可观测，零运行时依赖）：与 P1-4 对 L2 的关系一样，先把
+  "能声明、能降级、能看见"钉死，接哪个后端都只是往探测里加一项。
+
+**顺手修掉一处旧引用**：沙箱方案里"与 `external-integration-plan.md` §9 的执行后端抽象合流"是**失效指针**
+（该文档 §9 现在是"明确不做"，全文没有"执行后端"一节）—— 设计稿里改成显式的挂点清单 + 分期建议。
+
+### 验证
+
+- **typecheck**：真实退出码 0 / `error TS` 0。
+- **全量测试**：**2971 pass / 0 fail / 4 skip**（基线 2955 ⇒ **+16**）。4 条 skip 仍是 P1-3 的 macOS
+  真机 e2e（嵌套沙箱，见续 279）。
+- **反向验证两处**（`cp` + `shasum -a 256 -c` 还原 OK、`grep --include='*.ts'` 0 残留）：
+
+  | 变异 | 预测 | 实测 |
+  |---|---|---|
+  | `loadPluginsInWorker` 恒返回 `[]` | 8 | **8** ✓（worker 组 6 + load-plugin-dirs 2） |
+  | `narrowPluginContext` 恒返回原 ctx（不收窄） | 4 | **4** ✓ |
+
 ## 2026-10-12（续 279）OS 级绑定 L2 落地 + MCP 能力声明 + 插件代码扫描 + 三平台 CI
+
 
 **起因**：续 278 把 P2 整档清空后，沙箱方案只剩 **P1-3（OS 绑定）/ P1-5（插件代码边界）/
 P1-7（MCP 能力声明）/ P3-3（三平台 CI）**。用户点单"继续后几项" ⇒ 四项一次推进，按
