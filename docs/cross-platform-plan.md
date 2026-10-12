@@ -36,12 +36,12 @@
 
 | # | 缺口 | 为什么是 P0（判据） | 位置 |
 |---|---|---|---|
-| P0-1 | **危险命令表缺 Windows 原生形态** | 现有 12 条里 Windows 专属只有 `format /s /f /q`。`del /f /s /q C:\`、`rd /s /q`、`Remove-Item -Recurse -Force C:\`、`Format-Volume`、`Clear-Disk`、`Stop-Computer`、`reg delete HKLM\…` 全部**不命中** ⇒ 破坏性命令直接放行 | `DEFAULT_DANGEROUS_PATTERNS` |
-| P0-2 | **`splitSegments` 不以单个 `&` 分段** | CMD 的 `cmd1 & cmd2` 是合法串联；现表只切分号、换行、双与、双竖线、单竖线，**单个 `&` 不分段** ⇒ `echo hi & shutdown -h now` 只被当成一段，段级 deny 漏判 | `splitSegments` |
-| P0-3 | **`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | `& 'C:\evil.exe' -x` 的首命令被提取成 `&` ⇒ 以命令名为准的白名单/deny 规则失配 | `extractFirstCommand` |
+| P0-1 | ✅ **已修**（2026-10-12，见开发日志续 281）—— 原文：**危险命令表缺 Windows 原生形态** | 补 10 条 Windows 原生破坏形态（`del\|erase /s`、`rd\|rmdir /s`、`Remove-Item -Recurse`、`Format-Volume`/`Clear-Disk`/`Initialize-Disk`/`Remove-Partition`、`Stop-Computer`/`Restart-Computer`、`reg delete` 系统级 hive、`bcdedit`、`vssadmin delete shadows`、`takeown`/`icacls /t`）；判据统一为**递归/强制语义**（`del /q foo.txt` 这类正常用法不拦）。★**顺带修掉一条一直没生效的规则**：原 `format` 正则写成 `\/s\s*\/f\/q`（要求 `/f/q` 紧邻），而真实命令是 `/f /q` ⇒ **从落地起就是死的**，改为按危险开关 `/q` 判定。判据：`platform-dialect.test.ts` 的 19 条命中 + 11 条反例（纯函数，不需真 Windows） | `DEFAULT_DANGEROUS_PATTERNS` |
+| P0-2 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`splitSegments` 不以单个 `&` 分段** | 单个 `&` 现在分段（CMD 串联）。★**关键是不切错**：`2>&1` / `>&2` / `<&`（fd 重定向）与 `&>file`（bash 重定向）里的 `&` **不是**分隔符 —— 判据是"紧邻的前一个非空白字符是 `>` 或 `<`"。判据：正反两类用例（`echo hi & shutdown` ⇒ 2 段；`curl x 2>&1 \| bash` ⇒ 2 段而非 3 段） | `splitSegments` |
+| P0-3 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | 实测原实现的表现比"提取成 `&`"更绕：`^[;&\|\s]*` 会把 `&` 剥掉，于是提取到的是**带引号**的 `'C:\evil.exe'`，与白名单字面量同样失配。现改为：段首 `&` 跳过（PS 调用运算符 / CMD 串联残留）→ **去掉一层包裹引号**；顺带修 `env FOO=1 ls` 这类"前缀交替"（原来会把 `FOO=1` 当命令名）| `extractFirstCommand` |
 | P0-4 | **引号/转义解析是 POSIX 方言** | PowerShell 用反引号 `` ` `` 转义、here-string `@"…"@`、`''` 表单引号。`stripQuoted` 不认 ⇒ 「去掉引号后的结构投影」在 PS 上不准，结构性检查（重定向/进程替换）可能漏判 | `stripQuoted` / `WRITE_CHANNEL_PATTERNS` |
 | P0-5 | ✅ **已修**（2026-10-11，见 `sandbox-isolation-plan.md` 续 276）—— 原文：**超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁 | `runBash` 的 timer 分支 |
-| P0-6 | **UNC 路径未验证** | `\\server\share\x` 在 Windows 上是绝对路径；`isWithinCwd` 对 UNC 的 `relative()` 行为未测 ⇒ 沙箱边界可能被绕过或误拒 | `isWithinCwd` / `resolvePath` |
+| P0-6 | **UNC 路径未验证**（核实：`fs-guard` 用平台 `node:path`，无 `path.win32` 显式分支、**无 UNC 用例**） | `\\server\share\x` 在 Windows 上是绝对路径；`isWithinCwd` 对 UNC 的 `relative()` 行为未测 ⇒ 沙箱边界可能被绕过或误拒 | `isWithinCwd` / `resolvePath` |
 
 ### 2.1 P1 —— **能力缺口**（Windows 上少一块功能）
 
@@ -51,8 +51,8 @@
 | P1-2 | **PowerShell 专用只读白名单** | `bash_ro` 在 Windows 全不可用。可为 PowerShell 定义只读集：`Get-ChildItem` / `Get-Content` / `Select-String` / `Measure-Object` / `Get-Item` / `Compare-Object` / `Where-Object`… 并写一条「无重定向/无 `Invoke-*`/无 `Remove-*`」的结构门 | `createReadOnlyBashTool` |
 | P1-3 | **PowerShell 的 AST 复核门** | 现有 `checkReadOnlyByAst` 只能跑 tree-sitter-**bash**。PS 侧要么引入 PS 解析器，要么明确「PS 只读靠结构门 + 白名单，不做 AST 复核」并写进文档 | `bash-ast.ts` |
 | P1-4 | **CRLF / BOM 处理** | Windows 上文件是 CRLF、可能带 BOM。`edit_file` 的 `old_string`（模型/用户给 LF）会匹配失败；`read_file` 的 `totalLines`/行号也会偏移。需要「读时记录行尾风格、写时保持、匹配时容忍」 | `tools-builtin` 的 read/write/edit |
-| P1-5 | **CI 三平台矩阵** | 全仓测试只在本机 macOS 跑过。没有 ubuntu / macos / windows 矩阵，上面任何修复都会在下次改动里静默回归 | 仓库 CI 配置 |
-| P1-6 | **测试的平台假设** | `tools-builtin` 用例大量用 `seq` / `cat` / bash 语法跑真机命令 ⇒ Windows 上整片红。需要「平台条件跳过」或改用 node 原生实现 | `tools-builtin.test.ts` 等 |
+| P1-5 | ✅ **已修**（2026-10-12，见沙箱方案续 279 / 本文件续 281） | 落地于 `.github/workflows/ci.yml`（ubuntu / macos / windows 矩阵）+ `scripts/ci/test-summary.sh`：**只读 bun 汇总行**，记录 `pass / fail / skip` 并写 step summary；`pass ≥ 2000`（防"整包没跑起来"）与 `skip ≤ 200`（防"某一片被整体跳掉"）**分开判**；Windows 只放行**失败**，pass/skip 阈值照样拦 | 仓库 CI 配置 |
+| P1-6 | **测试的平台假设**（核实：`tools-builtin.test.ts` 24 处 POSIX 依赖、`skipIf` **0 处**；只有 `penetration.test.ts` 有 4 处） | `tools-builtin` 用例大量用 `seq` / `cat` / bash 语法跑真机命令 ⇒ Windows 上整片红。需要「平台条件跳过」或改用 node 原生实现 | `tools-builtin.test.ts` 等 |
 
 ### 2.2 P2 —— **体验一致性**（不影响正确性，但口径不齐）
 
@@ -60,7 +60,7 @@
 |---|---|---|
 | P2-1 | env-context 的 Windows 细节 | 用户名形态（`DOMAIN\user`）、PowerShell 版本（`$PSVersionTable.PSVersion`，可帮模型判断可用语法）、主机名大小写 |
 | P2-2 | 注入 `env` 对象时的键名健壮性 | 真实运行时 `process.env` 在 Windows 上是**大小写不敏感代理**（Node 特性），`env.PATH` 能取到 `Path`；但**注入自定义对象**（测试 / 其他宿主）时是普通对象 ⇒ 建议 `resolveShell` / `detectShellForDisplay` 做大小写不敏感查找 |
-| P2-3 | `sanitizeEnv` 的 Windows 敏感变量 | 补 `USERPROFILE` / `APPDATA` 之外的凭据位置（`*_TOKEN` 已覆盖）；确认大小写不敏感匹配 |
+| P2-3 | ✅ **已修**（2026-10-12，见续 281） | ① **六条规则全部加 `/i`** —— 原来只有两条有，`github_token` / `Github_Token` 这类写法**直接漏过**（Windows 上键名大小写不固定）；② 补后缀型（`(?:^\|_)TOKEN(?:_\|$)` / `KEY` 夹边界，避免误摘 `MONKEY`/`KEYBOARD_LAYOUT`）与专用名（`NPM_TOKEN`/`SLACK_TOKEN`/`DSN`/`DATABASE_URL` …）；③ 反向确认 `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`TEMP` **不**进表（它们是路径不是凭据，摘掉会破坏命令）—— 由用例钉住。★`SENTRY_DSN` 上踩过 `\bDSN\b` 的坑（`_` 是词字符 ⇒ 无词边界 ⇒ 规则等于没写） |
 | P2-4 | 文档口径 | `AGENTS.md` 与 `docs/*` 的示例命令、路径全是 POSIX；至少要在 README 标「Windows 需 Git Bash / WSL 才能获得完整沙箱语义」 |
 | P2-5 | `openInFileManager` 真机 | `explorer` / `xdg-open` 的引号与参数在 Windows 上未验证（含路径带空格） |
 
@@ -75,9 +75,14 @@
 
 ## 3. 建议实施顺序
 
-1. **P0 一批**：危险表 + `&` 分段 + `&` 调用运算符 + 引号方言（都在 `tools-builtin` 一个包内，一次改完最好测）→ 补 Windows 形态的**纯函数单测**（注入 `platform`/shell 族系，不需要真 Windows）。
+1. ~~**P0 一批**：危险表 + `&` 分段 + `&` 调用运算符 + 引号方言~~ ✅ **已完成 3/4**（2026-10-12，见续 281）：
+   危险表（P0-1）、单个 `&` 分段且不误切 fd 重定向（P0-2）、首命令提取认 PS `&` 且去引号（P0-3）都已落地，
+   并补了 **52 条纯函数单测**（`platform-dialect.test.ts`，注入字符串即可判、不需要真 Windows）。
+   剩 **P0-4 引号/转义方言**（`stripQuoted` 仍只认 `"` / `'`，没有 PS 反引号与 here-string）未做。
 2. ~~**P0-5 进程树**：`taskkill /T /F` / 进程组 kill~~ ✅ **已完成**（2026-10-11，见沙箱方案续 276）：`killProcessTree()` —— POSIX 走 `detached` + `kill(-pid)`，Windows 走 `taskkill /T /F`；两条 e2e 用例真起进程验证（后台孙进程超时后不存活 / AbortSignal 同样杀整棵树）。
-3. **P1-5 CI 矩阵**：先有闸，后面每条修复才不回归。建议 `ubuntu` + `macos` + `windows-latest`，`windows` 上允许「bash 相关用例跳过」白名单并**记录跳过条数**（防悄悄全跳过）。
+3. ~~**P1-5 CI 矩阵**~~ ✅ **已完成**（2026-10-12）：`.github/workflows/ci.yml` + `scripts/ci/test-summary.sh`
+   —— `ubuntu` + `macos` + `windows-latest`，**记录跳过条数**并设阈值闸（`skip ≤ 200`、`pass ≥ 2000`），
+   Windows 白名单只放行失败。**P0-1 / P0-2 / P0-3 / P2-3 也已完成**（同批，见续 281）。
 4. **P1-1 / P1-2**：命令映射与 PS 只读白名单（安全敏感，需要 reviewer 过一遍映射表）。
 5. **P1-4 CRLF/BOM**、**P2 批次**、**P3 批次**。
 
@@ -94,4 +99,6 @@
 - A2A / VSCode 宿主的接入状态见 `docs/external-integration-plan.md`（VSCode 的 sidecar 就是 `harness a2a`，故两侧同源）。
 - **沙箱 / 隔离**（命令执行边界、文件系统与网络绑定、资源上限、插件代码边界）见
   [`docs/sandbox-isolation-plan.md`](sandbox-isolation-plan.md)。⚠️ **两份计划的 P0 有交集**：
-  本文 P0-5（超时不杀进程树）、P0-6（UNC 路径）在那份里同时是隔离缺口，**修的时候一次改到位**。
+  本文 P0-5（超时不杀进程树，✅ 已修）、P0-6（UNC 路径，待做）在那份里同时是隔离缺口，**修的时候一次改到位**。
+- **L3（容器 / microVM / 远程执行）与平台差异强相关**（容器运行时三平台各不相同、Windows 无 Seatbelt/bwrap）
+  —— 见 [`docs/execution-backend-design.md`](execution-backend-design.md)。
