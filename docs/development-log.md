@@ -1,5 +1,85 @@
 # Agent Harness 开发日志
 
+## 2026-10-12（续 284）跨平台：P2-2 环境键名 / P2-1 域用户名 / P3-4 插件 shell 声明
+
+起因：用户问"计划还有哪些未完成的"，逐条对代码核对后列出 8 项（P2-1/2/4/5 + P3-1~4），
+并指出其中 **P2/P3 的剩余项有一个共同点：本机（macOS）无法闭环** —— 判据里"未验证"三个字掩盖了"**不可验证**"。
+本轮把**本机能做的**做掉：P2-2、P2-4 收尾、P3-4、以及 P2-1 的一半。
+
+### 一、P2-2 注入 `env` 时的键名大小写
+
+**起因**：`process.env` 在 Windows 上是**大小写不敏感代理**（Node 特性）⇒ `env.PATH` 能取到 `Path`；
+但**注入普通对象**时（单测 / 其它宿主 / A2A 远端）它就是普通对象 ⇒ 取不到，于是
+"本机装了 Git Bash 却静默落到 `cmd.exe`"。★**这个错在 macOS 开发机上永远看不到**，只有 Windows 用户会撞上。
+
+**落地**：`resolveShell`（执行侧）与 `detectShellForDisplay`（展示侧）各加 `lookupEnvCI(env, name)` ——
+**先精确匹配、再退到大小写不敏感扫描**（空串继续找：Windows 上可能同时存在空的 `PATH` 与有效的 `Path`），
+`PATH` / `ComSpec` / `SHELL` 全走它。
+
+**为什么不物理共用一份**：两者分属不同包（`tools-builtin` 依赖 7 个包、`env-context` 只依赖 `@harness/plugin`），
+把 shell 探测下沉到 `@harness/plugin` 等于把"shell 知识"放进插件框架（错的层次）。判据要的是**两者一致**，
+所以落实方式是：注释互相指向 + **用例成对**（`platform-dialect.test.ts` 的 P2-2 组 / `env-context/src/index.test.ts`
+的 P2-2 组，形状相同、同一输入同一期望）—— 一侧改了另一侧没改时，那侧会红。
+
+### 二、P2-1 Windows 用户名形态（做一半，另一半**刻意不做**）
+
+- ✅ **`DOMAIN\user`**：win32 下优先 `USERDOMAIN` + `USERNAME` 拼（都走 `lookupEnvCI`），
+  缺 `USERNAME` 才退回 `os.userInfo()`。理由：只看 `alice` 在域环境里**不可定位**
+  （同名用户在域 / 本机 / 其它域都存在），而模型经常拿它拼路径或判断权限归属。
+- 为让这条能被钉住，`collectStaticEnv` 加了 `{ platform, env }` 注入（缺省＝当前进程 ⇒ 既有调用不变）。
+- ⚠️ **`$PSVersionTable.PSVersion` 刻意不做**：它必须 `spawn` 一个 PowerShell 才能拿到，
+  而 `collectStaticEnv` 是**每次装配都要跑**的路径（为一行展示付一个进程的代价不划算）；
+  模型需要时自己查一次更便宜，且 PS 方言判定（P1-2/P1-3）**不需要版本号**。
+  ★"不做"也是**结论**，写进文档 —— 否则下一个人会把同一个问题重新纠结一遍。
+- 主机名大小写：**无需处理**（收集方原样返回；"Windows 上比较大小写不敏感"是**消费方**的事）。
+
+### 三、P3-4 插件包的 shell 需求声明 + 双向守卫
+
+**落地**：`packages/plugins/<name>/package.json` 新增约定字段 `"harness": { "shellRequirement": "posix" }`
+（缺省＝`'none'`），`tools-builtin` 已声明。它回答的是那个以前只存在于**人的记忆**里的问题：
+"这个包在没有 bash 的平台上会不会残" —— 而发现它的人**只能是 Windows 用户**。
+
+**守卫**（`host/src/plugin-shell-requirement.test.ts`）**双向**：
+1. **用了却没声明**：源码（非测试、**跳过注释行**）里出现 `getShell(` / `resolveShell(` ⇒ 必须声明；
+2. **声明了却没用** ⇒ 红 —— 防**声明腐烂**（包改成不依赖 shell 了、声明还留着，后来看声明的人被误导）；
+3. 取值只能是 `posix` / `none`（写错值等于没声明）；
+4. **控制组钉子**：`tools-builtin` 确实声明且确实在用 —— 没有这条，"两个方向都为空"这种退化解也能永远绿。
+
+★**跳过注释行是必需的**（实测）：`shell-quoting.ts` 的注释里提到过 `resolveShell`，不跳就会误命中
+（同 `host/plugin-scan.ts` 的做法）。
+
+### 四、P2-4 文档口径收尾 + 两条判据的更正
+
+README 的「跨平台」小节（续 283 加）已写明"要完整语义请装 Git Bash / WSL" ⇒ P2-4 判据满足。
+核对时**更正了两条判据描述**（写进计划文档，免得后人照着错描述去"修"）：
+- **P2-5**：`openInFileManager` 用 `execFile('explorer', [path])` ⇒ **不经 shell**，
+  所以"引号与带空格路径"**不是风险点**；真正的风险是 **`explorer.exe` 成功时也常返回非零退出码**
+  ⇒ 现有实现会把成功报成 `{ok:false}`（仍需 Windows 真机确认）。
+- **P3-1**：本机实测 `bun build --compile --target=bun-windows-x64` **失败**在
+  `Could not resolve: "@opentui/core-win32-x64"`（`@opentui/core` 用 optionalDependencies 按平台分发）
+  ⇒ 这条**不是"跑一条命令就能验"**；解法是在 Windows runner 上构建（`ci.yml` 已就位），
+  或先 `bun install --os=* --cpu=*`（会拉全平台 native 包、动 lockfile —— **未做**，属"可选改动先不动"）。
+
+### 五、验证
+
+- **typecheck**：真实退出码 **0** / `error TS` **0**。
+- **全量测试**（走 CI 脚本）：**pass=3130 / fail=0 / skip=4**（上轮 3111 ⇒ **+19**：
+  `platform-dialect` +5、`env-context` +10、`plugin-shell-requirement` +4 —— 数字逐项对上）。
+- **反向验证三处**（`cp` 备份 → 变异 → 跑子集 → `shasum -a 256 -c` 还原、0 残留）：
+
+| # | 变异 | 预测 | 实测 | 偏差归因 |
+|---|---|---|---|---|
+| M1 | `lookupEnvCI` 退化为精确匹配（**两个包都改**） | 7 | **8** | 多的那条是 env-context 的"`shell` 小写探测"（也是同一能力） |
+| M2 | win32 域形态短路（`platform === 'win32-never'`） | 3 | **3** | — |
+| M3 | 删掉 `tools-builtin` 的 `harness` 声明 | 2 | **2** | 含控制组那条（守卫确实在看） |
+
+### 六、剩余（**都需要 Windows 真机**）
+
+P2-1 的 `$PSVersionTable` 下游（若将来真需要版本相关的语法分支）、**P2-5**（`explorer.exe` 退出码语义）、
+**P3-1**（交叉编译卡在 optional native dep）、**P3-2 / P3-3**（VSCode 端到端 / A2A 路径与端口），
+外加**整批 PS / CMD 分支的真机复核**。★建议的下一步不是继续在本机抠，而是
+**把 `ci.yml` 的 Windows 矩阵跑起来** —— 一次拿到 P3-1/2/3 与 PS/CMD 行为的第一手证据。
+
 ## 2026-10-12（续 283）跨平台：P0-6（UNC/路径方言）+ P1-1/2/3/4/6 全收
 
 用户"先 p0 再 p1" ⇒ 先收 P0 最后一项（P0-6），再把 P1 剩余五项一次推完（P1-5 已在续 279 完成）。

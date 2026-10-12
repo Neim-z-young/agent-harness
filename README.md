@@ -466,6 +466,12 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 - **文件读写按平台**：`read_file` 如实报告 `lineEnding`（`lf` / `crlf` / `mixed`）与 `bom`；`edit_file` 用 LF 的
   `old_string` 也能匹配 CRLF 文件，写回**保持原风格**（`old_string` 自带 BOM 也认）；`write_file` 覆盖已有文件时
   同样保持其行尾与 BOM —— 不然"改一行"会被 diff 显示成"整文件改动"。**路径边界**判定按平台方言（UNC / 盘符 / 大小写不敏感）。
+- **插件包的 shell 需求有声明位**：`packages/plugins/<name>/package.json` 里
+  `"harness": { "shellRequirement": "posix" }` 表示"本包需要 POSIX shell 才能给完整语义"（缺省＝不需要）。
+  守卫 `host/src/plugin-shell-requirement.test.ts` **双向**校验：源码里用了 `getShell(`/`resolveShell(`
+  却没声明会红，"声明了却没用"也会红（防声明腐烂）。
+- **环境变量按键名大小写不敏感地读**（`lookupEnvCI`）：注入的 `env`（单测 / 其它宿主 / A2A 远端）是普通对象，
+  `env.PATH` 取不到 `{ Path: … }` —— 不处理就会"本机装了 Git Bash 却静默落到 `cmd.exe`"。
 - ⚠️ **以上 PS / CMD 分支与其真机行为尚未在 Windows 上验证**（开发机 macOS）：用例钉的是判定算法（纯函数、逐条正反例）。
 
 ### 执行后端（L3，设计稿）

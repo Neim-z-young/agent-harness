@@ -58,20 +58,20 @@
 
 | # | 缺口 | 说明 |
 |---|---|---|
-| P2-1 | env-context 的 Windows 细节 | 用户名形态（`DOMAIN\user`）、PowerShell 版本（`$PSVersionTable.PSVersion`，可帮模型判断可用语法）、主机名大小写 |
-| P2-2 | 注入 `env` 对象时的键名健壮性 | 真实运行时 `process.env` 在 Windows 上是**大小写不敏感代理**（Node 特性），`env.PATH` 能取到 `Path`；但**注入自定义对象**（测试 / 其他宿主）时是普通对象 ⇒ 建议 `resolveShell` / `detectShellForDisplay` 做大小写不敏感查找 |
+| P2-1 | ⚠️ **部分已修**（2026-10-12，见续 284） | **① 用户名形态 ✅**：`collectStaticEnv` 在 win32 下优先用 `USERDOMAIN\USERNAME` 拼 `DOMAIN\user`（只看 `alice` 在域环境里不可定位），`USERNAME` 缺失时退回 `os.userInfo()`；`collectStaticEnv` 现在接受 `{platform, env}` 注入 ⇒ 该分支可被**纯函数**钉住（4 条用例）。**② 主机名大小写：无需处理**（`os.hostname()` 原样返回，Windows 上比较大小写不敏感是**消费方**的事，不是收集方）。**③ `$PSVersionTable.PSVersion`：刻意不做** —— 它必须 `spawn` 一个 PowerShell 才能拿到，而 `collectStaticEnv` 是**每次装配都要跑**的路径；模型自己在需要时查一次更划算（且 tools-builtin 的 PS 方言判定不需要版本号）。 |
+| P2-2 | ✅ **已修**（2026-10-12，见续 284） | `resolveShell`（执行侧）与 `detectShellForDisplay`（展示侧）各加一个 **`lookupEnvCI(env, name)`**：**先精确匹配、再退到大小写不敏感扫描**（空串继续找 —— Windows 上可能同时存在空的 `PATH` 与有效的 `Path`），`ComSpec` 同样处理。两侧注释互相指向（这是**同一份口径的两个落点**：一边改了另一边没改，就会出现"提示说用 Git Bash、实际执行走 cmd"）。判据：两包**成对**用例 —— `platform-dialect.test.ts` 的 P2-2 组（执行侧）+ `env-context/src/index.test.ts` 的 P2-2 组（展示侧），形状相同、同一输入同一期望 |
 | P2-3 | ✅ **已修**（2026-10-12，见续 281） | ① **六条规则全部加 `/i`** —— 原来只有两条有，`github_token` / `Github_Token` 这类写法**直接漏过**（Windows 上键名大小写不固定）；② 补后缀型（`(?:^\|_)TOKEN(?:_\|$)` / `KEY` 夹边界，避免误摘 `MONKEY`/`KEYBOARD_LAYOUT`）与专用名（`NPM_TOKEN`/`SLACK_TOKEN`/`DSN`/`DATABASE_URL` …）；③ 反向确认 `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`TEMP` **不**进表（它们是路径不是凭据，摘掉会破坏命令）—— 由用例钉住。★`SENTRY_DSN` 上踩过 `\bDSN\b` 的坑（`_` 是词字符 ⇒ 无词边界 ⇒ 规则等于没写） |
-| P2-4 | 文档口径 | `AGENTS.md` 与 `docs/*` 的示例命令、路径全是 POSIX；至少要在 README 标「Windows 需 Git Bash / WSL 才能获得完整沙箱语义」 |
-| P2-5 | `openInFileManager` 真机 | `explorer` / `xdg-open` 的引号与参数在 Windows 上未验证（含路径带空格） |
+| P2-4 | ✅ **已满足**（2026-10-12，见续 283/284） | README 新增的「跨平台（bash / PowerShell / CMD）」小节已写明：**"PS / CMD 不做语法树复核 ⇒ 只读保证弱于 bash，要完整语义请装 Git Bash / WSL"**，并列出白名单翻译边界、结构门、文件读写与路径方言的行为。⚠️ `AGENTS.md` 与 `docs/*` 里的**示例命令**仍是 POSIX —— 那是**描述现状**（本仓开发环境就是 POSIX），不是缺口；真要在 Windows 上跟做，README 那一节已给出前提 |
+| P2-5 | ⚠️ **判据需更正**（2026-10-12，见续 284） | 核实：`workspace-shell/src/index.ts` 用 `execFile('explorer', [path])` —— **`execFile` 不经过 shell**（argv 直接传给进程）⇒ 判据里"引号与带空格路径"这半句**不是风险点**。真正的风险是 **`explorer.exe` 成功时也常返回非零退出码** ⇒ 现有实现会把成功报成 `{ok:false, error}`。这条**需要 Windows 真机确认**（改法是 Windows 分支忽略退出码，或改用 `cmd /c start ""`），因此仍算未完成 |
 
 ### 2.3 P3 —— **工程与分发**（长尾）
 
 | # | 缺口 | 说明 |
 |---|---|---|
-| P3-1 | `bun build --compile` 的 Windows 目标 | 现在只验证过 darwin-arm64。`bun build --compile --target=bun-windows-x64` 未跑通验证 |
+| P3-1 | ⚠️ **已实测，阻塞点明确**（2026-10-12，见续 284） | 本机跑 `bun build src/index.ts --compile --target=bun-windows-x64` **失败**：`Could not resolve: "@opentui/core-win32-x64"` —— `@opentui/core` 用 **optionalDependencies 按平台分发 native 包**，本机只装了 `core-darwin-arm64` ⇒ **交叉编译不是"跑一条命令就能验"**：要么在 Windows 上构建，要么先 `bun install --os=* --cpu=*`（会拉全平台 native 包、动 lockfile，**未做**：属"可选改动先不动"）。⇒ 这条的实际解法是**在 GitHub Windows runner 上跑一次**（`ci.yml` 已就位） |
 | P3-2 | VSCode 扩展的 Windows 端到端 | `src/bun.ts` 的 Windows 安装位置、`launch.ts` 的 sidecar 启动在真机未验证 |
 | P3-3 | A2A 在 Windows 的路径/端口 | sidecar 的 `--port 0` 握手、`dataDir` 含盘符时的 JSON 序列化 |
-| P3-4 | 新增插件包的跨平台约定 | 新工具插件应声明「是否需要 POSIX shell」，避免再出现「无 bash 就整片失效」 |
+| P3-4 | ✅ **已修**（2026-10-12，见续 284） | `packages/plugins/<name>/package.json` 新增约定字段 `"harness": { "shellRequirement": "posix" }`（缺省＝`'none'`）；`tools-builtin` 已声明 `'posix'`。配套**双向守卫** `host/src/plugin-shell-requirement.test.ts`：① **用了却没声明**（源码非测试、非注释行里出现 `getShell(` / `resolveShell(` ⇒ 必须声明）② **声明了却没用**（防**声明腐烂**，别让后来看声明的人被误导）③ 取值只能是 `posix` / `none` ④ 控制组钉子（`tools-builtin` 确实声明且确实在用 —— 否则前两条断言会退化成"两边都是空"而永远绿） |
 
 ## 3. 建议实施顺序
 
@@ -100,9 +100,16 @@
    的 **31 个"真跑命令"用例**改用 `posixIt`（`it.skipIf(!HAS_POSIX_SHELL)`，判据＝**与运行时同一份**
    `resolveShell().family === 'bash'`，因此装了 Git Bash 的 Windows runner 会真跑）。其余四个含 POSIX
    字面量的测试文件经抽查是**纯函数输入**（喂 `assessRisk` / 解析器 / 格式化函数），**未逐一核查**。
-8. **剩余**：**P2-1 / P2-2 / P2-4 / P2-5**（env-context 的 Windows 细节、注入 `env` 的键名健壮性、
-   README 口径、`openInFileManager` 真机）与 **P3-1 ~ P3-4**（`bun build --compile` 的 Windows 目标 /
-   VSCode 端到端 / A2A 路径与端口 / 插件跨平台约定）；**外加本轮所有 PS / CMD 分支的真机复核**（第 4 条）。
+8. ~~**P2-2 / P2-4 / P3-4**~~ ✅ **已完成**（2026-10-12，见续 284）：`lookupEnvCI` 大小写不敏感 env 查找
+   （执行 / 展示两侧成对）、README 口径（"要完整语义装 Git Bash / WSL"已写明）、插件包的
+   `harness.shellRequirement` 声明 + 双向守卫。~~**P2-1 的用户名形态**~~ ✅ 也已做（win32 ⇒ `DOMAIN\user`）；
+   `$PSVersionTable` **刻意不做**（要 spawn，而这是每次装配都跑的路径）。
+9. **剩余（都需要 Windows 真机）**：**P2-1 的 `$PSVersionTable` 下游**（若将来真需要版本相关的语法分支）、
+   **P2-5**（`explorer.exe` 的退出码语义 —— 判据里的"引号"那半句已更正为伪风险）、
+   **P3-1**（交叉编译被 optional native dep 卡住 ⇒ 交给 Windows CI）、**P3-2 / P3-3**（VSCode 端到端 /
+   A2A 路径与端口）；**外加整批 PS / CMD 分支的真机复核**（第 4 条）。
+   ★**P2/P3 的剩余项有一个共同点：本机（macOS）无法闭环** —— 判据里"未验证"三个字掩盖了"**不可验证**"。
+   最实际的动作是**把 `ci.yml` 的 Windows 跑起来**（矩阵已就位），一次拿到 P3-1/2/3 与 PS/CMD 的第一手证据。
 
 ## 4. 验收口径（每一条都要能自动判）
 
