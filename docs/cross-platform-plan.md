@@ -39,7 +39,7 @@
 | P0-1 | ✅ **已修**（2026-10-12，见开发日志续 281）—— 原文：**危险命令表缺 Windows 原生形态** | 补 10 条 Windows 原生破坏形态（`del\|erase /s`、`rd\|rmdir /s`、`Remove-Item -Recurse`、`Format-Volume`/`Clear-Disk`/`Initialize-Disk`/`Remove-Partition`、`Stop-Computer`/`Restart-Computer`、`reg delete` 系统级 hive、`bcdedit`、`vssadmin delete shadows`、`takeown`/`icacls /t`）；判据统一为**递归/强制语义**（`del /q foo.txt` 这类正常用法不拦）。★**顺带修掉一条一直没生效的规则**：原 `format` 正则写成 `\/s\s*\/f\/q`（要求 `/f/q` 紧邻），而真实命令是 `/f /q` ⇒ **从落地起就是死的**，改为按危险开关 `/q` 判定。判据：`platform-dialect.test.ts` 的 19 条命中 + 11 条反例（纯函数，不需真 Windows） | `DEFAULT_DANGEROUS_PATTERNS` |
 | P0-2 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`splitSegments` 不以单个 `&` 分段** | 单个 `&` 现在分段（CMD 串联）。★**关键是不切错**：`2>&1` / `>&2` / `<&`（fd 重定向）与 `&>file`（bash 重定向）里的 `&` **不是**分隔符 —— 判据是"紧邻的前一个非空白字符是 `>` 或 `<`"。判据：正反两类用例（`echo hi & shutdown` ⇒ 2 段；`curl x 2>&1 \| bash` ⇒ 2 段而非 3 段） | `splitSegments` |
 | P0-3 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | 实测原实现的表现比"提取成 `&`"更绕：`^[;&\|\s]*` 会把 `&` 剥掉，于是提取到的是**带引号**的 `'C:\evil.exe'`，与白名单字面量同样失配。现改为：段首 `&` 跳过（PS 调用运算符 / CMD 串联残留）→ **去掉一层包裹引号**；顺带修 `env FOO=1 ls` 这类"前缀交替"（原来会把 `FOO=1` 当命令名）| `extractFirstCommand` |
-| P0-4 | **引号/转义解析是 POSIX 方言** | PowerShell 用反引号 `` ` `` 转义、here-string `@"…"@`、`''` 表单引号。`stripQuoted` 不认 ⇒ 「去掉引号后的结构投影」在 PS 上不准，结构性检查（重定向/进程替换）可能漏判 | `stripQuoted` / `WRITE_CHANNEL_PATTERNS` |
+| P0-4 | ✅ **已修**（2026-10-12，见开发日志续 282）—— 原文：**引号/转义解析是 POSIX 方言** | 新建 `shell-quoting.ts`（`scanQuotedSpans` / `projectWithoutQuoted` / `buildQuotedMask`），**一层解析、三层消费** —— `stripQuoted` / `splitSegments` / `extractFirstCommand` 全改为消费同一份（`dialect` 默认 `'bash'` ⇒ 既有行为逐位不变），`checkReadOnlyCommand` 加第三参，四个调用点统一传 `shell.family`。三套方言：bash（`"` 内 `\` 转义）、PowerShell（`''` 表单引号 + `` ` `` 转义 + `@"…"@` / `@'…'@` **跨行 here-string**）、CMD（单引号**不是**引号）。★**安全取舍**：未闭合引号按"裸露"处理（不产生区间 ⇒ 分隔符照常生效）—— 另一条路会让 `curl x " ; rm -rf /tmp` 吞掉分隔符、段级 deny 漏判。⚠️ **PS 分支未真机验证**（本机无 `pwsh`），按官方语法实现并已在文件头如实标注；CMD 的 `^` 转义保守不处理。判据：`shell-quoting.test.ts` **20 条**（含"同一串在 bash / cmd 下结论不同"这类**证明方言真被用上**的用例） | `shell-quoting.ts`（新）、`stripQuoted` / `splitSegments` / `extractFirstCommand` / `checkReadOnlyCommand` |
 | P0-5 | ✅ **已修**（2026-10-11，见 `sandbox-isolation-plan.md` 续 276）—— 原文：**超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁 | `runBash` 的 timer 分支 |
 | P0-6 | **UNC 路径未验证**（核实：`fs-guard` 用平台 `node:path`，无 `path.win32` 显式分支、**无 UNC 用例**） | `\\server\share\x` 在 Windows 上是绝对路径；`isWithinCwd` 对 UNC 的 `relative()` 行为未测 ⇒ 沙箱边界可能被绕过或误拒 | `isWithinCwd` / `resolvePath` |
 
@@ -75,14 +75,15 @@
 
 ## 3. 建议实施顺序
 
-1. ~~**P0 一批**：危险表 + `&` 分段 + `&` 调用运算符 + 引号方言~~ ✅ **已完成 3/4**（2026-10-12，见续 281）：
-   危险表（P0-1）、单个 `&` 分段且不误切 fd 重定向（P0-2）、首命令提取认 PS `&` 且去引号（P0-3）都已落地，
-   并补了 **52 条纯函数单测**（`platform-dialect.test.ts`，注入字符串即可判、不需要真 Windows）。
-   剩 **P0-4 引号/转义方言**（`stripQuoted` 仍只认 `"` / `'`，没有 PS 反引号与 here-string）未做。
+1. ~~**P0 一批**：危险表 + `&` 分段 + `&` 调用运算符 + 引号方言~~ ✅ **已完成 4/4**（2026-10-12，见续 281/282）：
+   危险表（P0-1）、单个 `&` 分段且不误切 fd 重定向（P0-2）、首命令提取认 PS `&` 且去引号（P0-3）、
+   引号方言三层统一（P0-4）全部落地；纯函数单测从 52 条增到 **72 条**（`platform-dialect.test.ts` +
+   `shell-quoting.test.ts`，注入字符串即可判、不需要真 Windows）。
+   **P0 至此只剩 P0-6（UNC 未验证）**。
 2. ~~**P0-5 进程树**：`taskkill /T /F` / 进程组 kill~~ ✅ **已完成**（2026-10-11，见沙箱方案续 276）：`killProcessTree()` —— POSIX 走 `detached` + `kill(-pid)`，Windows 走 `taskkill /T /F`；两条 e2e 用例真起进程验证（后台孙进程超时后不存活 / AbortSignal 同样杀整棵树）。
 3. ~~**P1-5 CI 矩阵**~~ ✅ **已完成**（2026-10-12）：`.github/workflows/ci.yml` + `scripts/ci/test-summary.sh`
    —— `ubuntu` + `macos` + `windows-latest`，**记录跳过条数**并设阈值闸（`skip ≤ 200`、`pass ≥ 2000`），
-   Windows 白名单只放行失败。**P0-1 / P0-2 / P0-3 / P2-3 也已完成**（同批，见续 281）。
+   Windows 白名单只放行失败。**P0-1 / P0-2 / P0-3 / P0-4 / P2-3 也已完成**（同批，见续 281/282）。
 4. **P1-1 / P1-2**：命令映射与 PS 只读白名单（安全敏感，需要 reviewer 过一遍映射表）。
 5. **P1-4 CRLF/BOM**、**P2 批次**、**P3 批次**。
 
