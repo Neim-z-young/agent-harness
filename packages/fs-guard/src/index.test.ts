@@ -9,6 +9,7 @@ import {
   realpathBestEffort,
   isWithinRoot,
   isWithinCwd,
+  defaultPathDialect,
   isSensitiveReadPath,
   findSensitiveReadPath,
 } from './index'
@@ -178,6 +179,130 @@ describe('isWithinCwd', () => {
       expect(isWithinCwd(join(unrealCwd, 'f.txt'), unrealCwd)).toBe(true)
     } finally {
       rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+// ===== P0-6：路径方言（UNC / 盘符 / 大小写）=====
+//
+// 这一组在 macOS / Linux 上跑，却要钉住 **Windows 的判定口径** —— 靠的是
+// `dialect` 参数（消费 `node:path` 的 `win32` 那一套），而不是模拟文件系统。
+// 每条"方言差异"都配一条**同串在 posix 下的相反结论**：只断言 win32 侧的话，
+// 一个把两边都写死的实现也能全绿。
+
+describe('P0-6 defaultPathDialect', () => {
+  it('只有 win32 平台是 win32 方言（不传 dialect 时既有行为逐位不变）', () => {
+    expect(defaultPathDialect('win32')).toBe('win32')
+    expect(defaultPathDialect('darwin')).toBe('posix')
+    expect(defaultPathDialect('linux')).toBe('posix')
+    expect(defaultPathDialect()).toBe(process.platform === 'win32' ? 'win32' : 'posix')
+  })
+})
+
+describe('P0-6 resolvePath：按方言解析', () => {
+  it('win32：盘符与 UNC **都是绝对路径**（原样归一）', () => {
+    expect(resolvePath('C:\\work\\a.txt', 'D:\\other', 'win32')).toBe('C:\\work\\a.txt')
+    expect(resolvePath('\\\\srv\\share\\x', 'C:\\work', 'win32')).toBe('\\\\srv\\share\\x')
+  })
+
+  it('win32：相对路径按 cwd 解析；`..` 折叠到盘根为止', () => {
+    expect(resolvePath('a.txt', 'C:\\work', 'win32')).toBe('C:\\work\\a.txt')
+    expect(resolvePath('..\\..\\x', 'C:\\work\\sub', 'win32')).toBe('C:\\x')
+  })
+
+  it('★同一串在 posix 下是**相对路径**（反斜杠只是普通字符）—— 不能"看到反斜杠就当 Windows"', () => {
+    expect(resolvePath('\\\\srv\\share\\x', '/tmp/work', 'posix')).toBe('/tmp/work/\\\\srv\\share\\x')
+  })
+})
+
+describe('P0-6 isWithinRoot：UNC / 盘符 / 大小写', () => {
+  it('UNC：share 自身与 share 内的子路径 ⇒ true', () => {
+    expect(isWithinRoot('\\\\srv\\share', '\\\\srv\\share', 'win32')).toBe(true)
+    expect(isWithinRoot('\\\\srv\\share\\a\\b', '\\\\srv\\share\\a', 'win32')).toBe(true)
+  })
+
+  it('★UNC：同 server 不同 share ⇒ false（`relative` 给 `..\\..\\s2\\b`）', () => {
+    expect(isWithinRoot('\\\\srv\\s2\\b', '\\\\srv\\s1\\a', 'win32')).toBe(false)
+  })
+
+  it('★UNC：不同 server ⇒ false（`relative` 直接给绝对路径，走 isAbsolute 那一支）', () => {
+    expect(isWithinRoot('\\\\other\\share\\b', '\\\\srv\\s1\\a', 'win32')).toBe(false)
+  })
+
+  it('★盘符不同 ⇒ false', () => {
+    expect(isWithinRoot('D:\\x', 'C:\\work', 'win32')).toBe(false)
+  })
+
+  it('★大小写不敏感（Windows 默认语义，`node:path` 的 win32 已内建折叠）', () => {
+    expect(isWithinRoot('C:\\Work\\a', 'c:\\work', 'win32')).toBe(true)
+    expect(isWithinRoot('C:\\work', 'C:\\WORK', 'win32')).toBe(true)
+  })
+
+  it('★同一条在 posix 下必须相反（大小写是不同目录）—— 证明方言真被用上', () => {
+    expect(isWithinRoot('/Work/a', '/work', 'posix')).toBe(false)
+    expect(isWithinRoot('/work/A', '/work/a', 'posix')).toBe(false)
+  })
+
+  it('`..` 只认整段：win32 下 `..foo` 同样是普通目录名', () => {
+    expect(isWithinRoot('C:\\work\\..foo\\f', 'C:\\work', 'win32')).toBe(true)
+    expect(isWithinRoot('C:\\work\\..\\x', 'C:\\work', 'win32')).toBe(false)
+  })
+
+  it('兄弟前缀目录仍不算在内（win32 侧同样成立）', () => {
+    expect(isWithinRoot('C:\\work-other\\a', 'C:\\work', 'win32')).toBe(false)
+  })
+})
+
+describe('P0-6 isWithinCwd：注入 realpath ⇒ 纯函数，不必真机 Windows', () => {
+  // 模拟"真实路径"：只做大小写折叠（Windows 上 `C:\Work` 与 `c:\work` 是同一处）
+  const lower = (p: string): string => p.toLowerCase()
+  // 模拟 macOS 上问 `C:\...`：必然 ENOENT ⇒ 上溯到盘根后退回字符串口径
+  const enoent = (): string => { throw new Error('ENOENT') }
+
+  it('UNC：cwd 内 ⇒ true', () => {
+    const cwd = '\\\\srv\\share\\proj'
+    expect(isWithinCwd('\\\\srv\\share\\proj\\a.txt', cwd, { dialect: 'win32', realpath: lower })).toBe(true)
+    expect(isWithinCwd(cwd, cwd, { dialect: 'win32', realpath: lower })).toBe(true)
+  })
+
+  it('★UNC：跨 share / 跨 server ⇒ false（沙箱边界不会被 UNC 绕开）', () => {
+    const cwd = '\\\\srv\\share\\proj'
+    expect(isWithinCwd('\\\\srv\\share2\\a.txt', cwd, { dialect: 'win32', realpath: lower })).toBe(false)
+    expect(isWithinCwd('\\\\other\\share\\proj\\a.txt', cwd, { dialect: 'win32', realpath: lower })).toBe(false)
+  })
+
+  it('★大小写经 realpath 归一后仍在 cwd 内（Windows 上这确实是同一个目录）', () => {
+    expect(isWithinCwd('C:\\WORK\\A.TXT', 'c:\\work', { dialect: 'win32', realpath: lower })).toBe(true)
+  })
+
+  it('盘符不同 / 兄弟前缀 ⇒ false', () => {
+    expect(isWithinCwd('D:\\work\\a', 'C:\\work', { dialect: 'win32', realpath: lower })).toBe(false)
+    expect(isWithinCwd('C:\\work-other\\a', 'C:\\work', { dialect: 'win32', realpath: lower })).toBe(false)
+  })
+
+  it('realpath 全失败（路径还不存在）⇒ 仍按字符串口径判对，含向上越界', () => {
+    expect(isWithinCwd('C:\\work\\a\\b\\new.txt', 'C:\\work', { dialect: 'win32', realpath: enoent })).toBe(true)
+    expect(isWithinCwd('C:\\other\\x', 'C:\\work', { dialect: 'win32', realpath: enoent })).toBe(false)
+  })
+
+  it('★反面钉子：posix 下反斜杠不是分隔符 ⇒ `/tmp/work/\\srv\\share\\x` 是 cwd 内的字面文件名', () => {
+    // 与上面 win32 那条对照：同一个 `\\srv\share\x`，当它是**绝对 UNC** 时判界外，
+    // 当它是 posix 下"名字里带反斜杠的文件"时判界内 —— 结论完全由方言决定。
+    expect(isWithinCwd('/tmp/work/\\\\srv\\share\\x', '/tmp/work', { dialect: 'posix', realpath: enoent })).toBe(true)
+  })
+
+  it('★契约：两侧都必须是**绝对路径**（相对路径会被 `resolve()` 拼到 process.cwd()，不是 cwd）', () => {
+    // 这是既有行为（改造前就是 `resolve(p)`），不是本次引入的；写出来是因为它容易被误用 ——
+    // 工具层的调用顺序是「先 resolvePath(input, cwd)、再 isWithinCwd(abs, cwd)」。
+    expect(isWithinCwd('a.txt', '/tmp/work', { dialect: 'posix', realpath: enoent })).toBe(false)
+  })
+
+  it('方言缺省＝当前平台（两侧同一方言，不会一半 win32 一半 posix）', () => {
+    const d = mkTmp('fsg-dia-')
+    try {
+      expect(isWithinCwd(join(d, 'a.txt'), d)).toBe(isWithinCwd(join(d, 'a.txt'), d, { dialect: defaultPathDialect() }))
+    } finally {
+      rmSync(d, { recursive: true, force: true })
     }
   })
 })

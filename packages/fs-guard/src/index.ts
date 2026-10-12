@@ -28,10 +28,56 @@
  * 目标路径上有一环是**悬空**符号链接（指向不存在的路径）时，`realpath` 抛 ENOENT ⇒ 我们
  * 把它当作"不存在的一段"拼回去，判定结果为"在 cwd 内"。此时后续 `open` **也会失败**
  * （ENOENT），所以不构成逃逸面。真要做符号链接级强隔离，是 L2（OS 级只读绑定）的事。
+ *
+ * ## P0-6：路径语义按**平台方言**解析（2026-10-12）
+ * 改造前这里直接用 `node:path` 的**平台默认**函数（`resolve` / `relative` / `isAbsolute`…），
+ * 也就是"跑在 Windows 上就是 win32 语义、跑在别处就是 posix 语义"，**两套语义的判定无法被
+ * 单测钉住**（在 macOS 上写不出针对 UNC / 盘符的用例）。现在方言显式化：
+ * {@link PathDialect} + 每函数一个可选 `dialect`（缺省＝当前平台 ⇒ 既有行为逐位不变），
+ * 于是同一份用例能在两种语义下都跑一遍。
+ *
+ * 四条由实测（node 26 / Bun）确定的方言差异，它们正是 P0-6 要挡的东西：
+ * 1. **UNC 是绝对路径**：`win32.isAbsolute('\\\\srv\\share\\x') === true`，而
+ *    `posix.isAbsolute` 同串为 `false`（posix 上反斜杠是**普通字符**）⇒ 判定**必须**用
+ *    运行平台的口径，**不能"看到反斜杠就当 Windows"**。
+ * 2. **跨 share / 跨 server 不可相对**：`win32.relative('\\\\srv\\s1\\a', '\\\\other\\share\\b')`
+ *    返回**绝对路径**（`\\\\other\\share\\b`）⇒ `isAbsolute(rel)` 那一支要判 `false`；
+ *    而同 server 不同 share 返回 `..\\..\\s2\\b` ⇒ 由"以 `..\` 开头"那一支判 `false`。
+ * 3. **盘符不同不可相对**：`win32.relative('C:\\work', 'D:\\x')` 返回 `D:\\x`（绝对）。
+ * 4. **win32 的大小写折叠是 `node:path` 自己的行为**（`win32.relative('c:\\work','C:\\Work\\a')`
+ *    ⇒ `'a'`）⇒ 本包**不需要**再折一次，折两次反而会把 posix 侧的语义带歪。
+ *    （NTFS 可以按目录打开大小写敏感，这里取 Windows 的默认语义。）
+ *
+ * ⚠️ **未真机验证的部分**：Windows 的 `realpath` 还有 8.3 短名（`PROGRA~1`）、盘符大小写
+ * 归一、UNC 的 `\\?\\` 前缀这些形态，本机（macOS）无法覆盖 —— 这里保证的是**纯字符串判定**的
+ * 方言正确性，真机接入时应补端到端复核。
  */
 
-import { isAbsolute, resolve, relative, dirname, basename, join, sep } from 'node:path'
+import { posix, win32 } from 'node:path'
 import { realpathSync } from 'node:fs'
+
+/** `node:path` 的 posix / win32 两套实现同型（`PlatformPath` 不是它的导出名，得从 `posix` 取） */
+type PathModule = typeof posix
+
+/** 路径方言（与 `node:path` 的 `posix` / `win32` 一一对应） */
+export type PathDialect = 'posix' | 'win32'
+
+/** 按运行平台取缺省方言（`win32` 只对应 Windows 本体，不包含 Cygwin/MSYS 的 posix 形态） */
+export function defaultPathDialect(platform: string = process.platform): PathDialect {
+  return platform === 'win32' ? 'win32' : 'posix'
+}
+
+function pathFor(dialect: PathDialect): PathModule {
+  return dialect === 'win32' ? win32 : posix
+}
+
+/** 判定函数的可选参数：方言 + 可注入的 realpath（后者让纯函数用例不必碰真机路径） */
+export interface PathSemantics {
+  /** 路径方言；缺省 `defaultPathDialect()` */
+  dialect?: PathDialect
+  /** 覆盖 `realpath`（缺省 `node:fs` 的 `realpathSync`） */
+  realpath?: (p: string) => string
+}
 
 /**
  * 把路径解析为绝对路径（相对 `cwd`）。**纯字符串运算，不触碰文件系统**。
@@ -39,8 +85,13 @@ import { realpathSync } from 'node:fs'
  * 产出的是真正拿去 `open` / `stat` 的那个路径 —— 保留符号链接（不做 realpath），
  * 因为 realpath 对"还不存在的新文件"会抛错。边界判定交给 {@link isWithinCwd}。
  */
-export function resolvePath(inputPath: string, cwd: string): string {
-  return isAbsolute(inputPath) ? resolve(inputPath) : resolve(cwd, inputPath)
+export function resolvePath(
+  inputPath: string,
+  cwd: string,
+  dialect: PathDialect = defaultPathDialect(),
+): string {
+  const P = pathFor(dialect)
+  return P.isAbsolute(inputPath) ? P.resolve(inputPath) : P.resolve(cwd, inputPath)
 }
 
 /**
@@ -52,20 +103,25 @@ export function resolvePath(inputPath: string, cwd: string): string {
  *
  * 到根都取不到真实路径（极端情况：根不可达）⇒ 退回 `resolve(p)` 的结果。
  */
-export function realpathBestEffort(p: string): string {
-  const abs = resolve(p)
+export function realpathBestEffort(p: string, sem: PathSemantics = {}): string {
+  const dialect = sem.dialect ?? defaultPathDialect()
+  const P = pathFor(dialect)
+  const real = sem.realpath ?? realpathSync
+  // ⚠️ `resolve` 必须走方言（win32 下 `C:\work\a` 不能被当成相对路径拼到 `/Users/...` 后面）
+  const abs = P.resolve(p)
   let cur = abs
   const rest: string[] = []
   for (;;) {
     try {
-      const real = realpathSync(cur)
-      return rest.length === 0 ? real : join(real, ...rest)
+      const r = real(cur)
+      return rest.length === 0 ? r : P.join(r, ...rest)
     } catch {
       /* `cur` 不存在 / 不可达 ⇒ 退到上一级再试 */
     }
-    const parent = dirname(cur)
+    // win32 下 `dirname('C:\\')` / `dirname('\\\\srv\\share')` 都返回自身 ⇒ 终止条件同样成立
+    const parent = P.dirname(cur)
     if (parent === cur) return abs // 到根了还是没有 ⇒ 退回 resolve 结果
-    rest.unshift(basename(cur))
+    rest.unshift(P.basename(cur))
     cur = parent
   }
 }
@@ -79,11 +135,17 @@ export function realpathBestEffort(p: string): string {
  * - `..` 只认**整段**：`root=/a/b` 时 `/a/b/..foo` 是 `..foo` 段，**算在内部**
  *   （老实现用 `startsWith('..')`，会把 `..foo` 误判成越界 —— 一个只会误杀的假阳性）。
  */
-export function isWithinRoot(p: string, root: string): boolean {
-  const rel = relative(root, p)
+export function isWithinRoot(
+  p: string,
+  root: string,
+  dialect: PathDialect = defaultPathDialect(),
+): boolean {
+  const P = pathFor(dialect)
+  const rel = P.relative(root, p)
   if (rel === '') return true // 就是根本身
-  if (isAbsolute(rel)) return false // 不同盘符 / 根（Windows）
-  return rel !== '..' && !rel.startsWith(`..${sep}`)
+  // 不同盘符 / 不同 UNC server / 不同 share（win32 下这些都给绝对路径）
+  if (P.isAbsolute(rel)) return false
+  return rel !== '..' && !rel.startsWith(`..${P.sep}`)
 }
 
 /**
@@ -91,9 +153,21 @@ export function isWithinRoot(p: string, root: string): boolean {
  *
  * 两侧都取真实路径 ⇒ 一条 `ln -s /etc secret` 之后 `secret/passwd` 会被判成**界外**，
  * 而不是像改造前那样"字符串看着在里头，`open` 却读了外面"。
+ *
+ * P0-6：方言与 `realpath` 都可注入（缺省＝当前平台 + 真 `realpathSync` ⇒ 既有行为逐位不变）。
+ * ⚠️ 两侧**必须同一方言**：拿 win32 的路径去问 posix 的 `relative`，会把 `\\srv\share\x`
+ * 当成 cwd 里的普通文件名而判"在内"（实测 `posix.resolve` 就是这么干的）。
+ * ⚠️ 两侧还都必须是**绝对路径**（这是既有契约）：`realpathBestEffort` 内部是 `resolve(p)`，
+ * 相对路径会被拼到 **`process.cwd()`** 而不是这里的 `cwd`。工具层的顺序是
+ * 「先 `resolvePath(input, cwd)`、再 `isWithinCwd(abs, cwd)`」。
  */
-export function isWithinCwd(filePath: string, cwd: string): boolean {
-  return isWithinRoot(realpathBestEffort(filePath), realpathBestEffort(cwd))
+export function isWithinCwd(filePath: string, cwd: string, sem: PathSemantics = {}): boolean {
+  const dialect = sem.dialect ?? defaultPathDialect()
+  return isWithinRoot(
+    realpathBestEffort(filePath, { ...sem, dialect }),
+    realpathBestEffort(cwd, { ...sem, dialect }),
+    dialect,
+  )
 }
 
 // ============================================================================
