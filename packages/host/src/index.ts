@@ -51,6 +51,19 @@ export type { PluginLoadResult, BuiltinGeneralPlugin } from './plugins'
 // P1-5：插件代码静态扫描（纯函数 —— 判定归这里，装配在 `./plugins.ts` 的 loadPluginDirs 里）
 export { PLUGIN_CODE_RULES, scanPluginCode, formatPluginScanFindings } from './plugin-scan'
 export type { PluginCodeFinding } from './plugin-scan'
+// P1-5：插件装载后端（worker = 资源与故障边界，**不是安全边界**）与能力面收窄
+export { loadPluginsInWorker } from './plugin-runner'
+export type { WorkerLoadOutcome, WorkerLoadOptions } from './plugin-runner'
+export { describePluginExports, PLUGIN_WORKER_DEFAULT_MEMORY_MB, PLUGIN_WORKER_DEFAULT_TIMEOUT_MS } from './plugin-worker-protocol'
+export type { PluginExportSummary, PluginWorkerRequest, PluginWorkerResponse } from './plugin-worker-protocol'
+export {
+  PLUGIN_CAPABILITIES,
+  applyPluginCapabilities,
+  formatCapabilityGrant,
+  narrowPluginContext,
+  resolvePluginCapabilities,
+} from './plugin-context'
+export type { PluginCapability, PluginCapabilityTable } from './plugin-context'
 
 
 // ========================================================================

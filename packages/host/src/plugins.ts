@@ -38,6 +38,16 @@ import type { IsolationLevel, OsBinding } from '@harness/isolation'
 export interface PluginLoadResult {
   /** 从插件目录加载出的通用 AgentPlugin（非 Provider 专用，参与 Hooks 生命周期） */
   plugins: AgentPlugin[]
+  /**
+   * worker 装载模式的产物（P1-5）：**只登记、不装载**。
+   *
+   * worker 模式下 `plugins` 恒为空 —— 跨线程拿不到函数（`install` / hooks 都是函数），
+   * 硬接会得到"看起来装了、实际没生效"的插件。这里回的是可序列化的插件摘要，
+   * 供 `/plugins` 之类的展示与装配期审计。
+   */
+  summaries?: PluginExportSummary[]
+  /** worker 模式下的装载失败（每个文件一条；**不回退到 in-process**，见 `./plugin-runner.ts`） */
+  workerFailures?: Array<{ file: string; error: string }>
 }
 
 /** 探测一个值是否为合法的 AgentPlugin（id + install） */
@@ -132,6 +142,18 @@ export async function loadPluginDirs(
      * 缺省 `'warn'` —— 只在开闸后生效，且**只预警不拦截**（见 `./plugin-scan.ts` 文件头）。
      */
     pluginCodeScan?: 'warn' | 'refuse' | 'off'
+    /**
+     * P1-5：装载后端。`'in-process'`（缺省，逐位等于改造前）/ `'worker'`（**资源与故障边界**）。
+     * ⚠️ worker **不是安全边界**（实测：env / pid / fs 与宿主一致），且只登记不装载 hooks
+     * —— 两句话都写在 `./plugin-runner.ts` 文件头，改这里前先读它。
+     */
+    runner?: 'in-process' | 'worker'
+    /** worker 模式的内存上限（MB）；`0` = 不限 */
+    workerMemoryMb?: number
+    /** worker 模式的装载超时（ms）；`0` = 不限 */
+    workerTimeoutMs?: number
+    /** P1-5：能力面收窄表（按插件 id；`'*'` 为默认模板）。缺省 = 四通道全给 */
+    capabilities?: PluginCapabilityTable
   } = {},
 ): Promise<PluginLoadResult> {
   const out = log ?? ((s: string) => { if (typeof process !== 'undefined') process.stderr.write(s + '\n') })
@@ -168,6 +190,57 @@ export async function loadPluginDirs(
   // 通用插件按 id 去重：后加载覆盖先加载（project 覆盖 user，扫描顺序即覆盖顺序）
   const byId = new Map<string, AgentPlugin>()
   const scanMode = opts.pluginCodeScan ?? 'warn'
+
+  // ---- P1-5：worker 装载路径（资源与故障边界；只登记不装载）----
+  if (opts.runner === 'worker') {
+    const outcomes = await loadPluginsInWorker(items.map((it) => it.full), {
+      memoryMb: opts.workerMemoryMb,
+      timeoutMs: opts.workerTimeoutMs,
+    })
+    const summaries: PluginExportSummary[] = []
+    const workerFailures: Array<{ file: string; error: string }> = []
+    for (const o of outcomes) {
+      if (o.findings.length) {
+        if (scanMode === 'refuse') {
+          emit(
+            makeNotice('plugins.code-refused', { file: o.file, items: o.findings }),
+            () => {
+              out(`已拒绝加载插件代码 ${o.file}（命中静态扫描规则，sandbox.pluginCodeScan="refuse"）：\n`)
+              for (const l of o.findings) out(`  - ${l}\n`)
+            },
+          )
+          continue
+        }
+        if (scanMode !== 'off') {
+          emit(
+            makeNotice('plugins.code-scan', { file: o.file, items: o.findings }),
+            () => {
+              out(`插件代码 ${o.file} 命中静态扫描规则（**预警不是边界**）：\n`)
+              for (const l of o.findings) out(`  - ${l}\n`)
+            },
+          )
+        }
+      }
+      if (o.error) {
+        workerFailures.push({ file: o.file, error: o.error })
+        emit(
+          makeNotice('plugins.worker-failed', { file: o.file, error: o.error }),
+          () => { out(`worker 装载失败 ${o.file}：${o.error}\n`) },
+        )
+        continue
+      }
+      summaries.push(...o.summaries)
+    }
+    emit(
+      makeNotice('plugins.worker-loaded', { count: summaries.length, ids: summaries.map((x) => x.id) }),
+      () => {
+        out(`worker 模式：已登记 ${summaries.length} 个插件（**只登记不装载** —— worker 拿不到 hooks，`
+          + `要参与循环请用 sandbox.pluginRunner="in-process"）\n`)
+      },
+    )
+    return { plugins: [], summaries, workerFailures }
+  }
+
   for (const item of items) {
     const full = item.full
     // P1-5：开闸＝进程内全权，至少在**装载之前**把命中的危险调用摆出来。
@@ -201,8 +274,8 @@ export async function loadPluginDirs(
     }
     try {
       const mod = (await import(pathToFileURL(full).href)) as Record<string, unknown>
-      // 1) 通用 AgentPlugin
-      for (const p of collectAgentPlugins(mod)) byId.set(p.id, p)
+      // 1) 通用 AgentPlugin（P1-5：按能力表收窄 install 收到的 ctx）
+      for (const p of collectAgentPlugins(mod)) byId.set(p.id, applyPluginCapabilities(p, opts.capabilities))
       // 2) Provider 类型工厂
       registerProviderTypeFactory(registry, mod, full, out, opts.onNotice)
     } catch (err) {
@@ -240,6 +313,9 @@ export async function loadPluginDirs(
 
 import { lazyImport } from './lazy'
 import { formatPluginScanFindings, scanPluginCode, type PluginCodeFinding } from './plugin-scan'
+import { type PluginExportSummary } from './plugin-worker-protocol'
+import { loadPluginsInWorker } from './plugin-runner'
+import { applyPluginCapabilities, type PluginCapabilityTable } from './plugin-context'
 
 // 统一惰性加载入口已单独成文件（`./lazy.ts`）：`./config.ts` 与 `./provider.ts` 都要用它，
 // 留在本文件会让它们反向 import index 而形成环。这里 import + re-export 保持导出面不变。

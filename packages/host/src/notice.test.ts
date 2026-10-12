@@ -180,6 +180,8 @@ describe('renderNotice：逐条字节快照（S2 的逐字不变判据）', () =
       ['config.compaction-inactive', { items: [] }],
       ['config.sandbox-inactive', { items: [] }],
       ['plugins.code-scan', { file: '/p/x.ts', items: [] }],
+      ['plugins.worker-loaded', { count: 1, ids: ['a'] }],
+      ['plugins.worker-failed', { file: '/p/x.ts', error: 'e' }],
       ['plugins.code-refused', { file: '/p/x.ts', items: [] }],
       ['config.mcp-inactive', { items: [] }],
       ['sandbox.isolation-degraded', { level: 'L1', required: 'L2', reasons: [] }],

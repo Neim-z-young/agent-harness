@@ -60,6 +60,16 @@ export interface NoticePayloads {
   'plugins.code-scan': { file: string; items: string[] }
   /** 扫描命中且 `sandbox.pluginCodeScan="refuse"` ⇒ 该文件不加载 */
   'plugins.code-refused': { file: string; items: string[] }
+  /**
+   * worker 装载模式（P1-5）的登记结果。**文案必须说清"只登记不装载"** ——
+   * 否则用户以为插件生效了，而在 agent 循环里它根本不在。
+   */
+  'plugins.worker-loaded': { count: number; ids: string[] }
+  /**
+   * worker 装载失败（P1-5）：起不来 / 超时 / 装载期 OOM / 模块报错。
+   * ★这里**不回退到 in-process** —— 用户要求收窄却拿到最宽的那条路，是最坏的一种降级。
+   */
+  'plugins.worker-failed': { file: string; error: string }
 
   // ── 配置校验（前两条随后 throw）──
   'config.providers-invalid': { issues: string[] }
@@ -129,6 +139,8 @@ export const NOTICE_LEVEL: { readonly [C in NoticeCode]: NoticeLevel } = {
   'plugins.not-a-plugin': 'notice',
   'plugins.code-scan': 'warn',
   'plugins.code-refused': 'warn',
+  'plugins.worker-loaded': 'log',
+  'plugins.worker-failed': 'warn',
   'config.providers-invalid': 'notice',
   'config.secret-unresolved': 'notice',
   'provider.construct-failed': 'notice',
@@ -203,6 +215,22 @@ export function renderNotice(n: HostNotice): string {
         ...n.data.items.map((m) => `  - ${m}\n`),
         '  ⚠️ 这是**预警不是边界**：正则挡不住刻意绕过的写法。要真正的边界得等 worker / WASI。\n',
         '  不想看到这些告警：config.json → sandbox.pluginCodeScan（warn / refuse / off）。\n',
+      )
+
+    case 'plugins.worker-loaded':
+      return outLines(
+        `worker 模式：已登记 ${n.data.count} 个插件（${n.data.ids.join(' / ') || '无'}）\n`,
+        '  ⚠️ **只登记不装载** —— worker 线程里拿不到 hooks（跨线程同步回调要完整 RPC 桥，是后续项），\n',
+        '    所以这些插件**不参与 agent 循环**。要参与请用 sandbox.pluginRunner="in-process"。\n',
+        '  另：worker 给的是**资源与故障边界**（内存上限 / 不阻塞主线程 / 崩溃不拖垮宿主），\n',
+        '    **不是安全边界** —— 实测 worker 内 env / pid / 文件系统与宿主完全一致。\n',
+      )
+
+    case 'plugins.worker-failed':
+      return outLines(
+        `[WARN] worker 装载失败：${n.data.file}\n`,
+        `       原因：${n.data.error}\n`,
+        '  （**不会回退到 in-process** —— 要求收窄却拿到最宽的那条路是最坏的降级；该插件已跳过）\n',
       )
 
     case 'plugins.code-refused':

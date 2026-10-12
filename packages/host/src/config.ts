@@ -177,6 +177,25 @@ export interface SandboxSection {
    * 只在 `allowPluginCode` 开闸后才扫（没开闸根本不加载，扫它没意义）。
    */
   pluginCodeScan?: 'warn' | 'refuse' | 'off'
+  /**
+   * **插件装载后端**（P1-5）：`'in-process'`（默认，逐位等于改造前）/ `'worker'`。
+   *
+   * worker 给的是**资源与故障边界**（内存上限 / 加载期死循环不阻塞主线程 / 加载崩溃不拖垮宿主），
+   * ⚠️ **不是安全边界**（实测：worker 内 `process.env` / `pid` / 文件系统与宿主完全一致）；且
+   * worker 模式**只登记不装载**（跨线程拿不到 hooks）。改这个值前先读 `host/src/plugin-runner.ts` 的文件头。
+   */
+  pluginRunner?: 'in-process' | 'worker'
+  /** worker 模式的内存上限（MB，默认 256）；`0` = 不限制 */
+  pluginWorkerMemoryMb?: number
+  /** worker 模式的装载超时（ms，默认 10000）；`0` = 不限制 */
+  pluginWorkerTimeoutMs?: number
+  /**
+   * **插件能力面收窄**（P1-5）：按插件 id 声明它允许用 `ctx` 的哪几件
+   * （`bus` / `config` / `log` / `workspace`），键 `"*"` 作默认模板。未声明的通道**取用即抛**。
+   *
+   * ⚠️ 这是**授予面收窄，不是安全边界**（插件仍能 `import('node:fs')`）。缺省 = 四通道全给。
+   */
+  pluginCapabilities?: Record<string, Array<'bus' | 'config' | 'log' | 'workspace'>>
 }
 
 /**
@@ -1210,6 +1229,10 @@ const SANDBOX_KEYS: Record<keyof NonNullable<HarnessConfig['sandbox']>, true> = 
   netAllow: true,
   osBinding: true,
   pluginCodeScan: true,
+  pluginRunner: true,
+  pluginWorkerMemoryMb: true,
+  pluginWorkerTimeoutMs: true,
+  pluginCapabilities: true,
 }
 
 /**
@@ -1277,6 +1300,27 @@ export function checkSandboxConfig(c: unknown): string[] {
   // P1-5：扫描档位写错值 ⇒ 静默退回默认，必须出声
   if (c.pluginCodeScan !== undefined && !['warn', 'refuse', 'off'].includes(String(c.pluginCodeScan))) {
     out.push(`sandbox.pluginCodeScan="${String(c.pluginCodeScan)}" 不是合法取值（warn / refuse / off），运行期按 warn 处理`)
+  }
+  // P1-5：装载后端取值必须能识别（写错会静默退回 in-process —— 而 in-process 是最宽的那条）
+  if (c.pluginRunner !== undefined && c.pluginRunner !== 'in-process' && c.pluginRunner !== 'worker') {
+    out.push(`sandbox.pluginRunner="${String(c.pluginRunner)}" 不是合法取值（in-process / worker），运行期按 in-process 处理`)
+  }
+  // P1-5：能力表里写了不认识的能力名 ⇒ 该项不生效（静默收窄失败，必须出声）
+  if (isPlainObject(c.pluginCapabilities)) {
+    const known = ['bus', 'config', 'log', 'workspace']
+    for (const [pid, caps] of Object.entries(c.pluginCapabilities)) {
+      if (!Array.isArray(caps)) {
+        out.push(`sandbox.pluginCapabilities["${pid}"] 不是数组，该条目被忽略（插件将拿到四通道全给）`)
+        continue
+      }
+      const bad = caps.filter((x) => !known.includes(String(x)))
+      if (bad.length) {
+        out.push(`sandbox.pluginCapabilities["${pid}"] 含未知能力 ${bad.join(' / ')}（可选：${known.join(' / ')}），该项不生效`)
+      }
+    }
+  }
+  if (c.pluginWorkerMemoryMb !== undefined && (typeof c.pluginWorkerMemoryMb !== 'number' || c.pluginWorkerMemoryMb < 0)) {
+    out.push(`sandbox.pluginWorkerMemoryMb 应为非负数（MB，0 = 不限制），收到 ${JSON.stringify(c.pluginWorkerMemoryMb)}`)
   }
   // 要求 L2 却没开 osBinding ⇒ 一定达不到（原语不给用）
   if (c.level === 'L2' && c.osBinding !== 'on') {

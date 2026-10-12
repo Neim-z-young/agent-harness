@@ -100,6 +100,72 @@ describe('loadPluginDirs：代码注入闸门', () => {
     expect((refused!.data as { file: string }).file).toContain('risky.ts')
   })
 
+  it('★P1-5 runner="worker"：只登记不装载（plugins 为空 + summaries 有内容），并说清"不参与循环"', async () => {
+    const pluginDir = join(dir, 'wrunner', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'w.ts'), `
+      export const plugins = [{ id: 'ext.w', version: '2.0.0', name: 'W' }]
+    `)
+
+    const notes: { code: string; data: unknown }[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, {
+      allowCode: true,
+      runner: 'worker',
+      onNotice: (n) => notes.push(n as never),
+    })
+
+    expect(result.plugins).toEqual([]) // worker 拿不到函数 ⇒ 不装载
+    expect(result.summaries!.map((x) => x.id)).toEqual(['ext.w'])
+    expect(result.summaries![0]!.version).toBe('2.0.0')
+    expect(notes.some((n) => n.code === 'plugins.worker-loaded')).toBe(true)
+  })
+
+  it('★P1-5 runner="worker"：加载期炸掉的插件**不回退 in-process**，只记进 workerFailures', async () => {
+    const pluginDir = join(dir, 'wboom', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'boom.ts'), `throw new Error('load-time boom')`)
+    writeFileSync(join(pluginDir, 'ok.ts'), `export const plugins = [{ id: 'ext.ok', version: '1' }]`)
+
+    const notes: { code: string; data: unknown }[] = []
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, {
+      allowCode: true,
+      runner: 'worker',
+      onNotice: (n) => notes.push(n as never),
+    })
+
+    expect(result.plugins).toEqual([])
+    expect(result.summaries!.map((x) => x.id)).toEqual(['ext.ok'])
+    expect(result.workerFailures).toHaveLength(1)
+    expect(result.workerFailures![0]!.error).toContain('load-time boom')
+    expect(notes.some((n) => n.code === 'plugins.worker-failed')).toBe(true)
+  })
+
+  it('★P1-5 capabilities：in-process 装载时 install 收到**收窄后的 ctx**', async () => {
+    const pluginDir = join(dir, 'caps', 'plugins')
+    mkdirSync(pluginDir, { recursive: true })
+    writeFileSync(join(pluginDir, 'c.ts'), `
+      let sawBus = 'unset'
+      export const plugins = [{
+        id: 'ext.caps', version: '1', name: 'C',
+        async install(ctx) { try { void ctx.bus; sawBus = 'ok' } catch (e) { sawBus = 'denied' } },
+      }]
+      export const probe = () => sawBus
+    `)
+
+    const result = await loadPluginDirs(new ProviderTypeRegistry(), [pluginDir], undefined, {
+      allowCode: true,
+      capabilities: { 'ext.caps': ['log'] },
+    })
+    const p = result.plugins.find((x) => x.id === 'ext.caps')!
+    const hooks = await p.install({
+      bus: {} as never, config: { get: () => undefined, set: () => {} },
+      log: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    } as never)
+    expect(hooks).toBeUndefined()
+    const mod = (await import(join(pluginDir, 'c.ts'))) as unknown as { probe: () => string }
+    expect(mod.probe()).toBe('denied') // 未授予 bus ⇒ 取用即抛
+  })
+
   it('★P1-5：pluginCodeScan="off" ⇒ 不扫、不出告警（但这个开关本身不是安全边界）', async () => {
     const pluginDir = join(dir, 'scanoff', 'plugins')
     mkdirSync(pluginDir, { recursive: true })

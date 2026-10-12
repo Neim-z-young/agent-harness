@@ -844,6 +844,11 @@ export class HarnessHost {
       allowCode: this.options.allowPluginCode ?? cfg.allowPluginCode ?? false,
       // P1-5：开闸后的静态扫描档位（缺省 warn —— 只预警不拦截，见 plugin-scan.ts）
       pluginCodeScan: cfg.sandbox?.pluginCodeScan ?? 'warn',
+      // P1-5：装载后端 + 能力面收窄（缺省 in-process / 四通道全给 = 逐位等于改造前）
+      runner: cfg.sandbox?.pluginRunner ?? 'in-process',
+      workerMemoryMb: cfg.sandbox?.pluginWorkerMemoryMb,
+      workerTimeoutMs: cfg.sandbox?.pluginWorkerTimeoutMs,
+      capabilities: cfg.sandbox?.pluginCapabilities,
       // 装配期诊断改走结构化出口（文案字节由 renderNotice 复刻，逐字不变）
       onNotice: (n) => this.emitNotice(n),
     })
