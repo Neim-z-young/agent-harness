@@ -18,6 +18,9 @@ on:
   push:
     branches: [main, master]
   pull_request:
+  # 手动触发：P3-1 / P3-2 / P3-3 那批**只能在 Windows 上验**，需要一个"现在就跑一次"的入口
+  # （否则每次都得造一个提交来触发 push 事件）
+  workflow_dispatch:
 
 # 同一分支连续推送时取消上一次 —— 矩阵三份跑起来不便宜
 concurrency:
@@ -50,10 +53,16 @@ jobs:
 
       # Windows 上 shell 显式指定 bash：runner 默认是 pwsh，而脚本与
       # `bun --filter=*` 的输出解析（grep -oE）都是 POSIX 口径
+      # ⚠️ 日志路径用**相对工作目录**，不要写 `/tmp`：
+      # `bash` 步骤里的 `/tmp` 会被 MSYS 映射到别处，而 `upload-artifact`（Node 实现、不经 MSYS）
+      # 看到的是字面 `/tmp/...` ⇒ **Windows 上 artifact 永远为空**（`if-no-files-found: ignore` 会静默跳过）
+      # —— 而 Windows 恰恰是最需要那份日志的平台。相对路径两平台都明确。
       - name: 测试（含汇总 / 阈值判定）
         shell: bash
-        run: bash scripts/ci/test-summary.sh /tmp/harness-ci-test.log "${{ runner.os }}"
+        run: bash scripts/ci/test-summary.sh ./harness-ci-test.log "${{ runner.os }}"
         # 只有 Windows 允许非零退出（平台差异白名单，见文件头）；失败条数仍进 summary
+        # ⚠️ 取舍：这一步会把 **Windows 的真回归也一起吞掉**（job 仍绿）。因此第一次跑通后，
+        # 应当把 Windows 的 `continue-on-error` 收窄（或至少每次人工看 summary / artifact）。
         continue-on-error: ${{ matrix.os == 'windows-latest' }}
 
       - name: 上传测试日志
@@ -61,6 +70,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: test-log-${{ matrix.os }}
-          path: /tmp/harness-ci-test.log
-          if-no-files-found: ignore
+          path: harness-ci-test.log
+          if-no-files-found: warn
           retention-days: 7
