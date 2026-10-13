@@ -1426,6 +1426,68 @@ describe('TuiApp 集成（mock provider）', () => {
     await f.cleanup()
   })
 
+  it('权限审批模态：键位图例只渲染一次（回归：卡片自带一份 + 宿主再渲染一份 = 两行）', async () => {
+    const f = await mountTui({
+      permissionMode: 'ask',
+      responses: [
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'echo ok' } }] },
+        { match: 'hi', response: '已完成' },
+      ],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKeys(['h', 'i'])
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (frame) => frame.includes('权限审批'))
+    // 真机症状：`[y] 允许 … [Shift-n] 始终拒绝` 出现两次。修后由宿主唯一渲染。
+    expect(frame.split('始终拒绝').length - 1).toBe(1)
+    f.setup.mockInput.pressKey('y')
+    await f.cleanup()
+  })
+
+  // 说明：审批挂起时按 Ctrl-C 也走 abortCurrent（键盘可中断），但 **mock 渲染器对 0x03
+  // 会清空帧缓冲**（同一 abort 路径用鼠标点击「■ 终止」触发则帧正常），故该路径无法用帧断言，
+  // 其行为由下面这条鼠标用例覆盖（两者共用同一个 abortCurrent）。
+
+  it('权限审批模态：点「■ 终止」立即关模态并中断（挂起的审批被结算为 deny）', async () => {
+    const f = await mountTui({
+      permissionMode: 'ask',
+      responses: [
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: 'echo ok' } }] },
+        { match: 'hi', response: '已完成' },
+      ],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKeys(['h', 'i'])
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (frame) => frame.includes('权限审批') && frame.includes('■ 终止'))
+    const pos = locateChar(frame, '■ 终止')
+    expect(pos).not.toBeNull()
+    await f.setup.mockMouse.click(pos!.x, pos!.y)
+    await waitFrame(f.setup, (frame) => !frame.includes('权限审批') && frame.includes('已请求中断'))
+    await f.cleanup()
+  })
+
+  it('权限审批模态：长入参不占满整屏（内容区限高滚动，键位行仍在视口内）', async () => {
+    // 4000 字符的单值入参：不限高时会把卡片撑到 ~58 行，键位行/输入行被挤出 24 行视口
+    const longCmd = 'echo ' + 'x'.repeat(4000)
+    const f = await mountTui({
+      permissionMode: 'ask',
+      responses: [
+        { match: 'hi', once: true, response: '', toolCalls: [{ toolUseId: 'b1', toolId: 'bash', input: { command: longCmd } }] },
+        { match: 'hi', response: '已完成' },
+      ],
+    })
+    await waitFrame(f.setup, (frame) => frame.includes('会话上下文'))
+    f.setup.mockInput.pressKeys(['h', 'i'])
+    pressSubmit(f.setup)
+    const frame = await waitFrame(f.setup, (frame) => frame.includes('权限审批'))
+    // 键位行必须**仍在视口内**（内容被限高滚动，标题/键位留在滚动区之外）
+    expect(frame).toInclude('始终拒绝')
+    expect(frame.split('始终拒绝').length - 1).toBe(1)
+    f.setup.mockInput.pressKey('n')
+    await f.cleanup()
+  })
+
   it('approvalLine 提炼权限问题主行', () => {
     expect(approvalLine('\n⚠️ 权限请求 [bash] /etc/passwd\n  操作: allow / deny ... ')).toBe('⚠️ 权限请求 [bash] /etc/passwd')
     expect(approvalLine('  权限请求 [write] src/x.ts  ')).toBe('权限请求 [write] src/x.ts')

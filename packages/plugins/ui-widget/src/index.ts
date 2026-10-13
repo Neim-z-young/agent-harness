@@ -219,8 +219,10 @@ export const WIDGET_RENDERERS: Record<string, WidgetRenderer> = {
         typeof w.historyCount === 'number' && w.historyCount > 0
           ? `  本次会话同类操作已执行 ${w.historyCount} 次`
           : '  本次会话首次执行该操作'
-      const keys = '  [y] 允许    [n] 拒绝    [Shift-y] 始终允许    [Shift-n] 始终拒绝'
-      return [head, ...rows, hist, keys].join('\n')
+      // 键位图例**不在这里输出**：它是"宿主怎么应答这次询问"，属于宿主职责。
+      // TUI 的审批模态会在卡片下方统一渲染一行（回退到纯文本时也一样），
+      // 此前两端各写一份 ⇒ 真机同一行出现两次（卡片尾部一次 + 模态底部一次）。
+      return [head, ...rows, hist].join('\n')
     },
     renderText(props) {
       const w = props as unknown as DecisionCardWidget

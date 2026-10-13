@@ -96,7 +96,7 @@ describe('渲染器注册表', () => {
     expect(renderWidgetText('timeline', props)).toBe('[Timeline] 2 步 · 有失败')
   })
 
-  it('decision-card：风险标签 + 参数表格 + 历史 + 按键提示', () => {
+  it('decision-card：风险标签 + 参数表格 + 历史（键位图例由宿主渲染）', () => {
     const props = {
       tool: 'bash',
       riskLevel: 'high',
@@ -110,7 +110,9 @@ describe('渲染器注册表', () => {
     expect(out).toInclude('权限请求 [bash] rm -rf /tmp/x')
     expect(out).toInclude('command: rm -rf /tmp/x')
     expect(out).toInclude('已执行 2 次')
-    expect(out).toInclude('[y] 允许')
+    // 键位图例**不属于卡片**：卡片只描述"这次决策是什么"，"怎么应答"由宿主渲染
+    // （TUI 审批模态在卡片下方统一输出一行）。卡片此前自带一份 ⇒ 与宿主那份重复成两行。
+    expect(out).not.toInclude('[y] 允许')
     expect(renderWidgetText('decision-card', props)).toBe('[决策卡] bash · high风险 · 已执行2次')
   })
   it('decision-card：首次执行提示 + 中风险默认标签', () => {

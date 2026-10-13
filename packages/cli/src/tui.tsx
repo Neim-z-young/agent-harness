@@ -113,6 +113,27 @@ const SIDEBAR_WIDTH = 26
  */
 const SIDEBAR_SCROLLBAR_OPTIONS = { trackOptions: { foregroundColor: '#8b93a1' } } as const
 
+/**
+ * 权限审批模态**内容区**的最大高度（单元格）。
+ *
+ * 为什么必须限高：审批卡片的入参表格可能是任意长的单值（`write_file` 的 content、
+ * 长命令行），不加限制会把整个屏幕占满、把对话与输入行挤出视口。超过此高度时
+ * 内容区内部滚动（标题行与键位图例留在滚动区外，始终可见）。
+ */
+const APPROVAL_MAX_HEIGHT = 12
+
+/**
+ * 估算审批内容体的**可视行数**（按 ~72 列折行）。
+ * 只用于"要不要给滚动容器"这一个判断，不追求精确 —— 宁可早一点判定为溢出
+ * （多套一层滚动容器顶多多一条滚动条），也不要漏判（内容顶出屏幕）。
+ */
+function estimateApprovalLines(text: string): number {
+  const width = 72
+  let n = 0
+  for (const line of text.split('\n')) n += Math.max(1, Math.ceil(line.length / width))
+  return n
+}
+
 /** 选区闪烁周期（ms）。450ms 接近终端光标闪烁节奏：够显眼又不晃眼 */
 export const SELECTION_BLINK_MS = 450
 /** 选区闪烁的两套配色（A 亮黄底黑字 / B 暗灰底浅字，交替即"闪"） */
@@ -1240,14 +1261,31 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       })
       .catch(() => {})
   }, [options.app])
+  // 结算「挂起中」的审批询问：以 `deny` 让 asker 的 Promise settle，并清掉模态。
+  //
+  // 为什么不能只清模态状态：权限询问发生在**工具执行前**，此刻查询正停在引擎内的
+  // `await asker(...)` 上。只 abort 控制器**不会** settle 这个 Promise —— 引擎既不前进、
+  // 模态也无人置空，表现为真机那两种症状：点「■ 终止」像是没反应、审批框一直挂着。
+  // 以 deny 结算后，引擎继续走（该工具被拒），随即在下一个中断检查点看到 aborted 而收尾。
+  const cancelPendingApproval = useCallback(() => {
+    const resolve = approvalResolveRef.current
+    if (resolve) {
+      approvalResolveRef.current = null
+      resolve('deny')
+    }
+    setApprovalQ(null)
+    setApprovalCard(null)
+  }, [])
   // 运行中强制终止（点击「■ 终止」按钮 / Ctrl-C 共用）：abort 当前查询，已完成的步骤保留
   const abortCurrent = useCallback(() => {
     const ctl = abortCtlRef.current.current
     if (ctl) {
       ctl.abort()
+      // 先解开可能挂起的审批询问（见 cancelPendingApproval），否则上面那句等于空转
+      cancelPendingApproval()
       setState((prev) => pushConsole(prev, '\n⏹️  已请求中断，正在停止…（已完成的步骤会保留）\n'))
     }
-  }, [])
+  }, [cancelPendingApproval])
   // 工具token归并状态：暂存本轮 LLM 用量，仅归并到紧随的第一个工具
   const pendingToolAttrRef = useRef<{ input: number; output: number } | null>(null)
   const toolAttributedRef = useRef(false)
@@ -1827,6 +1865,22 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       setHelpOpen(false)
       return true
     }
+    // Ctrl-C：执行中 ⇒ 中断本次查询（含"正停在审批询问上"的情形，见 abortCurrent）；
+    // 空闲 ⇒ 退出。**刻意放在审批模态之前** —— 否则审批期间 Ctrl-C 会被下面那句
+    // 无条件吞掉，键盘就再没有任何中断手段（只剩鼠标点「■ 终止」）。
+    // 与 REPL 的 SIGINT 语义一致。
+    if (key.ctrl && key.name === 'c') {
+      if (abortCtlRef.current.current) {
+        abortCurrent()
+        return true
+      }
+      // 审批挂起、但查询句柄已清（异常路径）：至少关掉模态，别顺手退出进程
+      if (approvalQ !== null) {
+        cancelPendingApproval()
+        return true
+      }
+      return finish('exit')
+    }
     // 模块 E：命令审批模态 —— 审批期间吞掉所有按键，仅响应审批选项
     if (approvalQ !== null) {
       const submitApproval = (ans: PermissionAnswer) => {
@@ -1840,17 +1894,6 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
       else if (key.shift && key.name === 'y') submitApproval('always-allow')     // 始终允许
       else if (key.shift && key.name === 'n') submitApproval('always-deny')      // 始终拒绝
       return true // 其余按键在审批中一律吞掉
-    }
-    if (key.ctrl && key.name === 'c') {
-      // 执行中 ⇒ 中断本次查询（引擎在步边界与每个工具执行前响应，已完成的部分保留）；
-      // 空闲 ⇒ 退出。与 REPL 的 SIGINT 语义一致。
-      const ctl = abortCtlRef.current.current
-      if (ctl) {
-        ctl.abort()
-        setState((prev) => pushConsole(prev, '\n⏹️  已请求中断，正在停止…（已完成的步骤会保留）\n'))
-        return true
-      }
-      return finish('exit')
     }
     // 诊断：连修饰键一起记录。此前只记 name/ctrl，导致「Shift+Enter 的修饰信息到底有没有
     // 送达应用」在日志里无从判断（实测结论见开发日志续 125）。
@@ -2240,6 +2283,20 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
     }
   }
 
+  // 审批模态内容体：先算出渲染文本，仅当**估算可视行数**超过上限时才套滚动容器。
+  //
+  // 为什么不能无条件套 ScrollBox：它是按"填满父容器"设计的（内部 viewport `flexGrow:1`、
+  // content `minHeight:100%`），只给 `maxHeight` 会让它**恒占** maxHeight 高度 ——
+  // 卡片只有 3 行时也留一大片空白。故这里显式判定：不溢出就用普通 `<text>`（自适应高度），
+  // 溢出才用一个定高的滚动容器（带垂直滚动条）。
+  const approvalBody =
+    approvalQ === null
+      ? ''
+      : approvalCard
+        ? renderWidget('decision-card', approvalCard as unknown as Record<string, unknown>)
+        : approvalLine(approvalQ)
+  const approvalScrollable = estimateApprovalLines(approvalBody) > APPROVAL_MAX_HEIGHT
+
   return (
     <box
       flexDirection="column"
@@ -2474,17 +2531,29 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         {/* 模块 E：命令审批模态 —— 权限询问弹出，Y=允许 N=拒绝 Shift-Y=始终允许 Shift-N=始终拒绝。
             M3：有结构化卡片（风险标签 + 参数表格 + 历史）时渲染 decision-card，否则回退文本 */}
         {approvalQ !== null && (
-          <box style={{ border: true, padding: 1 }}>
+          <box style={{ border: true, padding: 1, flexShrink: 0 }}>
             <text attributes={createTextAttributes({ bold: true, reverse: true })}>
               {' 权限审批 '.padEnd(22)}
             </text>
-            {approvalCard ? (
-              <text wrapMode="word" {...selStyleProps}>
-                {renderWidget('decision-card', approvalCard as unknown as Record<string, unknown>)}
-              </text>
+            {/* 内容区溢出时限高 + 内部滚动：审批卡片可能带很长的入参（write_file 的
+                content、长命令行），不限高会把整屏占满、把对话与输入行挤出视口。
+                标题行与键位图例留在滚动区之外，任何时候都可见。 */}
+            {approvalScrollable ? (
+              <scrollbox
+                style={{ height: APPROVAL_MAX_HEIGHT, flexShrink: 0 }}
+                verticalScrollbarOptions={SIDEBAR_SCROLLBAR_OPTIONS}
+              >
+                <text wrapMode="word" {...selStyleProps}>
+                  {approvalBody}
+                </text>
+              </scrollbox>
             ) : (
-              <text attributes={createTextAttributes({ dim: true })} wrapMode="word">
-                {approvalLine(approvalQ)}
+              <text
+                attributes={approvalCard ? undefined : createTextAttributes({ dim: true })}
+                wrapMode="word"
+                {...selStyleProps}
+              >
+                {approvalBody}
               </text>
             )}
             <text wrapMode="word">  [y] 允许    [n] 拒绝    [Shift-y] 始终允许    [Shift-n] 始终拒绝</text>
