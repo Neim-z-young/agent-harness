@@ -42,9 +42,31 @@
 import { describe, it, expect } from 'bun:test'
 import { readdirSync, readFileSync } from 'node:fs'
 import type { Dirent } from 'node:fs'
-import { join } from 'node:path'
+import { join, relative } from 'node:path'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..')
+
+/**
+ * 把路径里的分隔符统一折成 `/`（**纯函数，导出以便本机单测**）。
+ *
+ * ⚠️ 为什么不能用 `split(sep).join('/')`：那个写法在 macOS（`sep==='/'`）上是恒等，
+ * **本机永远测不出 Windows 分支** —— 而这条恰恰只在 Windows 上错。`replaceAll('\\','/')`
+ * 两平台都对，且可以喂一个 Windows 风格的字符串在**任何平台**上验证。
+ */
+export function toPosix(p: string): string {
+  return p.replaceAll('\\', '/')
+}
+
+/**
+ * 相对仓库根的路径，**统一折成 `/`**。
+ *
+ * ⚠️ 必须折：Windows 上 `relative()` 给的是 `packages\cli\src\index.ts`，而白名单键写的是
+ * `packages/cli/src/index.ts` —— 不折就会把两个**已白名单**的文件当成"未白名单命中"
+ * （本守卫首轮 CI 就踩了这条，与 `fs-guard` 的 `PathDialect` 是同一类坑）。
+ */
+function relPosix(abs: string): string {
+  return toPosix(relative(REPO_ROOT, abs))
+}
 
 /**
  * 白名单：允许保留 `.unref` 的**源码文件** → 理由（必须说明"回调不被 await"）。
@@ -106,7 +128,7 @@ function unrefCalls(): UnrefHit[] {
     const lines = readFileSync(abs, 'utf8').split('\n')
     lines.forEach((line, i) => {
       if (isUnrefCallLine(line)) {
-        hits.push({ file: abs.slice(REPO_ROOT.length + 1), line: i + 1, text: line.trim() })
+        hits.push({ file: relPosix(abs), line: i + 1, text: line.trim() })
       }
     })
   }
@@ -130,7 +152,7 @@ describe('等待定时器不得 unref（Bun/Windows 会因此整包挂死）', (
     expect(files.length).toBeGreaterThan(100)
     // 白名单里的两个文件必须真的在扫描集合内（否则上一条会"因为扫不到"而假绿）
     for (const f of Object.keys(ALLOWED_UNREF)) {
-      expect(files.some((abs) => abs.endsWith(f))).toBe(true)
+      expect(files.some((abs) => relPosix(abs) === f)).toBe(true)
     }
   })
 
@@ -142,5 +164,10 @@ describe('等待定时器不得 unref（Bun/Windows 会因此整包挂死）', (
     expect(isUnrefCallLine(' * 定时器不 unref：因为……')).toBe(false)
     // 与 unref 无关的普通代码行不算
     expect(isUnrefCallLine('const timer = setTimeout(resolve, ms)')).toBe(false)
+    // 路径归一：Windows 风格必须折成 `/`（否则白名单键对不上 —— 首轮 CI 就踩了这条）。
+    // 这条断言在**任何平台**上都可验（不依赖 sep），这正是抽成纯函数的目的。
+    expect(toPosix('packages\\cli\\src\\index.ts')).toBe('packages/cli/src/index.ts')
+    expect(toPosix('packages/cli/src/index.ts')).toBe('packages/cli/src/index.ts')
+    expect(toPosix('packages\\plugins\\herdr\\src\\index.ts')).toBe('packages/plugins/herdr/src/index.ts')
   })
 })
