@@ -50,7 +50,9 @@
 
 - 全量类型检查：`bun run typecheck`
 
-- 全量测试：`bun run test`（= `bun --filter=* run test`，逐包跑，退出码可用于 CI/脚本判断；此前因 `@harness/permission` 一个测试文件都没有而**恒为 1**，已补该包测试修正）
+- 全量测试：`bun run test`（= `bun run --filter '*' test`，逐包跑，退出码可用于 CI/脚本判断；此前因 `@harness/permission` 一个测试文件都没有而**恒为 1**，已补该包测试修正）
+
+> ⚠️ **根脚本里的 `--filter` 模式必须加引号**（`--filter '*'`，**不要**写 `--filter=*`）：不加引号的 `*` 会被 shell 当 glob 展开，而 **Windows 上 `bun run <script>` 由 Bun Shell 执行**（像 zsh 一样对无匹配的 glob **报错**）⇒ `bun: no matches found: --filter=*`，四个根脚本（`dev`/`build`/`test`/`typecheck`）**在 Windows 上全部起不来**（CI 的 windows job 就是这么红的 —— 开发机 macOS/bash 永远看不到）。守卫：`packages/host/src/repo-scripts-guard.test.ts`（全仓 scripts 不得出现**未加引号**的 `*`）。同一纪律适用于任何"靠 POSIX shell 保留未匹配 glob"的写法。
 
 > 别用根目录的 `bun test`：它会把 `reference/**`（参考代码 / 外部仓库快照）一起扫进来，那里缺 react 等依赖，会产生数百个与本次改动无关的失败。
 > **路径参数同样会踩这个坑**：`bun test packages/cli`（无 `./` 前缀）按模糊匹配把 `reference/opencode-dev/packages/cli` 也扫进来（实测 4 个 `Cannot find package 'effect'`）。安全写法只有两种：`cd packages/<pkg> && bun test`，或 `bun test ./packages`（带前缀）。

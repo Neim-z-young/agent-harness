@@ -110,6 +110,21 @@
    A2A 路径与端口）；**外加整批 PS / CMD 分支的真机复核**（第 4 条）。
    ★**P2/P3 的剩余项有一个共同点：本机（macOS）无法闭环** —— 判据里"未验证"三个字掩盖了"**不可验证**"。
    最实际的动作是**把 `ci.yml` 的 Windows 跑起来**（矩阵已就位），一次拿到 P3-1/2/3 与 PS/CMD 的第一手证据。
+10. ~~**把 `ci.yml` 的 Windows 跑起来**~~ ✅ **已跑，并抓到 6 个"本机永远看不到"的问题**（2026-10-13，见续 285）：
+   首次真跑（macos ✅ / ubuntu ✗ 5 条 / windows ✗ 卡在 typecheck）：
+   - **Windows 阻塞（影响 4 个根脚本）**：`bun --filter=* run <script>` 里的 `*` 被 **Bun Shell** 当 glob 展开，
+     无匹配即报 `bun: no matches found` ⇒ `dev`/`build`/`test`/`typecheck` **全部起不来**（测试根本没跑到）。
+     ⇒ 全部改为 **`bun run --filter '*' <script>`**（加引号；`--filter '*'` 的**依赖顺序**是有文档保证的，
+     故不用 `--workspaces` —— 后者在有包缺脚本时行为不同）。★**同一坑在 zsh 下也成立**（本机直接敲
+     `bun --filter=* run typecheck` 就报同样的错，只是 `bun run <script>` 会挑 bash 才"看起来没事"）。
+     守卫：`packages/host/src/repo-scripts-guard.test.ts`。
+   - **ubuntu 5 条**：全是**测试侧平台耦合**（无一条指向产品逻辑），其中 **3 条是前两轮自己写的**：
+     P1-3 三态用例的非空断言（Linux 无原语 ⇒ `buildOsBinding` 返回 `null`）、`ulimit -f` 期望值把
+     **macOS 的 1024B 单位**写死、mcp-client 透传用例拿 `sandbox-exec` 真 spawn（Linux ENOENT）；
+     另两条是 subagent 用例**依赖"macOS 的 tmpdir 不在 `/tmp` 下"**这条平台事实、bench 用例在
+     慢 runner 上超时。**全部已修**（2026-10-13）。
+   ⇒ 这条本身现在是**已验证可执行的流程**：`git push` 触发（或 `gh workflow run CI` 手动），
+   结果用 `gh run view --job <id> --log` 取、artifact 用 `gh run download` 取。
 
 ## 4. 验收口径（每一条都要能自动判）
 

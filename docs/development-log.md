@@ -1,5 +1,68 @@
 # Agent Harness 开发日志
 
+## 2026-10-13（续 285）首次真跑 CI 的收尾：根脚本去 glob + 5 条平台耦合用例
+
+用户先问"Windows 矩阵怎么跑"，推送后跑出首份真实 CI 结果：**macos ✅ / ubuntu ✗ 5 条 / windows ✗ 卡在 typecheck**。
+本轮把三类问题全部修掉（其中 **6 个问题里有 4 个是开发机 macOS 结构上看不到的**）。
+
+### 一、Windows 阻塞：`--filter=*` 依赖 shell glob 语义（影响 4 个根脚本）
+
+根 `package.json` 的 `dev` / `build` / `test` / `typecheck` 原来都写 `bun --filter=* run <script>`。
+在 macOS 上跑得通，是因为 `bun run <script>` 用 bash/sh 执行脚本，而 **POSIX shell 对无匹配的 glob 保留原样**；
+但 **Windows 上 `bun run <script>` 由 Bun Shell 执行**，Bun Shell 对无匹配 glob **报错**：
+
+```
+$ bun --filter=* run typecheck
+bun: no matches found: --filter=*
+```
+
+⇒ 四个脚本**全部起不来**，Windows job 停在 `typecheck` 这一步、**测试根本没跑到**（而 Windows 恰恰是唯一
+能给出 PS/CMD 行为证据的平台）。
+
+**排查中附带发现**：同一写法在 **zsh** 下也是错的（本次在本机直接敲 `bun --filter=* run typecheck`
+就复现了同样的 `no matches found`）—— 之所以一直没暴露，只是因为根脚本经 `bun run` 走的是 bash 分支。
+
+**修法**：改成 `bun run --filter '*' <script>`（**加引号**，Bun Shell 不会展开引号内的串）。
+选它而不是 `--workspaces` 的理由：`--filter '*'` 的**依赖顺序**有文档保证（"Bun respects package
+dependency order when running scripts"），而 `--workspaces` 在有 workspace 缺该脚本时行为不同
+（文档明确要配 `--if-present`）—— `build` 依赖顺序是对的，不能为一个 glob 问题把它换掉。
+本机验证：`bun run --filter '*' typecheck` ⇒ exit 0、**覆盖 48 个包**（= 有 `typecheck` 脚本的包数），
+与改动前逐位等价。
+
+**守卫**：`packages/host/src/repo-scripts-guard.test.ts` —— 全仓 `package.json` 的 scripts 值里
+不得出现**未加引号**的 `*`（判据是"去掉单/双引号包裹的片段后再找 `*`"），外加控制组钉子
+（根确实还有那四个脚本、且都用 `--filter` 选包 —— 否则"扫描集合为空"这种退化解也能永远绿）。
+★这条守卫是**必要的**：这个坑在开发机上表现为"一切正常"，只有 Windows/zsh 用户会撞上。
+
+### 二、ubuntu 的 5 条失败：全是测试侧平台耦合（无一条指向产品逻辑）
+
+| # | 用例 | 归因 | 修法 |
+|---|---|---|---|
+| 1 | `P1-3 OS 级绑定 > ★自检/真实执行/fsBound 三者必须一致` | 用例只写了「干净环境 / 嵌套沙箱」两态，Linux 上 `buildOsBinding` 返回 `null` 被 `!` 非空断言崩掉 | 补**第三态**（无原语 ⇒ 断言 `fsBound:false`，即"不模拟"） |
+| 2 | `SubagentTool 摘要 > 智能提示…` | 用例靠 **macOS 的 tmpdir 不在 `/tmp` 下**这条平台事实构造"工作目录外"；Linux 上 tmpdir 就是 `/tmp` ⇒ 落盘路径反而在 cwd 内，断言取反 | cwd 与结果目录**显式取两个不同临时目录**（不再依赖平台事实） |
+| 3 | `buildLimitPreamble > 未设/false/全 0` | 期望值把 **macOS 的 `ulimit -f` 单位（1024B）** 写死；Linux 是 512B ⇒ 应为 `4194304` | **显式传 `platform`**，并同时钉住 darwin / linux 两侧换算 |
+| 4 | `defaultTransportFactory 透传 osBinding` | 用例构造 darwin binding 却**真 spawn** ⇒ Linux `posix_spawn '/usr/bin/sandbox-exec' ENOENT`，而 `StdioTransport` 没挂 `error` 监听 ⇒ unhandled error | 改用 `/bin/sh`（POSIX 恒存在、`-c true` 立即退出）当"原语"，只钉**接线**；真原语由 tools-builtin 的 P1-3 真机组负责 |
+| 5 | `judgeTask > 全量任务回放自洽` | **超时** 5469ms > 默认 5000ms（80+ 任务 ⇒ 每个建库 + 回放 + 比对，Linux runner 比开发机慢一截） | 显式放宽到 **30s**（测的是数据/实现一致性，不该因机器慢变随机红灯） |
+
+★5 条里 **3 条是前两轮自己写的**（#1 / #3 / #4）—— 都是"在 macOS 上写、在 Linux 上不成立"的形态。
+本机全量 3130 条全绿，**没有任何一条会红**：这正是"不跑 CI 就永远看不到"的那一类。
+
+### 三、顺带修掉的两处"跑起来也白跑"（CI 自身）
+
+1. **Windows 上测试日志拿不到**：`bash` 步骤里的 `/tmp/...` 由 **MSYS 映射**到别处，而 `upload-artifact`
+   是 **Node 实现、不经 MSYS** ⇒ 看到字面 `/tmp/...` ⇒ 找不到文件；原来是 `if-no-files-found: ignore`
+   ⇒ **artifact 永远为空且无任何提示**（而 Windows 正是最需要那份日志的平台）。改为相对工作目录
+   `./harness-ci-test.log` + `warn`。
+2. **加 `workflow_dispatch`**：原来只有 push/PR，想"现在跑一次"只能造提交。
+
+### 验证
+
+- `bun run typecheck` 真实退出码 **0** / `error TS` **0**
+- 全量 **pass=3134 / fail=0 / skip=4**（基线 3130 ⇒ **+4** = 守卫 3 条 + mcp-client 新增 1 条）
+- 反向验证（`cp` 备份 + `shasum -a 256 -c` 还原、0 残留）：把根 `typecheck` 改回 `bun --filter=* run typecheck`
+  ⇒ 守卫 **2 红**（"未加引号"命中 + 控制组的引号正则失配），与预测一致
+- ⚠️ **本轮改动有一部分本机无法闭环**：Windows 上"脚本是否真能起来、测试跑成什么样"只有下次 CI 才知道
+
 ## 2026-10-12（续 284）跨平台：P2-2 环境键名 / P2-1 域用户名 / P3-4 插件 shell 声明
 
 起因：用户问"计划还有哪些未完成的"，逐条对代码核对后列出 8 项（P2-1/2/4/5 + P3-1~4），
