@@ -15,6 +15,7 @@
 | **E1** 授权弹窗无配额 | `ask` 模式下模型陷进"被拒 ⇒ 换工具再试"就狂弹（实测 8 次/54s） | 同上：`MAX_PERMISSION_PROMPTS = 8` |
 | **E2** 轮数上限把待决授权**静默丢弃** | 任务永停 `INPUT_REQUIRED` ⇒ 该会话之后每条消息都被 `ConcurrentTaskError` 拒 | 同上：`pending` 提到循环外 + 轮末 `CancelTask` fail-safe |
 | 服务端流式续接未发首事件 | 授权后 `-32004`，会话卡死 | `packages/a2a-server/src/executor.ts`（**已修：`805cee7`**） |
+| 排障埋点缺失（缺 `◀` 判据 / 无首帧守卫） | 真机卡住时只能猜 | `adapters/vscode/src/participant.ts`（**2026-10-13 已补**：`[turn]` 埋点 + 0 帧告警 + 15s 首帧守卫，见 §4 补记） |
 
 回归用例：`adapters/vscode/src/transport/a2a.test.ts`（2 条）、`adapters/vscode/src/participant.test.ts`（9 条）。
 
@@ -96,6 +97,12 @@ chatWidget.sendRequest({ agentIdSilent: this._lockedAgent.id })   // 锁定的 a
 **M1 · 路由**：输出通道出现 `activate()` → `已注册动态 participant: id=…`；选择器里出现本仓项；发一句话后出现
 `▶ turn` → `▶ send round=0` → `▶ 首帧到达` → `◀ turn 结束 outcome=done frames=N`。
 > `▶` / `◀` 两组埋点是**无条件**的（不受 trace 门控）。**缺 `◀` 的那一轮就是卡住的那一轮。**
+
+> **2026-10-13 补记（探针拆除后）**：这组埋点已**移植进生产适配器**
+> `adapters/vscode/src/participant.ts`（`[turn] ▶ turn / ▶ send / ▶ 首帧到达 / ◀ turn 结束 outcome=… frames=N`
+> + 0 帧告警 + `FIRST_FRAME_TIMEOUT_MS = 15_000` 首帧超时守卫），并有
+> `src/participant.test.ts` 的 6 条用例钉住（含"守卫在 0 帧退出路径上也被清掉"）。
+> ⇒ 「缺 `◀` 的那一轮就是卡住的那一轮」在 `@harness` 上重新成立。
 
 **M2 · 后端**：装配三行（`bun:` / `cwd` / `cliPath` / `runner`）中 `cliPath` 指向 `packages/cli/src/index.ts` ⇒ 走的是**当前工作树**；回复里出现 harness 才有的东西（工具 `progress`、harness 的报错文案）。
 

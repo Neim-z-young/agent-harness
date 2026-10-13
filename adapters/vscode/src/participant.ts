@@ -114,6 +114,32 @@ export function turnMetadata(state: TurnState): TurnState {
   return { ...state, taskId: undefined }
 }
 
+/**
+ * 首帧超时：`send()` 的流在这么久内**一个 SSE 帧都没有** ⇒ 主动 abort。
+ *
+ * 为什么必须有：UI 上「连接 harness…」是 handler 里**唯一在 `send()` 之前**的 progress，
+ * 只要流不吐帧，它就会**无限**停在那儿 —— 既不报错、也不给任何线索（真机踩过，见
+ * `docs/vscode-chat-sessions-spike.md` §4）。把它变成明确失败，是「挂住」与「可见故障」的分界线。
+ *
+ * ⚠️ 这个定时器**不许 `unref`**：被 `await` 的 `setTimeout` 一旦 `unref`，在 Bun/Windows 上
+ * 会出现"事件循环里只剩 unref 的工作"⇒ 定时器永不到期 ⇒ 静默挂死。清理由 `finally` 与
+ * 首帧到达两条路径保证。
+ */
+export const FIRST_FRAME_TIMEOUT_MS = 15_000
+
+/**
+ * 本轮诊断埋点。**刻意不受 `harness.trace` 门控** —— 这些行是排障判据本身：
+ * 缺 `◀` 的那一轮就是卡住的那一轮（真机三次卡死都是靠它把范围缩到单轮）。
+ */
+function turnLog(deps: ParticipantDeps, msg: string): void {
+  deps.log?.(`[turn] ${msg}`)
+}
+
+/** prompt 的展示长度（埋点里不放整段长文，否则一行刷满输出通道） */
+function brief(text: string, max = 60): string {
+  return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
 export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequestHandler {
   return async (request, context, stream, token) => {
     const log = deps.log ?? (() => {})
@@ -122,6 +148,15 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
     const controller = new AbortController()
     const abort = () => controller.abort()
     token.onCancellationRequested(abort)
+
+    // 本轮诊断埋点的四个状态量（声明在最外层，catch/finally 也要读得到）
+    const t0 = Date.now()
+    /** 本轮收到的 SSE 帧总数（含权限续接的各段）—— 用来抓「0 帧却报成功」 */
+    let totalFrames = 0
+    /** 首帧守卫的定时器；`undefined` = 已清或未建（见 FIRST_FRAME_TIMEOUT_MS） */
+    let guard: ReturnType<typeof setTimeout> | undefined
+    /** 是不是**我们自己的**首帧守卫中止的（区别于用户点停止） */
+    let firstFrameTimedOut = false
 
     try {
       await deps.transport.start()
@@ -155,6 +190,8 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       // 时间线：本轮的"块"从这里开始累积（侧栏订阅它 —— 设计稿 §12.9）
       deps.timeline?.startTurn(prompt)
 
+      turnLog(deps, `▶ turn "${brief(prompt)}"`)
+
       /**
        * 待决的授权请求。**声明在循环外**：循环可能因上限退出，那时必须还能看见它、
        * 并把它关掉（见 `MAX_PERMISSION_ROUNDS` 的说明）。
@@ -172,6 +209,22 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
 
         pending = undefined
         let textOut = ''
+
+        // 首帧守卫（理由见 FIRST_FRAME_TIMEOUT_MS 定义处）
+        let sawFrame = false
+        if (guard !== undefined) clearTimeout(guard)
+        guard = setTimeout(() => {
+          if (sawFrame) return
+          firstFrameTimedOut = true
+          turnLog(
+            deps,
+            `✗ 首帧超时：${FIRST_FRAME_TIMEOUT_MS}ms 内没有任何 SSE 帧 ⇒ 主动 abort`
+              + '（请求多半没真正发出去：调试器 / 网络检查拦截、代理，或 fetch 层问题）',
+          )
+          controller.abort()
+        }, FIRST_FRAME_TIMEOUT_MS)
+
+        turnLog(deps, `▶ send round=${round} ctx=${state.contextId ?? '-'} task=${state.taskId ?? '-'}`)
 
         for await (const frame of deps.transport.send(
           { contextId: state.contextId, taskId: state.taskId },
@@ -191,6 +244,15 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
           const op = mapA2aEvent(frame)
           // Chat 视图与时间线**同一份映射**（一份真相，两个落点）
           deps.timeline?.append(op)
+          totalFrames++
+          if (!sawFrame) {
+            sawFrame = true
+            if (guard !== undefined) {
+              clearTimeout(guard)
+              guard = undefined
+            }
+            turnLog(deps, `▶ 首帧到达 (+${Date.now() - t0}ms)`)
+          }
           switch (op.kind) {
             case 'text':
               textOut += op.text
@@ -274,16 +336,42 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       }
 
       deps.timeline?.finish(outcome === 'done' ? 'completed' : outcome)
+      turnLog(
+        deps,
+        `◀ turn 结束 outcome=${outcome} frames=${totalFrames}`
+          + ` (+${Date.now() - t0}ms tokenCancelled=${token.isCancellationRequested})`,
+      )
+      // 0 帧是**异常**：正常一轮的首帧一定是 `{task: SUBMITTED}`。
+      // 0 帧 = 服务端连流都没开 —— 典型是预流错误（HTTP 200 + application/json）被吞成
+      // 静默成功。没有这行告警时，它会伪装成"正常结束、只是没有输出"，极难归因。
+      if (totalFrames === 0) {
+        turnLog(
+          deps,
+          '⚠️ 本轮 0 帧：服务端未开流（多为预流错误，HTTP 200 + application/json）'
+            + ' ⇒ 检查 transport/a2a.ts 的「非 SSE 分流」分支是否生效',
+        )
+      }
       return { metadata: turnMetadata(state) }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       stream.markdown(`\n\n❌ ${msg}\n\n`)
       log(`[error] ${msg}`)
+      turnLog(deps, `◀ turn 结束 outcome=error frames=${totalFrames} (+${Date.now() - t0}ms)`)
+      if (firstFrameTimedOut) {
+        // 是我们自己的首帧守卫中止的：给一句能照做的中文，而不是一个英文 AbortError
+        stream.markdown(
+          `\n\n（${FIRST_FRAME_TIMEOUT_MS}ms 内没有等到任何响应，已主动中止；`
+            + '详见输出通道 "Agent Harness"）\n\n',
+        )
+      }
       // 异常退出也要收尾：否则时间线永远显示"进行中"
       deps.timeline?.finish('error')
       // 失败路径同样只回写跨轮状态（`taskId` 绝不跨轮，见 turnMetadata）
       return { metadata: turnMetadata(state) }
     } finally {
+      // 守卫必须在这里清：否则一个 15s 的定时器会把宿主/测试进程钉住
+      //（⚠️ 不许用 unref 代替清理，见 FIRST_FRAME_TIMEOUT_MS 的说明）
+      if (guard !== undefined) clearTimeout(guard)
       token.onCancellationRequested(() => {})
       controller.abort()
     }

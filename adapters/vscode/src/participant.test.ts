@@ -12,7 +12,7 @@
  * 注意必须**先 mock 再动态 import** —— 静态 import 会被提升到 mock 之前。
  */
 
-import { beforeEach, describe, expect, it, mock } from 'bun:test'
+import { beforeEach, describe, expect, it, jest, mock } from 'bun:test'
 import type { HarnessTransport, RenderOp } from './types'
 
 /** 已弹过的授权窗（每次调用 `showInformationMessage` 记一条） */
@@ -36,9 +36,13 @@ mock.module('vscode', () => ({
   Uri: { file: (p: string) => ({ fsPath: p }) },
 }))
 
-const { createParticipantHandler, MAX_PERMISSION_PROMPTS, MAX_PERMISSION_ROUNDS, turnMetadata } = await import(
-  './participant'
-)
+const {
+  createParticipantHandler,
+  FIRST_FRAME_TIMEOUT_MS,
+  MAX_PERMISSION_PROMPTS,
+  MAX_PERMISSION_ROUNDS,
+  turnMetadata,
+} = await import('./participant')
 
 // ---------------------------------------------------------------- 假件
 
@@ -87,14 +91,19 @@ interface Sent {
   text: string
 }
 
-/** 假 transport：按 `script` 决定每次 send 吐什么帧；记录出参与取消 */
-function makeTransport(script: (round: number) => unknown[]): {
+/** 假 transport：按 `script` 决定每次 send 吐什么帧；记录出参、取消与最后拿到的 signal */
+function makeTransport(
+  script: (round: number) => unknown[],
+  opts: { hang?: boolean } = {},
+): {
   transport: HarnessTransport
   sent: Sent[]
   cancelled: string[]
+  lastSignal: () => AbortSignal | undefined
 } {
   const sent: Sent[] = []
   const cancelled: string[] = []
+  let lastSignal: AbortSignal | undefined
   let round = 0
   const transport = {
     start: async () => {},
@@ -104,15 +113,43 @@ function makeTransport(script: (round: number) => unknown[]): {
     },
     control: async () => ({}),
     listTasks: async () => ({}),
-    send: (ctx: { contextId?: string; taskId?: string }, text: string) => {
+    send: (ctx: { contextId?: string; taskId?: string }, text: string, signal: AbortSignal) => {
       sent.push({ contextId: ctx.contextId, taskId: ctx.taskId, text })
+      lastSignal = signal
       const frames = script(round++)
+      // 挂起模式：abort 监听在 `send()` 里**同步**注册（不放进生成器体 —— 生成器要等
+      // 第一个 next() 才跑，那样测试里"推进定时器"的时机就对不上了）。
+      // abort 时**抛**（不是 resolve）—— 真实 fetch 被 abort 就是抛 AbortError，
+      // 这条决定了 handler 走 catch 分支（那段"已主动中止"的用户交代只有 catch 里才有）。
+      const gate =
+        opts.hang === true
+          ? new Promise<void>((_resolve, reject) => {
+              const boom = () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))
+              if (signal.aborted) {
+                boom()
+                return
+              }
+              signal.addEventListener('abort', boom, { once: true })
+            })
+          : null
       return (async function* () {
+        if (gate !== null) {
+          await gate
+          return
+        }
         for (const f of frames) yield f
       })()
     },
   } as unknown as HarnessTransport
-  return { transport, sent, cancelled }
+  return { transport, sent, cancelled, lastSignal: () => lastSignal }
+}
+
+/** 带日志捕获的一套（诊断埋点用例专用：埋点**不受 trace 门控**，所以必须能断言到） */
+function setup(script: (round: number) => unknown[], opts: { hang?: boolean } = {}) {
+  const logs: string[] = []
+  const base = makeTransport(script, opts)
+  const handler = createParticipantHandler({ transport: base.transport, log: (m) => logs.push(m) })
+  return { ...base, handler, logs }
 }
 
 function makeStream(): { parts: Array<{ kind: 'md'; text: string }>; stream: never } {
@@ -257,6 +294,138 @@ describe('E1/E2：弹窗配额 + 到顶 fail-safe 释放会话', () => {
     expect(promptsShown).toHaveLength(0)
     expect(cancelled).toHaveLength(0)
     expect(sent).toHaveLength(1)
+  })
+})
+
+// ---------------------------------------------------------------- 诊断埋点
+
+describe('诊断埋点：▶/◀ 配对 + 0 帧告警 + 首帧超时守卫', () => {
+  it('★ 正常一轮打全 ▶ turn / ▶ send / ▶ 首帧到达 / ◀ turn 结束（frames 与真实帧数一致）', async () => {
+    const { handler, logs, sent } = setup(() => [taskFrame(), doneFrame()])
+    const { stream } = makeStream()
+
+    await handler(request('统计一下'), await historyWith({}), stream, makeToken())
+
+    expect(logs.some((l) => l.includes('▶ turn "统计一下"'))).toBe(true)
+    expect(logs.some((l) => l.includes(`▶ send round=0 ctx=- task=-`))).toBe(true)
+    expect(logs.some((l) => l.includes('▶ 首帧到达'))).toBe(true)
+    const end = logs.find((l) => l.includes('◀ turn 结束'))
+    expect(end).toBeDefined()
+    expect(end).toContain('outcome=done')
+    expect(end).toContain('frames=2') // task + done 两帧
+    expect(sent).toHaveLength(1)
+  })
+
+  it('0 帧 ⇒ 明确告警（预流错误被吞成"静默成功"时，这是唯一看得见的信号）', async () => {
+    const { handler, logs } = setup(() => [])
+    const { stream } = makeStream()
+
+    await handler(request(), await historyWith({}), stream, makeToken())
+
+    const end = logs.find((l) => l.includes('◀ turn 结束'))
+    expect(end).toContain('frames=0')
+    expect(logs.some((l) => l.includes('⚠️ 本轮 0 帧'))).toBe(true)
+    expect(logs.some((l) => l.includes('预流错误'))).toBe(true)
+  })
+
+  it('★ 首帧 15s 不到达 ⇒ 主动 abort 并明确报错（不是无限停在「连接 harness…」）', async () => {
+    jest.useFakeTimers()
+    try {
+      const { handler, logs, lastSignal } = setup(() => [], { hang: true })
+      const { parts, stream } = makeStream()
+
+      const done = handler(request(), await historyWith({}), stream, makeToken())
+      // 等到 `send()` 被调用（abort 监听已在其中同步注册）再推进定时器
+      for (let i = 0; i < 100 && lastSignal() === undefined; i++) await Promise.resolve()
+      expect(lastSignal()).toBeDefined()
+      jest.advanceTimersByTime(FIRST_FRAME_TIMEOUT_MS)
+
+      // 看门狗用**微任务计数**而不是定时器：假定时器下真实定时器不一定会到点，
+      // 而"守卫失效 ⇒ handler 永不 settle"这条必须**快速失败**，不能挂死
+      //（反向验证实测：删掉守卫时这条会永久挂住 ⇒ 没有看门狗就是 CI 上的定时炸弹）
+      let settled = false
+      void done.then(() => {
+        settled = true
+      })
+      for (let i = 0; i < 2000 && !settled; i++) await Promise.resolve()
+      expect(settled).toBe(true) // false ⇒ 首帧守卫没生效（明确失败，不挂死）
+
+      expect(lastSignal()?.aborted).toBe(true)
+      expect(logs.some((l) => l.includes('✗ 首帧超时'))).toBe(true)
+      // 用户看得见的交代：可执行的中文，而不是一个 AbortError
+      expect(parts.some((p) => p.text.includes('已主动中止'))).toBe(true)
+      // 收尾行仍然打出来（缺 ◀ 的那一轮就是卡住的那一轮）
+      expect(logs.some((l) => l.includes('◀ turn 结束'))).toBe(true)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('守卫在正常结束时被清掉（否则一个 15s 定时器会把宿主/测试进程钉住）', async () => {
+    jest.useFakeTimers()
+    try {
+      const { handler, logs } = setup(() => [taskFrame(), doneFrame()])
+      const { stream } = makeStream()
+
+      await handler(request(), await historyWith({}), stream, makeToken())
+
+      // 判据是**行为**而不是定时器计数：时间再往前走 10 倍，守卫若还在就会触发
+      //（打「✗ 首帧超时」并 abort）。不打、不 abort ⇒ 真的清掉了。
+      const before = logs.length
+      jest.advanceTimersByTime(FIRST_FRAME_TIMEOUT_MS * 10)
+      expect(logs).toHaveLength(before)
+      expect(logs.some((l) => l.includes('✗ 首帧超时'))).toBe(false)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('守卫在授权取消的退出路径上也被清掉', async () => {
+    jest.useFakeTimers()
+    try {
+      answerIndex = -1 // 用户关掉弹窗 ⇒ answer undefined ⇒ 提前 break
+      const { handler, logs } = setup(() => [permissionFrame()])
+      const { stream } = makeStream()
+
+      await handler(request(), await historyWith({}), stream, makeToken())
+
+      const before = logs.length
+      jest.advanceTimersByTime(FIRST_FRAME_TIMEOUT_MS * 10)
+      expect(logs).toHaveLength(before)
+      expect(logs.some((l) => l.includes('✗ 首帧超时'))).toBe(false)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('★ 0 帧退出路径上守卫也必须被清掉（首帧到达会顺带清，唯独这条路径不会）', async () => {
+    // 反向验证抓到的：把 `finally` 里的 clearTimeout 删掉，前两条"守卫被清掉"的用例
+    // **全绿** —— 因为正常轮/授权轮的首帧到达时已经清过一次。唯一还挂着定时器退出的是
+    // "一个帧都没收到"（空流 / 服务端没开流），正是这条。
+    jest.useFakeTimers()
+    try {
+      const { handler, logs } = setup(() => [])
+      const { stream } = makeStream()
+
+      await handler(request(), await historyWith({}), stream, makeToken())
+
+      const before = logs.length
+      jest.advanceTimersByTime(FIRST_FRAME_TIMEOUT_MS * 10)
+      expect(logs).toHaveLength(before)
+      expect(logs.some((l) => l.includes('✗ 首帧超时'))).toBe(false)
+    } finally {
+      jest.useRealTimers()
+    }
+  })
+
+  it('埋点不受 trace 门控：没传 traceEnabled 也照样打（排障判据不能可选项）', async () => {
+    const { handler, logs } = setup(() => [taskFrame(), doneFrame()])
+    const { stream } = makeStream()
+
+    await handler(request(), await historyWith({}), stream, makeToken())
+
+    expect(logs.some((l) => l.includes('▶ turn'))).toBe(true)
+    expect(logs.some((l) => l.includes('◀ turn 结束'))).toBe(true)
   })
 })
 
