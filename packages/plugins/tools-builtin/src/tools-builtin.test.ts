@@ -21,6 +21,8 @@ import {
   resolveShell,
   buildLimitPreamble,
   resolveBashLimits,
+  resolveTaskkillPath,
+  buildTaskkillArgs,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
@@ -1511,5 +1513,29 @@ describe('resolveShell：跨平台 shell 探测', () => {
     expect(sh.family).toBe('cmd')
     expect(sh.program).toBe('cmd.exe')
     expect(sh.args).toEqual(['/c'])
+  })
+})
+
+// ===== Windows 进程树 kill 的参数（纯函数；2026-10-13 查证后加的） =====
+//
+// 为什么单列一组：`killProcessTree` 的 win32 分支**只能在 Windows 上跑**，但其中有两件事是
+// **纯决策**、可以在任何平台钉住：①`taskkill.exe` 用**绝对路径**（不靠 PATH）；
+// ②argv 形态。原实现把 `taskkill` 交给 PATH 且**不看返回值**（`spawnSync` 的 ENOENT/非零退出
+// 都不抛）⇒ "树没杀成"完全静默。这一组挡的就是那类退化。
+describe('killProcessTree（win32 分支）的参数构造', () => {
+  it('★taskkill 取 System32 绝对路径；键名大小写不敏感（SystemRoot / SYSTEMROOT / windir）', () => {
+    expect(resolveTaskkillPath({ SystemRoot: 'C:\\Windows' })).toBe('C:\\Windows\\System32\\taskkill.exe')
+    expect(resolveTaskkillPath({ SYSTEMROOT: 'D:\\Win' })).toBe('D:\\Win\\System32\\taskkill.exe')
+    expect(resolveTaskkillPath({ windir: 'C:\\WINDOWS' })).toBe('C:\\WINDOWS\\System32\\taskkill.exe')
+  })
+
+  it('取不到 SystemRoot / windir ⇒ 退回裸 taskkill（交给 PATH，而不是拼出半截路径）', () => {
+    expect(resolveTaskkillPath({})).toBe('taskkill')
+    expect(resolveTaskkillPath({ Path: 'C:\\tools' })).toBe('taskkill')
+  })
+
+  it('argv：`/T` 连整棵树、`/F` 强制（缺一都会退回"只杀一个进程"的语义）', () => {
+    expect(buildTaskkillArgs(1234, true)).toEqual(['/PID', '1234', '/T', '/F'])
+    expect(buildTaskkillArgs(1234, false)).toEqual(['/PID', '1234', '/T'])
   })
 })

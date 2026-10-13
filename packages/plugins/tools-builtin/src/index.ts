@@ -641,6 +641,23 @@ export function buildLimitPreamble(
 }
 
 /**
+ * `taskkill.exe` 的**绝对路径**（Windows）。不靠 PATH —— CI / 受限宿主 / Git-Bash 启动的进程里
+ * PATH 常被裁剪，`spawnSync` 找不到时**不抛错**、只把错误塞进返回值，于是"树没杀成"被静默吞掉
+ * （实战实现 openclaw 的 `exec-termination.ts` 也是显式取 System32，理由同）。
+ * 取不到（非 Windows / 无 SystemRoot）⇒ 退回裸 `taskkill`，交给 PATH。
+ */
+export function resolveTaskkillPath(env: NodeJS.ProcessEnv = process.env): string {
+  // 大小写不敏感（P2-2 口径）：注入普通对象时键名可能是 `SystemRoot` / `SYSTEMROOT` / `windir`
+  const root = lookupEnvCI(env, 'SystemRoot') ?? lookupEnvCI(env, 'windir')
+  return root ? `${root}\\System32\\taskkill.exe` : 'taskkill'
+}
+
+/** `taskkill` 的 argv（纯函数，便于单测）：`/T` 连树、`/F` 强制。 */
+export function buildTaskkillArgs(pid: number, force: boolean): string[] {
+  return ['/PID', String(pid), '/T', ...(force ? ['/F'] : [])]
+}
+
+/**
  * 杀**整棵进程树**（P0-6）。
  *
  * 为什么不能只 `child.kill()`：那只把信号发给 shell 自己。`npm run dev` / `vite` / 后台
@@ -649,17 +666,29 @@ export function buildLimitPreamble(
  *
  * - POSIX：spawn 时带 `detached: true` 让子进程成为**新进程组的组长**，于是 `kill(-pid)`
  *   一次覆盖全组（含所有后代）。
- * - Windows：没有"进程组信号"，走 `taskkill /T /F`。
+ * - Windows：没有"进程组信号"。用 `taskkill /PID <pid> /T /F`——它**对快照遍历、最深优先**，
+ *   这正是"要趁链接还在时解析树"的正确形态（`process.kill` / `Stop-Process` 都只杀一个进程）。
  * - 两者都不可用（如组已消失）⇒ 退回杀直接子进程，至少不比改造前差。
+ *
+ * ## Windows 上的三条已知边界（2026-10-13 查证，见 `docs/cross-platform-plan.md` 的"进程树"节）
+ * 1. **不声称内核级兜底**：libuv 给非 detached 子进程建了 Job Object，但带
+ *    `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` —— 其源码注释明写"only the processes that we
+ *    explicitly add are affected, and **their subprocesses are not**" ⇒ **孙进程不在 job 里**，
+ *    `KILL_ON_JOB_CLOSE` 兜不住。要让孙进程随 job 一起死得**自建 job**（Node 没有该 API，需原生扩展）。
+ * 2. **快照竞态**：`/T` 是对某一时刻的树遍历；MSYS2/Cygwin 创建原生子进程用 `CREATE_SUSPENDED`
+ *    再唤醒，落在窗口里的孩子可能被漏掉（Claude Code #98976 的实测）。
+ * 3. **必须看返回值**：`spawnSync` 在 ENOENT / 非零退出时**不抛**，只回填 `error`/`status`；
+ *    不看就当成功 —— 那会让"树没杀成"完全静默（本条是本函数原先的真实缺陷）。
  */
 export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGKILL'): void {
   const pid = child.pid
   if (typeof pid === 'number' && pid > 0) {
     if (process.platform === 'win32') {
       try {
-        spawnSync('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' })
-        return
-      } catch { /* taskkill 不可用 ⇒ 退回单进程 */ }
+        const r = spawnSync(resolveTaskkillPath(), buildTaskkillArgs(pid, true), { stdio: 'ignore' })
+        if (!r.error && r.status === 0) return
+        // 失败（找不到 taskkill / 拒绝访问 / 已退出）⇒ **落到下面的直系 kill**，不再静默返回
+      } catch { /* 同上下落 */ }
     } else {
       try {
         process.kill(-pid, signal)
