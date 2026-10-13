@@ -54,18 +54,6 @@ jobs:
         timeout-minutes: 15
         run: bun run typecheck
 
-      # ⚠️ **临时诊断**（见 scripts/ci/probe-core-hang.ts 的文件头）：逐条用例跑 `core` 的
-      # `step-gate.test.ts`（每条自带 45s 硬超时），定位到底哪一条永不返回。
-      #
-      # 来历：Windows 的测试步骤曾挂住 25 分钟 —— partial log 显示卡在 `@harness/core`
-      # （该包无汇总、无退出行），而 `bun test` 的默认超时**没有触发**（本仓已知：异步用例
-      # 永不 settle 时不报超时）。文件级定位不够（管道缓冲会让"最后打印的用例"≠"挂住的那条"），
-      # 所以改用脚本自带的硬超时逐条二分。**定位到并修好之后删掉这一步与那个脚本。**
-      - name: 【临时】core 挂住逐用例二分
-        if: matrix.os == 'windows-latest'
-        shell: bash
-        run: bun run scripts/ci/probe-core-hang.ts
-
       # Windows 上 shell 显式指定 bash：runner 默认是 pwsh，而脚本与
       # `bun run --filter '*'` 的输出解析（grep -oE）都是 POSIX 口径
       # ⚠️ 日志路径用**相对工作目录**，不要写 `/tmp`：

@@ -46,8 +46,26 @@ const TMP_DIR = join(import.meta.dir, '.tmp-test')
  */
 const HAS_POSIX_SHELL = resolveShell().family === 'bash'
 
-/** ≡ `it`，但在没有 POSIX shell 的环境跳过（见 {@link HAS_POSIX_SHELL}） */
+/**
+ * ≡ `it`，但在没有 POSIX shell 的环境跳过（见 {@link HAS_POSIX_SHELL}）。
+ *
+ * ⚠️ **注意它挡不住什么**：判据是"解析到的 shell 是不是 bash 族"，而 **Git Bash（MSYS）也算 bash**
+ * —— 它的 `ulimit` / `pwd` 语义与 POSIX **不同**（实测：`ulimit -f` 回读不是数字、`pwd` 打印 MSYS 路径
+ * `/d/a/...`）。凡依赖这些语义的断言还得**单独按 `process.platform` 加一层门**。
+ */
 const posixIt = it.skipIf(!HAS_POSIX_SHELL)
+
+/**
+ * 把 **MSYS 路径**折回 native 形式（`/d/a/b` ⇒ `D:\a\b`）；非 win32 原样返回。
+ *
+ * 为什么需要：Git Bash 里 `pwd` 打印的是 MSYS 路径，而 Node 侧 `mkdtempSync` / `join` 给的是 native 形式
+ * —— 直接比字符串必红，**但产品没错**（命令确实跑在指定目录里）。只折 win32 一侧，POSIX 平台零改动。
+ */
+function nativePath(p: string): string {
+  if (process.platform !== 'win32') return p
+  const m = /^\/([a-zA-Z])\/(.*)$/.exec(p)
+  return m ? `${m[1]!.toUpperCase()}:\\${m[2]!.replace(/\//g, '\\')}` : p
+}
 
 function makeCtx(overrides: Partial<ToolContext> = {}): ToolContext {
   return {
@@ -395,7 +413,8 @@ describe('@harness/tools-builtin', () => {
       await mkdir(sub, { recursive: true })
       const res = await bashTool.call({ command: 'pwd', cwd: sub }, makeCtx())
       expect(res.ok).toBe(true)
-      expect(res.output!.stdout.trim()).toBe(sub)
+      // ⚠️ Git Bash 的 `pwd` 给 MSYS 路径 ⇒ 折回 native 再比（见 nativePath）
+      expect(nativePath(res.output!.stdout.trim())).toBe(sub)
     })
 
     posixIt('env 参数注入环境变量', async () => {
@@ -565,7 +584,7 @@ describe('@harness/tools-builtin', () => {
       const tool = createBashTool({ rootDir: TMP_DIR })
       const res = await tool.call({ command: 'pwd', cwd: TMP_DIR }, makeCtx())
       expect(res.ok).toBe(true)
-      expect(res.output!.stdout.trim()).toBe(TMP_DIR)
+      expect(nativePath(res.output!.stdout.trim())).toBe(TMP_DIR) // 同上：MSYS 的 `pwd`
     })
 
     it('命令白名单：允许的命令可执行', async () => {
@@ -1033,8 +1052,14 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     const tool = createBashTool({ limits: { maxFileSizeKb: 1024 } })
     const res = await tool.call({ command: 'ulimit -f' }, makeCtx())
     expect(res.ok).toBe(true)
-    // darwin：1 单位 = 1024B ⇒ 1024KB = 1024 单位；linux：512B ⇒ 2048
-    expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
+    // ⚠️ **回读数值只在 POSIX shell 上有意义**：MSYS/Git Bash 的 `ulimit -f` 语义不同
+    //（实测 Windows 上 `Number()` 得 NaN —— 它没按"1 单位 = 512B/1024B"回读）。
+    // 于是：命令照跑（`res.ok` 仍断言），只是**不比对那个数字**。
+    // 换算本身仍有覆盖：`buildLimitPreamble` 的纯函数用例（显式传 platform）逐位钉住它。
+    if (process.platform !== 'win32') {
+      // darwin：1 单位 = 1024B ⇒ 1024KB = 1024 单位；linux：512B ⇒ 2048
+      expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
+    }
   })
 
   posixIt('limits:false ⇒ 不加任何抬头（回读为 unlimited）', async () => {

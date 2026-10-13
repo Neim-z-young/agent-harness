@@ -1,7 +1,7 @@
 import { describe, it, expect, afterEach } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import {
   ACTIVE_PLAN_FILE_NAME,
   ATTEST_FILE_NAME,
@@ -127,7 +127,10 @@ describe('parsePlan：Phase + 复选框', () => {
 
 describe('resolvePlanDir / slug 校验 / .active_plan', () => {
   it('目录 = cwd/.planning', () => {
-    expect(resolvePlanDir('/tmp/x')).toBe('/tmp/x/.planning')
+    // ⚠️ 两侧都先 `resolve`：实现把 cwd 解析成**平台绝对路径**（Windows 上 `/tmp/x` ⇒ `D:\tmp\x`）
+    // ⇒ 期望值必须走同一套解析（同 workspace.test.ts 的说明）。派生一律 `join`。
+    const root = resolve('/tmp/x')
+    expect(resolvePlanDir(root)).toBe(join(root, '.planning'))
   })
 
   it('slug 校验：拒绝穿越与分隔符', () => {
@@ -270,8 +273,10 @@ describe('展示工具', () => {
   })
 
   it('displayPlanPath：根下给相对路径，根外原样', () => {
-    expect(displayPlanPath('/tmp/x', '/tmp/x/.planning/task_plan.md')).toBe('.planning/task_plan.md')
-    expect(displayPlanPath('/tmp/x', '/other/a.md')).toBe('/other/a.md')
+    const root = resolve('/tmp/x')
+    expect(displayPlanPath(root, join(root, '.planning', 'task_plan.md'))).toBe(join('.planning', 'task_plan.md'))
+    const outside = resolve('/other/a.md')
+    expect(displayPlanPath(root, outside)).toBe(outside)
   })
 
   it('renderPlanSummary 列出阶段与完成度', () => {

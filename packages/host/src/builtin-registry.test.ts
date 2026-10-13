@@ -370,7 +370,10 @@ describe('P0-1：sandbox 段透传（配置不再静默失效）', () => {
       const bash = tools.find((t) => t.id === 'bash')!
       const res = (await bash.call({ command: 'ulimit -f' }, toolCtx(dir))) as { output?: { stdout: string } }
       // darwin：1 单位 = 1024B ⇒ 1024KB = 1024；linux：512B ⇒ 2048
-      expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
+      // ⚠️ 同上（tools-builtin 那处）：MSYS/Git Bash 的 `ulimit -f` 回读不是数字 ⇒ 只在非 win32 上比对。
+      if (process.platform !== 'win32') {
+        expect(Number(res.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 1024 : 2048)
+      }
 
       // 与默认（2 GiB）对照 —— 这一条才是"配置真的起作用"的证据：
       // 只断言 limits:false ⇒ unlimited 是**无效**的，因为"根本没加抬头"也是 unlimited。

@@ -1,14 +1,17 @@
 import { describe, it, expect } from 'bun:test'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { resolveWorkspace, level, dataFiles, defaultUserDir } from './index'
 
-const TMP = '/tmp/ws-mod'
+// ⚠️ 用 `resolve` 归一后再派生：`resolveWorkspace` 会把 cwd/dataDir 解析成**平台绝对路径**
+//（Windows 上 `/tmp/x` ⇒ `<当前盘>:\tmp\x`）⇒ 期望值必须先走同一套解析；派生路径一律 `join`
+//（手写 `'/'` 会在 Windows 上拼出 `D:\tmp\ws-mod/proj-a` 这种混合分隔符，照样对不上）。
+const TMP = resolve('/tmp/ws-mod')
 
 describe('resolveWorkspace（工作区定位与解析）', () => {
   it('给定 cwd 与 dataDir：返回两级目录 + 数据文件路径，全部绝对路径', () => {
-    const cwd = `${TMP}/proj-a`
-    const dataDir = `${TMP}/store`
+    const cwd = join(TMP, 'proj-a')
+    const dataDir = join(TMP, 'store')
     const ws = resolveWorkspace({ cwd, dataDir })
 
     // 根
@@ -40,7 +43,7 @@ describe('resolveWorkspace（工作区定位与解析）', () => {
   })
 
   it('两级扫描：user 在前、project 在后（后者覆盖）', () => {
-    const ws = resolveWorkspace({ cwd: `${TMP}/proj-b`, dataDir: `${TMP}/store-b` })
+    const ws = resolveWorkspace({ cwd: join(TMP, 'proj-b'), dataDir: join(TMP, 'store-b') })
     expect(ws.loadDirs.plugins).toEqual([ws.user.plugins, ws.project.plugins])
     expect(ws.loadDirs.skills).toEqual([ws.user.skills, ws.project.skills])
     expect(ws.loadDirs.agents).toEqual([ws.user.agents, ws.project.agents])
@@ -48,7 +51,7 @@ describe('resolveWorkspace（工作区定位与解析）', () => {
   })
 
   it('记忆目录：两级各一处，且与其它资源目录同级（路径约定，不预创建）', () => {
-    const ws = resolveWorkspace({ cwd: `${TMP}/proj-mem`, dataDir: `${TMP}/store-mem` })
+    const ws = resolveWorkspace({ cwd: join(TMP, 'proj-mem'), dataDir: join(TMP, 'store-mem') })
     expect(ws.user.memory).toBe(join(ws.user.root, 'memory'))
     expect(ws.project.memory).toBe(join(ws.project.root, 'memory'))
     // 只给路径，不落地目录（写入方按需创建）——与 plugins/skills/agents 同一约定
@@ -57,20 +60,20 @@ describe('resolveWorkspace（工作区定位与解析）', () => {
   })
 
   it('dataDir 缺省为 ~/.harness（defaultUserDir）', () => {
-    const ws = resolveWorkspace({ cwd: `${TMP}/proj-c` })
+    const ws = resolveWorkspace({ cwd: join(TMP, 'proj-c') })
     expect(ws.dataDir).toBe(defaultUserDir())
     expect(ws.user.root).toBe(defaultUserDir())
   })
 
   it('默认情况下 dataDir 与项目级目录指向同一根（cwd/.harness 独立）', () => {
-    const ws = resolveWorkspace({ cwd: `${TMP}/proj-d`, dataDir: `${TMP}/store-d` })
+    const ws = resolveWorkspace({ cwd: join(TMP, 'proj-d'), dataDir: join(TMP, 'store-d') })
     // 项目级目录与用户级 dataDir 相互独立（不同根），避免覆盖污染
     expect(ws.project.root).not.toBe(ws.dataDir)
     expect(ws.project.root).toBe(join(ws.cwd, '.harness'))
   })
 
   it('helpers：level / dataFiles / defaultUserDir', () => {
-    const root = `${TMP}/helper`
+    const root = join(TMP, 'helper')
     const lv = level(root)
     expect(lv).toEqual({
       root,
