@@ -48,16 +48,22 @@ jobs:
         run: bun install --frozen-lockfile
 
       # typecheck 是平台无关的判据（除 `adapters/*` —— 它不在根 workspaces 里，另行处理）
+      # 超时是**有界的失败**：卡住比慢更糟 —— 没有超时时 job 会一直挂到 GitHub 的 6 小时上限，
+      # 期间既没有日志也没有结论（2026-10-13 实测：Windows 的测试步骤挂住 15 分钟+）。
       - name: typecheck
+        timeout-minutes: 15
         run: bun run typecheck
 
       # Windows 上 shell 显式指定 bash：runner 默认是 pwsh，而脚本与
-      # `bun --filter=*` 的输出解析（grep -oE）都是 POSIX 口径
+      # `bun run --filter '*'` 的输出解析（grep -oE）都是 POSIX 口径
       # ⚠️ 日志路径用**相对工作目录**，不要写 `/tmp`：
       # `bash` 步骤里的 `/tmp` 会被 MSYS 映射到别处，而 `upload-artifact`（Node 实现、不经 MSYS）
       # 看到的是字面 `/tmp/...` ⇒ **Windows 上 artifact 永远为空**（`if-no-files-found: ignore` 会静默跳过）
       # —— 而 Windows 恰恰是最需要那份日志的平台。相对路径两平台都明确。
+      # ⚠️ 超时同样是为了**拿到证据**：步骤被超时杀掉之后，`if: always()` 的上传仍然执行
+      # ⇒ artifact 里是"卡住那一刻为止"的日志 ⇒ 从最后一个开始的包就能定位卡点。
       - name: 测试（含汇总 / 阈值判定）
+        timeout-minutes: 25
         shell: bash
         run: bash scripts/ci/test-summary.sh ./harness-ci-test.log "${{ runner.os }}"
         # 只有 Windows 允许非零退出（平台差异白名单，见文件头）；失败条数仍进 summary
