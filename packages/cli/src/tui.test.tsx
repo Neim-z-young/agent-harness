@@ -1233,10 +1233,10 @@ describe('TuiApp 集成（mock provider）', () => {
     // 不恢复（来源为 new），所以走欢迎页；提示必须由欢迎页渲染，否则会被欢迎页整体替换掉
     const frame = await waitFrame(f.setup, (fr) => fr.includes('未自动恢复会话'))
     expect(frame).toContain('它属于其它工作目录')
-    // ⚠️ 这一行文案很长，会被**按终端宽度换行**；而换行点取决于中间那个 `s.cwd` 路径的长度
-    // （各平台不同）⇒ 直接 `toContain('/resume')` 会因 `/resume` 恰被折行而失败（CI 实测）。
-    // 去掉空白后再找，才是"内容在不在"的正确判据。
-    expect(frame.replace(/\s+/g, '')).toContain('/resume')
+    // ⚠️ 这一行文案很长，会被**按终端宽度换行**，换行处插入的是**框线字符**（`│`）而不只是空白
+    // ⇒ 直接 `toContain('/resume')` 会因 `/` 与 `resume` 被框线隔开而失败（CI 实测：帧里实际是
+    // `要用它：/││resumes_179…`）。把**空白 + 制表/框线字符**一起去掉，才是"内容在不在"的判据。
+    expect(frame.replace(/[\s\u2500-\u257F|]+/g, '')).toContain('/resume')
     expect(f.app.sessionRestore.source).toBe('new')
     expect(f.app.sessionRestore.skipped?.reason).toBe('other-cwd')
     expect(f.currentSession().messages.length).toBe(0)
