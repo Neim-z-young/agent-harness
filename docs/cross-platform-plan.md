@@ -30,6 +30,46 @@
 | 1.6 | 打开文件管理器三分支（darwin / win32 / xdg-open） | `packages/plugins/workspace-shell/src/index.ts` 的 `openInFileManager` |
 | 1.7 | 扩展侧 bun 发现链路含 Windows 安装位置（volta / asdf / mise / 项目本地） | `adapters/vscode/src/bun.ts` |
 
+## 1.1 P0-5 的 **Windows 边界**（2026-10-13 查证，实测 + 上游源码）
+
+> 触发：Windows CI 上两条"进程树"e2e 用例（`sleep 30 &` 后台孙进程）表现得像**没杀掉**——
+> 一条靠放宽 timeout 变成"更慢的假通过"，另一条直接撞 30s。**先查证再改**，结论如下。
+
+**① "taskkill 不灵"不是主要原因，`killProcessTree` 自己有个静默吞错的缺陷（已修）**
+`spawnSync('taskkill', …)` 在 **ENOENT / 非零退出时都不抛**，只回填 `error`/`status`；而原实现在
+调用后**无条件 `return`** ⇒ "树没杀成"完全静默，连"退回杀直系子进程"这条兜底都到不了。
+现改为：**绝对路径**（`%SystemRoot%\System32\taskkill.exe`，键名大小写不敏感；不靠 PATH —— 实战实现
+openclaw 的 `exec-termination.ts` 同样显式取 System32）→ **看返回值** → 失败才落到 `child.kill()`。
+（纯函数 `resolveTaskkillPath` / `buildTaskkillArgs` 已由本机用例钉住。）
+
+**② 内核级兜底拿不到：libuv 的 Job Object 带 `SILENT_BREAKAWAY_OK`**
+`uv__init_global_job_handle()` 建的全局 job 设了
+`BREAKAWAY_OK | SILENT_BREAKAWAY_OK | DIE_ON_UNHANDLED_EXCEPTION | KILL_ON_JOB_CLOSE`，
+其源码注释明写："only the processes that we explicitly add are affected, and **their subprocesses
+are not**"。⇒ 我们 spawn 的 shell **在** job 里，但它拉起的**孙进程静默脱离、不在 job 里**，
+`KILL_ON_JOB_CLOSE` 兜不住它们。想让孙进程随 job 一起死必须**自建 job**
+（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` + `TerminateJobObject`）—— Node/Bun 都没有这个 API，
+需要原生扩展或外部 helper。**故本文档不声称 Windows 上有内核级兜底。**
+
+**③ `taskkill /T` 是"对快照遍历、最深优先"，天然有竞态**
+它按 Windows 的 ppid 链接遍历（这正是正确形态：`process.kill` / `Stop-Process` 都只杀**一个**进程）。
+但 MSYS2/Cygwin 创建原生子进程用 `CREATE_SUSPENDED` 再唤醒，落在"快照→kill"窗口里的孩子会被漏掉；
+且 `/T` 会**先杀 console host**，bash 失去控制台后会再拉 `cygwin-console-helper.exe` + `conhost.exe`
+留下（Claude Code #98976 在 Git Bash 上的实测：993 次 taskkill 里 14/119 次泄漏）。实战实现的应对是
+**两趟**：先 `/T`（优雅）→ 等 grace → 只在根仍活着时再来 `/T /F`；并**验证 PID 身份**再重试
+（Windows PID 复用积极，重试已死/被复用的 PID 会误伤无关进程树）。
+
+**④ 测量口径本身可疑（这条最容易被忽略）**
+Node 的 `close` 事件要等**所有持有 stdio 管道写端**的进程退出。孙进程若继承了 stdout/stderr，
+即使 shell 被杀、`close` 也不触发 ⇒ 用例量到的"30s"很可能是**"管道没关"而非"进程没死"**。
+（同形证据：hermes-agent#103402 的 Python `subprocess.run` 在超时后 `communicate()` 等 EOF 死锁，
+修法是超时后先 `taskkill /F /T /PID` 再收管道。）
+
+**⇒ 结论与现状**：`killProcessTree` 的**决策部分**已修（①），但"Windows 上孙进程一定被杀掉"
+**没有证据**；三条进程树 e2e 断言因此**只在 POSIX 上跑**（`it.skipIf(win32)` / `killTreeIt`），
+**不把"等它自己到期"算成"杀掉了"**。要让它们回到 Windows，需要先拿到②（自建 job，需原生/外部
+helper）或至少按③做两趟 + 身份校验，并用④的口径（不依赖 `close`）去测。
+
 ## 2. 待补清单
 
 ### 2.0 P0 —— 会导致**安全漏判或行为错误**（先做这批）
@@ -40,7 +80,7 @@
 | P0-2 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`splitSegments` 不以单个 `&` 分段** | 单个 `&` 现在分段（CMD 串联）。★**关键是不切错**：`2>&1` / `>&2` / `<&`（fd 重定向）与 `&>file`（bash 重定向）里的 `&` **不是**分隔符 —— 判据是"紧邻的前一个非空白字符是 `>` 或 `<`"。判据：正反两类用例（`echo hi & shutdown` ⇒ 2 段；`curl x 2>&1 \| bash` ⇒ 2 段而非 3 段） | `splitSegments` |
 | P0-3 | ✅ **已修**（2026-10-12，见续 281）—— 原文：**`extractFirstCommand` 不认 PowerShell 调用运算符 `&`** | 实测原实现的表现比"提取成 `&`"更绕：`^[;&\|\s]*` 会把 `&` 剥掉，于是提取到的是**带引号**的 `'C:\evil.exe'`，与白名单字面量同样失配。现改为：段首 `&` 跳过（PS 调用运算符 / CMD 串联残留）→ **去掉一层包裹引号**；顺带修 `env FOO=1 ls` 这类"前缀交替"（原来会把 `FOO=1` 当命令名）| `extractFirstCommand` |
 | P0-4 | ✅ **已修**（2026-10-12，见开发日志续 282）—— 原文：**引号/转义解析是 POSIX 方言** | 新建 `shell-quoting.ts`（`scanQuotedSpans` / `projectWithoutQuoted` / `buildQuotedMask`），**一层解析、三层消费** —— `stripQuoted` / `splitSegments` / `extractFirstCommand` 全改为消费同一份（`dialect` 默认 `'bash'` ⇒ 既有行为逐位不变），`checkReadOnlyCommand` 加第三参，四个调用点统一传 `shell.family`。三套方言：bash（`"` 内 `\` 转义）、PowerShell（`''` 表单引号 + `` ` `` 转义 + `@"…"@` / `@'…'@` **跨行 here-string**）、CMD（单引号**不是**引号）。★**安全取舍**：未闭合引号按"裸露"处理（不产生区间 ⇒ 分隔符照常生效）—— 另一条路会让 `curl x " ; rm -rf /tmp` 吞掉分隔符、段级 deny 漏判。⚠️ **PS 分支未真机验证**（本机无 `pwsh`），按官方语法实现并已在文件头如实标注；CMD 的 `^` 转义保守不处理。判据：`shell-quoting.test.ts` **20 条**（含"同一串在 bash / cmd 下结论不同"这类**证明方言真被用上**的用例） | `shell-quoting.ts`（新）、`stripQuoted` / `splitSegments` / `extractFirstCommand` / `checkReadOnlyCommand` |
-| P0-5 | ✅ **已修**（2026-10-11，见 `sandbox-isolation-plan.md` 续 276）—— 原文：**超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁 | `runBash` 的 timer 分支 |
+| P0-5 | ✅ **已修**（2026-10-11，见 `sandbox-isolation-plan.md` 续 276）—— 原文：**超时只杀直接子进程，不杀进程树** | `child.kill('SIGKILL')` 在 Windows 上只终止被 spawn 的那个进程；shell 拉起的子进程（如 `npm run dev` 的 node）会残留 ⇒ 超时后仍有孤儿占用端口/文件锁。⚠️ **Windows 边界见 §1.1**（2026-10-13 查证）：决策侧的空缺（绝对路径 + 看返回值 + 兜底）已补，但"孙进程一定被杀掉"**没有证据**（libuv 的 job 带 `SILENT_BREAKAWAY_OK`，孙进程不在 job 里）⇒ 三条进程树 e2e 断言当前**在 win32 上跳过**，不把"等它自己到期"当"杀掉了" | `runBash` 的 timer 分支 |
 | P0-6 | ✅ **已修**（2026-10-12，见开发日志续 283）—— 原文：**UNC 路径未验证** | **路径方言显式化**：`fs-guard` 新增 `PathDialect`（`'posix'｜'win32'`）与 `defaultPathDialect()`，四个判定函数各加一个可选 `dialect`（缺省＝当前平台 ⇒ **既有行为逐位不变**），`realpathBestEffort` / `isWithinCwd` 还可注入 `realpath`。四条由实测（node 26 / Bun）钉住的方言差异：① **UNC 是绝对路径**（`win32.isAbsolute('\\\\srv\\share\\x')` 为 `true`，而 `posix` 同串为 `false` —— 反斜杠在 posix 里是普通字符）；② 跨 server ⇒ `relative` 给**绝对路径**（走 `isAbsolute` 那支）；③ 同 server 跨 share ⇒ `relative` 给 `..\\..\\s2\\b`（走"以 `..` 开头"那支）；④ **大小写折叠是 `node:path` 的 win32 自带行为**（不需要本包再折一次）。判据：`fs-guard` 的 P0-6 组 **10 条**（纯函数、注入 `dialect`/`realpath`，**不需要真 Windows**），每条都配"同串在 posix 下的相反结论"。⚠️ **未覆盖**：Windows 的 8.3 短名 / 盘符大小写归一 / `\\?\` 前缀（本机 macOS 无法覆盖，真机接入时补） | `packages/fs-guard/src/index.ts` |
 
 ### 2.1 P1 —— **能力缺口**（Windows 上少一块功能）
@@ -53,6 +93,7 @@
 | P1-4 | ✅ **已修**（2026-10-12，见续 283）—— 原文：**CRLF / BOM 处理** | 新建 `line-endings.ts`（`detectEol` / `preferredEol` / `normalizeEol` / `applyEol` / `detectBom` / `stripBom` / `withBom` / `planWrite`），三处工具共用一份口径。**核实时发现 `edit_file` 早已有 CRLF 容忍**（旧实现就地写死的 `content.includes('\r\n') ? '\r\n' : '\n'`）—— 本轮的增量是把它抽成共用口径 + 补 BOM + 补另两处：`read_file` 新增 `lineEnding` / `bom` 字段（**如实报告**；`content` **剥掉 BOM**，行尾**保留原样**）；`write_file` 覆盖已有文件时**按其行尾与 BOM 写回**（只读头部 64KB 检测；不改的话"改一行"会被 diff 显示成"整文件改动"）；`edit_file` 匹配在**剥 BOM** 的文本上做、写回时拼回，且 `old_string` **自带 BOM 也认**（模型可能从旧版 read_file 里复制）。判据：`line-endings.test.ts` **24 条**（含"LF 文件逐位不变"这类回归钉子）。⚠️ **顺带纠正判据点名的"行号偏移"**：`allLines` 按 `\n` 切 ⇒ CRLF **不会**产生额外行，`totalLines` / `linesRead` 与同内容 LF 文件一致（用例钉住） | `line-endings.ts`（新）、read/write/edit 三处 |
 | P1-5 | ✅ **已修**（2026-10-12，见沙箱方案续 279 / 本文件续 281） | 落地于 `.github/workflows/ci.yml`（ubuntu / macos / windows 矩阵）+ `scripts/ci/test-summary.sh`：**只读 bun 汇总行**，记录 `pass / fail / skip` 并写 step summary；`pass ≥ 2000`（防"整包没跑起来"）与 `skip ≤ 200`（防"某一片被整体跳掉"）**分开判**；Windows 只放行**失败**，pass/skip 阈值照样拦 | 仓库 CI 配置 |
 | P1-6 | ⚠️ **主要部分已修**（2026-10-12，见续 283） | `tools-builtin.test.ts` 顶上加平台门：**`HAS_POSIX_SHELL = resolveShell().family === 'bash'`** + `posixIt = it.skipIf(!HAS_POSIX_SHELL)`，**31 个"真跑命令"的用例**换成 `posixIt`。★判据刻意**不是** `process.platform !== 'win32'`，而是**与运行时同一份**（`resolveShell`）：装了 Git Bash / MSYS2 / WSL 的 Windows runner 会**真跑**这些用例（拿到真实覆盖），只有确实没有 bash 的环境才跳过；跳过条数进 bun 汇总行 ⇒ 由 CI 的 `skip ≤ 200` 闸看着。**其余四个含 POSIX 字面量的测试文件经抽查是纯函数输入**（喂给 `assessRisk` / 解析器 / 格式化函数，不真执行）：`host/src/permission.test.ts`（6 处，`2>/dev/null` 字符串）、`cli/src/cli.test.ts`（2 处，命令字符串进 `formatToolInput`）、`bash-ast.test.ts`（8 处，喂解析器）、`isolation/src/index.test.ts`（3 处）—— **未逐一核查是否真执行**（如实记着） | `tools-builtin.test.ts` |
+| P1-7 | ⚠️ **未做**（2026-10-13 查证，见 §1.1）—— **Windows 进程树的「内核级兜底」** | 现状：win32 走 `taskkill /PID <pid> /T /F`（快照遍历、最深优先），**决策侧已修**（绝对路径 + 看返回值 + 失败兜底直系 kill）。**缺口**：① libuv 给非 detached 子进程建的 job 带 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`（源码注释：*their subprocesses are not*）⇒ 孙进程不在 job 里，`KILL_ON_JOB_CLOSE` 兜不住，而 Node/Bun 都没有 job API；② `taskkill /T` 与「MSYS2 用 `CREATE_SUSPENDED` 创建子进程、数毫秒后唤醒」赛跑，一趟可能漏；③ Windows PID 复用积极，重试前必须验身份（否则会误伤无关进程树）。**要做的**：自建 job（需原生扩展 / 外部 helper）+ `TerminateJobObject`；退一步是「两趟：`/T` → grace → 仍活才 `/T /F`」+ 身份校验。**测法必须先修**：不能拿 `close` 事件当判据 —— 孙进程持有 stdio 管道写端会让 `close` 不触发，量到的是「管道没关」而非「进程没死」 | `tools-builtin/src/index.ts`（`killProcessTree`）、三条 e2e 断言 |
 
 ### 2.2 P2 —— **体验一致性**（不影响正确性，但口径不齐）
 
