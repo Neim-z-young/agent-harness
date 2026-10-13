@@ -98,6 +98,8 @@ describe('P3-4 渗透用例集（沙箱回归门）', () => {
 
   // ---------- 2. env 泄漏 ----------
 
+  // ⚠️ 本组会**真起 sandboxed bash**。CI 的慢 runner 上偶发撞 bun 默认 5s 超时
+  // （实测 macOS 上 ③ 卡过 5000ms，而同组 ④~⑩ 全过）⇒ 显式放宽 timeout。
   it('③ env 泄漏（bash）：敏感名变量在沙箱内读不到（env 默认拒绝）', async () => {
     process.env.__PEN_TEST_API_KEY = 'leak-me'
     try {
@@ -106,7 +108,7 @@ describe('P3-4 渗透用例集（沙箱回归门）', () => {
     } finally {
       delete process.env.__PEN_TEST_API_KEY
     }
-  })
+  }, 30_000)
 
   it('④ env 后门（bash_ro）：只读工具**不接受** input.env 覆盖（PYTHONSTARTUP / NODE_OPTIONS 这类后门）', async () => {
     // 注：主 bash **允许** input.env（那是调用方显式给的值，不是从宿主 env 里漏出来的），

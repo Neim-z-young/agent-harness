@@ -244,10 +244,12 @@ describe('collectStaticEnv / readGitInfo：真机读取', () => {
     expect(env.arch!.length).toBeGreaterThan(0)
   })
 
+  // ⚠️ 这两条会**真 spawn `git`**（不止一次）。CI 的慢 runner 上"进程启动 + 父目录向上探测"
+  // 偶发很慢（实测 macOS 上撞过 bun 默认 5s 超时，且**失败点每轮游走**）⇒ 显式放宽 timeout。
   it('readGitInfo：非 git 目录返回 undefined（省略而非报错）', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'envctx-nogit-'))
     expect(await readGitInfo(dir)).toBeUndefined()
-  })
+  }, 30_000)
 
   it('readGitInfo：最小 git 仓库（无提交 + untracked ⇒ 脏；提交后 ⇒ 干净）', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'envctx-git-'))
@@ -260,7 +262,7 @@ describe('collectStaticEnv / readGitInfo：真机读取', () => {
     execFileSync('git', ['-C', dir, 'add', 'a.txt'])
     execFileSync('git', ['-C', dir, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'])
     expect(await readGitInfo(dir)).toEqual({ branch, dirty: false })
-  })
+  }, 30_000)
 })
 
 // ===== P2-2：注入 env 时的键名大小写（Windows 上常写作 `Path` / `ComSpec`）=====

@@ -1613,7 +1613,11 @@ describe('TuiApp 文件引用导航（Tab / 上下键选中 / Enter 打开）', 
 
     // 下移一次选中第二项 src/bar.ts:3
     f.setup.mockInput.pressArrow('down')
-    await new Promise((r) => setTimeout(r, 10))
+    // ⚠️ 必须**等选中项真的移动**再按 Enter：原实现只是 `setTimeout(10)`，而"按键处理"
+    // 与"重渲染"的先后在慢 runner 上没有保证 ⇒ 偶发 Enter 用的还是第一项（CI macOS 实测：
+    // 期望 `src/bar.ts` 却拿到 `src/foo.ts`，同一用例本机稳定通过）。
+    // 选中行以 `▸` 前缀标记，且 `abbrevFileRef` 的契约是"中间省略但**保留文件名**" ⇒ 用文件名认。
+    await waitFrame(f.setup, (frame) => /▸[^\n]*bar\.ts/.test(frame))
     // 打开选中项 → 退出列表模式
     f.setup.mockInput.pressEnter()
     await waitFrame(f.setup, (frame) => !frame.includes('▸'))
