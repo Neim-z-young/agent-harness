@@ -1321,7 +1321,7 @@ describe('bash_ro：只读哨兵的沙箱内只读 shell', () => {
     it('丢弃到 /dev/null 的重定向放行 —— 只读命令最常写的「静音 stderr」惯用法', () => {
       // 回归：`/>>?/` 只看 `>` 这一个字符，分不清 `2>err.txt` 与 `2>/dev/null`，
       // 实测 `git rev-parse --is-inside-work-tree 2>/dev/null` 被判 SANDBOX_RO_REDIRECT 整条拒绝，
-      // 只读哨兵因此反复重试（spikes/vscode-chat-sessions 真机记录：两次 bash_ro REDIRECT）。
+      // 只读哨兵因此反复重试（真机记录见 docs/vscode-chat-sessions-spike.md §5.3：两次 bash_ro REDIRECT）。
       for (const cmd of [
         'git rev-parse --is-inside-work-tree 2>/dev/null',
         'cat f 2>/dev/null; wc -l f',

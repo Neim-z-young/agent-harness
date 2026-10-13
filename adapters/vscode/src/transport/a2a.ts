@@ -88,6 +88,34 @@ export class A2aTransport implements HarnessTransport {
       // 404 之类的非 JSON 体会让 `json()` 抛出一个掩盖真因的错误。
       throw new TransportError(`SendStreamingMessage 失败：HTTP ${res.status}`, res.status)
     }
+
+    // ★ 预流错误必须在这里分流（真机踩过，见 docs/vscode-chat-sessions-spike.md §5c）：
+    // A2A 的**预流错误**（任务已终态 / contextId 与任务不符 / 同会话并发 / 鉴权失败）走的是
+    // `server.ts` 的 `serverErrorResponse` → `Response.json(...)`，也就是
+    // **HTTP 200 + `application/json`**（JSON-RPC over HTTP 的惯例：错误在体里，状态码仍是 200）。
+    // 无条件按 SSE 解帧 ⇒ `SseDecoder` 解出 **0 帧** ⇒ 调用方的 for-await 一次循环体都不进
+    // ⇒ 表现为"这一轮正常结束、但什么都没有"，**错误被彻底吞掉**。
+    // 实测：第二轮的消息带上第一轮的 `taskId` ⇒ `-32004 TASK_TERMINAL` 就是这样被吃掉的。
+    //
+    // 判据必须是 **content-type**，不能是状态码 —— 上述情形状态码**全是 200**。
+    const contentType = res.headers.get('content-type') ?? ''
+    if (!contentType.includes('text/event-stream')) {
+      const text = await res.text()
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(text)
+      } catch {
+        throw new TransportError(
+          `SendStreamingMessage 返回既非 SSE 也非 JSON（HTTP ${res.status}，ct=${contentType}）：${text.slice(0, 200)}`,
+          res.status,
+        )
+      }
+      // 原样吐出：`mapA2aEvent` 认得 `{jsonrpc,id,error}` 信封，会翻成 `kind:'error'`
+      //（而非在此另造一套错误语义 —— 错误渲染只有一处定义）。
+      yield parsed
+      return
+    }
+
     if (res.body === null) throw new TransportError('SSE 响应没有 body', -1)
 
     const decoder = new SseDecoder()

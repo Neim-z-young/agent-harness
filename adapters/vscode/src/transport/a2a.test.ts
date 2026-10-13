@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it } from 'bun:test'
+import { mapA2aEvent } from '../map/render'
 import type { Sidecar } from '../sidecar'
 import type { SidecarHandshake } from '../types'
 import { A2aTransport, TransportError, type FetchLike } from './a2a'
@@ -131,6 +132,45 @@ describe('A2aTransport.send', () => {
     }
     expect(thrown).toBeInstanceOf(TransportError)
     expect((thrown as TransportError).code).toBe(404)
+  })
+
+  it('★ 预流错误（HTTP 200 + application/json）必须被分流成 1 帧，不能吞成 0 帧', async () => {
+    // 回归（真机 2026-10-09，见 docs/vscode-chat-sessions-spike.md §5c）：
+    // A2A 的预流错误走 `serverErrorResponse` → `Response.json(...)`，即 **HTTP 200 +
+    // application/json**。旧实现只看 `res.ok`，之后无条件按 SSE 解帧 ⇒ `SseDecoder` 解出
+    // **0 帧** ⇒ 调用方的 for-await 一次循环体都不进 ⇒ 表现为"这一轮正常结束、但什么都没有"。
+    // 判据只能是 content-type —— 这里的 HTTP 状态码就是 200。
+    const { fetch } = recordingFetch(
+      () =>
+        new Response(JSON.stringify({ jsonrpc: '2.0', id: 2, error: { code: -32004, message: 'Task is terminal' } }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+    )
+    const t = new A2aTransport({ sidecar: fakeSidecar(), fetchImpl: fetch })
+
+    const got: unknown[] = []
+    for await (const f of t.send({ contextId: 'c1', taskId: 't1' }, 'hi', new AbortController().signal)) got.push(f)
+
+    expect(got).toHaveLength(1)
+    // 原样吐出信封，由 mapA2aEvent 翻成 error 算子（错误渲染只有一处定义）
+    expect(mapA2aEvent(got[0])).toMatchObject({ kind: 'error', code: -32004 })
+  })
+
+  it('既非 SSE 也非 JSON ⇒ TransportError（带上 content-type 便于归因）', async () => {
+    const { fetch } = recordingFetch(
+      () => new Response('<html>502 Bad Gateway</html>', { status: 200, headers: { 'content-type': 'text/html' } }),
+    )
+    const t = new A2aTransport({ sidecar: fakeSidecar(), fetchImpl: fetch })
+
+    let thrown: unknown
+    try {
+      for await (const _ of t.send({}, 'hi', new AbortController().signal)) break
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(TransportError)
+    expect((thrown as Error).message).toContain('text/html')
   })
 
   it('配了 token ⇒ 带 Bearer', async () => {

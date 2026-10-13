@@ -1,5 +1,65 @@
 # Agent Harness 开发日志
 
+## 2026-10-13（续 286）VSCode 适配器：移植 spike 的四类客户端修复（D1/D2/E1/E2）+ 探针归档拆除
+
+### 起因
+
+盘点 `spikes/` 时发现那份 VSCode 会话选择器探针**不是历史归档，而是四类修复的唯一副本**：
+逐条核对上游 `adapters/vscode/src`（该目录最后一次改动是 2026-10-08）后确认，探针里修好的
+四个缺陷在生产路径上**逐字仍在** ⇒ `@harness` 参与者**在同一会话发第二条消息仍会静默失败**、
+**授权问到第 8 轮仍会把会话卡死**。修法已经过真机验证，压着不划算。
+
+### 决策与落地
+
+**一、移植（`adapters/vscode/src`，两处）。**
+
+- **D2**（`transport/a2a.ts` 的 `send()`）：按 **content-type** 分流 —— 非 `text/event-stream`
+  就 `JSON.parse` 后原样 `yield`（交给 `mapA2aEvent` 翻成 `kind:'error'`），不在此另造错误语义。
+  判据只能是 content-type：预流错误的 HTTP 状态码**就是 200**。
+- **D1**（`participant.ts`）：新增导出的纯函数 `turnMetadata(state)` = `{...state, taskId: undefined}`，
+  三条回写路径（正常轮 / 异常轮 / 斜杠命令轮）统一走它；`readState()` 同时不再回填 `taskId`。
+  **写入 + 读回两道都要有** —— 只堵一头，另一头照样把终态 task 带到下一轮。
+- **E1/E2**（同文件）：新增 `MAX_PERMISSION_PROMPTS = 8`（弹窗配额），`MAX_PERMISSION_ROUNDS`
+  由 8 提到 **40**（整轮硬上限）；`pending` 提到循环外；超配额自动 `deny` 且**仍走同一轮续接**；
+  循环结束后若仍有待决授权 ⇒ `CancelTask` + 明确文案 + `outcome='error'`。
+  顺带**去掉循环体内那个多余的 `round++`**（它与 `for` 的自增叠加 ⇒ 实际续接次数只有常量的一半，
+  与"配额 8 / 轮数 40"的口径对不上）。
+
+**二、探针归档拆除（用户选 C）。**
+- 知识归档到 **`docs/vscode-chat-sessions-spike.md`**（择要：proposed 门槛 / 请求路由根因 /
+  三次卡死的真机病史与三轮对照表 / 已知边界 / 下一步），并写明每一条修复的生产落点。
+- 删除 `spikes/vscode-chat-sessions/`（**141MB**，其中 `node_modules` 140MB；目录**未被 git 跟踪**，
+  删除不可逆 ⇒ 删前先 `tar czf /tmp/vscode-chat-sessions-spike-20261013.tgz --exclude node_modules --exclude out`，
+  252KB / 32 项，已备份）。
+- 顺手修掉两处指向已删路径的**活引用**（`development-log.md` 续 264 的引言、
+  `tools-builtin.test.ts` 的一条注释）；memory 侧 `notes/longform.md` 的索引指针也改指新文档。
+  （历史逐日日志里的旧路径是当日记录，不改。）
+
+### 只有实现时才暴露的发现
+
+1. **探针那份"已修"版本本身有个口径没做对**（移植时被回归用例抓出来）：用户在授权弹窗上点取消
+   （`answer === undefined`）时，代码已 `CancelTask` 并 `break`，但 `pending` **没清** ⇒ 轮末
+   fail-safe **又发一次 `CancelTask`**，还把"用户主动取消"误报成"连续 40 轮授权询问仍未结束"。
+   修法：已经在答复路径上处理过的待决请求就地清掉 —— fail-safe 的语义是"轮数用尽仍待决"，
+   只该在那一种情形下触发。（生产版已修，回归用例钉住。）
+2. **`sessionSwitched` 不经过 `readState` 流转**：它由 `extension.ts` 的
+   `buildFollowups(result?.metadata)` **直接读上一轮 metadata**，所以 `turnMetadata` 必须保留它
+   （只回 `contextId` 会让 follow-ups 换档失效、启动自检每轮都弹）。`readState` 只继承
+   `contextId` + `noticesShown` 是对的 —— 两个通道各管各的。
+3. **`vscode` 模块在测试进程里可以桩掉**：`mock.module('vscode', …)` 能拦住一个**根本没安装**的模块，
+   但必须**先 mock、再动态 `import()`** —— 静态 import 会被提升到 mock 之前，于是 handler
+   一行都没测过。这条让 `participant.ts` 第一次有了单测（此前它导入 `vscode`，测试直接绕开它）。
+
+### 验证
+
+- `adapters/vscode`：**typecheck 0 error**；**259 pass / 0 fail**（新增 11 条：`transport/a2a.test.ts`
+  2 条 + 新文件 `src/participant.test.ts` 9 条）。
+- **反向验证**（`cp` 备份 + 源码变异 + `shasum -a 256 -c` 还原，五处各验一次，**每次都只红在预期的那几条**）：
+  ①去掉 D2 的 content-type 分流 ⇒ 红 2 条；②`readState` 回填 `taskId` ⇒ 红 1 条；
+  ③去掉轮末 fail-safe ⇒ 红 1 条；④去掉弹窗配额 ⇒ 红 1 条；⑤撤销"已答复即清 `pending`" ⇒ 红 1 条。
+- 根 `bun run typecheck` **48 包 0 error**、`bun run test` **exit 0**（改动不在 workspaces 里，
+  仍全量跑一遍确认无涟漪）。
+
 ## 2026-10-13（续 285）首次真跑 CI 的收尾：根脚本去 glob + 5 条平台耦合用例
 
 用户先问"Windows 矩阵怎么跑"，推送后跑出首份真实 CI 结果：**macos ✅ / ubuntu ✗ 5 条 / windows ✗ 卡在 typecheck**。
@@ -1601,7 +1661,8 @@ TUI 新增 widget 块（widgetType→注册表→组件，每渲染器带 render
 
 ### 起因
 
-spike 真机记录（`spikes/vscode-chat-sessions/README.md` §5e）：只读哨兵连续两次 `bash_ro`
+spike 真机记录（原 `spikes/vscode-chat-sessions/README.md` §5e；该目录已拆除，归档见
+`docs/vscode-chat-sessions-spike.md` §5.3）：只读哨兵连续两次 `bash_ro`
 返回 `SANDBOX_RO_REDIRECT`，模型被文案带偏后反复换写法重试。最小复现：
 
 ```

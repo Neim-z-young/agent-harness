@@ -27,8 +27,28 @@ import {
 import { extractTaskIds, mapA2aEvent } from './map/render'
 import type { FileTreeWireNode, HarnessTransport, RenderOp } from './types'
 
-/** 权限续接的最大轮数（防死循环：每轮一次挂起） */
-const MAX_PERMISSION_ROUNDS = 8
+/**
+ * 用户最多被问几次授权（**弹窗配额**）。
+ *
+ * 超过之后**不再打扰用户**，剩余授权请求按 `deny` 自动处理（fail-safe）。为什么必须有这道闸：
+ * `permissionMode: ask` 下模型**每调一次工具就是一次询问**，一旦它陷进"工具被拒 ⇒ 换个工具
+ * 再试"的循环就会一直弹窗 —— **实测一轮弹过 8 次**（真机记录见
+ * `docs/vscode-chat-sessions-spike.md` §5e）。
+ */
+export const MAX_PERMISSION_PROMPTS = 8
+
+/**
+ * 权限续接的轮数**硬**上限（防死循环：每轮一次挂起）。
+ *
+ * 与 `MAX_PERMISSION_PROMPTS` 的分工：前者只限制"问用户几次"，这条限制"整轮一共能发几次"；
+ * 到顶即 fail-safe 收尾。
+ *
+ * ⚠️ 为什么收尾必须显式做（真机踩过，2026-10-09）：`pending` 原先声明在循环**内部**，
+ * 循环因上限退出时那笔待决授权就被**静默丢弃**了 ⇒ 服务端任务永远停在 `INPUT_REQUIRED`，
+ * 而它仍算"活跃任务" ⇒ 该 `contextId` 之后**每条消息**都被 `ConcurrentTaskError` 拒
+ * （会话卡死，只能重启 sidecar）。**铁律：任何退出路径都不得留下未答复的授权请求。**
+ */
+export const MAX_PERMISSION_ROUNDS = 40
 
 /**
  * 块模型时间线的写入口（P3-B2）。
@@ -69,13 +89,29 @@ export interface ParticipantDeps {
 }
 
 /** 跨轮状态：写进 `ChatResult.metadata`，下轮从 `ChatResponseTurn.result` 读回 */
-interface TurnState {
+export interface TurnState {
   readonly contextId?: string
   readonly taskId?: string
   /** 启动自检（warn notices）已在本线程展示过 —— 每条线程只提示一次 */
   readonly noticesShown?: boolean
   /** 上一轮刚执行过 /new 或 /resume（follow-ups 换一档建议） */
   readonly sessionSwitched?: boolean
+}
+
+/**
+ * 轮末要写进 `ChatResult.metadata` 的跨轮状态（纯函数，可单测）。
+ *
+ * **必须剥掉 `taskId`**：它是**轮内**凭据，只在"回答权限挂起"时成立。上一轮一旦正常结束，
+ * 那个任务就是终态，下一条消息带它 ⇒ 服务端按协议拒绝（`-32004 TASK_TERMINAL`，
+ * a2a-tck `CORE-SEND-002` 是 MUST）。而只按 SSE 解帧的客户端会把这条错误**吞成 0 帧**
+ * 静默成功 —— 表现为"这一轮正常结束、但什么都没有"（传输层已按 content-type 分流，
+ * 见 `transport/a2a.ts`；两处必须一起才对得起）。
+ *
+ * 其余字段（`noticesShown` / `sessionSwitched`）照旧继承 —— 只回 `contextId` 会让
+ * "每线程一次"的启动自检变成每轮都弹。
+ */
+export function turnMetadata(state: TurnState): TurnState {
+  return { ...state, taskId: undefined }
 }
 
 export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequestHandler {
@@ -119,6 +155,14 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       // 时间线：本轮的"块"从这里开始累积（侧栏订阅它 —— 设计稿 §12.9）
       deps.timeline?.startTurn(prompt)
 
+      /**
+       * 待决的授权请求。**声明在循环外**：循环可能因上限退出，那时必须还能看见它、
+       * 并把它关掉（见 `MAX_PERMISSION_ROUNDS` 的说明）。
+       */
+      let pending: Extract<RenderOp, { kind: 'permission' }> | undefined
+      /** 已经弹过几次授权窗（配额见 `MAX_PERMISSION_PROMPTS`） */
+      let prompts = 0
+
       // 权限续接：挂起 ⇒ 弹窗 ⇒ 把答复当作新一条消息发回（带 taskId + contextId）
       for (let round = 0; round < MAX_PERMISSION_ROUNDS; round++) {
         if (token.isCancellationRequested) {
@@ -126,7 +170,7 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
           break
         }
 
-        let pending: Extract<RenderOp, { kind: 'permission' }> | undefined
+        pending = undefined
         let textOut = ''
 
         for await (const frame of deps.transport.send(
@@ -189,27 +233,56 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
         if (!pending) break
 
         // ---- 权限待决：弹窗 → 答复 → 续接 ----
-        const answer = await askPermission(pending, token)
+        //
+        // 配额用尽后**不再打扰用户**，直接按 `deny` 处理：既让整轮能走到终态，又不至于把用户
+        // 按在弹窗上。注意仍走同一轮续接（`prompt = answer`），所以模型看得见"被拒绝"并据此
+        // 调整 —— **不是把请求丢掉**（丢掉就会卡死会话，见 MAX_PERMISSION_ROUNDS）。
+        let answer: string | undefined
+        if (prompts < MAX_PERMISSION_PROMPTS) {
+          prompts++
+          answer = await askPermission(pending, token)
+        } else {
+          answer = 'deny'
+          log(`[permission] 授权提示已达 ${MAX_PERMISSION_PROMPTS} 次，本轮起自动 deny（不再弹窗）`)
+        }
         if (answer === undefined) {
           stream.markdown('\n\n（已取消授权，本轮结束）\n\n')
           outcome = 'cancelled'
           if (state.taskId) await deps.transport.cancel(state.taskId).catch(() => {})
+          // ★ 这一笔授权已经用 CancelTask 答复过了 ⇒ 必须清掉，否则轮末的 fail-safe 会
+          // **再发一次 CancelTask**，并把"用户主动取消"误报成"连续 N 轮授权询问仍未结束"。
+          //（fail-safe 的语义是"轮数用尽仍待决"，只该在那一种情形下触发。）
+          pending = undefined
           break
         }
         prompt = answer
-        round++
       }
 
       if (outcome === 'cancelled') stream.markdown('\n\n_已停止_\n')
+
+      // ★ 绝不能留着未答复的授权请求就走人（理由见 `MAX_PERMISSION_ROUNDS`）：
+      // 服务端那个任务会永远停在 `INPUT_REQUIRED`，而它仍算"活跃任务" ⇒ 整个会话之后发什么都
+      // 报 `ConcurrentTaskError`。走到这里说明硬上限都到顶了，直接 CancelTask 把它释放
+      //（`SuspendTable.cancel` 会唤醒挂起方，跑完最后一段并落到终态）。
+      if (pending !== undefined) {
+        log(`[permission] 续接轮数用尽（${MAX_PERMISSION_ROUNDS} 轮）仍有一笔待决授权 ⇒ 发 CancelTask 释放会话`)
+        if (state.taskId) await deps.transport.cancel(state.taskId).catch(() => {})
+        stream.markdown(
+          `\n\n（连续 ${MAX_PERMISSION_ROUNDS} 轮授权询问仍未结束，已中止并释放会话；可以直接继续对话）\n\n`,
+        )
+        outcome = 'error'
+      }
+
       deps.timeline?.finish(outcome === 'done' ? 'completed' : outcome)
-      return { metadata: state satisfies TurnState }
+      return { metadata: turnMetadata(state) }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e)
       stream.markdown(`\n\n❌ ${msg}\n\n`)
       log(`[error] ${msg}`)
       // 异常退出也要收尾：否则时间线永远显示"进行中"
       deps.timeline?.finish('error')
-      return { metadata: state }
+      // 失败路径同样只回写跨轮状态（`taskId` 绝不跨轮，见 turnMetadata）
+      return { metadata: turnMetadata(state) }
     } finally {
       token.onCancellationRequested(() => {})
       controller.abort()
@@ -347,7 +420,8 @@ async function handleCommand(
     const msg = e instanceof Error ? e.message : String(e)
     stream.markdown(`\n\n❌ \`/${command}\` 失败：${msg}\n\n`)
   }
-  return { metadata: state }
+  // 命令轮同样只回写跨轮状态（`taskId` 绝不跨轮，见 turnMetadata）
+  return { metadata: turnMetadata(state) }
 }
 
 // ========================================================================
@@ -405,20 +479,24 @@ export function resolveRefUri(ref: string): vscode.Uri | undefined {
 // ========================================================================
 
 /**
- * 从 Chat 历史里读回上一轮的会话/任务 id。
+ * 从 Chat 历史里读回上一轮的会话 id。
  *
  * `ChatContext` **只有 `history`，没有 session id**（vscode.d.ts 实测）——
  * 所以跨轮状态只能靠 `ChatResult.metadata` 写、`ChatResponseTurn.result` 读。
+ *
+ * ⚠️ **`taskId` 刻意不继承**：它是**轮内**凭据（只在"回答权限挂起"时成立），上一轮结束即终态，
+ * 带进新一轮必被服务端拒（`-32004`）。写不进去（见 `turnMetadata`）+ 读不回来，两道都要有。
  */
 function readState(context: vscode.ChatContext): TurnState {
   for (let i = context.history.length - 1; i >= 0; i--) {
     const turn = context.history[i]
     if (turn instanceof vscode.ChatResponseTurn) {
       const md = turn.result?.metadata as Partial<TurnState> | undefined
-      if (md && (md.contextId || md.taskId || md.noticesShown)) {
-        // 全字段继承（含 noticesShown / sessionSwitched）—— 只继承 id 会让
-        // "每线程一次"的启动自检变成每轮都弹。
-        return { contextId: md.contextId, taskId: md.taskId, noticesShown: md.noticesShown }
+      if (md && (md.contextId || md.noticesShown)) {
+        // 只继承"每轮都要带上"的两项：`noticesShown` 不带 ⇒ "每线程一次"的启动自检会每轮都弹。
+        // （`sessionSwitched` 不在 `state` 里流转 —— follow-ups 是**直接读上一轮的 metadata**
+        // 算的，见 `extension.ts` 的 `buildFollowups(result?.metadata)`，两者互不影响。）
+        return { contextId: md.contextId, noticesShown: md.noticesShown }
       }
     }
   }
