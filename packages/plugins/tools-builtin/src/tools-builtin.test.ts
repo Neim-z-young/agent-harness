@@ -23,6 +23,8 @@ import {
   resolveBashLimits,
   resolveTaskkillPath,
   buildTaskkillArgs,
+  isChildAlive,
+  KILL_TREE_GRACE_MS,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
@@ -56,17 +58,6 @@ const HAS_POSIX_SHELL = resolveShell().family === 'bash'
  * `/d/a/...`）。凡依赖这些语义的断言还得**单独按 `process.platform` 加一层门**。
  */
 const posixIt = it.skipIf(!HAS_POSIX_SHELL)
-
-/**
- * **进程树 kill** 相关用例的门：win32 上**不跑**（2026-10-13 定案）。
- *
- * 产品在 win32 上走 `taskkill /T /F` 试图杀整棵树，但**实测不生效** —— 被留下的孙进程会活到
- * `sleep` 自然退出，于是 `waitGone(...)` 只是"等到它自己到期"（**假通过**：把"杀掉了"偷换成
- * "等到了"）。给更大 timeout 只会让它变成"更慢的假通过"（另一条 `sleep 30` 的同款用例直接撞
- * 30s 超时）。⇒ 这里不声称 Windows 具备进程组语义，断言只在 POSIX 上成立（缺口的记录见
- * `.workbuddy/memory` 的待办；修它需要真机调 `taskkill` 路径，不能靠超时糊过去）。
- */
-const killTreeIt = it.skipIf(!HAS_POSIX_SHELL || process.platform === 'win32')
 
 /**
  * 把 **MSYS 路径**折回 native 形式（`/d/a/b` ⇒ `D:\a\b`）；非 win32 原样返回。
@@ -1087,7 +1078,7 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     expect(res.output!.stdout.trim()).toBe('hi')
   })
 
-  killTreeIt('★超时杀掉整棵进程树：后台孙进程不能活下来（P0-6 回归）', async () => {
+  posixIt('★超时杀掉整棵进程树：后台孙进程不能活下来（P0-6 回归）', async () => {
     const pidFile = join(TMP_DIR, 'grandchild.pid')
     const res = await bashTool.call({
       // 后台起一个长命孙进程并记下它的 pid，然后自己挂住
@@ -1101,7 +1092,7 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     // ⚠️ 显式放宽：Windows 上杀整棵进程树 + 等孙进程消失更慢（CI 实测撞过 5s 默认超时）
   }, 30_000)
 
-  killTreeIt('★中断（AbortSignal）同样杀整棵树', async () => {
+  posixIt('★中断（AbortSignal）同样杀整棵树', async () => {
     const pidFile = join(TMP_DIR, 'grandchild2.pid')
     const ac = new AbortController()
     const promise = bashTool.call(
@@ -1537,5 +1528,19 @@ describe('killProcessTree（win32 分支）的参数构造', () => {
   it('argv：`/T` 连整棵树、`/F` 强制（缺一都会退回"只杀一个进程"的语义）', () => {
     expect(buildTaskkillArgs(1234, true)).toEqual(['/PID', '1234', '/T', '/F'])
     expect(buildTaskkillArgs(1234, false)).toEqual(['/PID', '1234', '/T'])
+  })
+
+  it('★`isChildAlive`：第 2 趟前必须过的**身份校验**（防拿被复用的 PID 误伤无关进程树）', () => {
+    // 只有"两个都没被观测到"才算活着 —— 这是**我们自己的句柄**给出的判据，
+    // 比"这个 PID 还在不在"可靠得多（Windows 复用 PID 很积极）。
+    expect(isChildAlive({ exitCode: null, signalCode: null })).toBe(true)
+    expect(isChildAlive({ exitCode: 0, signalCode: null })).toBe(false)
+    expect(isChildAlive({ exitCode: null, signalCode: 'SIGKILL' })).toBe(false)
+    expect(isChildAlive({ exitCode: 143, signalCode: 'SIGTERM' })).toBe(false)
+  })
+
+  it('宽限期是个"够走完一轮 taskkill 又快过人察觉"的值（0 < grace < 1s）', () => {
+    expect(KILL_TREE_GRACE_MS).toBeGreaterThan(0)
+    expect(KILL_TREE_GRACE_MS).toBeLessThan(1000)
   })
 })

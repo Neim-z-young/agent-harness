@@ -658,6 +658,35 @@ export function buildTaskkillArgs(pid: number, force: boolean): string[] {
 }
 
 /**
+ * 两趟之间的**宽限期**（ms）：第 1 趟 `/T`（不带 `/F`）之后等这么久，仍活着才补 `/T /F`。
+ * 300ms 的取法：短于"人察觉"，又够 `taskkill` 走完一轮快照遍历并让被杀的进程真正消失。
+ */
+export const KILL_TREE_GRACE_MS = 300
+
+/**
+ * 子进程**按我们自己的句柄**判断是否仍活着 —— 第 2 趟之前必须过的**身份校验**。
+ *
+ * ★为什么不能拿"这个 PID 还在不在"当判据：**Windows 复用 PID 很积极**，一个已退出、被复用的 PID
+ * 去 `taskkill /T` 会**误伤无关进程树**。而 `exitCode` / `signalCode` 是**我们自己的进程句柄**
+ * 给出的：两者都还是 `null` ⇒ 我们没观测到它退出 ⇒ 这个 `child` 一定还是同一个进程。
+ * （实战实现 openclaw 的 `exec-termination.ts` 用同款判据，并写明"retrying a dead, reusable PID
+ * can target an unrelated tree"。）
+ */
+export function isChildAlive(child: Pick<ChildProcess, 'exitCode' | 'signalCode'>): boolean {
+  return child.exitCode === null && child.signalCode === null
+}
+
+/** 跑一趟 taskkill；返回是否**确实成功**（`spawnSync` 在 ENOENT / 非零退出时都不抛，必须看返回值）。 */
+function runTaskkill(pid: number, force: boolean): boolean {
+  try {
+    const r = spawnSync(resolveTaskkillPath(), buildTaskkillArgs(pid, force), { stdio: 'ignore' })
+    return !r.error && r.status === 0
+  } catch {
+    return false
+  }
+}
+
+/**
  * 杀**整棵进程树**（P0-6）。
  *
  * 为什么不能只 `child.kill()`：那只把信号发给 shell 自己。`npm run dev` / `vite` / 后台
@@ -666,35 +695,45 @@ export function buildTaskkillArgs(pid: number, force: boolean): string[] {
  *
  * - POSIX：spawn 时带 `detached: true` 让子进程成为**新进程组的组长**，于是 `kill(-pid)`
  *   一次覆盖全组（含所有后代）。
- * - Windows：没有"进程组信号"。用 `taskkill /PID <pid> /T /F`——它**对快照遍历、最深优先**，
- *   这正是"要趁链接还在时解析树"的正确形态（`process.kill` / `Stop-Process` 都只杀一个进程）。
+ * - Windows：没有"进程组信号"，走 `taskkill /PID <pid> /T /F` —— 它**对快照遍历、最深优先**
+ *   （`process.kill` / `Stop-Process` 都只杀**一个**进程），且**两趟**：先 `/T`（优雅）→ 宽限
+ *   {@link KILL_TREE_GRACE_MS} → 经 {@link isChildAlive} 验明"仍是我们的那个进程"后才补 `/T /F`。
+ *   两趟是从实战实现（openclaw）学来的：一趟可能漏掉"快照之后才创建的孩子"，而**不带身份校验的
+ *   重试又会误伤复用的 PID**。
  * - 两者都不可用（如组已消失）⇒ 退回杀直接子进程，至少不比改造前差。
  *
- * ## Windows 上的三条已知边界（2026-10-13 查证，见 `docs/cross-platform-plan.md` 的"进程树"节）
+ * ## Windows 上的三条已知边界（2026-10-13 查证，见 `docs/cross-platform-plan.md` §1.1/§1.2）
  * 1. **不声称内核级兜底**：libuv 给非 detached 子进程建了 Job Object，但带
  *    `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK` —— 其源码注释明写"only the processes that we
  *    explicitly add are affected, and **their subprocesses are not**" ⇒ **孙进程不在 job 里**，
- *    `KILL_ON_JOB_CLOSE` 兜不住。要让孙进程随 job 一起死得**自建 job**（Node 没有该 API，需原生扩展）。
+ *    `KILL_ON_JOB_CLOSE` 兜不住。根治要自建 job（`CREATE_SUSPENDED` → `AssignProcessToJobObject`
+ *    → resume → `TerminateJobObject`），而这三个 API **Node/Bun 都不暴露**（规划：P1-7）。
  * 2. **快照竞态**：`/T` 是对某一时刻的树遍历；MSYS2/Cygwin 创建原生子进程用 `CREATE_SUSPENDED`
- *    再唤醒，落在窗口里的孩子可能被漏掉（Claude Code #98976 的实测）。
- * 3. **必须看返回值**：`spawnSync` 在 ENOENT / 非零退出时**不抛**，只回填 `error`/`status`；
- *    不看就当成功 —— 那会让"树没杀成"完全静默（本条是本函数原先的真实缺陷）。
+ *    再唤醒，落在窗口里的孩子可能被漏掉。本函数的"两趟"是把窗口收窄，**不是**消除它。
+ * 3. **必须看返回值**：见 {@link runTaskkill}。
  */
 export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'SIGKILL'): void {
   const pid = child.pid
   if (typeof pid === 'number' && pid > 0) {
     if (process.platform === 'win32') {
-      try {
-        const r = spawnSync(resolveTaskkillPath(), buildTaskkillArgs(pid, true), { stdio: 'ignore' })
-        if (!r.error && r.status === 0) return
-        // 失败（找不到 taskkill / 拒绝访问 / 已退出）⇒ **落到下面的直系 kill**，不再静默返回
-      } catch { /* 同上下落 */ }
-    } else {
-      try {
-        process.kill(-pid, signal)
-        return
-      } catch { /* 组不存在 / 已退出 ⇒ 退回单进程 */ }
+      // 第 1 趟：`/T` 不带 `/F`（先给一次优雅机会，仍然连整棵树）
+      const firstOk = runTaskkill(pid, false)
+      // 第 1 趟就失败（找不到 taskkill / 拒绝访问）⇒ 立刻退回杀直系子进程，至少不比改造前差
+      if (!firstOk) {
+        try { child.kill(signal) } catch { /* 已退出 */ }
+      }
+      // 第 2 趟：宽限后补强。**只在"我们的子进程仍活着"时才做**（见 {@link isChildAlive}）。
+      // 定时器**不 unref**：它被"清理"这件事依赖，而 unref 过的等待定时器在 Windows 上不会到期。
+      setTimeout(() => {
+        if (!isChildAlive(child)) return
+        runTaskkill(pid, true)
+      }, KILL_TREE_GRACE_MS)
+      return
     }
+    try {
+      process.kill(-pid, signal)
+      return
+    } catch { /* 组不存在 / 已退出 ⇒ 退回单进程 */ }
   }
   try { child.kill(signal) } catch { /* 已退出 */ }
 }
@@ -1084,6 +1123,20 @@ export interface BashOutput {
 const DEFAULT_BASH_TIMEOUT = 30_000
 /** 最大输出字符数（stdout + stderr 各自截断） */
 const MAX_OUTPUT_CHARS = 64 * 1024 // 64KB
+
+/**
+ * 子进程 `exit` 之后，再等多久仍没等到 `close` 就**主动 destroy 管道**（ms）。
+ *
+ * 为什么需要（2026-10-13，§④）：`close` 要等**所有持有 stdio 管道写端**的进程退出。超时被杀之后
+ * 被留下的孙进程继承了 stdout/stderr 的写端 ⇒ `close` 迟迟不来 ⇒ **工具会远迟于自己的 timeout
+ * 才返回**（实测：`timeoutMs: 400` 的用例被拖到 30s）。更要命的是它会**污染测量**：那条 e2e 量到的
+ * "30s"是"管道没关"，不是"进程没死"（同形证据：hermes-agent#103402 的 Python `subprocess.run`
+ * 超时后等 EOF 死锁）。
+ *
+ * 250ms 的取法：足够把还在路上的最后几个 chunk 收完（父进程退出后不会有新的生产端），
+ * 又远小于任何"人察觉"的量级。数据不会丢 —— 已经收到的都在 `stdout` / `stderr` 里。
+ */
+const CLOSE_LINGER_MS = 250
 
 /**
  * bash 的入参 schema（模块级，与 `read_file` / `write_file` / `edit_file` 同形）。
@@ -2025,10 +2078,23 @@ function runBash(opts: {  command: string
       })
     })
 
+    // §④（见 CLOSE_LINGER_MS 的注释）：`exit` 之后再给一小段收尾窗口；到点还没 `close`
+    // 就主动 destroy 管道，逼 `close` 到来 —— 否则"被留下的孙进程握着写端"会把工具钉住。
+    let lingerTimer: ReturnType<typeof setTimeout> | undefined
+    child.on('exit', () => {
+      if (settled || lingerTimer) return
+      lingerTimer = setTimeout(() => {
+        if (settled) return
+        try { child.stdout?.destroy() } catch { /* 已关闭 */ }
+        try { child.stderr?.destroy() } catch { /* 已关闭 */ }
+      }, CLOSE_LINGER_MS)
+    })
+
     child.on('close', (code) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (lingerTimer) clearTimeout(lingerTimer)
       // ok 语义：工具执行成功（命令实际跑起来），命令自身结果由 exitCode 反映。
       // 仅在 spawn 失败或 AbortSignal 中断时才返回 ok:false。
       resolvePromise({

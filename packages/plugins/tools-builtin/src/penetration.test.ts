@@ -169,13 +169,12 @@ describe('P3-4 渗透用例集（沙箱回归门）', () => {
 
   // ---------- 6. 进程树残留 ----------
 
-  // ⚠️ **只在 POSIX 上跑**（2026-10-13 定案）：产品在 win32 上走 `taskkill /T /F` 试图杀整棵树，
-  // 但**实测不生效** —— 孙进程（`sleep`）会活到自然退出，断言 `waitGone(...)` 只是"等到它自己
-  // 到期"才成立（假通过：把断言的胜出者从"杀掉了"偷换成"等到了"）。给 30s 超时只会把它变成
-  // "更慢的假通过"（另一条 `sleep 30` 的同款用例因此直接撞 30s 超时）。
-  // ⇒ 这里**不声称** Windows 支持进程组语义（那是平台缺口，见 MEMORY 的待办），只保留 POSIX 侧断言。
-  //    同时把 timeout 拉到 30s：POSIX 上"杀整棵树 + 轮询消失"也确有可能超过默认 5s。
-  it.skipIf(process.platform === 'win32')('⑨ 进程树残留：超时后后台孙进程不能活下来（只杀 shell 会留孤儿）', async () => {
+  // ✅ **重新在 Windows 上跑**（2026-10-13 路 3）：先前只在 POSIX 上跑，是因为量到的是"等它自己
+  // 到期"而非"杀掉了"——两个原因都已处理：①`killProcessTree` 原先**静默吞掉 taskkill 的失败**
+  // （`spawnSync` 不抛），现改为看返回值 + 失败兜底 + **两趟**（`/T` → 宽限 → 验身份后 `/T /F`）；
+  // ②用例侧的"30s"其实是 **`close` 等不到**（被留下的孙进程握着 stdio 写端 ⇒ 见 `CLOSE_LINGER_MS`）。
+  // 若 Windows 上仍红，CI artifact 会给证据（`waitGone` 的预算只有 2~3s，不会假通过）。
+  it('⑨ 进程树残留：超时后后台孙进程不能活下来（只杀 shell 会留孤儿）', async () => {
     const pidFile = join(TMP, 'gc.pid')
     const tool = createBashTool()
     const res = await tool.call!({
