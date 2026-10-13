@@ -35,16 +35,20 @@ function collectSources(dir: string, out: string[] = []): string[] {
 // ===== resolvePath：纯字符串，不碰文件系统 =====
 
 describe('resolvePath', () => {
+  // ⚠️ 这几条**必须显式传 `'posix'`**：`resolvePath` 的缺省方言是**当前平台**
+  //（P0-6 的口径：缺省＝平台 ⇒ 既有行为逐位不变），而这里的输入/期望都是 POSIX 字面量。
+  // 不传的话，Windows 上 `resolvePath('../a', '/tmp/x/y')` 会按 win32 语义给出 `D:\tmp\x\a`
+  // —— 测试会红，但**产品没错**（喂给它的本来就是平台相关的输入）。这正是 CI 首跑暴露的那一类。
   it('相对路径按 cwd 解析；绝对路径原样归一', () => {
-    expect(resolvePath('a.txt', '/tmp/x')).toBe('/tmp/x/a.txt')
-    expect(resolvePath('/abs/a.txt', '/tmp/x')).toBe('/abs/a.txt')
+    expect(resolvePath('a.txt', '/tmp/x', 'posix')).toBe('/tmp/x/a.txt')
+    expect(resolvePath('/abs/a.txt', '/tmp/x', 'posix')).toBe('/abs/a.txt')
   })
 
   it('折叠 `..` 与 `.`，不做 realpath', () => {
-    expect(resolvePath('../a', '/tmp/x/y')).toBe('/tmp/x/a')
-    expect(resolvePath('./a', '/tmp/x')).toBe('/tmp/x/a')
+    expect(resolvePath('../a', '/tmp/x/y', 'posix')).toBe('/tmp/x/a')
+    expect(resolvePath('./a', '/tmp/x', 'posix')).toBe('/tmp/x/a')
     // 不碰文件系统：这个路径根本不存在，也不会抛
-    expect(resolvePath('/nope/never/here.txt', '/tmp')).toBe('/nope/never/here.txt')
+    expect(resolvePath('/nope/never/here.txt', '/tmp', 'posix')).toBe('/nope/never/here.txt')
   })
 
   it('保留符号链接（realpath 的活由 isWithinCwd 干）', () => {
