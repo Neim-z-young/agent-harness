@@ -25,7 +25,7 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve } from 'node:path'
 // 模板外置为 `.txt`（**不是 `.md`**：Bun 会把 .md 转成 HTML，见 env.d.ts 的说明）
 import findingsTemplate from './templates/findings.txt'
 import progressTemplate from './templates/progress.txt'
@@ -103,8 +103,13 @@ export function resolvePlanRoot(dir: string): string {
 /** 绝对路径 → 展示用的短路径（在项目根之下时给相对路径，否则原样返回绝对路径） */
 export function displayPlanPath(cwd: string, abs: string): string {
   const root = resolve(cwd)
-  if (abs === root) return '.'
-  return abs.startsWith(`${root}/`) ? abs.slice(root.length + 1) : abs
+  // ⚠️ 原实现是 `abs.startsWith(`${root}/`)` —— **硬编码 `/`**：Windows 上 root 是 `D:\tmp\x`
+  // 而 abs 用反斜杠，`startsWith('D:\tmp\x/')` 永不命中 ⇒ 根内路径也被原样返回成绝对路径。
+  // 改用 `relative` 做**分隔符无关**的包含判定（跨盘 / 越界时 relative 会给绝对路径或 `..` 前缀）。
+  const rel = relative(root, resolve(abs))
+  if (rel === '') return '.'
+  if (rel.startsWith('..') || isAbsolute(rel)) return abs
+  return rel
 }
 
 /** 一条多计划条目（`/plan list` / `/plan use` 无参时展示） */

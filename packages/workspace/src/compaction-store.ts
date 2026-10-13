@@ -13,9 +13,11 @@
  */
 
 import { existsSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+// 原子写（tmp + rename）走公共模块：`rename` 在 Windows 上要带重试，且 tmp 名必须带随机串
+import { writeFileAtomic } from './atomic-write'
 import type { Message, SessionOriginalStore } from '@harness/session'
 import type { Workspace } from './index'
 
@@ -142,9 +144,7 @@ export class SessionCompactionStore {
     }
 
     const p = this.pathFor(sessionId)
-    const tmp = `${p}.${process.pid}.tmp`
-    await writeFile(tmp, JSON.stringify(file, null, 2))
-    await rename(tmp, p)
+    await writeFileAtomic(p, JSON.stringify(file, null, 2))
 
     return merged
   }
@@ -213,9 +213,7 @@ export class SessionCompactionStore {
   ): Promise<string> {
     const p = this.origPathFor(sessionId, blockId)
     await mkdir(this.origDirFor(sessionId), { recursive: true })
-    const tmp = `${p}.${process.pid}.tmp`
-    await writeFile(tmp, JSON.stringify(messages, null, 2))
-    await rename(tmp, p)
+    await writeFileAtomic(p, JSON.stringify(messages, null, 2))
     return p
   }
 

@@ -7,29 +7,14 @@
  */
 
 import { existsSync, realpathSync } from 'node:fs'
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto'
 import { join, resolve } from 'node:path'
 import type { Message, Session } from '@harness/session'
 import type { Workspace } from './index'
 import { SessionCompactionStore } from './compaction-store'
-
-/**
- * 原子写：先写临时文件再 `rename` 到目标路径。
- * tmp 必须落在**同一目录**（`${path}.${process.pid}.${Date.now()}.<rand>.tmp`）才能同文件系统
- * rename（跨文件系统 rename 部分平台会失败/退化为拷贝）；末尾带随机串避免同毫秒同 pid 的并发
- * 调用互相覆盖 tmp。写入失败时清理 tmp，避免留下半截 `.tmp` 污染目录。
- */
-async function writeFileAtomic(path: string, content: string): Promise<void> {
-  const tmp = `${path}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
-  try {
-    await writeFile(tmp, content)
-    await rename(tmp, path)
-  } catch (err) {
-    await rm(tmp, { force: true }).catch(() => {})
-    throw err
-  }
-}
+// 原子写抽到公共模块（本包 3 处共用；`rename` 在 Windows 上要带重试，见该文件头注释）
+import { writeFileAtomic } from './atomic-write'
 
 /** 配置校验 / 密钥解析等一次性启动失败 */
 export class ConfigValidationError extends Error {

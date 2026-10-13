@@ -64,32 +64,50 @@ export function collectFileRefsFromTexts(texts: readonly string[], max = 8): str
 // ------------------------------------------------------------------------
 
 /**
+ * 把路径分隔符统一折成 `/`（**纯函数，导出以便单测**）。
+ *
+ * 用途：`abbrevFileRef` 这类**单行展示**函数要跨平台产出同一形态（`~/x`、`./src/a`），
+ * 而 Windows 的 `homedir()` / `cwd` 都是反斜杠 —— 直接 `startsWith(home + '/')` **永远不命中**
+ * （本仓 `displayPlanPath` 是同一个 bug）。⚠️ 别写 `split(sep).join('/')`：那在 macOS 上恒等，
+ * **本机永远测不出 Windows 分支**。
+ */
+export function toPosix(p: string): string {
+  return p.replaceAll('\\', '/')
+}
+
+/**
  * 缩写：外层文件引用路径为"可读且保留目录层级"的单行形态。
  * 优先相对化到主目录（`~/...`）再相对化到工作目录；仍超宽时对中间目录做省略
  * （`dir1/…/name.ext`），文件名与最近一级目录始终保留。
+ *
+ * 输出**恒用 `/`**（展示用途）；比较前先把两侧都折成 `/`，否则 Windows 上两条相对化
+ * 分支都不会命中（`homedir()` 给 `C:\Users\x`，而这里比的是 `${home}/`）。
  *
  * @param base 工作目录基准（缺省 process.cwd()）。调用方应传**启动时解析出的工作目录**，
  *   否则以 `--cwd` 启动时 `./` 前缀会指向进程启动目录而非实际工作目录。
  */
 export function abbrevFileRef(path: string, maxLen = 40, base?: string): string {
   if (!path) return path
-  const home = homedir()
+  const p = toPosix(path)
+  const home = toPosix(homedir())
   const rels: string[] = []
   // 主目录相对化（`~/...`）
-  if (path === home) return '~'
-  if (path.startsWith(home + '/')) rels.push(path === home ? '~' : '~' + path.slice(home.length))
-  else if (path.startsWith('~/')) rels.push(path)
+  if (p === home) return '~'
+  if (p.startsWith(home + '/')) rels.push('~' + p.slice(home.length))
+  else if (p.startsWith('~/')) rels.push(p)
   // 工作目录相对化（`./...`），与主目录相对化并存、取较短者
   try {
-    const cwd = base ?? process.cwd()
-    if (path === cwd) rels.push('.')
-    else if (path.startsWith(cwd + '/')) rels.push('.' + path.slice(cwd.length))
-    else if (path.startsWith('./')) rels.push(path)
+    const cwd = toPosix(base ?? process.cwd())
+    if (p === cwd) rels.push('.')
+    else if (p.startsWith(cwd + '/')) rels.push('.' + p.slice(cwd.length))
+    else if (p.startsWith('./')) rels.push(p)
   } catch { /* cwd 不可用则忽略 */ }
-  const rel = rels.length ? rels.sort((a, b) => a.length - b.length)[0] : path
+  // 相对化不了 ⇒ **原样返回**（不改既有语义；也避免把 Windows 的 `C:\x` 悄悄变成 `C:/x`）
+  const rel = rels.length ? rels.sort((a, b) => a.length - b.length)[0]! : path
   if (rel.length <= maxLen) return rel
   // 超宽：保留目录前段 + 文件名末段，中间折叠，严格控制在 maxLen 内
-  const segs = rel.split('/')
+  // （折叠前先归一成 `/` 分段，否则 Windows 的反斜杠路径会被当成"一整段"）
+  const segs = toPosix(rel).split('/')
   const leaf = segs.pop() ?? rel
   const head = segs.shift() ?? ''
   let headFull = head

@@ -11,8 +11,8 @@
 
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { join } from 'node:path'
-import { existsSync, readFileSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
+import { existsSync, readFileSync, realpathSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 
 const execFileP = promisify(execFile)
 
@@ -58,6 +58,27 @@ export async function runGit(base: string, args: string[], opts?: { cwd?: string
 }
 
 /**
+ * 把 **git 输出的路径**折算成与 Node 侧同一形态的绝对路径。**导出**：调用方与测试要用同一份口径
+ * （否则又是一处"两边各写一套"的平台耦合）。
+ *
+ * 为什么需要（Windows 实测）：`git rev-parse --show-toplevel` / `git worktree list` 给的是
+ * `C:/Users/runneradmin/...`（**正斜杠 + 长名**），而 Node 的 `tmpdir()` / `mkdtempSync()` 给的是
+ * `C:\Users\RUNNER~1\...`（**反斜杠 + 8.3 短名**）—— 同一目录两种写法，直接 `toBe`/`toContain` 必然不等。
+ *
+ * ⚠️ **只在 win32 折 realpath**：POSIX 上 `realpath` 会把 `/var/...` 改成 `/private/var/...`（macOS）、
+ * 解析掉符号链接 —— 那是**改变既有行为**，不是修 bug。win32 上 `resolve` 顺带把正斜杠折回反斜杠。
+ */
+export function canonicalGitPath(p: string): string {
+  const abs = resolve(p)
+  if (process.platform !== 'win32') return abs
+  try {
+    return resolve(realpathSync.native(abs))
+  } catch {
+    return abs // 目录可能已不存在（prunable / 刚删的 worktree），退回字符串归一
+  }
+}
+
+/**
  * 检测 base 是否为 git 仓库，返回仓库根目录（绝对路径）；非仓库返回 null。
  * `git rev-parse --show-toplevel` 从任意子目录向上定位仓库根，失败即视为非仓库。
  */
@@ -65,7 +86,7 @@ export async function gitTopLevel(base: string): Promise<string | null> {
   try {
     const { stdout } = await runGit(base, ['rev-parse', '--show-toplevel'])
     const root = stdout.trim()
-    return root ? root : null
+    return root ? canonicalGitPath(root) : null
   } catch {
     return null
   }
@@ -178,7 +199,7 @@ export async function listWorktrees(base: string): Promise<WorktreeInfo[]> {
       if (cur.path) out.push(cur as WorktreeInfo)
       cur = {}
     } else if (line.startsWith('worktree ')) {
-      cur.path = line.slice('worktree '.length).trim()
+      cur.path = canonicalGitPath(line.slice('worktree '.length).trim())
     } else if (line.startsWith('HEAD ')) {
       cur.head = line.slice('HEAD '.length).trim()
     }
