@@ -652,7 +652,12 @@ describe('SseTransport', () => {
 
 describe('defaultTransportFactory', () => {
   it('stdio 配置返回 StdioTransport', () => {
-    const t = defaultTransportFactory({ name: 's', command: '/bin/echo', args: ['hi'] })
+    // ⚠️ 原来写的是 `command: '/bin/echo'` —— 这是个**只在 POSIX 上成立**的硬编码：
+    // Windows 上没有 `/bin/echo` ⇒ spawn 失败（ENOENT），而 `StdioTransport` 没给 `proc` 挂
+    // `error` 监听 ⇒ 变成 unhandled error；更坏的是**失败 spawn 留下的管道可能没人关**，
+    // 那是"测试都跑完了、进程却不肯退出"的经典成因（Windows CI 上表现为整步挂住）。
+    // `process.execPath` 是**两平台都成立**的等价物（`--version` 立即退出），且不引入假设。
+    const t = defaultTransportFactory({ name: 's', command: process.execPath, args: ['--version'] })
     expect(t).toBeInstanceOf(StdioTransport)
     t.close()
   })
