@@ -11,6 +11,7 @@ import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   PLUGIN_CAPABILITIES,
   applyPluginCapabilities,
@@ -123,7 +124,11 @@ describe('loadPluginsInWorker（P1-5 worker 装载）', () => {
     writeFileSync(bomb, `const a: any[] = []\nwhile (true) { a.push(Buffer.alloc(4 * 1024 * 1024)) }`)
     const runner = join(dir, 'bomb-runner.ts')
     writeFileSync(runner, [
-      `import { loadPluginsInWorker } from ${JSON.stringify(new URL('./plugin-runner.ts', import.meta.url).pathname)}`,
+      // ⚠️ 用 `fileURLToPath` 而不是 `new URL(...).pathname`：Windows 上 `.pathname` 给的是
+      // `/D:/a/…/plugin-runner.ts`（**前导斜杠 + 正斜杠**），动态 import 直接失败 ⇒ 子进程
+      // 什么都不吐、`BOMB_RESULT` 永远不出现（CI 实测）。这是**测试自身的跨平台写错**，
+      // 与"worker 能不能拦住内存炸弹"无关。
+      `import { loadPluginsInWorker } from ${JSON.stringify(fileURLToPath(new URL('./plugin-runner.ts', import.meta.url)))}`,
       `const [o] = await loadPluginsInWorker([${JSON.stringify(bomb)}], { memoryMb: 24, timeoutMs: 8000 })`,
       `process.stdout.write('BOMB_RESULT=' + JSON.stringify({ error: o.error ?? null, n: o.summaries.length }))`,
     ].join('\n'))

@@ -11,7 +11,7 @@
 import { describe, it, expect, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { HarnessApp, parseCliArgs, TOOL_CONT_MARK } from './index'
 import {
   classifyConsoleLine,
@@ -1233,7 +1233,10 @@ describe('TuiApp 集成（mock provider）', () => {
     // 不恢复（来源为 new），所以走欢迎页；提示必须由欢迎页渲染，否则会被欢迎页整体替换掉
     const frame = await waitFrame(f.setup, (fr) => fr.includes('未自动恢复会话'))
     expect(frame).toContain('它属于其它工作目录')
-    expect(frame).toContain('/resume')
+    // ⚠️ 这一行文案很长，会被**按终端宽度换行**；而换行点取决于中间那个 `s.cwd` 路径的长度
+    // （各平台不同）⇒ 直接 `toContain('/resume')` 会因 `/resume` 恰被折行而失败（CI 实测）。
+    // 去掉空白后再找，才是"内容在不在"的正确判据。
+    expect(frame.replace(/\s+/g, '')).toContain('/resume')
     expect(f.app.sessionRestore.source).toBe('new')
     expect(f.app.sessionRestore.skipped?.reason).toBe('other-cwd')
     expect(f.currentSession().messages.length).toBe(0)
@@ -1377,7 +1380,9 @@ describe('TuiApp 集成（mock provider）', () => {
     //    序列化变长，固定宽度的尾窗就够不到它了；改成断言**真正的首/尾锚点**
     //    （第一个字符 / 最后一个字段）才不随字段增删漂移 —— 这也是"尾部保留"的原意。
     expect(frame).toContain('{"stdout":"1\\n2\\n3')
-    expect(frame).toContain('shell":"Bash"')
+    // 尾部锚点写**字段名 + 任意取值**：`shell` 的名字各平台不同（Windows 上是 Git Bash），
+    // 而这条要证的是"尾部窗口真的贴到了结果末尾"，不是某个具体平台值。
+    expect(frame).toMatch(/"shell":"[^"]+"/)
     await f.cleanup()
   })
 
@@ -1842,14 +1847,18 @@ describe('TuiApp /tree 磁盘目录树命令', () => {
   })
 
   it('/tree <path>：目录不存在时提示', async () => {
+    // 用**平台合法**的绝对路径（win32 下 `/no/such/dir` 没有盘符，会被 resolve 到当前盘根）
+    const noSuch = resolve('/no/such/dir')
     const f = await mountTui()
     await waitFrame(f.setup, (fr) => fr.includes('会话上下文'))
     await sendMessageWithGap(f.setup, 'hello') // 让欢迎页消失
     await waitFrame(f.setup, (fr) => fr.includes('你好，我是 TUI 助手。'))
-    f.setup.mockInput.typeText('/tree /no/such/dir')
+    f.setup.mockInput.typeText('/tree ' + noSuch)
     for (let i = 0; i < 12; i++) { await pumpOnce(f.setup); await new Promise((r) => setTimeout(r, 5)) }
     pressSubmit(f.setup)
-    await waitFrame(f.setup, (fr) => fr.includes('目录不存在：/no/such/dir'))
+    // ⚠️ 提示里带的是**解析后**的路径（`resolveEditPath` 基于工作目录 resolve），
+    // 所以期望值要用同一个解析，而不是把 POSIX 字面量塞进去（win32 上会解析成 `D:\no\such\dir`）。
+    await waitFrame(f.setup, (fr) => fr.includes(`目录不存在：${noSuch}`))
     await f.cleanup()
   })
 })
@@ -1860,17 +1869,21 @@ describe('TuiApp /edit 外部编辑器命令', () => {
     expect(resolveEditPath('~/x/y.ts')).toBe(join(home, 'x/y.ts'))
     expect(resolveEditPath('~/.harness/p.json')).toBe(join(home, '.harness/p.json'))
     expect(resolveEditPath('relative/z.ts')).toBe(join(process.cwd(), 'relative/z.ts'))
-    expect(resolveEditPath('/abs/a.ts')).toBe('/abs/a.ts')
+    // ⚠️ 喂 `resolve('/abs/a.ts')` 而不是 POSIX 字面量：win32 下 `/abs/a.ts` **不是绝对路径**
+    // （没有盘符 ⇒ 会被解释成"当前盘根下"），期望值与输入必须走同一套平台解析。
+    const abs = resolve('/abs/a.ts')
+    expect(resolveEditPath(abs)).toBe(abs)
   })
 
   // 工作目录是**启动参数**决定的（-c/--cwd），缺省才是进程启动目录：
   // TUI 里所有相对路径都必须以它为基准，不能硬用 process.cwd()。
   it('resolveEditPath：显式 base（启动工作目录）优先于 process.cwd()', () => {
-    const workdir = '/tmp/harness-workdir-base'
+    const workdir = resolve('/tmp/harness-workdir-base')
+    const abs = resolve('/abs/a.ts')
     expect(resolveEditPath('relative/z.ts', workdir)).toBe(join(workdir, 'relative/z.ts'))
     expect(resolveEditPath('a/b.ts', workdir)).not.toContain(process.cwd())
     // 绝对路径与 ~ 不受 base 影响
-    expect(resolveEditPath('/abs/a.ts', workdir)).toBe('/abs/a.ts')
+    expect(resolveEditPath(abs, workdir)).toBe(abs)
     expect(resolveEditPath('~/x.ts', workdir)).toBe(join(require('node:os').homedir(), 'x.ts'))
   })
 
@@ -1887,11 +1900,12 @@ describe('TuiApp /edit 外部编辑器命令', () => {
   })
 
   it('abbrevFileRef：显式 base 时按该目录做 `./` 相对化', () => {
-    const workdir = '/tmp/harness-workdir-base'
+    const workdir = resolve('/tmp/harness-workdir-base')
+    // 不在 base 下的路径原样保留（不会被错误地挂上 ./）—— 同样用平台合法的绝对路径
+    const other = resolve('/other/place/a.ts')
     expect(abbrevFileRef(join(workdir, 'src/a.ts'), 40, workdir)).toBe('./src/a.ts')
     expect(abbrevFileRef(workdir, 40, workdir)).toBe('.')
-    // 不在 base 下的路径原样保留（不会被错误地挂上 ./）
-    expect(abbrevFileRef('/other/place/a.ts', 40, workdir)).toBe('/other/place/a.ts')
+    expect(abbrevFileRef(other, 40, workdir)).toBe(other)
   })
 
   it('buildDiskFileTree：根节点按 base 相对化，引用按 base 解析后打标', () => {

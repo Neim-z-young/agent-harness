@@ -2,7 +2,7 @@ import { describe, it, expect, afterAll } from 'bun:test'
 import { tmpdir } from 'node:os'
 import { mkdtempSync, rmSync, writeFileSync, realpathSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { join } from 'node:path'
-import { runGit, gitTopLevel } from './worktree'
+import { runGit, gitTopLevel, canonicalGitPath } from './worktree'
 import {
   createSubagentPlugin,
   createSubagentTool,
@@ -3235,7 +3235,9 @@ describe('Subagent git worktree 隔离', () => {
     await runGit(dir, ['add', '.'])
     await runGit(dir, ['commit', '-q', '-m', 'base'])
     cleanupDirs.push(dir)
-    return realpathSync(dir)
+    // 与产品的 `gitTopLevel` 同一口径：Windows 上 realpathSync 不展开 8.3 短名（`RUNNER~1`），
+    // 而产品经 `canonicalGitPath` 拿到的是长名 ⇒ 期望值也要过同一套归一，否则永远差一个短名。
+    return canonicalGitPath(realpathSync(dir))
   }
 
   /** 组装插件并触发 core.harness.start，返回可调用的 subagentTool */

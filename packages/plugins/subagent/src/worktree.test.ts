@@ -23,6 +23,7 @@ import {
   getWorktreeDiff,
   removeWorktree,
   listWorktrees,
+  canonicalGitPath,
   GitCommandError,
 } from './worktree'
 
@@ -38,8 +39,11 @@ async function initRepo(): Promise<string> {
   writeFileSync(join(dir, 'readme.md'), '# repo\n')
   await runGit(dir, ['add', '.'])
   await runGit(dir, ['commit', '-q', '-m', 'base'])
-  // git 输出的是真实路径（macOS /tmp→/private/tmp 会 //var 规范化），统一用 realpath 对齐
-  return realpathSync(dir)
+  // git 输出的是真实路径（macOS /tmp→/private/tmp 会 //var 规范化），统一用 realpath 对齐。
+  // ⚠️ 还要再套一层 **产品同一个** `canonicalGitPath`：Windows 上 realpathSync 不展开 8.3 短名
+  // （`RUNNER~1`），而 git 给的是长名（`runneradmin`）+ **正斜杠** —— 期望值必须与 gitTopLevel
+  // 的返回值走同一套口径，否则右边永远对不上。POSIX 上这层基本是恒等（只做绝对化）。
+  return canonicalGitPath(realpathSync(dir))
 }
 
 beforeAll(async () => {

@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { mkdtempSync, mkdirSync, rmSync, readFileSync, readdirSync, writeFileSync, existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { resolveWorkspace, createWorkspaceOriginalStore } from '@harness/workspace'
 import type { Message } from '@harness/session'
@@ -252,7 +252,8 @@ describe('工作目录（启动参数 > 当前目录）', () => {
       cwd: '.', dataDir: join(dir, '.harness'), agentId: 'default', provider: 'mock',
     })
     expect(app.workspace.cwd).toBe(process.cwd())
-    expect(app.workspace.cwd.startsWith('/')).toBe(true)
+    // ⚠️ 别断 `startsWith('/')`：win32 的绝对路径是 `D:\…`（没有前导 `/`）。
+    expect(isAbsolute(app.workspace.cwd)).toBe(true)
   })
 })
 
@@ -694,7 +695,9 @@ describe('validateProviderConfigs / buildConfigOverview 配置校验', () => {
     const bad: string[] = []
     let checked = 0
     for (const file of readdirSync(docsDir).filter((f) => f.endsWith('.md'))) {
-      const md = readFileSync(join(docsDir, file), 'utf8')
+      // ⚠️ 归一为 LF：下面是 ```jsonc + `\n` 的围栏正则，Windows 上 git 可能按 **CRLF** 检出
+      // ⇒ 围栏失配、`checked` 恒为 0（报出来是"没扫到示例"，看不出真因）。CI 实测。
+      const md = readFileSync(join(docsDir, file), 'utf8').replaceAll('\r\n', '\n')
       for (const m of md.matchAll(/```jsonc\n([\s\S]*?)```/g)) {
         // 片段里可能并列写多个候选对象（每行一个）：按行累积，能 parse 就收一个
         let buf = ''

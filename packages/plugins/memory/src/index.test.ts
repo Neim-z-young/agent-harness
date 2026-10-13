@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { CliCommandInput, Hooks, PluginContext, PluginWorkspaceView } from '@harness/plugin'
@@ -550,6 +550,9 @@ describe('MemoryStore', () => {
   })
 
   it('权限：新文件按 0600 建，已存在则沿用原模式（别把 600 写成 644）', () => {
+    // ⚠️ **Windows 不实现 POSIX mode**（`statSync().mode` 恒给 0o666/0o444 这类合成值），
+    // 这不是我们的权限逻辑坏了 ⇒ 整条按平台门控，并在 macOS/Linux 上照常守住"0600 + 沿用原模式"。
+    if (process.platform === 'win32') return
     const st = new MemoryStore(storePath())
     st.add('第一条')
     expect(statSync(storePath()).mode & 0o777).toBe(0o600)
@@ -1033,7 +1036,11 @@ describe('turn_end 计数只认主会话', () => {
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     expect(await inject(hooks)).toContain('初始')
 
-    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    // ⚠️ 显式换成长度**不同**的内容：原先写 `'- 改动\n'` 与 `'- 初始\n'` **等长**，能否被缓存
+    // 判为"变了"完全依赖文件 mtime 是否推进 —— 而 **Windows 的文件时间戳粒度约 15.6ms**，
+    // 紧挨着的两次写入可能拿到同一个戳 ⇒ 偶发"改了却没发现"（CI 实测：本组三条同形用例里
+    // 随机挂一条）。本用例的主题是**轮次计数**，不是时间戳精度 ⇒ 不依赖时钟。
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动完成\n')
     endTurn(hooks, 'teammate-1') // 两次都不该计数
     endTurn(hooks, 'teammate-1')
     expect(await inject(hooks)).toContain('初始') // 仍是旧快照
@@ -1048,7 +1055,7 @@ describe('turn_end 计数只认主会话', () => {
     const { hooks } = await installAt()
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
-    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动完成\n')
     // 变更要先被某次注入"发现"（dirty 只在注入时算出）——真实链路里就是下一轮开头那一次
     expect(await inject(hooks)).toContain('初始')
 
@@ -1062,8 +1069,18 @@ describe('turn_end 计数只认主会话', () => {
     const r = new MemoryReader()
     writeFileSync(f, 'aaaa\n')
     expect(r.read(f).text).toBe('aaaa\n')
+    // ⚠️ 两次改写之间只有亚毫秒级间隔 ⇒ **不能**用 `Date.now()+2000`（毫秒分辨率下两轮可能取到
+    // 同一个值，戳没变 ⇒ 缓存照样命中）。用**秒级单调递增**的基准，保证每轮戳都严格变大。
+    const secBase = Math.floor(Date.now() / 1000)
+    let step = 0
     for (const v of ['bbbb', 'cccc', 'dddd']) {
       writeFileSync(f, `${v}\n`) // 与上一版**等长**：只看 size 分辨不出来
+      // ⚠️ 这里**显式把 mtime 推后**再读，而不是指望"紧挨着的两次写入自然拿到不同的戳"：
+      // **Windows 的文件时间戳粒度约 15.6ms**，同一 tick 内的等长改写可能戳不变 ⇒ 偶发误判。
+      // 本用例要证的是"判据不能只看 size（戳变了就必须重读）"，不是"自然时钟一定分辨得出"。
+      step += 1
+      const t = new Date((secBase + step) * 1000)
+      utimesSync(f, t, t)
       expect(r.read(f).text).toBe(`${v}\n`)
     }
   })
@@ -1101,7 +1118,7 @@ describe('轮次计数的来源必须是引擎层（core.agent.turn.end）', () 
 
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
-    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动完成\n')
     expect(await inject(hooks)).toContain('初始') // 先被"发现"（dirty）
 
     endTurn(hooks)
@@ -1114,7 +1131,7 @@ describe('轮次计数的来源必须是引擎层（core.agent.turn.end）', () 
     const { hooks } = await install({ flushAfterTurns: 2 })
     hooks['cli.command']!({ raw: 'memory add', command: 'memory', arg: 'add 初始', out: () => {}, sessionId: 's' })
     await inject(hooks)
-    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动\n')
+    writeFileSync(join(w.user.memory, 'MEMORY.md'), '- 改动完成\n')
     expect(await inject(hooks)).toContain('初始')
 
     endTurn(hooks, 'subagent')

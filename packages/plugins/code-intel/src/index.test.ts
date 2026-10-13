@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, rmSync, utimesSync, writeFileSync, mkdirSync, symlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
@@ -133,8 +133,13 @@ describe('CodeIntelIndex', () => {
     const first = await index.symbols(file, dir)
     expect(first.map((s) => s.name)).toEqual(['v1'])
 
-    // 内容变更（size 变）→ 重新索引
+    // 内容变更 → 重新索引。⚠️ v1 → v2 是**等长**改写（原注释写"size 变"是错的），能否被判定
+    // 为"变了"全靠 mtime 推进 —— 而 **Windows 的文件时间戳粒度约 15.6ms**，紧挨的两次写入
+    // 可能拿到同一个戳 ⇒ 偶发"改了却没重新索引"（CI 实测）。这里显式把 mtime 推后，让
+    // "戳变了 ⇒ 必须重新索引"这一条**确定性**成立（本用例要证的是缓存判据，不是时钟精度）。
     writeFileSync(file, 'export function v2() {}\n')
+    const later = new Date(Date.now() + 2000)
+    utimesSync(file, later, later)
     const second = await index.symbols(file, dir)
     expect(second.map((s) => s.name)).toEqual(['v2'])
   })

@@ -379,8 +379,13 @@ describe('P0-1：sandbox 段透传（配置不再静默失效）', () => {
       // 只断言 limits:false ⇒ unlimited 是**无效**的，因为"根本没加抬头"也是 unlimited。
       const dflt = (await toolsOf(await getBuiltinRegistry().get('tools-builtin')!.load())).find((t) => t.id === 'bash')!
       const def = (await dflt.call({ command: 'ulimit -f' }, toolCtx(dir))) as { output?: { stdout: string } }
-      expect(Number(def.output!.stdout.trim())).not.toBe(Number(res.output!.stdout.trim()))
-      expect(Number(def.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 2_097_152 : 4_194_304)
+      // ⚠️ 这三条回读**都是数值比对**，必须整体进平台门（上一版只给第一条加了门 ⇒ Windows 仍红）。
+      // MSYS / Git Bash 的 `ulimit -f` 回读不是数字（`Number()` 得 NaN），`NaN !== NaN` 恒真 ⇒ 直接崩。
+      // 命令照跑、`res.ok` 仍断言；"换算对不对"由 `buildLimitPreamble` 的**纯函数**用例逐位覆盖。
+      if (process.platform !== 'win32') {
+        expect(Number(def.output!.stdout.trim())).not.toBe(Number(res.output!.stdout.trim()))
+        expect(Number(def.output!.stdout.trim())).toBe(process.platform === 'darwin' ? 2_097_152 : 4_194_304)
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

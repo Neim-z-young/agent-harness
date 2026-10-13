@@ -180,7 +180,8 @@ describe('P3-4 渗透用例集（沙箱回归门）', () => {
     const gpid = Number((await Bun.file(pidFile).text()).trim())
     expect(Number.isInteger(gpid)).toBe(true)
     expect(await waitGone(gpid)).toBe(true)
-  })
+    // ⚠️ 显式放宽：Windows 上"杀整棵进程树 + 等孙进程消失"明显更慢（CI 实测撞过 5s 默认超时）
+  }, 30_000)
 
   // ---------- 7. 执行期自述（模型/取证看到的是事实） ----------
 

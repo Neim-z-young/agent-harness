@@ -29,6 +29,15 @@ import type { ToolDescriptor } from '@harness/a2a-server'
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..')
 const EXT_SRC = join(REPO_ROOT, 'adapters/vscode/src/lmtools.ts')
 
+/**
+ * 读源码文本并**归一为 LF**。
+ *
+ * ⚠️ 必须归一：下面几条守卫用 `…/g)\n` 这类**以 `\n` 收尾**的正则去抓文本，而 Windows 上
+ * git 可能把文件按 **CRLF** 检出（实际序列是 `\r\n`）⇒ 正则静默失配、`exec` 得 `null`，
+ * 报出来却是"命名规则不一致"这种**误导性**结论（CI 实测）。
+ */
+const readSource = (p: string): string => readFileSync(p, 'utf8').replaceAll('\r\n', '\n')
+
 function descriptor(name: string, over: Partial<ToolDescriptor> = {}): ToolDescriptor {
   return {
     name,
@@ -82,7 +91,7 @@ describe('守卫：已提交的贡献点与现场工具池一致', () => {
 // ========================================================================
 
 describe('守卫：命名规则与扩展侧逐字一致', () => {
-  const extSrc = readFileSync(EXT_SRC, 'utf8')
+  const extSrc = readSource(EXT_SRC)
 
   it('LM_TOOL_PREFIX 与 `lmtools.ts` 相同', () => {
     const m = /export const LM_TOOL_PREFIX = '([^']*)'/.exec(extSrc)

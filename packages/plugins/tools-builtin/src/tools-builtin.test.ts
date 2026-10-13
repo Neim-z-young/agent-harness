@@ -1085,7 +1085,8 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     const gpid = Number((await Bun.file(pidFile).text()).trim())
     expect(Number.isInteger(gpid)).toBe(true)
     expect(await waitGone(gpid)).toBe(true)
-  })
+    // ⚠️ 显式放宽：Windows 上杀整棵进程树 + 等孙进程消失更慢（CI 实测撞过 5s 默认超时）
+  }, 30_000)
 
   posixIt('★中断（AbortSignal）同样杀整棵树', async () => {
     const pidFile = join(TMP_DIR, 'grandchild2.pid')
@@ -1099,7 +1100,7 @@ describe('bash 资源上限与进程树 kill（P0-6 / P1-1 端到端）', () => 
     expect(res.interrupted).toBe(true)
     const gpid = Number((await Bun.file(pidFile).text()).trim())
     expect(await waitGone(gpid)).toBe(true)
-  })
+  }, 30_000) // ⚠️ 同上：Windows 上进程树 kill + 轮询更慢
 })
 
 
