@@ -123,8 +123,9 @@ export class McpSessionTable {
     const deadlineAt = this.now() + this.ttlMs
     const promise = new Promise<ElicitAnswer>((resolve) => {
       const timer = setTimeout(() => this.settle(id, { action: 'cancel' }), this.ttlMs)
-      // Node/Bun 下定时器不应阻止进程退出
-      ;(timer as unknown as { unref?: () => void }).unref?.()
+      // ★**不 unref**：客户端在等这个 promise 结算（超时 ⇒ cancel）。Bun/Windows 上
+      // "事件循环里只剩 unref 工作"时定时器永不到期（upstream #32014）⇒ 响应流永久悬挂。
+      // 本包目前因为有 `Bun.serve` 的 ref 句柄而侥幸不挂 —— 去掉 unref 才不依赖这个巧合。
       this.pending.set(id, { sessionId, message, deadlineAt, resolve, timer })
     })
     return { id, promise }

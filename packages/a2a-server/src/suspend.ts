@@ -102,8 +102,10 @@ export class SuspendTable {
       entry.resolve({ outcome: 'expired' })
       this.onExpire?.(pending)
     }, this.ttlMs)
-    // Node/Bun 下 unref 让定时器不阻止进程退出（服务器常驻，但测试里很重要）
-    ;(timer as unknown as { unref?: () => void }).unref?.()
+    // ★**不 unref**：这个 timer 决定挂起 promise 的到期，而 executor 在 await 它。
+    // Bun/Windows 上"事件循环里只剩 unref 工作"⇒ 定时器永不到期（upstream #32014）⇒
+    // 请求与测试一起挂死。"不阻止进程退出"由 `clear()`（关闭服务时释放全部挂起）负责，
+    // 而不是靠 unref 这次等待。
 
     this.entries.set(taskId, { pending, promise, resolve: resolveFn, timer })
     onSuspend?.(pending)

@@ -2255,7 +2255,15 @@ interface AgentStepGateDecisionLike {
  * `STEP_GATE_SLICE_MS`，但 `sliceMs=0` 的硬等路径仍是整档），用户此刻按 Ctrl-C 必须
  * **立刻**停 —— 裸 sleep 会让"中断"最多晚 60 秒才生效，那和没中断没区别。
  * 中断时立即 resolve，由调用方检查 `signal.aborted` 决定后续（不是在这里抛错：
- * 闸门不是错误路径）。定时器 `unref` 掉，避免一个等待中的长定时器把进程钉住。
+ * 闸门不是错误路径）。
+ *
+ * ★定时器**不 unref**（2026-10-13 实测 + 上游确认）：这个 promise 是**被 await 的**，
+ * 而 Bun 在 Windows 上有个已知缺陷 —— 事件循环里**只剩 unref 过的工作**时，
+ * `uv_run()` 会整段跳过 `uv_poll`，那些定时器**永不到期** ⇒ await 永不 settle ⇒
+ * `bun test` 忙等挂死（upstream #32014 / #33334 / #34158；同形复现见 gbrain#5332，
+ * 症状正是"打完已通过的用例后卡住"）。
+ * "别把进程钉住"要靠调用方的 `signal` 中断 / 显式 shutdown，**不是** unref 一个正在被
+ * 等待的定时器 —— 那等于凭空取消这次等待（本仓 core/cli/a2a-server 三个包整包挂住就是它）。
  */
 function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
   if (signal?.aborted) return Promise.resolve()
@@ -2264,7 +2272,6 @@ function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
       cleanup()
       resolve()
     }, ms)
-    ;(timer as unknown as { unref?: () => void }).unref?.()
     const onAbort = (): void => {
       cleanup()
       resolve()

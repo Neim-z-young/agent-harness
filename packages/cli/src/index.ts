@@ -686,9 +686,10 @@ export async function waitForPendingNotifications(
     opts.sleep ??
     ((ms: number) =>
       new Promise<void>((r) => {
-        const t = setTimeout(r, ms)
-        // 不阻止进程退出
-        ;(t as unknown as { unref?: () => void }).unref?.()
+        // ★**不 unref**：这次等待是被 await 的。Bun/Windows 上"事件循环里只剩 unref 工作"时
+        // 定时器永不到期（upstream #32014）⇒ 自动续轮的退避等待会直接挂死。
+        // 总预算 ≤1s（50+100+250+600），钉不住进程该退出。
+        setTimeout(r, ms)
       }))
   for (const wait of steps) {
     const n = session.peekNotifications(sessionId).length
