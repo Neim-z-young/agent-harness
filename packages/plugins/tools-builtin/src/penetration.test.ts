@@ -259,7 +259,24 @@ describe('P1-3 OS 级绑定（工具执行层）', () => {
   })
 
   it('★自检 / 真实执行 / fsBound 三者必须一致 —— 三处都在说"到底绑上了没有"', async () => {
-    const b = buildOsBinding({ writable: [OSB_DIR] })!
+    // ★**三态**都要成立（第一版只写了两态，CI 的 ubuntu 上直接崩 —— 见下）：
+    // ① **没有原语**（Linux 无 `bwrap`、或不支持的平台）：`buildOsBinding` 恒 `null`。
+    //    这时要断言的是"**不模拟**"：工具侧必须如实报 `fsBound:false`。
+    //    ⚠️ 第一版在这里写了 `buildOsBinding(...)!`（非空断言）⇒ 拿到 `null` 直接 TypeError。
+    //    这是**开发机（macOS 有 sandbox-exec）永远看不到**的写法 —— 只在 Linux CI 上暴露。
+    // ② 有原语且可用：自检 true、命令成功、`fsBound` true。
+    // ③ 有原语但**内核拒 apply**（嵌套沙箱：实测本机 `bun test` / `bun run` 派生的进程都在宿主
+    //    沙箱内，`sandbox-exec` 再 apply 一层 ⇒ `sandbox_apply: Operation not permitted`，exit 71）：
+    //    自检 false、命令失败、**`fsBound` 必须是 false**（否则就是"看起来隔离了"）。
+    const b = buildOsBinding({ writable: [OSB_DIR] })
+    if (!b) {
+      const res = await createBashTool({ osBinding: null, isolationLevel: 'L2' })
+        .call!({ command: 'echo probe' } as never, ctx({ cwd: OSB_DIR }))
+      const out = (res as { output?: { exitCode: number; isolation?: { fsBound: boolean } } }).output
+      expect(out?.isolation?.fsBound).toBe(false) // 拿不到原语就如实说没绑上
+      return
+    }
+
     const selfTest = verifyOsBinding(b)
     const res = await createBashTool({ osBinding: b, isolationLevel: 'L2' })
       .call!({ command: 'echo probe' } as never, ctx({ cwd: OSB_DIR }))
@@ -267,11 +284,7 @@ describe('P1-3 OS 级绑定（工具执行层）', () => {
       output?: { exitCode: number; isolation?: { fsBound: boolean; fsBoundFailed?: true } }
     }).output
 
-    // 两种环境都合法，但三处都得给同一个答案：
-    // - 干净环境（CI / 普通 shell 派生的进程）：自检 true、命令成功、fsBound true；
-    // - **嵌套沙箱**（实测：本机 `bun test` / `bun run` 派生的进程都在宿主沙箱内，
-    //   `sandbox-exec` 再 apply 一层被内核拒 `sandbox_apply: Operation not permitted`，
-    //   exit 71）：自检 false、命令失败、**fsBound 必须是 false**（否则就是"看起来隔离了"）。
+    // ②/③ 两种环境都合法，但三处都得给同一个答案。
     const reallyBound = out?.exitCode === 0
     expect(selfTest).toBe(reallyBound)
     expect(out?.isolation?.fsBound).toBe(reallyBound)

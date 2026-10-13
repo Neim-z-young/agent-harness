@@ -1005,10 +1005,43 @@ describe('mcpSpawnArgv（P1-7）', () => {
 })
 
 describe('defaultTransportFactory 透传 osBinding（P1-7）', () => {
-  it('stdio 且传了绑定 ⇒ transport 里带着它（不是"写了但没递进去"）', () => {
-    const binding = { level: 'L2' as const, platform: 'darwin', prefix: ['/usr/bin/sandbox-exec', '-p', 'P'], via: 'sandbox-exec', writable: ['/w'] }
-    const t: any = defaultTransportFactory({ name: 's', transport: 'stdio', command: 'npx' }, { osBinding: binding })
-    // 判定只看**装上了没有**（内部字段），不真起进程
-    expect(t.proc?.spawnargs?.[0] ?? t.proc?.spawnfile).toBe('/usr/bin/sandbox-exec')
+  /**
+   * ⚠️ 这里刻意用 `/bin/sh`（POSIX 上恒存在、带 `-c true` 会立即退出）当"原语"，**不用**
+   * `buildOsBinding` 产出的 `/usr/bin/sandbox-exec`：
+   * - 那台机器上没有 `sandbox-exec` 时（Linux CI / Windows），`spawn` 会抛 **ENOENT**，
+   *   而 `StdioTransport` 没给 `proc` 挂 `error` 监听 ⇒ 变成 **unhandled error** 把整条用例打红
+   *   （本机 macOS 永远看不到 —— 第一次是在 ubuntu CI 上暴露的）；
+   * - 而"真原语能不能套上"由 `tools-builtin` 的 P1-3 那条真机组负责，prefix 的**构造**由上面的
+   *   `mcpSpawnArgv` 组负责。本条只钉**接线**（"写了但没递进去"那类病）。
+   */
+  it.skipIf(process.platform === 'win32')('stdio 且传了绑定 ⇒ transport 里带着它（不是"写了但没递进去"）', () => {
+    const binding = {
+      level: 'L2' as const, platform: process.platform, prefix: ['/bin/sh', '-c', 'true'], via: 'test', writable: ['/w'],
+    }
+    const t = defaultTransportFactory({ name: 's', transport: 'stdio', command: 'npx' }, { osBinding: binding }) as unknown as {
+      proc?: { spawnfile?: string; spawnargs?: string[] }
+      close?: () => void
+    }
+    try {
+      // 判定只看**装上了没有**（Node 的 spawnfile/spawnargs 反映最终被 spawn 的 program/argv）
+      expect(t.proc?.spawnfile ?? t.proc?.spawnargs?.[0]).toBe('/bin/sh')
+      // server 命令整体落到 prefix 之后（顺序不能反 —— 反了就变成把 npx 当解释器）
+      expect(t.proc?.spawnargs ?? []).toContain('npx')
+    } finally {
+      t.close?.() // 别留下真实子进程（本会话踩过"匿名子进程拖住测试进程"的坑）
+    }
+  })
+
+  it.skipIf(process.platform === 'win32')('stdio 且没传绑定 ⇒ program 仍是 server 命令本身（逐位等于改造前）', () => {
+    const t = defaultTransportFactory({ name: 's', transport: 'stdio', command: 'sh', args: ['-c', 'true'] }) as unknown as {
+      proc?: { spawnfile?: string; spawnargs?: string[] }
+      close?: () => void
+    }
+    try {
+      expect(t.proc?.spawnfile ?? t.proc?.spawnargs?.[0]).toBe('sh')
+      expect(t.proc?.spawnargs ?? []).toContain('-c')
+    } finally {
+      t.close?.()
+    }
   })
 })

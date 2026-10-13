@@ -69,5 +69,9 @@ describe('judgeTask（DB 终态校验）', () => {
         throw new Error(`task ${task.id} golden 回放不自洽: ${r.dbDiffPath}`)
       }
     }
-  })
+    // ⚠️ 显式放宽超时（默认 5s 在 CI 的 Linux runner 上不够）：这条要跑 80+ 个任务，
+    // 每个都建库 + 回放 + 比对终态 ⇒ 耗时随任务数线性增长，而 runner 比开发机慢一截。
+    // 实测 ubuntu-latest 上 5469ms 撞线（macOS 本机 <1s）⇒ 这是"环境慢"不是"实现慢"。
+    // 刻意给足（30s）：它测的是数据/实现一致性，不该因为机器慢而变成随机红灯。
+  }, 30_000)
 })

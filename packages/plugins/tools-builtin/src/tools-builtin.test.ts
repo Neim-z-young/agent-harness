@@ -999,7 +999,11 @@ describe('buildLimitPreamble / resolveBashLimits（P1-1 纯函数）', () => {
   it('未设/`false`/全 0 ⇒ 空串；缺省只开单文件大小', () => {
     expect(buildLimitPreamble(resolveBashLimits(false), 'bash')).toBe('')
     expect(buildLimitPreamble({ cpuSeconds: 0, maxFileSizeKb: 0, maxProcesses: 0, memoryKb: 0 }, 'bash')).toBe('')
-    expect(buildLimitPreamble(resolveBashLimits(undefined), 'bash')).toBe('ulimit -f 2097152 2>/dev/null; ')
+    // ⚠️ 第三参 **必须显式传 platform**：`ulimit -f` 的单位是平台相关的（darwin 1024B / 其它 512B），
+    // 不传就等于把这个换算值写死在"跑测试的机器"上 —— 本机（macOS）绿、Linux CI 上红。
+    // 缺省上限 2 GiB ⇒ darwin `2097152`（= 2GiB/1KiB）、linux `4194304`（= 2GiB/512B）。
+    expect(buildLimitPreamble(resolveBashLimits(undefined), 'bash', 'darwin')).toBe('ulimit -f 2097152 2>/dev/null; ')
+    expect(buildLimitPreamble(resolveBashLimits(undefined), 'bash', 'linux')).toBe('ulimit -f 4194304 2>/dev/null; ')
   })
 
   it('非 bash 族系 ⇒ 空串（不模拟）', () => {

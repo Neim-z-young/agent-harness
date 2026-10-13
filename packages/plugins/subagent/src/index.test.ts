@@ -1427,24 +1427,40 @@ describe('SubagentTool 工具调用摘要', () => {
 
   it('智能提示：无探索工具且路径在工作目录外时，如实说明读不到（不再误报「请考虑拆分任务」）', async () => {
     const longReply = 'x'.repeat(3000)
-    const sessions = new Map<string, Session>()
-    const sessionsRef = sessions
-    const agent = createMockAgentRuntime([coderAgent], async (input) => {
-      const msg = makeMessage('assistant', longReply)
-      const s = sessionsRef.get(input.sessionId)
-      if (s) { s.messages.push(msg) }
-      return msg
-    })
-    const session = createMockSessionManager(sessions)
-    const harness = { agent, session }
+    // ★结果目录与 cwd **显式取两个不同的临时目录**。
+    // 以前这条用例没有 `getTasksDir` ⇒ 落盘退到 `os.tmpdir()`，于是"在不在工作目录内"取决于
+    // **平台事实**：macOS 的 tmpdir 是 `/var/folders/...`（≠ cwd 的 `/tmp`）⇒ 判"在外"；
+    // Linux 的 tmpdir 就是 `/tmp` ⇒ 与 cwd 同一棵树 ⇒ 判"在内"，断言随之取反。
+    // 这是"在 macOS 上写、在 Linux 上不成立"的典型；显式两个目录后两个平台结论一致。
+    const cwd = mkdtempSync(join(tmpdir(), 'sa-hint-out-cwd-'))
+    const resultsRoot = mkdtempSync(join(tmpdir(), 'sa-hint-out-results-'))
+    try {
+      const sessions = new Map<string, Session>()
+      const sessionsRef = sessions
+      const agent = createMockAgentRuntime([coderAgent], async (input) => {
+        const msg = makeMessage('assistant', longReply)
+        const s = sessionsRef.get(input.sessionId)
+        if (s) { s.messages.push(msg) }
+        return msg
+      })
+      const session = createMockSessionManager(sessions)
+      const harness = { agent, session }
 
-    const tool = createSubagentTool(() => harness, 5000, false, 2000)
-    // ctx.variables 不含 callerToolIds；cwd=/tmp，落盘在 dataDir（工作目录外）
-    const res = await tool.call({ agentId: 'coder', prompt: 'test' }, makeToolContext())
+      // ctx.variables 不含 callerToolIds（无探索工具）；落盘目录在 cwd **之外**
+      const tool = createSubagentTool(
+        () => harness, 5000, false, 2000, 500,
+        undefined, undefined, undefined, DEFAULT_SUBAGENT_MAX_STEPS,
+        () => join(resultsRoot, '.harness', 'tasks'),
+      )
+      const res = await tool.call({ agentId: 'coder', prompt: 'test' }, makeToolContext({ cwd }))
 
-    expect(res.output!.summarized).toBe(true)
-    expect(res.output!.message).toInclude('该路径不在工作目录内')
-    expect(res.output!.message).not.toInclude('请考虑拆分任务')
+      expect(res.output!.summarized).toBe(true)
+      expect(res.output!.message).toInclude('该路径不在工作目录内')
+      expect(res.output!.message).not.toInclude('请考虑拆分任务')
+    } finally {
+      rmSync(cwd, { recursive: true, force: true })
+      rmSync(resultsRoot, { recursive: true, force: true })
+    }
   })
 
   it('智能提示：有 subagent 工具时提示可委派 explore agent', async () => {
