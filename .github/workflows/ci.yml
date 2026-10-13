@@ -54,6 +54,17 @@ jobs:
         timeout-minutes: 15
         run: bun run typecheck
 
+      # ⚠️ **临时诊断**（见 scripts/ci/probe-unref-timer.ts 的文件头）：只回答一个问题 ——
+      # `unref()` 过的定时器在 Windows 上**会不会真的触发**。
+      # 来历：实测 Windows 的测试步骤挂住 25 分钟，日志显示卡在 `@harness/core` 的
+      # `step-gate.test.ts` 第一条真引擎用例（该包无汇总、无退出行），而那条路径上的等待用的是
+      # `sleepAbortable()` ⇒ 若 `unref` 让定时器永不到期，`await` 就永不 settle（用例永不结束）。
+      # 本机（macOS）验不出这件事，只能跑在 Windows runner 上。**拿到结论后删掉这一步与那个脚本。**
+      - name: 【临时】定时器探针（诊断 core 挂住）
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: bun run scripts/ci/probe-unref-timer.ts
+
       # Windows 上 shell 显式指定 bash：runner 默认是 pwsh，而脚本与
       # `bun run --filter '*'` 的输出解析（grep -oE）都是 POSIX 口径
       # ⚠️ 日志路径用**相对工作目录**，不要写 `/tmp`：
@@ -63,8 +74,16 @@ jobs:
       # ⚠️ 超时同样是为了**拿到证据**：步骤被超时杀掉之后，`if: always()` 的上传仍然执行
       # ⇒ artifact 里是"卡住那一刻为止"的日志 ⇒ 从最后一个开始的包就能定位卡点。
       - name: 测试（含汇总 / 阈值判定）
-        timeout-minutes: 25
+        # 40 分钟的来历：Windows 上改成**逐包**跑（见下面 PER_PKG_TIMEOUT）⇒ 不再并行，
+        # 48 个包串行会明显长于 macOS/Linux 的 ~90s；留足空间，别让"慢"被误判成"挂"。
+        timeout-minutes: 40
         shell: bash
+        env:
+          # 逐包 + 单包超时：**仅 Windows**（其它平台保持整轮 `bun run test`，语义不变）。
+          # 240s 的来历：本机 macOS 上最慢的单包约 20s，Windows 慢一截但远小于此。
+          # 一个包真挂住时只损失 4 分钟，且**其余包照常跑完**（实测：core 挂住曾让下游 22 个包
+          # 一个都没跑到）—— 这才是这个开关的主要价值。
+          PER_PKG_TIMEOUT: ${{ matrix.os == 'windows-latest' && 240 || 0 }}
         run: bash scripts/ci/test-summary.sh ./harness-ci-test.log "${{ runner.os }}"
         # 只有 Windows 允许非零退出（平台差异白名单，见文件头）；失败条数仍进 summary
         # ⚠️ 取舍：这一步会把 **Windows 的真回归也一起吞掉**（job 仍绿）。因此第一次跑通后，
