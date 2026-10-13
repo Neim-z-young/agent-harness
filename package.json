@@ -9,10 +9,10 @@
     "packages/plugins/*"
   ],
   "scripts": {
-    "dev": "bun --filter=* run dev",
-    "build": "bun --filter=* run build",
-    "test": "bun --filter=* run test",
-    "typecheck": "bun --filter=* run typecheck",
+    "dev": "bun run --filter '*' dev",
+    "build": "bun run --filter '*' build",
+    "test": "bun run --filter '*' test",
+    "typecheck": "bun run --filter '*' typecheck",
     "probe:cache": "bun run packages/cli/src/probe-cache-telemetry.ts",
     "gen:lm-tools": "bun run packages/cli/src/gen-lm-tools.ts"
   },
