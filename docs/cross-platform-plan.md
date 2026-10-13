@@ -65,10 +65,39 @@ Node 的 `close` 事件要等**所有持有 stdio 管道写端**的进程退出�
 （同形证据：hermes-agent#103402 的 Python `subprocess.run` 在超时后 `communicate()` 等 EOF 死锁，
 修法是超时后先 `taskkill /F /T /PID` 再收管道。）
 
-**⇒ 结论与现状**：`killProcessTree` 的**决策部分**已修（①），但"Windows 上孙进程一定被杀掉"
-**没有证据**；三条进程树 e2e 断言因此**只在 POSIX 上跑**（`it.skipIf(win32)` / `killTreeIt`），
-**不把"等它自己到期"算成"杀掉了"**。要让它们回到 Windows，需要先拿到②（自建 job，需原生/外部
-helper）或至少按③做两趟 + 身份校验，并用④的口径（不依赖 `close`）去测。
+**⇒ 结论与现状**（2026-10-13 更新）：`killProcessTree` **已按"路 3"落地**——
+①决策侧（绝对路径 / 看返回值 / 失败兜底直系 kill）②**两趟**（`/T` → 宽限 `KILL_TREE_GRACE_MS`
+→ 经 `isChildAlive` 验明"仍是我们的那个进程"后补 `/T /F`）③调用侧的测量缺陷（**`close` 会等
+"持有 stdio 管道写端的进程"退出**，被留下的孙进程会把工具钉住 ⇒ 加 `CLOSE_LINGER_MS`：
+`exit` 后 250ms 仍无 `close` 就主动 destroy 管道）。
+三条进程树 e2e 断言因此**回到 Windows 上跑**（`waitGone` 预算只有 2~3s ⇒ **不会假通过**）。
+⚠️ **仍未解决**的是②（快照竞态）与"内核级兜底"——那是**路 1**（见 §1.2 与 P1-7）。
+
+### 1.2 业界怎么做的（三平台的 containment 机制，2026-10-13 查证）
+
+"整棵树一起收掉"在各平台都有**内建**机制，**快照式枚举（`taskkill /T` / `pidtree` / `tree-kill`）
+是公认的降级方案**（duck/duct.py 的 gotchas 说得最直白：枚举与信号之间"任何进程都可能又生了新的，
+退出的 PID 还可能被复用"，所以它**天生 racy**）。
+
+| 平台 | 机制 | 为什么它没有竞态 |
+|---|---|---|
+| **Windows** | **Job Object**（`KILL_ON_JOB_CLOSE` + `TerminateJobObject`） | 成员是**创建时继承**的；业界的标准姿势是 **"子进程以 `CREATE_SUSPENDED` 起 → `AssignProcessToJobObject` → 再 resume"** ⇒ 连"第一瞬间 fork 出来的孙进程"都被装进去 |
+| **Linux** | **cgroup v2**（systemd 的 `KillMode=control-group`，5.14+ 的原子 `cgroup.kill`） | 后代一 `fork` 就在 cgroup 里；`cgroup.kill` 是一次原子操作（5.14 之前 systemd 只能"循环扫描 PID 再逐个杀" ⇒ 同样有 PID 复用竞态） |
+| **macOS / BSD** | **没有整棵树的容器**，只有 **POSIX 进程组**（`setpgid` + `killpg`） | 进程组**不是树**（每个进程只有一个 pgid），子进程**自己 `setpgid` 就能脱离** ⇒ 这是平台能力上限，不是实现偷懒 |
+
+参考实现：`ProcessKit-rs` 的 `docs/platform-support.md`（把三种机制、以及"Windows 上没有信号分级、
+优雅关闭只能塌缩成原子 job kill"、"macOS 没有 whole-tree container"都如实列成表）；Electron /
+VS Code 在生产里就是**把子进程放进同一个 job**（"closing the job kills every process in it
+recursively …… typical of IDEs to ensure stopping debugging will stop everything"）；
+Rust 的 `uv` 有 `uv-windows/src/spawn.rs` 专门做 job 监督。
+
+**对我们（P1-7）的含义**：POSIX 侧我们已经在用上表第三行的等价物（`detached: true` + `kill(-pid)`）；
+Windows 侧**已按"路 3"降级**（两趟 + 身份校验 + 不再被 `close` 钉住），但**根治要走上表第一行** ——
+它的三个 API（`CreateJobObject` / `AssignProcessToJobObject` / `TerminateJobObject`）Node/Bun 都不暴露，
+所以需要原生扩展（标准姿势：**子进程 `CREATE_SUSPENDED` 起 → `AssignProcessToJobObject` → resume**，
+这样"第一瞬间 fork 的孙进程"也在 job 里），这是**路 1**、记为 P1-7 的剩余工作。
+另外 job 顺带能给我们 **`max_memory` / `max_processes`** —— 正好是 `bash.limits` 在 Windows 上缺的那块。
+
 
 ## 2. 待补清单
 
@@ -93,7 +122,7 @@ helper）或至少按③做两趟 + 身份校验，并用④的口径（不依�
 | P1-4 | ✅ **已修**（2026-10-12，见续 283）—— 原文：**CRLF / BOM 处理** | 新建 `line-endings.ts`（`detectEol` / `preferredEol` / `normalizeEol` / `applyEol` / `detectBom` / `stripBom` / `withBom` / `planWrite`），三处工具共用一份口径。**核实时发现 `edit_file` 早已有 CRLF 容忍**（旧实现就地写死的 `content.includes('\r\n') ? '\r\n' : '\n'`）—— 本轮的增量是把它抽成共用口径 + 补 BOM + 补另两处：`read_file` 新增 `lineEnding` / `bom` 字段（**如实报告**；`content` **剥掉 BOM**，行尾**保留原样**）；`write_file` 覆盖已有文件时**按其行尾与 BOM 写回**（只读头部 64KB 检测；不改的话"改一行"会被 diff 显示成"整文件改动"）；`edit_file` 匹配在**剥 BOM** 的文本上做、写回时拼回，且 `old_string` **自带 BOM 也认**（模型可能从旧版 read_file 里复制）。判据：`line-endings.test.ts` **24 条**（含"LF 文件逐位不变"这类回归钉子）。⚠️ **顺带纠正判据点名的"行号偏移"**：`allLines` 按 `\n` 切 ⇒ CRLF **不会**产生额外行，`totalLines` / `linesRead` 与同内容 LF 文件一致（用例钉住） | `line-endings.ts`（新）、read/write/edit 三处 |
 | P1-5 | ✅ **已修**（2026-10-12，见沙箱方案续 279 / 本文件续 281） | 落地于 `.github/workflows/ci.yml`（ubuntu / macos / windows 矩阵）+ `scripts/ci/test-summary.sh`：**只读 bun 汇总行**，记录 `pass / fail / skip` 并写 step summary；`pass ≥ 2000`（防"整包没跑起来"）与 `skip ≤ 200`（防"某一片被整体跳掉"）**分开判**；Windows 只放行**失败**，pass/skip 阈值照样拦 | 仓库 CI 配置 |
 | P1-6 | ⚠️ **主要部分已修**（2026-10-12，见续 283） | `tools-builtin.test.ts` 顶上加平台门：**`HAS_POSIX_SHELL = resolveShell().family === 'bash'`** + `posixIt = it.skipIf(!HAS_POSIX_SHELL)`，**31 个"真跑命令"的用例**换成 `posixIt`。★判据刻意**不是** `process.platform !== 'win32'`，而是**与运行时同一份**（`resolveShell`）：装了 Git Bash / MSYS2 / WSL 的 Windows runner 会**真跑**这些用例（拿到真实覆盖），只有确实没有 bash 的环境才跳过；跳过条数进 bun 汇总行 ⇒ 由 CI 的 `skip ≤ 200` 闸看着。**其余四个含 POSIX 字面量的测试文件经抽查是纯函数输入**（喂给 `assessRisk` / 解析器 / 格式化函数，不真执行）：`host/src/permission.test.ts`（6 处，`2>/dev/null` 字符串）、`cli/src/cli.test.ts`（2 处，命令字符串进 `formatToolInput`）、`bash-ast.test.ts`（8 处，喂解析器）、`isolation/src/index.test.ts`（3 处）—— **未逐一核查是否真执行**（如实记着） | `tools-builtin.test.ts` |
-| P1-7 | ⚠️ **未做**（2026-10-13 查证，见 §1.1）—— **Windows 进程树的「内核级兜底」** | 现状：win32 走 `taskkill /PID <pid> /T /F`（快照遍历、最深优先），**决策侧已修**（绝对路径 + 看返回值 + 失败兜底直系 kill）。**缺口**：① libuv 给非 detached 子进程建的 job 带 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`（源码注释：*their subprocesses are not*）⇒ 孙进程不在 job 里，`KILL_ON_JOB_CLOSE` 兜不住，而 Node/Bun 都没有 job API；② `taskkill /T` 与「MSYS2 用 `CREATE_SUSPENDED` 创建子进程、数毫秒后唤醒」赛跑，一趟可能漏；③ Windows PID 复用积极，重试前必须验身份（否则会误伤无关进程树）。**要做的**：自建 job（需原生扩展 / 外部 helper）+ `TerminateJobObject`；退一步是「两趟：`/T` → grace → 仍活才 `/T /F`」+ 身份校验。**测法必须先修**：不能拿 `close` 事件当判据 —— 孙进程持有 stdio 管道写端会让 `close` 不触发，量到的是「管道没关」而非「进程没死」 | `tools-builtin/src/index.ts`（`killProcessTree`）、三条 e2e 断言 |
+| P1-7 | 🟡 **降级已做（路 3，2026-10-13）+ 根治未做（路 1）** | **已做**：win32 走**两趟** `taskkill`（`/T` → 宽限 `KILL_TREE_GRACE_MS=300` → 经 `isChildAlive`（用**我们自己的句柄**判活，防 PID 复用误伤）后补 `/T /F`）+ 决策侧（绝对路径 / 看返回值 / 失败兜底直系 kill）+ 调用侧不再被 `close` 钉住（`CLOSE_LINGER_MS`）。三条进程树 e2e 已**回到 Windows**。**未做（路 1，根治）**：自建 Job Object —— 标准姿势是"子进程 `CREATE_SUSPENDED` 起 → `AssignProcessToJobObject` → resume → `TerminateJobObject`"，这样连"第一瞬间 fork 的孙进程"都装进去，**没有快照竞态、也没有 PID 复用问题**；三个 API **Node/Bun 都不暴露** ⇒ 需原生扩展（每平台预编译产物）或外部 helper。**顺带收益**：job 还能给 `max_memory` / `max_processes`，补上 `bash.limits`（`ulimit`，POSIX 语义）在 Windows 的空白 | `tools-builtin/src/index.ts`（`killProcessTree`）、三条 e2e 断言 |
 
 ### 2.2 P2 —— **体验一致性**（不影响正确性，但口径不齐）
 
