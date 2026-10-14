@@ -233,7 +233,21 @@ export interface PermissionEngine {
   updateRules(rules: PermissionRuleset): void
 
   /**
+   * 设置 **agent 约束层**（可选举缝）。
+   *
+   * agent 定义里的 `permission` 是**约束**（如只读子 agent 声明 `{ '*': 'deny' }`），
+   * 语义上**只收紧不放宽**，绝不能整键覆盖用户基线规则。实现方应把它与用户基线
+   * **分层合成**（最严者胜，见 `@harness/core` 的 `composeRules`），且**不进持久化**。
+   *
+   * 缺省（不实现）⇒ 引擎无 agent 约束概念，core 跳过该层。`DefaultPermissionEngine` 已实现。
+   */
+  setAgentRules?(rules: PermissionRuleset | undefined): void
+
+  /**
    * 获取当前规则集（可用于调试/序列化）
+   *
+   * ⚠️ 实现方应返回**用户基线**（不含 agent 约束层）—— 展示与持久化都读它，
+   * 混入 agent 约束会把"运行时约束"误当"用户配置"落盘。
    */
   getRules(): PermissionRuleset
 }

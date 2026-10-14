@@ -228,6 +228,8 @@ import type {
   PermissionRuleset,
   PermissionEngine,
   PathRules,
+  ToolPermissionRule,
+  PermissionBehavior,
   PermissionRequest as PermRequest,
   PermissionDecision as PermDecision,
 } from '@harness/permission'
@@ -452,17 +454,129 @@ function missingRequiredKeys(tool: Tool, input: unknown): string[] | undefined {
   return missing.length > 0 ? missing : undefined
 }
 
+/** 简写行为归一成 `PathRules`（与 `rememberRule` 的归一一致：整工具 = `**` 通配） */
+function toPathRules(v: ToolPermissionRule): PathRules {
+  if (typeof v === 'string') {
+    return v === 'allow' ? { allow: ['**'] } : v === 'deny' ? { deny: ['**'] } : { ask: ['**'] }
+  }
+  return { ...v }
+}
+
+/** 行为取最严（allow < ask < deny） */
+function mostRestrictive(a: PermissionBehavior, b: PermissionBehavior): PermissionBehavior {
+  const rank: Record<PermissionBehavior, number> = { allow: 0, ask: 1, deny: 2 }
+  return rank[a] >= rank[b] ? a : b
+}
+
+/**
+ * allow 列表取交集。`'**'` 通配短路：`['**'] ∩ X = X`（`**` 匹配一切，逐字面比对会误判成空集）。
+ * 其余按字面量相等比对 —— 非同形 glob 判为空集，**偏严（fail-closed）**，不会放到更宽。
+ */
+function intersectAllow(a: string[], b: string[]): string[] {
+  if (a.includes('**')) return b
+  if (b.includes('**')) return a
+  return a.filter((p) => b.includes(p))
+}
+
+/** 同键两个规则取最严（见 {@link composeRules}） */
+function composeRuleValue(a: ToolPermissionRule, b: ToolPermissionRule): ToolPermissionRule {
+  // ★ 两个都是简写 ⇒ 直接取最严并**保持 string 形态**。
+  // 关键：绝不能把 `'deny'` 归一成 `{ deny: ['**'] }` —— 那会把"默认兜底 deny"升级成
+  // "跨层否决 deny"，从而连 **agent 自己的** 例外（`{'*':'deny', read:'allow'}` 里的 read）也一起否掉。
+  if (typeof a === 'string' && typeof b === 'string') return mostRestrictive(a, b)
+  const ta = toPathRules(a)
+  const tb = toPathRules(b)
+  const out: PathRules = {}
+  // deny 取并集：任一层声明的 deny 都必须生效
+  const deny = [...new Set([...(ta.deny ?? []), ...(tb.deny ?? [])])]
+  if (deny.length > 0) out.deny = deny
+  // ask 取并集：任一层要问就得问（ask 无否决语义，归成列表 `['**']` 即等价于"默认 ask"）
+  const ask = [...new Set([...(ta.ask ?? []), ...(tb.ask ?? [])])]
+  if (ask.length > 0) out.ask = ask
+  // allow 取交集（保 ⊆ 不变式：缺一边即视为空 ⇒ 两侧都放行才算放行）
+  const allow = intersectAllow(ta.allow ?? [], tb.allow ?? [])
+  if (allow.length > 0) out.allow = allow
+  return out
+}
+
+/**
+ * 规则分层合成（**最严者胜**）—— 用户基线层与 agent 约束层合成，**只收紧、不放宽**。
+ *
+ * ## 背景（2026-10-14 修复）
+ * `_prepareQueryOnce` 曾用 `{ ...getRules(), ...agent.permission }` 把 agent 权限**整键覆盖**
+ * 到用户规则上，于是默认 agent 的 `'*': 'ask'` 会抹掉用户 `'*': { deny: ['/etc/**'] }` 的
+ * 全局否决权（fail-open），且该写路径不过 `setPermissionRules()`（无审计、还污染持久化）。
+ * 反向把用户规则压在上层同样错：会把 agent 的收窄（只读子 agent 的 `'*': 'deny'`）放大回宽松。
+ *
+ * ## 正确模型
+ * 两层**各自独立**持有，合成时逐键取最严：
+ * - `deny` 取**并集**（两边任何一条 deny 都生效）；
+ * - `ask` 取**并集**（任一层要问就得问）；
+ * - `allow` 取**交集**（两边都放行才算放行；缺一边即不放行 —— fail-closed）；
+ * - **两边都是简写**（`'allow'`/`'deny'`/`'ask'`）时直接取最严并**保持简写形态** —— 尤其 `'deny'`
+ *   必须留作"默认兜底"而非升级为"跨层否决"（见 `composeRuleValue` 的说明）。
+ *
+ * 结果**恒 ⊆ 两层各自的判定**（`compose(base, agent)` 对任何请求都至少和 `base`、`agent` 一样严），
+ * 因此"用户否决权"与"agent 收窄"同时成立。仅当**两侧都定义了同一个键**时才合成；
+ * 只在一侧出现的键**原样保留**（含 `session:`/`caller:` 归属键）。
+ *
+ * ## 已知取舍
+ * 交集用**字面量相等**比对 glob（`['**'] ∩ ['**'] = ['**']`，`['src/**'] ∩ ['src/a.ts'] = ∅`）。
+ * 非同形 glob 会被判成空集 ⇒ **偏严（fail-closed）**，不会放到更宽 —— 这是可接受的代价。
+ */
+export function composeRules(
+  base: PermissionRuleset,
+  agent: PermissionRuleset | undefined,
+): PermissionRuleset {
+  if (!agent || Object.keys(agent).length === 0) return { ...base }
+  const out: PermissionRuleset = {}
+  for (const key of new Set([...Object.keys(base), ...Object.keys(agent)])) {
+    const a = base[key]
+    const b = agent[key]
+    out[key] = a === undefined ? b : b === undefined ? a : composeRuleValue(a, b)
+  }
+  return out
+}
+
 export class DefaultPermissionEngine implements PermissionEngine {
+  /** 用户基线规则集：`permissions.json` / `/permission` / 控制面写入都落这里；展示与持久化读它 */
+  private baseRules: PermissionRuleset
+  /** agent 约束层（`_prepareQueryOnce` 每轮设置；只收紧，见 {@link composeRules}） */
+  private agentRules: PermissionRuleset = {}
+  /** 合成后的**生效**规则（`check()` 读它）= `composeRules(baseRules, agentRules)` */
   private rules: PermissionRuleset
+
   constructor(rules: PermissionRuleset = { '*': 'ask' }) {
+    this.baseRules = { ...rules }
     this.rules = { ...rules }
   }
 
+  /** 设置**用户基线**规则集（唯一写入口；`host.setPermissionRules` 与 `rememberRule` 都经它） */
   updateRules(rules: PermissionRuleset): void {
-    this.rules = { ...rules }
+    this.baseRules = { ...rules }
+    this.recompute()
   }
+
+  /**
+   * 设置 **agent 约束层**（core 每次查询前调用）。
+   *
+   * 与 `updateRules` 分开的理由：
+   * - agent 权限**只收紧不放宽**（见 {@link composeRules}），不能整键覆盖用户规则；
+   * - agent 权限**不进持久化**（`getRules()` 只回基线），避免"切了 agent 后旧约束残留"与
+   *   "`/permission` 把 agent 约束当用户规则落盘"（旧实现在这两点上都是错的）。
+   */
+  setAgentRules(rules: PermissionRuleset | undefined): void {
+    this.agentRules = rules ? { ...rules } : {}
+    this.recompute()
+  }
+
+  /** 用户**基线**规则集（**不含** agent 约束层）。展示 / 持久化 / 控制面读它。 */
   getRules(): PermissionRuleset {
-    return { ...this.rules }
+    return { ...this.baseRules }
+  }
+
+  private recompute(): void {
+    this.rules = composeRules(this.baseRules, this.agentRules)
   }
 
   /**
@@ -2838,10 +2952,10 @@ export class AgentRuntimeImpl implements AgentRuntime {
         agent.excludeMcpServers,
       )
 
-    this.deps.permission.updateRules({
-      ...this.deps.permission.getRules(),
-      ...(agent.permission as PermissionRuleset),
-    })
+    // agent 权限作为**约束层**并入（只收紧不放宽），不再整键覆盖用户规则 —— 见 `composeRules`。
+    // 走独立入口 `setAgentRules`：① agent 约束**不进持久化**（`getRules()` 仍只回用户基线）；
+    // ② 每轮**整体替换**约束层（`recompute` 从基线重算）⇒ 换 agent 后不会残留上一轮的约束。
+    this.deps.permission.setAgentRules?.(agent.permission as PermissionRuleset | undefined)
 
     const sess = await this.deps.session.get(sessionId)
     if (!sess) throw new Error(`Session "${sessionId}" not found`)
