@@ -1,0 +1,6 @@
+# 代码归属（CODEOWNERS）—— 配合 main 分支保护的 `require_code_owner_review`
+#
+# 语义：**除仓库所有者（可 bypass 规则直推 main）之外**，任何 PR 都必须先拿到属主批准
+# 才能合并（`required_approving_review_count: 1` + 本文件 ⇒ 批准只能来自这里列出的 owner）。
+# 新增协作者时若想放宽，改这一行即可，不要去动分支保护规则。
+* @Neim-z-young
