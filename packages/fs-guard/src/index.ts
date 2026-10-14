@@ -275,3 +275,27 @@ export function resolveSensitiveReadPolicy(
     paths: cfg.paths ?? [],
   }
 }
+
+/**
+ * **大小写不敏感**地取环境变量（P2-2）。
+ *
+ * 顺序：先精确匹配，再退到大小写不敏感扫描；空串继续找（Windows 上可能同时有空的
+ * `PATH` 与有效的 `Path`）。找不到时返回**原键的值**（含 undefined）。
+ *
+ * ## 为什么只有这一份（2026-10-14 收敛）
+ * `@harness/tools-builtin`（执行侧 `resolveShell`）与 `@harness/env-context`
+ * （展示侧 `detectShellForDisplay`）曾各抄一份 —— 正是"同一份口径两个落点"的反面教材：
+ * 改一处漏一处，两边漂移（D7 实录：展示侧看 `SHELL`、执行侧不看）。现收敛到这里，
+ * 两边都从本包导入；**改语义只改这一处**。
+ */
+export function lookupEnvCI(env: NodeJS.ProcessEnv, name: string): string | undefined {
+  const direct = env[name]
+  if (typeof direct === 'string' && direct !== '') return direct
+  const upper = name.toUpperCase()
+  for (const k of Object.keys(env)) {
+    if (k.toUpperCase() !== upper) continue
+    const v = env[k]
+    if (typeof v === 'string' && v !== '') return v
+  }
+  return direct
+}

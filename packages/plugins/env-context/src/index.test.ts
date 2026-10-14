@@ -209,13 +209,16 @@ describe('createEnvContextPlugin：两条注入通道', () => {
 })
 
 describe('detectShellForDisplay：跨平台 shell 名称探测', () => {
-  it('非 Windows 优先 process.env.SHELL，缺失回退 bash', () => {
-    expect(detectShellForDisplay({ platform: 'darwin', env: { SHELL: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('/bin/zsh')
+  it('★非 Windows 一律 bash —— **不看 `SHELL`**（对齐执行侧 resolveShell，消除 D7 漂移）', () => {
+    // 旧实现读 `SHELL` ⇒ 注入 `/bin/zsh`（用户登录 shell），而 bash 工具实际跑的是
+    // harness 解析出的 bash —— 模型照 zsh 语法写命令就是错的。展示口径必须与执行口径一致。
+    expect(detectShellForDisplay({ platform: 'darwin', env: { SHELL: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('bash')
     expect(detectShellForDisplay({ platform: 'linux', env: {} as NodeJS.ProcessEnv })).toBe('bash')
   })
 
-  it('Windows 优先 SHELL，其次 PATH 中的 bash.exe，再 PowerShell，最后 cmd', () => {
-    expect(detectShellForDisplay({ platform: 'win32', env: { SHELL: '/bin/bash' } as NodeJS.ProcessEnv })).toBe('/bin/bash')
+  it('Windows：PATH 中的 bash.exe → PowerShell → ComSpec（**不看 `SHELL`**，与执行侧同一套判据）', () => {
+    // `SHELL` 在 MSYS/Git-Bash 会话里常有值，但 resolveShell 不认它 ⇒ 展示侧也不认
+    expect(detectShellForDisplay({ platform: 'win32', env: { SHELL: '/bin/bash' } as NodeJS.ProcessEnv })).toBe('cmd.exe')
 
     const hasBash = (p: string) => p === 'C:\\Git\\bin\\bash.exe'
     expect(detectShellForDisplay({ platform: 'win32', pathSep: ';', dirSep: '\\', exists: hasBash, env: { PATH: 'C:\\Git\\bin' } as NodeJS.ProcessEnv })).toBe('bash.exe')
@@ -310,8 +313,10 @@ describe('P2-2 detectShellForDisplay：键名大小写不敏感', () => {
     expect(detectShellForDisplay({ platform: 'win32', env: { ComSpec: 'D:\\cmd.exe' } as NodeJS.ProcessEnv, exists })).toBe('D:\\cmd.exe')
   })
 
-  it('POSIX 平台不受影响（`SHELL` 大小写两种写法）', () => {
-    expect(detectShellForDisplay({ platform: 'linux', env: { shell: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('/bin/zsh')
+  it('★POSIX 不看 `SHELL`（大小写两种写法都不认）—— 展示口径与执行侧 resolveShell 一致', () => {
+    // 旧实现 POSIX 上读 `SHELL`/`shell` ⇒ 注入 `/bin/zsh`，而 bash 工具实际跑 bash（D7 漂移）
+    expect(detectShellForDisplay({ platform: 'linux', env: { shell: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('bash')
+    expect(detectShellForDisplay({ platform: 'linux', env: { SHELL: '/bin/zsh' } as NodeJS.ProcessEnv })).toBe('bash')
   })
 })
 

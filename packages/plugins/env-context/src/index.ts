@@ -27,6 +27,10 @@ import { existsSync } from 'node:fs'
 import { hostname, release, userInfo } from 'node:os'
 import { resolve } from 'node:path'
 import type { AgentPlugin, Hooks, PromptInput } from '@harness/plugin'
+// 环境键名的大小写不敏感取值（P2-2）：与执行侧 `@harness/tools-builtin` 的 `resolveShell`
+// 共用**同一份**（收敛在 `@harness/fs-guard`）—— 此前两边各抄一份，展示侧看 `SHELL`、
+// 执行侧不看，注入的 `Shell:` 与实际方言不一致（D7 漂移实录）。
+import { lookupEnvCI } from '@harness/fs-guard'
 
 // ===== 数据形状 =====
 
@@ -178,32 +182,18 @@ export function renderNowSection(now: Date, git?: GitInfo): string {
  *   在 PATH 中探测，与 tools-builtin 执行口径保持一致。
  */
 /**
- * **大小写不敏感**地取环境变量（P2-2）。
+ * 展示侧 shell 名称探测 —— **判据必须与执行侧 `resolveShell` 一致**。
  *
- * 与 `@harness/tools-builtin` 的 `resolveShell` 使用**同一份口径**（一个管执行、一个管展示，
- * 两者必须一致 —— 否则提示里说用 Git Bash、实际执行却走 cmd）。
- *
- * 顺序：先精确匹配，再退到大小写不敏感扫描；空串继续找（Windows 上可能同时有空的 `PATH` 与有效的 `Path`）。
+ * ## 2026-10-14 对齐（消除 D7 漂移）
+ * 旧实现**优先读 `SHELL`**，而执行侧从不看它 ⇒ 注入的 `Shell:` 说 `/bin/zsh`（用户的登录 shell）、
+ * 实际 bash 工具跑的却是 harness 自己解析出的 bash —— 模型照着 zsh 语法写命令就是错的。
+ * 现在两边同一套判据：非 win32 ⇒ bash；win32 ⇒ PATH 探 bash.exe → pwsh/powershell → ComSpec。
+ * （`SHELL` 是"用户登录 shell"，不是"harness 执行 shell"，注入给模型的是后者。）
  */
-function lookupEnvCI(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const direct = env[name]
-  if (typeof direct === 'string' && direct !== '') return direct
-  const upper = name.toUpperCase()
-  for (const k of Object.keys(env)) {
-    if (k.toUpperCase() !== upper) continue
-    const v = env[k]
-    if (typeof v === 'string' && v !== '') return v
-  }
-  return direct
-}
-
 export function detectShellForDisplay(
   deps: { platform?: string; pathSep?: string; dirSep?: string; exists?: (p: string) => boolean; env?: NodeJS.ProcessEnv } = {},
 ): string {
   const env = deps.env ?? process.env
-  const sh = lookupEnvCI(env, 'SHELL')
-  if (sh) return sh
-
   const platform = deps.platform ?? process.platform
   if (platform !== 'win32') return 'bash'
 

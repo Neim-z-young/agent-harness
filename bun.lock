@@ -284,6 +284,7 @@
       "name": "@harness/env-context",
       "version": "0.1.0",
       "dependencies": {
+        "@harness/fs-guard": "workspace:*",
         "@harness/plugin": "workspace:*",
       },
     },

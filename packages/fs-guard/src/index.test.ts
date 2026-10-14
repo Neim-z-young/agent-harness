@@ -12,6 +12,7 @@ import {
   defaultPathDialect,
   isSensitiveReadPath,
   findSensitiveReadPath,
+  lookupEnvCI,
 } from './index'
 
 // ===== 工具 =====
@@ -394,5 +395,21 @@ describe('isSensitiveReadPath', () => {
   it('findSensitiveReadPath 指出第一个命中项', () => {
     expect(findSensitiveReadPath(['a.ts', '.env', 'b.ts'])).toBe('.env')
     expect(findSensitiveReadPath(['a.ts', 'b.ts'])).toBeUndefined()
+  })
+})
+
+describe('lookupEnvCI：环境键名大小写不敏感（P2-2，唯一一份口径）', () => {
+  it('★注入普通对象时 `Path` 能被 `PATH` 取到（Windows 键名形态）', () => {
+    expect(lookupEnvCI({ Path: 'C:\\bin' } as NodeJS.ProcessEnv, 'PATH')).toBe('C:\\bin')
+    expect(lookupEnvCI({ PATH: 'C:\\bin' } as NodeJS.ProcessEnv, 'PATH')).toBe('C:\\bin')
+    expect(lookupEnvCI({ 'cOmSpEc': 'cmd.exe' } as NodeJS.ProcessEnv, 'ComSpec')).toBe('cmd.exe')
+  })
+
+  it('空值不挡路：空的 `PATH` 与有效的 `Path` 并存时取有效的那个（Windows 实录）', () => {
+    expect(lookupEnvCI({ PATH: '', Path: 'C:\\real' } as NodeJS.ProcessEnv, 'PATH')).toBe('C:\\real')
+  })
+
+  it('都不命中 ⇒ 返回原键的值（undefined），不猜', () => {
+    expect(lookupEnvCI({ SHELL: '/bin/zsh' } as NodeJS.ProcessEnv, 'PATH')).toBeUndefined()
   })
 })

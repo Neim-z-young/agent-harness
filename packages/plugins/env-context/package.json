@@ -10,6 +10,7 @@
     }
   },
   "dependencies": {
+    "@harness/fs-guard": "workspace:*",
     "@harness/plugin": "workspace:*"
   },
   "scripts": {
