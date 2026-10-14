@@ -123,6 +123,54 @@ bun test                    # 全部测试
 bun run typecheck           # 全部类型检查
 ```
 
+## 构建与打包
+
+三种产物，按需构建（`dist/` 已在 `.gitignore` 中，不入库）。
+
+### 1. 全仓 JS 产物（各包 → `dist/`）
+
+```bash
+bun run build        # bun run --filter '*' build，48 个包全部 exit 0
+```
+
+> ⚠️ `@harness/cli` 的 build 必须把 `@opentui/core` 的**按平台原生包**标成 external
+> （`@opentui/core-darwin-x64` 等 8 个）：它们由 `@opentui/core` 在运行时**动态 import**，
+> 而本机只装当前平台那一个，静态打包会全部尝试解析 ⇒ `Could not resolve`。
+> 该清单已写死在 `packages/cli/package.json` 的 `build` 脚本里，**新增平台时同步补一行**。
+
+### 2. CLI 单文件可执行（A2A sidecar，~76 MB）
+
+```bash
+cd packages/cli && bun run build:sidecar
+# 产物：packages/cli/dist/harness-a2a
+```
+
+`bun build --compile` 把 Bun runtime + 全部依赖（385 modules）打进一个可执行文件，
+**不依赖目标机的 Bun / node_modules**，可直接拷贝运行。验证符号是否真的进了二进制：
+
+```bash
+python3 -c "d=open('packages/cli/dist/harness-a2a','rb').read(); print(d.count(b'composeRules'))"
+```
+
+跨平台产物需在对应 OS 上分别构建（`--compile` 产的是本机平台二进制）。
+
+### 3. VSCode 扩展（.vsix）
+
+```bash
+cd adapters/vscode && bun run package
+# 产物：adapters/vscode/harness-vscode-*.vsix
+```
+
+`tsc` 编译 + `vsce package --no-dependencies`（sidecar 由扩展在运行时自行拉起，不打进 VSIX）。
+
+### 附到 Release
+
+二进制体积大，**不要**提交进 git；发布时作为 release 附件：
+
+```bash
+gh release upload v0.1.0 packages/cli/dist/harness-a2a
+```
+
 ## Configuration（config.json）
 
 配置通过两级 `config.json` 加载：user 级 `~/.harness/config.json` 与 project 级 `.harness/config.json`，**project 级覆盖 user 级**。数据目录由 `--data-dir` 指定（默认 `~/.harness`），承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。

@@ -1,5 +1,18 @@
 # Agent Harness 开发日志
 
+## 2026-10-14（续 288）打包链修复 + README 补「构建与打包」
+
+**修掉根 `bun run build` 唯一失败点**（`5947d68`）：实测 47/48 包 exit 0，仅 `@harness/cli` 失败 ——
+`@opentui/core` 运行时**按平台动态 import** 8 个原生包（`@opentui/core-{darwin,linux,win32}-*`），
+本机只装当前平台那个 ⇒ bun 静态打包去解析全部 ⇒ `Could not resolve`。
+修：`build` 脚本逐个 `--external`（运行时再解析）。修后根 build **48/48 exit 0**。
+`build:sidecar`（`--compile`）不受影响，实测仍产出 76MB 单文件（385 modules），
+且 `composeRules` / `setAgentRules` / `team_shutdown` / `timeoutClamped` 均可在二进制里数到
+（今日改动确实进成品）。
+
+**README 补「构建与打包」章节**（公开仓库的贡献者入口）：三种产物（全仓 JS / sidecar 可执行 /
+VSIX）+ external 坑 + "二进制别进 git、作为 release 附件"的口径。
+
 ## 2026-10-14（续 287）D1 权限分层合成（最严者胜）+ 评审遗留 10 处收尾
 
 **D1（权限语义修复，用户选定"取最严"方案）**
