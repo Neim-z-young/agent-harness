@@ -57,7 +57,7 @@
   },
   "scripts": {
     "dev": "bun run ./src/index.ts repl",
-    "build": "bun build src/index.ts --outdir dist --target bun",
+    "build": "bun build src/index.ts --outdir dist --target bun --external @opentui/core-darwin-x64 --external @opentui/core-darwin-arm64 --external @opentui/core-linux-x64 --external @opentui/core-linux-x64-musl --external @opentui/core-linux-arm64 --external @opentui/core-linux-arm64-musl --external @opentui/core-win32-x64 --external @opentui/core-win32-arm64",
     "start": "bun run ./src/index.ts repl",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
