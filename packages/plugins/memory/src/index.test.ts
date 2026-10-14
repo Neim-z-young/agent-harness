@@ -1143,3 +1143,23 @@ describe('轮次计数的来源必须是引擎层（core.agent.turn.end）', () 
     expect(await inject(hooks)).toContain('改动')
   })
 })
+
+describe('readCapped：字节上限对**多字节文本**也必须真的生效（评审实测复现）', () => {
+  it('★ CJK 内容按字节截断，不再返回 3 倍超限（且不为乱切字符）', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mem-cap-'))
+    try {
+      const p = join(dir, 'index.md')
+      // 8000 字符 / 24000 字节：旧实现 `slice(0, maxBytes)` 会**一字不删**（15000 字节返回给 5000 上限）
+      writeFileSync(p, '中文测试'.repeat(2000), 'utf-8')
+      const r = readCapped(p, { maxBytes: 5000, maxLines: 100000 })
+      expect(r.truncated).toBe(true)
+      expect(r.truncatedBy).toBe('bytes')
+      expect(Buffer.byteLength(r.text, 'utf-8')).toBeLessThanOrEqual(5000)
+      // 不能把多字节字符切成两半（尾部出现 U+FFFD 就是切坏了）
+      expect(r.text.endsWith('\uFFFD')).toBe(false)
+      expect(r.text.length).toBeGreaterThan(0)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})

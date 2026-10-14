@@ -122,8 +122,16 @@ export function readCapped(
   }
   let text = kept.join('\n')
   if (Buffer.byteLength(text, 'utf-8') > maxBytes) {
-    // 字节先到：按字符二分不稳，直接截字符数（UTF-8 下 1 字符 ≥ 1 字节 ⇒ 截 maxBytes 字符必然不超）
-    text = text.slice(0, maxBytes)
+    // ⚠️ 这里曾写 `text.slice(0, maxBytes)` 并按"1 字符 ≥ 1 字节"论证"必然不超上限" ——
+    // 那个不等式给的是字节数的**下界**，方向反了。实测（CJK 文本 / maxBytes=5000）：
+    // 返回 15000 字节、3 倍超限，同时还把 truncated=true/truncatedBy='bytes' 置上 ⇒ 向模型
+    // 注入一句"因字节上限被截断"的**假告警**（N 与总行数相等）。本文件的硬上限是 system 占用
+    // 永不回收的前提，必须真的生效 ⇒ 改成按**字节**切，并在切完再验一次。
+    const buf = Buffer.from(text, 'utf-8')
+    let cut = maxBytes
+    // 别把一个多字节字符切成半个（否则尾部会出现 U+FFFD 替换符）
+    while (cut > 0 && (buf[cut]! & 0xc0) === 0x80) cut--
+    text = buf.subarray(0, cut).toString('utf-8')
     truncated = true
     truncatedBy = truncatedBy === 'lines' ? 'lines' : 'bytes'
   }
