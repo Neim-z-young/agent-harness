@@ -25,6 +25,7 @@ import {
   buildTaskkillArgs,
   isChildAlive,
   KILL_TREE_GRACE_MS,
+  sanitizeEnv,
 } from './index'
 import { createHarness, DefaultPermissionEngine, AgentDefinition } from '@harness/core'
 import { createProviderMockPlugin } from '@harness/provider-mock'
@@ -1542,5 +1543,53 @@ describe('killProcessTree（win32 分支）的参数构造', () => {
   it('宽限期是个"够走完一轮 taskkill 又快过人察觉"的值（0 < grace < 1s）', () => {
     expect(KILL_TREE_GRACE_MS).toBeGreaterThan(0)
     expect(KILL_TREE_GRACE_MS).toBeLessThan(1000)
+  })
+})
+
+// ===== 2026-10-13 评审修复：只读越权 / 静默失败（每条都对应一次实测复现） =====
+
+describe('bash_ro：sed / git 的写与执行通道必须被拒（评审实测复现）', () => {
+  const ro = createReadOnlyBashTool()
+  const allowed = async (command: string): Promise<boolean> => (await ro.call({ command }, {} as never)).ok === true
+
+  it('★ sed 的 w/W/e 脚本命令与 s///e 标志一律拒（`sed -n "w f" x` 真会写文件）', async () => {
+    // 实测：macOS BSD sed 下 `sed -n "w /tmp/x" in` ⇒ exit 0 且文件被创建
+    expect(await allowed('sed -n "w /tmp/pwned" /tmp/in')).toBe(false)
+    expect(await allowed('sed "e id" /etc/passwd')).toBe(false)
+    expect(await allowed('sed "s/a/b/e" /etc/hosts')).toBe(false)
+    // 正常的只读用法不受影响（避免"修成不可用"）
+    expect(await allowed('sed -n 1,5p /etc/hosts')).toBe(true)
+    expect(await allowed('sed "s/a/b/g" /etc/hosts')).toBe(true)
+    expect(await allowed('sed -n /w/p /etc/hosts')).toBe(true)
+  })
+
+  it('★ git 的 `-c` / `--ext-diff` 等"会调外部程序"的选项一律拒（实测可执行任意程序）', async () => {
+    // 实测：`git -c diff.external=/tmp/evil.sh log -p -1 --ext-diff` ⇒ 脚本被执行
+    expect(await allowed('git -c diff.external=/tmp/evil.sh log -p -1 --ext-diff')).toBe(false)
+    expect(await allowed('git --ext-diff log')).toBe(false)
+    expect(await allowed('git --config-env=foo.BAR=baz log')).toBe(false)
+    expect(await allowed('git --exec-path=/tmp/x log')).toBe(false)
+    // 正常只读 git 不受影响
+    expect(await allowed('git log -1')).toBe(true)
+    expect(await allowed('git -C /tmp log -1')).toBe(true)
+  })
+})
+
+describe('sanitizeEnv：keepEnv 大小写不敏感（Windows 键名大小写不固定）', () => {
+  it('keepEnv 写小写也能保住大写的真实键', () => {
+    // 回归：此前 `keepEnv.includes(key)` 大小写敏感 ⇒ 显式配的保留被静默丢弃
+    expect(sanitizeEnv({ GITHUB_TOKEN: 't', Path: '/bin' }, ['github_token'])).toEqual({ GITHUB_TOKEN: 't', Path: '/bin' })
+    expect(Object.keys(sanitizeEnv({ GITHUB_TOKEN: 't' }, ['github_token']))).toContain('GITHUB_TOKEN')
+  })
+})
+
+describe('bash：timeoutMs 超上界要被钳住并如实上报（不是"命令莫名超时"）', () => {
+  it('1e10 不再被 setTimeout 当成 1ms（实测：sleep 2 在 24ms 内被杀）', async () => {
+    const tool = createBashTool()
+    const r = await tool.call({ command: 'echo hi', timeoutMs: 1e10 }, { cwd: process.cwd() } as never)
+    expect(r.ok).toBe(true)
+    expect(r.output?.timedOut).toBe(false)
+    expect(r.output?.exitCode).toBe(0)
+    expect(r.output?.timeoutClamped).toEqual({ requested: 1e10, applied: 10 * 60 * 1000 })
   })
 })

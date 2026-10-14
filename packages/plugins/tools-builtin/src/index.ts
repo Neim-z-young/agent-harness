@@ -36,6 +36,7 @@ import {
   isSensitiveReadPath,
   findSensitiveReadPath,
   resolveSensitiveReadPolicy,
+  lookupEnvCI,
   type SensitiveReadPolicyInput,
 } from '@harness/fs-guard'
 // 隔离档位与网络出口策略（P1-4 / P1-2）：与宿主、tools-web 共用同一份口径
@@ -50,7 +51,7 @@ import {
   type OsBinding,
 } from '@harness/isolation'
 import { resolve, relative } from 'node:path'
-import { stat, readFile, writeFile, mkdir } from 'node:fs/promises'
+import { stat, readFile, writeFile, mkdir, open } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 // 4 个原语工具的完整文档（documentation，参考 Claude Code / opencode），prompts/*.txt 加载
@@ -473,10 +474,19 @@ export const writeFileTool = defineTool<WriteFileInput, WriteFileOutput>({
       // 不必为了检测风格把一个大文件整读一遍。
       let style: { eol: EolStyle; bom: BomKind } = { eol: 'none', bom: 'none' }
       if (existed) {
+        // ⚠️ 这里曾写 `await readFile(absPath, 'utf-8')` 再 slice —— 那是**整读**，与注释承诺的
+        // "只读头部 64KB" 不符（大文件上就是一次内存尖峰，与 P1-8 的不整读口径冲突）。
+        // 改成只读前 64KB：BOM 在开头，行尾风格在前 64KB 内基本可判。
         try {
-          const head = await readFile(absPath, 'utf-8')
-          const sample = head.length > 65536 ? head.slice(0, 65536) : head
-          style = { eol: detectEol(sample), bom: detectBom(head) }
+          const fh = await open(absPath, 'r')
+          try {
+            const buf = Buffer.alloc(65536)
+            const { bytesRead } = await fh.read(buf, 0, 65536, 0)
+            const sample = buf.subarray(0, bytesRead).toString('utf-8')
+            style = { eol: detectEol(sample), bom: detectBom(sample) }
+          } finally {
+            await fh.close()
+          }
         } catch {
           style = { eol: 'none', bom: 'none' } // 读不动就按原样写（不因此让写入失败）
         }
@@ -741,30 +751,7 @@ export function killProcessTree(child: ChildProcess, signal: NodeJS.Signals = 'S
 /** Shell 族系 */
 type ShellFamily = ShellDialect
 
-/**
- * **大小写不敏感**地取环境变量（P2-2）。
- *
- * 为什么需要：`process.env` 在 Windows 上是**大小写不敏感代理**（Node 特性）⇒ `env.PATH` 能取到 `Path`；
- * 但**注入普通对象**时（单测、其它宿主、A2A 远端）它就是普通对象 ⇒ `env.PATH` 取不到 `{ Path: … }`，
- * 于是"本机明明装了 Git Bash 却探测不到"，静默落到 `cmd.exe` 分支。
- *
- * 顺序：**先精确匹配**（绝大多数场景一次命中、零开销），再退到大小写不敏感扫描。
- * 空串也继续找（Windows 上可能同时存在空的 `PATH` 与有效的 `Path`）。
- *
- * ⚠️ 与 `@harness/env-context` 的 `detectShellForDisplay` 是**同一份口径的两个落点**
- * （一个管执行、一个管展示，判据要求两者一致）—— 改这里时那边也要改。
- */
-function lookupEnvCI(env: NodeJS.ProcessEnv, name: string): string | undefined {
-  const direct = env[name]
-  if (typeof direct === 'string' && direct !== '') return direct
-  const upper = name.toUpperCase()
-  for (const k of Object.keys(env)) {
-    if (k.toUpperCase() !== upper) continue
-    const v = env[k]
-    if (typeof v === 'string' && v !== '') return v
-  }
-  return direct
-}
+// `lookupEnvCI` 已收敛到 `@harness/fs-guard`（P2-2；执行侧与展示侧共用同一份，别处再抄会漂移）。
 
 /** 解析后的 shell 可执行文件与调用参数 */
 interface ResolvedShell {
@@ -999,10 +986,14 @@ function detectAstDangerous(facts: BashCommandFacts, patterns: RegExp[]): string
 /** 环境隔离：过滤掉敏感变量，保留必要与 keepEnv 指定的变量（导出为单测，见 P2-3） */
 export function sanitizeEnv(env: NodeJS.ProcessEnv, keepEnv: string[]): Record<string, string> {
   const result: Record<string, string> = {}
+  // ⚠️ `keepEnv` 的比较必须**大小写不敏感**：Windows 上键名大小写不固定，而注入的 env 可能是
+  // 普通对象 —— `keepEnv: ['github_token']` 却遇到 `GITHUB_TOKEN` 时会被静默摘掉（实测复现），
+  // 即"我明确配了保留却没保留"。口径与 `lookupEnvCI` 一致。
+  const keepLower = new Set(keepEnv.map((k) => k.toLowerCase()))
   for (const key of Object.keys(env)) {
     const value = env[key]
     if (value === undefined) continue
-    if (keepEnv.includes(key)) {
+    if (keepLower.has(key.toLowerCase())) {
       result[key] = value
       continue
     }
@@ -1097,6 +1088,11 @@ export interface BashOutput {
   /** 是否经由沙箱回退到宿主 bash 执行（fallbackToHost 触发） */
   viaHost?: boolean
   /**
+   * `timeoutMs` 被上界钳过时给出**原值与实际值**（见 `MAX_BASH_TIMEOUT_MS`）。
+   * 只在真的钳过时出现 —— 否则工具结果里会多一个恒定的噪声字段。
+   */
+  timeoutClamped?: { requested: number; applied: number }
+  /**
    * 本次执行的**边界自述**（P1-4 / P2-3）。
    *
    * 存在的理由与 `env-context` 注入 `Shell:` 同源：模型不知道自己的边界，就会反复撞
@@ -1121,6 +1117,13 @@ export interface BashOutput {
 
 /** 默认超时 30 秒 */
 const DEFAULT_BASH_TIMEOUT = 30_000
+
+/**
+ * `timeoutMs` 的**上界**（10 分钟）。
+ * 存在理由见调用点：`setTimeout` 对 >2³¹−1 的延时按 1ms 处理，模型给个大数会把命令"瞬间杀掉"。
+ * 取 10 分钟的依据：真机里最长的合法命令（构建 / 跑测试）都在几分钟内，再长的活该走后台任务。
+ */
+const MAX_BASH_TIMEOUT_MS = 10 * 60 * 1000
 /** 最大输出字符数（stdout + stderr 各自截断） */
 const MAX_OUTPUT_CHARS = 64 * 1024 // 64KB
 
@@ -1310,7 +1313,14 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         }
       }
 
-      const timeoutMs = input.timeoutMs ?? DEFAULT_BASH_TIMEOUT
+      // ⚠️ `setTimeout` 对超过 2³¹−1 的延时按 **1ms** 处理 ⇒ 模型给个大数（`1e10`）会让命令被
+      // "瞬间杀掉"并回 `exitCode 124`，现象是"命令莫名超时"而看不出是超时值非法（实测：`sleep 2`
+      // 在 24ms 内返回）。这里钳到上界，并把"被钳过"如实写进输出（否则又是一处静默失败）。
+      const requestedTimeout = input.timeoutMs ?? DEFAULT_BASH_TIMEOUT
+      const timeoutClamped = Number.isFinite(requestedTimeout) && requestedTimeout > MAX_BASH_TIMEOUT_MS
+      const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+        ? Math.min(requestedTimeout, MAX_BASH_TIMEOUT_MS)
+        : DEFAULT_BASH_TIMEOUT
       const cwd = requestedCwd ?? rootDir
 
       // ---- 沙箱防护 4：env 隔离（过滤敏感变量） ----
@@ -1382,6 +1392,10 @@ export function createBashTool(config: BashSandboxConfig = {}): Tool<BashInput, 
         command: input.command, cwd, env: sandboxEnv, timeoutMs, signal: ctx.signal, limits, isolation,
         osBinding,
       })
+      // 超时被钳 ⇒ 如实写进输出（下面两个 return 分支都 spread 了 output，一处即可覆盖）
+      if (timeoutClamped && sandboxResult.ok && sandboxResult.output) {
+        sandboxResult.output.timeoutClamped = { requested: requestedTimeout, applied: timeoutMs }
+      }
 
       // ---- 回退兜底：非破坏性命令在沙箱内未按预期执行（spawn 失败 / env 隔离开致命令非零退出）时提升到宿主 bash ----
       if (!sandboxResult.interrupted && sandboxResult.output?.exitCode !== 0 && config.fallbackToHost) {
@@ -1494,7 +1508,28 @@ export const READONLY_GIT_SUBCOMMANDS: readonly string[] = [
 
 /** 命令参数级禁区：首命令在白名单里，但这些开关/子命令会写 */
 const READONLY_FORBIDDEN_ARGS: ReadonlyArray<{ cmd: string; re: RegExp; why: string }> = [
-  { cmd: 'sed', re: /(^|\s)-i(\s|$)|--in-place/, why: 'sed -i 会就地写文件' },
+  {
+    // ⚠️ sed 是只读集里最大的口子（实测复现）：`sed -n 'w /tmp/x' f` 与 `sed 'e id' f`
+    // 会**写文件 / 执行命令**，而 `-i` 只是它众多写通道之一。这里把三类都挡上：
+    //   · `-i` / `--in-place`（就地写）
+    //   · 脚本**命令位**的 `w` / `W` / `e`（写文件、执行）——要求前面是行首/空白/分号/引号，
+    //     以免误伤 `s/foo/bar/` 这类替换内容
+    //   · `s///e` 的 `e` **标志**（用替换结果当命令执行）
+    // 刻意保守（宁可误拒）：sed 的变换能力太强，判错方向必须是"拒绝"。
+    cmd: 'sed',
+    re: /(^|\s)-i(\s|$)|--in-place|(^|[\s;'"])(?:\d+(?:,\d+)?)?[wWe](?:\s|$)|[0-9gipm]*e[0-9gipm]*(?=\s|$|["';)|&])/,
+    why: 'sed 会写文件或执行命令（-i 就地写；脚本命令 w/W 写文件、e 执行命令；s///e 标志执行替换结果）',
+  },
+  {
+    // ⚠️ git 的"会调外部程序"选项（实测复现）：`git -c diff.external=/tmp/evil.sh log -p --ext-diff`
+    // 会**执行任意程序**。根因是下面第 4 步的子命令扫描会把"带值的旗标"整段跳过（`-c` 的值
+    // 不受检查），于是子命令落到 `log` 就放行了 ⇒ 必须在**参数级**先拦掉这些选项。
+    // `-c` / `--config-env` 能设任意配置键（diff.external / core.sshCommand / core.pager…），
+    // `--ext-diff` / `--textconv` / `--exec-path` / `--upload-pack` 直接指定外部程序。
+    cmd: 'git',
+    re: /(^|\s)(?:-c|--config-env|--exec-path|--upload-pack|--ext-diff|--textconv)(?:\s|=)/,
+    why: 'git 这些选项会执行外部程序（-c/--config-env 可设 diff.external、core.sshCommand 等；--ext-diff/--textconv/--exec-path/--upload-pack 直接指定外部程序）',
+  },
   { cmd: 'find', re: /-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)\b/, why: 'find -delete/-exec 会写或执行命令' },
   { cmd: 'jq', re: /(^|\s)-i(\s|$)|--in-place/, why: 'jq -i 会就地写文件' },
   { cmd: 'sort', re: /(^|\s)-o(\s|$)|--output/, why: 'sort -o 会写文件' },
@@ -2046,6 +2081,8 @@ function runBash(opts: {  command: string
     let stderr = ''
     let timedOut = false
     let settled = false
+    /** abort 监听器的摘除函数（声明在监听器回调之前，供 error/close 两处 settle 路径调用） */
+    let removeAbortListener: (() => void) | undefined
 
     const timer = setTimeout(() => {
       if (!settled) {
@@ -2072,6 +2109,7 @@ function runBash(opts: {  command: string
       if (settled) return
       settled = true
       clearTimeout(timer)
+      removeAbortListener?.()
       resolvePromise({
         ok: false,
         error: { message: `无法执行命令: ${err.message}`, code: 'SPAWN_ERROR', cause: err },
@@ -2095,6 +2133,7 @@ function runBash(opts: {  command: string
       settled = true
       clearTimeout(timer)
       if (lingerTimer) clearTimeout(lingerTimer)
+      removeAbortListener?.()
       // ok 语义：工具执行成功（命令实际跑起来），命令自身结果由 exitCode 反映。
       // 仅在 spawn 失败或 AbortSignal 中断时才返回 ok:false。
       resolvePromise({
@@ -2127,31 +2166,26 @@ function runBash(opts: {  command: string
       })
     })
 
+    // abort 监听器**必须成对摘除**：`ctx.signal` 是**会话级**的（一个会话里所有 bash 调用共用），
+    // 只 add 不 remove 会逐次累积（实测 12 次调用 ⇒ 12 个监听器），既泄漏闭包（child/timer/…）
+    // 又迟早撞 Node 的 MaxListenersExceededWarning。
     if (opts.signal) {
-      if (opts.signal.aborted) {
-        if (!settled) {
-          settled = true
-          clearTimeout(timer)
-          killProcessTree(child)
-          resolvePromise({
-            ok: false,
-            error: { message: '操作被中断', code: 'ABORTED' },
-            interrupted: true,
-          })
-        }
-      } else {
-        opts.signal.addEventListener('abort', () => {
-          if (!settled) {
-            settled = true
-            clearTimeout(timer)
-            killProcessTree(child)
-            resolvePromise({
-              ok: false,
-              error: { message: '操作被中断', code: 'ABORTED' },
-              interrupted: true,
-            })
-          }
+      const onAbort = () => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        killProcessTree(child)
+        resolvePromise({
+          ok: false,
+          error: { message: '操作被中断', code: 'ABORTED' },
+          interrupted: true,
         })
+      }
+      if (opts.signal.aborted) onAbort()
+      else {
+        const signal = opts.signal
+        signal.addEventListener('abort', onAbort, { once: true })
+        removeAbortListener = () => signal.removeEventListener('abort', onAbort)
       }
     }
   })
