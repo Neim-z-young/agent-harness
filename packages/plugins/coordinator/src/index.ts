@@ -36,6 +36,7 @@
  */
 
 import { defineTool, fromJsonSchema, type Tool, type ToolResult, type ToolContext } from '@harness/tool'
+import { normalize } from 'node:path'
 import type { AgentPlugin } from '@harness/plugin'
 import type { AgentDefinition } from '@harness/agent'
 import type { AgentRuntime, SessionManager } from '@harness/core'
@@ -253,9 +254,21 @@ export class FileWriteArbiter {
   }
 }
 
-/** 规范化写路径：resolve + 去尾斜杠 + 小写（仅路径语义，不做存在性检查） */
+/**
+ * 规范化写路径：**词法归一** + 去尾分隔符。
+ *
+ * `normalize()` 会去掉 `./`、折叠重复分隔符、词法解掉 `..`（不做存在性检查，也不碰文件系统）。
+ * 这一步是**互斥正确性**的前提：`src/a.ts` 与 `./src/a.ts` 指向同一文件，若不归一就是两个不同的
+ * 锁键 ⇒ 两条任务同时写同一文件却互不等待（写覆盖）。
+ *
+ * 不做大小写折叠：Linux 大小写敏感，折叠会把两个不同文件误判成同一个（无谓争用）；
+ * 跨平台大小写语义归平台文件系统处理。
+ */
 export function normalizeWritePath(p: string): string {
-  return p.replace(/\/+$/, '')
+  const trimmed = p.replace(/[/\\]+$/, '')
+  if (trimmed === '') return ''
+  const norm = normalize(trimmed)
+  return norm === '' ? trimmed : norm
 }
 
 /** 写类工具（有明确 path 输入参数；bash 无法可靠解析写入路径，不纳入） */

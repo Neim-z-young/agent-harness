@@ -299,7 +299,22 @@ async function buildAuthHeaders(
   return headers
 }
 
-/** 从 SSE 文本流中解析出 data 行（按 `\n\n` 分事件，每个事件合并多行 data） */
+/**
+ * 找**最后一个** SSE 事件边界（空行）的位置；没有则 `undefined`。
+ *
+ * ⚠️ 行尾判据必须与 `parseSseChunk` **同一套**（`\r?\n\r?\n`）。此前切帧只认 `\n\n`，
+ * 而 CRLF 流的 `\r\n\r\n` 里**不存在相邻的 `\n\n`** ⇒ 边界永不命中 ⇒ 内容全堆在缓冲里、
+ * 直到流关闭才一次性 flush ⇒ 长连对端的流式中途消息表现为**挂死**（本仓 mcp-server 发 LF
+ * 所以自配对没事，第三方/严格 SSE 实现会命中）。
+ */
+function lastSseBoundary(s: string): { end: number } | undefined {
+  const re = /\r?\n\r?\n/g
+  let last: { end: number } | undefined
+  for (let m = re.exec(s); m !== null; m = re.exec(s)) last = { end: m.index + m[0].length }
+  return last
+}
+
+/** 从 SSE 文本流中解析出 data 行（按空行分事件，每个事件合并多行 data） */
 function parseSseChunk(chunk: string): string[] {
   const messages: string[] = []
   // SSE 事件以空行分隔；只取 data: 行内容（多行 data 用 \n 拼接）
@@ -372,11 +387,11 @@ export class HttpTransport implements McpTransport {
         const { done, value } = await reader.read()
         if (done) break
         buf += decoder.decode(value, { stream: true })
-        // 按事件边界切分，保留最后一段不完整的内容
-        const lastBoundary = buf.lastIndexOf('\n\n')
-        if (lastBoundary !== -1) {
-          const complete = buf.slice(0, lastBoundary + 2)
-          buf = buf.slice(lastBoundary + 2)
+        // 按事件边界切分，保留最后一段不完整的内容（判据见 lastSseBoundary）
+        const boundary = lastSseBoundary(buf)
+        if (boundary) {
+          const complete = buf.slice(0, boundary.end)
+          buf = buf.slice(boundary.end)
           for (const msg of parseSseChunk(complete)) {
             this.handler?.(msg)
           }
@@ -567,7 +582,10 @@ export function defaultTransportFactory(
 /** JSON-RPC 2.0 请求/响应管理 */
 export class McpClient {
   private nextId = 1
-  private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
+  private readonly pending = new Map<
+    number,
+    { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }
+  >()
   private connected = false
   /** Server capabilities（initialize 响应中缓存） */
   private capabilities: McpServerCapabilities = {}
@@ -671,7 +689,10 @@ export class McpClient {
     this.transport.close()
     this.connected = false
     // 拒绝所有 pending 请求
-    for (const [, p] of this.pending) p.reject(new Error('MCP client closed'))
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer)
+      p.reject(new Error('MCP client closed'))
+    }
     this.pending.clear()
   }
 
@@ -691,22 +712,26 @@ export class McpClient {
     const id = this.nextId++
     const timeoutMs = this.config?.requestTimeoutMs ?? 30_000
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject })
-      // send 可能是 async（HTTP/SSE transport），需要捕获其抛出的错误
-      Promise.resolve(this.transport.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })))
-        .catch((err) => {
-          if (this.pending.has(id)) {
-            this.pending.delete(id)
-            reject(new Error(`MCP send "${method}" failed: ${String((err as Error)?.message ?? err)}`))
-          }
-        })
-      // 超时
-      setTimeout(() => {
+      // ★ 定时器要随请求**一起结算**：请求一旦 resolve/reject（响应到达 / send 失败 / 关闭），
+      // 必须 `clearTimeout` —— 否则每个请求都留一个最多 30s 的悬空 timer（`pending` 已删、回调是
+      // 空操作），既有定时器泄漏又拖住事件循环。故把 timer 存进 pending，在**每个结算路径**清掉。
+      const timer = setTimeout(() => {
         if (this.pending.has(id)) {
           this.pending.delete(id)
           reject(new Error(`MCP request "${method}" timed out (${timeoutMs}ms)`))
         }
       }, timeoutMs)
+      this.pending.set(id, { resolve, reject, timer })
+      // send 可能是 async（HTTP/SSE transport），需要捕获其抛出的错误
+      Promise.resolve(this.transport.send(JSON.stringify({ jsonrpc: '2.0', id, method, params })))
+        .catch((err) => {
+          const p = this.pending.get(id)
+          if (p) {
+            this.pending.delete(id)
+            clearTimeout(p.timer)
+            reject(new Error(`MCP send "${method}" failed: ${String((err as Error)?.message ?? err)}`))
+          }
+        })
     })
   }
 
@@ -721,11 +746,21 @@ export class McpClient {
 
   private handleMessage(data: string): void {
     let msg: any
-    try { msg = JSON.parse(data) } catch { return }
+    try {
+      msg = JSON.parse(data)
+    } catch (err) {
+      // ⚠️ 不能静默 return：调用方只会看到一个 30s 后的 `MCP request "…" timed out`，
+      // 真因（对端发了坏帧）完全丢失。宁可打一条带截断原文的线索。
+      console.error(
+        `[mcp-client] 收到无法解析的帧（已忽略）：${(err as Error)?.message ?? err}；原文前 200 字=${data.slice(0, 200)}`,
+      )
+      return
+    }
     // 响应（有 id 且 pending 中存在）
     if (msg.id != null && this.pending.has(msg.id)) {
       const p = this.pending.get(msg.id)!
       this.pending.delete(msg.id)
+      clearTimeout(p.timer) // 结算即停表，别留悬空定时器（见 request() 的说明）
       if (msg.error) p.reject(new Error(msg.error?.message ?? 'MCP error'))
       else p.resolve(msg.result)
       return

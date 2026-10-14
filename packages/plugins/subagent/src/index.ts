@@ -45,7 +45,7 @@ import { writeFileSync, existsSync, readdirSync, readFileSync, mkdirSync, rmSync
 import { mkdir, writeFile, appendFile } from 'node:fs/promises'
 import { join, dirname, resolve as resolvePath } from 'node:path'
 import { tmpdir } from 'node:os'
-import { createWorktree, getWorktreeDiff, gitTopLevel, listWorktrees, removeWorktree } from './worktree'
+import { createWorktree, getWorktreeDiff, gitTopLevel, isUnderDir, listWorktrees, removeWorktree } from './worktree'
 // SubagentTool 提示词文本（prompts/*.txt，import 加载，参考 opencode）
 import subagentToolDescription from './prompts/subagent-tool-description.txt'
 import subagentToolDocumentation from './prompts/subagent-tool-documentation.txt'
@@ -1100,7 +1100,10 @@ export function createSubagentTool(
         }
         subSessionId = input.sessionId
         isContinuation = true
-        // 续接：若非隔离 worktree 目录则保持该 session 原执行目录（不强行迁移）
+        // 续接：已在隔离 worktree 下则**继续用它**（isUnderDir 判定，跨平台）；
+        // 否则保持该 session 原执行目录（不强行迁移）。返回值与 `existing.cwd` 同值 ——
+        // cwd 已持久化在 session 记录里、query 无 cwd 入参，故无需再写回；这次调用
+        // 的价值是把"是否复用隔离目录"收敛到同一个判定函数（isUnderDir），别处再判就分叉了。
         await worktree?.resolve(existing.cwd)
       } else {
         // 创建新子 session（隔离上下文，关联父 session 便于审计追溯）
@@ -1801,10 +1804,13 @@ export function createSubagentPlugin(options: SubagentPluginOptions = {}): Agent
    */
   const resolveWorktree = async (existingCwd?: string): Promise<string | undefined> => {
     if (!worktreeEnabled || !baseCwd) return undefined
-    const prefix = join(baseCwd, '.harness', 'worktrees') + '/'
+    const worktreeRoot = join(baseCwd, '.harness', 'worktrees')
     if (existingCwd) {
-      if (existingCwd.startsWith(prefix)) return existingCwd
-      return undefined
+      // 归属判定走 `isUnderDir`（path.relative，跨平台）—— 旧实现拿
+      // `join(...) + '/'` 做字符串前缀比对，win32 上 join 产出 `\` 而后拼的是
+      // `'/'` ⇒ **永远不命中**，续接从不复用 worktree（恰好被"返回值被丢弃"
+      // 掩盖成 no-op）。见 `isUnderDir` 的说明。
+      return isUnderDir(worktreeRoot, existingCwd) ? existingCwd : undefined
     }
     try {
       const token = `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`

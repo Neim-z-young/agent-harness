@@ -12,7 +12,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync, mkdirSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { join, sep } from 'node:path'
 import {
   runGit,
   gitTopLevel,
@@ -24,6 +24,7 @@ import {
   removeWorktree,
   listWorktrees,
   canonicalGitPath,
+  isUnderDir,
   GitCommandError,
 } from './worktree'
 
@@ -161,5 +162,33 @@ describe('runGit', () => {
   it('失败归一化为 GitCommandError', async () => {
     await expect(runGit(repo, ['status', '--bogus-flag-does-not-exist']))
       .rejects.toBeInstanceOf(GitCommandError)
+  })
+})
+describe('isUnderDir：worktree 归属判定（跨平台，不能靠字符串前缀）', () => {
+  const base = join('/tmp', 'wt-base')
+
+  it('★ 不能用 `join(base,…) + "/"` 做前缀：win32 上 join 产出 `\\` 而后拼的是 `/`，永远不命中', () => {
+    // 旧实现形态复现：前缀尾部是 `/`，candidate 的分隔符是 `\\`（win32 join 产物）
+    // ⇒ startsWith 恒 false ⇒ 续接从不复用 worktree。isUnderDir 用 relative 判定，不受分隔符影响。
+    const candidate = `${base}${sep}harness-wt`
+    expect(isUnderDir(base, candidate)).toBe(true)
+  })
+
+  it('界内（含相等）⇒ true；界外 ⇒ false', () => {
+    expect(isUnderDir(base, base)).toBe(true)
+    expect(isUnderDir(base, join(base, 's_1'))).toBe(true)
+    expect(isUnderDir(base, join(base, 's_1', 'x.md'))).toBe(true)
+    expect(isUnderDir(base, join(base, '..', 'elsewhere'))).toBe(false)
+    expect(isUnderDir(base, '/totally/other')).toBe(false)
+  })
+
+  it('★ `..` 开头的**合法文件名**不算越界（整段为 `..` 才算）', () => {
+    expect(isUnderDir(base, join(base, '..hidden'))).toBe(true)
+    expect(isUnderDir(base, join(base, '..foo', 'bar.md'))).toBe(true)
+  })
+
+  it('candidate 缺省/空串 ⇒ false（不误判成界内）', () => {
+    expect(isUnderDir(base, undefined)).toBe(false)
+    expect(isUnderDir(base, '')).toBe(false)
   })
 })

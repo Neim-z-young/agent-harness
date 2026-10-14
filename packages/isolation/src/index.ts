@@ -265,29 +265,122 @@ export function isMetadataHost(host: string): boolean {
 }
 
 /**
- * 是否私有 / 本机地址（SSRF 判定）。
+ * 是否私有 / 本机地址（SSRF 判定 + 元数据硬拒的判据）。
  *
- * 从 `tools-web` 的 `isPrivateIp` **收敛**过来（行为逐字保留）：RFC1918、环回、
- * link-local（含 `169.254.*`）、IPv6 ULA（`fc`/`fd`）、`0.0.0.0`/`::`，以及
- * `localhost` / `*.local` / `*.localhost`。
+ * 从 `tools-web` 的 `isPrivateIp` **收敛**过来，但**不再逐字保留**：原实现只枚举了少数
+ * 字面量前缀，于是同一台机器/同一个元数据端点可以换一种**写法**绕过（2026-10-13 实测复现）：
+ *
+ * | 写法 | 原实现 | 说明 |
+ * |---|---|---|
+ * | `::ffff:127.0.0.1` | `false` ❌ | IPv4-mapped 环回 |
+ * | `::ffff:169.254.169.254` | `false` ❌ | IPv4-mapped 云元数据端点 |
+ * | `0:0:0:0:0:0:0:1` | `false` ❌ | 展开式环回 |
+ * | `fe80::1` | `false` ❌ | IPv6 link-local |
+ * | `2130706433` / `0x7f000001` | `false` ❌ | IPv4 的十进制 / 十六进制整数写法 |
+ *
+ * 现在改为**先解析成数值再比网段**（点分十进制 / 十进制 / 十六进制 → 4 个八位组；
+ * IPv6 展开 → 8 个 16 位组，含内嵌 IPv4 尾段），并且 **fail-closed**：
+ * 看着像 IP 却解析不出来 ⇒ 判为私有（宁可误拒一个公网 IP，也不让一种绕过写法悄悄通过）。
  */
 export function isPrivateHost(host: string): boolean {
-  const h = normalizeHost(host)
+  let h = normalizeHost(host)
   if (!h) return false
+  // `host:port`（单个冒号 + 纯数字端口）⇒ 去掉端口再判（IPv6 是多个冒号，不受影响）
+  const portMatch = /^([^:]+):(\d+)$/.exec(h)
+  if (portMatch) h = portMatch[1]!
   if (isIpLike(h)) {
-    if (h === '127.0.0.1' || h === '::1') return true
-    if (h.startsWith('10.')) return true
-    if (h.startsWith('192.168.')) return true
-    if (/^172\.(1[6-9]|2\d|3[01])\./.test(h)) return true
-    if (h.startsWith('169.254.')) return true
-    if (h.startsWith('127.')) return true
-    if (h.startsWith('fd') || h.startsWith('fc')) return true
-    if (h === '0.0.0.0' || h === '::') return true
-    return false
+    const v4 = parseIpv4(h)
+    if (v4) return isPrivateIpv4(v4)
+    const v6 = parseIpv6(h)
+    if (v6) return isPrivateIpv6(v6)
+    return true // ★ fail-closed：像 IP 但解析不出（畸形 / 未覆盖的写法）
   }
   if (h === 'localhost') return true
   if (h.endsWith('.local')) return true
   if (h.endsWith('.localhost')) return true
+  return false
+}
+
+/** 点分十进制 / 十进制整数 / 十六进制整数 → 4 个八位组；解析不出返回 `undefined` */
+function parseIpv4(h: string): number[] | undefined {
+  if (/^0x[0-9a-f]+$/.test(h)) {
+    const n = Number.parseInt(h, 16)
+    return n >= 0 && n <= 0xffffffff ? [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255] : undefined
+  }
+  if (/^[0-9]+$/.test(h)) {
+    const n = Number.parseInt(h, 10)
+    return n >= 0 && n <= 0xffffffff ? [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255] : undefined
+  }
+  const parts = h.split('.')
+  if (parts.length !== 4) return undefined
+  const oct: number[] = []
+  for (const p of parts) {
+    if (!/^[0-9]+$/.test(p)) return undefined
+    const v = Number.parseInt(p, 10)
+    if (v > 255) return undefined
+    oct.push(v)
+  }
+  return oct
+}
+
+/**
+ * IPv6 文本 → 8 个 16 位组；解析不出返回 `undefined`。
+ * 只做**判定够用**的解析：`::` 压缩 + 内嵌 IPv4 尾段（`::ffff:127.0.0.1`）。
+ */
+function parseIpv6(h: string): number[] | undefined {
+  if (!h.includes(':')) return undefined
+  let s = h
+  const embedded = /^(.*):(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s)
+  if (embedded) {
+    const oct = parseIpv4(embedded[2]!)
+    if (!oct) return undefined
+    s = `${embedded[1]}:${(((oct[0]! << 8) | oct[1]!) >>> 0).toString(16)}:${(((oct[2]! << 8) | oct[3]!) >>> 0).toString(16)}`
+  }
+  const groups = (part: string): number[] | undefined => {
+    const out: number[] = []
+    for (const g of part.split(':').filter((x) => x !== '')) {
+      if (!/^[0-9a-f]{1,4}$/.test(g)) return undefined
+      out.push(Number.parseInt(g, 16))
+    }
+    return out
+  }
+  const dbl = s.indexOf('::')
+  if (dbl === -1) {
+    const all = groups(s)
+    return all && all.length === 8 ? all : undefined
+  }
+  const head = groups(s.slice(0, dbl))
+  const tail = groups(s.slice(dbl + 2))
+  if (!head || !tail) return undefined
+  const fill = 8 - head.length - tail.length
+  if (fill < 1) return undefined
+  return [...head, ...new Array<number>(fill).fill(0), ...tail]
+}
+
+/** 4 个八位组是否落在私有/本机/保留网段 */
+function isPrivateIpv4(o: number[]): boolean {
+  const a = o[0]!
+  const b = o[1]!
+  if (a === 0) return true // 0.0.0.0/8
+  if (a === 10) return true // 10/8
+  if (a === 127) return true // 环回
+  if (a === 169 && b === 254) return true // link-local（含云元数据 169.254.169.254）
+  if (a === 172 && b >= 16 && b <= 31) return true // 172.16/12
+  if (a === 192 && b === 168) return true // 192.168/16
+  if (a >= 224) return true // 组播 / 保留
+  return false
+}
+
+/** 8 个 16 位组是否落在私有/本机/保留网段（含 IPv4-mapped / IPv4-compatible） */
+function isPrivateIpv6(g: number[]): boolean {
+  if (g.slice(0, 7).every((x) => x === 0)) return true // `::`（未指定）与 `::1`（环回）
+  const first = g[0]!
+  if ((first & 0xfe00) === 0xfc00) return true // fc00::/7 ULA
+  if ((first & 0xffc0) === 0xfe80) return true // fe80::/10 link-local
+  if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0)) {
+    // IPv4-mapped（::ffff:0:0/96）/ IPv4-compatible ⇒ 取尾 32 位按 IPv4 判
+    return isPrivateIpv4([g[6]! >> 8, g[6]! & 255, g[7]! >> 8, g[7]! & 255])
+  }
   return false
 }
 
@@ -320,10 +413,12 @@ function normalizeHost(host: string): string {
   return host.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '')
 }
 
-/** 是否是"像 IP"的形态（含点分十进制 / 冒号分隔的 IPv6），用于分流判定 */
+/** 是否是"像 IP"的形态（含点分十进制 / 冒号分隔的 IPv6 / 十进制与十六进制整数写法），用于分流判定 */
 function isIpLike(h: string): boolean {
   if (h.includes(':')) return true
-  return /^[0-9.]+$/.test(h)
+  if (/^[0-9.]+$/.test(h)) return true
+  if (/^0x[0-9a-f]+$/.test(h)) return true
+  return false
 }
 
 /**
@@ -581,7 +676,7 @@ export interface OsBindingRequest {
  * `Operation not permitted` 失败 —— 一个"看起来只收紧了写"的规则，能让**常用命令全线报错**。
  * 所以这一组例外不是可选优化，是**能用**的前提。
  */
-export const DEV_WRITE_LITERALS = ['/dev/null', '/dev/dull', '/dev/zero', '/dev/tty']
+export const DEV_WRITE_LITERALS = ['/dev/null', '/dev/zero', '/dev/tty']
 
 /** SBPL 字符串字面量转义（只有 `"` 与 `\` 需要；路径里出现它们会截断 profile） */
 function escapeSbpl(s: string): string {

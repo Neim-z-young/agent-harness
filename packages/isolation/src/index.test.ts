@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test'
+import { existsSync } from 'node:fs'
 import {
   ISOLATION_LEVELS,
   METADATA_HOSTS,
@@ -110,6 +111,32 @@ describe('isPrivateHost / isMetadataHost / isBlockedNetTarget（与 tools-web �
       expect(isPrivateHost(h)).toBe(false)
     }
     expect(isPrivateHost('')).toBe(false)
+  })
+
+  it('★同一台机器的**换写法**也要认（IPv4-mapped / 展开式 / link-local / 整数写法）', () => {
+    // 回归（2026-10-13 实测复现）：原实现只枚举字面量前缀 ⇒ 下面这些**同一台机器**的写法全返回 false
+    // ⇒ SSRF 防护（tools-web）与"元数据端点硬拒"（isBlockedNetTarget）都能被绕过。
+    for (const h of [
+      '::ffff:127.0.0.1', // IPv4-mapped 环回（node http 会真的连到 127.0.0.1）
+      '::ffff:169.254.169.254', // IPv4-mapped 云元数据端点
+      '0:0:0:0:0:0:0:1', // 展开式环回
+      'fe80::1', // IPv6 link-local
+      '2130706433', // 127.0.0.1 的十进制整数写法
+      '0x7f000001', // 127.0.0.1 的十六进制写法
+      '127.0.0.1:8080', // 带端口的本机
+    ]) {
+      expect([h, isPrivateHost(h)]).toEqual([h, true])
+      expect([h, isBlockedNetTarget(h)]).toEqual([h, true])
+    }
+  })
+
+  it('★"像 IP 却解析不出"一律按私有处理（fail-closed，宁可误拒）', () => {
+    // 判据是"绕过写法不可存在"：形状是 IP、我们解析不出来 ⇒ 不能当公网放行
+    expect(isPrivateHost('999.999.999.999')).toBe(true)
+    expect(isPrivateHost('::ffff:zzzz')).toBe(true)
+    // 但正常的公网 IP / 域名不受影响
+    expect(isPrivateHost('203.0.113.7')).toBe(false)
+    expect(isPrivateHost('example.com:443')).toBe(false)
   })
 
   it('★云元数据端点单独认（不是"互联网上的某台主机"）', () => {
@@ -324,6 +351,16 @@ describe('renderSandboxProfile（P1-3）', () => {
     const p = renderSandboxProfile(['/work'])
     expect(p).toContain('(allow file-write* (literal "/dev/null"))')
     for (const d of DEV_WRITE_LITERALS) expect(p).toContain(`(literal "${d}")`)
+  })
+
+  it('DEV_WRITE_LITERALS 只含真实存在的设备节点（防 `/dev/dull` 这类拼写错混进放行表）', () => {
+    // 曾在表里出现 `/dev/dull`（不存在的路径）—— 一条"看起来像放行、其实是空操作"的条目。
+    // 设备节点在 win32 上不存在，故仅 unix 断言（isolation 本体也只面向 macOS/Linux）。
+    if (process.platform === 'win32') return
+    for (const d of DEV_WRITE_LITERALS) {
+      expect(d.startsWith('/dev/')).toBe(true)
+      expect(existsSync(d)).toBe(true)
+    }
   })
 
   it('路径里的引号/反斜杠会转义（否则 profile 被截断 ⇒ 静默失效）', () => {

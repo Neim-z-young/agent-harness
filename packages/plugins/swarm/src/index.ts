@@ -1889,7 +1889,10 @@ export function createShutdownDecisionTool(
       required: ['team'],
       additionalProperties: false,
     }),
-    permission: { key: id, extractPatterns: (input) => [input.team] },
+    // 权限键取**语义族名** `team_shutdown`，而不是工具 id（`approve_shutdown`/`reject_shutdown`）——
+    // 本仓权限键的合法族是 `task_*` / `team_*` / `send_*` 等；写成裸工具 id 会落在族外，
+    // 用户按族配规则（如 `team_*`）时覆盖不到它。批准/拒绝是同一语义操作，共用一个键。
+    permission: { key: 'team_shutdown', extractPatterns: (input) => [input.team] },
     async call(input, ctx) {
       try {
         await getMailbox().writeToMailbox(input.team, TEAM_LEAD_NAME, createShutdownDecision({

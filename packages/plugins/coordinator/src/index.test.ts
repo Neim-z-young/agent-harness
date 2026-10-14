@@ -6,6 +6,7 @@ import {
   createCoordinatorPlugin,
   createSendMessageTool,
   FileWriteArbiter,
+  normalizeWritePath,
   type SendMessageInput,
 } from './index'
 import { createBus } from '@harness/bus'
@@ -247,6 +248,25 @@ describe('FileWriteArbiter', () => {
     const p2 = arb.acquireWrite('src/a.ts/', { sessionId: 's2', toolUseId: 't2' }).then(() => { acquired = true })
     await new Promise((r) => setTimeout(r, 10))
     expect(acquired).toBe(false)
+    arb.releaseWrite('src/a.ts', 't1')
+    await p2
+    expect(acquired).toBe(true)
+  })
+
+  it('normalizeWritePath：./ 前缀、重复分隔符、词法 .. 都归一到同一键', () => {
+    expect(normalizeWritePath('./src/a.ts')).toBe(normalizeWritePath('src/a.ts'))
+    expect(normalizeWritePath('src//a.ts')).toBe('src/a.ts')
+    expect(normalizeWritePath('src/sub/../a.ts')).toBe('src/a.ts')
+    expect(normalizeWritePath('src/a.ts///')).toBe('src/a.ts')
+  })
+
+  it('★ ./ 前缀归一到同一锁：`./src/a.ts` 必须与 `src/a.ts` 互斥（旧实现不 resolve ⇒ 漏互斥）', async () => {
+    const arb = new FileWriteArbiter()
+    await arb.acquireWrite('src/a.ts', { sessionId: 's1', toolUseId: 't1' })
+    let acquired = false
+    const p2 = arb.acquireWrite('./src/a.ts', { sessionId: 's2', toolUseId: 't2' }).then(() => { acquired = true })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(acquired).toBe(false) // 旧实现两个键不同 ⇒ 会立刻 acquired=true（同一文件无保护）
     arb.releaseWrite('src/a.ts', 't1')
     await p2
     expect(acquired).toBe(true)

@@ -11,7 +11,7 @@
 
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
-import { join, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { existsSync, readFileSync, realpathSync, writeFileSync, rmSync, mkdirSync } from 'node:fs'
 
 const execFileP = promisify(execFile)
@@ -76,6 +76,23 @@ export function canonicalGitPath(p: string): string {
   } catch {
     return abs // 目录可能已不存在（prunable / 刚删的 worktree），退回字符串归一
   }
+}
+
+/**
+ * `candidate` 是否位于 `base` 之内（含相等）。**跨平台安全**：用 `path.relative` 判定，
+ * 不做字符串 `startsWith` —— 旧实现拿 `join(base, …) + '/'` 当前缀比对，win32 上
+ * `join` 产出反斜杠而后拼的却是 `'/'`，**永远匹配不上**（续接 thus 从不复用 worktree）。
+ *
+ * ⚠️ 越界判定认「整段为 `..`」：`..hidden`（合法文件名）虽以 `..` 开头但**不是**逃出。
+ * 与 `@harness/fs-guard` 的 `isWithinRoot` 同一口径；这里不引依赖，因为 worktree.ts
+ * 是零依赖工具模块（判据保持同一份，注释互相指认）。
+ */
+export function isUnderDir(base: string, candidate: string | undefined): boolean {
+  if (!candidate || candidate === '') return false
+  const rel = relative(base, candidate)
+  if (rel === '') return true
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return false
+  return true
 }
 
 /**
