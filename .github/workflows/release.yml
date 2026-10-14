@@ -1,0 +1,69 @@
+# Release 二进制流水线（.github/workflows/release.yml）
+#
+# 触发：release 被 publish（或手动 workflow_dispatch 指定 tag）⇒ 在三个平台上分别
+# `build:sidecar`，把单文件可执行附到该 release 上。
+#
+# 为什么单独一个 workflow 而不是塞进 ci.yml：
+#  - ci.yml 的三个 job 名是 main 分支保护的 required_status_checks（ubuntu/macos/windows），
+#    名字与语义都不能动；release 构建只在 release 事件上跑，混进去会让判读变糊。
+#  - `--compile` 产的是**本机平台**二进制 ⇒ 必须按平台各跑一次，这正是矩阵的用途。
+#
+# ⚠️ 二进制不进 git（`dist/` 已 ignore）；大体积产物只作为 release 附件存在。
+
+name: release
+
+on:
+  release:
+    types: [published]
+  # 手动补传 / 重传：指定一个已存在的 tag（如 v0.1.0）
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并上传二进制的 tag（例：v0.1.0）"
+        required: true
+
+permissions:
+  contents: write # 上传 release 附件必需
+
+jobs:
+  binaries:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 发布事件取 release 对应的 tag；手动触发取输入的 tag
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.x"
+
+      - name: 安装依赖
+        run: bun install --frozen-lockfile
+
+      - name: 构建 CLI 单文件可执行（sidecar）
+        run: cd packages/cli && bun run build:sidecar
+
+      - name: 重命名带 tag/平台/架构后缀
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag || github.ref_name }}"
+          OS="$(echo '${{ runner.os }}' | tr 'A-Z' 'a-z')"
+          ARCH="$(uname -m)"
+          SRC="packages/cli/dist/harness-a2a"
+          [ -f "$SRC" ] || SRC="packages/cli/dist/harness-a2a.exe"
+          OUT="harness-a2a-${TAG}-${OS}-${ARCH}"
+          case "$SRC" in *.exe) OUT="${OUT}.exe" ;; esac
+          mv "$SRC" "$OUT"
+          echo "产物：$OUT（$(du -h "$OUT" | cut -f1)）"
+
+      - name: 上传到 release（--clobber 允许重跑覆盖）
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag || github.ref_name }}" harness-a2a-* --clobber
