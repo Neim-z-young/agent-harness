@@ -21,7 +21,7 @@ import { rm, rename, writeFile } from 'node:fs/promises'
  * POSIX 的 `rename` 是原子的、几乎不给这些码 ⇒ 重试对既有行为无影响。
  */
 const RENAME_RETRY_CODES: ReadonlySet<string> = new Set(['EPERM', 'EBUSY', 'EACCES'])
-/** 重试上限（配合下面的退避，总等待 < 100ms） */
+/** 重试上限（配合下面的退避，最坏总等待 1+2+4+8+16+32+50+50 = 163ms） */
 const RENAME_RETRY_MAX = 8
 
 /** 该错误值不值得重试（只认 `code`，别的错误立刻抛出，不掩盖真问题） */

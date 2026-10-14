@@ -279,6 +279,16 @@ describe('展示工具', () => {
     expect(displayPlanPath(root, outside)).toBe(outside)
   })
 
+  it('displayPlanPath：根内以 `..` 开头的**文件名**不算越界', () => {
+    // 回归：越界判据一度写成 `rel.startsWith('..')`，把根内合法的 `..hidden.md` / `..foo/bar.md`
+    // 也误判成越界、原样返回绝对路径（`relative` 对它们给的就是 `..` 前缀）。
+    const root = resolve('/tmp/x')
+    expect(displayPlanPath(root, join(root, '..hidden.md'))).toBe('..hidden.md')
+    expect(displayPlanPath(root, join(root, '..foo', 'bar.md'))).toBe(join('..foo', 'bar.md'))
+    // 真正的越界仍要原样返回
+    expect(displayPlanPath(root, resolve('/tmp/y/a.md'))).toBe(resolve('/tmp/y/a.md'))
+  })
+
   it('renderPlanSummary 列出阶段与完成度', () => {
     const p = parsePlan('## Phase 1: 调研\n- [x] a\n- [ ] b\n')
     const s = renderPlanSummary(p)

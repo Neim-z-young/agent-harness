@@ -25,7 +25,7 @@
 
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 // 模板外置为 `.txt`（**不是 `.md`**：Bun 会把 .md 转成 HTML，见 env.d.ts 的说明）
 import findingsTemplate from './templates/findings.txt'
 import progressTemplate from './templates/progress.txt'
@@ -108,7 +108,10 @@ export function displayPlanPath(cwd: string, abs: string): string {
   // 改用 `relative` 做**分隔符无关**的包含判定（跨盘 / 越界时 relative 会给绝对路径或 `..` 前缀）。
   const rel = relative(root, resolve(abs))
   if (rel === '') return '.'
-  if (rel.startsWith('..') || isAbsolute(rel)) return abs
+  // ⚠️ 越界判据必须**精确到 `..` 段**，不能写 `rel.startsWith('..')`：根内名为 `..hidden.md` /
+  // `..foo/bar.md` 的合法路径，`relative` 给的就是 `..hidden.md` —— 前缀判断会把它误判成越界、
+  // 原样返回绝对路径（实测：`join(root,'..hidden.md')` ⇒ rel=`..hidden.md` ⇒ 旧判据判越界）。
+  if (rel === '..' || rel.startsWith(`..${sep}`) || isAbsolute(rel)) return abs
   return rel
 }
 
