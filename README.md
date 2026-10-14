@@ -163,13 +163,24 @@ cd adapters/vscode && bun run package
 
 `tsc` 编译 + `vsce package --no-dependencies`（sidecar 由扩展在运行时自行拉起，不打进 VSIX）。
 
-### 附到 Release
+### 附到 Release（CI 自动完成）
 
-二进制体积大，**不要**提交进 git；发布时作为 release 附件：
+二进制体积大，**不要**提交进 git。发布 release 时由 `.github/workflows/release.yml`
+**自动**在 macos / ubuntu / windows 上分别构建并上传：
 
 ```bash
-gh release upload v0.1.0 packages/cli/dist/harness-a2a
+# 你只需要发 release（tag + notes），二进制不用管
+gh release create v0.1.1 --title "..." --notes-file notes.md
 ```
+
+产物名：`harness-a2a-<tag>-<os>-<arch>`（Windows 自动带 `.exe`）。补传 / 重传某个 tag：
+
+```bash
+gh workflow run release.yml -f tag=v0.1.0
+```
+
+⚠️ `gh run rerun` 会沿用**触发时那个 commit 的 workflow 版本** —— 改了 workflow 之后
+必须重新触发，重跑不会带上修复。
 
 ## Configuration（config.json）
 

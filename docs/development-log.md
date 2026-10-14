@@ -1,5 +1,25 @@
 # Agent Harness 开发日志
 
+## 2026-10-14（续 289）CI release 流水线：三平台二进制自动附到 release
+
+新增 `.github/workflows/release.yml`：`release: published`（或 `workflow_dispatch` 指定 tag）时，
+在 macos/ubuntu/windows 上分别 `build:sidecar`，产物改名 `harness-a2a-<tag>-<os>-<arch>`
+（Windows 自动 `.exe`）后 `gh release upload --clobber` 附到该 release。单独一个 workflow 的
+理由：ci.yml 的三个 job 名是 main 保护的 required_status_checks，不能动；release 构建只在
+release 事件上跑，混进去会让判读变糊。
+
+**首跑抓到两个坑（都已修，均有实证）**：
+1. **shell 脚本里不能有全角字符**：`echo "产物：$OUT（…"` 的全角括号被 macOS 的 bash 3.2
+   当作变量名一部分 ⇒ `OUT（: unbound variable`（ubuntu/windows 的 bash 5 反而正常 ⇒ 只在
+   macos 炸）。修：run 体只用 ASCII，中文留在 step name / 注释。
+2. **`gh run rerun` 沿用触发时 commit 的 workflow 版本**：修复后重跑仍报同一个错
+   （日志里 echo 行还是全角版），必须**重新触发**才生效。
+
+**实证通过**（run 38558140168 三平台 success）：v0.1.0 现有三个附件
+（macos-arm64 76MB / linux-x86_64 151MB / windows-x86_64.exe 109MB）；
+macos 附件与本机构建**逐字节相同**（`cmp` 通过），符号 `composeRules` / `setAgentRules` /
+`team_shutdown` / `timeoutClamped` 均在二进制里数到；三种文件头（ELF / Mach-O / PE）正确。
+
 ## 2026-10-14（续 288）打包链修复 + README 补「构建与打包」
 
 **修掉根 `bun run build` 唯一失败点**（`5947d68`）：实测 47/48 包 exit 0，仅 `@harness/cli` 失败 ——
