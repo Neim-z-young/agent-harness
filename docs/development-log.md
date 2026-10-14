@@ -1,5 +1,47 @@
 # Agent Harness 开发日志
 
+## 2026-10-14（续 287）D1 权限分层合成（最严者胜）+ 评审遗留 10 处收尾
+
+**D1（权限语义修复，用户选定"取最严"方案）**
+`core` 的 `_prepareQueryOnce` 曾用 `{ ...getRules(), ...agent.permission }` 把 agent 权限**整键覆盖**到
+用户规则上（每次查询跑一次、不过 `setPermissionRules()` ⇒ 无审计，且 `/permission` 会把污染结果持久化）。
+端到端实测：用户 `{"*":{"deny":["/etc/**"]}}` 一次查询后变 `{"*":"ask"}`，`read /etc/passwd` 由 deny→ask。
+- **反转顺序也不可行**（实测）：把用户规则压上层能救回 P，却把只读子 agent 的 `{"*":"deny"}` 放大到 ask
+  —— 正确模型是**两层独立 + 逐键取最严**，不是"谁压谁"。
+- **落地**：`DefaultPermissionEngine` 拆 `baseRules`（用户基线，`getRules`/持久化只回它）与
+  `agentRules`（约束层，`setAgentRules` 每轮整体替换 ⇒ 换 agent 无残影）；`composeRules()`
+  纯函数合成：deny/ask 并集、allow 交集（`**` 通配短路）、**两边都是简写时直接取最严并保持 string 形态**
+  （★关键：把 `'deny'` 归一成 `{deny:['**']}` 会把"默认兜底"升级成"跨层否决"，连 agent 自己的
+  `read:'allow'` 例外一起否掉 —— 首版实现就在这栽了，测试抓出来后修正）。
+  `PermissionEngine` 接口加可选 `setAgentRules?`；core 改调它；写路径/审计不变。
+- 已知取舍：allow 交集按字面量比对（非同形 glob 判空集 ⇒ 偏严，fail-closed）。
+
+**评审遗留收尾（10 处，全部带反向验证）**
+| 项 | 位置 | 修法 |
+|---|---|---|
+| 客户端断连不中止任务 | a2a-server `sseBody` | `cancel()` 里停生成器 + `onCancel`；**同时**挂 `req.signal` abort（实测 Bun 下流 `cancel` 在本仓路径不稳定触发，两道都接）。⚠️ 测试侧：断连传播在 bun test 里不可稳定复现 ⇒ 对机制做确定性单测（导出 `sseBody`） |
+| 挂起超时被报成 COMPLETED | a2a-server `executor` | `onExpire` **无条件**由 executor 接管（`SuspendTable.setOnExpire`）—— 外部注入的表原本不接管，`running.expired` 永不置位 |
+| 非授权类 INPUT_REQUIRED 落 noop | vscode `render.ts` | 改显式 error（带中断态类型）；noop 会让任务静默挂在服务端 |
+| content-type 大小写敏感 | vscode `transport/a2a.ts` | 小写归一后再比对 |
+| 命令轮 4 处早退裸 `metadata: state` | vscode `participant.ts` | 全部过 `turnMetadata`（防未来 state 形态变化泄漏 taskId） |
+| `lookupEnvCI` 两份 + SHELL 漂移 | fs-guard / env-context / tools-builtin | 收敛到 `fs-guard` 唯一一份；`detectShellForDisplay` **删掉 SHELL 优先**，与执行侧 `resolveShell` 同判据（注入的 `Shell:` 说 zsh、实际跑 bash 的漂移消除） |
+| `toPosix` 测试内第二份 | host `unref-guard.test.ts` | 改 import `./files` |
+| 写锁键不归一 | coordinator | `normalizeWritePath` 用 `path.normalize`（`./src/a.ts` 与 `src/a.ts` 同键；不做大小写折叠）；注释与实现不一致一并修正 |
+| worktree 归属判据 win32 恒 false | subagent | 抽 `isUnderDir`（path.relative，认"整段 `..`"），修掉 `join()+"/"` 前缀比对 |
+| `/dev/dull` 拼写错 | isolation | 移除不存在的条目 + existsSync 守卫（win32 skip） |
+| swarm 权限键用裸工具 id | swarm | `approve/reject_shutdown` → 语义族键 `team_shutdown` |
+| mcp-client 请求定时器不 clear | mcp-client | timer 存进 pending，响应/send 失败/close 三条结算路径都清 |
+| CI `continue-on-error: windows` | ci.yml | 移除（实测 run 38395195265 Windows 各包 0 fail、仅 5 skip，门只剩吞回归一个作用） |
+
+**验证**：根 typecheck 48 包 0 error；根 `bun run test` **3183 pass / 0 fail**（3159→+24）；
+`adapters/vscode` 自口径 typecheck 0 error / **276 pass**（+4）。
+反向验证 9 组（cp 备份 + 变异 + `shasum -a 256 -c` 还原，9/9 OK、无残留）：
+①compose 改 agent 覆盖 ⇒ 红 **5**（预测 2；偏差＝allow 交集/并集/"不能放宽 deny"三条同样依赖取最严，归因非测试问题）；
+②onExpire 不接管 ⇒ 红 1；③sseBody 不调 onCancel ⇒ 红 1；④写锁键回退 ⇒ 红 3（预测 2，`-t` 命中两条都红）；
+⑤isUnderDir 退 `startsWith('..')` ⇒ 红 1（`..hidden`）；⑥content-type 去小写归一 ⇒ 红 1；
+⑦命令早退裸 state ⇒ **0 红** —— 同码双防线（`readState` 那道闸先行），两道同摘 ⇒ 红 1（预测 1 首跑未红，按协议追了第二层）；
+⑧非授权中断态回 noop ⇒ 红 2；⑨`/dev/dull` 回归 ⇒ 红 1。
+
 ## 2026-10-13（续 286）VSCode 适配器：移植 spike 的四类客户端修复（D1/D2/E1/E2）+ 探针归档拆除
 
 ### 起因
