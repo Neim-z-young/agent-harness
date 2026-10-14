@@ -6,11 +6,13 @@
 # 与 `bwrap` 的可用性、bash 语义差异）都会在下次改动里**静默回归** —— 沙箱那一批
 # （P0-6 / P1-1 / P1-2 / P1-3）尤其如此：它们的判据本来就跟平台绑着。
 #
-# ## 三档口径
-# - `ubuntu` / `macos`：**硬失败**（typecheck + 测试都必须过）。
-# - `windows`：typecheck 硬失败（TS 是平台无关的，过不了就是真问题）；
-#   测试允许"bash 语义差异"造成的失败不阻断，但**汇总数字照写 summary**，且
-#   `pass` 阈值照样判 —— 防的是"全跳过/整包炸了还绿"，不是防少量回归。
+# ## 三档口径（2026-10-14 收窄：Windows 与另两档同权）
+# - `ubuntu` / `macos` / `windows`：**全部硬失败**（typecheck + 测试都必须过）。
+#   Windows 曾短暂允许"测试非零退出不阻断"（平台差异白名单期），在该窗口里修完全部
+#   平台耦合后（unref 挂死 / 进程树 kill / 路径方言 / CRLF…，见 cross-platform-plan.md），
+#   实测 Windows 已全绿（run 38395195265：各包 0 fail，仅 5 条平台 skip）⇒ 这扇门
+#   只剩"吞掉真回归"一个作用（job 仍绿、summary 里才有线索）⇒ 关掉。
+#   若未来确需临时放行，**必须**配一个读 summary 失败数的门槛步骤，而不是整步吞掉。
 # - 两个平台上都跑 `scripts/ci/test-summary.sh`：它负责记录跳过条数 + 阈值判定。
 name: CI
 
@@ -74,10 +76,9 @@ jobs:
           # 一个都没跑到）—— 这才是这个开关的主要价值。
           PER_PKG_TIMEOUT: ${{ matrix.os == 'windows-latest' && 240 || 0 }}
         run: bash scripts/ci/test-summary.sh ./harness-ci-test.log "${{ runner.os }}"
-        # 只有 Windows 允许非零退出（平台差异白名单，见文件头）；失败条数仍进 summary
-        # ⚠️ 取舍：这一步会把 **Windows 的真回归也一起吞掉**（job 仍绿）。因此第一次跑通后，
-        # 应当把 Windows 的 `continue-on-error` 收窄（或至少每次人工看 summary / artifact）。
-        continue-on-error: ${{ matrix.os == 'windows-latest' }}
+        # 三平台同权（2026-10-14 收窄）：Windows 的测试失败现在**照常阻断**。
+        # 旧实现 `continue-on-error: windows` 会把真回归吞成绿灯（job 仍绿，summary 里才有
+        # 线索）—— 实测修完平台耦合后 Windows 已 0 fail，这扇门没有存在理由了。
 
       - name: 上传测试日志
         if: always()
