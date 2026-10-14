@@ -1574,7 +1574,11 @@ export class DefaultSessionManager implements SessionManager {
       const occ = readAcpOccupancy(sess.meta)
       if (occ) {
         const occWindow = occ.window ?? windowTokens
-        if (occ.requestTok < occWindow * pct2) return false
+        // ★ 判据是「**实际发出** = requestTok + fixedTok」：`fixedTok` 是 system prompt + 工具 schema
+        // 的固定开销（不随会话增长、却实占窗口）。只按 `requestTok` 判会让左值偏小 ⇒ 该压的不压，
+        // 而 ACP 侧闸门与 /stats 面板已按"合计"告警（两把尺子对不上，且全程无症状）。
+        // session 侧的 `readAcpOccupancy` 现已返回该字段（此前被读取器丢掉）。
+        if (occ.requestTok + (occ.fixedTok ?? 0) < occWindow * pct2) return false
       }
     }
 

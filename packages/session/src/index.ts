@@ -229,13 +229,25 @@ export function readAcpOccupancy(
 ): AcpOccupancySnapshot | undefined {
   const raw = meta?.[ACP_OCCUPANCY_META_KEY]
   if (!raw || typeof raw !== 'object') return undefined
-  const r = raw as { requestTok?: unknown; rawTok?: unknown; window?: unknown }
+  const r = raw as { requestTok?: unknown; rawTok?: unknown; window?: unknown; fixedTok?: unknown }
   if (typeof r.requestTok !== 'number' || !Number.isFinite(r.requestTok)) return undefined
   const rawTok = typeof r.rawTok === 'number' && Number.isFinite(r.rawTok) ? r.rawTok : r.requestTok
   const win = typeof r.window === 'number' && Number.isFinite(r.window) && r.window > 0
     ? r.window
     : undefined
-  return { requestTok: r.requestTok, rawTok, ...(win != null ? { window: win } : {}) }
+  // ⚠️ `fixedTok` 必须**读出来**：接口注释明写"窗口保护闸的判据 = requestTok + fixedTok"，
+  // 但读取器此前把它丢了 ⇒ 下游（core 的自动压缩 B2 合取条件）只能按 requestTok 判 ⇒ 左值偏小
+  // ⇒ 该压的没压，而 ACP 侧闸门与 /stats 面板已按"合计"告警（两把尺子对不上）。
+  // 判据与 @harness/usage 的同族读取器一致：≤0 / 非数一律当"没测到"。
+  const fixed = typeof r.fixedTok === 'number' && Number.isFinite(r.fixedTok) && r.fixedTok > 0
+    ? r.fixedTok
+    : undefined
+  return {
+    requestTok: r.requestTok,
+    rawTok,
+    ...(win != null ? { window: win } : {}),
+    ...(fixed != null ? { fixedTok: fixed } : {}),
+  }
 }
 
 // ===== 会话级模型覆盖（会话内自由切模型）=====
