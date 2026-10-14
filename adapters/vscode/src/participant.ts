@@ -147,7 +147,9 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
     let state = readState(context)
     const controller = new AbortController()
     const abort = () => controller.abort()
-    token.onCancellationRequested(abort)
+    // 退订句柄：`finally` 里要 dispose（此前把返回值丢了，`finally` 只好再注册一个空回调来"抵消"
+    // —— 那是死代码，还把一个监听永远留在 token 上）
+    const cancelSub = token.onCancellationRequested(abort)
 
     // 本轮诊断埋点的四个状态量（声明在最外层，catch/finally 也要读得到）
     const t0 = Date.now()
@@ -327,12 +329,24 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       // 报 `ConcurrentTaskError`。走到这里说明硬上限都到顶了，直接 CancelTask 把它释放
       //（`SuspendTable.cancel` 会唤醒挂起方，跑完最后一段并落到终态）。
       if (pending !== undefined) {
-        log(`[permission] 续接轮数用尽（${MAX_PERMISSION_ROUNDS} 轮）仍有一笔待决授权 ⇒ 发 CancelTask 释放会话`)
-        if (state.taskId) await deps.transport.cancel(state.taskId).catch(() => {})
-        stream.markdown(
-          `\n\n（连续 ${MAX_PERMISSION_ROUNDS} 轮授权询问仍未结束，已中止并释放会话；可以直接继续对话）\n\n`,
+        // ⚠️ 两种"带着待决授权离场"必须分开说（都**必须** CancelTask —— 服务端那个任务此刻停在
+        // `INPUT_REQUIRED`，不释放就会让该 contextId 之后每条消息被 ConcurrentTaskError 拒）：
+        //  · 轮数用尽仍待决 ⇒ 异常：明确文案 + outcome='error'；
+        //  · 用户主动取消（token 在上一轮弹窗答复的间隙被取消，循环顶 `break`）⇒ 只是取消，
+        //    文案由上面的 `_已停止_` 负责。误报成"连续 40 轮授权询问仍未结束"是 9ca3d42 修过的
+        //    同一类口径问题，只是这条路径当时漏了（pending 未清 ⇒ 走到这里）。
+        log(
+          outcome === 'cancelled'
+            ? '[permission] 用户取消时仍有未答复的授权请求 ⇒ 发 CancelTask 释放会话'
+            : `[permission] 续接轮数用尽（${MAX_PERMISSION_ROUNDS} 轮）仍有一笔待决授权 ⇒ 发 CancelTask 释放会话`,
         )
-        outcome = 'error'
+        if (state.taskId) await deps.transport.cancel(state.taskId).catch(() => {})
+        if (outcome !== 'cancelled') {
+          stream.markdown(
+            `\n\n（连续 ${MAX_PERMISSION_ROUNDS} 轮授权询问仍未结束，已中止并释放会话；可以直接继续对话）\n\n`,
+          )
+          outcome = 'error'
+        }
       }
 
       deps.timeline?.finish(outcome === 'done' ? 'completed' : outcome)
@@ -353,6 +367,22 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       }
       return { metadata: turnMetadata(state) }
     } catch (e) {
+      // 用户点了「停止」（token 被取消）⇒ **这不是错误**：
+      // ① 只 abort 本地 fetch 只断开 SSE，服务端那一轮仍在跑（`executor.cancelTask` 才是唯一
+      //    会 abort 它的入口）⇒ 必须显式 CancelTask，否则该任务仍算"活跃"，这个 contextId
+      //    之后**每条消息**都被 ConcurrentTaskError 拒（会话卡死，同 MAX_PERMISSION_ROUNDS 那条铁律）；
+      // ② 给中文交代，而不是把 `AbortError: The operation was aborted` 原样丢给用户。
+      //（`firstFrameTimedOut` 时不算用户取消 —— 那时走下面那条"首帧超时"的说明。）
+      if (token.isCancellationRequested && !firstFrameTimedOut) {
+        if (state.taskId) await deps.transport.cancel(state.taskId).catch(() => {})
+        stream.markdown('\n\n_已停止_\n')
+        deps.timeline?.finish('cancelled')
+        turnLog(
+          deps,
+          `◀ turn 结束 outcome=cancelled frames=${totalFrames} (+${Date.now() - t0}ms tokenCancelled=true)`,
+        )
+        return { metadata: turnMetadata(state) }
+      }
       const msg = e instanceof Error ? e.message : String(e)
       stream.markdown(`\n\n❌ ${msg}\n\n`)
       log(`[error] ${msg}`)
@@ -372,7 +402,8 @@ export function createParticipantHandler(deps: ParticipantDeps): vscode.ChatRequ
       // 守卫必须在这里清：否则一个 15s 的定时器会把宿主/测试进程钉住
       //（⚠️ 不许用 unref 代替清理，见 FIRST_FRAME_TIMEOUT_MS 的说明）
       if (guard !== undefined) clearTimeout(guard)
-      token.onCancellationRequested(() => {})
+      // 退订本轮注册的取消监听（token 是请求级的；不 dispose 会留一个活到本轮回调）
+      cancelSub.dispose()
       controller.abort()
     }
   }
@@ -441,11 +472,11 @@ async function handleCommand(
 
   if (plan.kind === 'unknown') {
     stream.markdown(`❌ ${plan.message}\n\n${renderCommandHelp()}`)
-    return { metadata: state }
+    return { metadata: turnMetadata(state) }
   }
   if (plan.kind === 'local') {
     stream.markdown(`### /${command}\n\n${plan.message}`)
-    return { metadata: state }
+    return { metadata: turnMetadata(state) }
   }
 
   try {
@@ -459,7 +490,7 @@ async function handleCommand(
       const resolved = resolveModelSpec(plan.spec, info?.configured ?? [])
       if (typeof resolved === 'string') {
         stream.markdown(`❌ /model ${plan.spec}：${resolved}\n\n_用 \`/model\` 查看可选清单。_`)
-        return { metadata: state }
+        return { metadata: turnMetadata(state) }
       }
       stream.markdown(renderControlResult('model', await deps.transport.control('harness/model.set', resolved)))
     } else if (plan.kind === 'session-resolve') {
@@ -469,7 +500,7 @@ async function handleCommand(
       const resolved = resolveSessionSpec(plan.spec, entries)
       if (typeof resolved === 'string') {
         stream.markdown(`❌ /resume ${plan.spec}：${resolved}\n\n_用 \`/sessions\` 查看会话清单。_`)
-        return { metadata: state }
+        return { metadata: turnMetadata(state) }
       }
       const result = await deps.transport.control('harness/session.resume', { id: resolved.id })
       stream.markdown(renderControlResult('resume', result))

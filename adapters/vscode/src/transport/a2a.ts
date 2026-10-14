@@ -98,7 +98,10 @@ export class A2aTransport implements HarnessTransport {
     // 实测：第二轮的消息带上第一轮的 `taskId` ⇒ `-32004 TASK_TERMINAL` 就是这样被吃掉的。
     //
     // 判据必须是 **content-type**，不能是状态码 —— 上述情形状态码**全是 200**。
-    const contentType = res.headers.get('content-type') ?? ''
+    // ★ 小写归一后再比对：HTTP 头值大小写不敏感（对端可能给 `Text/Event-Stream`），
+    //   大小写敏感的 `includes` 会把"其实是 SSE"误判进 JSON 分支，然后 JSON.parse 一段
+    //   SSE 文本抛错 —— 一条大小写差异把整轮吃掉。
+    const contentType = (res.headers.get('content-type') ?? '').toLowerCase()
     if (!contentType.includes('text/event-stream')) {
       const text = await res.text()
       let parsed: unknown

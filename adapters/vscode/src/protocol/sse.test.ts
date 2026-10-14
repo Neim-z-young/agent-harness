@@ -56,6 +56,34 @@ describe('SseDecoder', () => {
     expect(out).toHaveLength(1)
   })
 
+  it('★ CRLF 被切在 `\\r`|`\\n` 之间 ⇒ 帧不得被吞掉', () => {
+    // 回归：归一化原先只作用于"新到的那一块"，跨块的 `\r\n` 漏折 ⇒ 残留 `\r` 让
+    // `...\n\r\n` 认不出 `\n\n` 边界 ⇒ **该帧 0 产出**（后续帧还会被并块直到 JSON.parse 抛错）。
+    const d = new SseDecoder()
+    const crlf = TASK_FRAME.replace(/\n/g, '\r\n')
+    const cut = crlf.length - 1 // 末字符是 `\n` ⇒ 切在结尾 `\r\n\r` + `\n`
+    expect(crlf.slice(cut - 1)).toBe('\r\n')
+    const out = [...d.push(crlf.slice(0, cut)), ...d.push(crlf.slice(cut))]
+    // 不管在第一次还是第二次 push 切出，**总数必须是 1**（旧实现是 0）
+    expect(out).toHaveLength(1)
+    expect(out[0]!.data).toMatchObject({ id: 1 })
+  })
+
+  it('裸 `\\r` 作行尾（规范允许）也能解', () => {
+    const d = new SseDecoder()
+    const out = d.push(TASK_FRAME.replace(/\n/g, '\r'))
+    expect(out).toHaveLength(1)
+    expect(out[0]!.data).toMatchObject({ id: 1 })
+  })
+
+  it('空 `data:`（无载荷的保活帧）不产出、也不当成坏 JSON', () => {
+    // 回归：空 data 曾走 `JSON.parse('')` ⇒ 抛 SseParseError ⇒ 一条心跳就把整轮判成解析失败。
+    const d = new SseDecoder()
+    expect(d.push('data:\n\n')).toHaveLength(0)
+    // 心跳之后紧跟的真帧照常产出
+    expect(d.push(TASK_FRAME)).toHaveLength(1)
+  })
+
   it('心跳注释行（: ping）必须被忽略，不能产出帧', () => {
     const d = new SseDecoder()
     const out = d.push(': ping\n\n' + TASK_FRAME)

@@ -170,6 +170,71 @@ function makeToken(): never {
   } as never
 }
 
+/**
+ * **可取消**的 token 假件：`isCancellationRequested` 是动态的（真实 token 在用户点停止时翻转），
+ * `cancel()` 模拟宿主触发取消回调 —— 于是 handler 注册的 `abort` 会执行、`controller.abort()` 生效。
+ *
+ * 为什么必须有它：此前所有用例的 token 恒为"未取消"（`makeToken`），**取消路径零覆盖**，
+ * 于是"用户点停止 ⇒ 只断开本地流、服务端任务照跑 ⇒ 会话卡死"这个缺陷一直没被看见。
+ */
+function makeCancellableToken(): { token: never; cancel: () => void } {
+  const listeners: Array<() => void> = []
+  let cancelled = false
+  return {
+    token: {
+      get isCancellationRequested() {
+        return cancelled
+      },
+      onCancellationRequested: (cb: () => void) => {
+        listeners.push(cb)
+        return {
+          dispose: () => {
+            const i = listeners.indexOf(cb)
+            if (i >= 0) listeners.splice(i, 1)
+          },
+        }
+      },
+    } as never,
+    cancel: () => {
+      cancelled = true
+      for (const l of listeners.slice()) l()
+    },
+  }
+}
+
+/**
+ * 先吐一帧（让 handler 拿到 `taskId`）再挂住，直到被 abort ⇒ **抛** AbortError
+ * （真实 fetch 被 abort 就是抛，见 makeTransport 里同款说明）。
+ */
+function makeHangingAfterFirstFrame(): {
+  transport: HarnessTransport
+  cancelled: string[]
+  sentFirst: () => boolean
+} {
+  const cancelled: string[] = []
+  let first = false
+  const transport = {
+    start: async () => {},
+    dispose: async () => {},
+    cancel: async (taskId: string) => {
+      cancelled.push(taskId)
+    },
+    control: async () => ({}),
+    listTasks: async () => ({}),
+    send: (_ctx: unknown, _text: string, signal: AbortSignal) =>
+      (async function* () {
+        yield taskFrame()
+        first = true // 生成器被再次 next() ⇒ 上面那帧已被 handler 处理（taskId 已记下）
+        await new Promise<void>((_res, reject) => {
+          const boom = () => reject(Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }))
+          if (signal.aborted) return boom()
+          signal.addEventListener('abort', boom, { once: true })
+        })
+      })(),
+  } as unknown as HarnessTransport
+  return { transport, cancelled, sentFirst: () => first }
+}
+
 /** 假 history：`ChatResponseTurn` 实例带上一轮的 metadata */
 async function historyWith(metadata: unknown): Promise<unknown> {
   const vscodeMock = await import('vscode')
@@ -235,6 +300,29 @@ describe('D1：`taskId` 绝不跨轮（跨轮带它 ⇒ -32004，且会被 SSE �
     // 第二轮（权限续接）必须仍带同一个 taskId
     expect(sent).toHaveLength(2)
     expect(sent[1]?.taskId).toBe(TASK)
+  })
+
+  it('★命令轮的**每一条**早退路径都必须过 turnMetadata（裸 `state` 会把 taskId 泄到下一轮）', async () => {
+    // 旧实现：unknown / local / model-resolve 失败 / session-resolve 失败 四处早退
+    // `return { metadata: state }` —— 上一轮的 taskId 就这样跨轮带出 ⇒ 下一条消息被
+    // -32004 TASK_TERMINAL 拒（正是 D1 要防的事，只是换了条更隐蔽的路）。
+    const { transport, sent } = makeTransport(() => [])
+    const handler = createParticipantHandler({ transport })
+    const { stream } = makeStream()
+    const history = await historyWith({ contextId: CTX, taskId: TASK })
+
+    for (const cmd of ['nope', 'help']) {
+      const result = (await handler(
+        { prompt: `/${cmd}`, command: cmd } as never,
+        history,
+        stream,
+        makeToken(),
+      )) as { metadata?: { taskId?: string; contextId?: string } }
+      expect(result.metadata?.taskId).toBeUndefined()
+      expect(result.metadata?.contextId).toBe(CTX)
+    }
+    // 命令轮不该发 A2A 消息
+    expect(sent).toHaveLength(0)
   })
 })
 
@@ -436,5 +524,80 @@ describe('权限帧 → RenderOp 的判据与用例保持同一份', () => {
     const { mapA2aEvent } = await import('./map/render')
     const op: RenderOp = mapA2aEvent(permissionFrame())
     expect(op.kind).toBe('permission')
+  })
+})
+
+// ---------------------------------------------------------------- 用户停止
+
+describe('用户点「停止」：中文交代 + CancelTask 释放服务端任务', () => {
+  it('abort 抛出的 AbortError 不得当成错误：给中文收尾并 CancelTask', async () => {
+    const { transport, cancelled, sentFirst } = makeHangingAfterFirstFrame()
+    const logs: string[] = []
+    const handler = createParticipantHandler({ transport, log: (m) => logs.push(m) })
+    const { parts, stream } = makeStream()
+    const { token, cancel } = makeCancellableToken()
+
+    const done = handler(request(), await historyWith({}), stream, token)
+    // 等到第一帧已被处理（taskId 已记下）再把 token 置为已取消
+    for (let i = 0; i < 200 && !sentFirst(); i++) await Promise.resolve()
+    expect(sentFirst()).toBe(true)
+
+    cancel()
+    await done
+
+    const md = parts.map((p) => p.text).join('')
+    // ① 不该把英文 AbortError 原样丢给用户（"用户点停止"不是错误）
+    expect(md).not.toInclude('The operation was aborted')
+    expect(md).not.toInclude('❌')
+    expect(md).toInclude('已停止')
+    // ② ★ 服务端任务必须被显式释放 —— 只 abort 本地 fetch 不会让 harness 那一轮结束，
+    //    留下活跃任务会让该 contextId 之后每条消息都被 ConcurrentTaskError 拒（会话卡死）
+    expect(cancelled).toEqual([TASK])
+    expect(logs.some((l) => l.includes('outcome=cancelled'))).toBe(true)
+  })
+
+  it('配额用尽那一轮遇上取消 ⇒ 不误报"连续 N 轮"，但仍发 CancelTask', async () => {
+    // 这条专门覆盖"循环顶 break 时 `pending` 仍是上一轮那笔"的路径：
+    // 弹窗路径拦得住（`askPermission` 见到取消就返回 undefined，走"已取消授权"分支并清 pending），
+    // 唯独**配额用尽后的自动 deny 分支没有取消检查** ⇒ 会带着上一轮的 pending 回到循环顶。
+    // 真机形态：用户已答过 8 次弹窗，在第 9 轮（不再弹窗）的流结束瞬间点了停止。
+    const { token, cancel } = makeCancellableToken()
+    let roundNo = 0
+    const { transport, cancelled } = makeTransport(() => {
+      const r = roundNo++
+      // 配额用尽后的那一轮：流收尾前把 token 置为已取消（模拟"停止"与流结束撞在一起）
+      if (r === MAX_PERMISSION_PROMPTS) cancel()
+      return [permissionFrame()]
+    })
+    const logs: string[] = []
+    const handler = createParticipantHandler({ transport, log: (m) => logs.push(m) })
+    const { parts, stream } = makeStream()
+
+    await handler(request(), await historyWith({}), stream, token)
+
+    const md = parts.map((p) => p.text).join('')
+    // 旧实现把"用户主动取消"误报成"连续 40 轮授权询问仍未结束"（fail-safe 的语义是
+    // "轮数用尽仍待决"，只该在那一种情形下触发）
+    expect(md).not.toInclude(`连续 ${MAX_PERMISSION_ROUNDS} 轮`)
+    expect(md).toInclude('已停止')
+    expect(logs.some((l) => l.includes('outcome=cancelled'))).toBe(true)
+    expect(logs.some((l) => l.includes('outcome=error'))).toBe(false)
+    // ★ 但该发的那次 CancelTask 一次都不能少：那时服务端任务停在 INPUT_REQUIRED，
+    //   不释放会让该 contextId 之后每条消息都被 ConcurrentTaskError 拒（会话卡死）
+    expect(cancelled).toEqual([TASK])
+  })
+
+  it('取消监听在轮末被 dispose（不再靠注册空回调"抵消"）', async () => {
+    const { transport } = makeTransport(() => [taskFrame(), doneFrame()])
+    const handler = createParticipantHandler({ transport })
+    const { stream } = makeStream()
+    let disposed = 0
+    const token = {
+      isCancellationRequested: false,
+      onCancellationRequested: () => ({ dispose: () => { disposed++ } }),
+    } as never
+
+    await handler(request(), await historyWith({}), stream, token)
+    expect(disposed).toBe(1)
   })
 })

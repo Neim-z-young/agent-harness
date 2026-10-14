@@ -49,8 +49,14 @@ export class SseDecoder {
 
   /** 追加一段文本，返回**本次**切出的完整帧（可能是 0 个或多个） */
   push(chunk: string): SseFrame[] {
-    // CRLF 归一：SSE 允许 \r\n，统一成 \n 后边界判断只需认一种
-    this.buffer += chunk.replace(/\r\n/g, '\n')
+    // CRLF 归一：SSE 允许 `\r\n`（也允许**裸 `\r`** 作行尾），统一成 `\n` 后边界判断只需认一种。
+    //
+    // ⚠️ 必须**归一整段缓冲**，而不是"只归一这一块"：`\r\n` 会被 TCP 切在两次 push 之间
+    //（前一块以 `\r` 结尾、后一块以 `\n` 开头）。只在块内 replace 会漏掉它 ⇒ 残留的 `\r` 让
+    // `...\n\r\n` 认不出 `\n\n` 边界 ⇒ **该帧被吞掉**（实测：整帧 CRLF、按 `\r|\n` 切块 ⇒ 0 帧）；
+    // 若后面还有帧，两帧会被并成一块、`data:` 变成两行 ⇒ `JSON.parse` 抛错、整轮失败。
+    // 归一化是**幂等**的（折过之后缓冲里不再有 `\r`），重复扫残余缓冲的代价可以忽略。
+    this.buffer = (this.buffer + chunk).replace(/\r\n?/g, '\n')
 
     const out: SseFrame[] = []
     let idx = this.buffer.indexOf('\n\n')
@@ -100,6 +106,12 @@ function parseBlock(block: string): SseFrame | undefined {
   if (dataLines.length === 0) return undefined
 
   const raw = dataLines.join('\n')
+  // 空 `data:`（`data:` 后没有内容）**不产出帧**，也不该被当成坏 JSON：
+  // 它是合法的 SSE 事件、语义上"这一帧没有载荷"（对端/中间层当保活帧发），而不是"帧被损坏"。
+  // 不加这条 ⇒ `JSON.parse('')` 抛 SseParseError ⇒ 一条心跳就把**整轮**判成解析失败并结束。
+  //（与上面那条一致：真正坏掉的 JSON 仍照抛，不静默跳过。）
+  if (raw === '') return undefined
+
   let parsed: unknown
   try {
     parsed = JSON.parse(raw)

@@ -180,6 +180,17 @@ function mapStatusUpdate(u: WireStatusUpdate & Record<string, unknown>): RenderO
     return { kind: 'error', code: -32010, message: '需要认证，扩展当前不支持该中断态' }
   }
 
+  // ★ 非授权类的 `INPUT_REQUIRED`（服务端将来可能新增的中断态）**绝不能落 noop**：
+  // noop 会让循环既不弹窗也不报错地跑完流 ⇒ 任务挂在服务端、用户只看到"什么都没发生"。
+  // 宁可响亮地失败 —— 至少用户知道为什么，且这是新增中断态时的显式提示点。
+  if (state === 'TASK_STATE_INPUT_REQUIRED') {
+    return {
+      kind: 'error',
+      code: -32010,
+      message: `任务在等待输入（扩展不支持的中断态：${strOr(md?.['kind'], '未知类型')}），本轮中止`,
+    }
+  }
+
   return mapWorkingPhase(md)
 }
 

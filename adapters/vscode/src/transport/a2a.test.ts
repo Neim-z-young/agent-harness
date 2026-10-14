@@ -157,6 +157,32 @@ describe('A2aTransport.send', () => {
     expect(mapA2aEvent(got[0])).toMatchObject({ kind: 'error', code: -32004 })
   })
 
+  it('★ content-type 大小写不敏感：`Text/Event-Stream` 也按 SSE 解帧（否则被误判进 JSON 分支）', async () => {
+    // HTTP 头值大小写不敏感。旧实现 `contentType.includes('text/event-stream')` 对
+    // `Text/Event-Stream` 判 false ⇒ 走 JSON 分支 ⇒ `JSON.parse` 一段 SSE 文本抛错
+    // —— 一条大小写差异把整轮吃掉。
+    const enc = new TextEncoder()
+    const { fetch } = recordingFetch(
+      () =>
+        new Response(
+          new ReadableStream<Uint8Array>({
+            start(c) {
+              for (const f of [TASK, DONE]) c.enqueue(enc.encode(f))
+              c.close()
+            },
+          }),
+          { status: 200, headers: { 'content-type': 'Text/Event-Stream; charset=utf-8' } },
+        ),
+    )
+    const t = new A2aTransport({ sidecar: fakeSidecar(), fetchImpl: fetch })
+
+    const got: unknown[] = []
+    for await (const f of t.send({}, 'hi', new AbortController().signal)) got.push(f)
+
+    expect(got).toHaveLength(2)
+    expect(mapA2aEvent(got[0])).toMatchObject({ kind: 'progress' }) // SUBMITTED 不是终态
+  })
+
   it('既非 SSE 也非 JSON ⇒ TransportError（带上 content-type 便于归因）', async () => {
     const { fetch } = recordingFetch(
       () => new Response('<html>502 Bad Gateway</html>', { status: 200, headers: { 'content-type': 'text/html' } }),

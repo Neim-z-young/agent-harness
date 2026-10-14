@@ -147,6 +147,28 @@ describe('mapA2aEvent · 权限挂起', () => {
     expect(op.kind).toBe('permission')
     expect(isTerminalState('TASK_STATE_INPUT_REQUIRED')).toBe(false)
   })
+
+  it('★非授权类 INPUT_REQUIRED ⇒ error（**绝不落 noop**：静默 break 会让任务挂在服务端）', () => {
+    const op = mapA2aEvent(
+      wrap({
+        statusUpdate: {
+          status: { state: 'TASK_STATE_INPUT_REQUIRED' },
+          metadata: { kind: 'some-future-interrupt' },
+        },
+      }),
+    )
+    expect(op.kind).toBe('error')
+    if (op.kind !== 'error') return
+    expect(op.message).toContain('等待输入')
+    expect(op.message).toContain('some-future-interrupt')
+  })
+
+  it('★非授权类 INPUT_REQUIRED 且没有 metadata.kind ⇒ 仍是 error（带未知类型提示）', () => {
+    const op = mapA2aEvent(
+      wrap({ statusUpdate: { status: { state: 'TASK_STATE_INPUT_REQUIRED' } } }),
+    )
+    expect(op.kind).toBe('error')
+  })
 })
 
 describe('mapA2aEvent · 错误', () => {
