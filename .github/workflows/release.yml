@@ -51,6 +51,9 @@ jobs:
 
       - name: 重命名带 tag/平台/架构后缀
         shell: bash
+        # ⚠️ 脚本体**只用 ASCII**：macOS runner 是 bash 3.2，`echo "…$OUT（…"` 里的全角括号
+        # 会被当成变量名的一部分 ⇒ `OUT（: unbound variable`（实测踩过，windows/ubuntu 的
+        # bash 5 反而正常 ⇒ 只在 macos 炸）。中文说明放 step name / 注释里，别进 run 体。
         run: |
           set -euo pipefail
           TAG="${{ inputs.tag || github.ref_name }}"
@@ -61,7 +64,7 @@ jobs:
           OUT="harness-a2a-${TAG}-${OS}-${ARCH}"
           case "$SRC" in *.exe) OUT="${OUT}.exe" ;; esac
           mv "$SRC" "$OUT"
-          echo "产物：$OUT（$(du -h "$OUT" | cut -f1)）"
+          echo "artifact: $OUT size=$(du -h "$OUT" | cut -f1)"
 
       - name: 上传到 release（--clobber 允许重跑覆盖）
         env:
