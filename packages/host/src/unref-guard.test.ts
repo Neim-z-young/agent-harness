@@ -43,19 +43,11 @@ import { describe, it, expect } from 'bun:test'
 import { readdirSync, readFileSync } from 'node:fs'
 import type { Dirent } from 'node:fs'
 import { join, relative } from 'node:path'
+// toPosix 只保留一份（`./files`）：测试里再定义一个"同名不同源"的副本，迟早与实现漂移
+// —— 本仓已见过 `lookupEnvCI` 双份漂移的实录。
+import { toPosix } from './files'
 
 const REPO_ROOT = join(import.meta.dir, '..', '..', '..')
-
-/**
- * 把路径里的分隔符统一折成 `/`（**纯函数，导出以便本机单测**）。
- *
- * ⚠️ 为什么不能用 `split(sep).join('/')`：那个写法在 macOS（`sep==='/'`）上是恒等，
- * **本机永远测不出 Windows 分支** —— 而这条恰恰只在 Windows 上错。`replaceAll('\\','/')`
- * 两平台都对，且可以喂一个 Windows 风格的字符串在**任何平台**上验证。
- */
-export function toPosix(p: string): string {
-  return p.replaceAll('\\', '/')
-}
 
 /**
  * 相对仓库根的路径，**统一折成 `/`**。

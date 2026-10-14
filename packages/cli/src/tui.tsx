@@ -2513,9 +2513,15 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
 
       {/* 底部输入：列表模式让出焦点（由 useKeyboard 接管上下/回车） */}
       <box flexDirection="column" style={{ flexShrink: 0 }}>
-        {/* 模块 D：帮助面板 overlay —— modal，输入框让出焦点，任意键关闭 */}
+        {/* 模块 D：帮助面板 overlay —— modal，输入框让出焦点，任意键关闭。
+            ⚠️ 必须套**滚动容器**：`HELP_LINES` 有 14 条（长文案还会折行），只写 `maxHeight: 12`
+            的话靠后的几条（`Esc` / `/help` / `/agent, /model`…）会被裁掉、又没有任何滚动键
+            ⇒ 用户看不到。与审批模态同一套做法（定高 scrollbox）。 */}
         {helpOpen && (
-          <box style={{ border: true, padding: 1, maxHeight: 12 }}>
+          <scrollbox
+            style={{ border: true, padding: 1, maxHeight: 12, flexShrink: 0 }}
+            verticalScrollbarOptions={SIDEBAR_SCROLLBAR_OPTIONS}
+          >
             {HELP_LINES.map((l) => (
               <box flexDirection="row" key={l.key} minHeight={1}>
                 <box width={20}>
@@ -2526,7 +2532,7 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
                 </text>
               </box>
             ))}
-          </box>
+          </scrollbox>
         )}
         {/* 模块 E：命令审批模态 —— 权限询问弹出，Y=允许 N=拒绝 Shift-Y=始终允许 Shift-N=始终拒绝。
             M3：有结构化卡片（风险标签 + 参数表格 + 历史）时渲染 decision-card，否则回退文本 */}
@@ -2561,8 +2567,10 @@ export function TuiApp({ options, onExit }: { options: TuiReplOptions; onExit: (
         )}
         {/* 模块 C：/ 命令补全菜单弹层（出现在输入框上方，随输入前缀过滤） */}
         {!listMode && cmdMenuOpen && cmdCandidates.length > 0 && (
+          // ⚠️ 条数上限必须**小于** maxHeight 扣掉边框后的可用行数：`slice(0, 8)` + 上下边框 2 行
+          // = 10 行 > `maxHeight: 8` ⇒ 选中第 7/8 项时高亮行会落在可视区之外（看不到自己选了谁）。
           <box style={{ border: true, maxHeight: 8 }}>
-            {cmdCandidates.slice(0, 8).map((c, i) => {
+            {cmdCandidates.slice(0, 6).map((c, i) => {
               const active = i === Math.min(Math.max(cmdSel, 0), cmdCandidates.length - 1)
               const attrs = active
                 ? createTextAttributes({ reverse: true, bold: true })

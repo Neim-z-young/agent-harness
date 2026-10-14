@@ -1291,7 +1291,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
         case '/stats-export': {
           const u = await resolveCurrentUsage(harness, current)
           const t = await resolveTodayUsage(app, current)
-          const [fmtArg, pathArg] = (arg ?? '').trim().split(/\s+/)
+          // ⚠️ 不能用上面的 `arg`（= `line.split(/\s+/, 2)[1]`，**只截第二个 token**）：
+          // `/stats-export md /tmp/x.md` 里的路径会被丢掉 ⇒ 报告静默打到 stdout、文件根本没生成。
+          // 与 `/permission` 同一处坑、同一处修法：从 `line` 自己重切。
+          const [fmtArg, pathArg] = line.split(/\s+/).slice(1).filter(Boolean)
           const isJson = fmtArg === 'json' || fmtArg === '--json'
           const content = isJson
             ? exportStatsJson(u, { sessionId: current.id, title: current.title, today: t })
@@ -1305,8 +1308,10 @@ export function createProcessLine(options: ProcessLineOptions): (raw: string) =>
           return 'continue'
         }
         case '/search': {
-          if (!arg || !arg.trim()) { out('用法：/search <keyword>\n'); return 'continue' }
-          const results = await harness.session.search(arg.trim())
+          // 同 `/stats-export`：关键词可能多词，必须从 `line` 重切（`arg` 只到第二个 token）
+          const keyword = line.split(/\s+/).slice(1).join(' ').trim()
+          if (!keyword) { out('用法：/search <keyword>\n'); return 'continue' }
+          const results = await harness.session.search(keyword)
           if (results.length === 0) { out('（无匹配会话）\n'); return 'continue' }
           for (const s of results) {
             const when = new Date(s.updatedAt).toLocaleString()

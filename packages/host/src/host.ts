@@ -1478,8 +1478,12 @@ export class HarnessHost {
       try {
         await this.sessionStore.save(s)
       } catch (err) {
-        // 可观测性增强：落盘失败不应中断主流程
-        console.warn(`[WARN] 脏会话落盘失败（${s.id}）：${(err as Error)?.message ?? String(err)}`)
+        // 可观测性增强：落盘失败不应中断主流程。
+        // ⚠️ 走 `emitLog`（→ `logSink` / `logLine`），**不能裸 `console.warn`**：本仓的输出
+        // 出口只有两条（装配期 `onNotice` / 运行期 `logLine`+`setLogSink`），裸 warn 两个都不沾 ——
+        // 在 TUI 下它会直写 stderr，而 OpenTUI 独占同一终端 ⇒ 渲染错位（`setLogSink` 正是为治它而生）；
+        // 在 A2A/VSCode 宿主下它也进不了 `notices` 环形缓冲 ⇒ 事后自检看不到"会话没落盘"。
+        this.emitLog('warn', `脏会话落盘失败（${s.id}）：${(err as Error)?.message ?? String(err)}`)
         try { this.harness.session.markDirty(s.id) } catch { /* ignore */ }
       }
     }
