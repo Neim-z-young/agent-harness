@@ -29,6 +29,7 @@ import { defineTool, type Hooks } from '@harness/core'
 import { HarnessHost, type Host } from '@harness/host'
 import type { MockProviderConfig } from '@harness/provider-mock'
 import { HarnessAgentExecutor } from './executor'
+import { SuspendTable } from './suspend'
 import { messageOf, textPart } from './mapping'
 
 // ========================================================================
@@ -96,6 +97,7 @@ async function makePair(opts: {
   permissionMode?: 'allow-all' | 'ask' | 'deny-all'
   suspendTtlMs?: number
   maxSteps?: number
+  suspendTable?: SuspendTable
 }): Promise<Pair> {
   const dir = mkdtempSync(join(tmpdir(), 'a2a-exec-'))
   dirs.push(dir)
@@ -105,6 +107,7 @@ async function makePair(opts: {
     suspendTtlMs: opts.suspendTtlMs ?? 5000,
     maxSteps: opts.maxSteps ?? 4,
     chunkChars: 1000, // 不切块，测试看单条最终 artifact 即可
+    ...(opts.suspendTable ? { suspendTable: opts.suspendTable } : {}),
   })
   host = new HarnessHost({
     cwd: dir,
@@ -411,6 +414,27 @@ describe('HarnessAgentExecutor：取消与超时', () => {
     const final = events.filter((e) => e.kind === 'statusUpdate').at(-1)!
     expect(final.data.metadata.code).toBe('INPUT_REQUIRED_TIMEOUT')
     expect(executor.suspend.size).toBe(0)
+  })
+
+  it('外部注入的挂起表：onExpire 仍由 executor 接管 ⇒ 超时照样 FAILED（不再伪装 COMPLETED）', async () => {
+    // 注入的表**不带** onExpire（模拟宿主自建并复用的那张表）。若 executor 不接管，
+    // `running.expired` 永不置位 ⇒ 超时被 finalize 静默报成 COMPLETED。
+    const table = new SuspendTable({ ttlMs: 40 })
+    const { executor } = await makePair({
+      mock: toolThenText('go', 'x'),
+      permissionMode: 'ask',
+      suspendTable: table,
+    })
+    const bus = new DefaultExecutionEventBus()
+    const events = collect(bus)
+
+    await executor.execute(ctxOf(requestOf('go'), 't7', 'c7'), bus)
+
+    expect(statuses(events).at(-1)).toBe(TaskState.TASK_STATE_FAILED)
+    expect(events.filter((e) => e.kind === 'statusUpdate').at(-1)!.data.metadata.code).toBe(
+      'INPUT_REQUIRED_TIMEOUT',
+    )
+    expect(table.size).toBe(0)
   })
 
   it('轮末落盘：A2A 会话写进 sessionStore，断线重连读得回来', async () => {

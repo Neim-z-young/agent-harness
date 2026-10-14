@@ -113,8 +113,11 @@ export class HarnessAgentExecutor implements AgentExecutor {
       opts.suspendTable ??
       new SuspendTable({
         ttlMs: opts.suspendTtlMs ?? DEFAULT_SUSPEND_TTL_MS,
-        onExpire: (p) => this.markExpired(p),
       })
+    // ★ `onExpire` **无条件由本 executor 接管**（含外部注入的表）。
+    // 不接管的后果：挂起超时后 `running.expired` 不置位 ⇒ `finalize` 把"等待授权答复超时"
+    // 静默报成 `COMPLETED`（用户看到"成功"，实际什么都没做）。这正是"写了像生效、其实只有一半"。
+    this.suspendTable.setOnExpire((p) => this.markExpired(p))
     this.asker = this.makeAsker()
   }
 

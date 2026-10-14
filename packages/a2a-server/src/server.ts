@@ -185,8 +185,21 @@ function isAsyncGenerator(v: unknown): v is AsyncGenerator<unknown> {
  * 中途出错时**必须补一帧 `event: error`**（SDK 的 `formatSSEErrorEvent`）：SSE 一旦
  * 提交了响应头就无法再回 JSON-RPC error，若只是 `finally { close() }`，客户端只会看到
  * 一段**正常结束的流**——错误被吞掉。SDK 自带的 express 宿主用的是同一策略。
+ *
+ * ## 客户端断连必须中止服务端任务（`cancel` 分支）
+ * 客户端断开时运行时会对响应体流调用 `cancel()`。不处理它=生成器**继续在后端跑**，
+ * 更糟的是若任务正停在权限挂起（`INPUT_REQUIRED`）上，它会**永久挂着**并令该 `contextId`
+ * 之后的每条消息都被 `ConcurrentTaskError` 拒（会话卡死）。故 `cancel` 里要做两件事：
+ * ① 停止消费生成器（`gen.return()`）；② 经 `onCancel` 让调用方发一次 `CancelTask` 释放任务。
+ *
+ * 导出仅为单测直接触发 `cancel()`（Bun 下从客户端 `fetch` abort 到本流 `cancel` 的传播
+ * 在测试环境里不可稳定复现，故对机制做确定性单测）。
  */
-function sseBody(gen: AsyncGenerator<unknown>, requestId?: unknown): ReadableStream<Uint8Array> {
+export function sseBody(
+  gen: AsyncGenerator<unknown>,
+  requestId?: unknown,
+  onCancel?: () => void,
+): ReadableStream<Uint8Array> {
   const enc = new TextEncoder()
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -205,6 +218,15 @@ function sseBody(gen: AsyncGenerator<unknown>, requestId?: unknown): ReadableStr
       } finally {
         controller.close()
       }
+    },
+    async cancel() {
+      // 客户端断连：先让生成器的 `for await` 收尾（其 finally 会清 inflight），再释放任务。
+      try {
+        await gen.return?.(undefined as never)
+      } catch {
+        /* 生成器收尾失败不影响下面的任务释放 */
+      }
+      onCancel?.()
     },
   })
 }
@@ -308,10 +330,12 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
   const eventBusManager = new HarnessEventBusManager((taskId) => executor.isRunning(taskId))
 
   // 幂等 / 并发的三张表：
-  //  - messageIndex: messageId → taskId（已执行完，可回放快照）
+  //  - messageIndex: messageId → { taskId, contextId }（已执行完，可回放快照）
   //  - inflight:     正在处理中的 messageId（尚无 taskId 可回放）
   //  - callers:      contextId → 调用方（隔离）
-  const messageIndex = new Map<string, string>()
+  // ⚠️ 值里**必须带 contextId**：`messageId` 是调用方自选的，只按它索引会让"复用同一个
+  //    messageId"静默命中别人那条任务（见回放处的归属校验）。
+  const messageIndex = new Map<string, { taskId: string; contextId?: string }>()
   const inflight = new Set<string>()
   const callers = new CallerRegistry()
 
@@ -422,12 +446,18 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
 
     // ---- 3. 发送类方法的前置判定：幂等 → 并发 → 隔离 ----
     let messageId = ''
+    /** 同上：`contextId` 要随 messageIndex 一起记下（回放时的归属校验），但它声明在下面的 isSend 块内 */
+    let msgContextId = ''
+    /** 请求里带的 `taskId`（续接轮）；客户端断连时用它发 `CancelTask` */
+    let reqTaskId = ''
     if (isSend) {
       const params = body['params'] as Record<string, unknown> | undefined
       const message = params?.['message'] as Record<string, unknown> | undefined
       messageId = typeof message?.['messageId'] === 'string' ? (message['messageId'] as string) : ''
       const contextId = typeof message?.['contextId'] === 'string' ? (message['contextId'] as string) : ''
+      msgContextId = contextId
       const taskId = typeof message?.['taskId'] === 'string' ? (message['taskId'] as string) : ''
+      reqTaskId = taskId
 
       if (!messageId) {
         return rpcError(body['id'], {
@@ -437,9 +467,17 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
         })
       }
 
-      // 幂等：已执行过 ⇒ 回放快照
+      // 幂等：已执行过 ⇒ 回放快照。
+      // ⚠️ 回放**必须带归属校验**：`messageId` 由调用方自选，messageIndex 只按它索引时，
+      // 另一个上下文复用同一个 messageId 就会**静默拿到别人那条任务的快照**（自己的消息既不执行
+      // 也不报错）。这条校验原本排在下面 `callers.claim` 之后 ⇒ 永远轮不到它。
       const known = messageIndex.get(messageId)
-      if (known) return replay(known, body['id'], ctx, isStream)
+      if (known) {
+        if (contextId && known.contextId && contextId !== known.contextId) {
+          return serverErrorResponse(new ContextTaskMismatchError(known.taskId, contextId), body['id'])
+        }
+        return replay(known.taskId, body['id'], ctx, isStream)
+      }
       // 幂等：仍在处理中 ⇒ 结构化拒绝（等它跑完再来查）
       if (inflight.has(messageId)) return serverErrorResponse(new DuplicateMessageError(messageId), body['id'])
 
@@ -513,22 +551,44 @@ export function createA2aServer(opts: A2aServerOptions): A2aServer {
 
         // 从首个带 task 的 chunk 记下 taskId（供后续重复 messageId 回放）
         const firstTaskId = (first.value as { result?: { task?: { id?: string } } })?.result?.task?.id
-        if (typeof firstTaskId === 'string' && firstTaskId) messageIndex.set(messageId, firstTaskId)
+        if (typeof firstTaskId === 'string' && firstTaskId) messageIndex.set(messageId, { taskId: firstTaskId, ...(msgContextId ? { contextId: msgContextId } : {}) })
+        // 客户端断连要释放的任务 id：优先用首个 chunk 里的（新任务），否则用请求里带的（续接轮）
+        const streamTaskId = typeof firstTaskId === 'string' && firstTaskId ? firstTaskId : reqTaskId
 
         const wrapped = (async function* () {
           try {
             if (!first.done) yield first.value
             for await (const chunk of iterator) yield chunk
           } finally {
+            req.signal.removeEventListener('abort', onDisconnect)
             inflight.delete(messageId)
           }
         })()
-        return new Response(sseBody(wrapped, body['id']), { headers: SSE_HEADERS })
+        // 客户端断连 ⇒ 释放服务端任务。**用 `req.signal` 而不是 `ReadableStream.cancel`**：
+        // 实测（Bun）客户端 `fetch` 的 abort 会触发 `req.signal` 的 abort，而 `sseBody` 流的
+        // `cancel()` 在本仓路径下**并不稳定触发** ⇒ 只挂 `cancel` 会漏掉断连（任务继续挂着）。
+        // 两处都接（`sseBody` 的 onCancel 兜底），用 `released` 去重。
+        let released = false
+        function releaseTask(): void {
+          if (released) return
+          released = true
+          if (!streamTaskId) return
+          void transport
+            .handle({ jsonrpc: '2.0', id: body['id'], method: 'CancelTask', params: { id: streamTaskId } }, ctx)
+            .catch(() => {})
+        }
+        function onDisconnect(): void {
+          void Promise.resolve(wrapped.return?.(undefined as never)).catch(() => {})
+          releaseTask()
+        }
+        // 流式响应已提交 ⇒ 此刻 `req.signal` 未 abort；一旦客户端断开即触发（`once` 防重入）
+        req.signal.addEventListener('abort', onDisconnect, { once: true })
+        return new Response(sseBody(wrapped, body['id'], onDisconnect), { headers: SSE_HEADERS })
       }
 
       inflight.delete(messageId)
       const taskId = (result as { result?: { task?: { id?: string } } })?.result?.task?.id
-      if (messageId && typeof taskId === 'string' && taskId) messageIndex.set(messageId, taskId)
+      if (messageId && typeof taskId === 'string' && taskId) messageIndex.set(messageId, { taskId, ...(msgContextId ? { contextId: msgContextId } : {}) })
       return Response.json(result)
     } catch (e) {
       inflight.delete(messageId)

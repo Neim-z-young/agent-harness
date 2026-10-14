@@ -58,11 +58,22 @@ interface Entry {
 export class SuspendTable {
   private readonly entries = new Map<string, Entry>()
   private readonly ttlMs: number
-  private readonly onExpire: ((pending: PendingAsk) => void) | undefined
+  private onExpire: ((pending: PendingAsk) => void) | undefined
 
   constructor(opts: SuspendTableOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_SUSPEND_TTL_MS
     this.onExpire = opts.onExpire
+  }
+
+  /**
+   * 替换超时回调。
+   *
+   * 存在的理由：executor 可能被传入一张**外部构造**的挂起表（`HarnessAgentExecutorOptions.suspendTable`），
+   * 那种情况下构造参数里的 `onExpire` 不是 executor 的 —— 而"超时置 `expired`"是 executor 的职责，
+   * 不接管就会把"挂起超时"静默报成 `COMPLETED`（`finalize` 只认 `running.expired`）。故必须能补装。
+   */
+  setOnExpire(fn: ((pending: PendingAsk) => void) | undefined): void {
+    this.onExpire = fn
   }
 
   /**

@@ -18,7 +18,7 @@ import { HarnessHost, createAuditSink, type Host } from '@harness/host'
 import type { MockProviderConfig } from '@harness/provider-mock'
 import { CallerRegistry, LOCAL_CALLER } from './auth'
 import { messageOf, textPart } from './mapping'
-import { DEFAULT_A2A_HOSTNAME, createA2aServer, type A2aServer } from './server'
+import { DEFAULT_A2A_HOSTNAME, createA2aServer, sseBody, type A2aServer } from './server'
 
 // ========================================================================
 // 夹具
@@ -339,6 +339,39 @@ describe('A2aServer：SendMessage / GetTask', () => {
 
     const r = await rpc(server, 'CancelTask', { id: task.id })
     expect(taskOf(r).status.state).toBe('TASK_STATE_CANCELED')
+  })
+
+  it('客户端断连（sseBody.cancel）⇒ 停掉生成器 + 释放服务端任务', async () => {
+    // ⚠️ Bun 下"客户端 fetch abort → 响应体流 cancel"的传播在测试环境里不可稳定复现
+    // （纯 `Bun.serve` 探针能复现，但经 SDK transport 后观测不到），故对**机制**做确定性单测：
+    // 直接触发流自身的 `cancel()`，断言它停掉生成器并调用 onCancel（= 生产侧发 CancelTask 的钩子）。
+    let onCancelCalls = 0
+    let firstYielded = false
+    async function* gen(): AsyncGenerator<unknown> {
+      try {
+        for (let i = 0; i < 100; i++) {
+          firstYielded = true
+          yield { n: i }
+          await new Promise((r) => setTimeout(r, 5))
+        }
+      } finally {
+        // 生成器被 `return()` 收尾时进这里 —— 证明 cancel 确实中断了消费
+        ;(gen as { returned?: boolean }).returned = true
+      }
+    }
+    const g = gen()
+    const stream = sseBody(g, 'r1', () => {
+      onCancelCalls += 1
+    })
+    const reader = stream.getReader()
+    const first = await reader.read()
+    expect(firstYielded).toBe(true)
+    expect(first.done).toBe(false)
+    await reader.cancel()
+    // return() 在下一个挂起点生效（最多 ~5ms）
+    await new Promise((r) => setTimeout(r, 60))
+    expect(onCancelCalls).toBe(1)
+    expect((gen as unknown as { returned?: boolean }).returned).toBe(true)
   })
 })
 
