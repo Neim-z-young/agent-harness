@@ -926,4 +926,4 @@ Agent 执行链路：
 
 ## License
 
-Private
+[MIT](./LICENSE) © 2026 Neim-z-young

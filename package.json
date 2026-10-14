@@ -1,6 +1,7 @@
 {
   "name": "agent-harness",
   "version": "0.1.0",
+  "license": "MIT",
   "private": true,
   "description": "A plugin-based Agent Harness framework built with TypeScript + Bun",
   "type": "module",
