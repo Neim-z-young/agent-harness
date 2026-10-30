@@ -15,7 +15,10 @@ import { join, resolve } from 'node:path'
 import { loadRetailDb, loadRetailTasks, loadTasksBySplit } from './data'
 import { runTask, type ProviderOpts } from './runner'
 import { renderReport, summarize, writeResults } from './metrics'
-import type { TauTask, TaskRunResult } from './types'
+import type { TauTask, TaskRunResult, TaskSplit } from './types'
+
+/** --split 的合法取值（与 TaskSplit 同源，避免「类型加了 base、CLI 还在拒 base」） */
+const VALID_SPLITS: readonly TaskSplit[] = ['train', 'test', 'base', 'all']
 
 interface CliArgs {
   provider: string
@@ -25,7 +28,7 @@ interface CliArgs {
   apiKey?: string
   baseUrl?: string
   apiPath?: string
-  split: 'train' | 'test' | 'all'
+  split: TaskSplit
   taskIds?: string[]
   k: number
   maxTurns: number
@@ -85,17 +88,29 @@ async function main(): Promise<number> {
   const concurrency = Math.max(1, args.concurrency ?? 4)
   const outDir = resolve(args.out ?? './bench-results')
   const split = args.split ?? 'test'
+  // 拼错的 --split 原先会一路走到「跑 0 个任务 → 输出一份全是 0 的报表」，无任何报错
+  if (!VALID_SPLITS.includes(split)) {
+    console.error(`未知 --split "${split}"（可用: ${VALID_SPLITS.join('|')}）`)
+    return 1
+  }
 
   let tasks: TauTask[]
   if (args.taskIds?.length) {
     const all = loadRetailTasks()
-    tasks = args.taskIds.map((id) => all.find((t) => t.id === id)).filter((t): t is TauTask => !!t)
+    const wanted = new Set(args.taskIds)
+    tasks = all.filter((t) => wanted.has(t.id))
     if (tasks.length === 0) {
       console.error(`task-ids 无匹配: ${args.taskIds.join(',')}`)
       return 1
     }
+    const missing = args.taskIds.filter((id) => !tasks.some((t) => t.id === id))
+    if (missing.length > 0) console.error(`[bench] 忽略不存在的 task-id: ${missing.join(',')}`)
   } else {
     tasks = loadTasksBySplit(split)
+  }
+  if (tasks.length === 0) {
+    console.error(`没有可跑的任务（split=${split}）`)
+    return 1
   }
 
   await mkdir(outDir, { recursive: true })

@@ -54,6 +54,21 @@ export interface TauTask {
   evaluation_criteria?: EvaluationCriteria | null
 }
 
+// ===== 任务划分（split_tasks.json）=====
+
+/**
+ * 划分键。**与数据文件保持一致**：split_tasks.json 实际有 train/test/base 三档，
+ * 此前类型只声明 train/test，'base'（全集 114 个任务）在类型上根本无法取用。
+ * 'all' 不是数据里的键，是「取全集」的伪划分。
+ */
+export type TaskSplit = 'train' | 'test' | 'base' | 'all'
+
+/** split_tasks.json 里真实存在的键 */
+export type TaskSplitName = Exclude<TaskSplit, 'all'>
+
+/** split_tasks.json 的形状（Partial：缺档是可观测的事实，不该靠 `!` 断言抹掉） */
+export type TaskSplitMap = Partial<Record<TaskSplitName, string[]>>
+
 // ===== retail DB 模型（data_model.py）=====
 
 export interface Variant {
