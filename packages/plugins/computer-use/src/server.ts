@@ -94,6 +94,8 @@ export class ComputerUseMcpServer {
           async handle(args) {
             const r = await backend.listApps({
               includeWindowIds: args.includeWindowIds as boolean | undefined,
+              // windowLimit 之前只在 schema 里声明、后端完全忽略（静默吞参数），现在真的生效
+              windowLimit: args.windowLimit as number | undefined,
             })
             return textBlock(formatApps(r.apps))
           },
@@ -138,9 +140,10 @@ export class ComputerUseMcpServer {
               x: num('x 坐标（图片像素）'),
               y: num('y 坐标（图片像素）'),
               element_id: str('UI 树 element_id'),
-              button: str('left | right | middle'),
-              clickCount: num('点击次数'),
+              button: str('left | right | middle（当前仅实现 left）'),
+              clickCount: num('点击次数（1-3，缺省 1）'),
             },
+            required: ['app'],
             additionalProperties: false,
           },
           async handle(args) {
@@ -170,8 +173,9 @@ export class ComputerUseMcpServer {
               deltaY: num('垂直滚动量'),
               deltaX: num('水平滚动量'),
               direction: str('up | down | left | right'),
-              pages: num('滚动页数（缺省 1）'),
+              pages: num('滚动页数（1-50，缺省 1）'),
             },
+            required: ['app'],
             additionalProperties: false,
           },
           async handle(args) {
@@ -201,6 +205,7 @@ export class ComputerUseMcpServer {
               toX: num('终点 x'),
               toY: num('终点 y'),
             },
+            required: ['app', 'fromX', 'fromY', 'toX', 'toY'],
             additionalProperties: false,
           },
           async handle(args) {
@@ -331,6 +336,9 @@ export class ComputerUseMcpServer {
     try {
       req = JSON.parse(msg)
     } catch {
+      // 协议口径：解析失败必须回 -32700。旧实现静默 return，
+      // 客户端只能等超时，排查时看不出是报文坏了还是对面没响应。
+      reply(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }))
       return
     }
     const respond = (result: unknown) =>
