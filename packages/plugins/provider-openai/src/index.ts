@@ -1105,8 +1105,11 @@ export function createOpenAICompatiblePlugin(
       }
 
       if (!resolved.apiKey) {
+        // 文案必须点名**本预设**的环境变量：只说"key 未配置"会让人去翻 OPENAI_API_KEY，
+        // 而预设刻意不继承别家的 key（见 resolvePresetConfig）
         ctx.log.warn(
-          `${preset.envApiKey} 未配置 ⇒ ${preset.pluginName} 请求将以空 Bearer 发出（刻意不回退 OPENAI_API_KEY）`,
+          `${preset.envApiKey} 未配置 ⇒ ${preset.pluginName} 请求将以空 Bearer 发出。` +
+            `请设置 ${preset.envApiKey}，或在 config 的 provider.${resolved.providerId} 里传 apiKey`,
         )
       }
 
@@ -1203,73 +1206,35 @@ export function presetProviderTypeFactory(preset: OpenAICompatiblePreset): Provi
 // 插件工厂
 // ========================================================================
 
+/**
+ * 原生 OpenAI 端点也是「预设」：它只比 GLM / Qwen 多一样东西 —— 缺省值恰好等于
+ * `OpenAIChatProvider` 构造函数的缺省值。走同一条装配路径，三份克隆才真的只剩一份。
+ */
+export const OPENAI_PRESET: OpenAICompatiblePreset = {
+  type: 'openai',
+  defaultProviderId: 'openai',
+  pluginName: 'OpenAI Provider',
+  pluginDescription: '对接 OpenAI Chat Completions API 的 Provider 插件',
+  envApiKey: 'OPENAI_API_KEY',
+  envBaseUrl: 'OPENAI_BASE_URL',
+  defaultBaseUrl: 'https://api.openai.com',
+  defaultApiPath: '/v1/chat/completions',
+  defaultModel: 'gpt-4o-mini',
+  // 顶层 `thinking: { type }` / `reasoning_effort` 是本类的既有能力
+  // （DeepSeek 等 compat 端点靠它；标准 OpenAI 不传即不发送）
+  supports: { thinking: true },
+}
+
+/**
+ * 构造 OpenAI Provider 插件。
+ *
+ * 插件 id 随 providerId 派生，使多个 OpenAI 兼容端点（openai/deepseek/ollama/glm/qwen…）
+ * 可在同一进程内各自注册而不冲突（PluginDuplicateIdError）。
+ */
 export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): AgentPlugin & {
   readonly provider: OpenAIChatProvider
 } {
-  let provider: OpenAIChatProvider | undefined
-
-  // 插件 id 随 providerId 派生，使多个 OpenAI 兼容端点（openai/deepseek/ollama/glm/qwen…）
-  // 可在同一进程内各自注册而不冲突（PluginDuplicateIdError）。
-  const providerId = config?.providerId ?? 'openai'
-  const pluginId = `provider.${providerId}`
-
-  const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
-    id: pluginId,
-    version: '0.1.0',
-    name: 'OpenAI Provider',
-    description: '对接 OpenAI Chat Completions API 的 Provider 插件',
-
-    async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<OpenAIProviderConfig>(pluginId)
-      const merged: OpenAIProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
-
-      provider = new OpenAIChatProvider(merged, () => [])
-
-      ctx.log.info('OpenAI Provider 已安装', {
-        baseUrl: provider['config'].baseUrl,
-        defaultModel: provider['config'].defaultModel,
-      })
-
-      return {
-        async 'core.harness.init'(_input, output) {
-          const harness = (output as { harness?: unknown }).harness as
-            | {
-                providers?: ProviderRuntime
-                tools?: { list?: () => Tool[] }
-              }
-            | undefined
-
-          if (!provider) return
-
-          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id —— 见
-          // docs/runtime-registration-plan.md §2.1。**不设默认**：默认由宿主显式 setDefault。
-          if (harness?.providers) {
-            harness.providers.register(providerId, provider, {
-              source: `plugin:${pluginId}`,
-              type: 'openai',
-            })
-          } else {
-            // 无兼容回退：`_setChatProvider` 已删除（见 remaining-work-plan §2-D）。
-            // 宿主没有 `providers` 实例表时**只告警不静默** —— 这条 else 是唯一可见出口。
-            ctx.log.warn('Harness.providers 未找到，OpenAI Provider 可能未注册')
-          }
-
-          provider.setToolsGetter(() => harness?.tools?.list?.() ?? [])
-        },
-      }
-    },
-
-    async uninstall() {
-      provider = undefined
-    },
-
-    get provider(): OpenAIChatProvider {
-      if (!provider) throw new Error('OpenAIChatProvider 未创建 — plugin.install() 未执行')
-      return provider
-    },
-  }
-
-  return plugin
+  return createOpenAICompatiblePlugin(OPENAI_PRESET, config)
 }
 
 /** 默认导出：无配置常量（配置来自 config store 与环境变量） */
@@ -1281,24 +1246,4 @@ export const providerOpenAIPlugin: AgentPlugin & { readonly provider: OpenAIChat
 // 上层（core/cli）只经 ProviderTypeRegistry 按 type 解析，不感知本模块具体配置结构。
 // ========================================================================
 
-export const providerTypeFactory: ProviderTypeFactory = {
-  type: 'openai',
-  createPlugin: (config: ProviderConfig): AgentPlugin =>
-    createProviderOpenAIPlugin({
-      baseUrl: config.baseUrl,
-      apiKey: config.apiKey,
-      defaultModel: config.model,
-      maxTokens: config.maxTokens,
-      timeoutMs: config.timeoutMs,
-      // 非流式总时长系数：ProviderConfig 有 index signature，这里的取值校验是唯一闸门
-      completeTimeoutFactor: typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
-        ? config.completeTimeoutFactor
-        : undefined,
-      apiPath: config.apiPath,
-      providerId: config.id,
-      // 思考模式（config.json providers[].thinking / reasoningEffort）。
-      // ProviderConfig 有 index signature，这里的取值校验是唯一闸门：非法值一律按未配置处理。
-      thinking: config.thinking === 'enabled' || config.thinking === 'disabled' ? config.thinking : undefined,
-      reasoningEffort: typeof config.reasoningEffort === 'string' && config.reasoningEffort ? config.reasoningEffort : undefined,
-    }),
-}
+export const providerTypeFactory: ProviderTypeFactory = presetProviderTypeFactory(OPENAI_PRESET)

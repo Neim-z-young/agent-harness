@@ -1,7 +1,10 @@
 import { describe, it, expect } from 'bun:test'
 import {
+  OPENAI_PRESET,
   createOpenAICompatiblePlugin,
+  createProviderOpenAIPlugin,
   presetProviderTypeFactory,
+  providerTypeFactory,
   resolvePresetConfig,
   type OpenAICompatiblePreset,
 } from './index'
@@ -156,7 +159,9 @@ describe('createOpenAICompatiblePlugin：装配与出声', () => {
       await createOpenAICompatiblePlugin(THINKING_PRESET).install?.(ctx)
       const warn = logs.find((l) => l.level === 'warn')
       expect(warn?.msg).toContain('HARNESS_TEST_ZHIPU_KEY')
-      expect(warn?.msg).toContain('不回退 OPENAI_API_KEY')
+      // 不给"去配 OPENAI_API_KEY"的暗示：预设的 key 只认自己声明的那个变量
+      expect(warn?.msg).toContain('provider.glm')
+      expect(warn?.msg).toContain('apiKey')
     })
   })
 
@@ -285,5 +290,37 @@ describe('presetProviderTypeFactory：config.json → 插件', () => {
     await bad.install?.(fakeCtx().ctx)
     expect(bad.provider['config'].thinking).toBeUndefined()
     expect(bad.provider['config'].completeTimeoutFactor).toBe(10)
+  })
+})
+
+describe('原生 OpenAI 也走预设装配（迁移回归）', () => {
+  it('插件 id / name / description 与迁移前逐字一致', () => {
+    const plugin = createProviderOpenAIPlugin()
+    expect(plugin.id).toBe('provider.openai')
+    expect(plugin.name).toBe('OpenAI Provider')
+    expect(plugin.description).toBe('对接 OpenAI Chat Completions API 的 Provider 插件')
+    expect(providerTypeFactory.type).toBe('openai')
+  })
+
+  it('端点缺省仍是 api.openai.com / /v1/chat/completions / gpt-4o-mini', () => {
+    const r = resolvePresetConfig(OPENAI_PRESET, undefined)
+    expect(r.baseUrl).toBe('https://api.openai.com')
+    expect(r.apiPath).toBe('/v1/chat/completions')
+    expect(r.defaultModel).toBe('gpt-4o-mini')
+  })
+
+  it('thinking / reasoningEffort 仍被转发（compat 端点如 DeepSeek 依赖）', async () => {
+    const plugin = createProviderOpenAIPlugin({
+      apiKey: 'k',
+      thinking: 'enabled',
+      reasoningEffort: 'high',
+    })
+    await plugin.install?.(fakeCtx().ctx)
+    expect(plugin.provider['config'].thinking).toBe('enabled')
+    expect(plugin.provider['config'].reasoningEffort).toBe('high')
+  })
+
+  it('providerId 可覆盖（deepseek / ollama 等多端点同进程注册）', () => {
+    expect(createProviderOpenAIPlugin({ providerId: 'deepseek' }).id).toBe('provider.deepseek')
   })
 })
