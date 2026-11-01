@@ -7,146 +7,60 @@
  * - 认证：Authorization: Bearer {ZHIPU_API_KEY}
  * - 默认模型：glm-4-flash
  *
- * 复用 @harness/provider-openai 的 OpenAIChatProvider，仅覆盖配置。
+ * 复用 @harness/provider-openai 的 `OpenAIChatProvider` + `createOpenAICompatiblePlugin`，
+ * 本文件**只声明常量**（端点、模型、环境变量名、能力开关）—— 装配逻辑在 provider-openai 里
+ * 只有一份，见其 `OpenAICompatiblePreset` 的说明。
  *
  * 配置来源（优先级从高到低）：
  * 1. createProviderGlmPlugin({ ... }) 直接传入配置
  * 2. ctx.config.get('provider.glm')
  * 3. 环境变量 ZHIPU_API_KEY / ZHIPU_BASE_URL
+ *
+ * ⚠️ **不继承 `OPENAI_API_KEY`**：本预设的 key 只认 `ZHIPU_API_KEY`，未配置时以空 Bearer 发出
+ * （安装期告警）。否则"忘了配智谱 key"会安静地把 OpenAI 的 key 送到 bigmodel.cn。
  */
 
-import type { ChatProvider, ProviderRuntime } from '@harness/core'
-import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
-import type { Tool } from '@harness/tool'
-import { OpenAIChatProvider, type OpenAIProviderConfig } from '@harness/provider-openai'
+import type { AgentPlugin } from '@harness/plugin'
+import {
+  createOpenAICompatiblePlugin,
+  presetProviderTypeFactory,
+  type OpenAICompatiblePreset,
+  type OpenAIProviderConfig,
+} from '@harness/provider-openai'
 
-// ===== 配置 =====
-
-export interface GlmProviderConfig {
-  /** API Key（默认读 ZHIPU_API_KEY 环境变量） */
-  apiKey?: string
-  /** API 根路径（默认 https://open.bigmodel.cn） */
-  baseUrl?: string
-  /** API 路径（默认 /api/paas/v4/chat/completions） */
-  apiPath?: string
-  /** 默认模型（默认 glm-4-flash） */
-  defaultModel?: string
-  /** max_tokens 默认值 */
-  maxTokens?: number
-  /** 请求超时（ms） */
-  timeoutMs?: number
-  /** 当模型输出空时是否报错 */
-  strictEmptyContent?: boolean
-  /** Provider ID（默认 'glm'；配置多 GLM 端点时可覆盖为不同 id） */
-  providerId?: string
+/** GLM 的端点常量（装配逻辑见 {@link createOpenAICompatiblePlugin}） */
+export const GLM_PRESET: OpenAICompatiblePreset = {
+  type: 'glm',
+  defaultProviderId: 'glm',
+  pluginName: 'GLM Provider',
+  pluginDescription: '对接智谱 GLM（BigModel OpenAI 兼容 API）的 Provider 插件',
+  envApiKey: 'ZHIPU_API_KEY',
+  envBaseUrl: 'ZHIPU_BASE_URL',
+  defaultBaseUrl: 'https://open.bigmodel.cn',
+  defaultApiPath: '/api/paas/v4/chat/completions',
+  defaultModel: 'glm-4-flash',
+  // 智谱接受顶层 `thinking: { type }`（与 DeepSeek 同形），故允许转发
+  supports: { thinking: true },
 }
 
-function toOpenAIConfig(cfg: GlmProviderConfig): OpenAIProviderConfig {
-  const envKey = typeof process !== 'undefined' ? process.env.ZHIPU_API_KEY : undefined
-  const envBase = typeof process !== 'undefined' ? process.env.ZHIPU_BASE_URL : undefined
-  return {
-    apiKey: cfg.apiKey ?? envKey,
-    baseUrl: cfg.baseUrl ?? envBase ?? 'https://open.bigmodel.cn',
-    apiPath: cfg.apiPath ?? '/api/paas/v4/chat/completions',
-    defaultModel: cfg.defaultModel ?? 'glm-4-flash',
-    maxTokens: cfg.maxTokens,
-    timeoutMs: cfg.timeoutMs,
-    strictEmptyContent: cfg.strictEmptyContent,
-    providerId: cfg.providerId ?? 'glm',
-  }
-}
-
-// ========================================================================
-// 插件工厂
-// ========================================================================
+/**
+ * 配置项。字段与缺省值见 {@link GLM_PRESET}（本类型刻意直接复用 `OpenAIProviderConfig`，
+ * 避免再维护一份"同样字段、不同注释"的影子类型）。
+ */
+export type GlmProviderConfig = OpenAIProviderConfig
 
 export function createProviderGlmPlugin(config?: GlmProviderConfig): AgentPlugin & {
-  readonly provider: OpenAIChatProvider
+  readonly provider: ReturnType<typeof createOpenAICompatiblePlugin>['provider']
 } {
-  let provider: OpenAIChatProvider | undefined
-
-  // 插件 id 随 providerId 派生，使多个 GLM 端点可在同一进程内各自注册而不冲突
-  const providerId = config?.providerId ?? 'glm'
-  const pluginId = `provider.${providerId}`
-
-  const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
-    id: pluginId,
-    version: '0.1.0',
-    name: 'GLM Provider',
-    description: '对接智谱 GLM（BigModel OpenAI 兼容 API）的 Provider 插件',
-
-    async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<GlmProviderConfig>(pluginId)
-      const merged: GlmProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
-
-      provider = new OpenAIChatProvider(toOpenAIConfig(merged), () => [])
-
-      ctx.log.info('GLM Provider 已安装', {
-        baseUrl: provider['config'].baseUrl,
-        defaultModel: provider['config'].defaultModel,
-      })
-
-      return {
-        async 'core.harness.init'(_input, output) {
-          const harness = (output as { harness?: unknown }).harness as
-            | {
-                providers?: ProviderRuntime
-                tools?: { list?: () => Tool[] }
-              }
-            | undefined
-
-          if (!provider) return
-
-          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id —— 见
-          // docs/runtime-registration-plan.md §2.1。**不设默认**：默认由宿主显式 setDefault。
-          if (harness?.providers) {
-            harness.providers.register(providerId, provider, {
-              source: `plugin:${pluginId}`,
-              type: 'glm',
-            })
-          } else {
-            // 无兼容回退：`_setChatProvider` 已删除（见 remaining-work-plan §2-D）。
-            // 宿主没有 `providers` 实例表时**只告警不静默** —— 这条 else 是唯一可见出口。
-            ctx.log.warn('Harness.providers 未找到，GLM Provider 可能未注册')
-          }
-
-          provider.setToolsGetter(() => harness?.tools?.list?.() ?? [])
-        },
-      }
-    },
-
-    async uninstall() {
-      provider = undefined
-    },
-
-    get provider(): OpenAIChatProvider {
-      if (!provider) throw new Error('GLM Provider 未创建 — plugin.install() 未执行')
-      return provider
-    },
-  }
-
-  return plugin
+  return createOpenAICompatiblePlugin(GLM_PRESET, config)
 }
 
 /** 默认导出：无配置常量（配置来自 config store 与环境变量） */
-export const providerGlmPlugin: AgentPlugin & { readonly provider: OpenAIChatProvider } =
-  createProviderGlmPlugin()
+export const providerGlmPlugin = createProviderGlmPlugin()
 
 // ========================================================================
 // Provider 类型工厂（抽象层契约：@harness/plugin → ProviderTypeFactory）
 // 上层（core/cli）只经 ProviderTypeRegistry 按 type 解析，不感知本模块具体配置结构。
 // ========================================================================
 
-export const providerTypeFactory: ProviderTypeFactory = {
-  type: 'glm',
-  createPlugin: (config: ProviderConfig): AgentPlugin =>
-    createProviderGlmPlugin({
-      baseUrl: config.baseUrl,
-      apiKey: config.apiKey,
-      defaultModel: config.model,
-      maxTokens: config.maxTokens,
-      timeoutMs: config.timeoutMs,
-      apiPath: config.apiPath,
-      providerId: config.id,
-    }),
-}
+export const providerTypeFactory = presetProviderTypeFactory(GLM_PRESET)
