@@ -27,10 +27,12 @@ import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
-
-// 流式总时长兜底系数：空闲超时负责「卡住不吐数据」，总时长兜底负责「一直慢慢吐、永不结束」。
-// 取 idle 的 10 倍作为宽松上限，正常请求不会触及。
-const STREAM_TOTAL_TIMEOUT_FACTOR = 10
+import {
+  RequestDeadline,
+  SseDecoder,
+  STREAM_TOTAL_TIMEOUT_FACTOR,
+  type SseFrame,
+} from '@harness/provider-kit'
 
 /**
  * 非流式 `complete()` 的总时长系数，与流式的 `STREAM_TOTAL_TIMEOUT_FACTOR` 对齐。
@@ -477,19 +479,13 @@ export class AnthropicChatProvider implements ChatProvider {
     const record = { body, response: undefined as AnthropicResponseBody | undefined, error: undefined as unknown }
     this.calls.push(record)
 
-    // AbortController 管理：外层 signal + 超时
-    const inner = new AbortController()
-    const outerSignal = params.signal
-    const onOuter = () => inner.abort()
-    if (outerSignal) {
-      if (outerSignal.aborted) inner.abort()
-      else outerSignal.addEventListener('abort', onOuter, { once: true })
-    }
+    // 外层 signal + 超时统一交给 @harness/provider-kit（此前 anthropic/gemini/openai 共 6 份同款样板）
+    const deadline = new RequestDeadline(params.signal)
     // 非流式的计时器是**总时长**，不是 idle ⇒ 与流式的总时长兜底取同一系数（见 completeTimeoutFactor）
     const completeTimeoutMs = this.config.timeoutMs * this.config.completeTimeoutFactor
-    const timer = setTimeout(
-      () => inner.abort(new Error(`Anthropic 请求超时（>${completeTimeoutMs}ms = timeoutMs ${this.config.timeoutMs}ms × ${this.config.completeTimeoutFactor}）`)),
+    deadline.armTotal(
       completeTimeoutMs,
+      `Anthropic 请求超时（>${completeTimeoutMs}ms = timeoutMs ${this.config.timeoutMs}ms × ${this.config.completeTimeoutFactor}）`,
     )
 
     try {
@@ -513,7 +509,7 @@ export class AnthropicChatProvider implements ChatProvider {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal: inner.signal,
+        signal: deadline.signal,
       })
 
       const text = await resp.text()
@@ -557,8 +553,7 @@ export class AnthropicChatProvider implements ChatProvider {
         raw: parsed,
       }
     } finally {
-      clearTimeout(timer)
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
+      deadline.dispose()
     }
   }
 
@@ -616,36 +611,23 @@ export class AnthropicChatProvider implements ChatProvider {
       ...(params.headers ?? {}),
     }
 
-    // AbortController 管理
-    const inner = new AbortController()
-    const outerSignal = params.signal
-    const onOuter = () => inner.abort()
-    if (outerSignal) {
-      if (outerSignal.aborted) inner.abort()
-      else outerSignal.addEventListener('abort', onOuter, { once: true })
-    }
+    // 外层 signal + 超时统一交给 @harness/provider-kit
+    const deadline = new RequestDeadline(params.signal)
     // 空闲超时（idle），**不是**总时长超时：每收到一块数据就重新计时。
     // 总时长语义下，只要模型持续输出超过 timeoutMs 就会把长回答无理由掐断，
     // 用户看到的是「内容明明已经渲染出来了，却报发送失败」。判定结束的职责
     // 交给 `message_stop`（Anthropic SSE 的终止事件），见下方 readLoop。
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const armIdleTimeout = () => {
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(
-        () => inner.abort(new Error(`Anthropic stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`)),
+    const armIdleTimeout = () =>
+      deadline.armIdle(
         this.config.timeoutMs,
+        `Anthropic stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`,
       )
-    }
     armIdleTimeout()
 
     // 总时长兜底：即使上游持续慢速吐数据（每次间隔 < timeoutMs，idle 计时器永远被续期），
     // 一旦累计超过总时长上限也必须结束，否则请求会永远挂住。该计时器**不**随数据续期。
     const totalMs = this.config.timeoutMs * STREAM_TOTAL_TIMEOUT_FACTOR
-    let totalTimer: ReturnType<typeof setTimeout> | undefined
-    totalTimer = setTimeout(
-      () => inner.abort(new Error(`Anthropic stream 总时长超时（>${totalMs}ms）`)),
-      totalMs,
-    )
+    deadline.armTotal(totalMs, `Anthropic stream 总时长超时（>${totalMs}ms）`)
 
     try {
       const url = `${this.config.baseUrl.replace(/\/$/, '')}/v1/messages`
@@ -653,7 +635,7 @@ export class AnthropicChatProvider implements ChatProvider {
         method: 'POST',
         headers,
         body: JSON.stringify(streamBody),
-        signal: inner.signal,
+        signal: deadline.signal,
       })
 
       if (!resp.ok) {
@@ -667,105 +649,109 @@ export class AnthropicChatProvider implements ChatProvider {
       const reader = resp.body?.getReader()
       if (!reader) throw new Error('Response body 不可读（stream not supported）')
 
-      const decoder = new TextDecoder()
-      let buf = ''
+      const textDecoder = new TextDecoder()
+      // 分帧交给 @harness/provider-kit：CRLF / 多行 data / 事件被 TCP 切半都在那里统一处理。
+      // 旧实现是「按行状态机 + 空行派发」，且 currentEvent / currentData 声明在**单次
+      // reader.read() 的作用域内** —— 上游用 CRLF 时 `line === ''` 永远不成立（实际是 '\r'），
+      // 于是整条流一个事件都派发不出去：不报错、不 yield 任何 delta，最后只 yield 一个 done。
+      const sse = new SseDecoder()
       let modelOut: string | undefined
       let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number; cacheWrite?: number } | undefined
       // 原生 stop_reason（`message_start` 里为 null，终值随 `message_delta` 到达）
       let finishRaw: string | undefined
       // 当前 content block 的 index → 类型映射
       const blockTypes: Map<number, 'text' | 'tool_use'> = new Map()
+      // 是否已看到 message_stop（嵌套生成器里无法 `break readLoop`，用标志位传达）
+      let stopped = false
+
+      /** 把一批 SSE 帧翻译成 ChatStreamChunk；`push()` 与 `flush()` 共用同一条解析路径 */
+      function* emitFrames(frames: SseFrame[]): Generator<ChatStreamChunk, void, unknown> {
+        for (const frame of frames) {
+          let json: any
+          try {
+            json = JSON.parse(frame.data)
+          } catch {
+            continue // 单帧坏掉不带走整条流（旧实现是裸 JSON.parse，一个坏帧直接抛穿）
+          }
+          // 事件名优先取 payload 的 type（Anthropic 两种载体都给），缺失时回落到 `event:` 字段
+          const eventName: string = json?.type ?? frame.event ?? ''
+
+          switch (eventName) {
+            case 'message_start': {
+              modelOut = json.message?.model
+              const u = json.message?.usage
+              if (u) tokenUsage = {
+                input: u.input_tokens ?? 0,
+                output: u.output_tokens ?? 0,
+                ...(u.cache_read_input_tokens != null ? { cacheRead: u.cache_read_input_tokens } : {}),
+                ...(u.cache_creation_input_tokens != null ? { cacheWrite: u.cache_creation_input_tokens } : {}),
+              }
+              break
+            }
+            case 'content_block_start': {
+              const block = json.content_block
+              if (block?.type === 'text') {
+                blockTypes.set(json.index, 'text')
+              } else if (block?.type === 'tool_use') {
+                blockTypes.set(json.index, 'tool_use')
+                yield { type: 'tool_use_start', toolUseId: block.id, toolId: block.name }
+              }
+              break
+            }
+            case 'content_block_delta': {
+              const delta = json.delta
+              if (delta?.type === 'text_delta') {
+                yield { type: 'text_delta', text: delta.text }
+              } else if (delta?.type === 'input_json_delta') {
+                yield { type: 'tool_use_delta', inputDelta: delta.partial_json }
+              }
+              break
+            }
+            case 'content_block_stop': {
+              const bt = blockTypes.get(json.index)
+              if (bt === 'tool_use') {
+                yield { type: 'tool_use_stop' }
+              }
+              blockTypes.delete(json.index)
+              break
+            }
+            case 'message_delta': {
+              const u = json.usage
+              if (u && tokenUsage) {
+                tokenUsage.output = u.output_tokens ?? tokenUsage.output
+                tokenUsage.total = tokenUsage.input + tokenUsage.output
+              }
+              // 终态 stop_reason 随 message_delta 到达（message_start 里是 null）
+              if (typeof json.delta?.stop_reason === 'string' && json.delta.stop_reason) {
+                finishRaw = json.delta.stop_reason
+              }
+              break
+            }
+            case 'message_stop': {
+              // `message_stop` 是 SSE 规范里的流终止事件 —— 到此为止，**不能再等 socket EOF**。
+              // 与 provider-openai 的 `data: [DONE]`、provider-gemini 的 `finishReason` 是同一类坑：
+              // 部分自建网关/代理发完终止事件后并不关闭连接，若继续 await reader.read()，
+              // 循环会一直挂着，直到超时计时器把整次请求判失败：内容早已渲染，用户却看到「发送失败」。
+              stopped = true
+              return
+            }
+            case 'error': {
+              throw new Error(`Anthropic stream error: ${json.error?.message ?? JSON.stringify(json)}`)
+            }
+          }
+        }
+      }
 
       readLoop: while (true) {
         const { done, value } = await reader.read()
         if (done) break
         armIdleTimeout() // 有数据到达 → 重新计时（idle 语义，持续输出不会被掐断）
-        buf += decoder.decode(value, { stream: true })
-
-        // 按行解析 SSE
-        const lines = buf.split('\n')
-        buf = lines.pop() ?? '' // 最后一行可能不完整
-
-        let currentEvent = ''
-        let currentData = ''
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim()
-          } else if (line.startsWith('data: ')) {
-            currentData = line.slice(6)
-          } else if (line === '' && currentData) {
-            // 空行 = 事件结束
-            const json = JSON.parse(currentData)
-            currentEvent = json.type ?? currentEvent
-
-            switch (currentEvent) {
-              case 'message_start': {
-                modelOut = json.message?.model
-                const u = json.message?.usage
-                if (u) tokenUsage = {
-                  input: u.input_tokens ?? 0,
-                  output: u.output_tokens ?? 0,
-                  ...(u.cache_read_input_tokens != null ? { cacheRead: u.cache_read_input_tokens } : {}),
-                  ...(u.cache_creation_input_tokens != null ? { cacheWrite: u.cache_creation_input_tokens } : {}),
-                }
-                break
-              }
-              case 'content_block_start': {
-                const block = json.content_block
-                if (block?.type === 'text') {
-                  blockTypes.set(json.index, 'text')
-                } else if (block?.type === 'tool_use') {
-                  blockTypes.set(json.index, 'tool_use')
-                  yield { type: 'tool_use_start', toolUseId: block.id, toolId: block.name }
-                }
-                break
-              }
-              case 'content_block_delta': {
-                const delta = json.delta
-                if (delta?.type === 'text_delta') {
-                  yield { type: 'text_delta', text: delta.text }
-                } else if (delta?.type === 'input_json_delta') {
-                  yield { type: 'tool_use_delta', inputDelta: delta.partial_json }
-                }
-                break
-              }
-              case 'content_block_stop': {
-                const bt = blockTypes.get(json.index)
-                if (bt === 'tool_use') {
-                  yield { type: 'tool_use_stop' }
-                }
-                blockTypes.delete(json.index)
-                break
-              }
-              case 'message_delta': {
-                const u = json.usage
-                if (u && tokenUsage) {
-                  tokenUsage.output = u.output_tokens ?? tokenUsage.output
-                  tokenUsage.total = tokenUsage.input + tokenUsage.output
-                }
-                // 终态 stop_reason 随 message_delta 到达（message_start 里是 null）
-                if (typeof json.delta?.stop_reason === 'string' && json.delta.stop_reason) {
-                  finishRaw = json.delta.stop_reason
-                }
-                break
-              }
-              case 'message_stop': {
-                // `message_stop` 是 SSE 规范里的流终止事件 —— 到此为止，**不能再等 socket EOF**。
-                // 与 provider-openai 的 `data: [DONE]` 是同一类坑：部分自建网关/代理发完终止
-                // 事件后并不关闭连接，若继续 await reader.read()，循环会一直挂着，直到超时
-                // 计时器把整次请求判失败：内容早已渲染，用户却看到「发送失败」。
-                break readLoop
-              }
-              case 'error': {
-                throw new Error(`Anthropic stream error: ${json.error?.message ?? JSON.stringify(json)}`)
-              }
-            }
-
-            currentEvent = ''
-            currentData = ''
-          }
-        }
+        yield* emitFrames(sse.push(textDecoder.decode(value, { stream: true })))
+        if (stopped) break
       }
+      // 没有 message_stop 就结束的流（截断 / 网关直接关连接）：把残留末帧交出来，
+      // 否则最后一条 message_delta（stop_reason + usage）会丢
+      if (!stopped) yield* emitFrames(sse.flush())
 
       // 由 `message_stop` 提前 break 时主动释放连接（服务端不关连接 → 不 cancel 会让连接滞留在池里）
       try { await reader.cancel() } catch {}
@@ -778,8 +764,7 @@ export class AnthropicChatProvider implements ChatProvider {
         ...(finishRaw ? { finishRaw } : {}),
       }
     } finally {
-      if (timer) clearTimeout(timer)
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
+      deadline.dispose()
     }
   }
 }

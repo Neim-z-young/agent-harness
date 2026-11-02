@@ -145,6 +145,46 @@ describe('AnthropicChatProvider.stream', () => {
     expect(done?.finishRaw).toBe('end_turn')
   })
 
+  it('CRLF 分隔的流同样能解析（回归：`line === \'\'` 永不成立 ⇒ 零 delta、静默只剩 done）', async () => {
+    const provider = new AnthropicChatProvider({ apiKey: 'test-key' })
+    const crlf = buildSseResponse({
+      text: 'crlf text',
+      model: 'claude-3-sonnet',
+      inputTokens: 3,
+      outputTokens: 4,
+    }).replace(/\n/g, '\r\n')
+    globalThis.fetch = mockFetchSse(crlf)
+
+    const chunks: ChatStreamChunk[] = []
+    for await (const chunk of provider.stream({
+      providerId: 'anthropic', messages: makeMessages('hi'), params: {},
+    })) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks.filter((c) => c.type === 'text_delta').map((c) => c.text).join('')).toBe('crlf text')
+    const done = chunks.find((c) => c.type === 'done')
+    expect(done?.tokenUsage?.input).toBe(3)
+  })
+
+  it('单个坏帧不带走整条流（旧实现是裸 JSON.parse，一帧坏掉直接抛穿）', async () => {
+    const provider = new AnthropicChatProvider({ apiKey: 'test-key' })
+    const good = buildSseResponse({ text: 'survives', model: 'm', inputTokens: 1, outputTokens: 1 })
+    // 在第一个事件之后插一帧非法 JSON
+    const marker = 'event: message_start'
+    const broken = good.replace(marker, 'data: {not json\n\n' + marker)
+    globalThis.fetch = mockFetchSse(broken)
+
+    const chunks: ChatStreamChunk[] = []
+    for await (const chunk of provider.stream({
+      providerId: 'anthropic', messages: makeMessages('hi'), params: {},
+    })) {
+      chunks.push(chunk)
+    }
+
+    expect(chunks.filter((c) => c.type === 'text_delta').map((c) => c.text).join('')).toBe('survives')
+  })
+
   it('文本 + tool_use 流式', async () => {
     const provider = new AnthropicChatProvider({ apiKey: 'test-key' })
     globalThis.fetch = mockFetchSse(buildSseResponse({
