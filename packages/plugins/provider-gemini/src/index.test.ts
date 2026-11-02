@@ -269,7 +269,7 @@ describe('@harness/provider-gemini', () => {
   // ===== 请求/响应往返 =====
 
   describe('请求/响应往返', () => {
-    it('URL 包含 model 和 generateContent action + key 查询参数', async () => {
+    it('URL 包含 model 与 generateContent action，且**默认不带** key 查询参数（key 只走请求头）', async () => {
       const p = new GeminiChatProvider({ apiKey: 'gem-key' })
       let capturedUrl = ''
       const restore = installMock(({ url }) => {
@@ -284,7 +284,32 @@ describe('@harness/provider-gemini', () => {
           params: {},
         })
         expect(capturedUrl).toContain('/v1beta/models/gemini-1.5-pro:generateContent')
+        // URL 会进代理日志 / 错误上报，凭据不应出现在这里
+        expect(capturedUrl).not.toContain('key=')
+        expect(capturedUrl).not.toContain('gem-key')
+      } finally {
+        restore()
+      }
+    })
+
+    it('apiKeyInQuery: true 时退回 `?key=` 形态（只认查询参数的第三方网关）', async () => {
+      const p = new GeminiChatProvider({ apiKey: 'gem-key', apiKeyInQuery: true })
+      let capturedUrl = ''
+      let capturedHeaders: Record<string, string> = {}
+      const restore = installMock(({ url, init }) => {
+        capturedUrl = url
+        capturedHeaders = init.headers as Record<string, string>
+        return new Response(geminiOkResponse('ok'))
+      })
+      try {
+        await p.complete({
+          providerId: 'gemini',
+          messages: [{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'x' }], createdAt: 1 }],
+          params: {},
+        })
         expect(capturedUrl).toContain('key=gem-key')
+        // 打开退路时仍带请求头：两种载体都给网关，由它择一
+        expect(capturedHeaders['x-goog-api-key']).toBe('gem-key')
       } finally {
         restore()
       }
@@ -455,7 +480,35 @@ describe('@harness/provider-gemini', () => {
         await iter.next()
         expect(capturedUrl).toContain(':streamGenerateContent')
         expect(capturedUrl).toContain('alt=sse')
-        expect(capturedUrl).toContain('key=stream-key')
+        // 凭据不进 URL（见 apiKeyInQuery 的说明）
+        expect(capturedUrl).not.toContain('key=stream-key')
+      } finally {
+        restore()
+      }
+    })
+
+    it('CRLF 分隔的 SSE 同样能解析（回归：只认 \\n\\n 时整条流零 delta、静默只剩 done）', async () => {
+      const p = new GeminiChatProvider({ apiKey: 'k' })
+      const first = JSON.stringify({
+        candidates: [{ content: { role: 'model', parts: [{ text: 'hi' }] }, index: 0 }],
+      })
+      const last = JSON.stringify({
+        candidates: [{ content: { role: 'model', parts: [] }, finishReason: 'STOP', index: 0 }],
+      })
+      const body = `data: ${first}\r\n\r\ndata: ${last}\r\n\r\n`
+      const restore = installMock(async () =>
+        new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }))
+      try {
+        const chunks: Array<{ type: string; text?: string }> = []
+        for await (const c of p.stream({
+          providerId: 'gemini',
+          messages: [{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'x' }], createdAt: 1 }],
+          params: {},
+        })) {
+          chunks.push(c as { type: string; text?: string })
+        }
+        expect(chunks.filter((c) => c.type === 'text_delta').map((c) => c.text).join('')).toBe('hi')
+        expect(chunks.at(-1)?.type).toBe('done')
       } finally {
         restore()
       }
