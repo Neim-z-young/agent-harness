@@ -5,6 +5,7 @@ import {
   Hooks,
   PluginCircularDependencyError,
   PluginDuplicateIdError,
+  PluginHookAggregateError,
   PluginHookError,
   PluginInstallError,
   PluginManager,
@@ -794,6 +795,66 @@ describe('@harness/plugin', () => {
       await pm.unload('A').catch(() => null)
       await bus.publish(E, { v: 1 })
       expect(n).toBe(1)
+    })
+
+    it('loadExternalBatch：乱序 spec 下 hotReload 仍用各自**正确**的 spec', async () => {
+      const A = makePlugin('A')
+      const B = makePlugin('B', { dependsOn: ['A'] })
+      // 传入顺序 B 在 A 前，但依赖排序会把 A 排到前面去 —— spec 对应关系不能靠下标
+      const imp = makeImporter({ 'spec-b': B, 'spec-a': A })
+      const pm = createPluginManager({ bus, dynamicImport: imp.fn })
+
+      await pm.loadBuiltin(['spec-b', 'spec-a'])
+      expect(pm.list().map((x) => x.plugin.id)).toEqual(['A', 'B'])
+
+      imp.calls.length = 0
+      await pm.hotReload('B')
+      expect(imp.calls).toEqual(['spec-b'])
+      await pm.hotReload('A')
+      expect(imp.calls).toEqual(['spec-b', 'spec-a'])
+    })
+
+    it('loadInternal 之后重复加载同一 id（外部来源）仍抛 DuplicateId —— 两级共用同一份校验', async () => {
+      const A = makePlugin('A')
+      const pm = createPluginManager({ bus, dynamicImport: async () => ({ default: A }) })
+      await pm.loadInternal([A])
+      const err = await pm.loadUser(['file:///a.mjs']).then(() => null, (e) => e)
+      expect(err).toBeInstanceOf(PluginDuplicateIdError)
+      expect(pm.list()).toHaveLength(1)
+    })
+  })
+
+  describe('PluginHookAggregateError（多插件 hook 失败的类型化聚合）', () => {
+    it('多个插件同名 hook 失败 → 抛带 hookName 的聚合错误，子项都是 PluginHookError', async () => {
+      const pm = createPluginManager({ bus })
+      const A = makePlugin('A', {
+        hooks: {
+          async 'core.session.compacting'() {
+            throw new Error('A-err')
+          },
+        },
+      })
+      const B = makePlugin('B', {
+        hooks: {
+          async 'core.session.compacting'() {
+            throw new Error('B-err')
+          },
+        },
+      })
+      await pm.loadInternal([A, B])
+
+      const err = await pm
+        .trigger('core.session.compacting', { agentId: '', sessionId: '' }, {})
+        .then(() => null, (e) => e)
+
+      expect(err).toBeInstanceOf(PluginHookAggregateError)
+      // 仍然 instanceof AggregateError（既有 consumer 的判据不变）
+      expect(err).toBeInstanceOf(AggregateError)
+      const agg = err as PluginHookAggregateError
+      expect(agg.hookName).toBe('core.session.compacting')
+      expect(agg.errors).toHaveLength(2)
+      expect(agg.errors.every((e) => e instanceof PluginHookError)).toBe(true)
+      expect(agg.errors.map((e) => e.pluginId).sort()).toEqual(['A', 'B'])
     })
   })
 })
