@@ -857,4 +857,68 @@ describe('@harness/plugin', () => {
       expect(agg.errors.map((e) => e.pluginId).sort()).toEqual(['A', 'B'])
     })
   })
+
+  describe('可诊断性：unload / hotReload 必须留痕', () => {
+    /** 记录 info/error 的消息（其余级别忽略） */
+    function makeLogger() {
+      const info: string[] = []
+      const error: string[] = []
+      return {
+        info,
+        error,
+        log: {
+          info: (msg: string) => void info.push(msg),
+          warn: () => {},
+          debug: () => {},
+          error: (msg: string) => void error.push(msg),
+        },
+      }
+    }
+
+    it('unload 成功 → info 记录插件 id 与来源', async () => {
+      const lg = makeLogger()
+      const pm = createPluginManager({ bus, logger: lg.log })
+      await pm.loadInternal([makePlugin('A')])
+      await pm.unload('A')
+      expect(lg.info.some((m) => m.includes('unloaded A') && m.includes('source=internal'))).toBe(true)
+    })
+
+    it('unload 失败 → error 留痕（调用方会吞掉抛出物，没有日志就等于零信号）', async () => {
+      const lg = makeLogger()
+      const pm = createPluginManager({ bus, logger: lg.log })
+      await pm.loadInternal([makePlugin('A', { failUninstall: true })])
+      await pm.unload('A').catch(() => null)
+      expect(lg.error.some((m) => m.includes('unload A failed') && m.includes('retryable'))).toBe(true)
+    })
+
+    it('hotReload 成功 → info 记录 reloaded', async () => {
+      const lg = makeLogger()
+      const pm = createPluginManager({ bus, logger: lg.log, dynamicImport: async () => ({ default: makePlugin('p') }) })
+      await pm.loadBuiltin(['npm:p'])
+      await pm.hotReload('p')
+      expect(lg.info.some((m) => m.includes('reloaded p') && m.includes('source=builtin'))).toBe(true)
+    })
+
+    it('hotReload 失败且回滚失败 → error 明确写出"插件已不在表里"（与"回滚成功"区分开）', async () => {
+      const lg = makeLogger()
+      let installCount = 0
+      const P: AgentPlugin = {
+        id: 'p',
+        version: '1',
+        name: 'p',
+        async install() {
+          installCount++
+          if (installCount >= 2) throw new Error('always-boom')
+          return {}
+        },
+      }
+      const pm = createPluginManager({ bus, logger: lg.log, dynamicImport: async () => ({ default: P }) })
+      await pm.loadBuiltin(['npm:p'])
+
+      await pm.hotReload('p').catch(() => null)
+
+      expect(lg.error.some((m) => m.includes('rollback failed') && m.includes('UNLOADED'))).toBe(true)
+      expect(pm.list()).toHaveLength(0)
+    })
+  })
 })

@@ -1396,6 +1396,8 @@ export class PluginManagerImpl implements PluginManager {
     try {
       await lp.plugin.uninstall?.()
     } catch (err) {
+      // 必须留痕：调用方（如 `core.stop()`）会吞掉这个错，不留日志就等于"插件没卸掉"零信号
+      this.logger.error(`[plugin] unload ${pluginId} failed; state kept intact (retryable)`, err)
       throw new PluginUninstallError(pluginId, err)
     }
 
@@ -1411,6 +1413,7 @@ export class PluginManagerImpl implements PluginManager {
     this.loaded.delete(pluginId)
     this.specById.delete(pluginId)
     this.internalPlugins.delete(pluginId)
+    this.logger.info(`[plugin] unloaded ${pluginId} (source=${lp.source})`)
   }
 
   /**
@@ -1449,10 +1452,17 @@ export class PluginManagerImpl implements PluginManager {
         () => true,
         () => false
       )
-      if (restored) this.rememberSource(pluginId, prev, source, specInfo)
+      if (restored) {
+        this.rememberSource(pluginId, prev, source, specInfo)
+        this.logger.error(`[plugin] reload ${pluginId} failed; rolled back to previous instance`, err)
+      } else {
+        // 两种失败要分得开：回滚成功 = 仍在服务（降级），回滚失败 = 插件已不在表里（事故）
+        this.logger.error(`[plugin] reload ${pluginId} failed AND rollback failed; plugin is now UNLOADED`, err)
+      }
       throw err
     }
     this.rememberSource(pluginId, next, source, specInfo)
+    this.logger.info(`[plugin] reloaded ${pluginId} (source=${source})`)
   }
 
   list(): LoadedPlugin[] {
