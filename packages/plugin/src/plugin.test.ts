@@ -668,4 +668,132 @@ describe('@harness/plugin', () => {
       expect(reg.get('s')?.id).toBe('s')
     })
   })
+
+  // ===== 加载/卸载状态机（hotReload 的 spec 保活、unload 的原子性） =====
+  describe('加载状态机：hotReload 与 unload 的一致性', () => {
+    /** 造一个按 spec 表解析的 dynamicImport，并记录每次收到的 spec */
+    function makeImporter(table: Record<string, AgentPlugin>) {
+      const calls: string[] = []
+      const fn = async (spec: string) => {
+        calls.push(spec)
+        const p = table[spec]
+        if (!p) throw new Error(`unknown spec: "${spec}"`)
+        return { default: p }
+      }
+      return { calls, fn }
+    }
+
+    it('hotReload（builtin）**连续两次**都保留 spec —— spec 不会被 unload 清掉', async () => {
+      const P = makePlugin('p')
+      const imp = makeImporter({ 'npm:p': P })
+      const pm = createPluginManager({ bus, dynamicImport: imp.fn })
+
+      await pm.loadBuiltin(['npm:p'])
+      await pm.hotReload('p')
+      await pm.hotReload('p')
+
+      // 三次解析用的都是原始 spec（回退实现里第二次会传空串）
+      expect(imp.calls).toEqual(['npm:p', 'npm:p', 'npm:p'])
+      expect(pm.list().map((x) => x.plugin.id)).toEqual(['p'])
+    })
+
+    it('hotReload：解析新实例失败 → **不卸载**旧实例（不能连带把活着的插件弄没）', async () => {
+      let uninstalled = 0
+      const P = makePlugin('p')
+      P.uninstall = async () => {
+        uninstalled++
+      }
+      let broken = false
+      const dynamicImport = async (_spec: string) => {
+        if (broken) throw new Error('import-boom')
+        return { default: P }
+      }
+      const pm = createPluginManager({ bus, dynamicImport })
+
+      await pm.loadBuiltin(['npm:p'])
+      broken = true
+      const err = await pm.hotReload('p').then(() => null, (e) => e)
+
+      expect((err as Error).message).toContain('import-boom')
+      expect(uninstalled).toBe(0) // 没走到 unload
+      expect(pm.list().map((x) => x.plugin.id)).toEqual(['p'])
+    })
+
+    it('hotReload：新实例 install 失败 → 回滚到旧实例，插件不从表里消失', async () => {
+      let installCount = 0
+      const P: AgentPlugin = {
+        id: 'p',
+        version: '1',
+        name: 'p',
+        async install() {
+          installCount++
+          if (installCount === 2) throw new Error('reinstall-boom')
+          return {}
+        },
+      }
+      const pm = createPluginManager({ bus, dynamicImport: async () => ({ default: P }) })
+      await pm.loadBuiltin(['npm:p'])
+      expect(installCount).toBe(1)
+
+      const err = await pm.hotReload('p').then(() => null, (e) => e)
+
+      expect(err).toBeInstanceOf(PluginInstallError)
+      expect(installCount).toBe(3) // 1 首次 + 1 失败的新装 + 1 回滚
+      expect(pm.list().map((x) => x.plugin.id)).toEqual(['p'])
+    })
+
+    it('hotReload：internal 插件即使 internalPlugins 索引缺失也重装原实例，而不是静默消失', async () => {
+      const track = { installed: [] as number[], uninstalled: [] as number[] }
+      const A = makePlugin('A', { track })
+      const pm = createPluginManager({ bus })
+      await pm.loadInternal([A])
+      // 模拟索引丢失（如外部误删）
+      ;(pm as any).internalPlugins.delete('A')
+
+      await pm.hotReload('A')
+      expect(track.installed).toHaveLength(2)
+      expect(pm.list().map((x) => x.plugin.id)).toEqual(['A'])
+    })
+
+    it('unload：uninstall() 抛错 → **整体不动**（hooks 仍生效，不是半死状态）', async () => {
+      let hookCalls = 0
+      const A = makePlugin('A', {
+        failUninstall: true,
+        hooks: {
+          async 'core.permission.check'() {
+            hookCalls++
+          },
+        },
+      })
+      const pm = createPluginManager({ bus })
+      await pm.loadInternal([A])
+
+      const err = await pm.unload('A').then(() => null, (e) => e)
+      expect(err).toBeInstanceOf(PluginUninstallError)
+
+      // 关键断言：仍在表中 **且** 仍能响应 hook（此前是"在表里但 hooks 已注销"）
+      expect(pm.list().map((x) => x.plugin.id)).toEqual(['A'])
+      await pm.trigger('core.permission.check', { toolKey: 'w', patterns: [], input: null }, { behavior: 'allow' })
+      expect(hookCalls).toBe(1)
+    })
+
+    it('unload：uninstall() 抛错时 core.bus.event 订阅也不退订', async () => {
+      let n = 0
+      const A = makePlugin('A', {
+        failUninstall: true,
+        hooks: {
+          async 'core.bus.event'() {
+            n++
+          },
+        },
+      })
+      const pm = createPluginManager({ bus })
+      await pm.loadInternal([A])
+      const E = BusEvent.define<{ v: number }>('state.ev')
+
+      await pm.unload('A').catch(() => null)
+      await bus.publish(E, { v: 1 })
+      expect(n).toBe(1)
+    })
+  })
 })

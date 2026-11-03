@@ -1367,61 +1367,69 @@ export class PluginManagerImpl implements PluginManager {
     const lp = this.loaded.get(pluginId)
     if (!lp) throw new PluginNotFoundError(pluginId)
 
-    // 1. core.bus.event 退订
-    const unsub = this.busEventUnsubs.get(pluginId)
-    if (unsub) {
-      unsub()
-      this.busEventUnsubs.delete(pluginId)
-    }
-
-    // 2. hooks 注销
-    this.hooks.unregister(pluginId)
-
-    // 3. uninstall()
+    // 1. 先跑 uninstall()：**失败就整体不动**（hooks / bus 订阅 / 表项全部保留），可以原样重试。
+    //    曾经是「先退订再 uninstall」，于是 uninstall 抛错后插件仍在 list() 里、hooks 却已注销 ——
+    //    "看起来加载着、实际什么都不响应"这种半死状态比直接报错难诊断得多。
     try {
       await lp.plugin.uninstall?.()
     } catch (err) {
       throw new PluginUninstallError(pluginId, err)
     }
 
-    // 4. 清理
+    // 2. 停掉入口：core.bus.event 退订 → hooks 注销
+    const unsub = this.busEventUnsubs.get(pluginId)
+    if (unsub) {
+      unsub()
+      this.busEventUnsubs.delete(pluginId)
+    }
+    this.hooks.unregister(pluginId)
+
+    // 3. 清理索引
     this.loaded.delete(pluginId)
     this.specById.delete(pluginId)
     this.internalPlugins.delete(pluginId)
   }
 
+  /**
+   * 热重载：解析出**新实例** → 卸载旧实例 → 装上新的。
+   *
+   * 两条顺序纪律（都踩过）：
+   * 1. **`specById` 必须在 `unload` 之前读进局部变量** —— `unload` 会删掉它，
+   *    之后再读就只能拿到 undefined（此前写成 `this.specById.get(id)?.spec ?? ''`，
+   *    于是**第二次** reload 会拿空串去 `import()`，第一次之后 spec 就永久丢了）。
+   * 2. **解析失败不卸载**：`import()` 一个坏包是常态（版本冲突 / 语法错），
+   *    此时旧实例还能用，先卸再解析等于"重载失败连带把活着的插件弄没了"。
+   */
   async hotReload(pluginId: string): Promise<void> {
     const lp = this.loaded.get(pluginId)
     if (!lp) throw new PluginNotFoundError(pluginId)
 
+    const prev = lp.plugin
     const source = lp.source
-    // 保存需要的信息
-    let plugin: AgentPlugin | null = null
+    // ⚠️ 必须在 unload 之前取：unload 会清空 specById / internalPlugins
+    const specInfo = source === 'internal' ? undefined : this.specById.get(pluginId)
 
+    let next: AgentPlugin = prev
     if (source === 'internal') {
-      plugin = this.internalPlugins.get(pluginId) ?? null
-    } else {
-      const specInfo = this.specById.get(pluginId)
-      if (specInfo) {
-        const mod = await this.resolveSpec(specInfo.spec)
-        plugin = mod
-      }
+      next = this.internalPlugins.get(pluginId) ?? prev
+    } else if (specInfo) {
+      next = await this.resolveSpec(specInfo.spec)
     }
 
-    // 先卸载
     await this.unload(pluginId)
 
-    // 再安装
-    if (plugin === null) return
-
-    if (source === 'internal') {
-      // 重新按单批加载
-      await this.installOne(plugin, 'internal')
-      this.internalPlugins.set(pluginId, plugin)
-    } else {
-      await this.installOne(plugin, source as 'builtin' | 'user')
-      this.specById.set(pluginId, { source: source as 'builtin' | 'user', spec: this.specById.get(pluginId)?.spec ?? '' })
+    try {
+      await this.installOne(next, source)
+    } catch (err) {
+      // 装新实例失败 → 把旧实例装回去（它本身仍可用），别让插件从表里消失
+      const restored = await this.installOne(prev, source).then(
+        () => true,
+        () => false
+      )
+      if (restored) this.rememberSource(pluginId, prev, source, specInfo)
+      throw err
     }
+    this.rememberSource(pluginId, next, source, specInfo)
   }
 
   list(): LoadedPlugin[] {
@@ -1526,6 +1534,20 @@ export class PluginManagerImpl implements PluginManager {
   }
 
   /** 将 spec 解析成 AgentPlugin（dynamic import 后找 default 或 匹配的命名导出） */
+  /**
+   * 记下"这个 id 日后怎么重新解析"（`hotReload` 的唯一依据）。
+   * internal 记对象引用，builtin/user 记 spec —— 两者都在 `unload` 里被清掉，故重装后必须补写。
+   */
+  private rememberSource(
+    pluginId: string,
+    plugin: AgentPlugin,
+    source: LoadedPlugin['source'],
+    specInfo: { source: 'builtin' | 'user'; spec: string } | undefined
+  ): void {
+    if (source === 'internal') this.internalPlugins.set(pluginId, plugin)
+    else if (specInfo) this.specById.set(pluginId, specInfo)
+  }
+
   private async resolveSpec(spec: string): Promise<AgentPlugin> {
     const mod = await this.dynamicImport(spec)
     const candidates = [
