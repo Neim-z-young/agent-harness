@@ -575,6 +575,9 @@
     "packages/snapshot": {
       "name": "@harness/snapshot",
       "version": "0.1.0",
+      "dependencies": {
+        "@harness/fs-guard": "workspace:*",
+      },
     },
     "packages/tool": {
       "name": "@harness/tool",
