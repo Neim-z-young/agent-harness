@@ -1058,6 +1058,107 @@ describe('code_semantic_edit replace_subtree 模式', () => {
   })
 })
 
+describe('行尾方言：CRLF 文件的结构感知编辑', () => {
+  const read = (p: string) => require('node:fs').readFileSync(join(dir, p), 'utf-8')
+
+  // 回归：修前 lineEndExclusive 只 `nextStart - 1`（指向 \n），把 \r 圈进范围 ⇒ 范围超出
+  // 节点右界 ⇒ findContainingNode 吸附失败 ⇒ 整行圈选在 CRLF 文件上恒报 NODE_NOT_FOUND。
+  it('整行圈选（endColumn=0）在 CRLF 文件上仍能吸附节点并落盘', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export const LEGACY = 1\r\nconst x = LEGACY + 1\r\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 2, startColumn: 1, endLine: 2, endColumn: 0, replacement: 'const x = 2\r\n' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_node') throw new Error('expected replace_node')
+    expect(out.node.type).toBe('VariableDeclaration')
+    expect(out.node.relation).toBe('exact') // CRLF 的 \r 未被圈进范围
+    // 行尾方言保持 CRLF，且不残留裸 \r（wholeLine 按 CRLF 两个字符整体消费）
+    expect(read('a.ts')).toBe('export const LEGACY = 1\r\nconst x = 2\r\n')
+    expect(read('a.ts')).not.toContain('\r\r')
+  })
+
+  it('无尾随换行的 CRLF 末行同样可整行替换', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const a = 1\r\nconst b = 2')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_node', path: 'a.ts', startLine: 2, startColumn: 1, endLine: 2, endColumn: 0, replacement: 'const b = 3' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    expect(read('a.ts')).toBe('const a = 1\r\nconst b = 3')
+  })
+
+  it('replace_subtree 批量替换保留 CRLF 行尾', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'const v = config.server.host\r\nconst w = config.server.host\r\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'replace_subtree', path: 'a.ts', selector: 'config.server.host', replacement: 'env.HOST' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    if (!res.ok) return
+    const out = res.output!
+    if (out.mode !== 'replace_subtree') throw new Error('expected replace_subtree')
+    expect(out.total).toBe(2)
+    expect(read('a.ts')).toBe('const v = env.HOST\r\nconst w = env.HOST\r\n')
+  })
+
+  it('rename 在 CRLF 文件上按 token 范围替换，行尾不变', async () => {
+    writeFileSync(join(dir, 'a.ts'), 'export const OLD = 1\r\nexport const y = OLD\r\n')
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', path: 'a.ts', symbol: 'OLD', to: 'NEW' },
+      ctx,
+    )
+    expect(res.ok).toBe(true)
+    expect(read('a.ts')).toBe('export const NEW = 1\r\nexport const y = NEW\r\n')
+  })
+})
+
+describe('错误口径：路径不存在与拒绝文案', () => {
+  // 修前：load() 吞掉 stat 错误 ⇒ 三个只读工具对打错的路径静默返回 count:0，无法诊断输入错误
+  it('三个只读工具对不存在的路径报 PATH_NOT_FOUND（不再静默返回 0 条）', async () => {
+    const index = new CodeIntelIndex()
+    const calls = [
+      () => codeSymbolsTool(index).call!({ path: 'no-such-dir' }, ctx),
+      () => codeReferenceTool(index).call!({ symbol: 'x', path: 'no-such-dir' }, ctx),
+      () => codeDefinitionTool(index).call!({ symbol: 'x', path: 'no-such-file.ts' }, ctx),
+    ]
+    for (const call of calls) {
+      const res = await call()
+      expect(res.ok).toBe(false)
+      if (res.ok) continue
+      expect(res.error!.code).toBe('PATH_NOT_FOUND')
+    }
+  })
+
+  it('rename 目标路径不存在报 PATH_NOT_FOUND（而非 SYMBOL_NOT_FOUND）', async () => {
+    const res = await codeSemanticEditTool(new CodeIntelIndex()).call!(
+      { mode: 'rename', path: 'no-such-dir', symbol: 'x', to: 'y' },
+      ctx,
+    )
+    expect(res.ok).toBe(false)
+    if (res.ok) return
+    expect(res.error!.code).toBe('PATH_NOT_FOUND')
+  })
+
+  // 钉住「拒绝文案单一来源」：只读工具与编辑引擎对同一路径必须给出同一句话
+  it('越界拒绝文案在只读工具与编辑引擎间完全一致', async () => {
+    const index = new CodeIntelIndex()
+    const readonly = await codeSymbolsTool(index).call!({ path: '/etc/passwd' }, ctx)
+    const edit = await codeSemanticEditTool(index).call!(
+      { mode: 'replace_node', path: '/etc/passwd', startLine: 1, startColumn: 1, endLine: 1, endColumn: 2, replacement: 'x' },
+      ctx,
+    )
+    expect(readonly.ok).toBe(false)
+    expect(edit.ok).toBe(false)
+    if (readonly.ok || edit.ok) return
+    expect(readonly.error!.message).toBe(edit.error!.message)
+    expect(readonly.error!.code).toBe('PATH_OUTSIDE_CWD')
+    expect(edit.error!.code).toBe('PATH_OUTSIDE_CWD')
+  })
+})
+
 describe('createCodeIntelPlugin', () => {
   it('装配为纯 MCP server（对齐 computer-use，不直装 harness 工具）', async () => {
     const plugin = createCodeIntelPlugin() as AgentPlugin
