@@ -7,11 +7,13 @@
  */
 
 // 路径边界收敛到 @harness/fs-guard（P0-5/P3-1）：本文件原来又抄了一份 resolvePath
-import { resolvePath, isWithinCwd } from '@harness/fs-guard'
+import { resolvePath } from '@harness/fs-guard'
 import { defineTool, fromJsonSchema, Tool, ToolResult, ToolContext } from '@harness/tool'
 import {
   CodeIntelIndex,
   execSemanticEdit,
+  asCoreError,
+  outsideCwd,
   MAX_RESULTS,
   type CodeSymbol,
   type CodeReference,
@@ -19,6 +21,31 @@ import {
   type CodeSemanticEditInput,
   type CodeSemanticEditOutput,
 } from './core'
+
+/**
+ * 只读工具的统一入口（唯一口径）：解析 → 路径边界 → 目标存在 → 执行 → 错误收口。
+ *
+ * 三个只读工具原来各写一份「越界文案 + 两段 catch」，与 core 的编辑引擎合起来是六份同口径；
+ * 收敛成一处后，拒绝文案与错误码只有 core 那一个来源（`outsideCwd` / `asCoreError`）。
+ */
+async function runOnTarget<T>(
+  index: CodeIntelIndex,
+  raw: string,
+  cwd: string,
+  work: (absPath: string) => Promise<T>,
+): Promise<ToolResult<T>> {
+  const absPath = resolvePath(raw, cwd)
+  const denied = outsideCwd(raw, absPath, cwd)
+  if (denied) return { ok: false, error: denied.error }
+  try {
+    const { exists } = await index.load(absPath, cwd)
+    // 路径打错与「目录里没有命中的文件」是两件事：前者是可诊断的输入错误，不能静默返回 0 条
+    if (!exists) return { ok: false, error: { message: `路径不存在: ${raw}`, code: 'PATH_NOT_FOUND' } }
+    return { ok: true, output: await work(absPath) }
+  } catch (err) {
+    return { ok: false, error: asCoreError(err, raw).error }
+  }
+}
 // 工具提示词文本（prompts/*.txt，import 加载，参考 opencode）
 import codeSymbolsPrompt from './prompts/code-symbols.txt'
 import codeReferencePrompt from './prompts/code-reference.txt'
@@ -55,28 +82,15 @@ export const codeSymbolsTool = (index: CodeIntelIndex): Tool<CodeSymbolsInput, C
       extractPatterns: (input) => [input.path ?? '.'],
     },
     async call(input, ctx): Promise<ToolResult<CodeSymbolsOutput>> {
-      const absPath = resolvePath(input.path ?? '.', ctx.cwd)
-      if (!isWithinCwd(absPath, ctx.cwd)) {
-        return { ok: false, error: { message: `路径 "${input.path ?? '.'}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
-      }
-      try {
+      return runOnTarget(index, input.path ?? '.', ctx.cwd, async (absPath) => {
         const symbols = await index.symbols(absPath, ctx.cwd)
-        const truncated = symbols.length > MAX_RESULTS
         return {
-          ok: true,
-          output: {
-            path: absPath,
-            count: symbols.length,
-            symbols: symbols.slice(0, MAX_RESULTS),
-            truncated,
-          },
+          path: absPath,
+          count: symbols.length,
+          symbols: symbols.slice(0, MAX_RESULTS),
+          truncated: symbols.length > MAX_RESULTS,
         }
-      } catch (err: any) {
-        if (err.code === 'ENOENT') {
-          return { ok: false, error: { message: `路径不存在: ${input.path ?? '.'}`, code: 'PATH_NOT_FOUND' } }
-        }
-        return { ok: false, error: { message: err.message ?? String(err), code: 'CODE_INTEL_ERROR' } }
-      }
+      })
     },
   })
 
@@ -112,30 +126,16 @@ export const codeReferenceTool = (index: CodeIntelIndex): Tool<CodeReferenceInpu
       extractPatterns: (input) => [input.path ?? '.'],
     },
     async call(input, ctx): Promise<ToolResult<CodeReferenceOutput>> {
-      const absPath = resolvePath(input.path ?? '.', ctx.cwd)
-      if (!isWithinCwd(absPath, ctx.cwd)) {
-        return { ok: false, error: { message: `路径 "${input.path ?? '.'}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
-      }
-      try {
-        await index.load(absPath, ctx.cwd)
+      return runOnTarget(index, input.path ?? '.', ctx.cwd, async (absPath) => {
         const references = index.allReferences(input.symbol)
-        const truncated = references.length > MAX_RESULTS
         return {
-          ok: true,
-          output: {
-            symbol: input.symbol,
-            path: absPath,
-            count: references.length,
-            references: references.slice(0, MAX_RESULTS),
-            truncated,
-          },
+          symbol: input.symbol,
+          path: absPath,
+          count: references.length,
+          references: references.slice(0, MAX_RESULTS),
+          truncated: references.length > MAX_RESULTS,
         }
-      } catch (err: any) {
-        if (err.code === 'ENOENT') {
-          return { ok: false, error: { message: `路径不存在: ${input.path ?? '.'}`, code: 'PATH_NOT_FOUND' } }
-        }
-        return { ok: false, error: { message: err.message ?? String(err), code: 'CODE_INTEL_ERROR' } }
-      }
+      })
     },
   })
 
@@ -170,28 +170,15 @@ export const codeDefinitionTool = (index: CodeIntelIndex): Tool<CodeDefinitionIn
       extractPatterns: (input) => [input.path ?? '.'],
     },
     async call(input, ctx): Promise<ToolResult<CodeDefinitionOutput>> {
-      const absPath = resolvePath(input.path ?? '.', ctx.cwd)
-      if (!isWithinCwd(absPath, ctx.cwd)) {
-        return { ok: false, error: { message: `路径 "${input.path ?? '.'}" 超出工作目录范围`, code: 'PATH_OUTSIDE_CWD' } }
-      }
-      try {
-        await index.load(absPath, ctx.cwd)
+      return runOnTarget(index, input.path ?? '.', ctx.cwd, async (absPath) => {
         const definitions = index.allDefinitions(input.symbol)
         return {
-          ok: true,
-          output: {
-            symbol: input.symbol,
-            path: absPath,
-            count: definitions.length,
-            definitions: definitions.slice(0, MAX_RESULTS),
-          },
+          symbol: input.symbol,
+          path: absPath,
+          count: definitions.length,
+          definitions: definitions.slice(0, MAX_RESULTS),
         }
-      } catch (err: any) {
-        if (err.code === 'ENOENT') {
-          return { ok: false, error: { message: `路径不存在: ${input.path ?? '.'}`, code: 'PATH_NOT_FOUND' } }
-        }
-        return { ok: false, error: { message: err.message ?? String(err), code: 'CODE_INTEL_ERROR' } }
-      }
+      })
     },
   })
 

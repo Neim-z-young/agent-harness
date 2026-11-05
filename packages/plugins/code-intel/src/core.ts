@@ -14,7 +14,7 @@ import { parse, type ParserPlugin } from '@babel/parser'
 import traverse, { type NodePath } from '@babel/traverse'
 import * as t from '@babel/types'
 import { stat, readFile, readdir, writeFile } from 'node:fs/promises'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, statSync, type Stats } from 'node:fs'
 import { dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { collectJavaModuleInfo, collectJavaRenameSites, extractMulti, MULTI_EXT, verifyJavaSource } from './multi'
 // 路径边界（P0-5/P3-1）：收敛到 @harness/fs-guard 一处。引它**不破坏**本模块
@@ -94,8 +94,17 @@ export type CoreResult<T> =
 export function ok<T>(output: T): CoreResult<T> {
   return { ok: true, output }
 }
-/** 失败：首个参数为人读 message，第二个为错误 code（对齐 tools.ts 的 ToolResult.error 结构） */
-export function fail<T = never>(message: string, code: string): CoreResult<T> {
+/** 失败结果（只有失败分支）。单独成型是为了让调用方能直接取 `.error`，不必先收窄整个联合 */
+export interface CoreFailure {
+  ok: false
+  error: { code: string; message: string }
+}
+
+/**
+ * 构造失败结果：首个参数为人读 message，第二个为错误 code（对齐 tools.ts 的 ToolResult.error 结构）。
+ * 返回值是 `CoreFailure`，可直接作为任意 `CoreResult<T>` 使用。
+ */
+export function fail(message: string, code: string): CoreFailure {
   return { ok: false, error: { code, message } }
 }
 
@@ -287,14 +296,33 @@ function buildLineStarts(content: string): number[] {
   return starts
 }
 
-/** 行末偏移（不含该行结尾换行符）。starts[i]=第 i+1 行起始；line1Based=1..total */
+/** 字符偏移 → 1-based `{ line, column }`（列不因 CRLF 偏移：`\r` 只影响行尾，不影响行首） */
+function offsetToPosition(starts: number[], offset: number): { line: number; column: number } {
+  const line = offsetToLine(starts, offset)
+  return { line, column: offset - (starts[line - 1] ?? 0) + 1 }
+}
+
+/**
+ * 行末偏移（不含该行结尾换行符）。starts[i]=第 i+1 行起始；line1Based=1..total
+ *
+ * ⚠️ 必须把 CRLF 的 `\r` 一并排除：Windows 检出的文件行尾是 `\r\n`，若只减 1（指向 `\n`）
+ * 就会把 `\r` 圈进范围 ⇒ 范围超出节点右界 ⇒ `findContainingNode` 吸附失败 ⇒ 整行圈选
+ * （`endColumn=0`）在 CRLF 文件上恒报 NODE_NOT_FOUND。macOS/Linux 上永远看不到这个错。
+ */
 function lineEndExclusive(content: string, starts: number[], line1Based: number): number {
   const total = starts.length
   const idx = Math.min(Math.max(line1Based, 1), total)
-  const nextStart = starts[idx] // 下一行起始；末行时为 undefined
-  if (nextStart !== undefined) return nextStart - 1
-  // 末行：若以换行结尾则去掉该换行，否则就是文件末尾
-  return content.endsWith('\n') ? content.length - 1 : content.length
+  const nextStart = starts[idx]
+  // 末行：无尾随换行 ⇒ 文件末尾；有 ⇒ 去掉尾随换行（`\n` 或 `\r\n`）
+  const end = nextStart !== undefined ? nextStart - 1 : content.endsWith('\n') ? content.length - 1 : content.length
+  return end > 0 && content[end - 1] === '\r' ? end - 1 : end
+}
+
+/** 位置 i 处的换行符长度（LF=1 / CRLF=2 / 无=0） */
+function eolLengthAt(content: string, i: number): number {
+  if (content[i] === '\r' && content[i + 1] === '\n') return 2
+  if (content[i] === '\n') return 1
+  return 0
 }
 
 /** 行列（1-based line，1-based column）→ 字符偏移；endColumn 0=endLine 行末（不含换行符） */
@@ -503,6 +531,73 @@ function resolveModuleFile(spec: string, importerDir: string): string | null {
 /** 结果中返回的最多条目数（防止 LLM 上下文爆炸） */
 export const MAX_RESULTS = 200
 
+/**
+ * 目标路径的 stat（仅认文件/目录；不存在、无权限、其它类型一律 null）。
+ *
+ * 这是「路径存不存在」的**唯一**判定点：`CodeIntelIndex.load`（给 `exists`）与编辑引擎
+ * （区分 PATH_NOT_FOUND / *_NOT_FOUND）都走它，避免"字符串是否存在"和"stat 是否存在"两套口径。
+ */
+async function statTarget(p: string): Promise<Stats | null> {
+  try {
+    const st = await stat(p)
+    return st.isFile() || st.isDirectory() ? st : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 路径边界拒绝（唯一口径）：越界返回可直接 `return` 的失败结果，在界内返回 null。
+ *
+ * 越界文案与 code 只在这里写一次 —— 编辑引擎三处、`tools.ts` 三个只读工具共六处原来各写
+ * 一份，改文案时漏一处就会出现"同一个拒绝两种说法"（本仓的老病）。
+ */
+export function outsideCwd(raw: string, absPath: string, cwd: string): CoreFailure | null {
+  if (isWithinCwd(absPath, cwd)) return null
+  return fail(`路径 "${raw}" 超出工作目录范围`, 'PATH_OUTSIDE_CWD')
+}
+
+/**
+ * 异常 → 失败结果（唯一口径）：ENOENT 归为 `PATH_NOT_FOUND`，其余统一 `CODE_INTEL_ERROR`。
+ *
+ * 用 `unknown` 而非 `any`：调用方只需保证"这可能是任何东西"，取值走显式收窄。
+ */
+export function asCoreError(err: unknown, rawPath: string): CoreFailure {
+  if ((err as { code?: unknown } | null)?.code === 'ENOENT') {
+    return fail(`路径不存在: ${rawPath}`, 'PATH_NOT_FOUND')
+  }
+  const message = (err as { message?: unknown } | null)?.message
+  return fail(typeof message === 'string' ? message : String(err), 'CODE_INTEL_ERROR')
+}
+
+/**
+ * 编辑后结构校验（唯一口径）：Java 走 tree-sitter 复核，其余走 babel 重解析。
+ * 返回 false 表示"这次编辑把文件改坏"，调用方必须整体放弃（不落盘）。
+ */
+async function structureValid(file: string, content: string): Promise<boolean> {
+  if (extname(file).toLowerCase() === '.java') return verifyJavaSource(content)
+  return tryParse(content, file) !== null
+}
+
+/** 结构校验失败（唯一口径）；verb 为「重命名」/「替换」 */
+function structureFailure(verb: string, file: string, cwd: string): CoreResult<never> {
+  return fail(`${verb}后 "${relative(cwd, file)}" 结构校验失败，已放弃（未落盘）`, 'EDIT_INVALID_STRUCTURE')
+}
+
+/**
+ * 按位点倒序应用替换（唯一口径）。
+ *
+ * 不变式（由调用方保证）：ranges 按 `start` 升序且互不重叠 —— 倒序应用使先写下的偏移始终有效，
+ * 否则每替换一次后面所有偏移都会失效。这条不变式原来在 rename / replace_subtree 各写一遍。
+ */
+function applySplices(content: string, ranges: Array<{ start: number; end: number }>, text: string): string {
+  let out = content
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    out = out.slice(0, ranges[i].start) + text + out.slice(ranges[i].end)
+  }
+  return out
+}
+
 interface CachedFile {
   stat: { mtimeMs: number; size: number }
   data: IndexedFile
@@ -591,23 +686,21 @@ export class CodeIntelIndex {
     return out
   }
 
-  /** 索引目标（文件或目录），返回 `{ files, isDir }` */
-  async load(target: string, relBase: string): Promise<{ files: IndexedFile[]; isDir: boolean }> {
-    let st
-    try {
-      st = await stat(target)
-    } catch {
-      return { files: [], isDir: false }
-    }
+  /**
+   * 索引目标（文件或目录），返回 `{ files, isDir, exists }`。
+   *
+   * `exists=false` 时 `files` 恒为空 —— 调用方据此把「路径打错」与「目录里没有命中的文件」
+   * 分开报（前者是可诊断的输入错误，后者是正常空结果）。
+   */
+  async load(target: string, relBase: string): Promise<{ files: IndexedFile[]; isDir: boolean; exists: boolean }> {
+    const st = await statTarget(target)
+    if (!st) return { files: [], isDir: false, exists: false }
     if (st.isFile()) {
       const f = await this.indexFile(target, relBase)
-      return { files: f ? [f] : [], isDir: false }
+      return { files: f ? [f] : [], isDir: false, exists: true }
     }
-    if (st.isDirectory()) {
-      const files = await this.indexDir(target, relBase)
-      return { files, isDir: true }
-    }
-    return { files: [], isDir: false }
+    const files = await this.indexDir(target, relBase)
+    return { files, isDir: true, exists: true }
   }
 
   /** 列出文件/目录符号（按文件、行排序） */
@@ -900,24 +993,23 @@ export type CodeSemanticEditOutput =
 
 const IDENTIFIER_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/
 
-/** 作用域白名单过滤：仅保留位于 scope 子目录/文件内的命中。scope 相对扫描根解析；不存在作用域时原样返回 */
+/** 作用域白名单过滤：仅保留位于 scope 子目录/文件内的命中。scope 相对扫描根解析；未给作用域时原样返回 */
 function filterByScope(
   byFile: Map<string, RenameSite[]>,
   root: string,
   scope: string | undefined,
   cwd: string,
-): Map<string, RenameSite[]> | { error: string } {
-  if (!scope) return byFile
+): { ok: true; byFile: Map<string, RenameSite[]> } | { ok: false; fail: CoreResult<never> } {
+  if (!scope) return { ok: true, byFile }
   const scopeAbs = resolvePath(scope, root)
-  if (!isWithinCwd(scopeAbs, cwd)) {
-    return { error: `路径 "${scope}" 超出工作目录范围` }
-  }
+  const denied = outsideCwd(scope, scopeAbs, cwd)
+  if (denied) return { ok: false, fail: denied }
   const prefix = scopeAbs + sep
   const filtered = new Map<string, RenameSite[]>()
   for (const [file, sites] of byFile) {
     if (file === scopeAbs || file.startsWith(prefix)) filtered.set(file, sites)
   }
-  return filtered
+  return { ok: true, byFile: filtered }
 }
 
 /** code_semantic_edit 核心：按 mode 分发（rename / replace_node / replace_subtree） */
@@ -944,16 +1036,16 @@ async function execRename(
     return fail('新符号名与旧符号名相同', 'NO_OP')
   }
   const absPath = resolvePath(input.path ?? '.', ctx.cwd)
-  if (!isWithinCwd(absPath, ctx.cwd)) {
-    return fail(`路径 "${input.path ?? '.'}" 超出工作目录范围`, 'PATH_OUTSIDE_CWD')
-  }
+  const denied = outsideCwd(input.path ?? '.', absPath, ctx.cwd)
+  if (denied) return denied
   try {
+    if (!(await statTarget(absPath))) {
+      return fail(`路径不存在: ${input.path ?? '.'}`, 'PATH_NOT_FOUND')
+    }
     const collected = await index.collectRenameSitesFromScope(absPath, ctx.cwd, input.symbol)
     const scoped = filterByScope(collected, absPath, input.scope, ctx.cwd)
-    if ('error' in scoped) {
-      return fail(scoped.error, 'PATH_OUTSIDE_CWD')
-    }
-    const byFile = scoped
+    if (!scoped.ok) return scoped.fail
+    const byFile = scoped.byFile
     if (byFile.size === 0) {
       return fail(
         input.scope
@@ -966,9 +1058,8 @@ async function execRename(
     const importsResolved = !!input.resolveImporters
     if (importsResolved) {
       const importRoot = input.importRoot ? resolvePath(input.importRoot, ctx.cwd) : ctx.cwd
-      if (!isWithinCwd(importRoot, ctx.cwd)) {
-        return fail(`路径 "${input.importRoot}" 超出工作目录范围`, 'PATH_OUTSIDE_CWD')
-      }
+      const deniedImportRoot = outsideCwd(input.importRoot ?? '.', importRoot, ctx.cwd)
+      if (deniedImportRoot) return deniedImportRoot
       const declaringFiles = new Set<string>()
       for (const file of byFile.keys()) {
         const indexed = await index.load(file, ctx.cwd)
@@ -990,24 +1081,8 @@ async function execRename(
     const planned: Array<{ file: string; content: string; sites: RenameSite[] }> = []
     for (const [file, sites] of byFile) {
       const original = await readFile(file, 'utf-8')
-      let out = original
-      for (let i = sites.length - 1; i >= 0; i--) {
-        const s = sites[i]
-        out = out.slice(0, s.start) + input.to + out.slice(s.end)
-      }
-      if (extname(file).toLowerCase() === '.java') {
-        if (!(await verifyJavaSource(out))) {
-          return fail(
-            `重命名后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
-            'EDIT_INVALID_STRUCTURE',
-          )
-        }
-      } else if (!tryParse(out, file)) {
-        return fail(
-          `重命名后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
-          'EDIT_INVALID_STRUCTURE',
-        )
-      }
+      const out = applySplices(original, sites, input.to)
+      if (!(await structureValid(file, out))) return structureFailure('重命名', file, ctx.cwd)
       planned.push({ file, content: out, sites })
     }
     const files: RenameEditFile[] = planned.map((p) => ({
@@ -1036,11 +1111,8 @@ async function execRename(
       index.invalidate(p.file)
     }
     return ok(output)
-  } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      return fail(`路径不存在: ${input.path ?? '.'}`, 'PATH_NOT_FOUND')
-    }
-    return fail(err.message ?? String(err), 'CODE_INTEL_ERROR')
+  } catch (err) {
+    return asCoreError(err, input.path ?? '.')
   }
 }
 
@@ -1050,9 +1122,8 @@ async function execReplaceNode(
   ctx: CoreContext,
 ): Promise<CoreResult<CodeSemanticEditReplaceNodeOutput>> {
   const absPath = resolvePath(input.path, ctx.cwd)
-  if (!isWithinCwd(absPath, ctx.cwd)) {
-    return fail(`路径 "${input.path}" 超出工作目录范围`, 'PATH_OUTSIDE_CWD')
-  }
+  const denied = outsideCwd(input.path, absPath, ctx.cwd)
+  if (denied) return denied
   try {
     const content = await readFile(absPath, 'utf-8')
     const ast = tryParse(content, absPath)
@@ -1068,28 +1139,29 @@ async function execReplaceNode(
     if (!hit) {
       return fail('范围内未找到可替换的 AST 节点', 'NODE_NOT_FOUND')
     }
-    // 整行圈选（endColumn=0）时，顺带消费紧随节点的行结尾换行符，避免替换后残留空行
+    // 整行圈选（endColumn=0）时，顺带消费紧随节点的行结尾换行符，避免替换后残留空行。
+    // 行尾按方言整体消费（CRLF 两个字符一起），否则 `\r` 会留在替换内容之后。
     let consumedEnd = hit.node.end
     const wholeLine = !(input.endColumn && input.endColumn > 0)
-    if (wholeLine && content[consumedEnd] === '\n') consumedEnd++
+    if (wholeLine) consumedEnd += eolLengthAt(content, consumedEnd)
     const out = content.slice(0, hit.node.start) + input.replacement + content.slice(consumedEnd)
-    if (!tryParse(out, absPath)) {
+    if (!(await structureValid(absPath, out))) {
       return fail('替换后结构校验失败，已放弃（未落盘）', 'EDIT_INVALID_STRUCTURE')
     }
     const nStart = hit.node.start
     const nEnd = hit.node.end
-    const sl = offsetToLine(starts, nStart)
-    const el = offsetToLine(starts, Math.max(nEnd - 1, 0))
+    const startPos = offsetToPosition(starts, nStart)
+    const endPos = offsetToPosition(starts, Math.max(nEnd - 1, 0))
     const output: CodeSemanticEditReplaceNodeOutput = {
       mode: 'replace_node',
       path: absPath,
       node: {
         relation: hit.relation,
         type: hit.node.type,
-        startLine: sl,
-        startColumn: nStart - starts[sl - 1] + 1,
-        endLine: el,
-        endColumn: nEnd - starts[el - 1] + 1,
+        startLine: startPos.line,
+        startColumn: startPos.column,
+        endLine: endPos.line,
+        endColumn: endPos.column,
         hasInner: hit.hasInner,
       },
       offsetStart: nStart,
@@ -1103,11 +1175,8 @@ async function execReplaceNode(
     await writeFile(absPath, out)
     index.invalidate(absPath)
     return ok(output)
-  } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      return fail(`路径不存在: ${input.path}`, 'PATH_NOT_FOUND')
-    }
-    return fail(err.message ?? String(err), 'CODE_INTEL_ERROR')
+  } catch (err) {
+    return asCoreError(err, input.path)
   }
 }
 
@@ -1117,22 +1186,14 @@ async function execReplaceSubtree(
   ctx: CoreContext,
 ): Promise<CoreResult<CodeSemanticEditReplaceSubtreeOutput>> {
   const absPath = resolvePath(input.path, ctx.cwd)
-  if (!isWithinCwd(absPath, ctx.cwd)) {
-    return fail(`路径 "${input.path}" 超出工作目录范围`, 'PATH_OUTSIDE_CWD')
-  }
+  const denied = outsideCwd(input.path, absPath, ctx.cwd)
+  if (denied) return denied
   const selector = input.selector.trim()
   if (!SELECTOR_RE.test(selector)) {
     return fail(`选择器 "${input.selector}" 不是合法成员链（期望如 config.server.host）`, 'INVALID_SELECTOR')
   }
   try {
-    let rootExists = false
-    try {
-      const st = await stat(absPath)
-      rootExists = st.isFile() || st.isDirectory()
-    } catch {
-      rootExists = false
-    }
-    if (!rootExists) {
+    if (!(await statTarget(absPath))) {
       return fail(`路径不存在: ${input.path}`, 'PATH_NOT_FOUND')
     }
     const byFile = await index.collectSubtreeFromScope(absPath, ctx.cwd, selector)
@@ -1142,28 +1203,15 @@ async function execReplaceSubtree(
     const planned: Array<{ file: string; original: string; content: string; matches: RangedNode[] }> = []
     for (const [file, matches] of byFile) {
       const original = await readFile(file, 'utf-8')
-      let out = original
-      for (let i = matches.length - 1; i >= 0; i--) {
-        const m = matches[i]
-        out = out.slice(0, m.start) + input.replacement + out.slice(m.end)
-      }
-      if (!tryParse(out, file)) {
-        return fail(
-          `替换后 "${relative(ctx.cwd, file)}" 结构校验失败，已放弃（未落盘）`,
-          'EDIT_INVALID_STRUCTURE',
-        )
-      }
-      planned.push({ file, original, content: out, matches })
+      const content = applySplices(original, matches, input.replacement)
+      if (!(await structureValid(file, content))) return structureFailure('替换', file, ctx.cwd)
+      planned.push({ file, original, content, matches })
     }
     const files: CodeSemanticEditSubtreeFileResult[] = planned.map((p) => {
       const starts = buildLineStarts(p.original)
       const matches = p.matches.map((m) => {
-        const line = offsetToLine(starts, m.start)
-        return {
-          line,
-          column: m.start - starts[line - 1] + 1,
-          text: p.original.slice(m.start, m.end),
-        }
+        const pos = offsetToPosition(starts, m.start)
+        return { line: pos.line, column: pos.column, text: p.original.slice(m.start, m.end) }
       })
       return {
         path: p.file,
@@ -1189,10 +1237,7 @@ async function execReplaceSubtree(
       index.invalidate(p.file)
     }
     return ok(output)
-  } catch (err: any) {
-    if (err.code === 'ENOENT') {
-      return fail(`路径不存在: ${input.path}`, 'PATH_NOT_FOUND')
-    }
-    return fail(err.message ?? String(err), 'CODE_INTEL_ERROR')
+  } catch (err) {
+    return asCoreError(err, input.path)
   }
 }
