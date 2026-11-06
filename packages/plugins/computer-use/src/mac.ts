@@ -5,11 +5,26 @@
  * 配合 /usr/sbin/screencapture 截图。所有外部命令都通过可注入的 ExecFn / ExecBinFn 执行，
  * 便于在单测中注入 mock（不真的操作电脑）。
  *
+ * 拼脚本与校验的纯逻辑都在 ./applescript.ts（唯一口径），本文件只负责"拼装 + 调用执行器"。
+ *
  * 权限：需要「辅助功能」(Accessibility) 授权；屏幕截图需要「屏幕录制」(Screen Recording) 授权。
  * 相应工具在被系统拒绝时抛出携带可读信息的错误，由上层转为工具 error 结果。
  */
 
 import { execFile } from 'node:child_process'
+import {
+  assertFiniteInt,
+  elementRefClause,
+  escapeAppleScriptText,
+  modifierClause,
+  parseAppList,
+  parseBoolResult,
+  parseElementRef,
+  quoteAppleScriptString,
+  resolveScrollDirection,
+  scrollKeyCode,
+  keyCodeFor,
+} from './applescript'
 
 // ===== 可注入执行器 =====
 
@@ -48,6 +63,8 @@ export function makeScreencaptureExec(): ExecBinFn {
 export interface PermissionsResult {
   accessibility: boolean
   screenRecording: boolean | null
+  /** 辅助功能查询失败的原因（成功 / 未失败时为 undefined）—— 失败不再静默成 false */
+  accessibilityError?: string
 }
 
 export interface AppInfo {
@@ -64,11 +81,6 @@ export interface AppStateResult {
   uiTree: string
   /** 截图 data URI（image-uri），可为空 */
   screenshot?: string
-}
-
-/** AppleScript System Events 进程名转义 */
-function q(s: string): string {
-  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
 // ===== AppleScript 片段 =====
@@ -97,7 +109,7 @@ function listAppsScript(): string {
 function uiTreeScript(processName: string, depthLimit: number, elementLimit: number): string {
   return [
     `use scripting additions`,
-    `set theProc to "${q(processName)}"`,
+    `set theProc to "${escapeAppleScriptText(processName)}"`,
     `set depthLimit to ${depthLimit}`,
     `set elemCap to ${elementLimit}`,
     `set out to ""`,
@@ -186,6 +198,24 @@ export interface ComputerUseBackendOptions {
   allowScreenshot?: boolean
 }
 
+/** 统一的后端错误：带操作名，便于从日志定位是哪一步失败 */
+export class ComputerUseError extends Error {
+  readonly op: string
+  constructor(op: string, message: string) {
+    super(`computer-use ${op} 失败：${message}`)
+    this.name = 'ComputerUseError'
+    this.op = op
+  }
+}
+
+/** 目标应用名校验（所有面向具体 app 的操作都需要） */
+function requireApp(app: unknown): string {
+  if (typeof app !== 'string' || app.trim() === '') {
+    throw new ComputerUseError('app', '缺少目标应用名（app）')
+  }
+  return app
+}
+
 /**
  * 电脑控制后端：每种工具一个方法，返回结构化结果或抛错。
  */
@@ -200,42 +230,38 @@ export class ComputerUseBackend {
     this.allowScreenshot = options.allowScreenshot !== false
   }
 
-  private async run(script: string): Promise<string> {
+  /** 执行一段脚本；失败时错误带操作名（ops：哪个工具/哪一步） */
+  private async run(script: string, op: string): Promise<string> {
     const r = await this.exec(['-e', script])
-    if (r.code !== 0) throw new Error(`osascript 失败：${r.stderr || r.stdout || '未知错误'}`)
+    if (r.code !== 0) throw new ComputerUseError(op, r.stderr || r.stdout || '未知错误')
     return r.stdout.trimEnd()
-  }
-
-  /** 提取布尔结果：true/false 或 error */
-  private parseBool(raw: string, fallback = false): boolean {
-    const s = raw.toLowerCase()
-    if (s.includes('true')) return true
-    if (s.includes('false')) return false
-    if (s.includes('error')) throw new Error(`权限查询失败：${raw}`)
-    return fallback
   }
 
   /** check_permissions：辅助功能 + 屏幕录制 */
   async checkPermissions(): Promise<PermissionsResult> {
     let accessibility = false
+    let accessibilityError: string | undefined
     try {
-      accessibility = this.parseBool(await this.run(permissionScript()))
-    } catch { accessibility = false }
+      accessibility = parseBoolResult(await this.run(permissionScript(), 'check_permissions'))
+    } catch (err) {
+      accessibility = false
+      accessibilityError = (err as Error)?.message ?? String(err)
+    }
     return {
       accessibility,
       // 屏幕录制状态难以稳定探测：接入截图命令作为启发式（失败/被拒则为 false）
       screenRecording: null,
+      accessibilityError,
     }
   }
 
   /** list_apps：列出运行中的应用（name + pid + 可选 windowId） */
   async listApps(opts: { includeWindowIds?: boolean; windowLimit?: number } = {}): Promise<{ apps: AppInfo[] }> {
-    const raw = await this.run(listAppsScript())
-    const apps: AppInfo[] = []
-    for (const line of raw.split('\n')) {
-      if (!line.trim()) continue
-      const [name, pidStr] = line.split('\t')
-      apps.push({ name, pid: pidStr ? parseInt(pidStr, 10) : undefined, running: true })
+    const raw = await this.run(listAppsScript(), 'list_apps')
+    let apps: AppInfo[] = parseAppList(raw).map((e) => ({ name: e.name, pid: e.pid, running: true }))
+    const limit = opts.windowLimit
+    if (typeof limit === 'number' && Number.isFinite(limit) && limit >= 0) {
+      apps = apps.slice(0, Math.floor(limit))
     }
     if (opts.includeWindowIds) {
       for (const a of apps) a.windowId = await this.frontWindowId(a.name)
@@ -247,7 +273,7 @@ export class ComputerUseBackend {
   async frontWindowId(processName: string): Promise<number | undefined> {
     const script = [
       `tell application "System Events"`,
-      `  tell process "${q(processName)}"`,
+      `  tell process "${escapeAppleScriptText(processName)}"`,
       `    try`,
       `      set w to front window`,
       `      return (id of w) as text`,
@@ -257,19 +283,20 @@ export class ComputerUseBackend {
       `  end tell`,
       `end tell`,
     ].join('\n')
-    const raw = await this.run(script)
-    const n = parseInt(raw, 10)
-    return Number.isNaN(n) ? undefined : n
+    const raw = await this.run(script, 'front_window_id')
+    const n = parsePidOrUndefined(raw)
+    return n
   }
 
   /** get_app_state：UI 树 + 可选截图 */
   async getAppState(opts: { app: string; windowId?: number; disableDiff?: boolean }): Promise<AppStateResult> {
-    const uiTree = await this.run(uiTreeScript(opts.app, 4, 200))
+    const app = requireApp(opts.app)
+    const uiTree = await this.run(uiTreeScript(app, 4, 200), 'get_app_state')
     let screenshot: string | undefined
     if (this.allowScreenshot && this.execBin) {
       try {
-        const wid = opts.windowId ?? (await this.frontWindowId(opts.app))
-        const args = ['-l', String(wid ?? opts.app), '-t', 'png', '-o', '-']
+        const wid = opts.windowId ?? (await this.frontWindowId(app))
+        const args = ['-l', String(wid ?? app), '-t', 'png', '-o', '-']
         const r = await this.execBin(args)
         if (r.code === 0 && r.stdout.length > 0) {
           screenshot = `data:image/png;base64,${r.stdout.toString('base64')}`
@@ -281,150 +308,150 @@ export class ComputerUseBackend {
 
   /** click：按坐标或 element_id */
   async click(opts: { app: string; windowId?: number; x?: number; y?: number; element_id?: string; button?: string; clickCount?: number }): Promise<{ ok: true }> {
+    const app = requireApp(opts.app)
+    const button = (opts.button ?? 'left').toString().trim().toLowerCase()
+    // 契约一致：schema 声称支持 right/middle，实现做不到就明确报错，而不是默默按左键点
+    if (button !== 'left') {
+      throw new ComputerUseError('click', `暂不支持 button=${button}（当前仅支持 left）`)
+    }
+    const clickCount = opts.clickCount == null ? 1 : assertFiniteInt(opts.clickCount, 'clickCount', { min: 1, max: 3 })
+
     if (opts.element_id != null) {
-      // element_id 形如 "role|name|index"，拆出用于 AppleScript 定位
-      const [role, name, idx] = opts.element_id.split('|')
-      const which = name !== undefined ? `${role} "${q(name)}"` : `${role} ${idx ?? '1'}`
-      await this.run(this.inProc(opts.app, `click ${which} of front window`))
+      const ref = parseElementRef(opts.element_id)
+      const which = elementRefClause(ref)
+      for (let i = 0; i < clickCount; i++) {
+        await this.run(this.inProc(app, `click ${which} of front window`), 'click')
+      }
     } else if (opts.x != null && opts.y != null) {
-      await this.run(this.inProc(opts.app, `click at {${opts.x}, ${opts.y}}`))
+      const x = assertFiniteInt(opts.x, 'x 坐标')
+      const y = assertFiniteInt(opts.y, 'y 坐标')
+      for (let i = 0; i < clickCount; i++) {
+        await this.run(this.inProc(app, `click at {${x}, ${y}}`), 'click')
+      }
     } else {
-      throw new Error('click 需要 element_id 或 (x, y) 坐标')
+      throw new ComputerUseError('click', '需要 element_id 或 (x, y) 坐标')
     }
     return { ok: true }
   }
 
   /** scroll：按方向/页 或 deltaY/deltaX */
   async scroll(opts: { app: string; element_id?: string; deltaY?: number; deltaX?: number; direction?: string; pages?: number }): Promise<{ ok: true }> {
-    const pages = opts.pages ?? 1
-    const dir = opts.direction ?? (opts.deltaY && opts.deltaY > 0 ? 'down' : opts.deltaY && opts.deltaY < 0 ? 'up' : 'down')
-    const axis = dir === 'left' || dir === 'right' ? 'horizontal' : 'vertical'
-    // 通过光标 & 方向键滚动（最通用的无元素方案）
-    await this.run(this.inProc(opts.app, `set frontmost to true`))
-    await this.run(`tell application "System Events" to repeat ${pages} times
-  key code ${dir === 'up' || dir === 'left' ? 126 : 125} using {${axis === 'horizontal' ? 'shift' : 'control'} down}
-end repeat`.replace('\n', '\n'))
+    const app = requireApp(opts.app)
+    const dir = resolveScrollDirection({ direction: opts.direction, deltaY: opts.deltaY, deltaX: opts.deltaX })
+    const pages = opts.pages == null ? 1 : assertFiniteInt(opts.pages, '滚动页数', { min: 1, max: 50 })
+    const axis = dir === 'left' || dir === 'right' ? 'shift' : 'control'
+    await this.run(this.inProc(app, `set frontmost to true`), 'scroll')
+    await this.run(
+      `tell application "System Events" to repeat ${pages} times\n  key code ${scrollKeyCode(dir)} using {${axis} down}\nend repeat`,
+      'scroll',
+    )
     return { ok: true }
   }
 
-  /** drag：从起点拖到终点 */
+  /**
+   * drag：从起点拖到终点。
+   *
+   * 已知限制：System Events 没有 mouse down/up，真正的拖拽需要 cliclick / CGEvent（未做）。
+   * 这里保持"按下起点 → 移动终点"的近似实现，但先校验再执行 —— 旧实现会先跑两段脚本、
+   * 最后才抛"缺少坐标"，等于在报错前已经动过用户的界面。
+   */
   async drag(opts: { app: string; fromX?: number; fromY?: number; toX?: number; toY?: number }): Promise<{ ok: true }> {
-    await this.run(this.inProc(opts.app, `set frontmost to true`))
-    await this.run(`tell application "System Events"
-  set p to ${opts.fromX ?? 0} + ${opts.toX ?? 0}
-end tell`)
-    // 真实拖动：按下鼠标 → 移动 → 释放（基于点击坐标近似）
-    if (opts.fromX != null && opts.fromY != null && opts.toX != null && opts.toY != null) {
-      await this.run(`tell application "System Events"
-  click at {${opts.fromX}, ${opts.fromY}}
-  click at {${opts.toX}, ${opts.toY}}
-end tell`)
-    } else {
-      throw new Error('drag 需要 fromX/fromY/toX/toY')
+    const app = requireApp(opts.app)
+    if (opts.fromX == null || opts.fromY == null || opts.toX == null || opts.toY == null) {
+      throw new ComputerUseError('drag', '需要 fromX/fromY/toX/toY 四个坐标')
     }
+    const fromX = assertFiniteInt(opts.fromX, 'fromX')
+    const fromY = assertFiniteInt(opts.fromY, 'fromY')
+    const toX = assertFiniteInt(opts.toX, 'toX')
+    const toY = assertFiniteInt(opts.toY, 'toY')
+    await this.run(this.inProc(app, `set frontmost to true`), 'drag')
+    await this.run(
+      `tell application "System Events"\n  click at {${fromX}, ${fromY}}\n  click at {${toX}, ${toY}}\nend tell`,
+      'drag',
+    )
     return { ok: true }
   }
 
-  /** type_text：向目标输入框输入文本（后台，不抢焦点） */
+  /** type_text：向目标输入框输入文本 */
   async typeText(opts: { app: string; text: string; slowly?: boolean }): Promise<{ ok: true }> {
-    if (opts.text == null) throw new Error('type_text 缺少 text')
+    if (typeof opts.text !== 'string') {
+      throw new ComputerUseError('type_text', '缺少 text（要输入的文本）')
+    }
     // 光标锁定由调用方先 click 目标字段；这里直接 keystroke（保持系统级）
-    await this.run(`tell application "System Events" to keystroke ${quotedText(opts.text)}`)
+    await this.run(`tell application "System Events" to keystroke ${quoteAppleScriptString(opts.text)}`, 'type_text')
     return { ok: true }
   }
 
   /** press_key：按键 / 组合键 */
   async pressKey(opts: { app: string; key: string; modifiers?: string[] }): Promise<{ ok: true }> {
-    const usage = AppleModifierList(opts.modifiers ?? [])
+    const usage = modifierClause(opts.modifiers ?? [])
+    if (typeof opts.key !== 'string' || opts.key.trim() === '') {
+      throw new ComputerUseError('press_key', '缺少 key（按键名）')
+    }
     const code = keyCodeFor(opts.key)
     const script = code != null
       ? `tell application "System Events" to key code ${code}${usage}`
-      : `tell application "System Events" to keystroke "${q(opts.key)}"${usage}`
-    await this.run(script)
+      : `tell application "System Events" to keystroke ${quoteAppleScriptString(opts.key)}${usage}`
+    await this.run(script, 'press_key')
     return { ok: true }
   }
 
   /** perform_action：AXPress = click 的辅助动作 */
   async performAction(opts: { app: string; element_id?: string; action: string }): Promise<{ ok: true }> {
+    if (typeof opts.action !== 'string' || opts.action.trim() === '') {
+      throw new ComputerUseError('perform_action', '缺少 action')
+    }
     if (opts.element_id == null) {
       // 无明确元素：尝试 action 对应的键（Show Menu → 上下文菜单）
-      await this.run(`tell application "System Events" to key code 49 using {control down}`)
+      await this.run(`tell application "System Events" to key code 49 using {control down}`, 'perform_action')
       return { ok: true }
     }
-    const [role, name, idx] = opts.element_id.split('|')
-    const which = name !== undefined ? `${role} "${q(name)}"` : `${role} ${idx ?? '1'}`
-    await this.run(this.inProc(opts.app, `perform action "${q(opts.action)}" of ${which} of front window`))
+    const app = requireApp(opts.app)
+    const ref = parseElementRef(opts.element_id)
+    await this.run(
+      this.inProc(app, `perform action ${quoteAppleScriptString(opts.action)} of ${elementRefClause(ref)} of front window`),
+      'perform_action',
+    )
     return { ok: true }
   }
 
   /** set_value：设置可写元素的值（Electron 等可能拒写） */
   async setValue(opts: { app: string; element_id?: string; value: string }): Promise<{ ok: true }> {
-    if (opts.element_id == null) throw new Error('set_value 需要 element_id')
-    const [role, name, idx] = opts.element_id.split('|')
-    const which = name !== undefined ? `${role} "${q(name)}"` : `${role} ${idx ?? '1'}`
-    await this.run(this.inProc(opts.app, `set value of ${which} of front window to "${q(opts.value)}"`))
+    if (opts.element_id == null) throw new ComputerUseError('set_value', '需要 element_id')
+    if (typeof opts.value !== 'string') throw new ComputerUseError('set_value', '缺少 value')
+    const app = requireApp(opts.app)
+    const ref = parseElementRef(opts.element_id)
+    await this.run(
+      this.inProc(app, `set value of ${elementRefClause(ref)} of front window to ${quoteAppleScriptString(opts.value)}`),
+      'set_value',
+    )
     return { ok: true }
   }
 
   /** select_text：在元素内选中文本（按前缀/后缀判定难，提供坐标型近似） */
   async selectText(opts: { app: string; element_id: string; text: string; selection?: string }): Promise<{ ok: true }> {
-    if (opts.element_id == null || opts.text == null) throw new Error('select_text 需要 element_id 和 text')
-    // 近似：双击元素锚点后使用 ⇧ 键扩展选择，或直接抓取文本所在范围
-    const [role, name, idx] = opts.element_id.split('|')
-    const which = name !== undefined ? `${role} "${q(name)}"` : `${role} ${idx ?? '1'}`
-    await this.run(this.inProc(opts.app, `select ${which} of front window`))
+    if (opts.element_id == null) throw new ComputerUseError('select_text', '需要 element_id')
+    if (typeof opts.text !== 'string') throw new ComputerUseError('select_text', '需要 text')
+    const app = requireApp(opts.app)
+    const ref = parseElementRef(opts.element_id)
+    await this.run(this.inProc(app, `select ${elementRefClause(ref)} of front window`), 'select_text')
     return { ok: true }
   }
 
   /** 构造 tell process APP 包裹的 AppleScript */
   private inProc(app: string, actions: string): string {
     return `tell application "System Events"
-  tell process "${q(app)}"
+  tell process "${escapeAppleScriptText(app)}"
     ${actions}
   end tell
 end tell`
   }
 }
 
-// ===== AppleScript 字符串转义 / 组合键 / 键码 =====
-
-/** AppleScript 字符串字面量（转义仅在字符串字面量上下文有效，keystroke 用其原始值） */
-function quotedText(s: string): string {
-  // keystroke 使用 AppleScript 字符串字面量，需转义反斜杠与引号
-  return `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
-}
-
-/** 修饰符 → AppleScript using {} 子句（空则空串） */
-function AppleModifierList(mods?: string[]): string {
-  if (!mods || mods.length === 0) return ''
-  const parts = mods.map((m) => {
-    switch (m.toLowerCase()) {
-      case 'cmd': case 'command': return 'command down'
-      case 'ctrl': case 'control': return 'control down'
-      case 'opt': case 'option': return 'option down'
-      case 'shift': return 'shift down'
-      default: return 'command down'
-    }
-  })
-  return ` using {${parts.join(', ')}}`
-}
-
-/** 命名键 → AppleScript key code（macOS 虚拟键码子集） */
-function keyCodeFor(key: string): number | null {
-  const k = (key ?? '').toLowerCase()
-  const map: Record<string, number> = {
-    enter: 36, return: 36,
-    tab: 48, space: 49, delete: 51, forwarddelete: 117,
-    escape: 53, esc: 53,
-    // 字母
-    a: 0, b: 11, c: 8, d: 2, e: 14, f: 3, g: 5, h: 4, i: 34, j: 38,
-    k: 40, l: 37, m: 46, n: 45, o: 31, p: 35, q: 12, r: 15, s: 1, t: 17,
-    u: 32, v: 9, w: 13, x: 7, y: 16, z: 6,
-    // 数字
-    '0': 29, '1': 18, '2': 19, '3': 20, '4': 21, '5': 23, '6': 22, '7': 26, '8': 28, '9': 25,
-    // 方向键
-    up: 126, down: 125, left: 123, right: 124,
-    home: 115, end: 119, pageup: 116, pagedown: 121,
-  }
-  return map[k] ?? null
+/** 窗口 id 文本 → number | undefined（空串 / 非数字 → undefined） */
+function parsePidOrUndefined(raw: string): number | undefined {
+  const s = (raw ?? '').trim()
+  if (!/^\d+$/.test(s)) return undefined
+  const n = Number(s)
+  return Number.isSafeInteger(n) ? n : undefined
 }
