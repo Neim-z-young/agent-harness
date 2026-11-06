@@ -1125,6 +1125,27 @@ export class PluginUninstallError extends Error {
   }
 }
 
+/**
+ * 同一条 hook 上有**多个**插件抛错时的聚合错误。
+ *
+ * 为什么单立一个类而不是裸 `AggregateError`：此前 `trigger` 用
+ * `(agg as { hookName?: string }).hookName = name` 往原生错误上**打补丁**，于是
+ * 「这条聚合错误属于哪个 hook」只有读源码的人知道，类型面完全看不见，消费方想按 hook 归因
+ * 只能 `as any`。这里把 `hookName` 收成只读字段、`errors` 收窄成 `PluginHookError[]`。
+ *
+ * 继承 `AggregateError` 是刻意的：既有消费方写的 `instanceof AggregateError` / `.errors`
+ * 逐位保持有效（`packages/plugin` 的聚合用例就是这样断言的）。
+ */
+export class PluginHookAggregateError extends AggregateError {
+  readonly hookName: string
+  declare readonly errors: PluginHookError[]
+  constructor(hookName: string, errors: PluginHookError[]) {
+    super(errors, `Hook "${hookName}": ${errors.length} plugin(s) failed`)
+    this.name = 'PluginHookAggregateError'
+    this.hookName = hookName
+  }
+}
+
 /** Hook 管道执行时某个插件抛错 */
 export class PluginHookError extends Error {
   readonly hookName: string
@@ -1145,22 +1166,22 @@ export class PluginHookError extends Error {
 /**
  * 拓扑排序：按 dependsOn 对插件列表排序
  *
- * - 缺失依赖 → PluginMissingDependencyError
+ * - 批内重复 ID → PluginDuplicateIdError
  * - 循环依赖 → PluginCircularDependencyError
  * - 其他按 Kahn BFS 算法排序
+ *
+ * **跨批依赖是合法输入、不会报错**：`dependsOn` 里指向「不在本批但在更早批次已加载」的 id，
+ * 该节点被当作「无批内依赖」处理（三个加载级的顺序 internal → builtin → user 正是为此）。
+ * 因此**本函数不抛 `PluginMissingDependencyError`** —— 那个类是留给「调用方在知道自己
+ * 那批的完整清单时」自行裁决用的（`packages/core` 仍按公共 API 转出它）。
+ * 曾在此处留一个空 body 的 `for` 循环配注释假装"在校验"，实际一行都没执行；
+ * 若哪天真要校验，判据必须带上"已加载集合"，不能在这个纯函数里做。
  */
 export function topologicalSortPlugins(plugins: AgentPlugin[]): AgentPlugin[] {
   const byId = new Map<string, AgentPlugin>()
   for (const p of plugins) {
     if (byId.has(p.id)) throw new PluginDuplicateIdError(p.id)
     byId.set(p.id, p)
-  }
-
-  // 依赖是否都在同一批内存在（只对在批内的校验；跨批依赖由调用方保证已加载）
-  for (const p of plugins) {
-    for (const dep of p.dependsOn ?? []) {
-      // 若依赖不在批内但 ID 不重复，假设它是跨批的（已加载），跳过校验
-    }
   }
 
   // Kahn 算法
@@ -1196,7 +1217,8 @@ export function topologicalSortPlugins(plugins: AgentPlugin[]): AgentPlugin[] {
 
   if (result.length !== plugins.length) {
     // 剩余节点组成环，DFS 找一条示例
-    const remaining = new Set(plugins.map((p) => p.id).filter((id) => !result.find((r) => r.id === id)))
+    const sorted = new Set(result.map((r) => r.id))
+    const remaining = new Set(plugins.map((p) => p.id).filter((id) => !sorted.has(id)))
     const cycle: string[] = []
     const visited = new Set<string>()
     const stack: string[] = []
@@ -1271,6 +1293,12 @@ export class HooksRegistry {
 
 // ===== PluginManagerImpl =====
 
+/** `loadBuiltin` / `loadUser` 的解析结果：spec 与插件成对携带（供 hotReload 复原） */
+interface ResolvedSpec {
+  spec: string
+  plugin: AgentPlugin
+}
+
 /** createPluginManager 参数 */
 export interface PluginManagerOptions {
   /** Bus 事件总线 */
@@ -1341,10 +1369,7 @@ export class PluginManagerImpl implements PluginManager {
   // ---- 三级加载 ----
 
   async loadInternal(plugins: AgentPlugin[]): Promise<void> {
-    const ordered = topologicalSortPlugins(plugins)
-    for (const p of ordered) {
-      if (this.loaded.has(p.id)) throw new PluginDuplicateIdError(p.id)
-    }
+    const ordered = this.sortBatch(plugins)
     for (const p of ordered) {
       await this.installOne(p, 'internal')
       this.internalPlugins.set(p.id, p)
@@ -1352,13 +1377,11 @@ export class PluginManagerImpl implements PluginManager {
   }
 
   async loadBuiltin(npmSpecs: string[]): Promise<void> {
-    const loaded = await Promise.all(npmSpecs.map((s) => this.resolveSpec(s)))
-    await this.loadExternalBatch(loaded, 'builtin', npmSpecs)
+    await this.loadExternalBatch(await this.resolveSpecs(npmSpecs), 'builtin')
   }
 
   async loadUser(userSpecs: string[]): Promise<void> {
-    const loaded = await Promise.all(userSpecs.map((s) => this.resolveSpec(s)))
-    await this.loadExternalBatch(loaded, 'user', userSpecs)
+    await this.loadExternalBatch(await this.resolveSpecs(userSpecs), 'user')
   }
 
   // ---- 卸载 / 热重载 ----
@@ -1367,61 +1390,79 @@ export class PluginManagerImpl implements PluginManager {
     const lp = this.loaded.get(pluginId)
     if (!lp) throw new PluginNotFoundError(pluginId)
 
-    // 1. core.bus.event 退订
+    // 1. 先跑 uninstall()：**失败就整体不动**（hooks / bus 订阅 / 表项全部保留），可以原样重试。
+    //    曾经是「先退订再 uninstall」，于是 uninstall 抛错后插件仍在 list() 里、hooks 却已注销 ——
+    //    "看起来加载着、实际什么都不响应"这种半死状态比直接报错难诊断得多。
+    try {
+      await lp.plugin.uninstall?.()
+    } catch (err) {
+      // 必须留痕：调用方（如 `core.stop()`）会吞掉这个错，不留日志就等于"插件没卸掉"零信号
+      this.logger.error(`[plugin] unload ${pluginId} failed; state kept intact (retryable)`, err)
+      throw new PluginUninstallError(pluginId, err)
+    }
+
+    // 2. 停掉入口：core.bus.event 退订 → hooks 注销
     const unsub = this.busEventUnsubs.get(pluginId)
     if (unsub) {
       unsub()
       this.busEventUnsubs.delete(pluginId)
     }
-
-    // 2. hooks 注销
     this.hooks.unregister(pluginId)
 
-    // 3. uninstall()
-    try {
-      await lp.plugin.uninstall?.()
-    } catch (err) {
-      throw new PluginUninstallError(pluginId, err)
-    }
-
-    // 4. 清理
+    // 3. 清理索引
     this.loaded.delete(pluginId)
     this.specById.delete(pluginId)
     this.internalPlugins.delete(pluginId)
+    this.logger.info(`[plugin] unloaded ${pluginId} (source=${lp.source})`)
   }
 
+  /**
+   * 热重载：解析出**新实例** → 卸载旧实例 → 装上新的。
+   *
+   * 两条顺序纪律（都踩过）：
+   * 1. **`specById` 必须在 `unload` 之前读进局部变量** —— `unload` 会删掉它，
+   *    之后再读就只能拿到 undefined（此前写成 `this.specById.get(id)?.spec ?? ''`，
+   *    于是**第二次** reload 会拿空串去 `import()`，第一次之后 spec 就永久丢了）。
+   * 2. **解析失败不卸载**：`import()` 一个坏包是常态（版本冲突 / 语法错），
+   *    此时旧实例还能用，先卸再解析等于"重载失败连带把活着的插件弄没了"。
+   */
   async hotReload(pluginId: string): Promise<void> {
     const lp = this.loaded.get(pluginId)
     if (!lp) throw new PluginNotFoundError(pluginId)
 
+    const prev = lp.plugin
     const source = lp.source
-    // 保存需要的信息
-    let plugin: AgentPlugin | null = null
+    // ⚠️ 必须在 unload 之前取：unload 会清空 specById / internalPlugins
+    const specInfo = source === 'internal' ? undefined : this.specById.get(pluginId)
 
+    let next: AgentPlugin = prev
     if (source === 'internal') {
-      plugin = this.internalPlugins.get(pluginId) ?? null
-    } else {
-      const specInfo = this.specById.get(pluginId)
-      if (specInfo) {
-        const mod = await this.resolveSpec(specInfo.spec)
-        plugin = mod
-      }
+      next = this.internalPlugins.get(pluginId) ?? prev
+    } else if (specInfo) {
+      next = await this.resolveSpec(specInfo.spec)
     }
 
-    // 先卸载
     await this.unload(pluginId)
 
-    // 再安装
-    if (plugin === null) return
-
-    if (source === 'internal') {
-      // 重新按单批加载
-      await this.installOne(plugin, 'internal')
-      this.internalPlugins.set(pluginId, plugin)
-    } else {
-      await this.installOne(plugin, source as 'builtin' | 'user')
-      this.specById.set(pluginId, { source: source as 'builtin' | 'user', spec: this.specById.get(pluginId)?.spec ?? '' })
+    try {
+      await this.installOne(next, source)
+    } catch (err) {
+      // 装新实例失败 → 把旧实例装回去（它本身仍可用），别让插件从表里消失
+      const restored = await this.installOne(prev, source).then(
+        () => true,
+        () => false
+      )
+      if (restored) {
+        this.rememberSource(pluginId, prev, source, specInfo)
+        this.logger.error(`[plugin] reload ${pluginId} failed; rolled back to previous instance`, err)
+      } else {
+        // 两种失败要分得开：回滚成功 = 仍在服务（降级），回滚失败 = 插件已不在表里（事故）
+        this.logger.error(`[plugin] reload ${pluginId} failed AND rollback failed; plugin is now UNLOADED`, err)
+      }
+      throw err
     }
+    this.rememberSource(pluginId, next, source, specInfo)
+    this.logger.info(`[plugin] reloaded ${pluginId} (source=${source})`)
   }
 
   list(): LoadedPlugin[] {
@@ -1459,11 +1500,9 @@ export class PluginManagerImpl implements PluginManager {
     }
 
     if (errors.length > 0) {
-      // 多个错误时用 AggregateError 包装
+      // 多个错误时聚合成 PluginHookAggregateError（继承 AggregateError，兼容既有 consumer）
       if (errors.length === 1) throw errors[0]
-      const agg = new AggregateError(errors, `Hook "${String(name)}": ${errors.length} plugin(s) failed`)
-      ;(agg as { hookName?: string }).hookName = String(name)
-      throw agg
+      throw new PluginHookAggregateError(String(name), errors)
     }
   }
 
@@ -1503,29 +1542,51 @@ export class PluginManagerImpl implements PluginManager {
     this.logger.info(`[plugin] loaded ${plugin.id}@${plugin.version} (${(performance.now() - start).toFixed(1)}ms, source=${source})`)
   }
 
-  private async loadExternalBatch(
-    plugins: AgentPlugin[],
-    source: 'builtin' | 'user',
-    specs: string[]
-  ): Promise<void> {
-    const ordered = topologicalSortPlugins(plugins)
+  /** 将 spec 列表解析成 `{ spec, plugin }` 对（保持入参顺序；任一失败则整批失败） */
+  private async resolveSpecs(specs: readonly string[]): Promise<ResolvedSpec[]> {
+    return Promise.all(specs.map(async (spec) => ({ spec, plugin: await this.resolveSpec(spec) })))
+  }
+
+  /**
+   * 批内排序 + 「不得与已加载插件重名」校验。
+   *
+   * 两级加载（internal / builtin+user）此前各抄一遍这两行，口径分裂只会往"一级校验、一级漏"走。
+   */
+  private sortBatch(plugins: readonly AgentPlugin[]): AgentPlugin[] {
+    const ordered = topologicalSortPlugins([...plugins])
     for (const p of ordered) {
       if (this.loaded.has(p.id)) throw new PluginDuplicateIdError(p.id)
     }
-    const idToSpec = new Map<string, string>()
-    // 简单地按顺序对应：如果顺序不稳定会用插件本身 id 存；实际上 resolver 返回顺序和传入顺序一致
-    for (let i = 0; i < specs.length; i++) {
-      const plug = plugins[i]
-      if (plug) idToSpec.set(plug.id, specs[i]!)
-    }
+    return ordered
+  }
+
+  private async loadExternalBatch(resolved: readonly ResolvedSpec[], source: 'builtin' | 'user'): Promise<void> {
+    const ordered = this.sortBatch(resolved.map((r) => r.plugin))
+    // spec 与插件的对应关系**按构造携带**（resolved 是 { spec, plugin } 配对），
+    // 不再靠"输入下标 == 输出下标"的位置约定 —— 排序一介入那种约定就只能靠注释担保。
+    const specById = new Map(resolved.map((r) => [r.plugin.id, r.spec]))
     for (const p of ordered) {
       await this.installOne(p, source)
-      const spec = idToSpec.get(p.id)
+      const spec = specById.get(p.id)
       if (spec) this.specById.set(p.id, { source, spec })
     }
   }
 
   /** 将 spec 解析成 AgentPlugin（dynamic import 后找 default 或 匹配的命名导出） */
+  /**
+   * 记下"这个 id 日后怎么重新解析"（`hotReload` 的唯一依据）。
+   * internal 记对象引用，builtin/user 记 spec —— 两者都在 `unload` 里被清掉，故重装后必须补写。
+   */
+  private rememberSource(
+    pluginId: string,
+    plugin: AgentPlugin,
+    source: LoadedPlugin['source'],
+    specInfo: { source: 'builtin' | 'user'; spec: string } | undefined
+  ): void {
+    if (source === 'internal') this.internalPlugins.set(pluginId, plugin)
+    else if (specInfo) this.specById.set(pluginId, specInfo)
+  }
+
   private async resolveSpec(spec: string): Promise<AgentPlugin> {
     const mod = await this.dynamicImport(spec)
     const candidates = [
@@ -1544,7 +1605,9 @@ export class PluginManagerImpl implements PluginManager {
       const r = probe(c)
       if (r) return r
     }
-    if (probe(mod)) return probe(mod)!
+    // 模块自身就是插件对象（`export const plugin = {...}` 无 default）
+    const self = probe(mod)
+    if (self) return self
     // 模块是普通对象，尝试遍历找一个 plugin
     if (mod && typeof mod === 'object') {
       for (const v of Object.values(mod as Record<string, unknown>)) {
