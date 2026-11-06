@@ -2,6 +2,7 @@ import { describe, it, expect } from 'bun:test'
 import {
   createProviderGlmPlugin,
   providerGlmPlugin,
+  providerTypeFactory,
   type GlmProviderConfig,
 } from './index'
 import { OpenAIChatProvider } from '@harness/provider-openai'
@@ -200,6 +201,69 @@ describe('@harness/provider-glm', () => {
       expect(providerGlmPlugin.id).toBe('provider.glm')
       expect(providerGlmPlugin.name).toBe('GLM Provider')
       expect(providerGlmPlugin.description).toContain('智谱')
+    })
+  })
+
+  // 装配逻辑现在只有一份（provider-openai 的 createOpenAICompatiblePlugin），
+  // 这里只钉住**接线**：预设常量确实生效、且能力门按 GLM 的实际情况开放。
+  describe('预设接线（回归）', () => {
+    it('不继承 OPENAI_API_KEY —— 凭据不会跨厂商泄漏', async () => {
+      const savedZhipu = process.env.ZHIPU_API_KEY
+      const savedOpenai = process.env.OPENAI_API_KEY
+      delete process.env.ZHIPU_API_KEY
+      process.env.OPENAI_API_KEY = 'openai-secret'
+      try {
+        const plugin = createProviderGlmPlugin()
+        await plugin.install?.({
+          config: { get: () => undefined } as any,
+          log: { info: () => {}, warn: () => {} } as any,
+        } as any)
+
+        let capturedHeaders: Record<string, string> = {}
+        const calls: string[] = []
+        const restore = installMock(({ url, init }) => {
+          calls.push(url)
+          capturedHeaders = init.headers as Record<string, string>
+          return new Response(okResponse('ok'))
+        })
+        let err: Error | undefined
+        try {
+          await plugin.provider.complete({
+            providerId: 'glm',
+            messages: [{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 }],
+            params: {},
+          })
+        } catch (e) {
+          err = e as Error
+        } finally {
+          restore()
+        }
+        // 空 key ⇒ 连请求都不发（不是"发出去了才知道 401"），且报错点名是哪个 provider
+        expect(calls).toHaveLength(0)
+        expect(capturedHeaders['Authorization']).toBeUndefined()
+        expect(err?.message).toContain('API Key 未配置')
+        expect(err?.message).toContain('glm')
+      } finally {
+        if (savedZhipu === undefined) delete process.env.ZHIPU_API_KEY
+        else process.env.ZHIPU_API_KEY = savedZhipu
+        if (savedOpenai === undefined) delete process.env.OPENAI_API_KEY
+        else process.env.OPENAI_API_KEY = savedOpenai
+      }
+    })
+
+    it('type factory 的 type=glm，且 thinking 被转发（智谱支持顶层 thinking）', async () => {
+      expect(providerTypeFactory.type).toBe('glm')
+      const plugin = providerTypeFactory.createPlugin({
+        id: 'glm',
+        model: 'glm-4',
+        thinking: 'enabled',
+      } as any) as ReturnType<typeof createProviderGlmPlugin>
+      await plugin.install?.({
+        config: { get: () => undefined } as any,
+        log: { info: () => {}, warn: () => {} } as any,
+      } as any)
+      expect(plugin.provider['config'].thinking).toBe('enabled')
+      expect(plugin.id).toBe('provider.glm')
     })
   })
 })

@@ -505,6 +505,22 @@ export class OpenAIChatProvider implements ChatProvider {
     this.config.apiKey = key
   }
 
+  /**
+   * 缺 API Key 时的报错。
+   *
+   * 文案按实例 id 分流：本类被 `createOpenAICompatiblePlugin` 复用为 GLM / Qwen 等预设的实现，
+   * 若一律提示"设置 OPENAI_API_KEY"，看日志的人会去配一个**根本不会生效**的变量
+   * （预设的 key 只认自己声明的那个环境变量，见 `resolvePresetConfig`）。
+   */
+  private missingApiKeyError(): Error {
+    if (this.config.providerId === 'openai') {
+      return new Error('OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量或在 config 中传入 apiKey')
+    }
+    return new Error(
+      `Provider "${this.config.providerId}" 的 API Key 未配置 —— 请在 config 中传入 apiKey，或设置该厂商对应的 API key 环境变量`,
+    )
+  }
+
   private buildHeaders(extra?: Record<string, string>): Record<string, string> {
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -607,7 +623,7 @@ export class OpenAIChatProvider implements ChatProvider {
 
     try {
       if (!this.config.apiKey) {
-        throw new Error('OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量或在 config 中传入 apiKey')
+        throw this.missingApiKeyError()
       }
 
       const headers = this.buildHeaders(params.headers)
@@ -743,7 +759,7 @@ export class OpenAIChatProvider implements ChatProvider {
     })
 
     if (!this.config.apiKey) {
-      throw new Error('OpenAI API Key 未配置，请设置 OPENAI_API_KEY 环境变量或在 config 中传入 apiKey')
+      throw this.missingApiKeyError()
     }
 
     const headers = this.buildHeaders({ ...params.headers, Accept: 'text/event-stream' })
@@ -975,35 +991,139 @@ export class OpenAIChatProvider implements ChatProvider {
 }
 
 // ========================================================================
-// 插件工厂
+// OpenAI 兼容预设（多厂商共用一份装配逻辑）
 // ========================================================================
 
-export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): AgentPlugin & {
-  readonly provider: OpenAIChatProvider
-} {
+/**
+ * 一个「OpenAI 兼容端点」的厂商预设：**只有常量不同**，装配逻辑完全相同。
+ *
+ * ## 为什么抽这一层
+ * `provider-glm` / `provider-qwen` 曾是**逐字克隆**的两份文件（各 152 行，归一化后 diff 只剩
+ * 厂商名与三个 URL/模型常量）：install / `core.harness.init` 注册 / uninstall / provider getter
+ * 四段完全相同。两份必然分叉 —— 往其中一份加"注册失败要出声"这类修复，另一份静默缺失，
+ * 而这个仓已经因为"同一个东西两套写法"反复踩坑。故把装配逻辑收敛到一处，厂商包只声明常量。
+ *
+ * ## 预设能声明什么、不能声明什么
+ * 只声明**与请求语义无关**的东西（URL、模型名、环境变量名、展示文案）。凡是会改变请求体形状的
+ * 能力（`thinking` / `reasoningEffort`）必须显式声明支持 —— 各家的字段名并不通用
+ * （GLM 用顶层 `thinking: { type }`，Qwen 用 `enable_thinking`），照抄过去会 400。
+ */
+export interface OpenAICompatiblePreset {
+  /** 注册表类型键（`providers[].type` 与 `providers.register` 的 `type`），如 `'glm'` */
+  type: string
+  /** `providerId` 缺省值（同时决定插件 id `provider.<providerId>`） */
+  defaultProviderId: string
+  /** 插件展示名，如 `'GLM Provider'` */
+  pluginName: string
+  /** 插件描述（会出现在 `harness plugins` 列表里） */
+  pluginDescription: string
+  /** 读 API Key 的环境变量名（如 `ZHIPU_API_KEY`） */
+  envApiKey: string
+  /** 读 baseUrl 的环境变量名（如 `ZHIPU_BASE_URL`） */
+  envBaseUrl: string
+  defaultBaseUrl: string
+  defaultApiPath: string
+  defaultModel: string
+  /**
+   * 该端点真正支持的请求体能力。**缺省一律不转发**（未知字段发给不认识的端点就是 400）。
+   * - `thinking`：顶层 `thinking: { type }`（GLM / DeepSeek 系）
+   */
+  supports?: { thinking?: boolean }
+}
+
+/** 读环境变量；空串按"未配置"处理（`FOO=` 与未设置同义） */
+function readEnv(name: string): string | undefined {
+  if (typeof process === 'undefined') return undefined
+  const v = process.env[name]
+  return v && v.length > 0 ? v : undefined
+}
+
+/**
+ * 把已合并的配置叠加预设的**环境变量与缺省值**，得到交给 `OpenAIChatProvider` 的终态配置。
+ *
+ * ⚠️ `apiKey` 缺省取 **空串而不是 `undefined`**：`OpenAIChatProvider` 构造函数里有
+ * `config.apiKey ?? process.env.OPENAI_API_KEY` 的兜底 —— 若这里放行 `undefined`，
+ * 一个**没配** `ZHIPU_API_KEY` 的 GLM 端点会把 `OPENAI_API_KEY` 当 Bearer 发到
+ * `open.bigmodel.cn`（凭据跨厂商泄漏，且日志上看起来"装好了"）。空串让 ctor 的 `??`
+ * 不触发，失败变成可诊断的 401，而不是把别家的 key 送出去。
+ */
+export function resolvePresetConfig(
+  preset: OpenAICompatiblePreset,
+  config?: OpenAIProviderConfig,
+): OpenAIProviderConfig {
+  return {
+    ...config,
+    apiKey: config?.apiKey ?? readEnv(preset.envApiKey) ?? '',
+    baseUrl: config?.baseUrl ?? readEnv(preset.envBaseUrl) ?? preset.defaultBaseUrl,
+    apiPath: config?.apiPath ?? preset.defaultApiPath,
+    defaultModel: config?.defaultModel ?? preset.defaultModel,
+    providerId: config?.providerId ?? preset.defaultProviderId,
+    // 不支持的字段显式清空：避免 `{...config}` 把它们带进请求体
+    thinking: preset.supports?.thinking ? config?.thinking : undefined,
+    reasoningEffort: preset.supports?.thinking ? config?.reasoningEffort : undefined,
+  }
+}
+
+/** 预设里"配置了也一定不会生效"的字段（安装期出声用） */
+const PRESET_GATED_FIELDS = ['thinking', 'reasoningEffort'] as const
+
+/**
+ * 用一个预设构造 Provider 插件（装配逻辑的唯一实现）。
+ *
+ * 与 `createProviderOpenAIPlugin` 的差别只有两点，都是刻意的：
+ * 1. 端点常量来自 `preset`（`createProviderOpenAIPlugin` 的常量写在 `OpenAIChatProvider` 缺省里）；
+ * 2. 安装期对"配置未生效"的两种情况出声（空 key / 不支持字段），见下方注释。
+ */
+export function createOpenAICompatiblePlugin(
+  preset: OpenAICompatiblePreset,
+  config?: OpenAIProviderConfig,
+): AgentPlugin & { readonly provider: OpenAIChatProvider } {
   let provider: OpenAIChatProvider | undefined
 
-  // 插件 id 随 providerId 派生，使多个 OpenAI 兼容端点（openai/deepseek/ollama/glm/qwen…）
-  // 可在同一进程内各自注册而不冲突（PluginDuplicateIdError）。
-  const providerId = config?.providerId ?? 'openai'
+  const providerId = config?.providerId ?? preset.defaultProviderId
   const pluginId = `provider.${providerId}`
 
   const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
     id: pluginId,
     version: '0.1.0',
-    name: 'OpenAI Provider',
-    description: '对接 OpenAI Chat Completions API 的 Provider 插件',
+    name: preset.pluginName,
+    description: preset.pluginDescription,
 
     async install(ctx: PluginContext): Promise<Hooks | void> {
       const storeCfg = ctx.config.get<OpenAIProviderConfig>(pluginId)
       const merged: OpenAIProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
+      const resolved = resolvePresetConfig(preset, merged)
 
-      provider = new OpenAIChatProvider(merged, () => [])
+      // 「配置了好像生效、其实没生效」必须出声（本仓的老病）：预设不支持的请求体能力一律不转发。
+      if (!preset.supports?.thinking) {
+        const dropped = PRESET_GATED_FIELDS.filter((k) => merged[k] !== undefined)
+        if (dropped.length > 0) {
+          ctx.log.warn(
+            `${preset.pluginName} 不转发 ${dropped.join('/')}：该端点无对应语义（QWEN 用 enable_thinking），本次按未配置处理`,
+          )
+        }
+      }
 
-      ctx.log.info('OpenAI Provider 已安装', {
-        baseUrl: provider['config'].baseUrl,
-        defaultModel: provider['config'].defaultModel,
+      if (!resolved.apiKey) {
+        // 文案必须点名**本预设**的环境变量：只说"key 未配置"会让人去翻 OPENAI_API_KEY，
+        // 而预设刻意不继承别家的 key（见 resolvePresetConfig）
+        ctx.log.warn(
+          `${preset.envApiKey} 未配置 ⇒ ${preset.pluginName} 请求将以空 Bearer 发出。` +
+            `请设置 ${preset.envApiKey}，或在 config 的 provider.${resolved.providerId} 里传 apiKey`,
+        )
+      }
+
+      provider = new OpenAIChatProvider(resolved, () => [])
+
+      // 日志取**解析后的**配置对象，不再用 `provider['config']` 钻私有字段：
+      // 那种写法在字段改名/私有化后不报错、只安静地打印 undefined。
+      ctx.log.info(`${preset.pluginName} 已安装`, {
+        baseUrl: resolved.baseUrl,
+        defaultModel: resolved.defaultModel,
+        providerId: resolved.providerId,
       })
+
+      const registerKey = resolved.providerId ?? providerId
 
       return {
         async 'core.harness.init'(_input, output) {
@@ -1019,14 +1139,14 @@ export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): Agent
           // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id —— 见
           // docs/runtime-registration-plan.md §2.1。**不设默认**：默认由宿主显式 setDefault。
           if (harness?.providers) {
-            harness.providers.register(providerId, provider, {
+            harness.providers.register(registerKey, provider, {
               source: `plugin:${pluginId}`,
-              type: 'openai',
+              type: preset.type,
             })
           } else {
             // 无兼容回退：`_setChatProvider` 已删除（见 remaining-work-plan §2-D）。
             // 宿主没有 `providers` 实例表时**只告警不静默** —— 这条 else 是唯一可见出口。
-            ctx.log.warn('Harness.providers 未找到，OpenAI Provider 可能未注册')
+            ctx.log.warn(`Harness.providers 未找到，${preset.pluginName} 可能未注册`)
           }
 
           provider.setToolsGetter(() => harness?.tools?.list?.() ?? [])
@@ -1039,12 +1159,82 @@ export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): Agent
     },
 
     get provider(): OpenAIChatProvider {
-      if (!provider) throw new Error('OpenAIChatProvider 未创建 — plugin.install() 未执行')
+      if (!provider) throw new Error(`${preset.pluginName} 未创建 — plugin.install() 未执行`)
       return provider
     },
   }
 
   return plugin
+}
+
+/**
+ * 预设的 `ProviderTypeFactory`（`config.json` 的 `providers[]` → 插件实例）。
+ *
+ * 字段映射只写一份：`completeTimeoutFactor` / `thinking` / `reasoningEffort` 的**取值校验**
+ * 也从 openai 的工厂搬到这里 —— 此前 glm/qwen 的工厂漏了这三项，同一个 `config.json`
+ * 写在 `type: "glm"` 下就静默丢失（"配置意图 ≠ 实际装配"）。
+ */
+export function presetProviderTypeFactory(preset: OpenAICompatiblePreset): ProviderTypeFactory {
+  return {
+    type: preset.type,
+    createPlugin: (config: ProviderConfig): AgentPlugin =>
+      createOpenAICompatiblePlugin(preset, {
+        baseUrl: config.baseUrl,
+        apiKey: config.apiKey,
+        defaultModel: config.model,
+        maxTokens: config.maxTokens,
+        timeoutMs: config.timeoutMs,
+        apiPath: config.apiPath,
+        providerId: config.id,
+        // 非流式总时长系数：ProviderConfig 有 index signature，这里的取值校验是唯一闸门
+        completeTimeoutFactor:
+          typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
+            ? config.completeTimeoutFactor
+            : undefined,
+        // 思考模式：ProviderConfig 有 index signature，非法值一律按未配置处理
+        thinking:
+          config.thinking === 'enabled' || config.thinking === 'disabled' ? config.thinking : undefined,
+        reasoningEffort:
+          typeof config.reasoningEffort === 'string' && config.reasoningEffort
+            ? config.reasoningEffort
+            : undefined,
+      }),
+  }
+}
+
+// ========================================================================
+// 插件工厂
+// ========================================================================
+
+/**
+ * 原生 OpenAI 端点也是「预设」：它只比 GLM / Qwen 多一样东西 —— 缺省值恰好等于
+ * `OpenAIChatProvider` 构造函数的缺省值。走同一条装配路径，三份克隆才真的只剩一份。
+ */
+export const OPENAI_PRESET: OpenAICompatiblePreset = {
+  type: 'openai',
+  defaultProviderId: 'openai',
+  pluginName: 'OpenAI Provider',
+  pluginDescription: '对接 OpenAI Chat Completions API 的 Provider 插件',
+  envApiKey: 'OPENAI_API_KEY',
+  envBaseUrl: 'OPENAI_BASE_URL',
+  defaultBaseUrl: 'https://api.openai.com',
+  defaultApiPath: '/v1/chat/completions',
+  defaultModel: 'gpt-4o-mini',
+  // 顶层 `thinking: { type }` / `reasoning_effort` 是本类的既有能力
+  // （DeepSeek 等 compat 端点靠它；标准 OpenAI 不传即不发送）
+  supports: { thinking: true },
+}
+
+/**
+ * 构造 OpenAI Provider 插件。
+ *
+ * 插件 id 随 providerId 派生，使多个 OpenAI 兼容端点（openai/deepseek/ollama/glm/qwen…）
+ * 可在同一进程内各自注册而不冲突（PluginDuplicateIdError）。
+ */
+export function createProviderOpenAIPlugin(config?: OpenAIProviderConfig): AgentPlugin & {
+  readonly provider: OpenAIChatProvider
+} {
+  return createOpenAICompatiblePlugin(OPENAI_PRESET, config)
 }
 
 /** 默认导出：无配置常量（配置来自 config store 与环境变量） */
@@ -1056,24 +1246,4 @@ export const providerOpenAIPlugin: AgentPlugin & { readonly provider: OpenAIChat
 // 上层（core/cli）只经 ProviderTypeRegistry 按 type 解析，不感知本模块具体配置结构。
 // ========================================================================
 
-export const providerTypeFactory: ProviderTypeFactory = {
-  type: 'openai',
-  createPlugin: (config: ProviderConfig): AgentPlugin =>
-    createProviderOpenAIPlugin({
-      baseUrl: config.baseUrl,
-      apiKey: config.apiKey,
-      defaultModel: config.model,
-      maxTokens: config.maxTokens,
-      timeoutMs: config.timeoutMs,
-      // 非流式总时长系数：ProviderConfig 有 index signature，这里的取值校验是唯一闸门
-      completeTimeoutFactor: typeof config.completeTimeoutFactor === 'number' && config.completeTimeoutFactor > 0
-        ? config.completeTimeoutFactor
-        : undefined,
-      apiPath: config.apiPath,
-      providerId: config.id,
-      // 思考模式（config.json providers[].thinking / reasoningEffort）。
-      // ProviderConfig 有 index signature，这里的取值校验是唯一闸门：非法值一律按未配置处理。
-      thinking: config.thinking === 'enabled' || config.thinking === 'disabled' ? config.thinking : undefined,
-      reasoningEffort: typeof config.reasoningEffort === 'string' && config.reasoningEffort ? config.reasoningEffort : undefined,
-    }),
-}
+export const providerTypeFactory: ProviderTypeFactory = presetProviderTypeFactory(OPENAI_PRESET)

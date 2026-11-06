@@ -2,6 +2,7 @@ import { describe, it, expect } from 'bun:test'
 import {
   createProviderQwenPlugin,
   providerQwenPlugin,
+  providerTypeFactory,
   type QwenProviderConfig,
 } from './index'
 import { OpenAIChatProvider } from '@harness/provider-openai'
@@ -205,6 +206,69 @@ describe('@harness/provider-qwen', () => {
       expect(providerQwenPlugin.id).toBe('provider.qwen')
       expect(providerQwenPlugin.name).toBe('Qwen Provider')
       expect(providerQwenPlugin.description).toContain('通义千问')
+    })
+  })
+
+  // 装配逻辑只有一份（见 provider-openai 的 createOpenAICompatiblePlugin），
+  // 这里钉**接线**：DASHSCOPE key 不被 OPENAI key 顶替、且思考字段按 Qwen 的语义被拦下。
+  describe('预设接线（回归）', () => {
+    it('不继承 OPENAI_API_KEY —— 凭据不会跨厂商泄漏', async () => {
+      const savedDash = process.env.DASHSCOPE_API_KEY
+      const savedOpenai = process.env.OPENAI_API_KEY
+      delete process.env.DASHSCOPE_API_KEY
+      process.env.OPENAI_API_KEY = 'openai-secret'
+      try {
+        const plugin = createProviderQwenPlugin()
+        await plugin.install?.({
+          config: { get: () => undefined } as any,
+          log: { info: () => {}, warn: () => {} } as any,
+        } as any)
+
+        let capturedHeaders: Record<string, string> = {}
+        const calls: string[] = []
+        const restore = installMock(({ url, init }) => {
+          calls.push(url)
+          capturedHeaders = init.headers as Record<string, string>
+          return new Response(okResponse('ok'))
+        })
+        let err: Error | undefined
+        try {
+          await plugin.provider.complete({
+            providerId: 'qwen',
+            messages: [{ id: 'u1', role: 'user', parts: [{ type: 'text', text: 'hi' }], createdAt: 1 }],
+            params: {},
+          })
+        } catch (e) {
+          err = e as Error
+        } finally {
+          restore()
+        }
+        expect(calls).toHaveLength(0)
+        expect(capturedHeaders['Authorization']).toBeUndefined()
+        expect(err?.message).toContain('API Key 未配置')
+        expect(err?.message).toContain('qwen')
+      } finally {
+        if (savedDash === undefined) delete process.env.DASHSCOPE_API_KEY
+        else process.env.DASHSCOPE_API_KEY = savedDash
+        if (savedOpenai === undefined) delete process.env.OPENAI_API_KEY
+        else process.env.OPENAI_API_KEY = savedOpenai
+      }
+    })
+
+    it('type factory 的 type=qwen，且 thinking 被拦截并告警（DashScope 用 enable_thinking）', async () => {
+      expect(providerTypeFactory.type).toBe('qwen')
+      const warns: string[] = []
+      const plugin = providerTypeFactory.createPlugin({
+        id: 'qwen',
+        model: 'qwen-plus',
+        thinking: 'enabled',
+      } as any) as ReturnType<typeof createProviderQwenPlugin>
+      await plugin.install?.({
+        config: { get: () => undefined } as any,
+        log: { info: () => {}, warn: (m: string) => warns.push(m) } as any,
+      } as any)
+      expect(plugin.provider['config'].thinking).toBeUndefined()
+      expect(warns.join('\n')).toContain('thinking')
     })
   })
 })

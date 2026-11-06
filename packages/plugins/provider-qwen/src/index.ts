@@ -7,146 +7,60 @@
  * - 认证：Authorization: Bearer {DASHSCOPE_API_KEY}
  * - 默认模型：qwen-plus
  *
- * 复用 @harness/provider-openai 的 OpenAIChatProvider，仅覆盖配置。
+ * 复用 @harness/provider-openai 的 `OpenAIChatProvider` + `createOpenAICompatiblePlugin`，
+ * 本文件**只声明常量**（端点、模型、环境变量名、能力开关）—— 装配逻辑在 provider-openai 里
+ * 只有一份，见其 `OpenAICompatiblePreset` 的说明。
  *
  * 配置来源（优先级从高到低）：
  * 1. createProviderQwenPlugin({ ... }) 直接传入配置
  * 2. ctx.config.get('provider.qwen')
  * 3. 环境变量 DASHSCOPE_API_KEY / DASHSCOPE_BASE_URL
+ *
+ * ⚠️ **不继承 `OPENAI_API_KEY`**：本预设的 key 只认 `DASHSCOPE_API_KEY`，未配置时以空 Bearer
+ * 发出（安装期告警）。
  */
 
-import type { ChatProvider, ProviderRuntime } from '@harness/core'
-import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
-import type { Tool } from '@harness/tool'
-import { OpenAIChatProvider, type OpenAIProviderConfig } from '@harness/provider-openai'
+import type { AgentPlugin } from '@harness/plugin'
+import {
+  createOpenAICompatiblePlugin,
+  presetProviderTypeFactory,
+  type OpenAICompatiblePreset,
+  type OpenAIProviderConfig,
+} from '@harness/provider-openai'
 
-// ===== 配置 =====
-
-export interface QwenProviderConfig {
-  /** API Key（默认读 DASHSCOPE_API_KEY 环境变量） */
-  apiKey?: string
-  /** API 根路径（默认 https://dashscope.aliyuncs.com） */
-  baseUrl?: string
-  /** API 路径（默认 /compatible-mode/v1/chat/completions） */
-  apiPath?: string
-  /** 默认模型（默认 qwen-plus） */
-  defaultModel?: string
-  /** max_tokens 默认值 */
-  maxTokens?: number
-  /** 请求超时（ms） */
-  timeoutMs?: number
-  /** 当模型输出空时是否报错 */
-  strictEmptyContent?: boolean
-  /** Provider ID（默认 'qwen'；配置多 Qwen 端点时可覆盖为不同 id） */
-  providerId?: string
+/** Qwen 的端点常量（装配逻辑见 {@link createOpenAICompatiblePlugin}） */
+export const QWEN_PRESET: OpenAICompatiblePreset = {
+  type: 'qwen',
+  defaultProviderId: 'qwen',
+  pluginName: 'Qwen Provider',
+  pluginDescription: '对接通义千问（DashScope OpenAI 兼容模式）的 Provider 插件',
+  envApiKey: 'DASHSCOPE_API_KEY',
+  envBaseUrl: 'DASHSCOPE_BASE_URL',
+  defaultBaseUrl: 'https://dashscope.aliyuncs.com',
+  defaultApiPath: '/compatible-mode/v1/chat/completions',
+  defaultModel: 'qwen-plus',
+  // 刻意**不**声明 supports.thinking：DashScope 的思考开关叫 `enable_thinking`，
+  // 顶层 `thinking: { type }` 不是它的语义 ⇒ 照抄过去会 400。配了会在安装期告警。
 }
 
-function toOpenAIConfig(cfg: QwenProviderConfig): OpenAIProviderConfig {
-  const envKey = typeof process !== 'undefined' ? process.env.DASHSCOPE_API_KEY : undefined
-  const envBase = typeof process !== 'undefined' ? process.env.DASHSCOPE_BASE_URL : undefined
-  return {
-    apiKey: cfg.apiKey ?? envKey,
-    baseUrl: cfg.baseUrl ?? envBase ?? 'https://dashscope.aliyuncs.com',
-    apiPath: cfg.apiPath ?? '/compatible-mode/v1/chat/completions',
-    defaultModel: cfg.defaultModel ?? 'qwen-plus',
-    maxTokens: cfg.maxTokens,
-    timeoutMs: cfg.timeoutMs,
-    strictEmptyContent: cfg.strictEmptyContent,
-    providerId: cfg.providerId ?? 'qwen',
-  }
-}
-
-// ========================================================================
-// 插件工厂
-// ========================================================================
+/**
+ * 配置项。字段与缺省值见 {@link QWEN_PRESET}（本类型刻意直接复用 `OpenAIProviderConfig`，
+ * 避免再维护一份"同样字段、不同注释"的影子类型）。
+ */
+export type QwenProviderConfig = OpenAIProviderConfig
 
 export function createProviderQwenPlugin(config?: QwenProviderConfig): AgentPlugin & {
-  readonly provider: OpenAIChatProvider
+  readonly provider: ReturnType<typeof createOpenAICompatiblePlugin>['provider']
 } {
-  let provider: OpenAIChatProvider | undefined
-
-  // 插件 id 随 providerId 派生，使多个 Qwen 端点可在同一进程内各自注册而不冲突
-  const providerId = config?.providerId ?? 'qwen'
-  const pluginId = `provider.${providerId}`
-
-  const plugin: AgentPlugin & { readonly provider: OpenAIChatProvider } = {
-    id: pluginId,
-    version: '0.1.0',
-    name: 'Qwen Provider',
-    description: '对接通义千问 Qwen（DashScope OpenAI 兼容模式）的 Provider 插件',
-
-    async install(ctx: PluginContext): Promise<Hooks | void> {
-      const storeCfg = ctx.config.get<QwenProviderConfig>(pluginId)
-      const merged: QwenProviderConfig = { ...(storeCfg ?? {}), ...(config ?? {}) }
-
-      provider = new OpenAIChatProvider(toOpenAIConfig(merged), () => [])
-
-      ctx.log.info('Qwen Provider 已安装', {
-        baseUrl: provider['config'].baseUrl,
-        defaultModel: provider['config'].defaultModel,
-      })
-
-      return {
-        async 'core.harness.init'(_input, output) {
-          const harness = (output as { harness?: unknown }).harness as
-            | {
-                providers?: ProviderRuntime
-                tools?: { list?: () => Tool[] }
-              }
-            | undefined
-
-          if (!provider) return
-
-          // 注册键由调用方给（= ProviderConfig.id 派生），不让实例自报 id —— 见
-          // docs/runtime-registration-plan.md §2.1。**不设默认**：默认由宿主显式 setDefault。
-          if (harness?.providers) {
-            harness.providers.register(providerId, provider, {
-              source: `plugin:${pluginId}`,
-              type: 'qwen',
-            })
-          } else {
-            // 无兼容回退：`_setChatProvider` 已删除（见 remaining-work-plan §2-D）。
-            // 宿主没有 `providers` 实例表时**只告警不静默** —— 这条 else 是唯一可见出口。
-            ctx.log.warn('Harness.providers 未找到，Qwen Provider 可能未注册')
-          }
-
-          provider.setToolsGetter(() => harness?.tools?.list?.() ?? [])
-        },
-      }
-    },
-
-    async uninstall() {
-      provider = undefined
-    },
-
-    get provider(): OpenAIChatProvider {
-      if (!provider) throw new Error('Qwen Provider 未创建 — plugin.install() 未执行')
-      return provider
-    },
-  }
-
-  return plugin
+  return createOpenAICompatiblePlugin(QWEN_PRESET, config)
 }
 
 /** 默认导出：无配置常量（配置来自 config store 与环境变量） */
-export const providerQwenPlugin: AgentPlugin & { readonly provider: OpenAIChatProvider } =
-  createProviderQwenPlugin()
+export const providerQwenPlugin = createProviderQwenPlugin()
 
 // ========================================================================
 // Provider 类型工厂（抽象层契约：@harness/plugin → ProviderTypeFactory）
 // 上层（core/cli）只经 ProviderTypeRegistry 按 type 解析，不感知本模块具体配置结构。
 // ========================================================================
 
-export const providerTypeFactory: ProviderTypeFactory = {
-  type: 'qwen',
-  createPlugin: (config: ProviderConfig): AgentPlugin =>
-    createProviderQwenPlugin({
-      baseUrl: config.baseUrl,
-      apiKey: config.apiKey,
-      defaultModel: config.model,
-      maxTokens: config.maxTokens,
-      timeoutMs: config.timeoutMs,
-      apiPath: config.apiPath,
-      providerId: config.id,
-    }),
-}
+export const providerTypeFactory = presetProviderTypeFactory(QWEN_PRESET)
