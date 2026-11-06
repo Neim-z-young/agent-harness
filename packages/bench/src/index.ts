@@ -23,4 +23,13 @@ export {
 export { judgeTask, deepEqualWithDiff, type JudgeResult } from './judge'
 export { UserSimulator, detectTermination, STOP, TRANSFER, OUT_OF_SCOPE } from './user-sim'
 export { runTask, createRetailAgentDef, buildRetailAgentPrompt, buildUserSimProvider, INITIAL_GREETING, type TaskRunOptions, type ProviderOpts } from './runner'
-export { summarize, renderReport, writeResults, type BenchSummary, type TaskSummary } from './metrics'
+export {
+  summarize,
+  renderReport,
+  writeResults,
+  countToolCalls,
+  mean,
+  compareTaskId,
+  type BenchSummary,
+  type TaskSummary,
+} from './metrics'
