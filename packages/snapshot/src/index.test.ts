@@ -4,10 +4,14 @@
  * 覆盖：capture（hash 稳定性 / 变更后新 hash）、files、diff、restore（选择性 /
  * 删除不存在文件 / 越界防护）、checkout 整仓恢复、preview 零副作用、大文件跳过、
  * disabled 语义。
+ *
+ * 另有「口径一致性」一节：错误标签只有一层前缀且指向**调用方看到的公共操作**、
+ * 二进制文件 diff 遵守 FileDiff 契约、路径边界走真实路径（符号链接越界被拒）、
+ * `..foo` 这类同名前缀目录不被误判、`gitTimeoutMs` 能关闭上限。
  */
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
@@ -15,6 +19,7 @@ import {
   FileSnapshotService,
   GitSnapshotService,
   SnapshotError,
+  type SnapshotID,
   type SnapshotService,
 } from './index'
 
@@ -461,6 +466,114 @@ describe('FileSnapshotService（§10.4 非 git fallback）', () => {
     await writeFile(path.join(worktree, 'a.txt'), 'hello\n')
     expect(await svc.capture()).toBeUndefined()
     await expect(svc.restore(new Map())).rejects.toBeInstanceOf(SnapshotError)
+  })
+})
+
+describe('口径一致性（错误标签 / 二进制 / 路径边界）', () => {
+  test('checkout 的失败标签是 checkout 而不是 restore（两后端一致）', async () => {
+    for (const backend of ['git', 'file'] as const) {
+      const { worktree, gitDir, dataDir } = await makeEnv()
+      const svc = createSnapshotService({
+        worktree,
+        gitDirectory: gitDir,
+        dataDir,
+        backend,
+        enabled: false,
+      })
+      const err = (await svc.checkout('x' as SnapshotID).catch((e: unknown) => e)) as SnapshotError
+      expect(err).toBeInstanceOf(SnapshotError)
+      expect(err.operation).toBe('checkout')
+      expect(err.message).toBe('[snapshot:checkout] Snapshots are disabled')
+    }
+  })
+
+  test('内部实现抛的错只带一层前缀，operation 指向调用方看到的公共操作', async () => {
+    const { worktree, dataDir } = await makeEnv()
+    const svc = createSnapshotService({ worktree, dataDir, backend: 'file' })
+
+    await writeFile(path.join(worktree, 'a.txt'), 'v1\n')
+    const s1 = await svc.capture()
+
+    const diffErr = (await svc.diff(s1!, 'fs-404' as SnapshotID).catch((e: unknown) => e)) as SnapshotError
+    expect(diffErr).toBeInstanceOf(SnapshotError)
+    expect(diffErr.operation).toBe('diff')
+    // 只有一层 [snapshot:...] 前缀（此前 diff 会把内部实现的 [snapshot:files] 再包一层）
+    expect(diffErr.message).toBe('[snapshot:diff] Snapshot not found: fs-404')
+
+    const previewErr = (await svc
+      .preview(new Map([['a.txt', 'fs-404' as SnapshotID]]))
+      .catch((e: unknown) => e)) as SnapshotError
+    expect(previewErr.operation).toBe('preview')
+    expect(previewErr.message).toBe('[snapshot:preview] Snapshot not found: fs-404')
+  })
+
+  test('二进制文件 diff 遵守 FileDiff 契约（additions/deletions=0、patch 空串）', async () => {
+    const { worktree, dataDir } = await makeEnv()
+    const svc = createSnapshotService({ worktree, dataDir, backend: 'file' })
+
+    const p = path.join(worktree, 'img.bin')
+    await writeFile(p, Buffer.from([0x89, 0x50, 0x4e, 0x00, 0x01, 0x02]))
+    const s1 = await svc.capture()
+    await writeFile(p, Buffer.from([0x89, 0x50, 0x4e, 0x00, 0x03, 0x04]))
+    const s2 = await svc.capture()
+
+    const [d] = await svc.diff(s1!, s2!)
+    expect(d!.path).toBe('img.bin')
+    expect(d!.status).toBe('modified')
+    expect(d!.additions).toBe(0)
+    expect(d!.deletions).toBe(0)
+    expect(d!.patch).toBe('')
+  })
+
+  test('符号链接指到工作目录外时 restore/preview 拒绝，且界外文件不被删除', async () => {
+    const outside = await mkdtemp(path.join(tmpdir(), 'harness-snapshot-outside-'))
+    tempDirs.push(outside)
+    const { worktree, dataDir } = await makeEnv()
+    const svc = createSnapshotService({ worktree, dataDir, backend: 'file' })
+
+    await writeFile(path.join(worktree, 'a.txt'), 'v1\n')
+    const s1 = await svc.capture()
+    await symlink(outside, path.join(worktree, 'link'), 'dir')
+    // 界外真实文件：旧口径（字符串 relative）会判成"在项目内"，restore 时把它删掉
+    await writeFile(path.join(outside, 'pwned.txt'), 'secret\n')
+
+    const rel = 'link/pwned.txt'
+    const restoreErr = (await svc.restore(new Map([[rel, s1!]])).catch((e: unknown) => e)) as SnapshotError
+    expect(restoreErr).toBeInstanceOf(SnapshotError)
+    expect(restoreErr.operation).toBe('restore')
+    expect(restoreErr.message).toBe(`[snapshot:restore] Path escapes the project: ${rel}`)
+    expect(await readFile(path.join(outside, 'pwned.txt'), 'utf-8')).toBe('secret\n')
+
+    const previewErr = (await svc.preview(new Map([[rel, s1!]])).catch((e: unknown) => e)) as SnapshotError
+    expect(previewErr).toBeInstanceOf(SnapshotError)
+    expect(previewErr.operation).toBe('preview')
+  })
+
+  test('`..foo` 这类同名前缀目录不被误判为越界', async () => {
+    const { worktree, dataDir } = await makeEnv()
+    const svc = createSnapshotService({ worktree, dataDir, backend: 'file' })
+
+    await mkdir(path.join(worktree, '..foo'), { recursive: true })
+    await writeFile(path.join(worktree, '..foo/x.txt'), 'v1\n')
+    const s1 = await svc.capture()
+    await writeFile(path.join(worktree, '..foo/x.txt'), 'v2\n')
+
+    // 旧口径 startsWith('..') ⇒ 误判越界并抛错
+    await svc.restore(new Map([['..foo/x.txt', s1!]]))
+    expect(await readFile(path.join(worktree, '..foo/x.txt'), 'utf-8')).toBe('v1\n')
+  })
+
+  test('gitTimeoutMs=0 关闭上限：git 后端 capture/gc 正常（选项确实下达子进程层）', async () => {
+    const { worktree, gitDir } = await makeEnv()
+    const svc = createSnapshotService({
+      worktree,
+      gitDirectory: gitDir,
+      backend: 'git',
+      gitTimeoutMs: 0,
+    })
+    await writeFile(path.join(worktree, 'a.txt'), 'v1\n')
+    expect(await svc.capture()).toBeDefined()
+    await expect(svc.gc?.()).resolves.toBeUndefined()
   })
 })
 

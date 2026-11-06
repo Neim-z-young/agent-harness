@@ -28,6 +28,7 @@ import type { Dirent, Stats } from 'node:fs'
 import { chmod, copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import path from 'node:path'
+import { isWithinCwd } from '@harness/fs-guard'
 
 // ===== 基础类型 =====
 
@@ -114,11 +115,28 @@ export interface SnapshotOptions {
   maxSnapshots?: number
   /** git 后端：capture 每 N 次自动执行 git gc --prune=7.days（默认 50；0 关闭） */
   gcEvery?: number
+  /**
+   * git 子进程等待上限（ms，默认 120000；0 关闭）。
+   * 超时后命令被杀掉并上报 `[snapshot:<op>] git … timed out after Nms`，
+   * 而不是让 capture 无限期挂住整轮 query。
+   */
+  gitTimeoutMs?: number
 }
 
 // ===== 自定义错误 =====
 
-export type SnapshotOperation = 'capture' | 'files' | 'diff' | 'preview' | 'restore'
+/**
+ * 公共操作名 —— 与 {@link SnapshotService} 的方法一一对应。
+ * `gc` 只有两后端都实现了才列进来；`list` 读注册表，不会失败到需要标签。
+ */
+export type SnapshotOperation =
+  | 'capture'
+  | 'files'
+  | 'diff'
+  | 'preview'
+  | 'restore'
+  | 'checkout'
+  | 'gc'
 
 /** 快照操作失败（统一错误，模块特定失败场景） */
 export class SnapshotError extends Error {
@@ -132,6 +150,47 @@ export class SnapshotError extends Error {
     this.cause = cause
   }
 }
+
+/**
+ * 把任意失败归到**调用方看到的那次公共操作**上。
+ *
+ * 口径（只有这一份）：
+ * - 内部实现（`lookupUnlocked` / `lsTreeEntry` / `applyEntryUnlocked`）**一律抛普通
+ *   `Error`** —— 它们不知道自己是被 `diff` 还是 `preview` 调到的，猜一个就是撒谎。
+ * - 标签只在公共入口由 {@link runOp} 挂一次，所以 `[snapshot:op]` 前缀**恒定一层**。
+ *
+ * ⚠️ 别在内部实现里抛 `SnapshotError`：那会被这里再包一层，消息变成
+ * `[snapshot:diff] [snapshot:files] …`（本模块改造前就是这副样子，八份手写 catch
+ * 里只有三份带 `instanceof` 判断，同一根因在 `diff` 和 `preview` 下前缀层数不同）。
+ */
+function asSnapshotError(operation: SnapshotOperation, err: unknown): SnapshotError {
+  return new SnapshotError(operation, err instanceof Error ? err.message : String(err), err)
+}
+
+// ===== 路径与目录口径（两后端共用一份） =====
+
+/** 快照仓库/存储的互斥键：同一工作目录的所有写操作串行 */
+const SNAPSHOT_LOCK_KEY = 'tree'
+
+/** worktree 的稳定短哈希（快照目录名，避免把绝对路径写进目录名） */
+function worktreeKey(worktree: string): string {
+  return createHash('sha256').update(worktree).digest('hex').slice(0, 16)
+}
+
+/**
+ * `rel` 是否**逃出**工作目录。
+ *
+ * 走 `@harness/fs-guard` 的真实路径判定（全仓唯一一份路径边界口径）：
+ * 两侧都 realpath，所以「工作目录里放一个指向界外的符号链接」会被判成越界 ——
+ * 用 `path.relative` 做字符串比较会放行，`copyFile` 于是写到项目外面去。
+ *
+ * ⚠️ 入参必须先 `path.resolve(worktree, rel)`：`realpathBestEffort` 内部是
+ * `resolve(p)`，相对路径会被拼到 `process.cwd()` 而不是 `worktree`。
+ */
+function escapesWorktree(worktree: string, rel: string): boolean {
+  return !isWithinCwd(path.resolve(worktree, rel), worktree)
+}
+
 
 // ===== KeyedMutex：按仓库串行化快照写操作（对齐 OpenCode locked()） =====
 
@@ -148,6 +207,28 @@ export class KeyedMutex {
     return next
   }
 }
+
+/**
+ * 在互斥锁内执行一次快照操作，并把任何失败统一登记为**当前公共操作**的
+ * {@link SnapshotError}。
+ *
+ * 以前每个方法各自手写一遍 `mutex.run(...).catch(err => { if (err instanceof
+ * SnapshotError) throw err; throw new SnapshotError(...) })`，八份副本里只有三份
+ * 带 `instanceof` 判断 ⇒ 同一根因在 `diff` 里叠出两层前缀、在 `preview` 里却只有一层，
+ * 标签还可能是内部实现的 `files`。统一到这一处后口径只有一份。
+ */
+async function runOp<T>(
+  mutex: KeyedMutex,
+  operation: SnapshotOperation,
+  task: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await mutex.run(SNAPSHOT_LOCK_KEY, task)
+  } catch (err) {
+    throw asSnapshotError(operation, err)
+  }
+}
+
 
 // ===== git 二进制解析 =====
 
@@ -189,38 +270,79 @@ function detectGit(): boolean {
 
 // ===== Git 底层封装 =====
 
+/**
+ * git 子进程的默认等待上限。
+ *
+ * `capture` 由宿主在每一轮 query 前调用，而 git 在 `index.lock` 残留、网络盘、
+ * 超大仓库 gc 时会**无限期阻塞** —— 没有上限时 await 永不 settle，整条 query 卡死
+ * 且没有任何信号。120s 足够覆盖正常仓库，超时后上报可诊断的 SnapshotError。
+ */
+const DEFAULT_GIT_TIMEOUT_MS = 120_000
+
 interface GitResult {
   exitCode: number
   stdout: string
   stderr: string
 }
 
-/** 执行 git 命令（Bun.spawn，stderr/stdout 全量收集） */
-async function runGit(
-  args: string[],
-  cwd: string,
-  stdin?: string,
-  env?: Record<string, string>,
-): Promise<GitResult> {
+interface RunGitOptions {
+  stdin?: string
+  env?: Record<string, string>
+  /** 等待上限（ms）；0 关闭上限 */
+  timeoutMs?: number
+}
+
+/** 执行 git 命令（Bun.spawn，stderr/stdout 全量收集，带超时兜底） */
+async function runGit(args: string[], cwd: string, options: RunGitOptions = {}): Promise<GitResult> {
   const proc = Bun.spawn({
     cmd: [resolveGitBin(), ...args],
     cwd,
-    stdin: stdin !== undefined ? 'pipe' : 'ignore',
+    stdin: options.stdin !== undefined ? 'pipe' : 'ignore',
     stdout: 'pipe',
     stderr: 'pipe',
-    env: { ...process.env, ...env },
+    env: { ...process.env, ...options.env },
   })
-  if (stdin !== undefined && proc.stdin) {
-    proc.stdin.write(stdin)
-    proc.stdin.end()
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
+  let timedOut = false
+  // ⚠️ 不 unref：本仓定案「被 await 的定时器不得 unref」（Windows 上会让事件循环
+  // 提前判定无工作而永久挂起）。这里在 finally 里 clearTimeout，不靠 unref 收尾。
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true
+          proc.kill()
+        }, timeoutMs)
+      : undefined
+
+  try {
+    if (options.stdin !== undefined && proc.stdin) {
+      // 子进程可能不读 stdin 就退出（EPIPE）；Bun 的 write/end 在背压时返回 Promise，
+      // 不接住会变成 unhandled rejection。也不能 await —— 那会在
+      // 「子进程先写满 stdout 管道」时与本函数的读取形成死锁。
+      const written = proc.stdin.write(options.stdin)
+      if (written instanceof Promise) written.catch(() => undefined)
+      const ended = proc.stdin.end()
+      if (ended instanceof Promise) ended.catch(() => undefined)
+    }
+    const [stdout, stderr] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+    ])
+    await proc.exited
+    if (timedOut) {
+      return {
+        exitCode: -1,
+        stdout,
+        stderr: `timed out after ${timeoutMs}ms (snapshot.gitTimeoutMs)`,
+      }
+    }
+    return { exitCode: proc.exitCode ?? -1, stdout, stderr }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
   }
-  const [stdout, stderr] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-  ])
-  await proc.exited
-  return { exitCode: proc.exitCode ?? -1, stdout, stderr }
 }
+
 
 /** 按 \0 拆分 git -z 输出 */
 function splitNul(text: string): string[] {
@@ -234,10 +356,12 @@ function splitNul(text: string): string[] {
 class GitRepo {
   readonly worktree: string
   readonly gitDirectory: string
+  private readonly timeoutMs: number
 
-  constructor(options: { worktree: string; gitDirectory: string }) {
+  constructor(options: { worktree: string; gitDirectory: string; timeoutMs?: number }) {
     this.worktree = options.worktree
     this.gitDirectory = options.gitDirectory
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS
   }
 
   /** 执行 git 命令；失败抛异常 */
@@ -246,7 +370,11 @@ class GitRepo {
     options?: { stdin?: string; env?: Record<string, string> },
   ): Promise<{ stdout: string; stderr: string }> {
     const fullArgs = ['--git-dir', this.gitDirectory, '--work-tree', this.worktree, ...args]
-    const result = await runGit(fullArgs, this.worktree, options?.stdin, options?.env)
+    const result = await runGit(fullArgs, this.worktree, {
+      stdin: options?.stdin,
+      env: options?.env,
+      timeoutMs: this.timeoutMs,
+    })
     if (result.exitCode !== 0) {
       const message = result.stderr.trim() || result.stdout.trim() || `git ${args[0]} failed`
       throw new Error(`git ${args.join(' ')}: ${message}`)
@@ -259,14 +387,12 @@ class GitRepo {
 
 /** 默认快照仓库目录：~/.harness/snapshots/{worktree-hash}（对齐 OpenCode data/snapshot） */
 function defaultSnapshotGitDirectory(worktree: string): string {
-  const hash = createHash('sha256').update(worktree).digest('hex').slice(0, 16)
-  return path.join(homedir(), '.harness', 'snapshots', hash)
+  return path.join(homedir(), '.harness', 'snapshots', worktreeKey(worktree))
 }
 
 /** 默认文件后端存储目录：~/.harness/file-snapshots/{worktree-hash} */
 function defaultFileSnapshotDataDir(worktree: string): string {
-  const hash = createHash('sha256').update(worktree).digest('hex').slice(0, 16)
-  return path.join(homedir(), '.harness', 'file-snapshots', hash)
+  return path.join(homedir(), '.harness', 'file-snapshots', worktreeKey(worktree))
 }
 
 /** 按行拆分（吞掉末尾换行产生的空串，对齐 git 行统计：'a\nb\n' 计 2 行） */
@@ -367,6 +493,37 @@ function lineDiff(
   return { additions, deletions, patch: out.join('\n') + '\n' }
 }
 
+/** 二进制嗅探窗口（对齐 git 的 8000 字节启发式） */
+const BINARY_SNIFF_BYTES = 8000
+
+/** 是否二进制：嗅探窗口内出现 NUL 字节即视为二进制 */
+function looksBinary(bytes: Uint8Array): boolean {
+  const end = Math.min(bytes.length, BINARY_SNIFF_BYTES)
+  for (let i = 0; i < end; i++) {
+    if (bytes[i] === 0) return true
+  }
+  return false
+}
+
+/**
+ * 按字节比较两个版本的内容，产出 {@link FileDiff} 的行统计。
+ *
+ * `FileDiff` 的契约是「二进制文件 additions/deletions 为 0、patch 为空串」——
+ * git 后端靠 `--numstat` 的 `-` 拿到这个结论，文件后端必须自己判，否则把 PNG
+ * 当 UTF-8 逐行比一遍，既产出乱码补丁又给出错误的 `+N/-M`。
+ */
+function diffContents(
+  a: Uint8Array | undefined,
+  b: Uint8Array | undefined,
+  context: number,
+): { additions: number; deletions: number; patch: string } {
+  if ((a && looksBinary(a)) || (b && looksBinary(b))) {
+    return { additions: 0, deletions: 0, patch: '' }
+  }
+  const decoder = new TextDecoder()
+  return lineDiff(a ? decoder.decode(a) : '', b ? decoder.decode(b) : '', context)
+}
+
 // ===== GitSnapshotService（OpenCode v2 git tree 方案） =====
 
 /** git 后端快照服务：独立 git 仓库 + content-addressed tree（对齐 OpenCode v2） */
@@ -389,7 +546,11 @@ export class GitSnapshotService implements SnapshotService {
     }
     const gitDirectory = options.gitDirectory ?? defaultSnapshotGitDirectory(options.worktree)
     this.snapshotIdsPath = path.join(gitDirectory, 'snapshot-ids.json')
-    this.repo = new GitRepo({ worktree: options.worktree, gitDirectory })
+    this.repo = new GitRepo({
+      worktree: options.worktree,
+      gitDirectory,
+      timeoutMs: options.gitTimeoutMs,
+    })
     this.maximumUntrackedFileBytes = options.maximumUntrackedFileBytes ?? 2 * 1024 * 1024
     this.enabled = options.enabled ?? true
     this.maxSnapshots = options.maxSnapshots ?? 100
@@ -403,7 +564,7 @@ export class GitSnapshotService implements SnapshotService {
   async capture(scope = '.'): Promise<SnapshotID | undefined> {
     if (!this.enabled) return undefined
     try {
-      return await this.mutex.run('tree', async () => {
+      return await runOp(this.mutex, 'capture', async () => {
         await this.ensureRepository()
         await this.refresh(scope)
         const id = await this.writeTree()
@@ -411,6 +572,7 @@ export class GitSnapshotService implements SnapshotService {
         return id
       })
     } catch (err) {
+      // best-effort：capture 失败不能让一轮 query 挂掉，但必须留痕可诊断
       console.warn('[snapshot] capture failed (best-effort)', err)
       return undefined
     }
@@ -419,7 +581,7 @@ export class GitSnapshotService implements SnapshotService {
   /** 清理快照仓库对象（git gc --prune=7.days，对齐 OpenCode 定期清理） */
   async gc(): Promise<void> {
     if (!this.enabled) return
-    await this.mutex.run('tree', () => this.gcUnlocked())
+    await runOp(this.mutex, 'gc', () => this.gcUnlocked())
   }
 
   /** 快照历史：读 snapshot-ids.json（最新在前），时间戳缺失的旧记录显示 unknown */
@@ -468,9 +630,7 @@ export class GitSnapshotService implements SnapshotService {
 
   /** 列出两个快照间变更的项目相对路径 */
   async files(from: SnapshotID, to: SnapshotID): Promise<string[]> {
-    return this.mutex.run('tree', () => this.filesUnlocked(from, to)).catch((err) => {
-      throw new SnapshotError('files', err instanceof Error ? err.message : String(err), err)
-    })
+    return runOp(this.mutex, 'files', () => this.filesUnlocked(from, to))
   }
 
   /** 生成两个快照间的结构化 per-file diff（status + numstat + unified patch） */
@@ -479,11 +639,7 @@ export class GitSnapshotService implements SnapshotService {
     to: SnapshotID,
     options?: { context?: number; paths?: string[] },
   ): Promise<FileDiff[]> {
-    return this.mutex
-      .run('tree', () => this.diffUnlocked(from, to, options))
-      .catch((err) => {
-        throw new SnapshotError('diff', err instanceof Error ? err.message : String(err), err)
-      })
+    return runOp(this.mutex, 'diff', () => this.diffUnlocked(from, to, options))
   }
 
   /**
@@ -496,7 +652,7 @@ export class GitSnapshotService implements SnapshotService {
   ): Promise<FileDiff[]> {
     if (!this.enabled) throw new SnapshotError('preview', 'Snapshots are disabled')
     const context = options?.context ?? 3
-    return this.mutex.run('tree', async () => {
+    return runOp(this.mutex, 'preview', async () => {
       await this.ensureRepository()
       // 先刷新 index 同步当前工作目录，再 write-tree 得到"当前状态"基准树
       await this.refresh('.')
@@ -521,9 +677,6 @@ export class GitSnapshotService implements SnapshotService {
       } finally {
         await rm(index, { force: true }).catch(() => undefined)
       }
-    }).catch((err) => {
-      if (err instanceof SnapshotError) throw err
-      throw new SnapshotError('preview', err instanceof Error ? err.message : String(err), err)
     })
   }
 
@@ -533,33 +686,26 @@ export class GitSnapshotService implements SnapshotService {
    */
   async restore(files: ReadonlyMap<string, SnapshotID>): Promise<void> {
     if (!this.enabled) throw new SnapshotError('restore', 'Snapshots are disabled')
-    await this.mutex.run('tree', async () => {
+    await runOp(this.mutex, 'restore', async () => {
       for (const [file, tree] of files) {
-        const absolute = path.resolve(this.repo.worktree, file)
-        if (!this.contains(this.repo.worktree, absolute)) {
+        if (escapesWorktree(this.repo.worktree, file)) {
           throw new SnapshotError('restore', `Path escapes the project: ${file}`)
         }
         if (await this.lsTreeEntry(tree, file)) {
           await this.repo.run(['checkout', tree, '--', file])
         } else {
-          await rm(absolute, { recursive: true, force: true })
+          await rm(path.resolve(this.repo.worktree, file), { recursive: true, force: true })
         }
       }
-    }).catch((err) => {
-      if (err instanceof SnapshotError) throw err
-      throw new SnapshotError('restore', err instanceof Error ? err.message : String(err), err)
     })
   }
 
   /** 整仓恢复：把工作目录替换为快照树（快照中不存在的文件保留） */
   async checkout(snapshot: SnapshotID): Promise<void> {
-    if (!this.enabled) throw new SnapshotError('restore', 'Snapshots are disabled')
-    await this.mutex.run('tree', async () => {
+    if (!this.enabled) throw new SnapshotError('checkout', 'Snapshots are disabled')
+    await runOp(this.mutex, 'checkout', async () => {
       await this.repo.run(['read-tree', snapshot])
       await this.repo.run(['checkout-index', '--all', '--force'])
-    }).catch((err) => {
-      if (err instanceof SnapshotError) throw err
-      throw new SnapshotError('restore', err instanceof Error ? err.message : String(err), err)
     })
   }
 
@@ -617,11 +763,6 @@ export class GitSnapshotService implements SnapshotService {
       })
     }
     return result
-  }
-
-  private contains(root: string, target: string): boolean {
-    const relative = path.relative(root, target)
-    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
   }
 
   /** 初始化快照仓库（首次使用时）：git init + 关键 config（对齐 OpenCode） */
@@ -697,7 +838,8 @@ export class GitSnapshotService implements SnapshotService {
     if (!text) return undefined
     const match = text.match(/^(\d+)\s+\w+\s+([0-9a-f]+)\t/)
     if (!match) {
-      throw new SnapshotError('restore', `Invalid tree entry for ${file}`)
+      // 用普通 Error：标签由 runOp 按调用方的公共操作挂，内部实现不猜自己是 diff 还是 preview
+      throw new Error(`Invalid tree entry for ${file}`)
     }
     return { mode: match[1]!, object: match[2]! }
   }
@@ -820,7 +962,7 @@ export class FileSnapshotService implements SnapshotService {
   async capture(scope = '.'): Promise<SnapshotID | undefined> {
     if (!this.enabled) return undefined
     try {
-      return await this.mutex.run('tree', async () => {
+      return await runOp(this.mutex, 'capture', async () => {
         await this.loadIgnoreRules()
         const chain = await this.loadChain()
         const prev = chain.snapshots[chain.snapshots.length - 1]
@@ -858,7 +1000,7 @@ export class FileSnapshotService implements SnapshotService {
   /** 清理无引用备份：快照链中不再被引用的 {sha256}@v{n} 文件 */
   async gc(): Promise<void> {
     if (!this.enabled) return
-    await this.mutex.run('tree', async () => {
+    await runOp(this.mutex, 'gc', async () => {
       const chain = await this.loadChain()
       const referenced = new Set<string>()
       for (const snap of chain.snapshots) {
@@ -888,9 +1030,7 @@ export class FileSnapshotService implements SnapshotService {
 
   /** 列出两个快照间变更的项目相对路径 */
   async files(from: SnapshotID, to: SnapshotID): Promise<string[]> {
-    return this.mutex.run('tree', () => this.filesUnlocked(from, to)).catch((err) => {
-      throw new SnapshotError('files', err instanceof Error ? err.message : String(err), err)
-    })
+    return runOp(this.mutex, 'files', () => this.filesUnlocked(from, to))
   }
 
   /** 生成两个快照间的结构化 per-file diff（简化行 diff，unified patch） */
@@ -899,31 +1039,26 @@ export class FileSnapshotService implements SnapshotService {
     to: SnapshotID,
     options?: { context?: number; paths?: string[] },
   ): Promise<FileDiff[]> {
-    return this.mutex
-      .run('tree', async () => {
-        const a = await this.lookupUnlocked(from)
-        const b = await this.lookupUnlocked(to)
-        const paths = options?.paths ?? (await this.filesUnlocked(from, to))
-        const result: FileDiff[] = []
-        for (const rel of paths) {
-          const aMeta = a.files[rel]
-          const bMeta = b.files[rel]
-          const aContent = aMeta?.backup
-            ? await this.readBackup(aMeta.backup)
-            : ''
-          const bContent = bMeta?.backup
-            ? await this.readBackup(bMeta.backup)
-            : ''
-          const { additions, deletions, patch } = lineDiff(aContent, bContent, options?.context ?? 3)
-          const status: FileDiff['status'] =
-            !aMeta || aMeta.backup === null ? 'added' : !bMeta || bMeta.backup === null ? 'deleted' : 'modified'
-          result.push({ path: rel, status, additions, deletions, patch })
-        }
-        return result
-      })
-      .catch((err) => {
-        throw new SnapshotError('diff', err instanceof Error ? err.message : String(err), err)
-      })
+    return runOp(this.mutex, 'diff', async () => {
+      const a = await this.lookupUnlocked(from)
+      const b = await this.lookupUnlocked(to)
+      const paths = options?.paths ?? (await this.filesUnlocked(from, to))
+      const context = options?.context ?? 3
+      const result: FileDiff[] = []
+      for (const rel of paths) {
+        const aMeta = a.files[rel]
+        const bMeta = b.files[rel]
+        const { additions, deletions, patch } = diffContents(
+          await this.readBackupBytes(aMeta?.backup),
+          await this.readBackupBytes(bMeta?.backup),
+          context,
+        )
+        const status: FileDiff['status'] =
+          !aMeta || aMeta.backup === null ? 'added' : !bMeta || bMeta.backup === null ? 'deleted' : 'modified'
+        result.push({ path: rel, status, additions, deletions, patch })
+      }
+      return result
+    })
   }
 
   /** 零副作用回滚预览：当前内容 vs 目标快照备份内容，不修改工作目录 */
@@ -932,86 +1067,76 @@ export class FileSnapshotService implements SnapshotService {
     options?: { context?: number },
   ): Promise<FileDiff[]> {
     if (!this.enabled) throw new SnapshotError('preview', 'Snapshots are disabled')
-    return this.mutex
-      .run('tree', async () => {
-        const result: FileDiff[] = []
-        for (const [rel, snapshotId] of files) {
-          const abs = path.resolve(this.worktree, rel)
-          if (!this.contains(abs)) {
-            throw new SnapshotError('preview', `Path escapes the project: ${rel}`)
-          }
-          const target = await this.lookupUnlocked(snapshotId)
-          const meta = target.files[rel]
-          const exists = await stat(abs).then(() => true, () => false)
-          const current = exists ? await readFile(abs, 'utf-8').catch(() => '') : ''
-          const targetContent = meta?.backup ? await this.readBackup(meta.backup) : ''
-          const { additions, deletions, patch } = lineDiff(current, targetContent, options?.context ?? 3)
-          const status: FileDiff['status'] =
-            !exists && meta?.backup ? 'added' : exists && (!meta || meta.backup === null) ? 'deleted' : 'modified'
-          result.push({ path: rel, status, additions, deletions, patch })
+    const context = options?.context ?? 3
+    return runOp(this.mutex, 'preview', async () => {
+      const result: FileDiff[] = []
+      for (const [rel, snapshotId] of files) {
+        if (escapesWorktree(this.worktree, rel)) {
+          throw new Error(`Path escapes the project: ${rel}`)
         }
-        return result
-      })
-      .catch((err) => {
-        if (err instanceof SnapshotError) throw err
-        throw new SnapshotError('preview', err instanceof Error ? err.message : String(err), err)
-      })
+        const abs = path.resolve(this.worktree, rel)
+        const target = await this.lookupUnlocked(snapshotId)
+        const meta = target.files[rel]
+        const current = await readFile(abs).catch(() => undefined)
+        const { additions, deletions, patch } = diffContents(
+          current,
+          await this.readBackupBytes(meta?.backup),
+          context,
+        )
+        const status: FileDiff['status'] =
+          !current && meta?.backup
+            ? 'added'
+            : current && (!meta || meta.backup === null)
+              ? 'deleted'
+              : 'modified'
+        result.push({ path: rel, status, additions, deletions, patch })
+      }
+      return result
+    })
   }
 
   /** 选择性恢复：从目标快照备份 copyFile 恢复（目标快照中不存在则删除） */
   async restore(files: ReadonlyMap<string, SnapshotID>): Promise<void> {
     if (!this.enabled) throw new SnapshotError('restore', 'Snapshots are disabled')
-    await this.mutex
-      .run('tree', async () => {
-        for (const [rel, snapshotId] of files) {
-          const abs = path.resolve(this.worktree, rel)
-          if (!this.contains(abs)) {
-            throw new SnapshotError('restore', `Path escapes the project: ${rel}`)
-          }
-          const target = await this.lookupUnlocked(snapshotId)
-          const meta = target.files[rel]
-          if (!meta || meta.backup === null) {
-            await rm(abs, { recursive: true, force: true })
-          } else {
-            await mkdir(path.dirname(abs), { recursive: true })
-            await copyFile(this.backupPath(meta.backup), abs)
-            await chmod(abs, meta.mode)
-          }
-        }
-      })
-      .catch((err) => {
-        if (err instanceof SnapshotError) throw err
-        throw new SnapshotError('restore', err instanceof Error ? err.message : String(err), err)
-      })
+    await runOp(this.mutex, 'restore', async () => {
+      for (const [rel, snapshotId] of files) {
+        const target = await this.lookupUnlocked(snapshotId)
+        await this.applyEntryUnlocked(rel, target.files[rel])
+      }
+    })
   }
 
   /** 整仓恢复：恢复快照内所有文件（快照外的文件保留） */
   async checkout(snapshot: SnapshotID): Promise<void> {
-    if (!this.enabled) throw new SnapshotError('restore', 'Snapshots are disabled')
-    await this.mutex
-      .run('tree', async () => {
-        const target = await this.lookupUnlocked(snapshot)
-        for (const [rel, meta] of Object.entries(target.files)) {
-          const abs = path.resolve(this.worktree, rel)
-          if (!this.contains(abs)) {
-            throw new SnapshotError('restore', `Path escapes the project: ${rel}`)
-          }
-          if (meta.backup === null) {
-            await rm(abs, { recursive: true, force: true })
-          } else {
-            await mkdir(path.dirname(abs), { recursive: true })
-            await copyFile(this.backupPath(meta.backup), abs)
-            await chmod(abs, meta.mode)
-          }
-        }
-      })
-      .catch((err) => {
-        if (err instanceof SnapshotError) throw err
-        throw new SnapshotError('restore', err instanceof Error ? err.message : String(err), err)
-      })
+    if (!this.enabled) throw new SnapshotError('checkout', 'Snapshots are disabled')
+    await runOp(this.mutex, 'checkout', async () => {
+      const target = await this.lookupUnlocked(snapshot)
+      for (const [rel, meta] of Object.entries(target.files)) {
+        await this.applyEntryUnlocked(rel, meta)
+      }
+    })
   }
 
   // ===== 内部实现 =====
+
+  /**
+   * 把一个快照条目落盘：有备份则 copy + 还原 mode，`backup === null` 则删除。
+   * `restore` 与 `checkout` 的差异只在**遍历哪个集合**，落盘动作必须同一份
+   * （此前两处各抄一遍 10 行，任何一侧的边界修复都会漏掉另一侧）。
+   */
+  private async applyEntryUnlocked(rel: string, meta: FileBackupMeta | undefined): Promise<void> {
+    if (escapesWorktree(this.worktree, rel)) {
+      throw new Error(`Path escapes the project: ${rel}`)
+    }
+    const abs = path.resolve(this.worktree, rel)
+    if (!meta || meta.backup === null) {
+      await rm(abs, { recursive: true, force: true })
+      return
+    }
+    await mkdir(path.dirname(abs), { recursive: true })
+    await copyFile(this.backupPath(meta.backup), abs)
+    await chmod(abs, meta.mode)
+  }
 
   /** 无锁 files：仅供已持有锁的内部路径（diff）调用 */
   private async filesUnlocked(from: SnapshotID, to: SnapshotID): Promise<string[]> {
@@ -1031,7 +1156,7 @@ export class FileSnapshotService implements SnapshotService {
   private async lookupUnlocked(id: SnapshotID): Promise<FileSnapshotRecord> {
     const chain = await this.loadChain()
     const record = chain.snapshots.find((s) => s.id === id)
-    if (!record) throw new SnapshotError('files', `Snapshot not found: ${id}`)
+    if (!record) throw new Error(`Snapshot not found: ${id}`)
     return record
   }
 
@@ -1108,17 +1233,14 @@ export class FileSnapshotService implements SnapshotService {
     return rel === normalized || rel.startsWith(`${normalized}/`)
   }
 
-  private contains(target: string): boolean {
-    const relative = path.relative(this.worktree, target)
-    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
-  }
-
   private backupPath(name: string): string {
     return path.join(this.backupsDir, name)
   }
 
-  private async readBackup(name: string): Promise<string> {
-    return readFile(this.backupPath(name), 'utf-8').catch(() => '')
+  /** 读备份原始字节（二进制安全的 diff 需要字节，不能被 UTF-8 解码毁掉内容）；缺失返回 undefined */
+  private async readBackupBytes(name: string | null | undefined): Promise<Uint8Array | undefined> {
+    if (!name) return undefined
+    return readFile(this.backupPath(name)).catch(() => undefined)
   }
 
   /** 惰性加载 worktree 根 .gitignore（不存在则忽略规则为空） */
