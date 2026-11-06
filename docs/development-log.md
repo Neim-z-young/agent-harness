@@ -1,5 +1,26 @@
 # Agent Harness 开发日志
 
+## 2026-11-06（续 290）README：把「所有扩展点默认关闭」改成精确措辞 + 补「如何查看当前启用的能力」
+
+起因：仓库已公开，README 特性亮点里「**所有扩展点默认关闭**」与实现不符 —— 代码里是三级：
+① 核心内置插件 `optIn: false` 随装配加载（`host.ts:1559` 的 `items.filter(p => !p.optIn)`）；
+② 可选能力插件 `optIn: true` 登记但不实例化，须 `config.json → plugins` 显式声明
+   （`plugins.ts:428`，README §plugins 数组 396 行已写对，是亮点那句自己说岔了）；
+③ 外部插件目录代码 `allowPluginCode` 默认 false，只登记告警不 `import()`（`config.ts:283`）。
+
+决策与落地：
+- 亮点那句改为「扩展点默认**不产生副作用**」+ 三级细化 + 工具能力边界须显式声明。
+- Configuration 章新增「如何查看当前启用的能力」：**不写静态功能清单**（会漂移、且与
+  fail-closed 口径自相矛盾），改成「声明层（config.json）→ 装配层（`harness config check`
+  + `host.notices`）→ 运行层（`plugin.list()` / `/plugins` / `/tools` / `/skills` / `/permission`）」
+  三层判据 + 一段真实 `config check` 输出节选（已剔除 provider URL / apiKey 等实例信息），
+  并声明本文 Packages 表只描述「可提供的能力」而非「当前启用的能力」。
+- 「在用」按 **能力 / 权限 / 边界** 三维度分开：权限是 `composeRules(base, agent)` 取最严的结果，
+  不是配置原文；`pluginCodeScan` / `pluginRunner:worker` / MCP `capabilities.net` 三处
+  「写了像生效其实只有一半」不得计入「已启用」。
+
+验证：纯文档改动，无代码变更 ⇒ 未跑 typecheck / test；`harness config check` 实跑确认示例输出形态。
+
 ## 2026-10-14（续 289）CI release 流水线：三平台二进制自动附到 release
 
 新增 `.github/workflows/release.yml`：`release: published`（或 `workflow_dispatch` 指定 tag）时，

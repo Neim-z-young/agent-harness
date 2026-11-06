@@ -7,7 +7,7 @@
 ## 特性亮点
 
 - **运行时协议优于函数接口**：Tool / Agent / Plugin 是完整的生命周期协议对象，不只是 `call()`
-- **Fail-Closed 安全优先**：所有扩展点默认关闭，需显式声明能力边界（`isReadOnly` / `isDestructive` / `isConcurrencySafe`）
+- **Fail-Closed 安全优先**：扩展点默认**不产生副作用**，具体分三级 —— 核心内置插件随装配加载；可选能力插件（`optIn`）一律「登记但不自动装配」，须在 `config.json → plugins` 显式声明；外部插件目录里的代码默认不执行（`allowPluginCode: false`）。工具的能力边界（`isReadOnly` / `isDestructive` / `isConcurrencySafe`）须显式声明，未声明一律按有风险处理（见 §Configuration → 如何查看当前启用的能力）
 - **Hooks 管道而非继承**：12+ 个 Hook 点让插件介入生命周期（`core.harness.start` / `core.tool.pre.execute` / `core.prompt.system.transform` / `cli.command` 等）
 - **三 transport MCP Client**：stdio / Streamable HTTP / 旧版 HTTP+SSE，自动发现 tools / resources / prompts
 - **会话 Compaction**：三级压缩策略（prune / summary / agent）+ 百分比阈值动态触发 + 系统记忆注入
@@ -187,6 +187,38 @@ gh workflow run release.yml -f tag=v0.1.0
 配置通过两级 `config.json` 加载：user 级 `~/.harness/config.json` 与 project 级 `.harness/config.json`，**project 级覆盖 user 级**。数据目录由 `--data-dir` 指定（默认 `~/.harness`），承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。
 
 **配置来源优先级**：CLI 参数 > config.json > 环境变量。例如 `--provider` / `--model` 会覆盖 config.json 的同名项。
+
+### 如何查看当前启用的能力
+
+**本项目没有固定的「功能清单」**。本文的 Packages 表描述的是「可提供的能力」，不是「当前实例启用的能力」。
+能力由三层决定，**以运行时输出为准**：
+
+| 层 | 描述什么 | 查哪里 |
+|---|---|---|
+| 声明层（意图） | 我*想*启用什么 | `~/.harness/config.json` / `.harness/config.json` 的 `plugins`、`permissions`、`sandbox`、`mcpServers` |
+| 装配层（事实） | 实际装上什么、**哪些降级了** | `harness config check`；`host.notices` 环形缓冲（含 `config.memory-not-enabled` 这类「写了配置但没启用」告警），远程宿主用控制面 `harness/notice.list` |
+| 运行层（可观测） | 此刻真正生效的工具与权限 | `harness.plugin.list()`、`/plugins`、`/tools`、`/skills`（`skillInfos().enabled`）、`/permission`；控制面 `harness/skill.list` / `harness/stats.get` |
+
+一个实例的 `harness config check` 输出节选（各实例不同，勿照抄）：
+
+```text
+内置插件（config.json → plugins）：code-intel、subagent、coordinator、swarm、herdr、memory、skill-forge、env-context
+长期记忆（memory）：已启用 · 索引上限 200 行 / 25600 字节
+遥测（telemetry）：已启用 · 会话级 dataDir/sessions/*.telemetry.jsonl
+配置校验通过。
+```
+
+对应的声明层是 `plugins: ["code-intel", "subagent", "coordinator", "swarm", "herdr", "memory", "skill-forge", "env-context"]`；
+`allowPluginCode` 未写 ⇒ 外部插件目录代码不执行。`config check` 同时会报出未登记的 id，以及「某配置段已写但对应插件未声明」——
+**配置意图 ≠ 实际装配**，这类差异必须上报，不能从文档推断。
+
+⚠️ 描述「在用」时把三个维度**分开说**，别把「装配了」当成「能用了」：
+
+- **能力（capability）**：插件 / 工具 / skill 是否装上（`plugin.list()`、`/tools`）
+- **权限（authority）**：规则集 + mode + **agent 约束层**合成后实际放行什么（`/permission`）—— 是逐键取最严的结果，不是配置原文
+- **边界（boundary）**：sandbox 档位、`fsBound` 是否真绑上、`net` 是否真强制。`pluginCodeScan`（预警不是边界）、
+  `pluginRunner: worker`（资源边界不是安全边界）、MCP `capabilities.net: "none"`（任何档位都强制不了）这三处
+  属于「写了像生效、其实只有一半」，必须显式标注，**不得计入「已启用」**
 
 ### config.json 顶层字段
 
