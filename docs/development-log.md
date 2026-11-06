@@ -1,5 +1,43 @@
 # Agent Harness 开发日志
 
+## 2026-11-06（续 292）README 全条目按最新代码核对（修 50+ 处过时、补齐缺失）
+
+起因：仓库已公开、且刚合并 7 条 refactor 分支（新增 `provider-kit` 等 27 个此前未列入
+README 的包），需要逐条确认文档未过时。做法：三路只读核对（Quick Start/命令/构建、
+Configuration、包清单/架构/决策），每条结论附 `文件:行号`；对高风险结论再亲自复核
+（config.json 单文件、外部依赖、subagent 20 步 / 8000、`dangerousDetection?: boolean`、
+23 个 Hook、12 个 optIn、49 个包、engines）。
+
+**修掉的事实错误（摘要）**：
+- 「零外部运行时依赖」三处 → **核心引擎零第三方依赖，可选能力有外部依赖**
+  （实测 7 个包：`@opentui/*`/`react`、`@a2a-js/sdk`、`acp-kernel`、`@babel/*`、`tree-sitter-*`/
+  `web-tree-sitter`；参数解析 / glob / readline / SSE 分帧仍是内置）。
+- 「两级 config.json」→ **单文件 `<data-dir>/config.json`**（`ConfigStore` 加载；两级只适用于
+  plugins/skills/agents/memory **目录**，`host/src/config.ts` 是纯校验层）。
+- 根目录 `bun test # 全部测试` → **`bun run test`**（前者会把 `reference/**` 扫进来）。
+- 数字类：48 包 → **49**；12+ Hook → **23**；subagent 默认 10 步 → **20**；
+  `maxResultLength` 2000 → **8000**；Skill「三来源」→ **5 类来源标签**（含 `plugin`）。
+- 语义类：死循环「走权限确认」→ **命中即硬中断**（两条判据）；`dangerousDetection`
+  类型 `boolean | string[]` → `boolean`（自定义走 `additionalDangerous`）；`config check`
+  「只有 Provider 错误返回 1」→ **plugins 未登记也返回 1**；裸 `harness config` 只打印用法
+  并 return 1；`/edit` 是 TUI 专属；`/help` 不含全部命令；qwen 不再消费 `thinking`
+  （preset `supports` 门控）；技能锻造 F1/F2 已落地；`subagents` frontmatter 字段已删除。
+- 表格类：删掉重复的 `allowPluginCode` 行；顶层表补 `compaction`/`memory`/`telemetry`/
+  `autoResume`；plugins 表 8 → **12 个 optIn id**；sandbox 补 `readOnlyTimeoutMs`；
+  compaction 补 `requestPressurePct`/`tokenCalibrationScale`；providers 补
+  `contextWindowTokens`、`id` 可省略、preset 装配模型；Agent 示例删 `subagents` 并补字段表。
+
+**补齐的缺失内容**：Packages 表由 22 → **49 个包**（新增「宿主/适配器层」「支撑层」「协作/
+编排」「上下文/记忆/规划/遥测」等分组，含 `provider-kit` 并注明它不是 Provider）；
+Architecture 图补 `@harness/host` / `@harness/a2a-server` / `adapters/vscode` / 控制面
+`/harness/rpc`；CLI 补 `a2a` 与 10+ 个选项、REPL 补 `/agent` `/search` `/export` 与插件命令族；
+Agent/Subagent 补 9 个 options / 9 个工具参数；Documentation 补 8 份重要设计文档链接；
+Key Design Decisions 补 5 行（共用装配、路径边界单一来源、权限分层合成、隔离档位等）。
+
+**验证**：76 个相对链接逐一检查**全部有效**；19 个表格块列数一致（顺手修掉一处 code span
+里的裸 `|`）；58 个代码块围栏闭合；过时词残留扫描为空。纯文档改动，无代码变更 ⇒
+未跑 typecheck / test。
+
 ## 2026-11-06（续 291）七条 refactor 分支盘点并合入 main（检查未发现需修的问题）
 
 盘点：7 条 `refactor/auto-*` 分支（10-31 ~ 11-06）**全部基于同一 base `728aafb`（= 当时 main）**，

@@ -8,21 +8,21 @@
 
 - **运行时协议优于函数接口**：Tool / Agent / Plugin 是完整的生命周期协议对象，不只是 `call()`
 - **Fail-Closed 安全优先**：扩展点默认**不产生副作用**，具体分三级 —— 核心内置插件随装配加载；可选能力插件（`optIn`）一律「登记但不自动装配」，须在 `config.json → plugins` 显式声明；外部插件目录里的代码默认不执行（`allowPluginCode: false`）。工具的能力边界（`isReadOnly` / `isDestructive` / `isConcurrencySafe`）须显式声明，未声明一律按有风险处理（见 §Configuration → 如何查看当前启用的能力）
-- **Hooks 管道而非继承**：12+ 个 Hook 点让插件介入生命周期（`core.harness.start` / `core.tool.pre.execute` / `core.prompt.system.transform` / `cli.command` 等）
+- **Hooks 管道而非继承**：**23 个** Hook 点让插件介入生命周期（`core.harness.start` / `core.tool.pre.execute` / `core.prompt.system.transform` / `cli.command` 等）
 - **三 transport MCP Client**：stdio / Streamable HTTP / 旧版 HTTP+SSE，自动发现 tools / resources / prompts
 - **会话 Compaction**：三级压缩策略（prune / summary / agent）+ 百分比阈值动态触发 + 系统记忆注入
 - **流式输出全链路**：Provider `stream()` → AgentRuntime `queryStream()` → CLI REPL 逐 token 打印
-- **双轨制 Skill Layer**：Markdown 知识 + 内嵌 Shell，三来源合并（bundled/user/project/mcp）+ paths 条件触发 + Agent 白名单注入
+- **双轨制 Skill Layer**：Markdown 知识 + 内嵌 Shell，**5 类来源标签**（`bundled` / `user` / `project` / `mcp` / `plugin`）合并（目录加载覆盖顺序 project > user > bundled，MCP 来源强制禁用 shell embed）+ paths 条件触发 + Agent 白名单注入
 - **Subagent 派遣**：主 Agent 通过 `subagent` 工具派出子 Agent 执行独立任务（隔离 session + 工具白名单 + 递归深度控制 + Bus 实时进度 + 工具调用摘要）
-- **多 Provider 支持**：Anthropic Claude / OpenAI / Gemini / 通义 Qwen / GLM / Mock，6 个 Provider 插件
-- **多级配置加载**：Agent 与 Skill 均支持 user 级（`~/.harness/*`）+ project 级（`.harness/*`）两级加载，project 覆盖 user
-- **零外部运行时依赖**：参数解析、glob 匹配、readline 交互、SSE 解析全部内置实现
+- **多 Provider 支持**：Anthropic Claude / OpenAI / Gemini / 通义 Qwen / GLM / Mock，**6 个 Provider 插件**；另有 `@harness/provider-kit` 提供共享的 SSE 分帧 / 请求时限底座（不是 Provider）
+- **多级配置加载**：Agent / Skill / 插件 / 记忆**目录**支持 user 级（`~/.harness/*`）+ project 级（`.harness/*`）两级加载，project 覆盖 user（`config.json` 本身是单文件，见 §Configuration）
+- **核心引擎零第三方运行时依赖**：参数解析、glob 匹配、readline 交互、SSE 分帧全部内置实现；**可选能力会引入外部依赖**（全屏 TUI 用 `@opentui/*` + `react`、A2A 服务端用 `@a2a-js/sdk`、ACP 压缩用 `acp-kernel`、代码情报与 bash AST 用 `@babel/*` / `tree-sitter-*` / `web-tree-sitter`），见 §Tech Stack
 
 ## Quick Start
 
 ### 前置要求
 
-- [Bun](https://bun.sh/) >= 1.3
+- [Bun](https://bun.sh/) **>= 1.3**（CI 与本机基线为 1.3.x；根 `package.json` 的 `engines.bun` 是较宽松的 `>=1.1.0`，实际按 1.3 走）
 
 ### 安装
 
@@ -35,7 +35,7 @@ bun install
 ### 运行 CLI
 
 ```bash
-# 交互式 REPL（默认用 Anthropic Claude，需配 API Key）
+# 交互式 REPL（默认 provider 是 anthropic；未配 key 时自动 fallback 到 Mock 并发 provider.fallback-mock 提示）
 export ANTHROPIC_API_KEY=sk-ant-xxx
 bun run packages/cli/src/index.ts repl
 
@@ -55,54 +55,76 @@ bun run packages/cli/src/index.ts run "读取 package.json 并告诉我项目名
 ```
 harness [repl|start] [options]        启动交互式 REPL（默认）
 harness list-sessions [options]       列出持久化会话
-harness resume <sessionId> [options]  恢复指定会话
+harness resume [sessionId] [options]  恢复会话（省略 id 时用项目级指针）
 harness run "<prompt>" [options]      一次性执行 prompt
+harness a2a [options]                 启动 A2A v1.0 服务端（--port / --token / --json）
 harness teammate --team <t> --name <n> [options]   以 teammate 身份运行（终端后端 spawn）
-harness config                        配置概览（Provider / 模型 / 压缩 概览 + 校验）
+harness config <set-key|get-key|check>             裸 `config` 只打印用法并退出码 1
 harness config set-key <providerId> <apiKey>       加密写入 apiKey（enc:v1 密文）
 harness config get-key <providerId>   解密查看 apiKey
-harness config check [options]        校验 config.json 并打印概览（等同于 --check-config）
+harness config check [options]        校验 config.json 并打印概览（含 plugins 自检 + Provider 类型清单）
 harness help                          显示帮助
 
-选项：
+选项（常用）：
   -c, --cwd <dir>           工作目录
   -a, --agent <id>          默认 Agent ID
-  -p, --provider <name>     mock / anthropic / openai
+  -p, --provider <name>     内置 mock / anthropic / openai / gemini / glm / qwen，或 config.providers 里的自定义 id
+  -m, --model <id>          默认模型 ID
   -s, --session <id>        指定会话 ID
   -d, --data-dir <dir>      持久化目录（默认 ~/.harness）
-      --permission <mode>   allow-all / ask（默认 ask）
+      --permission <mode>   allow-all / ask（默认 ask）/ deny-all
       --tui                 以 TUI（alt-screen 全屏）模式启动 REPL
+      --snapshot            开启文件快照 + /revert
+      --allow-plugin-code   执行外部插件目录里的代码（默认关闭）
+      --no-resume           启动时不自动恢复上次会话
       --check-config        校验配置并打印概览后退出
+      --json               机器可读输出（A2A 启动信息）
+      --port / --token      A2A 服务端监听端口 / 鉴权 token
+      --team / --name       teammate 的团队名 / 成员名
   -v, --verbose             调试日志
 ```
 
-> `harness config check` / `--check-config` 会做**配置形状校验**：写错键、写错取值、层级写错都会被指出来
-> （例如把 `preserveRecentTokens` 写成单数、把 `tokenCalibration` 写成 `'chars/4'`）。这些错误在默认情况下
-> **完全无声**——未知键会被 `defaultConfig` 静默丢弃，写错取值会降级到默认值，而概览照常显示正常。
-> 详见 [上下文压缩配置](docs/acp-context-config.md) §10。校验属告警级别，不影响退出码（只有 Provider 错误才返回 1）。
+> `harness config check` / `--check-config` 会做**配置形状校验**：写错键、写错取值、层级写错都会在
+> 启动时、`--check-config` 与 `/config` 概览里打印「配置告警」——未跑校验时内核才是静默丢弃/降级。
+> 详见 [上下文压缩配置](docs/acp-context-config.md) §10。校验属告警级别、不影响退出码；
+> 但 `config check` 遇到 **`plugins` 里未登记的内置插件 id** 或 Provider 配置错误时会返回 1
+> （`--check-config` 只判 Provider 错误，两者并不完全等同）。
 
 ### REPL 内斜杠命令
 
-内置命令（`/help` 列出全部，其余命令由插件注册）：
+内置命令（`/help` 只列**内置**清单；插件命令与 TUI 专属命令不在其中）：
 
 ```
-/help               显示所有可用命令
+/help               显示内置命令清单
 /exit  /quit        退出 REPL
 /sessions           列出持久化会话
 /new                新建会话
 /resume <id>        恢复指定会话
-/switch <id>        切换到另一会话
+/agent  /switch <id>   查看 / 切换当前 Agent
 /model [spec]       查看 / 切换模型（如 /model openai/gpt-4o）
 /config             查看 config.json 配置概览
 /save               保存当前会话
 /compact [prune|summary|agent|auto]  压缩当前会话历史
+/search /export     搜索历史 / 导出会话
 /plugins            插件管理（list / enable / disable / reload）
 /skills             技能管理（list / enable / disable / reload）
 /stats  /stats-export  用量统计
 /permission         权限交互模式与规则（permissions.json）
-/history            查看输入历史
-/tree [path]        打印磁盘文件树（对话引用过的文件带 *）
+
+# TUI 专属（普通 REPL 与 /help 均无）
 /edit <file[:line]> 挂起 TUI 前台打开外部编辑器（编辑后回读）
+/tree [path]        打印磁盘文件树（对话引用过的文件带 *）
+/history            查看输入历史
+
+# 由插件经 cli.commands / cli.command 注册（列出主要的）
+/tools             工具启停与白名单（tools-manager）
+/mcp  /mcp-serve /mcp-status /mcp-stop   MCP server 管理
+/memory            长期记忆条目管理
+/revert /snapshot  会话级文件回滚 / 快照
+/subagents /tasks /worktrees  子 Agent 与任务平面
+/plan*（6 个）     文件化持久规划（planning-files）
+/workspace         两级目录布局（workspace-shell）
+/skill-forge /forge  技能锻造
 ```
 
 ### TUI 文件引用与编辑
@@ -119,9 +141,14 @@ TUI（`harness repl --tui` 或 `startTuiRepl`）会在对话过程中**自动收
 ### 运行测试
 
 ```bash
-bun test                    # 全部测试
-bun run typecheck           # 全部类型检查
+bun run test                # 全量测试（= bun run --filter '*' test，逐包跑）
+bun run typecheck           # 全量类型检查
+cd packages/<pkg> && bun test   # 单包测试
 ```
+
+> ⚠️ **不要用根目录的 `bun test`**：它会把 `reference/**`（参考代码 / 外部仓库快照）一起扫进来，
+> 产生大量与本次改动无关的失败。`bun test packages/cli`（无 `./` 前缀）也会误扫
+> `reference/opencode-dev/packages/cli`。单包请用 `cd <pkg> && bun test`。
 
 ## 构建与打包
 
@@ -130,7 +157,7 @@ bun run typecheck           # 全部类型检查
 ### 1. 全仓 JS 产物（各包 → `dist/`）
 
 ```bash
-bun run build        # bun run --filter '*' build，48 个包全部 exit 0
+bun run build        # bun run --filter '*' build，49 个 workspace 包全部 exit 0
 ```
 
 > ⚠️ `@harness/cli` 的 build 必须把 `@opentui/core` 的**按平台原生包**标成 external
@@ -138,18 +165,20 @@ bun run build        # bun run --filter '*' build，48 个包全部 exit 0
 > 而本机只装当前平台那一个，静态打包会全部尝试解析 ⇒ `Could not resolve`。
 > 该清单已写死在 `packages/cli/package.json` 的 `build` 脚本里，**新增平台时同步补一行**。
 
-### 2. CLI 单文件可执行（A2A sidecar，~76 MB）
+### 2. CLI 单文件可执行（A2A sidecar，macOS-arm64 ~76 MB）
 
 ```bash
 cd packages/cli && bun run build:sidecar
 # 产物：packages/cli/dist/harness-a2a
 ```
 
-`bun build --compile` 把 Bun runtime + 全部依赖（385 modules）打进一个可执行文件，
-**不依赖目标机的 Bun / node_modules**，可直接拷贝运行。验证符号是否真的进了二进制：
+`bun build --compile` 把 Bun runtime + 全部依赖（历史构建实测 385 modules，随代码增长会变）
+打进一个可执行文件，**不依赖目标机的 Bun / node_modules**，可直接拷贝运行。
+体积按平台差异很大：macOS-arm64 ~76 MB / Linux-x86_64 ~151 MB / Windows-x86_64 ~109 MB
+（CI release 附件实测）。验证符号是否真的进了二进制（在**仓库根**执行）：
 
 ```bash
-python3 -c "d=open('packages/cli/dist/harness-a2a','rb').read(); print(d.count(b'composeRules'))"
+python3 -c "d=open('packages/cli/dist/harness-a2a','rb').read(); print(d.count(b'composeRules'))"  # 若已在 packages/cli 下，路径改为 dist/harness-a2a
 ```
 
 跨平台产物需在对应 OS 上分别构建（`--compile` 产的是本机平台二进制）。
@@ -179,12 +208,12 @@ gh release create v0.1.1 --title "..." --notes-file notes.md
 gh workflow run release.yml -f tag=v0.1.0
 ```
 
-⚠️ `gh run rerun` 会沿用**触发时那个 commit 的 workflow 版本** —— 改了 workflow 之后
-必须重新触发，重跑不会带上修复。
+⚠️ `gh run rerun <run-id>` 会沿用**触发时那个 commit 的 workflow 版本** —— 改了 workflow 之后
+必须重新触发，重跑不会带上修复（本仓实测，见 `docs/development-log.md` 续 289）。
 
 ## Configuration（config.json）
 
-配置通过两级 `config.json` 加载：user 级 `~/.harness/config.json` 与 project 级 `.harness/config.json`，**project 级覆盖 user 级**。数据目录由 `--data-dir` 指定（默认 `~/.harness`），承载 `config.json` / `permissions.json` / `sessions/` / `.config-key` / 快照数据。
+配置是**单文件**：`<data-dir>/config.json`（`--data-dir` 默认 `~/.harness`），由 `@harness/workspace` 的 `ConfigStore` 加载；`packages/host/src/config.ts` 是纯校验/推导层、不负责 IO。**两级加载只适用于目录**（`plugins/` / `skills/` / `agents/` / `memory/`：project 级 `.harness/*` 覆盖 user 级 `~/.harness/*`），不要把它套到 config.json 上。数据目录还承载 `permissions.json` / `sessions/` / `.config-key` / `snapshots/` / `file-snapshots/` / `backups/` / `teams/`。
 
 **配置来源优先级**：CLI 参数 > config.json > 环境变量。例如 `--provider` / `--model` 会覆盖 config.json 的同名项。
 
@@ -232,12 +261,15 @@ gh workflow run release.yml -f tag=v0.1.0
 | `agents` | AgentOverride[] | 按 id 覆盖 Agent 的工具白名单 / MCP server 白名单 |
 | `mcpServers` | McpServerEntry[] | 托管的外部 MCP server（支持运行时 `/mcp` 启停，写回本字段） |
 | `plugins` | string[] | 声明式启用**内置插件**（如 `["code-intel","subagent","coordinator"]`），依赖按 `dependsOn` 自动补齐；**无需写 `.harness/plugins/*.ts`** |
-| `allowPluginCode` | boolean | 是否**执行** `.harness/plugins/*.ts\|js\|mjs` 的插件代码（默认 **false**，防代码注入）。开闸后也不会补任何 `node_modules` 软链 |
-| `allowPluginCode` | boolean | 是否加载 `.harness/plugins/*.ts` 里的**插件代码**（默认 **false**，防代码注入）。绝大多数场景用上面那行即可，不需要开 |
+| `allowPluginCode` | boolean | 是否**执行** `.harness/plugins/*.ts\|js\|mjs` 的插件代码（默认 **false**，防代码注入）。开闸后也不会补任何 `node_modules` 软链；绝大多数场景用上一行的声明式 `plugins` 即可 |
 | `snapshot` | boolean | 开启文件快照 + `/revert`（缺省 false）；`--snapshot` 优先 |
 | `harness.snapshot` | boolean | 顶层 `snapshot` 的兼容嵌套写法 |
+| `autoResume` | boolean | 启动时是否自动恢复上次会话（`--no-resume` 可覆盖） |
+| `memory` | object | 长期记忆插件参数（启用仍看 `plugins` 里有没有 `"memory"`），见下 |
+| `telemetry` | object | 遥测插件参数 |
 | `sandbox` | object | 隔离与沙箱策略（**当前是策略级，不是 OS 级**），见下节 |
 | `compression` | object | 上下文压缩（ACP）配置，见下节 |
+| `compaction` | object | 会话压缩配置（与 ACP 是两套机制），见下节 |
 
 ### compression 对象（上下文压缩 ACP）
 
@@ -258,14 +290,14 @@ gh workflow run release.yml -f tag=v0.1.0
 | `enabled` | boolean | 是否启用（缺省 false） |
 | `autoTune` | boolean | **按上下文窗口自动推导**保护 tokens / 增长阈值 / 最小压缩区间（缺省 **false**）。开启后无需手写下面那些参数 |
 | `tokenCalibration` | `'auto'` \| `'chars4'` | token 折算口径。`auto`（默认）为 CJK 感知——中日韩按 1 字 1 token，与内核 `defaultCountTokens` 同口径；`chars4` 为旧的 `chars/4` 回退 |
-| `modelContextLimit` | number | 手动指定上下文窗口；缺省取默认 Provider 的 `contextWindowTokens`，再兜底 200000 |
+| `modelContextLimit` | number | 手动指定上下文窗口；三级回退 `modelContextLimit` → 默认 Provider 的 `contextWindowTokens` → 200000 |
 | `preserveRecentTokens` | number | 保护区 tokens（推荐交给 autoTune） |
 
 **三个容易踩的点**：
 
 1. **`autoTune` 默认关闭**，不写就按内核默认值跑；推荐显式开启让参数随窗口自适应。
 2. **窗口并非写死的 200000**：实际取 `modelContextLimit` → 默认 Provider 的 `contextWindowTokens` → 200000 三级回退。若 Provider 声明了较小的窗口（如 `102400`）却手写大 `preserveRecentTokens`，会直接吃掉半个窗口导致严重超窗——**小窗口请交给 autoTune 推导**。
-3. **写错键完全无声**：未知键被静默丢弃、写错取值降级到默认值，而概览照常显示正常。调参前后请跑 `harness config check`。
+3. **未跑校验时静默**：未知键被丢弃、写错取值降级到默认值；但现在启动、`/config` 与 `harness config check` 概览都会打印「上下文压缩（ACP）配置告警（下列项不会被应用）」，并可能发 `config.compression-inactive` notice。调参前后请跑 `harness config check`。
 
 ### Agentic Loop（引擎内自主多步执行）
 
@@ -274,13 +306,15 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 
 - **步数上限**：默认 `30`。优先级 `AgentQueryInput.maxSteps` > `AgentDefinition.maxSteps` > 默认；`-1` 表示不限。
   传 `maxSteps: 1` 即**显式单轮**（与旧行为一致，旧调用方常用）。
-  **子 Agent 更保守**：subagent 派出的子 Agent 默认 `10` 步（聚焦执行，且步数越多越容易撞上
-  subagent 的 120s 超时）；个别子 Agent 需要长链时在自己的 `AgentDefinition` 里写 `maxSteps` 覆盖。
+  **子 Agent 更保守**：subagent 派出的子 Agent 默认 **`20`** 步（旧上限 10 会截断长链，故提升；
+  聚焦执行且步数越多越容易撞上 subagent 的 120s 超时）；个别子 Agent 需要长链时在自己的
+  `AgentDefinition` 里写 `maxSteps`，或用工具的 `maxSteps` 参数覆盖。
 - **续轮判据**：本步**有工具调用** 且 `finish` 不是 `length`/`content_filter`/`error`。
   注意 `finish` 与「有工具调用」并不互斥（Gemini 返回 `functionCall` 时 `finishReason` 仍是 `STOP`），
   故不能只看 `finish`。
-- **死循环保护**：同一工具 + 完全相同的入参连续 3 次 ⇒ 在执行前拦下并走权限确认；
-  拒绝则标 `DOOM_LOOP` 错误并终止。
+- **死循环保护**：**命中即硬中断、不征求权限**（交给权限引擎裁决会被 `--permission allow-all` 架空）。
+  两条判据：① 整步签名（工具 + 入参组合）连续 3 次相同；② 单个工具签名连续 3 次相同。
+  命中后标 `code: 'DOOM_LOOP'` 并终止。
 - **步数到顶**：追加一条收尾提示再跑一步，而不是硬截断。
 - **中断**：Ctrl-C（REPL SIGINT / TUI Ctrl-C）在**执行中 = 中断本次查询**、空闲 = 退出；
   已完成的步骤成果保留，未执行的工具标 `ABORTED`。
@@ -293,10 +327,10 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 
 | 位置 | 形态 |
 |---|---|
-| TUI 状态栏 | `● openai | agent=coordinator(编排) | model=… | 工具·bash·3步`（忙时显示状态，**并隐藏快捷键提示**让出宽度——状态栏整行需 ≤80 列） |
-| REPL 统计行 | `⏱️ 812ms | agent=default · 第2步 · 结束=stop | model=…`（每轮结束打印） |
+| TUI 状态栏 | `● openai \| agent=coordinator(编排) \| model=… \| 工具·bash·3步`（忙时显示状态，**并隐藏快捷键提示**让出宽度——状态栏整行需 ≤80 列） |
+| REPL 统计行 | `⏱️ 812ms \| agent=default · 第2步 · 结束=stop \| model=…`（每轮结束打印） |
 
-状态取值：`空闲` / `推理`（reasoning）/ `输出`（text）/ `工具·<名>` / `已中断`。
+状态取值：`空闲` / `推理`（reasoning）/ `输出`（text）/ `工具·<名>` / `等待`（`step_gate` 步间等待相位）/ `已中断`。
 推导逻辑在 `packages/cli/src/agent-status.ts`（纯函数，可单测），UI 只负责渲染；
 中断态不会被 `turn_end` 冲掉，异常路径也能收到 `turn_end` 从而回到空闲（不会一直显示忙）。
 
@@ -327,6 +361,8 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 | `reservedTokens` | number | 30000 | 给摘要生成预留的 tokens |
 | `contextWindowTokens` | number | 按 Provider 推导 | 本段专用覆盖，一般不填 |
 | `tokenCalibration` | `'auto'` \| `'chars4'` | `'auto'` | token 折算口径，与 `compression.tokenCalibration` 同义；**必须两边一致**，否则 ACP 判定已超窗、会话层却说远未到阈值 |
+| `requestPressurePct` | number | 按配置推导 | 单轮请求占窗口的压力阈值（`core.session.preModel` 的窗口守卫用） |
+| `tokenCalibrationScale` | number | 内置校准 | token 折算的缩放系数（高级调参，一般不填） |
 
 **窗口不在本段硬填**：按 `compaction.contextWindowTokens → compression.modelContextLimit → 本会话实际端点（Provider / 模型）的窗口 → 默认 Provider 的 contextWindowTokens → 200000` 推导。**窗口跟着会话走**：会话内用 `/model` 切到别的模型后，阈值按新端点的窗口重算（`/stats` 与本会话/各子会话的占用率也各用各自的窗口）—— 否则小窗口会话的阈值会落在真实窗口之外，自动压缩永远不触发且没有任何报错。
 
@@ -334,7 +370,7 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 
 ### plugins 数组（内置插件声明式启用）
 
-不想写插件代码时，用一行配置开内置能力（依赖自动补齐、安装顺序由 core 拓扑排序保证）：
+不想写插件代码时，用一行配置开内置能力（依赖按 `AgentPlugin.dependsOn` 自动补齐，安装顺序由 `@harness/plugin` 的 `PluginManager.loadInternal` 拓扑排序保证）：
 
 ```json
 {
@@ -347,6 +383,7 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   | id | 能力 | 依赖 |
   | --- | --- | --- |
   | `mcp.server-registry` | MCP Server 注册表（进程内/外部 MCP server 的宿主）+ `/mcp` 命令 | — |
+  | `mcp-server` | 让 harness **自己当** MCP server，把工具集暴露给外部客户端 | — |
   | `code-intel` | 代码情报 MCP server（`mcp__code-intel__*`） | `mcp.server-registry` |
   | `computer-use` | 电脑控制 MCP server（`mcp__computer-use__*`） | `mcp.server-registry` |
   | `subagent` | 子 Agent 派工：`subagent` 工具 + `/subagents` 命令 | — |
@@ -354,6 +391,11 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   | `swarm` | 长期在线团队协作：Team / Mailbox / Task List 工具 | — |
   | `herdr` | 把 Agent 状态上报到 [Herdr](https://herdr.dev) 侧栏（working / idle / blocked） | — |
   | `memory` | 长期记忆：加载两级 `MEMORY.md` 索引 + `AGENTS.md` 项目指令并注入 system prompt（子 Agent 不注入） | — |
+  | `planning-files` | 文件化持久规划（`.planning/` 三文件，每轮尾部注入 + approved-hash 防篡改） | — |
+  | `skill-forge` | 技能锻造：把跑通的流程固化为 `SKILL.md`（两段式确认） | — |
+  | `env-context` | 运行环境/用户信息注入（恒定段进前缀、易变段进尾部） | — |
+
+  以上是 `getBuiltinRegistry()` 里**全部 12 个 `optIn: true`** 的插件；`ui-widget` 为 `optIn: false`（默认装配），不在此表。
 
 - **Herdr 集成**：Herdr 是 agent 感知的终端复用器（tmux 竞品），侧栏能显示每个 pane 在跑/空闲/等你批准。
   本插件在 Herdr pane 内自动生效（靠 `HERDR_ENV=1` + `HERDR_PANE_ID` / `HERDR_BIN_PATH` 判定），
@@ -421,13 +463,14 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   键名拼错 / 数值类型不对**不会报错但也不生效**，所以启动时会对未知键与非法值告警，
   `harness config check`（配置概览）也会打印最终生效的参数。
 
-  未做部分（自动沉淀的隐式触发、技能锻造 F0~F3）见
-  [记忆能力与技能锻造计划](docs/memory-and-skill-forge-plan.md)。
+  技能锻造 `F1` / `F2` **已落地**并作为 `skill-forge` 插件登记（见上表）；仅 `F3` 隐式检测待做。
+  自动沉淀的隐式触发也仍未做，见 [记忆能力与技能锻造计划](docs/memory-and-skill-forge-plan.md)。
 
 - 依赖**不必显式写出**；外部 MCP server 也可零代码启用：`plugins: ["mcp.server-registry"]` + `mcpServers: [...]`。
 - **这些插件一律「登记但不自动装配」**（`optIn`）：不写进 `plugins` 就不会被装上，也不会在 `/tools` 里
   以「仅元信息」现身——避免把「没装」误读成「可用」。
-- 声明式装配的实例**一律无参**：子 Agent 定义以 AgentRuntime 注册表（md frontmatter）为准，
+- 声明式装配的实例**默认无参**（唯一例外是 `memory`，它通过 `memory` 配置段带参装配）：
+  子 Agent 定义以 AgentRuntime 注册表（md frontmatter）为准，
   `coordinator` 的 `forceAsync` 走环境变量 `HARNESS_FORCE_ASYNC`。需要带参装配（自定义 `subagents` 数组等）
   请改用外部插件目录 `.harness/plugins/*.ts`，并同时开 `allowPluginCode`（见 `.harness/plugins/README.md`）。
 - 未登记的 id 只告警不阻断启动；`harness config check` 会报为配置错误。
@@ -442,19 +485,26 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 
 | 字段 | 说明 |
 |------|------|
-| `id` | 唯一 ID，运行时 `provider/model` 前缀据此分发（`anthropic` / `openai` / `deepseek` / `ollama`…） |
+| `id` | 唯一 ID，运行时 `provider/model` 前缀据此分发；**可省略**，此时按 `model` 派生 |
 | `type` | Provider 类型：内置 `anthropic` / `openai` / `gemini` / `glm` / `qwen` / `mock`；可经插件扩展自定义 |
 | `baseUrl` | API 根路径（如 `https://api.deepseek.com` / `http://localhost:11434`） |
 | `apiKey` | API Key（支持三种格式，见下） |
 | `model` | 该 Provider 默认模型 |
 | `apiPath` | OpenAI 类型专用：API 路径（默认 `/v1/chat/completions`；智谱等可改 `/chat/completions`） |
 | `maxTokens` | `max_tokens` 默认值 |
+| `contextWindowTokens` | 该 Provider 的上下文窗口（**compaction / ACP 窗口推导的关键输入**） |
 | `timeoutMs` | 请求超时（ms） |
 | `thinking` | OpenAI 系思考模式开关（DeepSeek / GLM 等）：请求体注入 `thinking: {type}`，取值 `enabled` / `disabled`；缺省不发送（DeepSeek 默认启用，标准 OpenAI 不认识该参数） |
 | `reasoningEffort` | 思考力度：请求体注入 `reasoning_effort`（DeepSeek 接受 `minimal`/`low`/`medium`/`high`/`xhigh`/`max`/`ultra`）；缺省不发送 |
 
-`thinking` / `reasoningEffort` 仅 openai 系 Provider（含 `glm` / `qwen`，它们复用同一实现）消费；
+`thinking` / `reasoningEffort` 由 **preset 的 `supports` 门控**：只有声明了 `supports.thinking` 的预设才转发，
+未声明的预设（如 `QWEN_PRESET`，其思考开关叫 `enable_thinking`）会丢弃该字段并告警，避免 400。
 也可按 Agent 覆盖：Agent 定义的 `model.options.reasoningEffort` / `model.options.thinking` 优先于 Provider 配置。
+
+> **预设装配模型**（2026-11 重构后）：`glm` / `qwen` 不再各自实现，只声明一组常量预设
+> （`GLM_PRESET` / `QWEN_PRESET`），统一由 `@harness/provider-openai` 的
+> `createOpenAICompatiblePlugin` + `presetProviderTypeFactory` 装配；`@harness/provider-kit` 提供共享的
+> `SseDecoder`（SSE 分帧）与 `RequestDeadline`（请求时限/取消桥），供 anthropic / gemini / openai 系共用。
 官方回传规则（DeepSeek Thinking Mode）：**请求带 `tools` 时，后续所有请求必须完整回传历史各轮的
 `reasoning_content`，否则 400**——引擎已自适应处理（缺失时自动补发并按模型记忆）。
 
@@ -514,7 +564,7 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| `dangerousDetection` | boolean \| string[] | 危险命令检测。命中即拒绝，**权限卡的「允许」不覆盖它**；默认表不可整表关闭 |
+| `dangerousDetection` | boolean | 危险命令检测开关；`false` 会清空默认表（自定义条目走 `additionalDangerous: RegExp[]`，是代码侧配置，不在 config.json 里）。命中即拒绝，**权限卡的「允许」不覆盖它** |
 | `rootDir` | string | 沙箱根（缺省为工作目录）；命令的 `cwd` 不得逃出它 |
 | `sanitizeEnv` / `keepEnv` | boolean / string[] | env 隔离：默认过滤敏感变量，`keepEnv` 追加保留项 |
 | `allowlist` | string[] | 命令白名单（匹配首命令名或完整片段）；为空 = 不启用 |
@@ -525,6 +575,7 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
 | `netAllow` | string[] | `allowlist` 模式的目标白名单（父域覆盖子域；元数据/私有地址**即使写进来也硬拒**） |
 | `readDeny` | object \| false | 读侧敏感文件清单（`.env` / `id_rsa*` / `*.pem` / `.ssh/**` …）；`false` = 关闭 |
 | `readMaxBytes` | number | `read_file` 单文件上限（默认 10 MiB，`0` = 不限制）。超限**拒绝**而非截断 |
+| `readOnlyTimeoutMs` | number | `bash_ro` 只读命令超时（默认 15000 ms） |
 | `osBinding` | string | **OS 级绑定**（L2）：`off`（默认）/ `on`。开了才把子进程包进 `sandbox-exec` / `bwrap` |
 | `pluginCodeScan` | string | 插件代码静态扫描：`warn`（默认）/ `refuse` / `off`。⚠️ **是预警不是边界**（正则挡不住刻意绕过） |
 | `pluginRunner` | string | 插件装载后端：`in-process`（默认）/ `worker`。worker 给**资源与故障边界**（内存上限 / 加载死循环不阻塞主线程 / 加载崩溃不拖垮宿主），⚠️ **不是安全边界**（worker 内 env / pid / fs 与宿主一致），且**只登记不装载**（拿不到 hooks） |
@@ -561,7 +612,7 @@ Agent 执行**已支持引擎内自主多步**：模型调用工具后，工具�
   `"harness": { "shellRequirement": "posix" }` 表示"本包需要 POSIX shell 才能给完整语义"（缺省＝不需要）。
   守卫 `host/src/plugin-shell-requirement.test.ts` **双向**校验：源码里用了 `getShell(`/`resolveShell(`
   却没声明会红，"声明了却没用"也会红（防声明腐烂）。
-- **环境变量按键名大小写不敏感地读**（`lookupEnvCI`）：注入的 `env`（单测 / 其它宿主 / A2A 远端）是普通对象，
+- **环境变量按键名大小写不敏感地读**（`lookupEnvCI`，**唯一一份在 `@harness/fs-guard`**，执行侧 `resolveShell` 与展示侧 `detectShellForDisplay` 共用）：注入的 `env`（单测 / 其它宿主 / A2A 远端）是普通对象，
   `env.PATH` 取不到 `{ Path: … }` —— 不处理就会"本机装了 Git Bash 却静默落到 `cmd.exe`"。
 - ⚠️ **以上 PS / CMD 分支与其真机行为尚未在 Windows 上验证**（开发机 macOS）：用例钉的是判定算法（纯函数、逐条正反例）。
 
@@ -621,6 +672,7 @@ effort: medium
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
+| `id` | string | 唯一标识（缺省取目录/文件名）；**与 `name` 不同**，运行时按 id 去重 |
 | `name` | string | 显示名（缺省取目录/文件名） |
 | `description` | string | AI 何时使用的触发说明 |
 | `paths` | string[] | glob 匹配：修改这些文件时自动注入上下文 |
@@ -683,9 +735,10 @@ mode: primary
 tools: ['*']
 skills:
   - git-workflow
-subagents:
-  - reviewer
-  - tester
+background: false
+maxSteps: 30
+writesTo: ['src/**']
+mcpServers: ['gh']
 permission:
   "*": ask
   agent:
@@ -699,6 +752,24 @@ model:
 
 你是一名资深的代码工程师，专注于 TypeScript / Bun 开发。
 
+字段说明（`packages/agent/src/index.ts`）：
+
+| 字段 | 缺省 | 说明 |
+|---|---|---|
+| `id` / `name` / `description` / `icon` / `tags` | — | 标识、显示名、描述、图标、标签 |
+| `mode` | `subagent` | 角色模式，见下表 |
+| `tools` | 只读哨兵 | 工具白名单；`['*']` 表示全部 |
+| `skills` | — | 绑定的 Skill id |
+| `permission` | `{'*':'ask'}` | 权限规则（可含 `agent.deny`） |
+| `model` | 跟随全局 | `providerId` / `modelId` / `temperature` / `options` |
+| `mcpServers` / `excludeMcpServers` | 全可见 | Agent 级 MCP server 白名单 / 黑名单 |
+| `background` | false | 是否后台运行 |
+| `writesTo` | — | 声明该 Agent 会写的文件范围（写锁/冲突判定用） |
+| `maxSteps` | 30 | 引擎内自主多步上限 |
+
+> ⚠️ **`subagents` 字段已删除**：历史上只解析、没有任何消费方，写了不生效（现在解析到会告警）。
+> 可派工范围由「派工方是否持 `subagent` 工具」+「子 Agent 自己的 `tools:` 白名单」决定。
+
 ## 工作规范
 1. 修改前必先阅读相关文件
 2. 提交前运行测试
@@ -709,7 +780,7 @@ model:
 
 | mode | 说明 |
 |------|------|
-| `primary` | 主 Agent，可直接对用户 |
+| `primary` | 主 Agent，可直接对用户（**缺省是 `subagent`**，需显式写 `mode: primary`） |
 | `subagent` | 只能被主 Agent 调用（独立 worker，见 [Subagent](#subagent)） |
 | `coordinator` | 调度器（不自己写代码，专派工） |
 | `teammate` | Swarm 协作成员（带 inbox/task list） |
@@ -747,9 +818,10 @@ const subagentPlugin = createSubagentPlugin({
     },
   ],
   timeoutMs: 120_000,
-  maxResultLength: 2000,
+  maxResultLength: 8000,   // 缺省 8000（旧值 2000 已提升）
   maxResultLines: 500,
   directive: '请结构化输出审查结论，包含：问题列表 + 严重等级 + 修复建议',
+  // 其余可选项：cleanupSession / injectRoster / maxSteps（缺省 20）/ draftFlushIntervalMs
 })
 ```
 
@@ -774,7 +846,8 @@ CLI 默认会从 `.harness/agents/` 和 `~/.harness/agents/` 加载所有 Agent 
 
 ### 主 Agent 调用 Subagent
 
-主 Agent 配置 `subagents` 白名单后，LLM 可通过 `subagent` 工具调用：
+主 Agent 持 `subagent` 工具后，LLM 即可派工（子 Agent 能否被派到，取决于它自己的 `tools:` 白名单与
+`permission.agent` 过滤，**不再靠 `subagents` 白名单字段**）：
 
 ```markdown
 ---
@@ -782,9 +855,6 @@ id: coordinator
 name: Coordinator
 mode: coordinator
 tools: ['*']
-subagents:
-  - reviewer
-  - tester
 ---
 ```
 
@@ -794,6 +864,10 @@ subagents:
 - `description`：可选，作为子 session 标题
 - `model`：可选，覆盖子 Agent 模型
 - `sessionId`：可选，续接已有子 session
+- `runInBackground`：可选，后台执行并注册 taskId（完成时经 Bus 通知父 Agent）
+- `maxSteps`：可选，覆盖本次的步数上限（缺省 20）
+- `timeoutMs`：可选，覆盖本次超时（缺省 120000）
+- `targetFiles`：可选，声明本次会写的文件（用于写锁互斥）
 
 ### 权限过滤
 
@@ -807,7 +881,7 @@ subagents:
 ### 工具调用摘要
 
 子 Agent 回复过长时自动生成摘要（参考 Claude Code `agentSummary.ts` + OpenCode `truncation.ts`）：
-- 双阈值触发：`maxResultLines`（行数，缺省 500）和 `maxResultLength`（字符，缺省 2000）
+- 双阈值触发：`maxResultLines`（行数，缺省 500）和 `maxResultLength`（字符，**缺省 8000**）
 - head+tail 保留策略：摘要包含首行和末行
 - 智能提示：父 Agent 有 `read_file`/`grep_file` 时提示用工具继续探索；有 `subagent` 工具时提示委派 explore agent
 - directive 注入：可注入结构化输出指令到子 Agent 的 prompt 前面
@@ -822,30 +896,43 @@ subagents:
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                   CLI / SDK / IDE / Worker                │  入口层
-├──────────────────────────────────────────────────────────┤
-│                   @harness/cli (REPL)                     │
-│   REPL · 会话持久化 · 权限交互 · 斜杠命令 · 流式打印        │
-├──────────────────────────────────────────────────────────┤
-│                   @harness/core                           │  核心层
-│   Harness · AgentRuntime · SessionManager                │
-│   ToolPool · PermissionEngine · ChatProvider             │
-│   Compaction · Title/Search/Export · Skill 注入           │
-├──────────┬──────────┬──────────┬────────────────────────┤
-│ @harness/ │ @harness/│ @harness/│ @harness/              │  基础层
-│   bus     │   tool   │  plugin  │  session · agent       │
-│ 事件总线  │ 工具协议 │ 插件管理  │  permission · skill    │
-├──────────┴──────────┴──────────┴────────────────────────┤
-│                        Plugins                            │  插件层
-│  provider-mock · provider-anthropic · provider-openai     │
-│  provider-gemini · provider-qwen · provider-glm          │
-│  tools-builtin (4 原语) · tools-search · tools-glob       │
-│  tools-web · tools-media · mcp-client · subagent         │
-└──────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  宿主 / 适配器层（三者共用同一份装配，避免"两份装配必然分叉"）      │
+│  @harness/cli（REPL + TUI） · @harness/a2a-server（A2A v1.0 SSE） │
+│  adapters/vscode（Chat Participant + 侧栏 webview，纯协议客户端）  │
+│  控制面：POST /harness/rpc（A2A 协议之外的那一半）                 │
+├──────────────────────────────────────────────────────────────────┤
+│              @harness/host（共用装配层）                            │
+│  插件目录加载 · 内置注册表 · providerType 注册 · 配置归一化         │
+│  窗口推导 · 权限接缝 · 装配期 notice                                │
+├──────────────────────────────────────────────────────────────────┤
+│              @harness/core（核心层）                                │
+│  Harness · AgentRuntime · SessionManager · ToolPool                 │
+│  PermissionEngine · Compaction · Skill 注入 · Agentic Loop         │
+├────────┬────────┬────────┬──────────────────┬───────────────────┤
+│ bus    │ tool   │ plugin │ session · agent   │ 支撑层（零依赖叶子）│
+│ 事件总线│工具协议│插件管理│ permission · skill│ fs-guard · isolation│
+│        │        │        │                   │ usage · workspace  │
+│        │        │        │                   │ snapshot · revert  │
+├────────┴────────┴────────┴──────────────────┴───────────────────┤
+│                   Plugins（31 个插件包）                          │
+│  provider-* 6 + provider-kit（共享 SSE/时限底座）                  │
+│  tools-* 5 + tools-manager / manage-plugin / ui-widget             │
+│  mcp-client / mcp-server / mcp-server-registry                     │
+│  code-intel · computer-use · workspace-shell                        │
+│  acp-context · memory · skill-forge · planning-files               │
+│  env-context · telemetry · coordinator · swarm · herdr · subagent  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
+> `adapters/vscode` **刻意不进 workspace**（带 `@types/vscode` 会污染主包类型面），
+> 源码也不 `import @harness/*` —— 跨进程只讲 A2A + 控制面。详见 §1 仓库结构与 §构建与打包。
+
 ## Packages
+
+当前 workspace 共 **49 个包**（`packages/*` 18 个 + `packages/plugins/*` 31 个）；
+下表是「可提供的能力」清单，**不是**当前实例启用的清单（见 §如何查看当前启用的能力）。
+`adapters/vscode` 不进 workspace，单列在最后。
 
 ### 核心与基础层
 
@@ -853,18 +940,38 @@ subagents:
 |---------|-------------|
 | [`@harness/bus`](packages/bus/src/index.ts) | 类型安全 Pub/Sub 事件总线 |
 | [`@harness/tool`](packages/tool/src/index.ts) | Tool 运行时协议 + 注册中心 + 执行流水线（Fail-Closed） |
-| [`@harness/plugin`](packages/plugin/src/index.ts) | 插件管理（三级加载 + 拓扑排序 + Hook 管道 + `cli.commands`/`cli.command` 扩展） |
-| [`@harness/core`](packages/core/src/index.ts) | Harness 编排器 + AgentRuntime + SessionManager + Compaction |
-| [`@harness/cli`](packages/cli/src/index.ts) | 命令行入口（REPL + 会话持久化 + 权限交互 + 流式输出） |
+| [`@harness/plugin`](packages/plugin/src/index.ts) | 插件管理（三级加载 + 拓扑排序 + **23 个** Hook 点 + `cli.commands`/`cli.command` 扩展） |
+| [`@harness/core`](packages/core/src/index.ts) | Harness 编排器 + AgentRuntime + SessionManager + Compaction + Agentic Loop |
+| [`@harness/cli`](packages/cli/src/index.ts) | 命令行入口（REPL + TUI + 会话持久化 + 权限交互 + 流式输出） |
+
+### 宿主 / 适配器层
+
+| Package | Description |
+|---------|-------------|
+| [`@harness/host`](packages/host/src/index.ts) | **共用装配层**：CLI / A2A server / VSCode 扩展共用一份装配（内置注册表、配置归一化、窗口推导、权限接缝、notice） |
+| [`@harness/a2a-server`](packages/a2a-server/src/index.ts) | A2A v1.0 服务端（SSE 流式 + 权限挂起/续接 + 幂等回放）+ 控制面 `POST /harness/rpc` |
+| `adapters/vscode` | VSCode Chat Participant + 侧栏 webview（纯协议客户端，不依赖 `@harness/*`，独立 typecheck/test） |
 
 ### 领域层
 
 | Package | Description |
 |---------|-------------|
 | [`@harness/session`](packages/session/src/index.ts) | 会话模型 + 持久化 + CompactionMeta/Memory schema |
-| [`@harness/agent`](packages/agent/src/index.ts) | Agent 协议（promptFragments + 工具白名单 + 权限配置） |
-| [`@harness/permission`](packages/permission/src/index.ts) | 权限引擎（4 级路径匹配 + 规则记忆） |
-| [`@harness/skill`](packages/skill/src/index.ts) | Skill 协议（Markdown 技能 + paths 条件触发） |
+| [`@harness/agent`](packages/agent/src/index.ts) | Agent 协议（promptFragments + 工具白名单 + 权限配置 + frontmatter 解析） |
+| [`@harness/permission`](packages/permission/src/index.ts) | 权限引擎（4 级路径匹配 + 规则记忆 + 分层合成取最严） |
+| [`@harness/skill`](packages/skill/src/index.ts) | Skill 协议（Markdown 技能 + 5 类来源标签 + paths 条件触发） |
+
+### 支撑层（多为零依赖叶子包）
+
+| Package | Description |
+|---------|-------------|
+| [`@harness/workspace`](packages/workspace/src/index.ts) | 工作区定位 / 目录布局 / `ConfigStore` / 两级目录加载 |
+| [`@harness/fs-guard`](packages/fs-guard/src/index.ts) | **全仓唯一一份**文件系统边界判定（`resolvePath` / `isWithinCwd` / `lookupEnvCI`） |
+| [`@harness/isolation`](packages/isolation/src/index.ts) | 沙箱隔离档位（L0~L3）+ 网络出口策略 + macOS Seatbelt profile 渲染 |
+| [`@harness/snapshot`](packages/snapshot/src/index.ts) | 文件快照 / Diff / 回滚（git content-addressed tree / 文件副本双后端） |
+| [`@harness/revert`](packages/revert/src/index.ts) | 会话级文件回滚三态 `stage/clear/commit` + `/revert` `/snapshot` 命令 |
+| [`@harness/usage`](packages/usage/src/index.ts) | 用量统计累积器（零依赖纯函数，引擎层唯一累加者） |
+| [`@harness/bench`](packages/bench/src/index.ts) | Benchmark 跑分框架（τ-bench / τ³-bench retail 域） |
 
 ### Provider 插件
 
@@ -872,50 +979,72 @@ subagents:
 |---------|-------------|
 | [`@harness/provider-mock`](packages/plugins/provider-mock/src/index.ts) | Mock LLM Provider（测试用，complete + stream） |
 | [`@harness/provider-anthropic`](packages/plugins/provider-anthropic/src/index.ts) | Anthropic Claude Messages API（complete + stream） |
-| [`@harness/provider-openai`](packages/plugins/provider-openai/src/index.ts) | OpenAI Chat Completions API（complete + stream，apiPath 可配置） |
-| [`@harness/provider-gemini`](packages/plugins/provider-gemini/src/index.ts) | Google Gemini API（独立实现，支持系统消息/角色映射/工具调用/图片） |
-| [`@harness/provider-qwen`](packages/plugins/provider-qwen/src/index.ts) | 阿里通义 Qwen API（复用 OpenAIChatProvider，兼容 OpenAI 协议） |
-| [`@harness/provider-glm`](packages/plugins/provider-glm/src/index.ts) | 智谱 GLM API（复用 OpenAIChatProvider，兼容 OpenAI 协议） |
+| [`@harness/provider-openai`](packages/plugins/provider-openai/src/index.ts) | OpenAI Chat Completions + **`OpenAICompatiblePreset` 装配层**（glm/qwen 共用这一份） |
+| [`@harness/provider-gemini`](packages/plugins/provider-gemini/src/index.ts) | Google Gemini API（系统消息/角色映射/工具调用/图片） |
+| [`@harness/provider-qwen`](packages/plugins/provider-qwen/src/index.ts) | 通义 Qwen：只声明 `QWEN_PRESET` 常量，装配走 provider-openai |
+| [`@harness/provider-glm`](packages/plugins/provider-glm/src/index.ts) | 智谱 GLM：只声明 `GLM_PRESET` 常量，装配走 provider-openai |
+| [`@harness/provider-kit`](packages/plugins/provider-kit/src/index.ts) | **跨协议公共底座**（只含 `SseDecoder` + `RequestDeadline`）；不是 Provider，不导出 `providerTypeFactory` |
 
-### 协作插件
+### 协作 / 编排插件
 
 | Package | Description |
 |---------|-------------|
-| [`@harness/subagent`](packages/plugins/subagent/src/index.ts) | Subagent 插件——主 Agent 派出子 Agent（隔离 session + 工具白名单 + 递归控制 + Bus 进度 + 摘要） |
+| [`@harness/subagent`](packages/plugins/subagent/src/index.ts) | 子 Agent 派工（隔离 session + 工具白名单 + 递归控制 + Bus 进度 + 摘要 + 后台任务/中途草稿） |
+| [`@harness/coordinator`](packages/plugins/coordinator/src/index.ts) | 四阶段派工 Research→Synthesis→Implementation→Verification + Barrier 自动集齐 + 写锁仲裁 |
+| [`@harness/swarm`](packages/plugins/swarm/src/index.ts) | 长期在线团队协作：Team / Mailbox / Task List / Leader 权限桥 |
+| [`@harness/herdr`](packages/plugins/herdr/src/index.ts) | 把 Agent 运行状态上报 [Herdr](https://herdr.dev) 侧栏（不在 Herdr 内全程 no-op） |
 
-### 工具插件
+### 工具 / MCP / 管理插件
 
-| Package | Tools | Description |
-|---------|-------|-------------|
-| [`@harness/tools-builtin`](packages/plugins/tools-builtin/src/index.ts) | `read_file` / `write_file` / `edit_file` / `bash` | 4 个原语工具（文件 I/O + Shell） |
+| Package | Tools / 命令 | Description |
+|---------|--------------|-------------|
+| [`@harness/tools-builtin`](packages/plugins/tools-builtin/src/index.ts) | `read_file` / `write_file` / `edit_file` / `bash` / `bash_ro` | 文件 I/O + Shell（跨方言白名单、AST 复核、危险命令检测、OS 级绑定） |
 | [`@harness/tools-search`](packages/plugins/tools-search/src/index.ts) | `list_dir` / `grep_file` | 搜索导航类 |
 | [`@harness/tools-glob`](packages/plugins/tools-glob/src/index.ts) | `glob` | 多模式通配符匹配 |
 | [`@harness/tools-web`](packages/plugins/tools-web/src/index.ts) | `web_fetch` | HTTP(S) 抓取 + SSRF 防护 |
 | [`@harness/tools-media`](packages/plugins/tools-media/src/index.ts) | `view_image` | 图片 base64 + 尺寸解析 |
+| [`@harness/tools-manager`](packages/plugins/tools-manager/src/index.ts) | `/tools` | 工具启停与白名单持久化 |
+| [`@harness/manage-plugin`](packages/plugins/manage-plugin/src/index.ts) | `/plugins` | 插件生命周期 list / enable / disable / reload |
+| [`@harness/code-intel`](packages/plugins/code-intel/src/index.ts) | `mcp__code-intel__*` | 代码情报：进程内 MCP server + 直装工具双路径（索引/符号/引用/定义） |
+| [`@harness/computer-use`](packages/plugins/computer-use/src/index.ts) | `mcp__computer-use__*` | 电脑控制 MCP server（macOS osascript）+ 注册 plugin 来源 Skill |
+| [`@harness/ui-widget`](packages/plugins/ui-widget/src/index.ts) | `ui_widget` | 生成式 UI：widget 注册表（默认装配，`optIn: false`） |
+| [`@harness/workspace-shell`](packages/plugins/workspace-shell/src/index.ts) | `/workspace` | 展示两级目录布局的薄壳 |
+| [`@harness/mcp-client`](packages/plugins/mcp-client/src/index.ts) | `/mcp` | MCP Client（stdio / http / sse 三态 + resources/prompts 发现 + Bearer/OAuth 鉴权） |
+| [`@harness/mcp-server`](packages/plugins/mcp-server/src/index.ts) | `/mcp-serve` `/mcp-status` `/mcp-stop` | 让 harness **自己当** MCP server，把工具集暴露给外部客户端 |
+| [`@harness/mcp-server-registry`](packages/plugins/mcp-server-registry/src/index.ts) | `/mcp` | MCP Server 注册表（client 侧清单，管理要连哪些 server） |
 
-### 协议插件
+### 上下文 / 记忆 / 规划 / 遥测插件
 
 | Package | Description |
 |---------|-------------|
-| [`@harness/mcp-client`](packages/plugins/mcp-client/src/index.ts) | MCP Client（stdio + HTTP/SSE transport + resources/prompts 发现 + Bearer 鉴权） |
+| [`@harness/acp-context`](packages/plugins/acp-context/src/index.ts) | ACP 上下文压缩（基于 `acp-kernel` 的 3 层 LSM，`core.session.preModel` + 4 个工具） |
+| [`@harness/memory`](packages/plugins/memory/src/index.ts) | 长期记忆：L0 `AGENTS.md` 项目指令 + L1 `MEMORY.md` 索引（含 `/memory` 命令） |
+| [`@harness/skill-forge`](packages/plugins/skill-forge/src/index.ts) | 技能锻造 F1/F2：把跑通的流程固化为 `SKILL.md`（两段式确认） |
+| [`@harness/planning-files`](packages/plugins/planning-files/src/index.ts) | 文件化持久规划（`.planning/` 三文件 + 每轮尾部注入 + approved-hash 防篡改） |
+| [`@harness/env-context`](packages/plugins/env-context/src/index.ts) | 运行环境/用户信息注入（恒定段进前缀、易变段进尾部） |
+| [`@harness/telemetry`](packages/plugins/telemetry/src/index.ts) | 通用遥测：订阅 `core.bus` 全事件写 `*.telemetry.jsonl` |
 
 ## Key Design Decisions
 
 | 决策 | 选型 | 理由 |
 |------|------|------|
 | 技术栈 | TypeScript + Bun | 原生 TS、零配置、fast test |
-| 包结构 | Monorepo (`packages/*`) | 模块边界清晰，可独立发布 |
+| 包结构 | Monorepo（`packages/*` + `packages/plugins/*`，49 包） | 模块边界清晰，可独立发布 |
 | 工具默认并发安全 | 否（Fail-Closed） | 新工具默认有风险，需显式声明 |
-| 扩展机制 | Hooks 管道 | 12+ 个 Hook 点，插件介入生命周期 |
+| 扩展机制 | Hooks 管道 | **23 个** Hook 点，插件介入生命周期 |
 | 插件加载顺序 | Internal → Builtin → User + 拓扑排序 | 保证覆盖关系明确 |
 | 权限匹配 | 精确路径 → glob → 工具级 → 全局 | 4 级匹配 + 规则记忆 |
 | 会话压缩 | 百分比阈值 + 三级策略 | 适配不同上下文窗口模型（含 1M 模型） |
 | MCP transport | 三态抽象（stdio/http/sse） | 统一接口，按配置选择 |
 | Skill 双轨制 | 知识（Markdown）+ Tool（功能） | 分离关注点，知识声明式、功能可执行 |
-| Skill 多来源 | bundled/user/project/mcp | 同 ID 后加载覆盖先加载；MCP 来源强制禁用 shell embed |
+| Skill 多来源 | bundled/user/project/mcp/**plugin**（5 类来源标签） | 目录加载 project > user > bundled；MCP 来源强制禁用 shell embed |
 | Subagent 隔离 | 独立 session + 工具白名单 + 递归控制 | 子 Agent 上下文独立，主 Agent 通过 prompt 通信 |
 | 多级配置加载 | user（~/.harness）+ project（.harness） | 个人配置 + 团队共享，project 覆盖 user |
-| 外部依赖 | 零 | 参数解析 / glob / readline / SSE 解析全部内置 |
+| 外部依赖 | **核心引擎零第三方运行时依赖**；可选能力按需引入 | 参数解析 / glob / readline / SSE 分帧内置；TUI(`@opentui/*`,`react`) / A2A(`@a2a-js/sdk`) / ACP(`acp-kernel`) / 语法解析(`tree-sitter-*`,`@babel/*`) 为外部依赖 |
+| 宿主装配 | 共用 `@harness/host` | CLI / A2A server / VSCode 扩展共用一份装配，避免两份装配必然分叉 |
+| 路径边界 | 唯一一份在 `@harness/fs-guard` | `resolvePath` / `isWithinCwd` 两侧都过 realpath，挡住 symlink 逃逸与 TOCTOU |
+| 权限合成 | 用户基线 + agent 约束**逐键取最严** | deny 否决权不被 agent 或 `--permission allow-all` 覆盖；规则持久化只回基线 |
+| 隔离档位 | L0 策略 / L1 进程 / L2 OS 绑定 / L3 未接线 | 拿不到原语不模拟，`BashOutput.isolation.fsBound` 如实报是否真绑上 |
 
 ## Plugin Development
 
@@ -935,7 +1064,7 @@ const myTool = defineTool({
   isReadOnly: () => true,          // 显式声明只读
   isConcurrencySafe: () => true,   // 显式声明并发安全
   isDestructive: () => false,      // 默认 false，破坏性操作需显式 true
-  inputSchema: makeSchema(),       // zod / 自定义 Schema
+  inputSchema: makeSchema(),       // 示意占位；实际推荐 fromJsonSchema(...) 或自定义 Schema
   permission: { key: 'read', extractPatterns: (input) => [input.path] },
   async call(input, ctx) {
     const path = resolvePath(input.path, ctx.cwd)
@@ -995,6 +1124,13 @@ const mcpPlugin = createMcpClientPlugin({
 - [MCP 服务](docs/mcp-services.md) — MCP server 注册方法、配置字段、命令用法、运行机制与凭据安全
 - [工作区管理](docs/workspace-management.md) — 两级工作区目录、config/permissions/sessions 数据布局
 - [代码情报插件](docs/codeintel-plugin.md) — CodeIntel 插件规划与实现说明
+- [沙箱隔离计划](docs/sandbox-isolation-plan.md) — L0~L3 档位、P-tier 授权范围与路径边界收敛、已知缺口
+- [执行后端设计稿](docs/execution-backend-design.md) — L3 容器 / microVM / 远程 executor（只出设计稿，未接线）
+- [跨平台计划](docs/cross-platform-plan.md) — bash / PowerShell / CMD 方言、行尾 BOM、进程树 kill、真机验证判据
+- [外部集成计划](docs/external-integration-plan.md) — A2A / VSCode 适配器 / 控制面的接线设计
+- [Host 装配层抽取设计](docs/host-extraction-design.md) — 三宿主共用一份装配的来龙去脉
+- [VSCode 集成设计](docs/vscode-integration-design.md) 与 [Chat Sessions spike](docs/vscode-chat-sessions-spike.md) — 扩展侧分层与真机踩坑记录
+- [MCP Server 插件](docs/mcp-server-plugin.md) · [规划文件插件](docs/planning-files-plugin.md) · [遥测计划](docs/telemetry-plan.md)
 
 上下文压缩（ACP）系列：
 
@@ -1010,10 +1146,12 @@ Agent 执行链路：
 
 ## Tech Stack
 
-- **Runtime**: Bun >= 1.3
-- **Language**: TypeScript
-- **Architecture**: Monorepo (packages/)
-- **Dependencies**: Zero external runtime deps
+- **Runtime**: Bun >= 1.3（CI 与本机基线 1.3.x；根 `engines.bun` 为宽松的 `>=1.1.0`）
+- **Language**: TypeScript（`strict: true`，`target ESNext`，`moduleResolution: bundler`）
+- **Architecture**: Monorepo（`packages/*` + `packages/plugins/*`，49 个 workspace 包；`adapters/vscode` 独立）
+- **Dependencies**: **核心引擎零第三方运行时依赖**（参数解析 / glob / readline / SSE 分帧内置）；
+  可选能力引入外部依赖：`@opentui/core` `@opentui/react` `react`（TUI）、`@a2a-js/sdk`（A2A 服务端）、
+  `acp-kernel`（ACP 压缩）、`@babel/*` `tree-sitter-*` `web-tree-sitter`（代码情报与 bash AST）
 
 ## License
 
