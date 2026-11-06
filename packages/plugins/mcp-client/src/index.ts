@@ -799,13 +799,32 @@ class PassthroughSchema implements Schema<Record<string, unknown>> {
   }
 }
 
+/**
+ * 工具 id 前缀 —— 命名约定 `mcp__<server>__<tool>` 的**唯一出处**。
+ * 生产方（convertMcpToolToHarnessTool）与消费方（按 server 过滤工具、/mcp tools 展示）
+ * 各拼一遍字面量时，一旦约定要改就会只改到一半，故统一从这里取。
+ */
+export function mcpToolPrefix(serverName: string): string {
+  return `mcp__${serverName}__`
+}
+
+/**
+ * 从工具 id 还原 server 内的 base 名（不带本 server 前缀的 id 原样返回）。
+ * 刻意不返回 undefined：调用方（工具级启停过滤）只关心"这条 id 属于哪个 base 名"，
+ * 不属于本 server 的 id 拿回去也匹配不到任何开关。
+ */
+export function mcpToolBaseName(serverName: string, toolId: string): string {
+  const prefix = mcpToolPrefix(serverName)
+  return toolId.startsWith(prefix) ? toolId.slice(prefix.length) : toolId
+}
+
 /** 把 MCP 工具定义转换为 Harness Tool 对象 */
 export function convertMcpToolToHarnessTool(
   mcpTool: McpToolDef,
   serverName: string,
   client: McpClient,
 ): Tool<Record<string, unknown>, unknown> {
-  const toolId = `mcp__${serverName}__${mcpTool.name}`
+  const toolId = `${mcpToolPrefix(serverName)}${mcpTool.name}`
   return {
     id: toolId,
     description: mcpTool.description ?? `MCP tool: ${mcpTool.name}`,
