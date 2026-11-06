@@ -12,7 +12,7 @@
  * 依赖约定：mcpserver 相关插件应 `dependsOn: ['mcp.server-registry']`，确保本插件先安装、先连接。
  */
 
-import type { AgentPlugin, Hooks, McpConfigureInput } from '@harness/plugin'
+import type { AgentPlugin, CliCommandInput, Hooks, McpConfigureInput } from '@harness/plugin'
 import { globalMcpToolIndex, type Tool } from '@harness/tool'
 import type { Unsubscribe } from '@harness/bus'
 import { LifecycleEvents } from '@harness/core'
@@ -20,6 +20,7 @@ import {
   McpClient,
   defaultTransportFactory,
   convertMcpToolToHarnessTool,
+  mcpToolBaseName,
   type McpServerConfig,
   type McpTransport,
 } from '@harness/mcp-client'
@@ -190,6 +191,21 @@ export interface McpCliStore {
 }
 
 /**
+ * `/mcp` 命令收到的输入 = 契约层 `CliCommandInput` + CLI **额外注入**的两个持久化字段。
+ *
+ * 这两个字段没进契约层是刻意的：`McpServerEntry` 的类型住在 mcp-client，让 `@harness/plugin`
+ * 反向依赖 MCP 插件包会把依赖方向倒过来。但这也意味着"CLI 注入什么"事实上由两边各写一遍
+ * （cli 侧一个结构化字面量、这里原本四个 `as any`）—— 故在本文件**只窄化一次**，
+ * 字段名与 cli 侧保持一致，读的地方直接用类型，不再逐个 `any`。
+ */
+interface McpCommandInput extends CliCommandInput {
+  /** CLI 注入：当前 config.json 的 mcpServers（与 cli 侧 `mcpServers:` 同源） */
+  mcpServers?: McpServerEntry[]
+  /** CLI 注入：持久化 mcpServers 回 config.json */
+  setMcpServers?: (list: McpServerEntry[]) => Promise<void> | void
+}
+
+/**
  * 创建 MCP Server 注册表插件。
  * 负责：core.harness.start 时连接所有已注册（代码 + config.json）server → core.tool.pool.assemble 暴露工具
  *       → /mcp 命令管理（服务器/工具两级启停）→ unload 时断开。
@@ -210,10 +226,61 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   const downTools = new Map<string, string[]>()
   /** 代码注册 server → 来源插件 id（供插件卸载/重载时同步断连/重连） */
   const serverSource = new Map<string, string>()
+  /** name → 最近一次连接失败原因；只在"连不上"时存在，供 /mcp servers 把静默失败变成可诊断 */
+  const lastError = new Map<string, string>()
+  /** 建连去重：两条来源路径（托管 / 代码注册）共用一张 in-flight 表，同名并发只真连一次 */
+  const inflight = new Map<string, Promise<McpServerRuntime | undefined>>()
+  /** 已卸载：in-flight 连接在 uninstall 之后才 resolve 时不得再登记 */
+  let disposed = false
   /** CLI 注入的持久化回调 */
   let cliStore: McpCliStore | undefined
   /** 事件退订句柄（install 注册、uninstall 退订） */
   const offs: Unsubscribe[] = []
+
+  const runtimeOf = (name: string): McpServerRuntime | undefined => runtimes.find((r) => r.name === name)
+
+  /** 关闭一个 runtime 并摘掉它的工具归属索引（"拆除"的唯一口径，三处调用点共用） */
+  function closeRuntime(rt: McpServerRuntime): void {
+    rt.client.close()
+    globalMcpToolIndex.unindex(rt.name)
+  }
+
+  /**
+   * 登记 runtime。**插件已卸载时立刻关闭并丢弃** —— 连接是异步的，uninstall 之后才
+   * resolve 的那一个若照常 push，就既不在任何列表里、也没有人会再去关它（连接与子进程泄漏）。
+   */
+  function commitRuntime(rt: McpServerRuntime): boolean {
+    if (disposed) {
+      closeRuntime(rt)
+      return false
+    }
+    runtimes.push(rt)
+    return true
+  }
+
+  /** 记录一次连接失败（单行、截断）：`/mcp servers` 输出里带上它，否则"连不上"只剩 connected=false */
+  function noteError(name: string, err: unknown): void {
+    const raw = (err as Error)?.message ?? String(err)
+    const oneLine = raw.replace(/\s+/g, ' ').trim().slice(0, 160)
+    lastError.set(name, oneLine || '未知错误')
+  }
+
+  /**
+   * 把一条托管配置折成运行态（缺省口径的唯一出处：enabled 缺省 true、tools 缺省空表）。
+   * `cli.mcp.configure` 与 `/mcp add` 两条入口此前各写一遍。
+   */
+  function toManagedEntry(e: McpServerEntry): ManagedEntry {
+    return { entry: e, enabled: e.enabled ?? true, tools: { ...(e.tools ?? {}) } }
+  }
+
+  /**
+   * 标记一个 server「本次进程内不可用」：先取运行态工具 id 再断开，供 assemble 收敛工具池。
+   * 卸载 / 禁用 / 移除三处共用；顺带清掉上一次连接失败原因（此时下线是**有意为之**，不是故障）。
+   */
+  function markDown(name: string): void {
+    downTools.set(name, runtimeOf(name)?.tools.map((t) => t.id) ?? [])
+    lastError.delete(name)
+  }
 
   /**
    * 跨层解耦的自检：核对 runtimes 与「托管配置 + 代码注册」两个来源，
@@ -223,87 +290,116 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     for (let i = runtimes.length - 1; i >= 0; i--) {
       const rt = runtimes[i]
       if (!managed.has(rt.name) && !reg.has(rt.name)) {
-        rt.client.close()
+        closeRuntime(rt)
         runtimes.splice(i, 1)
+        serverSource.delete(rt.name)
+        downTools.delete(rt.name)
       }
     }
   }
 
-  /** 根据一个 server 配置建立运行时（不落 entries，调用方 push；建立后登记归属索引） */
-  function makeRuntime(serverName: string, cfg: McpServerConfig, entry?: McpServerEntry): Promise<McpServerRuntime | undefined> {
-    return (async () => {
-      const transport = defaultTransportFactory(cfg, { dataDir, osBinding: bindingFor(entry) })
-      const client = new McpClient(serverName, transport, cfg)
-      await client.connect()
-      const tools = await client.listTools()
-      const harnessTools = tools.map((t) => convertMcpToolToHarnessTool(t, serverName, client))
-      globalMcpToolIndex.index(serverName, harnessTools.map((t) => t.id))
-      return { name: serverName, client, tools: harnessTools, entry }
-    })()
+  /** 建连材料：传输怎么来、McpClient 用什么配置、归属与工具级开关挂在哪条条目上 */
+  interface OpenSpec {
+    name: string
+    createTransport: () => McpTransport | Promise<McpTransport>
+    config?: McpServerConfig
+    /** 托管条目：assemble 时据此做工具级过滤 */
+    entry?: McpServerEntry
+    /** 代码注册的来源插件 id（供插件卸载时定位） */
+    source?: string
   }
 
-  /** 连接一个托管条目，失败返回 false（in-flight 去重，供懒加载并发安全） */
-  const managedInflight = new Map<string, Promise<boolean>>()
-  async function connectManaged(name: string): Promise<boolean> {
-    const m = managed.get(name)
-    if (!m) return false
-    if (runtimes.some((r) => r.name === name)) return true
-    const inflight = managedInflight.get(name)
-    if (inflight) return inflight
-    const p = (async () => {
-      try {
-        const rt = await makeRuntime(name, m.entry, m.entry)
-        runtimes.push(rt!)
-        return true
-      } catch {
-        return false
-      }
-    })().finally(() => managedInflight.delete(name))
-    managedInflight.set(name, p)
+  /**
+   * 建立一条 server 连接的**唯一实现**：建传输 → connect → listTools → 转 Harness 工具 → 登记归属索引。
+   * 托管 / 代码注册两条路径此前各写一遍这五步，改一处就会与另一处分叉（差异恰好落在
+   * OS 绑定与 source 登记上，正是最容易只改一半的地方）。
+   */
+  async function openRuntime(spec: OpenSpec): Promise<McpServerRuntime> {
+    const transport = await spec.createTransport()
+    const client = new McpClient(spec.name, transport, spec.config)
+    await client.connect()
+    const listed = await client.listTools()
+    const tools = listed.map((t) => convertMcpToolToHarnessTool(t, spec.name, client))
+    globalMcpToolIndex.index(spec.name, tools.map((t) => t.id))
+    if (spec.source) serverSource.set(spec.name, spec.source)
+    return { name: spec.name, client, tools, entry: spec.entry }
+  }
+
+  /** in-flight 去重：同名并发连接共享同一个 promise（懒加载 assemble 与 /mcp enable 会撞在一起） */
+  function withInflight(
+    name: string,
+    task: () => Promise<McpServerRuntime | undefined>,
+  ): Promise<McpServerRuntime | undefined> {
+    const running = inflight.get(name)
+    if (running) return running
+    const p = task().finally(() => inflight.delete(name))
+    inflight.set(name, p)
     return p
+  }
+
+  /** 连接一个托管条目；失败返回 undefined（原因记入 lastError，不再静默） */
+  async function connectManaged(name: string): Promise<McpServerRuntime | undefined> {
+    const m = managed.get(name)
+    if (!m || disposed) return undefined
+    const existing = runtimeOf(name)
+    if (existing) return existing
+    return withInflight(name, async () => {
+      try {
+        const rt = await openRuntime({
+          name,
+          // 能力声明按条目判定：只有声明了 fs:"cwd" 且本机有绑定才把 OS 绑定套到子进程上
+          createTransport: () => defaultTransportFactory(m.entry, { dataDir, osBinding: bindingFor(m.entry) }),
+          config: m.entry,
+          entry: m.entry,
+        })
+        if (!commitRuntime(rt)) return undefined
+        lastError.delete(name)
+        return rt
+      } catch (err) {
+        noteError(name, err)
+        return undefined
+      }
+    })
   }
 
   /**
    * 连接一个「代码注册」server（当前未连接则建立运行时并登记归属索引）。
    * 与懒加载 assemble 共用，供 /mcp enable 在会话内重新启用禁用项。
    */
-  const codeInflight = new Map<string, Promise<McpServerRuntime | undefined>>()
   async function connectCodeServer(name: string): Promise<McpServerRuntime | undefined> {
     const item = reg.list().find((r) => r.name === name)
-    if (!item) return undefined
-    const existing = runtimes.find((r) => r.name === name)
+    if (!item || disposed) return undefined
+    const existing = runtimeOf(name)
     if (existing) return existing
-    const inflight = codeInflight.get(name)
-    if (inflight) return inflight
-    const p = (async () => {
-      let transport: McpTransport
-      let config: McpServerConfig | undefined
-      if ('config' in item) {
-        config = item.config
-        transport = defaultTransportFactory(item.config, { dataDir: item.dataDir ?? dataDir })
-      } else {
-        transport = await item.createTransport()
+    return withInflight(name, async () => {
+      try {
+        const rt = await openRuntime({
+          name,
+          // config 条目：用共享的 defaultTransportFactory（可带 item.dataDir 覆盖）；
+          // createTransport 条目：由注册方自己拉起（进程内 server / 自定义启动器）
+          createTransport: () =>
+            'config' in item
+              ? defaultTransportFactory(item.config, { dataDir: item.dataDir ?? dataDir })
+              : item.createTransport(),
+          config: 'config' in item ? item.config : undefined,
+          source: item.source,
+        })
+        if (!commitRuntime(rt)) return undefined
+        lastError.delete(name)
+        return rt
+      } catch (err) {
+        noteError(name, err)
+        return undefined
       }
-      const client = new McpClient(item.name, transport, config)
-      await client.connect()
-      const tools = await client.listTools()
-      const harnessTools = tools.map((t) => convertMcpToolToHarnessTool(t, item.name, client))
-      globalMcpToolIndex.index(item.name, harnessTools.map((t) => t.id))
-      if (item.source) serverSource.set(item.name, item.source)
-      const rt: McpServerRuntime = { name: item.name, client, tools: harnessTools }
-      runtimes.push(rt)
-      return rt
-    })().finally(() => codeInflight.delete(name))
-    codeInflight.set(name, p)
-    return p
+    })
   }
 
   /** 断开并移除 one server（close 客户端，并清除其工具归属索引） */
   function disconnectServer(name: string): void {
-    const i = runtimes.findIndex((r) => r.name === name)
-    if (i >= 0) {
-      runtimes[i].client.close()
-      runtimes.splice(i, 1)
+    const rt = runtimeOf(name)
+    if (rt) {
+      closeRuntime(rt)
+      runtimes.splice(runtimes.indexOf(rt), 1)
     }
     globalMcpToolIndex.unindex(name)
     serverSource.delete(name)
@@ -315,13 +411,13 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     const jobs: Promise<unknown>[] = []
     for (const item of reg.list()) {
       if (down.has(item.name)) continue
-      if (runtimes.some((r) => r.name === item.name)) continue
+      if (runtimeOf(item.name)) continue
       jobs.push(connectCodeServer(item.name).catch(() => undefined))
     }
     for (const [name, m] of managed) {
       if (!m.enabled || down.has(name)) continue
-      if (runtimes.some((r) => r.name === name)) continue
-      jobs.push(connectManaged(name).catch(() => false))
+      if (runtimeOf(name)) continue
+      jobs.push(connectManaged(name).catch(() => undefined))
     }
     if (jobs.length) await Promise.all(jobs)
   }
@@ -341,24 +437,17 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     description: 'MCP Server 注册表：启动所有注册的 MCP Server，并通过 @harness/mcp-client 连接管理',
 
     async install(ctx) {
-      // 跨层解耦：宿主插件卸载/更新时自检并清理孤儿 runtime（不反向改上层状态）
-      offs.push(
-        ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
-          if (payload.id === 'mcp.server-registry') syncRuntimesFromSources()
-        }),
-      )
-      offs.push(
-        ctx.bus.subscribe(LifecycleEvents.pluginUpdated, ({ payload }) => {
-          if (payload.id === 'mcp.server-registry') syncRuntimesFromSources()
-        }),
-      )
+      // 跨层解耦：**任何**插件卸载/更新后自检并清理孤儿 runtime（不反向改上层状态）。
+      // 注意不能只看 `payload.id === 本插件`：宿主插件（如 code-intel）先注销了注册项却没走
+      // serverSource 路线时，孤儿 runtime 只能靠这里收；只认自己等于永远不跑（注释说的才是意图）。
+      offs.push(ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, () => syncRuntimesFromSources()))
+      offs.push(ctx.bus.subscribe(LifecycleEvents.pluginUpdated, () => syncRuntimesFromSources()))
       // 宿主插件卸载：断开其注册的 MCP server，并记录待移除工具（经 assembleTools 收敛）
       offs.push(
         ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
           for (const [serverName, src] of Array.from(serverSource)) {
             if (src !== payload.id) continue
-            const rt = runtimes.find((r) => r.name === serverName)
-            downTools.set(serverName, rt ? rt.tools.map((t) => t.id) : [])
+            markDown(serverName)
             disconnectServer(serverName)
             void ctx.bus.publish(LifecycleEvents.mcpServerDisabled, { name: serverName }, { source: 'mcp.server-registry' })
           }
@@ -369,7 +458,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
         ctx.bus.subscribe(LifecycleEvents.pluginLoaded, ({ payload }) => {
           for (const item of reg.list()) {
             if (item.source !== payload.id) continue
-            if (runtimes.some((r) => r.name === item.name)) continue
+            if (runtimeOf(item.name)) continue
             downTools.delete(item.name) // 恢复装配（之前卸载时可能被 downTools 记录）
             void (async () => {
               try {
@@ -393,13 +482,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
         'cli.mcp.configure'(input: McpConfigureInput) {
           const entries = (input.mcpServers ?? []) as unknown as McpServerEntry[]
           managed.clear()
-          for (const e of entries) {
-            managed.set(e.name, {
-              entry: e,
-              enabled: e.enabled ?? true,
-              tools: { ...(e.tools ?? {}) },
-            })
-          }
+          for (const e of entries) managed.set(e.name, toManagedEntry(e))
         },
 
         async 'core.harness.start'() {
@@ -409,24 +492,21 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
         },
 
         async 'core.tool.pool.assemble'(_input, pool) {
-          const p = pool as { add: (t: unknown) => void; remove?: (id: string) => void }
           // 懒加载：装配工具前确保「启用」server 已连接（in-flight 去重，失败仅跳过）
           await ensureConnected()
           // ① 先把「已禁用」server 的工具从池中移除（收敛运行时 ToolRegistry，避免残留可调用）
-          if (p.remove) {
-            for (const [, ids] of downTools) for (const id of ids) p.remove(id)
-          }
+          //    直接走契约里的 `ToolPool`：`remove` 是**必选**方法，此前把 pool 强转成
+          //    `{ remove?: … }` 再 `if (p.remove)`，等于为一个不可能为假的条件留死分支。
+          for (const [, ids] of downTools) for (const id of ids) pool.remove(id)
           // ② 装配启用状态 server 的工具
           const down = new Set<string>(downTools.keys())
           for (const rt of runtimes) {
             if (down.has(rt.name)) continue
             // 工具级过滤：base 名 = 去掉 mcp__<server>__ 前缀；managed.tools[base]===false 时跳过
-            const prefix = `mcp__${rt.name}__`
             const m = rt.entry ? managed.get(rt.name) : undefined
             for (const tool of rt.tools) {
-              const base = tool.id.startsWith(prefix) ? tool.id.slice(prefix.length) : tool.id
-              if (m && m.tools[base] === false) continue
-              p.add(tool)
+              if (m && m.tools[mcpToolBaseName(rt.name, tool.id)] === false) continue
+              pool.add(tool)
             }
           }
         },
@@ -442,11 +522,14 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
 
         async 'cli.command'(input) {
           if (input.command !== 'mcp') return
-          // CLI 注入持久化回调（对齐 setAgentTools 模式）
-          if ((input as any).setMcpServers) {
-            cliStore = { mcpServers: (input as any).mcpServers ?? [], save: (input as any).setMcpServers }
+          // CLI 注入持久化回调（对齐 setAgentTools 模式）。契约层 `CliCommandInput` 里没有这两个
+          // 字段（MCP 条目类型住在 mcp-client，不宜让契约包反向依赖），故在**一处**窄化，
+          // 而不是在每次读取时各转一次 `any`。
+          const cmd = input as McpCommandInput
+          if (cmd.setMcpServers) {
+            cliStore = { mcpServers: cmd.mcpServers ?? [], save: cmd.setMcpServers }
           }
-          const arg = (input.arg ?? '').trim()
+          const arg = cmd.arg.trim()
           const parts = arg.split(/\s+/)
           let sub = (parts[0] ?? '').toLowerCase()
           // 兼容嵌套写法 /mcp servers enable|disable <s>：把动作提升为主子命令，
@@ -457,18 +540,24 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
           }
           const out = (s: string) => input.out(s)
 
+          /** 一个 server 的展示行（托管 / 代码注册共用；连不上时带上最近一次失败原因） */
+          const serverLine = (name: string, tag: string) => {
+            const rt = runtimeOf(name)
+            const err = rt ? undefined : lastError.get(name)
+            const head = `  ${name}  ${tag}  tools=${rt?.tools.length ?? 0}  connected=${rt?.client.isConnected ?? false}`
+            out(head + (err ? `  error="${err}"` : '') + '\n')
+          }
+
           const serverList = () => {
-            if (runtimes.length === 0 && managed.size === 0 && reg.list().length === 0) { out('（无已注册的 MCP Server）\n'); return }
-            out(`已注册 ${managed.size + reg.list().length} 个 MCP Server（` + (cliStore ? 'config.json 托管 + 代码注册' : '全部为代码注册') + `）：\n`)
-            for (const [name, m] of managed) {
-              const rt = runtimes.find((r) => r.name === name)
-              out(`  ${name}  ${m.enabled ? '[启用]' : '[禁用]'}  tools=${rt?.tools.length ?? 0}  connected=${rt?.client.isConnected ?? false}\n`)
-            }
+            // 计数按**名字去重**：同名条目同处两条来源时（托管 + 代码注册），
+            // 此前表头 `managed.size + reg.list().length` 会比实际打印的行多。
+            const total = new Set([...managed.keys(), ...reg.list().map((r) => r.name)]).size
+            if (total === 0) { out('（无已注册的 MCP Server）\n'); return }
+            out(`已注册 ${total} 个 MCP Server（` + (cliStore ? 'config.json 托管 + 代码注册' : '全部为代码注册') + `）：\n`)
+            for (const [name, m] of managed) serverLine(name, m.enabled ? '[启用]' : '[禁用]')
             for (const item of reg.list()) {
               if (managed.has(item.name)) continue
-              const rt = runtimes.find((r) => r.name === item.name)
-              const disabled = downTools.has(item.name)
-              out(`  ${item.name}  [代码注册]${disabled ? ' [会话禁用]' : ' [启用]'}  tools=${rt?.tools.length ?? 0}  connected=${rt?.client.isConnected ?? false}\n`)
+              serverLine(item.name, `[代码注册]${downTools.has(item.name) ? ' [会话禁用]' : ' [启用]'}`)
             }
           }
 
@@ -479,7 +568,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             for (const rt of runtimes) {
               const m = managed.get(rt.name)
               for (const t of rt.tools) {
-                const base = t.id.startsWith(`mcp__${rt.name}__`) ? t.id.slice(`mcp__${rt.name}__`.length) : t.id
+                const base = mcpToolBaseName(rt.name, t.id)
                 toolList.push({ id: t.id, desc: t.description, server: rt.name, disabled: m ? m.tools[base] === false : undefined })
               }
             }
@@ -499,13 +588,15 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             if (isOn) {
               downTools.delete(name)
               if (m) { m.enabled = true; persist() }
-              const ok = m ? await connectManaged(name) : await connectCodeServer(name)
-              out(ok ? (m ? `已启用并连接 ${name}\n` : `已启用并重新连接 ${name}（本次进程生效）\n`) : `启用失败（未能连接 ${name}）\n`)
+              const rt = m ? await connectManaged(name) : await connectCodeServer(name)
+              const why = lastError.get(name)
+              out(rt
+                ? (m ? `已启用并连接 ${name}\n` : `已启用并重新连接 ${name}（本次进程生效）\n`)
+                : `启用失败（未能连接 ${name}${why ? `：${why}` : ''}）\n`)
               await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
             } else {
               // 记录待移除的工具 id（先从运行态取，再断开连接），供 core.tool.pool.assemble 收敛注册表
-              const rt = runtimes.find((r) => r.name === name)
-              downTools.set(name, rt ? rt.tools.map((t) => t.id) : [])
+              markDown(name)
               if (m) { m.enabled = false; persist() }
               disconnectServer(name)
               out(`已禁用 ${name}${m ? '' : '（本次进程生效；重启后恢复连接）'}\n`)
@@ -516,10 +607,17 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             try {
               const e = JSON.parse(json) as McpServerEntry
               if (!e?.name) { out('add 需要 JSON 含 name 字段\n'); return }
-              managed.set(e.name, { entry: e, enabled: e.enabled ?? true, tools: { ...(e.tools ?? {}) } })
+              const added = toManagedEntry(e)
+              managed.set(e.name, added)
               persist()
-              const ok = managed.get(e.name)!.enabled ? await connectManaged(e.name) : true
-              out(ok ? `已添加并连接 ${e.name}\n` : `已添加但仍需连接（config 有误？）${e.name}\n`)
+              // 禁用状态下不连接（此前会打印"已添加并连接"，与实际不符）
+              if (!added.enabled) {
+                out(`已添加 ${e.name}（enabled=false，当前不连接）\n`)
+              } else {
+                const rt = await connectManaged(e.name)
+                const why = lastError.get(e.name)
+                out(rt ? `已添加并连接 ${e.name}\n` : `已添加但连接失败：${why ?? '未知原因'}\n`)
+              }
               await ctx.bus.publish(LifecycleEvents.mcpServerAdded, { name: e.name }, { source: 'mcp.server-registry' })
             } catch (err) {
               out(`JSON 解析失败：${(err as Error)?.message ?? String(err)}\n用法：/mcp add <json>（含 name; 可再 -- 前缀）\n`)
@@ -528,8 +626,7 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             const name = parts[1]
             if (!name) { out('用法：/mcp remove <server>\n'); return }
             if (!managed.has(name)) { out(`未知托管 server："${name}"\n`); return }
-            const rt = runtimes.find((r) => r.name === name)
-            downTools.set(name, rt ? rt.tools.map((t) => t.id) : []) // 移除后从工具池收敛
+            markDown(name) // 移除后从工具池收敛
             managed.delete(name)
             disconnectServer(name)
             persist()
@@ -544,15 +641,18 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     },
 
     async uninstall() {
+      // 先置位再拆除：in-flight 的连接在 await 返回后才会看到这个标志，
+      // 否则它会照常 push 进已清空的 runtimes —— 没人再关它（连接与子进程泄漏）。
+      disposed = true
       for (const off of offs) off()
       offs.length = 0
-      for (const rt of runtimes) {
-        rt.client.close()
-        globalMcpToolIndex.unindex(rt.name)
-      }
+      for (const rt of runtimes) closeRuntime(rt)
       runtimes.length = 0
       managed.clear()
       downTools.clear()
+      serverSource.clear()
+      lastError.clear()
+      inflight.clear()
       cliStore = undefined
     },
   }
