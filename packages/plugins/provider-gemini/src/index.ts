@@ -18,8 +18,12 @@
  * - 可配置：apiKey / baseUrl / defaultModel / maxTokens / timeoutMs
  *
  * API 端点：
- * - 非流式：POST /v1beta/models/{model}:generateContent?key={apiKey}
- * - 流式：POST /v1beta/models/{model}:streamGenerateContent?alt=sse&key={apiKey}
+ * - 非流式：POST /v1beta/models/{model}:generateContent
+ * - 流式：POST /v1beta/models/{model}:streamGenerateContent?alt=sse
+ *
+ * 认证：默认走 `x-goog-api-key` **请求头**。旧实现同时把 key 塞进 URL 查询参数，
+ * 于是同一个秘密有两个载体 —— URL 会进代理日志、错误上报与调试输出（`?key=...`
+ * 原文可读）。确实只认查询参数的第三方网关可显式开 `apiKeyInQuery: true` 退回旧形态。
  *
  * 配置来源（优先级从高到低）：
  * 1. createProviderGeminiPlugin({ ... }) 直接传入配置
@@ -32,10 +36,7 @@ import { normalizeFinishReason } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message, Part } from '@harness/session'
 import type { Tool } from '@harness/tool'
-
-// 流式总时长兜底系数：空闲超时负责「卡住不吐数据」，总时长兜底负责「一直慢慢吐、永不结束」。
-// 取 idle 的 10 倍作为宽松上限，正常请求不会触及。
-const STREAM_TOTAL_TIMEOUT_FACTOR = 10
+import { RequestDeadline, SseDecoder, STREAM_TOTAL_TIMEOUT_FACTOR, type SseFrame } from '@harness/provider-kit'
 
 /**
  * 非流式 `complete()` 的总时长系数，与流式的 `STREAM_TOTAL_TIMEOUT_FACTOR` 对齐。
@@ -84,6 +85,13 @@ export interface GeminiProviderConfig {
    * 由 `providerTypeFactory.createPlugin` 从 `ProviderConfig.id` 透传（唯一权威来源）。
    */
   providerId?: string
+  /**
+   * 是否把 API Key 放在 URL 查询参数（`?key=`）而不是请求头（默认 `false`）。
+   *
+   * 保持默认 `false`：查询参数会让 key 以明文进入代理日志、`fetch` 调试输出与错误上报。
+   * 仅当对接的第三方网关**只认** `?key=` 时才打开（此时仍会同时带请求头，交由网关择一）。
+   */
+  apiKeyInQuery?: boolean
 }
 
 // ===== Gemini API 类型（精简子集）=====
@@ -304,7 +312,7 @@ export class GeminiChatProvider implements ChatProvider {
   private readonly config: Required<
     Pick<
       GeminiProviderConfig,
-      'baseUrl' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'completeTimeoutFactor' | 'strictEmptyContent'
+      'baseUrl' | 'defaultModel' | 'maxTokens' | 'timeoutMs' | 'completeTimeoutFactor' | 'strictEmptyContent' | 'apiKeyInQuery'
     >
   > & { apiKey?: string }
 
@@ -326,6 +334,7 @@ export class GeminiChatProvider implements ChatProvider {
       timeoutMs: config.timeoutMs ?? 120_000,
       completeTimeoutFactor: config.completeTimeoutFactor ?? COMPLETE_TIMEOUT_FACTOR_ALIGN,
       strictEmptyContent: config.strictEmptyContent ?? false,
+      apiKeyInQuery: config.apiKeyInQuery ?? false,
     }
   }
 
@@ -390,10 +399,15 @@ export class GeminiChatProvider implements ChatProvider {
   private buildUrl(model: string, stream: boolean): string {
     const base = this.config.baseUrl.replace(/\/$/, '')
     const action = stream ? 'streamGenerateContent' : 'generateContent'
-    // 使用查询参数 key 作为认证（Gemini 两种方式都支持，查询参数最通用）
-    const keyParam = this.config.apiKey ? `?key=${encodeURIComponent(this.config.apiKey)}` : ''
-    const streamParam = stream ? (this.config.apiKey ? '&alt=sse' : '?alt=sse') : ''
-    return `${base}/v1beta/models/${encodeURIComponent(model)}:${action}${keyParam}${streamParam}`
+    const query: string[] = []
+    // 默认只走请求头（见 apiKeyInQuery 的说明）；这里是给「只认 ?key= 的网关」的显式退路
+    if (this.config.apiKey && this.config.apiKeyInQuery) {
+      query.push(`key=${encodeURIComponent(this.config.apiKey)}`)
+    }
+    // alt=sse 只对流式有意义：缺了它 Gemini 返回的是 JSON 数组分块而不是 SSE 帧
+    if (stream) query.push('alt=sse')
+    const qs = query.length > 0 ? `?${query.join('&')}` : ''
+    return `${base}/v1beta/models/${encodeURIComponent(model)}:${action}${qs}`
   }
 
   // -------- ChatProvider.complete --------
@@ -420,18 +434,12 @@ export class GeminiChatProvider implements ChatProvider {
     }
     this.calls.push(record)
 
-    const inner = new AbortController()
-    const outerSignal = params.signal
-    const onOuter = () => inner.abort()
-    if (outerSignal) {
-      if (outerSignal.aborted) inner.abort()
-      else outerSignal.addEventListener('abort', onOuter, { once: true })
-    }
+    const deadline = new RequestDeadline(params.signal)
     // 非流式的计时器是**总时长**，不是 idle ⇒ 与流式的总时长兜底取同一系数（见 completeTimeoutFactor）
     const completeTimeoutMs = this.config.timeoutMs * this.config.completeTimeoutFactor
-    const timer = setTimeout(
-      () => inner.abort(new Error(`Gemini 请求超时（>${completeTimeoutMs}ms = timeoutMs ${this.config.timeoutMs}ms × ${this.config.completeTimeoutFactor}）`)),
+    deadline.armTotal(
       completeTimeoutMs,
+      `Gemini 请求超时（>${completeTimeoutMs}ms = timeoutMs ${this.config.timeoutMs}ms × ${this.config.completeTimeoutFactor}）`,
     )
 
     try {
@@ -450,7 +458,7 @@ export class GeminiChatProvider implements ChatProvider {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal: inner.signal,
+        signal: deadline.signal,
       })
 
       const text = await resp.text()
@@ -511,8 +519,7 @@ export class GeminiChatProvider implements ChatProvider {
         raw: parsed,
       }
     } finally {
-      clearTimeout(timer)
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
+      deadline.dispose()
     }
   }
 
@@ -556,35 +563,22 @@ export class GeminiChatProvider implements ChatProvider {
       Accept: 'text/event-stream',
     })
 
-    const inner = new AbortController()
-    const outerSignal = params.signal
-    const onOuter = () => inner.abort()
-    if (outerSignal) {
-      if (outerSignal.aborted) inner.abort()
-      else outerSignal.addEventListener('abort', onOuter, { once: true })
-    }
+    const deadline = new RequestDeadline(params.signal)
     // 空闲超时（idle），**不是**总时长超时：每收到一块数据就重新计时。
     // 总时长语义下，只要模型持续输出超过 timeoutMs 就会把长回答无理由掐断，
     // 用户看到的是「内容明明已经渲染出来了，却报发送失败」。判定结束的职责
     // 交给 `candidate.finishReason`，见下方 readLoop。
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const armIdleTimeout = () => {
-      if (timer) clearTimeout(timer)
-      timer = setTimeout(
-        () => inner.abort(new Error(`Gemini stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`)),
+    const armIdleTimeout = () =>
+      deadline.armIdle(
         this.config.timeoutMs,
+        `Gemini stream 空闲超时（>${this.config.timeoutMs}ms 无数据）`,
       )
-    }
     armIdleTimeout()
 
     // 总时长兜底：即使上游持续慢速吐数据（每次间隔 < timeoutMs，idle 计时器永远被续期），
     // 一旦累计超过总时长上限也必须结束，否则请求会永远挂住。该计时器**不**随数据续期。
     const totalMs = this.config.timeoutMs * STREAM_TOTAL_TIMEOUT_FACTOR
-    let totalTimer: ReturnType<typeof setTimeout> | undefined
-    totalTimer = setTimeout(
-      () => inner.abort(new Error(`Gemini stream 总时长超时（>${totalMs}ms）`)),
-      totalMs,
-    )
+    deadline.armTotal(totalMs, `Gemini stream 总时长超时（>${totalMs}ms）`)
 
     try {
       const url = this.buildUrl(model, true)
@@ -592,7 +586,7 @@ export class GeminiChatProvider implements ChatProvider {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal: inner.signal,
+        signal: deadline.signal,
       })
 
       if (!resp.ok) {
@@ -608,12 +602,10 @@ export class GeminiChatProvider implements ChatProvider {
       const reader = resp.body?.getReader()
       if (!reader) throw new Error('Response body 不可读（stream not supported）')
 
-      const decoder = new TextDecoder()
-      let buf = ''
-      let modelOut: string | undefined
+      const textDecoder = new TextDecoder()
+      // 分帧交给 @harness/provider-kit：CRLF / 多行 data / 事件被 TCP 切半都在那里统一处理
+      const sse = new SseDecoder()
       let tokenUsage: { input: number; output: number; total?: number; cacheRead?: number } | undefined
-      // functionCall 在 stream 中可能跨 chunk，用 id 累积
-      const pendingToolCalls: Map<string, { id: string; name: string; args: unknown }> = new Map()
       // 是否已看到 candidate.finishReason（= 模型生成已结束）
       let sawFinishReason = false
       // 原生 finishReason（大写，如 STOP / MAX_TOKENS / SAFETY / MALFORMED_FUNCTION_CALL）
@@ -649,91 +641,93 @@ export class GeminiChatProvider implements ChatProvider {
         }
       }
 
-      readLoop: while (true) {
-        const next = sawFinishReason ? await readOrDrain() : await reader.read()
-        if (next === 'drain' || next.done) break
-        armIdleTimeout() // 有数据到达 → 重新计时（idle 语义，持续输出不会被掐断）
-        buf += decoder.decode(next.value, { stream: true })
+      /**
+       * 把一批 SSE 帧翻译成 ChatStreamChunk。
+       *
+       * 抽成局部生成器（而不是内联在 readLoop 里）的理由：`SseDecoder.push()`（读到的数据）
+       * 与 `SseDecoder.flush()`（流结束时残留的末帧）**必须走同一套解析**，否则末帧的
+       * usageMetadata 会在 flush 这条更少被走到的路径上被漏掉。
+       */
+      function* emitFrames(frames: SseFrame[]): Generator<ChatStreamChunk, void, unknown> {
+        for (const frame of frames) {
+          const data = frame.data.trim()
+          if (!data) continue
 
-        // SSE 按双换行分块
-        const parts = buf.split('\n\n')
-        buf = parts.pop() ?? ''
+          let json: GeminiResponseBody & { error?: { message: string } }
+          try {
+            json = JSON.parse(data)
+          } catch {
+            // 单帧坏掉不该带走整条流（旧实现在这里 continue，保持一致）
+            continue
+          }
 
-        for (const part of parts) {
-          const lines = part.split('\n')
-          for (const line of lines) {
-            if (!line.startsWith('data: ')) continue
-            const data = line.slice(6).trim()
-            if (!data) continue
+          if (json.error) {
+            throw new Error(`Gemini stream error: ${json.error.message ?? JSON.stringify(json)}`)
+          }
 
-            let json: GeminiResponseBody & { error?: { message: string } }
-            try {
-              json = JSON.parse(data)
-            } catch {
-              continue
+          // usageMetadata 可能在最后一个 chunk，也**可能单独一帧、不带 candidates**
+          // （部分网关/代理仿 OpenAI 的 include_usage 行为）。必须在 `!candidate` 分支
+          // 之前解析，否则这一帧会被整个跳过、token 统计直接丢失。
+          if (json.usageMetadata) {
+            tokenUsage = {
+              input: json.usageMetadata.promptTokenCount ?? 0,
+              output: json.usageMetadata.candidatesTokenCount ?? 0,
+              total: json.usageMetadata.totalTokenCount,
+              ...(json.usageMetadata.cachedContentTokenCount != null ? { cacheRead: json.usageMetadata.cachedContentTokenCount } : {}),
             }
+          }
 
-            if (json.error) {
-              throw new Error(`Gemini stream error: ${json.error.message ?? JSON.stringify(json)}`)
-            }
+          const candidate = json.candidates?.[0]
+          if (!candidate) continue
+          // finishReason 出现即代表生成结束（STOP / MAX_TOKENS / SAFETY…）
+          if (candidate.finishReason) {
+            sawFinishReason = true
+            finishRaw = candidate.finishReason
+          }
 
-            // usageMetadata 可能在最后一个 chunk，也**可能单独一帧、不带 candidates**
-            // （部分网关/代理仿 OpenAI 的 include_usage 行为）。必须在 `!candidate` 分支
-            // 之前解析，否则这一帧会被整个跳过、token 统计直接丢失。
-            if (json.usageMetadata) {
-              tokenUsage = {
-                input: json.usageMetadata.promptTokenCount ?? 0,
-                output: json.usageMetadata.candidatesTokenCount ?? 0,
-                total: json.usageMetadata.totalTokenCount,
-                ...(json.usageMetadata.cachedContentTokenCount != null ? { cacheRead: json.usageMetadata.cachedContentTokenCount } : {}),
+          for (const p of candidate.content.parts) {
+            if ('text' in p && p.text) {
+              yield { type: 'text_delta', text: p.text }
+            } else if ('functionCall' in p) {
+              const fc = (p as { functionCall: { name: string; args: unknown; id?: string } })
+                .functionCall
+              const id = fc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`
+              yield {
+                type: 'tool_use_start',
+                toolUseId: id,
+                toolId: fc.name,
               }
-            }
-
-            const candidate = json.candidates?.[0]
-            if (!candidate) continue
-            // finishReason 出现即代表生成结束（STOP / MAX_TOKENS / SAFETY…）
-            if (candidate.finishReason) {
-              sawFinishReason = true
-              finishRaw = candidate.finishReason
-            }
-
-            for (const p of candidate.content.parts) {
-              if ('text' in p && p.text) {
-                yield { type: 'text_delta', text: p.text }
-              } else if ('functionCall' in p) {
-                const fc = (p as { functionCall: { name: string; args: unknown; id?: string } })
-                  .functionCall
-                const id = fc.id ?? `call_${Math.random().toString(36).slice(2, 10)}`
-                yield {
-                  type: 'tool_use_start',
-                  toolUseId: id,
-                  toolId: fc.name,
-                }
-                // Gemini functionCall.args 是完整对象，一次性 yield
-                const argsStr = JSON.stringify(fc.args ?? {})
-                yield { type: 'tool_use_delta', inputDelta: argsStr }
-                yield { type: 'tool_use_stop', toolUseId: id }
-                pendingToolCalls.set(id, { id, name: fc.name, args: fc.args })
-              }
+              // Gemini functionCall.args 是完整对象，一次性 yield
+              const argsStr = JSON.stringify(fc.args ?? {})
+              yield { type: 'tool_use_delta', inputDelta: argsStr }
+              yield { type: 'tool_use_stop', toolUseId: id }
             }
           }
         }
       }
+
+      readLoop: while (true) {
+        const next = sawFinishReason ? await readOrDrain() : await reader.read()
+        if (next === 'drain' || next.done) break
+        armIdleTimeout() // 有数据到达 → 重新计时（idle 语义，持续输出不会被掐断）
+        yield* emitFrames(sse.push(textDecoder.decode(next.value, { stream: true })))
+      }
+      // 上游末帧没有尾随空行时（自建网关「发完就关」）也要交出：最后一帧常常正是
+      // usageMetadata / finishReason 那一帧，丢了它 token 统计与结束原因都会缺
+      yield* emitFrames(sse.flush())
 
       // 提前 break 时主动释放连接（服务端不关连接 → 不 cancel 会让连接滞留在池里）
       try { await reader.cancel() } catch {}
 
       yield {
         type: 'done',
-        model: modelOut ?? model,
+        model,
         tokenUsage,
         finish: normalizeFinishReason(finishRaw),
         ...(finishRaw ? { finishRaw } : {}),
       }
     } finally {
-      if (timer) clearTimeout(timer)
-      if (totalTimer) clearTimeout(totalTimer)
-      if (outerSignal) outerSignal.removeEventListener('abort', onOuter)
+      deadline.dispose()
     }
   }
 }
@@ -834,5 +828,7 @@ export const providerTypeFactory: ProviderTypeFactory = {
         : undefined,
       // 装配实例键：ProviderConfig.id 是唯一权威来源（缺省时退回 'gemini'）
       providerId: config.id,
+      // 凭据载体退路：ProviderConfig 有 index signature，不在这里透传就等于「配了没人消费」
+      apiKeyInQuery: config.apiKeyInQuery === true ? true : undefined,
     }),
 }

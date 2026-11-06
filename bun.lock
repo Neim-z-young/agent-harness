@@ -25,6 +25,7 @@
         "@harness/provider-anthropic": "workspace:*",
         "@harness/provider-gemini": "workspace:*",
         "@harness/provider-glm": "workspace:*",
+        "@harness/provider-kit": "workspace:*",
         "@harness/provider-mock": "workspace:*",
         "@harness/provider-openai": "workspace:*",
         "@harness/provider-qwen": "workspace:*",
@@ -364,6 +365,7 @@
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/plugin": "workspace:*",
+        "@harness/provider-kit": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -375,6 +377,7 @@
         "@harness/bus": "workspace:*",
         "@harness/core": "workspace:*",
         "@harness/plugin": "workspace:*",
+        "@harness/provider-kit": "workspace:*",
         "@harness/session": "workspace:*",
         "@harness/tool": "workspace:*",
       },
@@ -390,6 +393,10 @@
         "@harness/session": "workspace:*",
         "@harness/tool": "workspace:*",
       },
+    },
+    "packages/plugins/provider-kit": {
+      "name": "@harness/provider-kit",
+      "version": "0.1.0",
     },
     "packages/plugins/provider-mock": {
       "name": "@harness/provider-mock",
@@ -664,6 +671,8 @@
     "@harness/provider-gemini": ["@harness/provider-gemini@workspace:packages/plugins/provider-gemini"],
 
     "@harness/provider-glm": ["@harness/provider-glm@workspace:packages/plugins/provider-glm"],
+
+    "@harness/provider-kit": ["@harness/provider-kit@workspace:packages/plugins/provider-kit"],
 
     "@harness/provider-mock": ["@harness/provider-mock@workspace:packages/plugins/provider-mock"],
 
