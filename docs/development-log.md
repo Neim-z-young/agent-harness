@@ -1,5 +1,33 @@
 # Agent Harness 开发日志
 
+## 2026-11-06（续 291）七条 refactor 分支盘点并合入 main（检查未发现需修的问题）
+
+盘点：7 条 `refactor/auto-*` 分支（10-31 ~ 11-06）**全部基于同一 base `728aafb`（= 当时 main）**，
+各自改动文件几乎不重叠，故按日期顺序逐个 `--no-ff` 合入；连两处都改到的 `bun.lock`
+（11-03 加 provider-kit、11-05 给 snapshot 加依赖）也被 git 自动合并，无冲突文件。
+`codex/*` 那 6 条是早期功能分支（历史快照），不属本次「重构分支」范围，未动。
+
+| 分支 | 内容 |
+|---|---|
+| 10-31 | bench：收敛跑分口径、修 pass^k 采样不足漏洞（+3 个测试文件） |
+| 11-01 | computer-use：抽 AppleScript 纯逻辑层、修四处静默错误，补 71 条用例 |
+| 11-02 | provider-openai/glm/qwen：抽出预设装配层，三份克隆收成一份 |
+| 11-03 | 新增 `@harness/provider-kit`（共享 SSE 分帧 + 请求时限桥），anthropic / gemini 接入；修 CRLF 与坏帧、凭据改走请求头 |
+| 11-04 | plugin：加载/卸载状态机收成原子操作、修 hotReload 丢 spec；三级加载共用批内校验，失败留痕并区分降级/事故 |
+| 11-05 | snapshot：错误标签统一到 runOp、路径边界收敛到 fs-guard，补二进制 diff / 符号链接越界 / `..foo` 假阳性用例 |
+| 11-06 | code-intel：路径边界与错误收口单一来源、修 CRLF 整行圈选失效；README「默认关闭」措辞精确化（续 290） |
+
+**检查结论：未发现需要修的问题**（如实记录，不编造修复）。关键判据：
+- `bun install --frozen-lockfile` rc=0 ⇒ 自动合并后的锁文件与 package.json 仍一致（CI 就是这条判据）；
+- 新包 `@harness/provider-kit` 四处登记齐全（根 `package.json` / 根 `tsconfig.json` paths /
+  依赖方 package.json / node_modules symlink），包数 48 → **49**；
+- 分支间无同文件竞争：11-02 动 openai/glm/qwen，11-03 动 anthropic/gemini + 新增 kit，互补不叠。
+
+验证（合并后的最终状态，一次做完）：
+`bun run typecheck` 49 包 **0 error**；`bun run test` **3361 pass / 0 fail**（49 包 exit 0，
+原 3183 → +178 条用例）；`bun run build` **49/49 exit 0**；`adapters/vscode` 自口径
+typecheck 0 error / **276 pass**。
+
 ## 2026-11-06（续 290）README：把「所有扩展点默认关闭」改成精确措辞 + 补「如何查看当前启用的能力」
 
 起因：仓库已公开，README 特性亮点里「**所有扩展点默认关闭**」与实现不符 —— 代码里是三级：
