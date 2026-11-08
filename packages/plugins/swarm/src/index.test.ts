@@ -563,6 +563,22 @@ describe('权限 mailbox fallback', () => {
     const decision = await requestSwarmPermission({ from: 'bob', toolName: 'bash' })
     expect(decision).toEqual({ allow: false })
   })
+
+  it('写请求失败 ⇒ 撤销挂起回调（不留永远等不到响应的条目）', async () => {
+    unregisterLeaderConfirmQueue()
+    const dir = await makeDir('swarm-perm-fail-')
+    const mb = new TeammateMailbox(dir)
+    // 把 leader 的 inbox 落点做成**目录** ⇒ writeFile 抛 EISDIR（锁本身照常拿到）
+    await mkdir(path.join(dir, 'alpha', 'inboxes', 'lead.json'), { recursive: true })
+    expect(hasPendingPermissionCallback()).toBe(false)
+
+    await expect(
+      requestSwarmPermission({ from: 'bob', toolName: 'bash', mailbox: mb, team: 'alpha', leaderName: 'lead' }),
+    ).rejects.toThrow()
+
+    // 发送失败必须收回挂起项：否则 hasPending*() 从此恒真，闭包活到进程结束
+    expect(hasPendingPermissionCallback()).toBe(false)
+  })
 })
 
 // ===== plan approval + permissionMode 继承 =====
@@ -618,6 +634,19 @@ describe('plan approval', () => {
     expect(handled).toBe(false)
     expect(await mb.countUnread('alpha', 'bob')).toBe(0)
   })
+
+  it('写请求失败 ⇒ 撤销挂起的 plan 审批回调', async () => {
+    const dir = await makeDir('swarm-plan-fail-')
+    const mb = new TeammateMailbox(dir)
+    await mkdir(path.join(dir, 'alpha', 'inboxes', 'lead.json'), { recursive: true })
+    expect(hasPendingPlanApproval()).toBe(false)
+
+    await expect(
+      requestPlanApproval({ from: 'bob', to: 'lead', plan: '重构 A', mailbox: mb, team: 'alpha' }),
+    ).rejects.toThrow()
+
+    expect(hasPendingPlanApproval()).toBe(false)
+  })
 })
 
 // ===== InboxPoller =====
@@ -663,6 +692,50 @@ describe('InboxPoller', () => {
     await poller.pollOnce()
     expect(attempts).toBe(2)
     expect(await mb.countUnread('alpha', 'bob')).toBe(0) // 成功后标记已读
+    poller.stop()
+  })
+
+  it('pollOnce 重叠：上一轮还在 onMessage 里时，并发轮询直接跳过（不重复投递）', async () => {
+    const dir = await makeDir('swarm-poll-overlap-')
+    // 计数 inbox 读取次数：没有重叠守卫时第二轮会再读一遍（标记已读发生在 onMessage 之后，
+    // 所以那时消息仍是未读），于是同一条消息被投递两次。
+    class CountingMailbox extends TeammateMailbox {
+      reads = 0
+      override async readUnreadMessages(team: string, agent: string): Promise<MailboxMessage[]> {
+        this.reads++
+        return super.readUnreadMessages(team, agent)
+      }
+    }
+    const mb = new CountingMailbox(dir)
+    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: 'slow', timestamp: 't1', type: 'message' })
+
+    let release: () => void = () => {}
+    const gate = new Promise<void>((r) => { release = r })
+    let entered: () => void = () => {}
+    const inOnMessage = new Promise<void>((r) => { entered = r })
+    const received: string[] = []
+
+    const poller = attachInboxPoller({
+      mailbox: mb, team: 'alpha', agent: 'bob', intervalMs: 0,
+      onMessage: async (msg) => { received.push(msg.text); entered(); await gate },
+    })
+
+    const first = poller.pollOnce()
+    await inOnMessage // 第一轮已进入 onMessage（消息尚未标记已读）
+    expect(mb.reads).toBe(1)
+
+    const second = poller.pollOnce()
+    let secondSettled = false
+    void second.then(() => { secondSettled = true })
+    await Promise.race([second, new Promise((r) => setTimeout(r, 200))])
+
+    expect(secondSettled).toBe(true) // 守卫让第二轮立即返回
+    expect(mb.reads).toBe(1) // 且没有再读一次 inbox
+    expect(received).toEqual(['slow']) // 同一条消息只投递一次
+
+    release()
+    await first
+    expect(await mb.countUnread('alpha', 'bob')).toBe(0)
     poller.stop()
   })
 })
@@ -923,6 +996,24 @@ describe('spawnInProcessTeammate + startTeammateLoop', () => {
     // 初始 prompt 执行了一轮
     expect(queries).toHaveLength(1)
     expect(queries[0]!.message).toBe('初始任务')
+  })
+
+  it('团队已存在时两条 spawn 路径都复用（不重建、不抛 Team already exists）', async () => {
+    const dir = await makeDir('swarm-reuse-')
+    const mgr = new TeamManager(dir)
+    const { harness } = makeMockHarness()
+    const registry = new TeammateRegistry()
+    // 团队先由 alice 建好（lead=alice，session 已知）
+    await mgr.create({ name: 'alpha', leadAgentId: 'alice', leadSessionId: 's_alice' })
+
+    await spawnInProcessTeammate({ harness, teamManager: mgr, team: 'alpha', name: 'bob', agentId: 'researcher', registry })
+    await spawnTerminalTeammate({ teamManager: mgr, team: 'alpha', name: 'carol', agentId: 'researcher', options: { run: async () => '' } })
+
+    const team = await mgr.get('alpha')
+    // 已有团队必须原样复用：lead 不被后继 spawn 覆盖，成员逐个追加
+    expect(team!.leadAgentId).toBe('alice')
+    expect(team!.leadSessionId).toBe('s_alice')
+    expect(team!.members.map((m) => m.name)).toEqual(['lead', 'bob', 'carol'])
   })
 
   it('startTeammateLoop：自动认领任务并完成，stop 停止', async () => {
@@ -1224,6 +1315,23 @@ describe('Swarm 工具', () => {
     expect((await claim.call({} as any, makeCtx())).error!.code).toBe('TEAM_REQUIRED')
     expect((await update.call({} as any, makeCtx())).error!.code).toBe('TEAM_REQUIRED')
     expect((await stop.call({} as any, makeCtx())).error!.code).toBe('TEAM_REQUIRED')
+  })
+
+  it('纯空白的 team 也算缺失：工具层与平面层同一判据、同一文案', async () => {
+    const dir = await makeDir('swarm-tool-')
+    const plane = new TaskListPlane(dir)
+    // 工具层：返回结构化错误（不是抛错、不是静默空数组）
+    const res = await createTaskListTool(() => plane).call({ team: '   ' } as any, makeCtx())
+    expect(res.ok).toBe(false)
+    expect(res.error!.code).toBe('TEAM_REQUIRED')
+    // 平面层：同一条入参抛 SwarmError，且**文案与工具层逐字相同**（用户不该听到两种说法）
+    let caught: unknown
+    try {
+      await plane.list('   ')
+    } catch (err) {
+      caught = err
+    }
+    expect((caught as Error).message).toContain(res.error!.message)
   })
 })
 
