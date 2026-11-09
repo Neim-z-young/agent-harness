@@ -241,9 +241,13 @@ describe('createMcpServerRegistryPlugin', () => {
     expect(pool.list().map((t: any) => t.id)).toContain('mcp__code-intel__code_symbols')
 
     // 插件卸载 → server 断开 + 工具从工具池收敛
+    // ★ 必须复刻生产时序：manage-plugin 先跑 uninstall()（code-intel 注销注册项）
+    //   再 publish pluginUnloaded。少了这步，无条件 sync 不会抢跑，回归测不出来。
+    reg.unregister('code-intel')
     await bus.publish(LifecycleEvents.pluginUnloaded, { id: 'code-intel' })
     await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
     expect(pool.list()).toHaveLength(0)
+    expect(bus.emitted.some((e) => e.name === LifecycleEvents.mcpServerDisabled.name)).toBe(true)
 
     // 插件重载 → 重新注册并重连，工具恢复
     reg.register({ name: 'code-intel', createTransport: () => transport, source: 'code-intel' })
@@ -327,9 +331,12 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     expect(bus.emitted).toContainEqual({ name: 'mcp.server.disabled', payload: { name: 'alpha' } })
 
     const out2: string[] = []
-    // enable 依赖连接管理 server；这里 force 一次 enable（无真实连接，会失败但事件仍发）
+    // ★ 旧断言写的是「无真实连接，会失败但事件仍发」—— 那是把 bug 当契约：
+    //   连不上还广播 mcp.server.enabled，会让遥测记下一条根本没启用的假事件。
+    //   现在要求：失败路径输出原因、且**不发** enabled。
     await hooks!['cli.command']!(mkCfg('enable alpha', (s: string) => out2.push(s)))
-    expect(bus.emitted).toContainEqual({ name: 'mcp.server.enabled', payload: { name: 'alpha' } })
+    expect(out2.join('')).toContain('启用失败')
+    expect(bus.emitted.some((e) => e.name === 'mcp.server.enabled')).toBe(false)
 
     const out3: string[] = []
     await hooks!['cli.command']!(mkCfg('add -- {"name":"beta","transport":"http","url":"http://x/b","enabled":false}', (s: string) => out3.push(s)))
@@ -338,6 +345,21 @@ describe('createMcpServerRegistryPlugin config 化管理（config.json mcpServer
     const out4: string[] = []
     await hooks!['cli.command']!(mkCfg('remove beta', (s: string) => out4.push(s)))
     expect(bus.emitted).toContainEqual({ name: 'mcp.server.removed', payload: { name: 'beta' } })
+    await plugin.uninstall?.()
+  })
+
+  test('★ /mcp enable 连上了才发 enabled（成功路径的正向契约）', async () => {
+    const reg = createMcpServerRegistry()
+    const { transport } = createFakeTransport([{ name: 'ping' }])
+    reg.register({ name: 'gamma', createTransport: () => transport })
+    const bus = makeBus()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = (await plugin.install({ log: mockLog, bus } as unknown as PluginContext)) as any
+
+    const out: string[] = []
+    await hooks['cli.command']!(mkInput({ arg: 'enable gamma', out: (s: string) => out.push(s) }))
+    expect(out.join('')).toContain('已启用并重新连接')
+    expect(bus.emitted).toContainEqual({ name: 'mcp.server.enabled', payload: { name: 'gamma' } })
     await plugin.uninstall?.()
   })
 
@@ -461,6 +483,19 @@ describe('连接生命周期与可诊断性', () => {
     expect(closed()).toBe(1)
     // 工具归属索引也要摘掉 —— 否则 /tools 里还挂着已死 server 的工具
     expect(globalMcpToolIndex.serverOf('mcp__ghost__t')).toBeUndefined()
+    await plugin.uninstall?.()
+  })
+
+  test('★建连失败也要关 transport（stdio 子进程不泄漏）', async () => {
+    const { reg, transport, closed } = setup()
+    // send 同步抛错 ⇒ connect() 失败；openRuntime 的 catch 必须关掉这个 transport
+    const broken: McpTransport = { ...transport, send: () => { throw new Error('boom') } }
+    reg.register({ name: 'broken', createTransport: () => broken })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, fakePool())
+    expect(closed()).toBeGreaterThan(0)
     await plugin.uninstall?.()
   })
 

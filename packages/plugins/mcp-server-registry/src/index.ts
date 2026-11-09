@@ -317,12 +317,21 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
   async function openRuntime(spec: OpenSpec): Promise<McpServerRuntime> {
     const transport = await spec.createTransport()
     const client = new McpClient(spec.name, transport, spec.config)
-    await client.connect()
-    const listed = await client.listTools()
-    const tools = listed.map((t) => convertMcpToolToHarnessTool(t, spec.name, client))
-    globalMcpToolIndex.index(spec.name, tools.map((t) => t.id))
-    if (spec.source) serverSource.set(spec.name, spec.source)
-    return { name: spec.name, client, tools, entry: spec.entry }
+    try {
+      await client.connect()
+      const listed = await client.listTools()
+      const tools = listed.map((t) => convertMcpToolToHarnessTool(t, spec.name, client))
+      globalMcpToolIndex.index(spec.name, tools.map((t) => t.id))
+      if (spec.source) serverSource.set(spec.name, spec.source)
+      return { name: spec.name, client, tools, entry: spec.entry }
+    } catch (err) {
+      // ★ connect / listTools 抛错时也要关 transport：stdio 传输可能已 spawn 子进程，
+      //   而 client 是这里的局部变量，外层 catch 只记账、拿不到它 ⇒ 只能在此收口。
+      client.close()
+      globalMcpToolIndex.unindex(spec.name)
+      serverSource.delete(spec.name)
+      throw err
+    }
   }
 
   /** in-flight 去重：同名并发连接共享同一个 promise（懒加载 assemble 与 /mcp enable 会撞在一起） */
@@ -437,12 +446,13 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
     description: 'MCP Server 注册表：启动所有注册的 MCP Server，并通过 @harness/mcp-client 连接管理',
 
     async install(ctx) {
-      // 跨层解耦：**任何**插件卸载/更新后自检并清理孤儿 runtime（不反向改上层状态）。
-      // 注意不能只看 `payload.id === 本插件`：宿主插件（如 code-intel）先注销了注册项却没走
-      // serverSource 路线时，孤儿 runtime 只能靠这里收；只认自己等于永远不跑（注释说的才是意图）。
-      offs.push(ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, () => syncRuntimesFromSources()))
-      offs.push(ctx.bus.subscribe(LifecycleEvents.pluginUpdated, () => syncRuntimesFromSources()))
-      // 宿主插件卸载：断开其注册的 MCP server，并记录待移除工具（经 assembleTools 收敛）
+      // 宿主插件卸载：**同一个回调里**先按 serverSource 处理归属，再自检清孤儿。
+      // ★ 不能拆成两个 pluginUnloaded 订阅：bus 按订阅顺序同步执行，若 sync 先跑，它会
+      //   serverSource.delete + downTools.delete，把归属处理需要的状态提前抹掉 ⇒
+      //   markDown / pool.remove / mcpServerDisabled 全失效，工具残留在工具池里。
+      //   生产时序正是如此：manage-plugin 先跑 uninstall()（code-intel 会 unregisterMcpServer）
+      //   再 publish pluginUnloaded，此时 reg 已无该项、sync 条件成立。
+      //   而无 source 的宿主插件（computer-use）不进归属分支，仍靠 sync 收孤儿。
       offs.push(
         ctx.bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
           for (const [serverName, src] of Array.from(serverSource)) {
@@ -451,8 +461,10 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
             disconnectServer(serverName)
             void ctx.bus.publish(LifecycleEvents.mcpServerDisabled, { name: serverName }, { source: 'mcp.server-registry' })
           }
+          syncRuntimesFromSources()
         }),
       )
+      offs.push(ctx.bus.subscribe(LifecycleEvents.pluginUpdated, () => syncRuntimesFromSources()))
       // 宿主插件重新启用/重载：重连其注册的 MCP server（reg 里已重新注册）
       offs.push(
         ctx.bus.subscribe(LifecycleEvents.pluginLoaded, ({ payload }) => {
@@ -593,7 +605,8 @@ export function createMcpServerRegistryPlugin(options: McpServerRegistryPluginOp
               out(rt
                 ? (m ? `已启用并连接 ${name}\n` : `已启用并重新连接 ${name}（本次进程生效）\n`)
                 : `启用失败（未能连接 ${name}${why ? `：${why}` : ''}）\n`)
-              await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
+              // ★ 连不上就别广播 enabled：否则遥测会记下一条根本没启用的假事件。
+              if (rt) await ctx.bus.publish(LifecycleEvents.mcpServerEnabled, { name }, { source: 'mcp.server-registry' })
             } else {
               // 记录待移除的工具 id（先从运行态取，再断开连接），供 core.tool.pool.assemble 收敛注册表
               markDown(name)
