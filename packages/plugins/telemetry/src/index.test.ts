@@ -226,6 +226,28 @@ describe('createTelemetryService', () => {
     expect(svc.telemetry.otlpStats).toEqual({ sent: 0, failed: 1, dropped: 0 })
   })
 
+  test('★ uninstall 等 OTLP 最后一批结算后才返回（退出时不再丢事件）', async () => {
+    let releaseFetch: (() => void) | undefined
+    const gate = new Promise<void>((r) => { releaseFetch = r })
+    let settled = false
+    const svc = createTelemetryService({
+      enabled: true, dataDir: dir, crash: false,
+      pathBuilder: () => join(dir, 'otlp', 'uninstall.jsonl'),
+      otlp: {
+        endpoint: 'http://c', batchMs: 60_000,
+        fetchImpl: async () => { await gate; settled = true; return { ok: true, status: 200 } },
+      },
+    })
+    svc.telemetry.record('k', {}, {})
+    const uninstalling = svc.plugin.uninstall?.()
+    await Bun.sleep(0)            // 让 flush 发起 fetch（卡在 gate）
+    expect(settled).toBe(false)   // fetch 尚未结算
+    releaseFetch!()
+    await uninstalling
+    expect(settled).toBe(true)    // uninstall 必须等它结算完
+    expect(svc.telemetry.otlpStats.sent).toBe(1)
+  })
+
   test('enabled:false ⇒ install 不返回 hook（这条不变式让 hook 内不必再判 enabled）', async () => {
     const svc = createTelemetryService({ enabled: false, dataDir: dir, crash: false })
     const hooks = await svc.plugin.install({ bus: new InMemoryBus() } as never)

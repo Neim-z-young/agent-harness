@@ -242,9 +242,13 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
     async uninstall() {
       unsubscribe?.()
       crashGuard?.detach()
-      // 顺序不变但不依赖顺序：flush() 先摘掉 OTLP 队列并开始发送，close() 只负责
-      // 清定时器 + 拒收新事件；两者都不吞掉已在队列里的那一批。
-      flush()
+      // ★ 最后一批必须 await：flush() 里的 `void otlpExporter.flush()` 与 close() 里的
+      //   `void send(batch)` 都是 fire-and-forget，进程退出时 fetch 刚发起就结束 ⇒ 丢事件。
+      //   writer.flush() 是同步 writeFileSync 无需等；otlpExporter.flush() 已先摘队列再
+      //   await send，等它结算完队列已空，close() 不会再重复发。
+      //   注意 controller.flush（崩溃兜底也用它）保持同步，不改为 async。
+      writer.flush()
+      await otlpExporter.flush()
       otlpExporter.close()
     },
   }
