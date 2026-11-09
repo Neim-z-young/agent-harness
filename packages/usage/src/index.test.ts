@@ -13,6 +13,7 @@ import {
   rebuildUsage,
   recordCall,
   recordTool,
+  recordTaskDone,
   uncachedInput,
   cacheHitRate,
   renderStatsText,
@@ -28,6 +29,11 @@ import {
   usageFromMessages,
   todayUsageLine,
   providerUsageRow,
+  modelUsageRow,
+  toolUsageRow,
+  agentUsageRow,
+  hourlyRow,
+  sparkline,
   exportStatsJson,
   exportStatsMarkdown,
   USAGE_STATS_KEY,
@@ -139,6 +145,20 @@ describe('mergeUsage / sumUsage', () => {
     expect(m.hourly[0]!.hour).toBeLessThan(m.hourly[1]!.hour)
   })
 
+  it('recordCall 自己就把小时桶插在升序位置（不能指望 mergeUsage 事后排）', () => {
+    // 覆盖缺口（反向验证实测）：上面那条「不同小时桶各自保留并升序」全程走 mergeUsage，
+    // 而 mergeUsage 末尾会自己 sort ⇒ 把 recordCall 的升序插入去掉，那条用例照样绿。
+    // 引擎的增量折叠路径**只**调 recordCall、不经过 mergeUsage，所以必须直接钉它：
+    // 乱序到达的时间戳（真机上跨小时、甚至时钟回拨）也得插在正确位置，
+    // 否则当日截取（usageSince 按 hour 前缀比较）与时间序列会错位。
+    let u = emptyUsage()
+    u = recordCall(u, { model: 'm', input: 1, output: 1, ts: at(0, 10) })
+    u = recordCall(u, { model: 'm', input: 2, output: 2, ts: at(0, 8) })
+    u = recordCall(u, { model: 'm', input: 3, output: 3, ts: at(0, 9) })
+    expect(u.hourly.map((h) => h.hour)).toStrictEqual([at(0, 8), at(0, 9), at(0, 10)])
+    expect(u.hourly.map((h) => h.inputTokens)).toStrictEqual([2, 3, 1])
+  })
+
   it('sumUsage 汇总多个会话', () => {
     let a = emptyUsage()
     a = recordCall(a, { model: 'm', input: 5, output: 1, ts: at(0, 9) })
@@ -239,8 +259,20 @@ describe('usageFromMeta / 杂项', () => {
     expect(cacheHitRate(base({ inputTokens: -5, cacheReadTokens: 100 }))).toBe(0)
     expect(cacheHitRate(base({ inputTokens: Number.POSITIVE_INFINITY, cacheReadTokens: 100 }))).toBe(0)
     expect(cacheHitRate(base({ inputTokens: 1000, cacheReadTokens: -1 }))).toBe(0)
-    // 渲染层端到端：绝不出现 NaN
-    expect(renderStatsText(base({ inputTokens: 1000, cacheReadTokens: NaN }))).not.toContain('NaN')
+
+    // 渲染层端到端：绝不出现 NaN。
+    // ⚠️ 这里**必须**给 cacheWriteTokens 一个正数：缓存行的渲染条件是
+    // `cacheReadTokens > 0 || cacheWriteTokens > 0`，而 NaN > 0 是 false ⇒
+    // 只写 NaN 时整行都不会输出，断言「不含 NaN」在**任何实现下**都成立（空转守卫）。
+    // 早期版本就是这么写的，于是 uncachedInput 的 NaN 漏出一直没被发现。
+    const nanLine = renderStatsText(base({ inputTokens: 1000, cacheReadTokens: NaN, cacheWriteTokens: 5 }))
+      .split('\n')
+      .find((l) => l.startsWith('缓存：'))
+    expect(nanLine).toBeDefined() // 证明真的走到了缓存行
+    expect(nanLine).not.toContain('NaN')
+    // 未命中 = 已知项相减，非有限项按 0 计（与命中率同口径）
+    expect(uncachedInput(base({ inputTokens: 1000, cacheReadTokens: NaN, cacheWriteTokens: 5 }))).toBe(995)
+    expect(uncachedInput(base({ inputTokens: NaN, cacheReadTokens: 1, cacheWriteTokens: 1 }))).toBe(0)
   })
 
   it('renderStatsText 缓存行含命中率', () => {
@@ -460,5 +492,115 @@ describe('Provider 维度', () => {
     const md = exportStatsMarkdown(u, { sessionId: 's1' })
     expect(md).toContain('## 按 Provider')
     expect(md).toContain('| hy3 | 1 | 300 | 30 | 0 | 0 |')
+  })
+})
+
+// ============================================================================
+// 归并原语与格式化的收敛守卫
+//
+// 这一节钉的是"本包只有一份维度加法"这件事的结果，而不是实现细节：
+// 5 个维度（provider / model / tool / agent / hour）走同一个 accumulateRows，
+// 任何一个维度漏加一列，都会在这里表现为某条断言对不上。
+// ============================================================================
+
+describe('recordCall 归因口径', () => {
+  it('给了 agentId 就必须落到该 agent 名下（不得因为缺 model 而静默记到 root）', () => {
+    // 回归背景：旧写法是 `rec.model ? (rec.agentId || 'root') : 'root'` ——
+    // 把"有没有 model"当成了"要不要认 agentId"的门。而 foldMessage 传的是
+    // `{ model: meta.model, agentId: m.agentId }`，meta 缺 model 的 assistant 消息
+    // （provider 未回报模型名的旧记录）会把子 agent 的用量整笔记到 root，
+    // /stats 的「按 agent」一栏于是长期少算，且没有任何信号。
+    const u = recordCall(emptyUsage(), { agentId: 'worker', input: 5, output: 1, ts: at(0, 9) })
+    expect(u.agents.map((a) => a.agentId)).toStrictEqual(['worker'])
+    expect(u.agents[0]!.inputTokens).toBe(5)
+    // 同时：模型维度按缺省口径仍是 unknown（两件事互不牵连）
+    expect(u.models.map((m) => m.model)).toStrictEqual(['unknown'])
+  })
+
+  it('旧落盘记录（连 models/agents/hourly 都缺）可直接进 recordCall，不抛', () => {
+    // 回归背景：normalizeUsage 存在的原因就是"旧记录缺维度数组"。但 recordCall 内部
+    // 只给 providers 写了 `?? []`，另外三个维度直接 `.findIndex` ⇒ 从这条路进来的
+    // 旧记录抛 `undefined is not an object`，抛点又在 core 的 try/catch 里
+    // ⇒ 症状是"用量静默不增长"。归一必须放在入口，且覆盖全部维度。
+    const legacy = {
+      llmCalls: 1, inputTokens: 5, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0,
+    } as unknown as UsageStats
+    const after = recordCall(legacy, { model: 'm', provider: 'p1', input: 2, output: 3 })
+    expect(after.llmCalls).toBe(2)
+    expect(after.models).toHaveLength(1)
+    expect(after.agents).toHaveLength(1)
+    expect(after.hourly).toHaveLength(1)
+    expect(after.providers).toHaveLength(1)
+  })
+
+  it('五个维度用同一份加法：每次调用都累加 calls/input/output/cacheRead/cacheWrite', () => {
+    let u = emptyUsage()
+    u = recordCall(u, { provider: 'p1', model: 'm', agentId: 'w', input: 100, output: 10, cacheRead: 40, cacheWrite: 6, ts: at(0, 9) })
+    u = recordCall(u, { provider: 'p1', model: 'm', agentId: 'w', input: 50, output: 5, cacheRead: 10, cacheWrite: 4, ts: at(0, 9) })
+    // provider / model / hour 有缓存列；agent 没有（任务维度不切缓存）
+    for (const row of [u.providers[0]!, u.models[0]!, u.hourly[0]!]) {
+      expect(row).toMatchObject({ calls: 2, inputTokens: 150, outputTokens: 15, cacheRead: 50, cacheWrite: 10 })
+    }
+    expect(u.agents[0]).toMatchObject({ calls: 2, inputTokens: 150, outputTokens: 15 })
+    // 汇总列与维度列必须自洽（权威口径：usageStats.inputTokens）
+    expect(u.inputTokens).toBe(150)
+    expect(u.cacheReadTokens).toBe(50)
+  })
+})
+
+describe('recordTaskDone', () => {
+  it('首次为该 agent 建行（calls 保持 0），再次调用只加 tasksDone', () => {
+    let u = recordTaskDone(emptyUsage(), 'worker')
+    u = recordTaskDone(u, 'worker')
+    u = recordTaskDone(u)
+    expect(u.agents).toHaveLength(2)
+    expect(u.agents.find((a) => a.agentId === 'worker')).toMatchObject({ calls: 0, tasksDone: 2 })
+    expect(u.agents.find((a) => a.agentId === 'root')!.tasksDone).toBe(1)
+    // 任务不产生调用
+    expect(u.llmCalls).toBe(0)
+  })
+})
+
+describe('格式化：同形与同量', () => {
+  it('providerUsageRow 与 modelUsageRow 对同一组计数输出完全同形（只差 key）', () => {
+    const tally = { calls: 3, inputTokens: 120, outputTokens: 30, cacheRead: 50, cacheWrite: 7 }
+    const p = providerUsageRow({ provider: 'K', ...tally })
+    const m = modelUsageRow({ model: 'K', ...tally })
+    // 这行断言的目的：两份格式化此前是逐字重复的实现，改一处漏一处会让
+    // 同一个面板里两行长不一样。现在它们必须恒等（只差 key 字符串）。
+    expect(p).toBe(m)
+    expect(p).toBe('K ×3 · ⚡50/w7 in120/out30')
+  })
+
+  it('无缓存时省略缓存段（不出现 ⚡0/w0 的噪音）', () => {
+    expect(modelUsageRow({ model: 'm', calls: 1, inputTokens: 2, outputTokens: 3, cacheRead: 0, cacheWrite: 0 }))
+      .toBe('m ×1 · in2/out3')
+  })
+
+  it('toolUsageRow：失败数与 token 段各有值才出现', () => {
+    expect(toolUsageRow({ tool: 'bash', count: 5, errors: 0, inputTokens: 0, outputTokens: 0 })).toBe('bash ×5')
+    expect(toolUsageRow({ tool: 'bash', count: 5, errors: 2, inputTokens: 0, outputTokens: 0 })).toBe('bash ×5 (2❌)')
+    expect(toolUsageRow({ tool: 'bash', count: 1, errors: 0, inputTokens: 9, outputTokens: 4 })).toBe('bash ×1 · 9/4')
+  })
+
+  it('agentUsageRow：tasksDone 为 0 时不显示 ✓', () => {
+    expect(agentUsageRow({ agentId: 'root', calls: 2, inputTokens: 10, outputTokens: 5, tasksDone: 0 })).toBe('root ×2 · 10/5')
+    expect(agentUsageRow({ agentId: 'w', calls: 2, inputTokens: 10, outputTokens: 5, tasksDone: 3 })).toBe('w ×2 ✓3 · 10/5')
+  })
+
+  it('sparkline：按比例取整、夹在 [0, width]、分母非正时全空', () => {
+    expect(sparkline(0, 100, 4)).toBe('░░░░')
+    expect(sparkline(50, 100, 4)).toBe('██░░')
+    expect(sparkline(100, 100, 4)).toBe('████')
+    expect(sparkline(999, 100, 4)).toBe('████') // 上界夹紧
+    expect(sparkline(-5, 100, 4)).toBe('░░░░') // 下界夹紧
+    expect(sparkline(10, 0, 4)).toBe('░░░░') // 分母 0：不得算出 Infinity/NaN
+  })
+
+  it('hourlyRow：条形与右侧数字是同一个量（都含输出）', () => {
+    // 回归背景：条形只画 inputTokens，而 renderStatsText 传的分母是 input+output 的最大值
+    // ⇒ 只要有输出，条形就系统性偏短（满峰也画不满）。这里用"该小时即峰值"钉死它。
+    const row = hourlyRow({ hour: at(0, 9), calls: 1, inputTokens: 10, outputTokens: 90, cacheRead: 0, cacheWrite: 0 }, 100)
+    expect(row).toMatch(/^09:00 ██████ 100$/)
   })
 })
