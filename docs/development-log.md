@@ -1,5 +1,50 @@
 # Agent Harness 开发日志
 
+## 2026-11-09（续 293）三条新重构分支审查 + 合入 main（这次真有问题，已修）
+
+盘点：`refactor/auto-20261107`（mcp-client / mcp-server-registry，2 提交）、
+`refactor/auto-20261108`（telemetry，3 提交）、`refactor/auto-20261109`（swarm，1 提交）
+**全部基于 `8c6a90b`**，改动文件互不重叠 → 按日期顺序 `--no-ff` 合入，无冲突。
+与续 291 不同，这轮**审查出真缺陷**（只读代码审查 + 亲自复核 + 变异验证，不是只看编译）。
+
+### 修掉的问题（5 处代码 + 5 条用例）
+
+1. **【新引入回归，最严重】pluginUnloaded 双订阅抢跑**（mcp-server-registry）：
+   07 分支把「任何卸载都跑 `syncRuntimesFromSources`」注册在「按 `serverSource` 下线」**之前**。
+   bus 按订阅顺序同步执行，而生产时序是 `manage-plugin` 先跑 `uninstall()`（code-intel 会
+   `unregisterMcpServer`）再 publish ⇒ sync 条件成立，先 `serverSource.delete` +
+   `downTools.delete` ⇒ 后一个回调的 `markDown` / `pool.remove` /
+   `mcpServerDisabled` 全失效，**已装配的工具残留在工具池里**（client 已关，调用打到死 transport）。
+   修：合并成**单个回调**，先按归属处理再自检清孤儿（无 source 的 computer-use 仍靠 sync 收），
+   消除对订阅顺序的依赖。
+2. **`/mcp enable` 连不上仍无条件广播 `mcpServerEnabled`**：合并后被 telemetry
+   `subscribeAll` 记成一条假事件。修：只在 `rt` 存在时 publish；既有用例注释竟写着
+   「会失败但事件仍发」—— 把 bug 当契约钉住了，已改为断言失败**不发** + 输出原因，
+   并补一条「连上了才发」的正向用例。
+3. **`openRuntime` 建连失败不关 transport**：`client` 是局部变量、外层 catch 只记账，
+   stdio 可能已 spawn 子进程 ⇒ 泄漏。修：try/catch 里 `client.close()` + 清索引/归属，并补用例。
+4. **telemetry `uninstall()` 全程不 await OTLP**：`flush()` 里 `void otlpExporter.flush()`、
+   `close()` 里 `void send(batch)`，进程退出时 fetch 刚发起就结束 ⇒ 最后一批仍丢
+   （08 分支提交声称已修）。修：`writer.flush()` + `await otlpExporter.flush()` + `close()`；
+   controller 的同步 `flush`（崩溃兜底用）保持不变。补 gate 用例卡住 fetch 验证 await。
+5. **swarm poller 守卫用例不可判**：实现用 `finally` 复位是对的，但 09 分支新增用例的
+   三条断言在「`inFlight` 永不复位」的坏实现下同样成立。修：用例末尾再投一条消息并轮询，
+   断言守卫真的放开（实现未改）。
+
+审查还列了若干「修了但没修全」的残留（OTLP 失败批次只记账不重试、`writer.dropped`
+未接 controller、`awaitMailboxResponse` 无超时、`tool` 包仍有 3 处 `mcp__` 字面量等），
+多为分支声称范围之外的既有取舍，本轮**未动**，避免扩张引出新风险。
+
+### 验证
+
+- **反向验证 5 组**（先写预测、cp 备份、变异、`shasum -a 256 -c` 还原、6/6 OK、无残留）：
+  ①恢复双订阅 ⇒ 红 1（卸载用例）；②去掉 `if (rt)` ⇒ 红 1；③`await`→`void` ⇒ 红 1；
+  ④删 `finally` 复位 ⇒ 红 1；⑤删 `client.close()` ⇒ 红 1。**预测 5×1 红，实际 5×1 红，全部对账**。
+- 三个受影响包：typecheck 0 error；mcp-server-registry **23 pass** / telemetry **69 pass** /
+  swarm **79 pass**（均 0 fail）。
+- 合并+修复后最终状态：`typecheck` 49 包 **0 error**；`test` **3389 pass / 0 fail**（49 包 exit 0，
+  原 3361 → +28）；`build` **49/49 exit 0**；`adapters/vscode` 自口径 0 error / **276 pass**。
+
 ## 2026-11-06（续 292）README 全条目按最新代码核对（修 50+ 处过时、补齐缺失）
 
 起因：仓库已公开、且刚合并 7 条 refactor 分支（新增 `provider-kit` 等 27 个此前未列入
