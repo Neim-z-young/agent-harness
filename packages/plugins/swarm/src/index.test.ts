@@ -736,6 +736,12 @@ describe('InboxPoller', () => {
     release()
     await first
     expect(await mb.countUnread('alpha', 'bob')).toBe(0)
+
+    // ★ 守卫必须**复位**：上面三条断言在「inFlight 永不复位」的坏实现下同样成立。
+    //   再投一条并轮询，能重新进入才证明 finally 真的放了锁。
+    await mb.writeToMailbox('alpha', 'bob', { from: 'lead', text: 'again', timestamp: 't2', type: 'message' })
+    await poller.pollOnce()
+    expect(received).toEqual(['slow', 'again'])
     poller.stop()
   })
 })
