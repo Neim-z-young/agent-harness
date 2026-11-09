@@ -64,22 +64,31 @@ export function sanitizeName(name: string): string {
 }
 
 /**
- * 校验 team 字段：缺失 / 非字符串 / 空串 → 返回结构化错误，供工具层直接返回
+ * team 字段的**唯一**判据（缺失 / 非字符串 / 纯空白都算缺失）。
+ *
+ * 「算不算提供了 team」只有这一处；「怎么报」才由两层分开决定 —— 工具层返回结构化
+ * 错误、内部平面抛 SwarmError。两层各写一个 `trim() === ''` 时，任何一次调整（比如
+ * 将来允许空白折叠后的名字）都只会改到一半，于是同一个入参在工具层被拒、在平面层被放行。
+ */
+function hasTeamName(team: unknown): team is string {
+  return typeof team === 'string' && team.trim() !== ''
+}
+
+/** 缺少 team 时的用户可见文案（工具层与平面层同一条，用户不该听到两种说法） */
+const TEAM_REQUIRED_MESSAGE = '缺少 team：请在入参里给出团队名'
+
+/**
+ * 校验 team 字段：非法 → 返回结构化错误，供工具层直接返回
  * （不抛错，避免落到 sanitizeName 抛 TypeError 或静默空数组）。
  */
 function requireTeam(input: { team?: unknown }): { ok: false; error: { message: string; code: string } } | undefined {
-  const team = input.team
-  if (typeof team !== 'string' || team.trim() === '') {
-    return { ok: false, error: { message: '缺少 team：请在入参里给出团队名', code: 'TEAM_REQUIRED' } }
-  }
-  return undefined
+  if (hasTeamName(input.team)) return undefined
+  return { ok: false, error: { message: TEAM_REQUIRED_MESSAGE, code: 'TEAM_REQUIRED' } }
 }
 
 /** 校验 team 字段（面向内部 TaskListPlane）：非法时抛 SwarmError，避免静默空数组 */
 function assertTeamName(team: unknown): void {
-  if (typeof team !== 'string' || team.trim() === '') {
-    throw new SwarmError('task', '缺少 team：请在入参里给出团队名')
-  }
+  if (!hasTeamName(team)) throw new SwarmError('task', TEAM_REQUIRED_MESSAGE)
 }
 
 /** 生成短唯一 ID（task 等用） */
@@ -259,6 +268,18 @@ export class TeamManager {
   async delete(name: string): Promise<void> {
     await rm(this.teamDir(name), { recursive: true, force: true })
   }
+}
+
+/**
+ * 取团队；不存在则以**发起者**为 lead 建一个（in-process 与终端两条 spawn 路径共用）。
+ *
+ * 两条路径原本各写一遍这段 get-or-create：一处将来改了判定（比如"目录存在但
+ * team.json 缺失时重建"）而另一处没改，就会出现"同一条团队，换个后端就变成新建"。
+ */
+async function ensureTeam(teamManager: TeamManager, team: string, agentId: string): Promise<TeamFile> {
+  const existing = await teamManager.get(team)
+  if (existing) return existing
+  return teamManager.create({ name: team, leadAgentId: agentId, leadSessionId: '' })
 }
 
 // ===== Mailbox：文件式收件箱（带锁） =====
@@ -656,11 +677,14 @@ export class TaskListPlane {
     return (await this.read(team)).find((t) => t.id === id)
   }
 
-  /** 认领任务：available → in_progress（已被认领/非 available/依赖未解决抛错；锁内 busy-check 防 TOCTOU） */
+  /**
+   * 认领任务：available → in_progress（已被认领/非 available/依赖未解决抛错；锁内 busy-check 防 TOCTOU）。
+   * 返回值直接来自锁内（withLock 把 fn 的返回值透出来），不再用 `claimed!` 假装非空 ——
+   * 那种断言在"锁内提前 return 但忘了赋值"时会把 undefined 当成 SwarmTask 交给调用方。
+   */
   async claim(team: string, id: string, agentName: string): Promise<SwarmTask> {
     assertTeamName(team)
-    let claimed: SwarmTask | undefined
-    await withLock(this.lockPath(team), async () => {
+    return withLock(this.lockPath(team), async () => {
       const tasks = await this.read(team)
       const task = tasks.find((t) => t.id === id)
       if (!task) throw new SwarmError('task', `Task not found: ${id}`)
@@ -680,9 +704,8 @@ export class TaskListPlane {
       task.claimedBy = agentName
       task.updatedAt = Date.now()
       await this.write(team, tasks)
-      claimed = task
+      return task
     })
-    return claimed!
   }
 
   /** 状态迁移（带生命周期校验） */
@@ -692,8 +715,7 @@ export class TaskListPlane {
     patch: { status?: SwarmTaskStatus; result?: string },
   ): Promise<SwarmTask> {
     assertTeamName(team)
-    let updated: SwarmTask | undefined
-    await withLock(this.lockPath(team), async () => {
+    return withLock(this.lockPath(team), async () => {
       const tasks = await this.read(team)
       const task = tasks.find((t) => t.id === id)
       if (!task) throw new SwarmError('task', `Task not found: ${id}`)
@@ -706,9 +728,8 @@ export class TaskListPlane {
       if (patch.result !== undefined) task.result = patch.result
       task.updatedAt = Date.now()
       await this.write(team, tasks)
-      updated = task
+      return task
     })
-    return updated!
   }
 
   /** 停止任务：in_progress → cancelled（统一 kill switch） */
@@ -769,17 +790,102 @@ export function requestPermissionThroughLeader(
 
 // ===== 权限 mailbox 双轨 fallback（对齐 useSwarmPermissionPoller + permissionSync） =====
 
-/** 挂起的权限回调（requestId → resolve；teammate 侧注册，收到响应后触发） */
-const pendingPermissionCallbacks = new Map<string, (decision: PermissionDecision) => void>()
+/**
+ * 挂起的请求-响应对（requestId → resolve）。
+ *
+ * 权限双轨与 plan 审批双轨其实是**同一件事**：本地生成 requestId → 挂一个等待者 →
+ * 把请求写进对方 inbox → 收到 `replyTo` 命中的响应时兑现并摘除。此前两条轨道各写了
+ * 一份 Map + register/has/兑现，任何一处要修（比如"发送失败必须撤销挂起项"）都得记得
+ * 改两遍 —— 收到这里一份。
+ */
+class PendingRequests<T> {
+  private readonly entries = new Map<string, (value: T) => void>()
+
+  register(requestId: string, resolve: (value: T) => void): void {
+    this.entries.set(requestId, resolve)
+  }
+
+  /** 命中则**摘除**并返回等待者（一条响应只能兑现一次）；未命中返回 undefined */
+  take(requestId: string | undefined): ((value: T) => void) | undefined {
+    if (!requestId) return undefined
+    const resolve = this.entries.get(requestId)
+    if (resolve) this.entries.delete(requestId)
+    return resolve
+  }
+
+  /** 撤销挂起项（发送失败时用：否则这条永远等不到响应的条目会留到进程结束） */
+  cancel(requestId: string): void {
+    this.entries.delete(requestId)
+  }
+
+  has(requestId?: string): boolean {
+    return requestId ? this.entries.has(requestId) : this.entries.size > 0
+  }
+}
+
+/** 挂起的权限回调（teammate 侧注册，收到 permission_response 后兑现） */
+const pendingPermissions = new PendingRequests<PermissionDecision>()
+
+/** 挂起的 plan 审批回调（teammate 侧注册，收到 plan_approval_response 后兑现） */
+const pendingPlanApprovals = new PendingRequests<PlanApprovalResult>()
+
+/**
+ * 把请求写进对方 inbox 并等待配对响应。
+ *
+ * **先挂等待者再发送**：反过来的话，快速回复可能在注册前就到达并被当作"陌生 requestId"
+ * 直接标记已读，调用方永远等不到。发送失败则撤销挂起项 —— 否则表里留下一条永远等不到
+ * 响应的条目，`hasPending*()` 从此恒真，且其闭包活到进程结束。
+ */
+async function awaitMailboxResponse<T>(
+  requestId: string,
+  pending: PendingRequests<T>,
+  send: () => Promise<void>,
+): Promise<T> {
+  const answer = new Promise<T>((resolve) => pending.register(requestId, resolve))
+  try {
+    await send()
+  } catch (err) {
+    pending.cancel(requestId)
+    throw err
+  }
+  return answer
+}
+
+/**
+ * 消费 teammate inbox 里的一类响应消息：命中挂起回调则摘除并兑现；未命中的
+ * （过期 / 陌生 requestId）也标记已读 —— 留着它只会每轮被重扫一遍。
+ * 权限与 plan 审批两条双轨共用（此前是两份逐字相同的循环）。
+ */
+async function settleResponseTrack<T>(
+  mailbox: TeammateMailbox,
+  team: string,
+  agentName: string,
+  type: MailboxMessageType,
+  pending: PendingRequests<T>,
+  readResult: (msg: MailboxMessage) => T,
+): Promise<boolean> {
+  const unread = await mailbox.readUnreadMessages(team, agentName)
+  let handled = false
+  for (const msg of unread) {
+    if (msg.type !== type) continue
+    const resolve = pending.take(msg.replyTo)
+    if (resolve) {
+      resolve(readResult(msg))
+      handled = true
+    }
+    await mailbox.markMessageAsReadByRef(team, agentName, { from: msg.from, timestamp: msg.timestamp })
+  }
+  return handled
+}
 
 /** 注册权限回调（requestId 关联） */
 export function registerPermissionCallback(requestId: string, resolve: (decision: PermissionDecision) => void): void {
-  pendingPermissionCallbacks.set(requestId, resolve)
+  pendingPermissions.register(requestId, resolve)
 }
 
 /** 是否还有挂起的权限回调 */
 export function hasPendingPermissionCallback(requestId?: string): boolean {
-  return requestId ? pendingPermissionCallbacks.has(requestId) : pendingPermissionCallbacks.size > 0
+  return pendingPermissions.has(requestId)
 }
 
 /** 通过 mailbox 向目标（通常是 leader）发送权限请求 */
@@ -814,22 +920,10 @@ export async function processMailboxPermissionResponse(
   team: string,
   agentName: string,
 ): Promise<boolean> {
-  const unread = await mailbox.readUnreadMessages(team, agentName)
-  let handled = false
-  for (const msg of unread) {
-    if (msg.type !== 'permission_response') continue
-    const requestId = msg.replyTo
-    if (requestId && pendingPermissionCallbacks.has(requestId)) {
-      const resolve = pendingPermissionCallbacks.get(requestId)!
-      pendingPermissionCallbacks.delete(requestId)
-      const allow = msg.data?.allow === true
-      const forever = msg.data?.forever === true
-      resolve({ allow, forever })
-      handled = true
-    }
-    await mailbox.markMessageAsReadByRef(team, agentName, { from: msg.from, timestamp: msg.timestamp })
-  }
-  return handled
+  return settleResponseTrack(mailbox, team, agentName, 'permission_response', pendingPermissions, (msg) => ({
+    allow: msg.data?.allow === true,
+    forever: msg.data?.forever === true,
+  }))
 }
 
 /**
@@ -855,27 +949,23 @@ export async function requestSwarmPermission(opts: {
   if (hasLeaderConfirmQueue()) {
     return requestPermissionThroughLeader({ toolName: opts.toolName, input: opts.input, workerBadge: opts.workerBadge })
   }
-  if (opts.mailbox && opts.team && opts.leaderName) {
+  const { mailbox, team, leaderName } = opts
+  if (mailbox && team && leaderName) {
     const requestId = generateRequestId('perm')
-    const decision = new Promise<PermissionDecision>((resolve) => {
-      registerPermissionCallback(requestId, resolve)
-    })
-    await sendPermissionRequestViaMailbox(opts.mailbox, opts.team, opts.leaderName, {
-      from: opts.from,
-      toolName: opts.toolName,
-      input: opts.input,
-      requestId,
-      escalation: opts.escalation,
-    })
-    return decision
+    return awaitMailboxResponse(requestId, pendingPermissions, () =>
+      sendPermissionRequestViaMailbox(mailbox, team, leaderName, {
+        from: opts.from,
+        toolName: opts.toolName,
+        input: opts.input,
+        requestId,
+        escalation: opts.escalation,
+      }),
+    )
   }
   return { allow: false }
 }
 
 // ===== plan approval + permissionMode 继承（对齐 Claude Code plan approval 自动批准） =====
-
-/** 挂起的 plan 审批回调（requestId → resolve；teammate 侧注册，收到响应后触发） */
-const pendingPlanApprovalCallbacks = new Map<string, (result: PlanApprovalResult) => void>()
 
 /** plan 审批结果（approved + 继承的 leader permissionMode） */
 export interface PlanApprovalResult {
@@ -885,12 +975,12 @@ export interface PlanApprovalResult {
 
 /** 注册 plan 审批回调（requestId 关联） */
 export function registerPlanApprovalCallback(requestId: string, resolve: (result: PlanApprovalResult) => void): void {
-  pendingPlanApprovalCallbacks.set(requestId, resolve)
+  pendingPlanApprovals.register(requestId, resolve)
 }
 
 /** 是否还有挂起的 plan 审批回调 */
 export function hasPendingPlanApproval(requestId?: string): boolean {
-  return requestId ? pendingPlanApprovalCallbacks.has(requestId) : pendingPlanApprovalCallbacks.size > 0
+  return pendingPlanApprovals.has(requestId)
 }
 
 /** 通过 mailbox 向 leader 发送 plan 审批请求 */
@@ -919,41 +1009,26 @@ export async function requestPlanApproval(opts: {
   team: string
 }): Promise<PlanApprovalResult> {
   const requestId = generateRequestId('plan')
-  const result = new Promise<PlanApprovalResult>((resolve) => {
-    registerPlanApprovalCallback(requestId, resolve)
-  })
-  await sendPlanApprovalRequestViaMailbox(opts.mailbox, opts.team, opts.to, {
-    from: opts.from,
-    plan: opts.plan,
-    permissionMode: opts.permissionMode,
-    requestId,
-  })
-  return result
+  return awaitMailboxResponse(requestId, pendingPlanApprovals, () =>
+    sendPlanApprovalRequestViaMailbox(opts.mailbox, opts.team, opts.to, {
+      from: opts.from,
+      plan: opts.plan,
+      permissionMode: opts.permissionMode,
+      requestId,
+    }),
+  )
 }
 
-/** teammate 侧：处理 inbox 中的 plan_approval_response（命中回调 resolve + 标记已读） */
+/** teammate 侧：处理 inbox 中的 plan_approval_response（命中回调兑现 + 标记已读） */
 export async function processMailboxPlanApprovalResponse(
   mailbox: TeammateMailbox,
   team: string,
   agentName: string,
 ): Promise<boolean> {
-  const unread = await mailbox.readUnreadMessages(team, agentName)
-  let handled = false
-  for (const msg of unread) {
-    if (msg.type !== 'plan_approval_response') continue
-    const requestId = msg.replyTo
-    if (requestId && pendingPlanApprovalCallbacks.has(requestId)) {
-      const resolve = pendingPlanApprovalCallbacks.get(requestId)!
-      pendingPlanApprovalCallbacks.delete(requestId)
-      resolve({
-        approved: msg.data?.approved === true,
-        permissionMode: msg.permissionMode ?? (msg.data?.permissionMode as string | undefined),
-      })
-      handled = true
-    }
-    await mailbox.markMessageAsReadByRef(team, agentName, { from: msg.from, timestamp: msg.timestamp })
-  }
-  return handled
+  return settleResponseTrack(mailbox, team, agentName, 'plan_approval_response', pendingPlanApprovals, (msg) => ({
+    approved: msg.data?.approved === true,
+    permissionMode: msg.permissionMode ?? (msg.data?.permissionMode as string | undefined),
+  }))
 }
 
 /**
@@ -1011,22 +1086,34 @@ export function attachInboxPoller(options: InboxPollerOptions): InboxPoller {
   const intervalMs = options.intervalMs ?? 2000
   let timer: ReturnType<typeof setInterval> | undefined
   let running = false
+  /** 上一轮是否仍在执行（用于跳过重叠轮询） */
+  let inFlight = false
   let unread = 0
 
   async function pollOnce(): Promise<void> {
-    // 优先级：shutdown 最高 → lead > peer（同级 FIFO）
-    const messages = sortMessagesByPriority(await options.mailbox.readUnreadMessages(options.team, options.agent))
-    if (messages.length === 0) return
-    for (const msg of messages) {
-      try {
-        await options.onMessage(msg)
-        // 投递成功后才标记已读（失败留未读，下轮重试，防丢消息）
-        await options.mailbox.markMessageAsReadByRef(options.team, options.agent, { from: msg.from, timestamp: msg.timestamp })
-      } catch {
-        // 单个消息处理失败不阻断后续；该消息保持未读等待下轮重试
+    // 防重叠（与 startTeammateLoop 同一判据）：`setInterval` 不会等上一次 poll 结束，而
+    // `onMessage` 可能要跑一整轮模型调用（数十秒）。不挡的话同一批未读消息会被两路并发
+    // 投递 —— 标记已读发生在 `onMessage` **之后**，所以第二轮照样读得到它们，结果是
+    // 重复回复、重复副作用。
+    if (inFlight) return
+    inFlight = true
+    try {
+      // 优先级：shutdown 最高 → lead > peer（同级 FIFO）
+      const messages = sortMessagesByPriority(await options.mailbox.readUnreadMessages(options.team, options.agent))
+      if (messages.length === 0) return
+      for (const msg of messages) {
+        try {
+          await options.onMessage(msg)
+          // 投递成功后才标记已读（失败留未读，下轮重试，防丢消息）
+          await options.mailbox.markMessageAsReadByRef(options.team, options.agent, { from: msg.from, timestamp: msg.timestamp })
+        } catch {
+          // 单个消息处理失败不阻断后续；该消息保持未读等待下轮重试
+        }
       }
+      unread = await options.mailbox.countUnread(options.team, options.agent)
+    } finally {
+      inFlight = false
     }
-    unread = await options.mailbox.countUnread(options.team, options.agent)
   }
 
   return {
@@ -1338,10 +1425,7 @@ export async function spawnInProcessTeammate(input: {
   registry?: TeammateRegistry
 }): Promise<TeammateTaskState> {
   const { harness, teamManager, team, name, agentId, prompt, model, color, registry: targetRegistry } = input
-  let teamFile = await teamManager.get(team)
-  if (!teamFile) {
-    teamFile = await teamManager.create({ name: team, leadAgentId: agentId, leadSessionId: '' })
-  }
+  const teamFile = await ensureTeam(teamManager, team, agentId)
   // 加入团队（lead 同名则跳过，避免覆盖）
   if (sanitizeName(name) !== TEAM_LEAD_NAME) {
     await teamManager.addMember(team, { agentId, name, role: 'teammate', model, color })
@@ -1431,10 +1515,7 @@ export async function spawnTerminalTeammate(input: {
   const cwd = input.cwd ?? process.cwd()
 
   // 团队：不存在则创建（lead = 发起者），否则复用
-  let teamFile = await teamManager.get(team)
-  if (!teamFile) {
-    teamFile = await teamManager.create({ name: team, leadAgentId: agentId, leadSessionId: '' })
-  }
+  const teamFile = await ensureTeam(teamManager, team, agentId)
   const memberName = sanitizeName(name)
 
   // CLI 启动命令（teammate 子命令：携带团队/成员身份）
