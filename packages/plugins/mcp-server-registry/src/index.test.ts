@@ -14,6 +14,7 @@ import {
 import type { PluginContext } from '@harness/plugin'
 import type { Bus } from '@harness/bus'
 import { LifecycleEvents } from '@harness/core'
+import { globalMcpToolIndex } from '@harness/tool'
 import type { McpTransport } from '@harness/mcp-client'
 
 /** 日志 ctx 桩 */
@@ -426,5 +427,110 @@ describe('resolveMcpCapabilities（P1-7）', () => {
   test('两项都声明、都没法强制 ⇒ 两条都在（不合并成一句）', () => {
     const r = resolveMcpCapabilities({ fs: 'cwd', net: 'none' }, { osBindingAvailable: false })
     expect(r.unenforceable).toHaveLength(2)
+  })
+})
+
+// ===== 连接生命周期：孤儿清理 / 失败可诊断 / 卸载后迟到的连接 / 计数去重 =====
+
+describe('连接生命周期与可诊断性', () => {
+  /** 装一个带假 transport 的代码注册 server，并记录 close 次数 */
+  function setup(tools: Array<{ name: string; description?: string }> = [{ name: 't' }]) {
+    const reg = createMcpServerRegistry()
+    const fake = createFakeTransport(tools)
+    let closed = 0
+    const transport: McpTransport = { ...fake.transport, close: () => { closed += 1; fake.transport.close() } }
+    return { reg, transport, closed: () => closed }
+  }
+
+  test('★孤儿 runtime：宿主插件注销了注册项却没走 serverSource 路线 ⇒ 任意外来卸载事件都要收掉', async () => {
+    const { reg, transport, closed } = setup()
+    const bus = makeBus()
+    reg.register({ name: 'ghost', createTransport: () => transport, source: 'ghost' })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await plugin.install({ log: mockLog, bus } as unknown as PluginContext)
+    const pool = fakePool()
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, pool)
+    expect(pool.list().map((t: any) => t.id)).toEqual(['mcp__ghost__t'])
+    expect(globalMcpToolIndex.serverOf('mcp__ghost__t')).toBe('ghost')
+
+    // 宿主插件只注销了注册项（没通过 source 路线下线），随后**别的**插件被卸载
+    reg.unregister('ghost')
+    await bus.publish(LifecycleEvents.pluginUnloaded, { id: 'some-other-plugin' })
+
+    expect(closed()).toBe(1)
+    // 工具归属索引也要摘掉 —— 否则 /tools 里还挂着已死 server 的工具
+    expect(globalMcpToolIndex.serverOf('mcp__ghost__t')).toBeUndefined()
+    await plugin.uninstall?.()
+  })
+
+  test('★连接失败必须留下可读原因：/mcp servers 输出里带 error="…"', async () => {
+    const reg = createMcpServerRegistry()
+    // 缺 command 的 stdio 配置 ⇒ defaultTransportFactory 抛错（真正的"配错了"）
+    reg.register({ name: 'bad', config: { name: 'bad', transport: 'stdio' } as any })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
+    await hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, fakePool())
+
+    const out: string[] = []
+    await hooks!['cli.command']!({
+      command: 'mcp', arg: 'servers', raw: 'mcp servers', sessionId: 's', out: (s: string) => out.push(s),
+    } as any)
+    const text = out.join('')
+    expect(text).toContain('connected=false')
+    expect(text).toContain('error="')
+    await plugin.uninstall?.()
+  })
+
+  test('★卸载后才 resolve 的 in-flight 连接：立刻关闭并丢弃，不留泄漏', async () => {
+    const { reg, transport, closed } = setup()
+    // createTransport 延迟 20ms ⇒ uninstall 一定发生在 connect 完成之前
+    reg.register({
+      name: 'slow',
+      createTransport: () => new Promise<McpTransport>((resolve) => setTimeout(() => resolve(transport), 20)),
+    })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)
+    const assembling = hooks!['core.tool.pool.assemble']!({ agentId: 'a' }, fakePool())
+    await new Promise((r) => setTimeout(r, 5)) // 让连接进入 await（尚未 resolve）
+    await plugin.uninstall?.()
+    await assembling
+    await new Promise((r) => setTimeout(r, 40)) // 等那条迟到的连接完成
+
+    expect(closed()).toBe(1)
+    expect(globalMcpToolIndex.serverOf('mcp__slow__t')).toBeUndefined()
+  })
+
+  test('同名条目同时出现在「托管」与「代码注册」时，表头计数按名字去重（与打印行数一致）', async () => {
+    const reg = createMcpServerRegistry()
+    reg.register({ name: 'dup', createTransport: () => createFakeTransport([{ name: 't' }]).transport })
+
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = (await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)) as any
+    await hooks['cli.mcp.configure']({ mcpServers: [{ name: 'dup', transport: 'http', url: 'http://x/a' }] })
+
+    const out: string[] = []
+    await hooks['cli.command']({ command: 'mcp', arg: 'servers', raw: 'mcp servers', sessionId: 's', out: (s: string) => out.push(s) })
+    const text = out.join('')
+    expect(text).toContain('已注册 1 个 MCP Server')
+    expect(text.split('dup').length - 1).toBe(1) // 只打一行，不与表头计数打架
+    await plugin.uninstall?.()
+  })
+
+  test('/mcp add 一条 enabled=false 的条目：如实说"不连接"，不谎称已连接', async () => {
+    const reg = createMcpServerRegistry()
+    const plugin = createMcpServerRegistryPlugin({ registry: reg })
+    const hooks = (await plugin.install({ log: mockLog, bus: makeBus() } as unknown as PluginContext)) as any
+
+    const out: string[] = []
+    await hooks['cli.command']({
+      command: 'mcp',
+      arg: 'add -- {"name":"off","transport":"http","url":"http://x/a","enabled":false}',
+      raw: 'mcp add', sessionId: 's', out: (s: string) => out.push(s),
+    })
+    expect(out.join('')).toContain('已添加 off（enabled=false，当前不连接）')
+    await plugin.uninstall?.()
   })
 })

@@ -12,6 +12,8 @@ import {
   mcpSpawnArgv,
   convertMcpToolToHarnessTool,
   createMcpClientPlugin,
+  mcpToolPrefix,
+  mcpToolBaseName,
   type McpTransport,
   type McpServerConfig,
   type McpToolDef,
@@ -1048,5 +1050,24 @@ describe('defaultTransportFactory 透传 osBinding（P1-7）', () => {
     } finally {
       t.close?.()
     }
+  })
+})
+
+// ===== 工具 id 命名约定的唯一出处（mcp__<server>__<tool>）=====
+
+describe('mcpToolPrefix / mcpToolBaseName', () => {
+  test('前缀与 convertMcpToolToHarnessTool 产出的 id 一致（生产/消费两侧同一份约定）', () => {
+    expect(mcpToolPrefix('gh')).toBe('mcp__gh__')
+    expect(`${mcpToolPrefix('gh')}list_prs`).toBe('mcp__gh__list_prs')
+  })
+
+  test('还原 base 名；不属于本 server 的 id 原样返回（不猜、不抛）', () => {
+    expect(mcpToolBaseName('gh', 'mcp__gh__list_prs')).toBe('list_prs')
+    expect(mcpToolBaseName('other', 'mcp__gh__list_prs')).toBe('mcp__gh__list_prs')
+    expect(mcpToolBaseName('gh', 'unprefixed')).toBe('unprefixed')
+  })
+
+  test('server 名自身含 `__` 时按完整前缀剥离，不做启发式切分', () => {
+    expect(mcpToolBaseName('a__b', 'mcp__a__b__run')).toBe('run')
   })
 })
