@@ -7,7 +7,16 @@
  */
 
 import type { BusEventRecord } from '@harness/bus'
-import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
+import {
+  makeEnvelope,
+  pickMetrics,
+  pickAttrs,
+  extractIdentity,
+  isRecord,
+  asFiniteNumber,
+  type TelemetryAttrs,
+  type TelemetryEnvelope,
+} from './envelope.js'
 
 /**
  * 需要单独语义化 kind 的特殊事件（其余走 telemetry.bus.<name>）。
@@ -24,12 +33,23 @@ const SEMANTIC_KINDS: Record<string, string> = {
   // registered / defaultChanged 这些每次都发生的正常事实挤在一起，检索时拉不出来。
   'provider.resolveMiss': 'telemetry.provider.resolveMiss',
 }
-/** 当作"会话边界"的事件（仅用于更新 lastKnown，不强依赖） */
-const LIFECYCLE_NAMES = new Set(['harness.initialized', 'harness.started', 'harness.stopped'])
+
+/** 只在有限数值时落指标（0 也是有效值，故判据是"能取到数"而不是"非零"） */
+function setMetric(target: Record<string, number>, key: string, v: unknown): void {
+  const n = asFiniteNumber(v)
+  if (n !== undefined) target[key] = n
+}
+
+/** 从任何 signal 形态里取会话归属（4 个 envelope 共用一套口径） */
+function identityAttrs(s: { sessionId?: string; agentId?: string }): TelemetryAttrs {
+  return { sessionId: s.sessionId, agentId: s.agentId }
+}
 
 /**
  * 把一条 bus 事件转成遥测 envelope。
- * 返回 null 表示该事件不落盘（极端脱敏场景专用，默认恒非 null）。
+ *
+ * 恒返回 envelope（没有"该事件不落盘"的分支）：脱敏发生在提取层（只收标量与低基数标签），
+ * 不在这里丢整条 —— 丢整条会让"某类事件完全不在遥测里"变成沉默的默认行为。
  */
 export function mapBusEvent(ev: BusEventRecord): TelemetryEnvelope {
   const kind = SEMANTIC_KINDS[ev.name] ?? `telemetry.bus.${ev.name}`
@@ -52,22 +72,15 @@ export function mapBusEvent(ev: BusEventRecord): TelemetryEnvelope {
  * 载荷原名一律保留（`pickAttrs` 已落），所以这步只做**加**、不做改名。
  */
 function semanticAttrs(name: string, payload: unknown): TelemetryAttrs {
-  if (name !== 'provider.resolveMiss' || payload === null || typeof payload !== 'object') return {}
-  const v = (payload as Record<string, unknown>)['requested']
+  if (name !== 'provider.resolveMiss' || !isRecord(payload)) return {}
+  const v = payload['requested']
   // provider 维度 = 「哪个实例没命中」，这也是消费方唯一想聚合的那个问题
   return typeof v === 'string' && v.length > 0 ? { provider: v } : {}
 }
 
+/** `round` 是**步号/轮号**这类结构性字段 ⇒ 只认真正的有限数值，不折布尔 */
 function pickRound(payload: unknown): number | undefined {
-  if (payload === null || typeof payload !== 'object') return undefined
-  const rec = payload as Record<string, unknown>
-  const v = rec['round']
-  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
-}
-
-/** 该事件是否为一次生命周期/会话边界（供 lastKnown 刷新） */
-export function isBoundaryEvent(name: string): boolean {
-  return LIFECYCLE_NAMES.has(name)
+  return isRecord(payload) ? asFiniteNumber(payload['round']) : undefined
 }
 
 /**
@@ -86,7 +99,7 @@ export function isBoundaryEvent(name: string): boolean {
  * null）—— 无 sessionId 的轮会落到 run 级文件，那也是它的正确归宿。
  */
 export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
-  if (signal === null || typeof signal !== 'object') return null
+  if (!isRecord(signal)) return null
   const s = signal as {
     agentId?: string
     agentName?: string
@@ -99,21 +112,23 @@ export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
     aborted?: boolean
   }
   const metrics: Record<string, number> = {}
-  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
-  const free = typeof s.freeSteps === 'number' && Number.isFinite(s.freeSteps) ? s.freeSteps : 0
+  // `freeSteps` 为 0 时不落（省无用字段）；`billedSteps` 是派生的额度口径，与 step 同生同灭
+  const free = asFiniteNumber(s.freeSteps) ?? 0
   if (free > 0) metrics.freeSteps = free
-  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.billedSteps = s.step - free
-  // 空步数（有值才落）：「模型连续零产出」与「请求层整轮没跑起来」的区分依据
-  if (typeof s.emptySteps === 'number' && Number.isFinite(s.emptySteps) && s.emptySteps > 0) {
-    metrics.emptySteps = s.emptySteps
+  const step = asFiniteNumber(s.step)
+  if (step !== undefined) {
+    metrics.step = step
+    metrics.billedSteps = step - free
   }
+  // 空步数（有值才落）：「模型连续零产出」与「请求层整轮没跑起来」的区分依据
+  const emptySteps = asFiniteNumber(s.emptySteps)
+  if (emptySteps !== undefined && emptySteps > 0) metrics.emptySteps = emptySteps
   // 只在真的中断时记一位（缺省即 0，不落无用字段）
   if (s.aborted === true) metrics.aborted = 1
   return makeEnvelope(
     'telemetry.turn.end',
     {
-      sessionId: s.sessionId,
-      agentId: s.agentId,
+      ...identityAttrs(s),
       agentName: s.agentName,
       mode: s.mode,
       finish: s.finish,
@@ -134,17 +149,13 @@ export function turnEndEnvelope(signal: unknown): TelemetryEnvelope | null {
  * 参数名虽是低基数但会随工具膨胀，故也不落。
  */
 export function paramsMissingEnvelope(signal: unknown): TelemetryEnvelope | null {
-  if (signal === null || typeof signal !== 'object') return null
+  if (!isRecord(signal)) return null
   const s = signal as { toolId?: string; sessionId?: string; agentId?: string; step?: number; missingCount?: number }
   if (!s.toolId) return null
   const metrics: Record<string, number> = {}
-  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
-  if (typeof s.missingCount === 'number' && Number.isFinite(s.missingCount)) metrics.missingCount = s.missingCount
-  return makeEnvelope(
-    'telemetry.tool.params.missing',
-    { toolId: s.toolId, sessionId: s.sessionId, agentId: s.agentId },
-    metrics,
-  )
+  setMetric(metrics, 'step', s.step)
+  setMetric(metrics, 'missingCount', s.missingCount)
+  return makeEnvelope('telemetry.tool.params.missing', { ...identityAttrs(s), toolId: s.toolId }, metrics)
 }
 
 /**
@@ -158,17 +169,13 @@ export function paramsMissingEnvelope(signal: unknown): TelemetryEnvelope | null
  * 只收数值，统一折 0/1 才能聚合）。
  */
 export function stepEmptyEnvelope(signal: unknown): TelemetryEnvelope | null {
-  if (signal === null || typeof signal !== 'object') return null
+  if (!isRecord(signal)) return null
   const s = signal as { sessionId?: string; agentId?: string; step?: number; hasTokenUsage?: boolean; aborted?: boolean }
   const metrics: Record<string, number> = {}
-  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
+  setMetric(metrics, 'step', s.step)
   metrics.hasTokenUsage = s.hasTokenUsage === true ? 1 : 0
   metrics.aborted = s.aborted === true ? 1 : 0
-  return makeEnvelope(
-    'telemetry.step.empty',
-    { sessionId: s.sessionId, agentId: s.agentId },
-    metrics,
-  )
+  return makeEnvelope('telemetry.step.empty', identityAttrs(s), metrics)
 }
 
 /**
@@ -182,16 +189,12 @@ export function stepEmptyEnvelope(signal: unknown): TelemetryEnvelope | null {
  * 只落工具 id 与步号 —— 不落入参正文（遥测红线）。
  */
 export function whitelistBlockedEnvelope(signal: unknown): TelemetryEnvelope | null {
-  if (signal === null || typeof signal !== 'object') return null
+  if (!isRecord(signal)) return null
   const s = signal as { toolId?: string; sessionId?: string; agentId?: string; step?: number }
   if (!s.toolId) return null
   const metrics: Record<string, number> = {}
-  if (typeof s.step === 'number' && Number.isFinite(s.step)) metrics.step = s.step
-  return makeEnvelope(
-    'telemetry.tool.whitelist.blocked',
-    { toolId: s.toolId, sessionId: s.sessionId, agentId: s.agentId },
-    metrics,
-  )
+  setMetric(metrics, 'step', s.step)
+  return makeEnvelope('telemetry.tool.whitelist.blocked', { ...identityAttrs(s), toolId: s.toolId }, metrics)
 }
 
 /**
@@ -227,10 +230,10 @@ export function toolFailureEnvelope(ctx: unknown, result: unknown): TelemetryEnv
     errName = 'DOOM_LOOP'
   }
   const metrics: Record<string, number> = {}
-  if (typeof r.meta?.durationMs === 'number') metrics.durationMs = r.meta.durationMs
+  setMetric(metrics, 'durationMs', r.meta?.durationMs)
   return makeEnvelope(
     kind,
-    { toolId, errName, sessionId: h?.ctx?.sessionId, agentId: h?.ctx?.agentId },
+    { ...identityAttrs(h?.ctx ?? {}), toolId, errName },
     metrics,
   )
 }

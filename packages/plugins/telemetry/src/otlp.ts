@@ -23,6 +23,30 @@ export interface OtlpOptions {
   batchMs?: number
   /** 单请求超时 ms（缺省 5000） */
   timeoutMs?: number
+  /**
+   * 注入 HTTP 实现（缺省 `globalThis.fetch`）。
+   *
+   * 存在的理由是可测性：此前本模块唯一能断言的只有"不抛"，因为 `send` 直接调全局
+   * `fetch` —— 连"非 2xx 被当成功""flush 期间的新事件被清掉"这类缺陷都测不出来
+   * （用例只能打真实端点 `http://collector:4318/`，跑一次 DNS 再静默失败）。
+   */
+  fetchImpl?: OtlpFetch
+}
+
+/** 只依赖 fetch 的最小契约：既能被 `globalThis.fetch` 满足，也能在用例里完全受控 */
+export type OtlpFetch = (
+  url: string,
+  init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
+) => Promise<{ ok: boolean; status?: number }>
+
+/** 上报计数（只读快照）。静默失败必须能看见：`failed > 0` 就是"collector 在拒收" */
+export interface OtlpStats {
+  /** 已被 collector 接受（2xx）的记录数 */
+  sent: number
+  /** 发送失败 / 非 2xx / 超时的记录数 */
+  failed: number
+  /** 因已 close 而未入队的记录数 */
+  dropped: number
 }
 
 export interface OtlpExporter {
@@ -31,8 +55,10 @@ export interface OtlpExporter {
   push(ev: TelemetryEnvelope): void
   /** 立即发送 pending（正常退出 / 崩溃兜底时调用） */
   flush(): Promise<void>
-  /** 关闭（取消定时器） */
+  /** 关闭：先把最后一批尽力发出，再停止接收 */
   close(): void
+  /** 只读计数快照 */
+  readonly stats: OtlpStats
 }
 
 /** OTLP 日志记录的 JSON 形态（最小子集） */
@@ -104,11 +130,29 @@ export function toExportRequest(records: OtlpLogRecord[]): Record<string, unknow
   }
 }
 
-export function createOtlpExporter(opts: OtlpOptions): OtlpExporter {
-  const endpoint = opts.endpoint?.replace(/\/+$/, '')
-  const enabled = (opts.enabled !== false ? opts.endpoint?.length : 0) !== 0 && !!endpoint
+/** 归一化端点：去空白、去尾斜杠（`https://c:4318///` 与 `https://c:4318` 是同一个 collector） */
+export function normalizeEndpoint(raw: string | undefined): string | undefined {
+  const s = raw?.trim().replace(/\/+$/, '')
+  return s ? s : undefined
+}
 
-  if (!enabled) return { enabled: false, push: () => {}, flush: async () => {}, close: () => {} }
+export function createOtlpExporter(opts: OtlpOptions): OtlpExporter {
+  const endpoint = normalizeEndpoint(opts.endpoint)
+  // 判据只有一条：显式关掉，或没给出可用端点 ⇒ no-op。此前写成
+  // `(opts.enabled !== false ? opts.endpoint?.length : 0) !== 0 && !!endpoint` —— 同一件事
+  // 换了三种写法（长度、真值、非零比较），端点写成空白串时行为还和直觉不一致。
+  const enabled = opts.enabled !== false && endpoint !== undefined
+
+  const stats: OtlpStats = { sent: 0, failed: 0, dropped: 0 }
+  if (!enabled) {
+    return {
+      enabled: false,
+      push: () => {},
+      flush: async () => {},
+      close: () => {},
+      stats,
+    }
+  }
 
   const batchMs = opts.batchMs ?? 1000
   const timeoutMs = opts.timeoutMs ?? 5000
@@ -117,59 +161,77 @@ export function createOtlpExporter(opts: OtlpOptions): OtlpExporter {
     'content-type': 'application/json',
     ...(opts.headers ?? {}),
   }
+  const doFetch: OtlpFetch = opts.fetchImpl ?? globalThis.fetch
 
   let pending: OtlpLogRecord[] = []
   let timer: ReturnType<typeof setTimeout> | null = null
   let closed = false
 
-  const send = async (records: OtlpLogRecord[]) => {
-    if (!records.length || closed) return
-    const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), timeoutMs)
+  const clearTimer = () => {
+    if (timer !== null) clearTimeout(timer)
+    timer = null
+  }
+
+  /**
+   * 发一批。**不看 `closed`**：close() 需要在置位前把最后一批交出去，而
+   * "已关闭还在发" 这个状态由调用点保证不会出现（close 先摘队列再置位）。
+   */
+  const send = async (records: OtlpLogRecord[]): Promise<void> => {
+    if (!records.length) return
     try {
-      await fetch(url, {
+      const res = await doFetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(toExportRequest(records)),
-        signal: ctrl.signal,
+        // 用 AbortSignal.timeout 而不是「setTimeout + ctrl.abort」：它内部的定时器是
+        // unref 的 ⇒ 收尾那次上报不会把进程退出钉住最多 timeoutMs（collector 黑洞时
+        // 用户看到的是"退出卡 5 秒"，且会归因到遥测）。
+        signal: AbortSignal.timeout(timeoutMs),
       })
+      // 非 2xx 此前**完全没看**：collector 401/413 一律被当成功，stats 里永远是 0 失败。
+      if (res.ok) stats.sent += records.length
+      else stats.failed += records.length
     } catch {
-      // OTLP 上报失败不致命：静默丢弃本批，不影响主流程
-    } finally {
-      clearTimeout(t)
+      // OTLP 上报失败不致命：静默丢弃本批，不影响主流程（但记账）
+      stats.failed += records.length
     }
   }
 
   const doFlush = () => {
-    if (!pending.length) return
+    clearTimer()
     const batch = pending
     pending = []
-    timer = null
-    void send(batch)
+    if (batch.length) void send(batch)
   }
 
   return {
     enabled: true,
+    stats,
     push(ev: TelemetryEnvelope) {
-      if (closed) return
+      if (closed) {
+        stats.dropped += 1
+        return
+      }
       pending.push(toOtlpLogRecord(ev))
       if (timer === null) timer = setTimeout(doFlush, batchMs)
     },
     async flush() {
-      if (timer !== null) {
-        clearTimeout(timer)
-        timer = null
-      }
-      await send(pending)
+      clearTimer()
+      // **先摘队列再 await**：此前是 `await send(pending); pending = []`，于是 await 期间
+      // push 进来的事件被同一句 `pending = []` 清掉（既不在这批里、也不在下一批里）。
+      const batch = pending
       pending = []
+      await send(batch)
     },
     close() {
-      closed = true
-      if (timer !== null) {
-        clearTimeout(timer)
-        timer = null
-      }
+      if (closed) return
+      clearTimer()
+      const batch = pending
       pending = []
+      // 先发再置位：uninstall 里「flush() 是 void、close() 紧随其后」是既有顺序，
+      // 旧实现在 close 里直接丢弃 + send 见到 closed 就早退 ⇒ **最后一批必然发不出去**。
+      if (batch.length) void send(batch)
+      closed = true
     },
   }
 }

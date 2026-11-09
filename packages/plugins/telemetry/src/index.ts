@@ -28,7 +28,7 @@ import { createJsonlWriter, type JsonlWriter } from './writer.js'
 import { makeEnvelope, type TelemetryAttrs, type TelemetryEnvelope } from './envelope.js'
 import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope, paramsMissingEnvelope, stepEmptyEnvelope, whitelistBlockedEnvelope } from './map.js'
 import { createCrashGuard, type CrashState } from './crash.js'
-import { createOtlpExporter, type OtlpOptions } from './otlp.js'
+import { createOtlpExporter, type OtlpOptions, type OtlpStats } from './otlp.js'
 
 export * from './envelope.js'
 export * from './writer.js'
@@ -62,6 +62,13 @@ export interface TelemetryController {
   flush(): void
   /** 是否开启 */
   enabled: boolean
+  /**
+   * OTLP 上报计数（未启用时恒 0）。
+   *
+   * 为什么要在 controller 上露出来：OTLP 是**全链路静默**的（失败不抛、不写日志），
+   * 于是"collector 在拒收"与"根本没产生事件"在宿主侧完全同形。排障时先看这三个数。
+   */
+  readonly otlpStats: OtlpStats
 }
 
 export interface TelemetryService {
@@ -97,15 +104,23 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
   const otlpExporter = createOtlpExporter(opts.otlp ?? { enabled: false })
 
   // 单活跃 writer（跟随会话边界切换；会话分摊 writer 不保留，边界处切换）
-  const UNSET = '\u0000uninitialized'
-  let activeSessionId: string = UNSET
+  //
+  // ⚠️ 初值必须是**独立的哨兵**，不能拿 `undefined` 兼作两种含义：
+  // `activeSessionId` 原本声明成 `string` 并用 `sessionId ?? UNSET` 赋值 ⇒ 「当前没有会话」
+  // 与「尚未初始化」都成了 UNSET，于是**每一条无 sessionId 的事件都不等于上一次**
+  // ⇒ 每次 persist 都重建 writer（新 pending 数组 + 新定时器）、并先把上一条 flush 掉。
+  // 后果是 run 级文件里的写入完全失去批量效果（一事件一次 IO），且这段在
+  // "有 sessionId 的主路径"上永远看不出来。
+  const NOT_STARTED = Symbol('telemetry.writer.not-started')
+  let activeSessionId: string | undefined | typeof NOT_STARTED = NOT_STARTED
   let writer: JsonlWriter<TelemetryEnvelope> = createJsonlWriter<TelemetryEnvelope>(undefined)
 
   const switchWriter = (sessionId: string | undefined) => {
     if (sessionId === activeSessionId) return
     writer.flush()
-    activeSessionId = sessionId ?? UNSET
-    writer = createJsonlWriter<TelemetryEnvelope>(enabled ? pathBuilder(sessionId) : undefined, debounceMs)
+    activeSessionId = sessionId
+    // 无路径 ⇒ no-op writer：`enabled === false` 时 persist 已早退，故这里不必再判 enabled
+    writer = createJsonlWriter<TelemetryEnvelope>(pathBuilder(sessionId), debounceMs)
   }
 
   const persist = (ev: TelemetryEnvelope) => {
@@ -133,12 +148,25 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
     persist(mapBusEvent(ev))
   }
 
-  const controller: TelemetryController = { record, recordRaw: persist, flush, enabled }
+  const controller: TelemetryController = { record, recordRaw: persist, flush, enabled, otlpStats: otlpExporter.stats }
 
   // 异常场景专项埋点 hooks（工具执行失败 → 细分 kind）。不改 core，只注册已有 hook。
+  //
+  // 四条「signal → envelope」的 hook 唯一差异就是映射函数，故收成工厂。
+  //
+  // ⚠️ 这里**不再**逐条写 `if (!enabled) return`：`install()` 在关闭时直接返回 undefined
+  // ⇒ 这些 hook 根本不会被注册；且 `persist()` 自己还有最后一道 `if (!enabled) return`。
+  // 原实现四份守卫里最外层那份是**不可达代码**（它测的是"注册了 hook 又关掉遥测"这一
+  // 永远不存在状态）。这个不变式由用例「enabled:false ⇒ install 不返回 hook」钉住。
+  const envelopeHook =
+    (map: (signal: unknown) => TelemetryEnvelope | null) =>
+    (signal: unknown): void => {
+      const ev = map(signal)
+      if (ev) persist(ev)
+    }
+
   const hooks: Hooks = {
     async 'core.tool.post.execute'(ctx: unknown, result: unknown): Promise<unknown> {
-      if (!enabled) return result
       const ev = toolFailureEnvelope(ctx, result)
       if (ev) persist(ev)
       // 遥测只读不改结果，原样返回以保持 pipeline 语义
@@ -154,47 +182,31 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
      * 同步返回即可（core 的调用点是 `void ... .catch(() => undefined)`，本 hook 抛错也不会
      * 影响主流程，但仍不要抛 —— 上报绝不顶掉主语义）。
      */
-    'core.agent.turn.end'(signal: unknown): void {
-      if (!enabled) return
-      const ev = turnEndEnvelope(signal)
-      if (ev) persist(ev)
-    },
+    'core.agent.turn.end': envelopeHook(turnEndEnvelope),
     /**
      * 入参缺失（`core.tool.params.missing`）：落 `telemetry.tool.params.missing`。
      *
      * 单独一条 kind 而不是并入 `telemetry.tool.fail`：后者触发得**更早**（那时 core 还没把
      * `[入参自愈]` 说明拼进错误消息），消费方在那里无从判断"这次失败是缺参数"。
      */
-    'core.tool.params.missing'(signal: unknown): void {
-      if (!enabled) return
-      const ev = paramsMissingEnvelope(signal)
-      if (ev) persist(ev)
-    },
+    'core.tool.params.missing': envelopeHook(paramsMissingEnvelope),
     /**
      * 空步（`core.step.empty`）：落 `telemetry.step.empty`。
      *
      * 「一次完整 prompt 换来零产出」此前在遥测里**完全隐形**（没有用量 ⇒ 没有 providerCache 行；
      * 没有工具调用 ⇒ 整轮结束；会话里只多一条空 parts 的 assistant）。真机开场 3 轮各 1 空步。
      */
-    'core.step.empty'(signal: unknown): void {
-      if (!enabled) return
-      const ev = stepEmptyEnvelope(signal)
-      if (ev) persist(ev)
-    },
+    'core.step.empty': envelopeHook(stepEmptyEnvelope),
     /**
      * 白名单越界（`core.tool.whitelist.blocked`）：落 `telemetry.tool.whitelist.blocked`。
      *
      * 这是**能力边界**事件，与 `telemetry.tool.fail`（工具自身报错）不同类：它说明模型
      * 试图调用一个本不在其白名单内的工具。此前该调用会被静默放行，遥测里看不出异常。
      */
-    'core.tool.whitelist.blocked'(signal: unknown): void {
-      if (!enabled) return
-      const ev = whitelistBlockedEnvelope(signal)
-      if (ev) persist(ev)
-    },
+    'core.tool.whitelist.blocked': envelopeHook(whitelistBlockedEnvelope),
   }
 
-  // bus 事件订阅 + 崩溃兜底（在 install(ctx) 里接线，chhug 需要 bus）
+  // bus 事件订阅 + 崩溃兜底（在 install(ctx) 里接线：两者都需要 bus / 进程级监听）
   let unsubscribe: Unsubscribe | undefined
   let crashGuard: ReturnType<typeof createCrashGuard> | undefined
 
@@ -230,6 +242,8 @@ export function createTelemetryService(opts: TelemetryOptions = {}): TelemetrySe
     async uninstall() {
       unsubscribe?.()
       crashGuard?.detach()
+      // 顺序不变但不依赖顺序：flush() 先摘掉 OTLP 队列并开始发送，close() 只负责
+      // 清定时器 + 拒收新事件；两者都不吞掉已在队列里的那一批。
       flush()
       otlpExporter.close()
     },

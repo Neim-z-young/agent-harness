@@ -31,11 +31,17 @@ export interface CrashGuard {
   detach(): void
 }
 
-/** 截断堆栈并算哈希（去重用），避免泄露源码正文 */
-export function stackHashStack(stack: string | undefined, limit = 2048): { hash?: string; trace?: string } {
-  if (!stack) return {}
-  const head = stack.slice(0, limit)
-  return { hash: createHash('sha256').update(stack).digest('hex').slice(0, 16), trace: head }
+/**
+ * 堆栈 → 16 位哈希（去重用，**不落堆栈正文**）。
+ *
+ * 只出哈希不出正文：这是崩溃路径上唯一与"源码/表达式"打交道的地方，任何"顺手带上
+ * 前 N 字符"的返回值都会立刻违反 `envelope.ts` 的隐私红线。此前这里返回
+ * `{ hash, trace }`，而 `trace` 全仓**零消费**（只有一条用例在断言它的长度）——
+ * 一个没人用、却随时会被下一个人当成"调试字段"打进日志的正文片段。
+ */
+export function hashStack(stack: string | undefined): string | undefined {
+  if (!stack) return undefined
+  return createHash('sha256').update(stack).digest('hex').slice(0, 16)
 }
 
 const SIGNAL_HANDLED = ['SIGTERM', 'SIGHUP']
@@ -44,7 +50,7 @@ export function createCrashGuard(opts: CrashGuardOpts): CrashGuard {
   // 信号监听：写 crash → flush → 交还原默认信号处理（会终止进程）
   const signalHandlers = new Map<string, () => void>()
   const exceptionHandler = (err: Error | unknown) => {
-    opts.recordCrash({ reason: 'exception', stackHash: stackHashStack((err as Error)?.stack).hash })
+    opts.recordCrash({ reason: 'exception', stackHash: hashStack((err as Error)?.stack) })
     opts.flush()
     // 交还原默认行为：重新抛出会进默认 uncaughtException → 进程退出
     throw err === undefined ? new Error('uncaughtException') : err
@@ -52,7 +58,7 @@ export function createCrashGuard(opts: CrashGuardOpts): CrashGuard {
   const rejectionHandler = (reason: unknown) => {
     opts.recordCrash({
       reason: 'rejection',
-      stackHash: stackHashStack((reason as Error)?.stack).hash,
+      stackHash: hashStack((reason as Error)?.stack),
     })
     opts.flush()
     // 交还 Node 默认语义：未被处理的 rejection 会让进程退出（Node 15+ 默认 throw→exit）。

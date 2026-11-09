@@ -6,7 +6,7 @@ import { InMemoryBus, BusEvent } from '@harness/bus'
 import { makeEnvelope, pickMetrics, pickAttrs, extractIdentity } from './envelope.js'
 import { createJsonlWriter } from './writer.js'
 import { mapBusEvent, toolFailureEnvelope, turnEndEnvelope, paramsMissingEnvelope, stepEmptyEnvelope, whitelistBlockedEnvelope } from './map.js'
-import { createTelemetryService, deriveUserID, stackHashStack } from './index.js'
+import { createTelemetryService, deriveUserID, hashStack } from './index.js'
 
 describe('envelope', () => {
   test('makeEnvelope 归一化 schema/ts', () => {
@@ -79,6 +79,30 @@ describe('writer', () => {
     w.flush()
     const lines = readFileSync(p, 'utf8').trim().split('\n').map((l) => JSON.parse(l) as { a: number })
     expect(lines).toEqual([{ a: 1 }, { a: 2 }])
+  })
+
+  test('批量间隔到点自动落盘（不必显式 flush）', async () => {
+    const p = join(dir, 'timer.jsonl')
+    const w = createJsonlWriter<{ a: number }>(p, 5)
+    w.write({ a: 1 })
+    const deadline = Date.now() + 2_000
+    while (!existsSync(p) && Date.now() < deadline) await Bun.sleep(5)
+    expect(existsSync(p)).toBe(true)
+    expect(readFileSync(p, 'utf8').trim()).toBe('{"a":1}')
+    w.flush()
+  })
+
+  test('写盘失败记入 dropped：静默丢弃也要留痕（否则"文件少一半"与"没产生事件"同形）', () => {
+    const blocker = join(dir, 'blocker')
+    writeFileSync(blocker, 'x') // 占位普通文件 ⇒ 其下无法 mkdir（ENOTDIR）
+    const w = createJsonlWriter<{ a: number }>(join(blocker, 'nested', 'x.jsonl'), 50)
+    expect(w.dropped).toBe(0)
+    w.write({ a: 1 })
+    w.write({ a: 2 })
+    w.flush()
+    expect(w.dropped).toBe(2)
+    // no-op writer 恒 0（不存在的失败不该被记成丢弃）
+    expect(createJsonlWriter<{ a: number }>(undefined).dropped).toBe(0)
   })
 })
 
@@ -187,8 +211,28 @@ describe('createTelemetryService', () => {
     expect(runLines.map((l) => l.attrs.requested)).toEqual(['hy4'])
   })
 
-  test('关闭时 record 为 no-op（不写盘）', () => {
-    const p = join(dir, 'off.jsonl')
+  test('controller.otlpStats 能反映上报结果（OTLP 全链路静默，宿主只有这个数可查）', async () => {
+    const svc = createTelemetryService({
+      enabled: true,
+      dataDir: dir,
+      crash: false,
+      pathBuilder: () => join(dir, 'otlp', 'x.jsonl'),
+      otlp: { endpoint: 'http://c', batchMs: 60_000, fetchImpl: async () => ({ ok: false, status: 413 }) },
+    })
+    svc.telemetry.record('k', {}, {})
+    svc.telemetry.flush()
+    await Bun.sleep(0)
+    // collector 413 拒收 ⇒ failed+1（旧实现连 res 都没看，这里会一直是 0）
+    expect(svc.telemetry.otlpStats).toEqual({ sent: 0, failed: 1, dropped: 0 })
+  })
+
+  test('enabled:false ⇒ install 不返回 hook（这条不变式让 hook 内不必再判 enabled）', async () => {
+    const svc = createTelemetryService({ enabled: false, dataDir: dir, crash: false })
+    const hooks = await svc.plugin.install({ bus: new InMemoryBus() } as never)
+    expect(hooks).toBeUndefined()
+  })
+
+  test('关闭时 record 为 no-op（不写盘）', () => {    const p = join(dir, 'off.jsonl')
     const svc = createTelemetryService({ enabled: false, pathBuilder: () => p })
     svc.telemetry.record('telemetry.x', {}, {})
     svc.telemetry.flush()
@@ -198,6 +242,58 @@ describe('createTelemetryService', () => {
   test('controller.enabled 反映开关', () => {
     expect(createTelemetryService({ enabled: true }).telemetry.enabled).toBe(true)
     expect(createTelemetryService({ enabled: false }).telemetry.enabled).toBe(false)
+  })
+
+  test('无 sessionId 的连续事件只构建一次 writer（否则每条都 flush 一次，"批量"彻底失效）', () => {
+    // 回归：activeSessionId 原本用 `sessionId ?? UNSET` 赋值 ⇒「当前没有会话」与「尚未初始化」
+    // 是同一个值，于是每条无 sessionId 的事件都不等于上一次 ⇒ 每条都重建 writer + 先 flush。
+    // 这条路径在"有 sessionId"的主流程上永远看不出来（那里 sessionId 稳定、只切一次）。
+    const built: (string | undefined)[] = []
+    const svc = createTelemetryService({
+      enabled: true,
+      dataDir: dir,
+      crash: false,
+      pathBuilder: (sid) => {
+        built.push(sid)
+        // 独立子目录：同 describe 里前一个用例已往 sessions/run.telemetry.jsonl 写过，
+        // 共用路径会让"本用例写了几条"退化成"整组写了几条"
+        return join(dir, 'nosess', `${sid ?? 'run'}.telemetry.jsonl`)
+      },
+    })
+    svc.telemetry.record('k1', {}, {})
+    svc.telemetry.record('k2', {}, {})
+    svc.telemetry.record('k3', {}, {})
+    svc.telemetry.flush()
+    // 用 toStrictEqual 而非 toEqual：jest/bun 的 toEqual **忽略数组里的 undefined 项**，
+    // `[undefined,undefined,undefined]` 与 `[undefined]` 会被判等（第一版就这么假绿了）。
+    expect(built).toStrictEqual([undefined])
+    // 三条都进了同一个 run 级文件（重建 writer 也不会丢，但会变成三次 IO）
+    const kinds = readFileSync(join(dir, 'nosess', 'run.telemetry.jsonl'), 'utf8')
+      .trim()
+      .split('\n')
+      .map((l) => (JSON.parse(l) as { kind: string }).kind)
+    expect(kinds).toEqual(['k1', 'k2', 'k3'])
+  })
+
+  test('会话切换才重建 writer（a → a → b ⇒ 两次），且切换前把上一会话刷掉', () => {
+    const built: (string | undefined)[] = []
+    const svc = createTelemetryService({
+      enabled: true,
+      dataDir: dir,
+      crash: false,
+      pathBuilder: (sid) => {
+        built.push(sid)
+        return join(dir, 'switch', `${sid ?? 'run'}.telemetry.jsonl`)
+      },
+    })
+    svc.telemetry.record('a1', { sessionId: 'sw1' }, {})
+    svc.telemetry.record('a2', { sessionId: 'sw1' }, {})
+    svc.telemetry.record('b1', { sessionId: 'sw2' }, {})
+    svc.telemetry.flush()
+    expect(built).toEqual(['sw1', 'sw2'])
+    // 切到 sw2 之前 sw1 的那两条必须已经落盘（否则切会话即丢前一段）
+    const sw1 = readFileSync(join(dir, 'switch', 'sw1.telemetry.jsonl'), 'utf8').trim().split('\n')
+    expect(sw1).toHaveLength(2)
   })
 })
 
@@ -209,10 +305,12 @@ describe('misc helpers', () => {
     expect(a.length).toBeGreaterThan(0)
   })
 
-  test('stackHashStack 截断并出哈希，不抛', () => {
-    const r = stackHashStack('line1\nline2\nelse'.repeat(500))
-    expect(r.hash).toBeTruthy()
-    expect(r.trace!.length).toBeLessThanOrEqual(2048)
+  test('hashStack 只出哈希，不返回堆栈正文（隐私红线：正文片段随时会被当调试字段打进日志）', () => {
+    const h = hashStack('line1\nline2\nelse'.repeat(500))
+    expect(h).toHaveLength(16)
+    // 无堆栈时不出值（而不是 'e3b0c442…' 那种"空串的哈希"，那会让"没有堆栈"和"堆栈为空行"同形）
+    expect(hashStack(undefined)).toBeUndefined()
+    expect(hashStack('')).toBeUndefined()
   })
 
   test('makeEnvelope 隐私：undefined 不残留', () => {

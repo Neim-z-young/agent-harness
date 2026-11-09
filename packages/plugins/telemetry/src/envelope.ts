@@ -49,12 +49,23 @@ export function makeEnvelope(
   return { schema: SCHEMA, kind, ts, attrs: { ...attrs }, metrics: { ...metrics } }
 }
 
+/**
+ * 载荷是否为「可按字段遍历的普通对象」。
+ *
+ * 提取器全部以它开头：此前 `payload === null || typeof payload !== 'object'` 这一句在
+ * envelope / map 两处共写了 10 遍 —— 少写一处就是一次运行时 TypeError（`Object.entries(null)`）。
+ * 数组也算对象（`Object.entries` 给的是下标），取舍见 `pickMetrics` 的注释。
+ */
+export function isRecord(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === 'object'
+}
+
 /** 从任意对象里挑出数值字段当 metrics（bus 载荷通用提取） */
 export function pickMetrics(payload: unknown): Record<string, number> {
-  if (payload === null || typeof payload !== 'object') return {}
+  if (!isRecord(payload)) return {}
   const metrics: Record<string, number> = {}
   for (const [k, v] of Object.entries(payload)) {
-    const n = asNumber(v)
+    const n = asMetricNumber(v)
     if (n !== undefined) metrics[k] = n
   }
   return metrics
@@ -62,16 +73,26 @@ export function pickMetrics(payload: unknown): Record<string, number> {
 
 /** 从任意对象里挑出低基数字符串/数值标签（bus 载荷通用提取） */
 export function pickAttrs(payload: unknown): TelemetryAttrs {
-  if (payload === null || typeof payload !== 'object') return {}
+  if (!isRecord(payload)) return {}
   const attrs: TelemetryAttrs = {}
   for (const [k, v] of Object.entries(payload)) {
     if (typeof v === 'string' && v.length > 0) attrs[k] = v
     else {
-      const n = asNumber(v)
+      const n = asMetricNumber(v)
       if (n !== undefined) attrs[k] = n
     }
   }
   return attrs
+}
+
+/**
+ * 严格的「有限数值」判定：只认 `number`（不接受布尔、不认知数字符串）。
+ *
+ * 与 `asMetricNumber` 分开是有意的：结构性数值字段（`round` / `step`）不该因为载荷里
+ * 出现了 `true` 就莫名其妙变成 1，而通用 metrics 提取必须折布尔（见下）。
+ */
+export function asFiniteNumber(v: unknown): number | undefined {
+  return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
 /**
@@ -88,10 +109,9 @@ export function pickAttrs(payload: unknown): TelemetryAttrs {
  * 布尔在 OTLP 里要么另开类型、要么同样丢；0/1 还能直接做 sum/avg 聚合。
  * 真实布尔以外的值（对象、数组、null、NaN、Infinity、空串）一律返回 undefined ⇒ 丢弃。
  */
-function asNumber(v: unknown): number | undefined {
-  if (typeof v === 'number') return Number.isFinite(v) ? v : undefined
+function asMetricNumber(v: unknown): number | undefined {
   if (typeof v === 'boolean') return v ? 1 : 0
-  return undefined
+  return asFiniteNumber(v)
 }
 
 /**
@@ -99,26 +119,22 @@ function asNumber(v: unknown): number | undefined {
  * ⚠️ **不把任意顶层 `id` 当 sessionId**：`tool.enabled {id}` / `plugin.loaded {id}` 等事件的
  * id 是工具/插件 id，顶掉 sessionId 会让会话遥测被切散到错误文件。只认明确的会话键。
  */
-const SESSION_KEY_HINTS = ['sessionId', 'session_id']
-const AGENT_KEY_HINTS = ['agentId', 'agent_id']
+const SESSION_KEY_HINTS = ['sessionId', 'session_id'] as const
+const AGENT_KEY_HINTS = ['agentId', 'agent_id'] as const
+
+/** 按候选键顺序取第一个非空字符串（两个维度共用一套口径） */
+function firstNonEmptyString(rec: Record<string, unknown>, keys: readonly string[]): string | undefined {
+  for (const k of keys) {
+    const v = rec[k]
+    if (typeof v === 'string' && v.length > 0) return v
+  }
+  return undefined
+}
 
 export function extractIdentity(payload: unknown): { sessionId?: string; agentId?: string } {
-  if (payload === null || typeof payload !== 'object') return {}
-  const out: { sessionId?: string; agentId?: string } = {}
-  const rec = payload as Record<string, unknown>
-  for (const k of SESSION_KEY_HINTS) {
-    const v = rec[k]
-    if (typeof v === 'string' && v.length > 0) {
-      out.sessionId = v
-      break
-    }
+  if (!isRecord(payload)) return {}
+  return {
+    sessionId: firstNonEmptyString(payload, SESSION_KEY_HINTS),
+    agentId: firstNonEmptyString(payload, AGENT_KEY_HINTS),
   }
-  for (const k of AGENT_KEY_HINTS) {
-    const v = rec[k]
-    if (typeof v === 'string' && v.length > 0) {
-      out.agentId = v
-      break
-    }
-  }
-  return out
 }
