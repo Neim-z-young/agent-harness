@@ -23,6 +23,7 @@ import {
   collectCoveredIds,
   blockSpan,
   coveredSpan,
+  defaultRuleSummary,
   measureRangeChars,
   createAcpContextPlugin,
   ACP_META_KEY,
@@ -774,6 +775,108 @@ test('coveredSpan：仅依据状态+归档轻量计算块的断点索引', () =>
   const archive = makeArchive(['c0', 'c1', 'c2'])
   expect(coveredSpan(state, archive, parent)).toEqual({ startId: 'm0', endId: 'm2' })
   expect(coveredSpan(state, archive, child)).toEqual({ startId: 'm1', endId: 'm2' })
+})
+
+test('coveredSpan 与 decompress 回读出的 span 必须同源一致（含嵌套子块）', () => {
+  // 口径守卫：两条路径（轻量索引 vs 全文回读）此前各算一遍 span，任一处改动都会让
+  // search_context 与 decompress 对同一个块报出不同的起止 —— 而两者都是模型定位原文的依据。
+  const state = createInitialState()
+  const child = makeBlock('cb', {
+    tier: 3,
+    directMessageIds: ['c1', 'c2'],
+    effectiveMessageIds: ['c1', 'c2'],
+  })
+  const parent = makeBlock('pb', {
+    tier: 2,
+    directMessageIds: ['c0'],
+    effectiveMessageIds: ['c0', 'c1', 'c2'],
+    directBlockIds: ['cb'],
+  })
+  state.blocks = [child, parent]
+  const archive = makeArchive(['c0', 'c1', 'c2'])
+  const engine = createCore()
+  for (const block of [parent, child]) {
+    const light = coveredSpan(state, archive, block)
+    const heavy = blockSpan(restoreBlockMessages(engine, state, archive, block.blockId))
+    expect(heavy).toEqual(light)
+  }
+})
+
+test('restoreBlockMessages：同一原始消息被 id 与 ref 各指一次时只回读一遍', () => {
+  // `effectiveMessageIds`（含子块）与 `directMessageIds`（本块直压）是重叠的两层，
+  // 同一个 core 可能同时以「裸 id」和「ref」两种键出现 ⇒ 去重必须落在**已解析的消息 id** 上，
+  // 否则 decompress 会把同一段原文吐两遍、块尾 id 也会算到重复项上。
+  const state = createInitialState()
+  state.messageRefs = { byRaw: {}, byRef: { m00009: 'c0' } }
+  const block = makeBlock('pb', {
+    directMessageIds: ['c0'],
+    effectiveMessageIds: ['m00009'],
+  })
+  state.blocks = [block]
+  const archive = makeArchive(['c0', 'c1'])
+  const engine = createCore()
+  const restored = restoreBlockMessages(engine, state, archive, 'pb')
+  expect(restored.map((r) => r.id)).toStrictEqual(['m0'])
+})
+
+test('restoreBlockMessages：工具消息取 result 而不是 input', () => {
+  // 「工具消息的文本从哪取」本身是口径：摘要兜底与原文回读必须走同一份投影，
+  // 否则块摘要里是工具**结果**、decompress 吐出来的却是工具**入参**。
+  const state = createInitialState()
+  const block = makeBlock('tb', { directMessageIds: ['c0'], effectiveMessageIds: ['c0'] })
+  state.blocks = [block]
+  const archive = new Map<string, Message>([
+    ['c0', {
+      id: 'm0',
+      role: 'tool',
+      parts: [{ type: 'tool', input: { cmd: 'ls' }, result: { out: 'file-list' } }],
+      createdAt: 0,
+    } as unknown as Message],
+  ])
+  const engine = createCore()
+  const restored = restoreBlockMessages(engine, state, archive, 'tb')
+  expect(restored.length).toBe(1)
+  expect(restored[0]!.text).toContain('file-list')
+  expect(restored[0]!.text).not.toContain('ls')
+})
+
+test('defaultRuleSummary：单条窗口不留尾换行、首尾拼接、超长按 2000 字截断', () => {
+  const single = defaultRuleSummary([msg('user', '只有一条', 0)])
+  // 尾换行会让块摘要带上脏字符，也会把 2000 字截断点整体挪一位
+  expect(single).toBe('只有一条')
+  expect(single.endsWith('\n')).toBe(false)
+
+  const pair = defaultRuleSummary([msg('user', '开头', 0), msg('assistant', '结尾', 1)])
+  expect(pair).toBe('开头\n…\n结尾')
+
+  const huge = defaultRuleSummary([msg('user', 'x'.repeat(3000), 0), msg('assistant', '尾', 1)])
+  expect(huge.length).toBe(2001) // 2000 字 + 省略号
+  expect(huge.endsWith('…')).toBe(true)
+
+  // 空窗口：不抛错，返回空串（窗口闸在无可压原文时会走到这里）
+  expect(defaultRuleSummary([])).toBe('')
+})
+
+test('四个工具对「无上下文会话」返回同一份拒绝（NO_CTX 文案不漂移）', async () => {
+  const plugin = createAcpContextPlugin({ modelContextLimit: 1000 })
+  const tools = new Map<string, any>()
+  const hooks = (await plugin.install({ log: { info: () => {} } } as any)) as Hooks
+  await (hooks['core.tool.pool.assemble'] as any)({}, { add: (t: any) => void tools.set(t.id, t) })
+
+  const calls: [string, unknown][] = [
+    ['compress', { content: [] }],
+    ['decompress', { blockId: 'b1' }],
+    ['search_context', { query: 'x' }],
+    ['acp_status', {}],
+  ]
+  const seen = new Set<string>()
+  for (const [id, input] of calls) {
+    const res = await tools.get(id)!.call(input, { sessionId: 'never-seen' } as any)
+    expect(res.ok, `${id} 应拒绝`).toBe(false)
+    expect(res.error.code, `${id} 的错误码`).toBe('NO_CTX')
+    seen.add(res.error.message)
+  }
+  expect(seen.size, '四条拒绝文案必须逐字相同').toBe(1)
 })
 
 test('runPreModel：压缩块创建后原文持久化到 ACP_ARCHIVE_KEY（断点索引回读容器）', async () => {

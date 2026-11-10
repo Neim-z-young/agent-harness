@@ -809,6 +809,17 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
 
   // ===== compress / decompress / search_context / acp_status 工具 =====
 
+  /**
+   * 四个工具共用的"本会话还没有 ACP 上下文"拒绝。
+   *
+   * 原先四条字面量逐字重复（message + code 各一份）。重复本身不是问题，**漂移**才是：
+   * `NO_CTX` 是宿主/模型侧的判据，message 是给人看的处境说明 —— 改其一漏其二，
+   * 同一个处境就会有两种说法，而模型恰恰靠这段文案决定"要不要重试"。
+   */
+  function noCtxError(): { ok: false; error: { message: string; code: string } } {
+    return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
+  }
+
   const compressTool = want('compress')
     ? defineTool<CompressInput, CompressOutput>({
         id: 'compress',
@@ -843,7 +854,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         async call(input, ctx) {
           const sctx = sessions.get(ctx.sessionId)
           if (!sctx) {
-            return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
+            return noCtxError()
           }
           // 取本会话生效的档位 —— 与 preModel 用的是同一份，不是工厂闭包里的全局 config
           const scope = sctx.scope ?? scopeFor(ctx.agentId)
@@ -944,19 +955,14 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         async call(input, ctx): Promise<ToolResult<DecompressOutput>> {
           const sctx = sessions.get(ctx.sessionId)
           if (!sctx) {
-            return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
+            return noCtxError()
           }
           const block = engine.decompress(input.blockId, sctx.state)
           if (!block) {
             return { ok: false, error: { message: `未找到压缩块: ${input.blockId}`, code: 'NOT_FOUND' } }
           }
-          const originalMessages = restoreBlockMessages(
-            engine,
-            sctx.state,
-            sctx.archive,
-            block.blockId,
-          )
-          const span = blockSpan(originalMessages)
+          const originalMessages = restoreCoveredBlock(sctx.state, sctx.archive, block)
+          const span = spanOf(originalMessages)
           return {
             ok: true,
             output: {
@@ -994,7 +1000,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         async call(input, ctx): Promise<ToolResult<SearchOutput>> {
           const sctx = sessions.get(ctx.sessionId)
           if (!sctx) {
-            return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
+            return noCtxError()
           }
           const blocks = engine.search(input.query, sctx.state)
           const limit = Math.max(0, input.limit ?? 5)
@@ -1028,7 +1034,7 @@ export function createAcpContextPlugin(options: AcpContextPluginOptions = {}): A
         async call(_input, ctx): Promise<ToolResult<AcpStatusOutput>> {
           const sctx = sessions.get(ctx.sessionId)
           if (!sctx) {
-            return { ok: false, error: { message: '当前会话尚无 ACP 上下文', code: 'NO_CTX' } }
+            return noCtxError()
           }
           const tokenCount = estimateTokens(sctx.lastCores, countTokens)
           // 同上：报表口径必须与决策口径同源，否则“工具说占 30%、压到 0.35 才触发”就成了两个事实
@@ -2140,12 +2146,23 @@ function acpRefPrefix(sessionId: string): string {
 export function defaultRuleSummary(window: Message[]): string {
   const head = textOf(window[0])
   const tail = window.length > 1 ? textOf(window[window.length - 1]) : undefined
-  const joined = [head, tail ? `…\n${tail}` : ''].join('\n')
+  // 只有 tail 存在时才拼进来：此前写成 `[head, tail ? … : ''].join('\n')` ⇒ 单条窗口的
+  // 摘要尾巴上会多一个换行（既脏了块摘要，又让下面的 2000 字截断点偏一位）。
+  const joined = tail === undefined ? head : [head, `…\n${tail}`].join('\n')
   return joined.length > 2000 ? `${joined.slice(0, 2000)}…` : joined
 }
 
-function textOf(m?: Message): string {
-  if (!m) return ''
+/**
+ * 一条原始消息的文本投影（工具消息取 `result ?? input`，其余取 text）。
+ *
+ * **单一来源**：`textOf`（摘要兜底）与 `restoreCoveredBlock`（decompress 回读原文）此前
+ * 各写了一遍同一个投影，而"工具消息该取 result 还是 input"本身就是口径 —— 两处各写一遍，
+ * 改一处漏一处就会出现"块摘要里是工具结果、回读原文里是工具入参"的分裂。
+ *
+ * 保留末端的 `typeof === 'string'` 过滤：`parts` 来自会话持久层，畸形存档里
+ * `text` 可能是非字符串，宁可少一行也不让 `join` 把对象转成 `[object Object]`。
+ */
+function messageText(m: Message): string {
   return (m.parts as Array<{ type?: string; text?: string; input?: unknown; result?: unknown }>)
     .map((p) => {
       if (p.type === 'tool') return safeString(p.result ?? p.input)
@@ -2153,6 +2170,10 @@ function textOf(m?: Message): string {
     })
     .filter((t) => typeof t === 'string')
     .join('\n')
+}
+
+function textOf(m?: Message): string {
+  return m ? messageText(m) : ''
 }
 
 /**
@@ -2184,11 +2205,24 @@ export function collectCoveredIds(
 export function blockSpan(
   originalMessages: DecompressOutput['originalMessages'],
 ): { startId: string; endId: string } {
-  const first = originalMessages[0]
-  const last = originalMessages[originalMessages.length - 1]
+  return spanOf(originalMessages)
+}
+
+/**
+ * 原始消息序列 → 断点 span。
+ *
+ * **单一来源**：`blockSpan` 与 `coveredSpan` 是"从两条不同路径拿到同一批原始消息、再算同一个
+ * 断点"的两种写法（前者走全文回读、后者走轻量索引）。算 span 的规则写两遍，`decompress`
+ * 与 `search_context` 给模型报的 startId/endId 就会各自漂移 —— 而两者都是模型定位原文的依据。
+ *
+ * 单条消息的块没有"结束"：`endId` 留空（既有契约，`blockSpan` 用例钉住）。
+ */
+function spanOf(originals: readonly { id: string }[]): { startId: string; endId: string } {
+  const first = originals[0]
+  const last = originals[originals.length - 1]
   return {
     startId: first?.id ?? '',
-    endId: originalMessages.length > 1 ? last?.id ?? '' : '',
+    endId: originals.length > 1 ? last?.id ?? '' : '',
   }
 }
 
@@ -2201,18 +2235,69 @@ export function coveredSpan(
   archive: Map<string, Message>,
   block: CompressionBlock,
 ): { startId: string; endId: string } {
+  return spanOf(coveredOriginalMessages(state, archive, block))
+}
+
+/**
+ * id 或 ref（mNNNNN）→ 归档里的原始消息：先试直接 id，再走 `messageRefs.byRef` 反查 core id。
+ *
+ * 抽成一处是因为下面两个回读入口原先把这三步各写了一遍（`archive.get` → `byRef` → `archive.get`），
+ * 两处一旦只改一处，同一个块在 `decompress` 与 `search_context` 里就会解析出不同的消息集合。
+ */
+function resolveArchived(
+  state: CompressionState,
+  archive: Map<string, Message>,
+  idOrRef: string,
+): Message | undefined {
+  const direct = archive.get(idOrRef)
+  if (direct && typeof direct === 'object') return direct
+  const coreId = state.messageRefs?.byRef?.[idOrRef]
+  const viaRef = coreId ? archive.get(coreId) : undefined
+  return viaRef && typeof viaRef === 'object' ? viaRef : undefined
+}
+
+/**
+ * 一个压缩块"完整覆盖"的原始消息（按收集顺序），含 tier2/3 嵌套子块。
+ *
+ * 按**已解析的消息 id** 去重：`effectiveMessageIds` 与 `directMessageIds` 描述的是重叠的两层
+ * （前者含自身 + 子块，后者是本块直接压掉的），同一条消息可能被两个键指到 —— 重复项会让
+ * decompress 把同一段原文吐两遍，也会把 `endId` 算到错误的那条上。
+ */
+function coveredOriginalMessages(
+  state: CompressionState,
+  archive: Map<string, Message>,
+  block: CompressionBlock,
+): Message[] {
   const covered = new Set<string>()
   collectCoveredIds(state, block, covered)
-  const ids: string[] = []
+  const out: Message[] = []
+  const seen = new Set<string>()
   for (const idOrRef of covered) {
-    let orig = archive.get(idOrRef)
-    if (!orig) {
-      const raw = state.messageRefs?.byRef?.[idOrRef]
-      orig = raw ? archive.get(raw) : undefined
-    }
-    if (orig && typeof orig === 'object') ids.push(orig.id)
+    const orig = resolveArchived(state, archive, idOrRef)
+    if (!orig || seen.has(orig.id)) continue
+    seen.add(orig.id)
+    out.push(orig)
   }
-  return { startId: ids[0] ?? '', endId: ids.length > 1 ? ids[ids.length - 1] ?? '' : '' }
+  return out
+}
+
+/**
+ * 已拿到块对象时的原文回读。
+ *
+ * 与 {@link restoreBlockMessages} 分开是为了**别让内核解析两遍**：`decompress` 工具手上已经有
+ * `engine.decompress(blockId, state)` 的返回值，此前它又被 `restoreBlockMessages` 内部按 id
+ * 解析了第二次（同一份状态、同一个块，两次解析）。
+ */
+function restoreCoveredBlock(
+  state: CompressionState,
+  archive: Map<string, Message>,
+  block: CompressionBlock,
+): DecompressOutput['originalMessages'] {
+  return coveredOriginalMessages(state, archive, block).map((m) => ({
+    id: m.id,
+    role: m.role,
+    text: messageText(m),
+  }))
 }
 
 /**
@@ -2229,29 +2314,5 @@ export function restoreBlockMessages(
 ): DecompressOutput['originalMessages'] {
   const block = engine.decompress(blockId, state)
   if (!block) return []
-
-  const covered = new Set<string>()
-  collectCoveredIds(state, block, covered)
-
-  const out: DecompressOutput['originalMessages'] = []
-  const seen = new Set<string>()
-  for (const idOrRef of covered) {
-    if (seen.has(idOrRef)) continue
-    seen.add(idOrRef)
-    let orig = archive.get(idOrRef)
-    if (!orig) {
-      const raw = state.messageRefs?.byRef?.[idOrRef]
-      orig = raw ? archive.get(raw) : undefined
-    }
-    if (!orig) continue
-    const text = (orig.parts as Array<{ type?: string; text?: string; input?: unknown; result?: unknown }>)
-      .map((p) => {
-        if (p.type === 'tool') return safeString(p.result ?? p.input)
-        return p.text ?? ''
-      })
-      .filter((t) => typeof t === 'string')
-      .join('\n')
-    out.push({ id: orig.id, role: orig.role, text })
-  }
-  return out
+  return restoreCoveredBlock(state, archive, block)
 }
