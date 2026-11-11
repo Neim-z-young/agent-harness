@@ -15,7 +15,7 @@
  */
 import { defineTool, type AgentPlugin, type Hooks, type Tool } from '@harness/core'
 import { fromJsonSchema } from '@harness/tool'
-import type { GiftCard, Order, RetailDB, User, Variant } from '../types'
+import type { GiftCard, Order, RetailDB, User, UserAddress, Variant } from '../types'
 import type { ToolResult } from '@harness/tool'
 
 // ===== 基础 helpers =====
@@ -68,11 +68,75 @@ function getPaymentMethod(db: RetailDB, userId: string, paymentMethodId: string)
 }
 
 function isGiftCard(pm: unknown): pm is GiftCard {
-  return (pm as GiftCard).source === 'gift_card'
+  return typeof pm === 'object' && pm !== null && (pm as { source?: unknown }).source === 'gift_card'
 }
 
-function isPendingOrder(order: Order): boolean {
+/**
+ * 「还能改」的 pending 语义：**包含** `pending (item modified)`。
+ *
+ * 与 `cancelPendingOrder` 里的 `order.status !== 'pending'`（只认严格 pending）**故意不同**：
+ * item 被改过的订单仍可改地址 / 改支付方式，但不能取消。两处不一致是官方行为，别合并成一条判据。
+ */
+function isModifiablePending(order: Order): boolean {
   return order.status.includes('pending')
+}
+
+/**
+ * 取必填字符串参数。
+ *
+ * 原来一律写 `String(args.x)`：缺参时得到的是**字面量 `"undefined"`**，于是 `getOrder` 报
+ * "Order not found"——一句把"参数没传"说成"订单不存在"的错误文案，调用方（judge 回放 /
+ * 手工构造的轨迹）几乎无法定位。缺参必须在进入业务逻辑前就说清楚。
+ */
+function requireString(args: Record<string, unknown>, key: string): string {
+  const v = args[key]
+  if (typeof v !== 'string') throw new ToolError(`Missing or invalid argument: ${key}`)
+  return v
+}
+
+/** 取字符串数组参数；缺省按空数组（官方 schema 允许空的 item_ids 列表） */
+function stringList(args: Record<string, unknown>, key: string): string[] {
+  const v = args[key]
+  if (v === undefined || v === null) return []
+  if (!Array.isArray(v)) throw new ToolError(`Missing or invalid argument: ${key}`)
+  return v.map((x) => String(x))
+}
+
+/**
+ * 订单地址的组装（改订单地址 / 改用户地址两处共用同一份字段口径）。
+ * `address2` 允许缺省为空串（官方 docstring 写作 `''`）。
+ */
+function addressFromArgs(args: Record<string, unknown>): UserAddress {
+  return {
+    address1: requireString(args, 'address1'),
+    address2: typeof args.address2 === 'string' ? args.address2 : '',
+    city: requireString(args, 'city'),
+    state: requireString(args, 'state'),
+    country: requireString(args, 'country'),
+    zip: requireString(args, 'zip'),
+  }
+}
+
+/**
+ * 校验「请求的每个 item 都在订单里，且出现次数不超过订单里的次数」。
+ *
+ * 换货 / 改单 / 退货三处原本各写一遍同一段 `itemIds.filter(...).length > allItemIds.filter(...).length`，
+ * 且都是 O(n²)——每次循环重建两个数组。这里改为一次计数，三处共用。
+ * 错误文案由调用方传入（三处的官方英文原文本来就不同）。
+ */
+function assertItemsInOrder(
+  order: Order,
+  itemIds: string[],
+  notFoundMessage: (itemId: string) => string,
+): void {
+  const owned = new Map<string, number>()
+  for (const item of order.items) owned.set(item.item_id, (owned.get(item.item_id) ?? 0) + 1)
+  const requested = new Map<string, number>()
+  for (const itemId of itemIds) {
+    const seen = (requested.get(itemId) ?? 0) + 1
+    requested.set(itemId, seen)
+    if (seen > (owned.get(itemId) ?? 0)) throw new ToolError(notFoundMessage(itemId))
+  }
 }
 
 /** 官方 calculate 工具的表达式子集求值（数字 / + - * / ( ) / 空格，递归下降） */
@@ -115,7 +179,14 @@ export function evalMathExpression(expression: string): number {
     while (peek() === '*' || peek() === '/') {
       const op = tokens[pos++] as string
       const rhs = parsePrimary()
-      v = op === '*' ? v * rhs : v / rhs
+      if (op === '*') {
+        v = v * rhs
+      } else {
+        // 除零不抛的话会得到 Infinity，`String(Infinity)` 就是一个模型看得见却算不出数的值，
+        // 且整条链路（round2 / 结果 JSON）都不会报警。官方 Python 走 eval，同样抛错。
+        if (rhs === 0) throw new ToolError('Division by zero')
+        v = v / rhs
+      }
     }
     return v
   }
@@ -198,12 +269,7 @@ function exchangeDeliveredOrderItems(
   const order = getOrder(db, orderId)
   if (order.status !== 'delivered') throw new ToolError('Non-delivered order cannot be exchanged')
 
-  const allItemIds = order.items.map((it) => it.item_id)
-  for (const itemId of itemIds) {
-    if (itemIds.filter((x) => x === itemId).length > allItemIds.filter((x) => x === itemId).length) {
-      throw new ToolError(`Number of ${itemId} not found.`)
-    }
-  }
+  assertItemsInOrder(order, itemIds, (itemId) => `Number of ${itemId} not found.`)
   if (itemIds.length !== newItemIds.length) {
     throw new ToolError('The number of items to be exchanged should match.')
   }
@@ -243,12 +309,7 @@ function modifyPendingOrderItems(
   const order = getOrder(db, orderId)
   if (order.status !== 'pending') throw new ToolError('Non-pending order cannot be modified')
 
-  const allItemIds = order.items.map((it) => it.item_id)
-  for (const itemId of itemIds) {
-    if (itemIds.filter((x) => x === itemId).length > allItemIds.filter((x) => x === itemId).length) {
-      throw new ToolError(`${itemId} not found`)
-    }
-  }
+  assertItemsInOrder(order, itemIds, (itemId) => `${itemId} not found`)
   if (itemIds.length !== newItemIds.length) {
     throw new ToolError('The number of items to be exchanged should match')
   }
@@ -296,7 +357,7 @@ function modifyPendingOrderItems(
 
 function modifyPendingOrderPayment(db: RetailDB, orderId: string, paymentMethodId: string): Order {
   const order = getOrder(db, orderId)
-  if (!isPendingOrder(order)) throw new ToolError('Non-pending order cannot be modified')
+  if (!isModifiablePending(order)) throw new ToolError('Non-pending order cannot be modified')
 
   const paymentMethod = getPaymentMethod(db, order.user_id, paymentMethodId)
 
@@ -339,24 +400,23 @@ function returnDeliveredOrderItems(
   const order = getOrder(db, orderId)
   if (order.status !== 'delivered') throw new ToolError('Non-delivered order cannot be returned')
 
-  const user = getUser(db, order.user_id)
-  void user
+  // 官方实现同样先解析 user / payment_method（不存在即报错），只是不参与后续计算 ——
+  // 原先靠 `void user` / `void paymentMethod` 吞掉返回值，`void paymentMethod` 尤其荒谬：
+  // 下一段就真的用到它，那行纯粹是死语句。
+  getUser(db, order.user_id)
   const paymentMethod = getPaymentMethod(db, order.user_id, paymentMethodId)
-  void paymentMethod
+  const originalPayment = order.payment_history[0]
+  if (!originalPayment) {
+    // 原先是 `order.payment_history[0]!.payment_method_id` —— 空数组时抛的是
+    // "Cannot read properties of undefined (reading 'payment_method_id')"，指向的是实现细节
+    throw new ToolError('Order has no payment history')
+  }
 
-  if (
-    !isGiftCard(paymentMethod) &&
-    paymentMethodId !== order.payment_history[0]!.payment_method_id
-  ) {
+  if (!isGiftCard(paymentMethod) && paymentMethodId !== originalPayment.payment_method_id) {
     throw new ToolError('Payment method should be the original payment method')
   }
 
-  const allItemIds = order.items.map((it) => it.item_id)
-  for (const itemId of itemIds) {
-    if (itemIds.filter((x) => x === itemId).length > allItemIds.filter((x) => x === itemId).length) {
-      throw new ToolError('Some item not found')
-    }
-  }
+  assertItemsInOrder(order, itemIds, () => 'Some item not found')
 
   order.status = 'return requested'
   order.return_items = [...itemIds].sort()
@@ -376,24 +436,27 @@ export async function executeRetailTool(
   try {
     switch (name) {
       case 'calculate':
-        return { ok: true, output: String(round2(evalMathExpression(String(args.expression)))) }
+        return { ok: true, output: String(round2(evalMathExpression(requireString(args, 'expression')))) }
       case 'cancel_pending_order':
-        return { ok: true, output: cancelPendingOrder(db, String(args.order_id), String(args.reason)) }
+        return {
+          ok: true,
+          output: cancelPendingOrder(db, requireString(args, 'order_id'), requireString(args, 'reason')),
+        }
       case 'exchange_delivered_order_items':
         return {
           ok: true,
           output: exchangeDeliveredOrderItems(
             db,
-            String(args.order_id),
-            (args.item_ids as string[]) ?? [],
-            (args.new_item_ids as string[]) ?? [],
-            String(args.payment_method_id),
+            requireString(args, 'order_id'),
+            stringList(args, 'item_ids'),
+            stringList(args, 'new_item_ids'),
+            requireString(args, 'payment_method_id'),
           ),
         }
       case 'find_user_id_by_name_zip': {
-        const first = String(args.first_name).toLowerCase()
-        const last = String(args.last_name).toLowerCase()
-        const zip = String(args.zip)
+        const first = requireString(args, 'first_name').toLowerCase()
+        const last = requireString(args, 'last_name').toLowerCase()
+        const zip = requireString(args, 'zip')
         for (const [userId, user] of Object.entries(db.users)) {
           if (
             user.name.first_name.toLowerCase() === first &&
@@ -406,36 +469,30 @@ export async function executeRetailTool(
         throw new ToolError('User not found')
       }
       case 'find_user_id_by_email': {
-        const email = String(args.email).toLowerCase()
+        const email = requireString(args, 'email').toLowerCase()
         for (const [userId, user] of Object.entries(db.users)) {
           if (user.email.toLowerCase() === email) return { ok: true, output: userId }
         }
         throw new ToolError('User not found')
       }
       case 'get_order_details':
-        return { ok: true, output: getOrder(db, String(args.order_id)) }
+        return { ok: true, output: getOrder(db, requireString(args, 'order_id')) }
       case 'get_product_details':
-        return { ok: true, output: getProduct(db, String(args.product_id)) }
+        return { ok: true, output: getProduct(db, requireString(args, 'product_id')) }
       case 'get_item_details':
-        return { ok: true, output: getItem(db, String(args.item_id)) }
+        return { ok: true, output: getItem(db, requireString(args, 'item_id')) }
       case 'get_user_details':
-        return { ok: true, output: getUser(db, String(args.user_id)) }
+        return { ok: true, output: getUser(db, requireString(args, 'user_id')) }
       case 'list_all_product_types': {
         const dict: Record<string, string> = {}
         for (const p of Object.values(db.products)) dict[p.name] = p.product_id
-        return { ok: true, output: JSON.stringify(Object.keys(dict).sort().reduce<Record<string, string>>((acc, k) => { acc[k] = dict[k]!; return acc }, {})) }
+        const sorted = Object.fromEntries(Object.keys(dict).sort().map((k) => [k, dict[k]!]))
+        return { ok: true, output: JSON.stringify(sorted) }
       }
       case 'modify_pending_order_address': {
-        const order = getOrder(db, String(args.order_id))
-        if (!isPendingOrder(order)) throw new ToolError('Non-pending order cannot be modified')
-        order.address = {
-          address1: String(args.address1),
-          address2: String(args.address2 ?? ''),
-          city: String(args.city),
-          state: String(args.state),
-          country: String(args.country),
-          zip: String(args.zip),
-        }
+        const order = getOrder(db, requireString(args, 'order_id'))
+        if (!isModifiablePending(order)) throw new ToolError('Non-pending order cannot be modified')
+        order.address = addressFromArgs(args)
         return { ok: true, output: order }
       }
       case 'modify_pending_order_items':
@@ -443,24 +500,24 @@ export async function executeRetailTool(
           ok: true,
           output: modifyPendingOrderItems(
             db,
-            String(args.order_id),
-            (args.item_ids as string[]) ?? [],
-            (args.new_item_ids as string[]) ?? [],
-            String(args.payment_method_id),
+            requireString(args, 'order_id'),
+            stringList(args, 'item_ids'),
+            stringList(args, 'new_item_ids'),
+            requireString(args, 'payment_method_id'),
           ),
         }
       case 'modify_pending_order_payment':
-        return { ok: true, output: modifyPendingOrderPayment(db, String(args.order_id), String(args.payment_method_id)) }
-      case 'modify_user_address': {
-        const user = getUser(db, String(args.user_id))
-        user.address = {
-          address1: String(args.address1),
-          address2: String(args.address2 ?? ''),
-          city: String(args.city),
-          state: String(args.state),
-          country: String(args.country),
-          zip: String(args.zip),
+        return {
+          ok: true,
+          output: modifyPendingOrderPayment(
+            db,
+            requireString(args, 'order_id'),
+            requireString(args, 'payment_method_id'),
+          ),
         }
+      case 'modify_user_address': {
+        const user = getUser(db, requireString(args, 'user_id'))
+        user.address = addressFromArgs(args)
         return { ok: true, output: user }
       }
       case 'return_delivered_order_items':
@@ -468,9 +525,9 @@ export async function executeRetailTool(
           ok: true,
           output: returnDeliveredOrderItems(
             db,
-            String(args.order_id),
-            (args.item_ids as string[]) ?? [],
-            String(args.payment_method_id),
+            requireString(args, 'order_id'),
+            stringList(args, 'item_ids'),
+            requireString(args, 'payment_method_id'),
           ),
         }
       case 'transfer_to_human_agents':
@@ -486,13 +543,15 @@ export async function executeRetailTool(
 // ===== harness 工具包装（defineTool + fromJsonSchema）=====
 // 描述与参数描述保持官方 docstring 英文原文。
 
-type ToolSpec = {
+type ToolSpecInit = {
   name: RetailToolName
   description: string
   schema: Record<string, { type: 'string' | 'number' | 'boolean' | 'array' | 'object'; description: string; items?: { type: 'string' } }>
   required: string[]
-  readOnly: boolean
 }
+
+/** spec + 派生出的只读性（不手写，见 `TOOL_SPECS`） */
+type ToolSpec = ToolSpecInit & { readOnly: boolean }
 
 /** 官方 docstring 里反复出现的 id 提示，抽出复用（与原文一致） */
 const ORDER_ID_DESC =
@@ -500,7 +559,7 @@ const ORDER_ID_DESC =
 const PAYMENT_METHOD_ID_DESC =
   "The payment method id to pay or receive refund for the item price difference, such as 'gift_card_0000000' or 'credit_card_0000000'. These can be looked up from the user or order details."
 
-const TOOL_SPECS: ToolSpec[] = [
+const TOOL_SPEC_LITERALS: ToolSpecInit[] = [
   {
     name: 'calculate',
     description:
@@ -513,7 +572,6 @@ const TOOL_SPECS: ToolSpec[] = [
       },
     },
     required: ['expression'],
-    readOnly: true,
   },
   {
     name: 'cancel_pending_order',
@@ -527,7 +585,6 @@ const TOOL_SPECS: ToolSpec[] = [
       },
     },
     required: ['order_id', 'reason'],
-    readOnly: false,
   },
   {
     name: 'exchange_delivered_order_items',
@@ -549,7 +606,6 @@ const TOOL_SPECS: ToolSpec[] = [
       payment_method_id: { type: 'string', description: PAYMENT_METHOD_ID_DESC },
     },
     required: ['order_id', 'item_ids', 'new_item_ids', 'payment_method_id'],
-    readOnly: false,
   },
   {
     name: 'find_user_id_by_name_zip',
@@ -561,7 +617,6 @@ const TOOL_SPECS: ToolSpec[] = [
       zip: { type: 'string', description: "The zip code of the customer, such as '12345'." },
     },
     required: ['first_name', 'last_name', 'zip'],
-    readOnly: true,
   },
   {
     name: 'find_user_id_by_email',
@@ -571,14 +626,12 @@ const TOOL_SPECS: ToolSpec[] = [
       email: { type: 'string', description: "The email of the user, such as 'something@example.com'." },
     },
     required: ['email'],
-    readOnly: true,
   },
   {
     name: 'get_order_details',
     description: 'Get the status and details of an order.',
     schema: { order_id: { type: 'string', description: ORDER_ID_DESC } },
     required: ['order_id'],
-    readOnly: true,
   },
   {
     name: 'get_product_details',
@@ -590,7 +643,6 @@ const TOOL_SPECS: ToolSpec[] = [
       },
     },
     required: ['product_id'],
-    readOnly: true,
   },
   {
     name: 'get_item_details',
@@ -602,14 +654,12 @@ const TOOL_SPECS: ToolSpec[] = [
       },
     },
     required: ['item_id'],
-    readOnly: true,
   },
   {
     name: 'get_user_details',
     description: 'Get the details of a user, including their orders.',
     schema: { user_id: { type: 'string', description: "The user id, such as 'sara_doe_496'." } },
     required: ['user_id'],
-    readOnly: true,
   },
   {
     name: 'list_all_product_types',
@@ -617,7 +667,6 @@ const TOOL_SPECS: ToolSpec[] = [
       'List the name and product id of all product types. Each product type has a variety of different items with unique item ids and options. There are only 50 product types in the store.',
     schema: {},
     required: [],
-    readOnly: true,
   },
   {
     name: 'modify_pending_order_address',
@@ -633,7 +682,6 @@ const TOOL_SPECS: ToolSpec[] = [
       zip: { type: 'string', description: "The zip code, such as '12345'." },
     },
     required: ['order_id', 'address1', 'address2', 'city', 'state', 'country', 'zip'],
-    readOnly: false,
   },
   {
     name: 'modify_pending_order_items',
@@ -655,7 +703,6 @@ const TOOL_SPECS: ToolSpec[] = [
       payment_method_id: { type: 'string', description: PAYMENT_METHOD_ID_DESC },
     },
     required: ['order_id', 'item_ids', 'new_item_ids', 'payment_method_id'],
-    readOnly: false,
   },
   {
     name: 'modify_pending_order_payment',
@@ -666,7 +713,6 @@ const TOOL_SPECS: ToolSpec[] = [
       payment_method_id: { type: 'string', description: PAYMENT_METHOD_ID_DESC },
     },
     required: ['order_id', 'payment_method_id'],
-    readOnly: false,
   },
   {
     name: 'modify_user_address',
@@ -682,7 +728,6 @@ const TOOL_SPECS: ToolSpec[] = [
       zip: { type: 'string', description: "The zip code, such as '12345'." },
     },
     required: ['user_id', 'address1', 'address2', 'city', 'state', 'country', 'zip'],
-    readOnly: false,
   },
   {
     name: 'return_delivered_order_items',
@@ -698,7 +743,6 @@ const TOOL_SPECS: ToolSpec[] = [
       payment_method_id: { type: 'string', description: PAYMENT_METHOD_ID_DESC },
     },
     required: ['order_id', 'item_ids', 'payment_method_id'],
-    readOnly: false,
   },
   {
     name: 'transfer_to_human_agents',
@@ -708,9 +752,21 @@ const TOOL_SPECS: ToolSpec[] = [
       summary: { type: 'string', description: 'A summary of the user\'s issue.' },
     },
     required: ['summary'],
-    readOnly: true,
   },
 ]
+
+/**
+ * 只读性**唯一来源**是 `MUTATES_STATE_TOOLS`。
+ *
+ * 原先 16 条 spec 各手写一遍 `readOnly`，与那个集合构成两个口径；漂移不会报错，
+ * 而是让 `buildRetailHarnessTools` 把写工具标成只读（`isReadOnly` / `isConcurrencySafe`
+ * 都从它派生）——judge 回放会跳过写工具、并发调度会把改 DB 的工具当安全并发执行。
+ * 派生后两者在结构上不可能不一致。
+ */
+const TOOL_SPECS: ToolSpec[] = TOOL_SPEC_LITERALS.map((spec) => ({
+  ...spec,
+  readOnly: !MUTATES_STATE_TOOLS.has(spec.name),
+}))
 
 /** 构造 harness 工具集（闭包持有 DB，工具执行即操作该 DB 实例） */
 export function buildRetailHarnessTools(db: RetailDB): Tool[] {
