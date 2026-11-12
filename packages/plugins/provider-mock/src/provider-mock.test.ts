@@ -295,6 +295,50 @@ describe('@harness/provider-mock', () => {
       await h.stop()
     })
 
+    it('agent 白名单过滤后的工具真的传到了 provider', async () => {
+      // 这条链路此前**无法断言**：mock 的入参类型里没有 `tools`，收不到也不记录。
+      // 结果是"白名单 → provider 载荷"这一段全仓没有一个端到端观察点 —— 引擎若把
+      // 全量注册表（而不是该 agent 可用的那份）发出去，也不会有任何用例变红。
+      const schemaAny: Schema<any> = {
+        parse: (v) => v as any,
+        safeParse: (v) => ({ success: true, data: v as any }),
+      }
+      const noiseTool = defineTool({
+        id: 'noise',
+        description: '不在该 agent 白名单内，不应出现在 provider 工具列表里',
+        inputSchema: schemaAny,
+        isReadOnly: () => true,
+        async call() {
+          return { ok: true, output: {} }
+        },
+      })
+      const ToolPlugin: AgentPlugin = {
+        id: 'tools', version: '1', name: 'Tools',
+        async install() {
+          return {
+            async 'core.tool.pool.assemble'(_i, pool: any) {
+              pool.add(createEchoTool())
+              pool.add(noiseTool)
+            },
+          } as Hooks
+        },
+      }
+      const mockPlugin = createProviderMockPlugin({ defaultResponse: 'ok' })
+
+      const h = await createHarness({
+        internalPlugins: [mockPlugin, ToolPlugin],
+        agents: [makeAgent({ tools: ['echo'] })],
+        permission: new DefaultPermissionEngine({ '*': 'allow' }),
+      })
+      await h.start()
+      const sess = await h.session.create()
+      await h.agent.query({ sessionId: sess.id, message: '你好' })
+
+      const seen = mockPlugin.provider.calls.at(-1)?.tools
+      expect(seen?.map((t) => t.id)).toStrictEqual(['echo'])
+      await h.stop()
+    })
+
     it('直接使用 providerMockPlugin 常量（默认配置）', async () => {
       const h = await createHarness({
         internalPlugins: [providerMockPlugin],
@@ -355,6 +399,177 @@ describe('usageSequence（逐轮用量）', () => {
       const r = await p.complete({ providerId: 'mock', messages: msgs, params: {} })
       expect(r.tokenUsage!.input).toBe(42)
       expect(r.tokenUsage!.cacheRead).toBe(40)
+    }
+  })
+})
+
+// ==========================================================================
+// 测试替身的**保真度**：这些断言守的是"mock 与真实 provider 契约不漂移"，
+// 不是 mock 自己的产品功能。mock 被 core/cli/a2a-server/tools-builtin/bench/host
+// 共用，任何一处漂移都会让下游用例在"看起来在测"的状态下测不到东西。
+// ==========================================================================
+
+describe('契约保真度', () => {
+  const msgs = (t: string): Message[] => [
+    { id: 'm1', role: 'user', parts: [{ type: 'text', text: t }], createdAt: 1 },
+  ]
+
+  it('带 g / y 标志的正则：每次调用都命中（不复用 lastIndex）', async () => {
+    // 回归：`/hello/g` 的 test() 会推进 lastIndex，第二次从上次位置继续 ⇒ 交替 命中/落空。
+    const p = new MockChatProvider({
+      defaultResponse: 'MISS',
+      responses: [
+        { match: /hello/g, response: 'HIT_G' },
+        { match: /world/y, response: 'HIT_Y' },
+      ],
+    })
+    for (let i = 0; i < 3; i++) {
+      const g = await p.complete({ providerId: 'mock', messages: msgs('say hello'), params: {} })
+      expect(g.content).toBe('HIT_G')
+      const y = await p.complete({ providerId: 'mock', messages: msgs('world peace'), params: {} })
+      expect(y.content).toBe('HIT_Y')
+    }
+  })
+
+  it('记录引擎传来的 tools（区分「没传」与「传了空数组」）', async () => {
+    const tool = createEchoTool()
+    const p = new MockChatProvider()
+
+    await p.complete({ providerId: 'mock', messages: msgs('a'), params: {}, tools: [tool] })
+    await p.complete({ providerId: 'mock', messages: msgs('a'), params: {}, tools: [] })
+    await p.complete({ providerId: 'mock', messages: msgs('a'), params: {} })
+
+    expect(p.calls[0].tools?.map((t) => t.id)).toStrictEqual(['echo'])
+    // 三者必须各不相同：[] 是"白名单一个都不允许"，undefined 是"这条链路没人传"
+    expect(p.calls[1].tools).toStrictEqual([])
+    expect(p.calls[2].tools).toBeUndefined()
+  })
+
+  it('记录命中的规则下标；未命中时为 undefined', async () => {
+    const p = new MockChatProvider({
+      defaultResponse: '默认',
+      responses: [
+        { match: 'alpha', response: 'A' },
+        { match: 'beta', response: 'B' },
+      ],
+    })
+    await p.complete({ providerId: 'mock', messages: msgs('alpha'), params: {} })
+    await p.complete({ providerId: 'mock', messages: msgs('beta'), params: {} })
+    await p.complete({ providerId: 'mock', messages: msgs('gamma'), params: {} })
+
+    expect(p.calls[0].matchedRuleIndex).toBe(0)
+    expect(p.calls[1].matchedRuleIndex).toBe(1)
+    expect(p.calls[2].matchedRuleIndex).toBeUndefined()
+  })
+
+  it('同一条 user 消息的多个 text part 都参与匹配', async () => {
+    // 只取第一个 text part 时，关键词落在第二段上 ⇒ 静默走默认响应。
+    const p = new MockChatProvider({
+      defaultResponse: '默认',
+      responses: [{ match: 'beta-gamma', response: 'HIT' }],
+    })
+    const r = await p.complete({
+      providerId: 'mock',
+      messages: [{
+        id: 'm1',
+        role: 'user',
+        parts: [{ type: 'text', text: 'alpha' }, { type: 'text', text: 'beta-gamma' }],
+        createdAt: 1,
+      }],
+      params: {},
+    })
+    expect(r.content).toBe('HIT')
+  })
+
+  it('delayMs 期间被中断 ⇒ 立即抛 AbortError，不等满延迟、不记录调用', async () => {
+    const p = new MockChatProvider({ delayMs: 500 })
+    const ac = new AbortController()
+    setTimeout(() => ac.abort(), 20)
+
+    const start = Date.now()
+    let caught: unknown
+    try {
+      await p.complete({ providerId: 'mock', messages: msgs('a'), params: {}, signal: ac.signal })
+    } catch (e) {
+      caught = e
+    }
+    const elapsed = Date.now() - start
+
+    // 名字是契约：core 的 isAbortError 只认 'AbortError' / 'TimeoutError'
+    expect((caught as { name?: string } | undefined)?.name).toBe('AbortError')
+    expect(elapsed).toBeLessThan(300)   // 远早于 500ms 延迟
+    expect(p.calls).toHaveLength(0)
+  })
+
+  it('传入已中断的 signal ⇒ 一个 chunk 都不发', async () => {
+    const p = new MockChatProvider({ delayMs: 0, defaultResponse: 'hi.' })
+    const ac = new AbortController()
+    ac.abort()
+
+    let caught: unknown
+    const chunks: unknown[] = []
+    try {
+      for await (const ch of p.stream({ providerId: 'mock', messages: msgs('a'), params: {}, signal: ac.signal })) {
+        chunks.push(ch)
+      }
+    } catch (e) {
+      caught = e
+    }
+    expect((caught as { name?: string } | undefined)?.name).toBe('AbortError')
+    expect(chunks).toHaveLength(0)
+  })
+
+  it('流式过程中被中断 ⇒ 抛 AbortError 且不发 done', async () => {
+    // 少了这条，"per-chunk 检查 signal" 就只被"起始已中断"那条覆盖 —— 而那条是被 delay() 的
+    // 前置检查拦下的，把 guard() 整个删掉也不会变红。
+    const p = new MockChatProvider({ defaultResponse: 'one two three four' })
+    const ac = new AbortController()
+
+    let text = ''
+    let sawDone = false
+    let caught: unknown
+    try {
+      for await (const ch of p.stream({ providerId: 'mock', messages: msgs('a'), params: {}, signal: ac.signal })) {
+        if (ch.type === 'text_delta') {
+          text += ch.text
+          ac.abort()               // 收到第一段就取消
+        }
+        if (ch.type === 'done') sawDone = true
+      }
+    } catch (e) {
+      caught = e
+    }
+
+    expect((caught as { name?: string } | undefined)?.name).toBe('AbortError')
+    expect(sawDone).toBe(false)
+    expect(text.length).toBeGreaterThan(0)   // 半截文本确实产出过
+  })
+
+  it('complete 与 stream 对同一配置给出逐位一致的 content / model / usage / finish', async () => {
+    // 两条路径曾各内联一份"取 turn + 组用量 + 算 finish"，改一侧忘另一侧就会静默分叉。
+    type Case = { name: string; config: MockProviderConfig; text: string }
+    const cases: Case[] = [
+      { name: '默认响应', config: { defaultResponse: '默认文案', model: 'm0' }, text: 'x' },
+      { name: '规则命中 + 缓存用量', config: { tokenUsage: { input: 9, output: 4, cacheRead: 7, cacheWrite: 3 }, responses: [{ match: 'k', response: 'K', model: 'm1' }] }, text: 'k' },
+      { name: '工具调用', config: { responses: [{ match: 'k', response: 'K', toolCalls: [{ toolUseId: 't1', toolId: 'echo', input: { m: 1 } }] }] }, text: 'k' },
+    ]
+
+    for (const c of cases) {
+      const pc = new MockChatProvider(c.config)
+      const ps = new MockChatProvider(c.config)
+      const done = await pc.complete({ providerId: 'mock', messages: msgs(c.text), params: {} })
+
+      let streamed = ''
+      let last: { model?: string; tokenUsage?: unknown; finish?: string } | undefined
+      for await (const ch of ps.stream({ providerId: 'mock', messages: msgs(c.text), params: {} })) {
+        if (ch.type === 'text_delta') streamed += ch.text
+        if (ch.type === 'done') last = ch
+      }
+
+      expect(streamed).toBe(done.content)
+      expect(last?.model).toBe(done.model)
+      expect(last?.tokenUsage).toStrictEqual(done.tokenUsage)
+      expect(last?.finish).toBe(done.finish)
     }
   })
 })
