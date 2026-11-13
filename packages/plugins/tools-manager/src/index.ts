@@ -12,7 +12,14 @@
  *   /tools <toolId> --global on|off # 作用域 B：全局工具池运行时 register/unregister（本轮进程生效）
  *
  * 作用域 A 依赖 cli 注入的 setAgentTools（写 config.json 的 agents[].tools + 即时覆盖运行时）；
- * 作用域 B 在插件内部缓存被卸载的 Tool 以便 on 时恢复。
+ * 作用域 B 在插件内部缓存被卸载的 Tool 以便 on 时恢复；插件 uninstall 时把缓存里的工具
+ * 还回注册池 —— 否则"本轮进程生效"会变成"直到重启"。
+ *
+ * 三个刻意的拒绝（都不是静默忽略）：
+ *   · 未知选项（`--nope`）⇒ 直接报"未知选项"，不当成 toolId 去查（写错一个字母时提示才有用）
+ *   · `mcp__` 工具 + `--global` ⇒ 拒绝：它的启停是写入 config.json 的 server 级掩码（跨进程持久），
+ *     与 `--global` 的"进程级、易失"语义相反
+ *   · `<toolId> on` 且 id 既未注册也不在内置元信息里 ⇒ 拒绝，不把拼错的 id 写进 config.json
  */
 
 import type { CliCommandInput, AgentPlugin, Hooks, ToolMetaEntry, ToolMetaLookup } from '@harness/plugin'
@@ -53,10 +60,20 @@ type ToolsCtx = Omit<CliCommandInput, 'harness'> & {
 
 const FLAGS = new Set(['--all', '--json', '--global'])
 
+/** 通配白名单字面量（`tools: ['*']` = 全部允许），冻结以免被调用方就地改写 */
+const WILDCARD_WHITELIST: readonly string[] = Object.freeze(['*'])
+
 /**
- * MCP 工具 id → { server, tool }。走 @harness/tool 的共享解析：优先用
- * globalMcpToolIndex 精确反解（server 名可含 __），未登记时回退启发式切分。
+ * `tools: ['*']` 的唯一判据。
+ * 全文件曾有 3 处手写同一个表达式（列表视图 / 状态列 / 命令分支），
+ * 只要有一处漏改，就会出现「列表说全部允许、off 却按显式白名单删」这类自相矛盾。
  */
+function isWildcardWhitelist(list: readonly string[]): boolean {
+  return list.length === 1 && list[0] === '*'
+}
+
+/** MCP 工具 id → { server, tool }。走 @harness/tool 的共享解析：优先用
+ * globalMcpToolIndex 精确反解（server 名可含 __），未登记时回退启发式切分。 */
 function mcpToolOf(id: string): { server: string; tool: string } | undefined {
   return resolveMcpTool(id, globalMcpToolIndex)
 }
@@ -75,21 +92,33 @@ function isMetaEntry(t: Tool | ToolMetaEntry): t is ToolMetaEntry {
   return !('call' in t)
 }
 
+/** 当前 Agent 的白名单（缺省 = 全部允许）。全文件唯一取白名单的入口 —— 4 处曾各写一遍 `?? ['*']` */
+function agentWhitelist(inp: ToolsCtx): readonly string[] {
+  return inp.harness.agent.get(inp.agentId)?.tools ?? WILDCARD_WHITELIST
+}
+
 /** 合并「已加载运行时工具 + 内置静态元信息兜底」：未加载的内置工具也能展示，标记 (meta) */
 function unionTools(loaded: Tool[], meta: ToolMetaLookup | undefined): Array<Tool | ToolMetaEntry> {
-  const seen = new Set<string>()
-  const result: Array<Tool | ToolMetaEntry> = []
-  for (const t of loaded) {
-    result.push(t)
-    seen.add(t.id)
-  }
-  for (const m of meta?.list() ?? []) {
-    if (!seen.has(m.id)) {
-      result.push(m)
-      seen.add(m.id)
-    }
-  }
+  const result: Array<Tool | ToolMetaEntry> = [...loaded]
+  appendUnseen(result, meta?.list() ?? [])
   return result
+}
+
+/**
+ * 按 id 去重追加：`candidates` 中未被现有 id 覆盖的项补到末尾（保持传入顺序）。
+ * 两处（{@link unionTools} 与 {@link agentUsableEntries} 的显式白名单分支）曾各手写一遍
+ * seen 集合循环，重复实现的下场是其中一处忘了 `seen.add` 就会重复出行。
+ */
+function appendUnseen(
+  target: Array<Tool | ToolMetaEntry>,
+  candidates: Iterable<Tool | ToolMetaEntry>,
+): void {
+  const seen = new Set(target.map((x) => x.id))
+  for (const c of candidates) {
+    if (seen.has(c.id)) continue
+    target.push(c)
+    seen.add(c.id)
+  }
 }
 
 /**
@@ -103,11 +132,11 @@ function unionTools(loaded: Tool[], meta: ToolMetaLookup | undefined): Array<Too
  */
 function agentAllowedTools(inp: ToolsCtx): Tool[] {
   const def = inp.harness.agent.get(inp.agentId)
-  const whitelist = def?.tools ?? ['*']
+  const whitelist = agentWhitelist(inp)
   // `tools: []`（"一个都不给"）是绝对逃生口，连 MCP 供给一并关掉 —— 与 core 装配同一判据
   if (whitelist.length === 0) return []
   return supplyMcpTools(
-    inp.harness.tools.filterByWhitelist(whitelist),
+    inp.harness.tools.filterByWhitelist(whitelist as string[] | ['*']),
     inp.harness.tools.list(),
     def?.mcpServers,
     def?.excludeMcpServers,
@@ -126,60 +155,66 @@ function agentAllowedIds(inp: ToolsCtx): Set<string> {
  * 这样 /tools 列表在懒加载期间也能完整呈现 Agent 可用工具及其描述/状态。
  */
 function agentUsableEntries(inp: ToolsCtx): Array<Tool | ToolMetaEntry> {
-  const harness = inp.harness
-  const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
-  const wildcard = agentTools.length === 1 && agentTools[0] === '*'
+  const agentTools = agentWhitelist(inp)
   const loaded = agentAllowedTools(inp)
-  if (wildcard) return unionTools(loaded, inp.toolMeta)   // 全允许：补全部静态元信息
   const meta = inp.toolMeta
+  // 全允许：补全部静态元信息
+  if (isWildcardWhitelist(agentTools)) return unionTools(loaded, meta)
   if (!meta) return loaded
   const result: Array<Tool | ToolMetaEntry> = [...loaded]
-  const seen = new Set(result.map((x) => x.id))
-  for (const id of agentTools) {
-    if (id === '*' || seen.has(id)) continue
+  appendUnseen(result, agentTools.flatMap((id) => {
     const m = meta.get(id)
-    if (m) { result.push(m); seen.add(id) }
-  }
+    return m ? [m] : []
+  }))
   return result
 }
 
-/** 从运行时 Tool 或静态元信息归一化出权限键 */
-function permKeyOf(t: Tool | ToolMetaEntry): string {
-  const asTool = t as Tool
-  const key = (asTool as { permission?: { key?: string } }).permission?.key ?? (t as ToolMetaEntry).permissionKey
-  return key ?? '-'
+/**
+ * 权限键（未声明 = undefined）。
+ * 运行时 Tool 放在 `permission.key`，静态元信息放在顶层 `permissionKey` —— 两个来源必须在这里
+ * 合流；`--json` 曾自己取 `permission?.key`，于是「表格里有权限键、JSON 里字段直接消失」。
+ */
+function permissionKeyOf(t: Tool | ToolMetaEntry): string | undefined {
+  // 两侧都用断言取：联合类型上直接读 `permissionKey` 不成立（Tool 不声明该字段），
+  // 而 `isMetaEntry()` 的类型谓词会把另一支收窄成 never —— 断言比"看似更类型安全"的写法可靠。
+  return (t as Tool).permission?.key ?? (t as ToolMetaEntry).permissionKey
 }
 
-/** 是否已加载运行时实现（false = 仅静态元信息占位） */
-function entryLoaded(t: Tool | ToolMetaEntry): boolean {
-  return !isMetaEntry(t)
+/** 权限键的展示形态（缺省用 `-` 占位，避免表格列错位） */
+function permKeyOf(t: Tool | ToolMetaEntry): string {
+  return permissionKeyOf(t) ?? '-'
 }
 
 /**
  * 状态串：启用/禁用（相对当前 Agent 白名单）+ 加载状态（已加载 / 仅元信息）。
  * 未加载的元信息占位：仅在 Agent 白名单为通配 *（或显式列出）时视为启用，否则为禁用。
  * `allowedIds` 由 {@link agentAllowedIds} 一次算好传入 —— 已加载的工具必须用它判，
- * 才能与 core 的装配判据（含 MCP server 供给）保持一致。
+ * 才能与 core 的装配判据（含 MCP server 供给）保持一致；`wildcard` 同样由调用方算一次，
+ * 否则每行都要重新取一次 agent 定义（表长 n 就是 n 次）。
  */
-function entryStatus(inp: ToolsCtx, t: Tool | ToolMetaEntry, allowedIds: Set<string>): string {
-  const agentTools = inp.harness.agent.get(inp.agentId)?.tools ?? ['*']
-  const wildcard = agentTools.length === 1 && agentTools[0] === '*'
-  const loaded = entryLoaded(t)
-  const enabled = isMetaEntry(t)
-    ? (wildcard || agentTools.includes(t.id))            // 未加载的占位只能按显式白名单判
+function entryStatus(
+  t: Tool | ToolMetaEntry,
+  allowedIds: Set<string>,
+  whitelist: readonly string[],
+  wildcard: boolean,
+): string {
+  const metaOnly = isMetaEntry(t)
+  const enabled = metaOnly
+    ? (wildcard || whitelist.includes(t.id))              // 未加载的占位只能按显式白名单判
     : allowedIds.has(t.id)                               // 已加载 ⇒ 与装配同源
-  const en = enabled ? '启用' : '禁用'
-  const ld = loaded ? '已加载' : '仅元信息'
-  return [en, ld].join('·')
+  return `${enabled ? '启用' : '禁用'}·${metaOnly ? '仅元信息' : '已加载'}`
 }
 
 /** 渲染工具表格：ID | 元信息(描述) | 权限键 | 状态（启用·加载·安全） */
 function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>, mcpDownServer?: Set<string>): string {
   const allowedIds = agentAllowedIds(inp)
+  // 白名单与通配判定各算一次：entryStatus 逐行再取一次 agent 定义是纯重复 I/O
+  const whitelist = agentWhitelist(inp)
+  const wildcard = isWildcardWhitelist(whitelist)
   const rows = entries.map((t) => {
     const { readOnly, destructive, concurrent } = entryFlags(t)
     const safety = [...(readOnly ? ['只读'] : []), ...(destructive ? ['危险'] : []), ...(concurrent === false ? ['非并发'] : [])]
-    const base = entryStatus(inp, t, allowedIds)
+    const base = entryStatus(t, allowedIds, whitelist, wildcard)
     let status = safety.length ? `${base}·${safety.join(',')}` : base
     if (t.id.startsWith('mcp__')) {
       // MCP 场景化工具：标注来源 server；server 已被 /mcp 禁用时状态改为「禁用」并额外标注
@@ -201,14 +236,14 @@ function renderToolTable(inp: ToolsCtx, entries: Array<Tool | ToolMetaEntry>, mc
   return lines.join('\n')
 }
 
-/** 详情视图的安全声明文本 */
+/** 详情视图的安全声明文本（首项恒为 只读/可写，故不存在"全空"情形） */
 function formatSafety(t: Tool | ToolMetaEntry): string {
   const { readOnly, destructive, concurrent } = entryFlags(t)
   return [
     readOnly ? '只读' : '可写',
     destructive ? '危险' : '',
     concurrent === false ? '非并发' : '',
-  ].filter(Boolean).join(' / ') || '-'
+  ].filter(Boolean).join(' / ')
 }
 
 /** 详情视图：优先运行时工具；未加载则回退内置静态元信息（并标注） */
@@ -247,6 +282,21 @@ export function createToolsManagerPlugin(): AgentPlugin {
   const offs: Unsubscribe[] = []
   /** 已被 /mcp 禁用的 server（用于 /tools 列表标注 mcp 工具来自的 server 不可用） */
   const disabledMcpServers = new Set<string>()
+  /**
+   * 最近一条命令看到的工具池。`--global off` 的语义是「本轮进程生效」，插件被卸载时
+   * 本轮就结束了 —— 若不在这里恢复，`suspended` 会跟着实例一起消失，注册池永久少一个工具，
+   * 用户只能重启进程才能拿回来（文档承诺的"本轮"变成了"直到重启"）。
+   */
+  let toolsRegistry: HarnessView['tools'] | undefined
+
+  /** 发布 tool.enabled / tool.disabled 的唯一入口（此前 6 处各写一遍同样的 payload 与 source） */
+  async function emitToolLifecycle(id: string, agentId: string, enabled: boolean): Promise<void> {
+    await bus?.publish(
+      enabled ? LifecycleEvents.toolEnabled : LifecycleEvents.toolDisabled,
+      { id, agentId },
+      { source: 'tools-manager' },
+    )
+  }
 
   /** 判定某工具是否来自「已被 /mcp 禁用的 server」 */
   function mcpServerDown(t: Tool | ToolMetaEntry): boolean {
@@ -265,10 +315,13 @@ export function createToolsManagerPlugin(): AgentPlugin {
     const list = [...(inp.mcpServers ?? [])]
     const entry = list.find((s) => s.name === m.server)
     if (!entry) return `未知 MCP server："${m.server}"（用 /mcp servers 查看）。`
+    // `setMcpServers` 是可选注入：宿主没给就只能空转。此前 `await inp.setMcpServers?.(…)`
+    // 会成功返回 undefined，于是命令照样打印"已写入 config.json" —— 用户以为改生效了，重启才发现没变。
+    if (!inp.setMcpServers) return '当前宿主未提供 config.json 写入能力，无法持久化 MCP 工具掩码（本次未做任何改动）。'
     const tools = { ...(entry.tools ?? {}) }
     if (isOn) delete tools[m.tool]
     else tools[m.tool] = false
-    await inp.setMcpServers?.([...list.map((s) => (s.name === m.server ? { ...s, tools } : s))])
+    await inp.setMcpServers([...list.map((s) => (s.name === m.server ? { ...s, tools } : s))])
     return undefined
   }
 
@@ -287,7 +340,17 @@ export function createToolsManagerPlugin(): AgentPlugin {
       const inp = input as ToolsCtx
       try {
         const { out, harness } = inp
+        // 记下工具池：uninstall 时靠它把 `--global off` 卸下的工具还回去（见 toolsRegistry 注释）
+        toolsRegistry = harness.tools
         const tokens = inp.arg.trim().split(/\s+/).filter(Boolean)
+        // 未知选项必须在解析阶段拦下：以前 `--nope` 会被当成工具 id，
+        // 用户写错一个字母，得到的是「工具 "--nope" 未找到（先看 /tools --all 确认 id）」——
+        // 把人指向一个根本不存在的地方，比什么都不说更糟。
+        const unknownOpts = tokens.filter((t) => t.startsWith('-') && !FLAGS.has(t))
+        if (unknownOpts.length) {
+          out(`未知选项：${unknownOpts.join(' ')}（支持 ${[...FLAGS].join(' / ')}）。\n`)
+          return
+        }
         const hasAll = tokens.includes('--all')
         const hasJson = tokens.includes('--json')
         const isGlobal = tokens.includes('--global')
@@ -299,21 +362,27 @@ export function createToolsManagerPlugin(): AgentPlugin {
             // 合并未加载的运行时工具：以内置静态元信息兜底，保证懒加载时也能看到全部内置工具
             const all = unionTools(harness.tools.list(), inp.toolMeta)
             if (hasJson) {
-              out(JSON.stringify(all.map((t) => ({
-                id: t.id, description: t.description, aliases: t.aliases,
-                isReadOnly: t.isReadOnly ? (typeof t.isReadOnly === 'function' ? (t as Tool).isReadOnly?.(undefined) ?? false : t.isReadOnly) : false,
-                isDestructive: t.isDestructive ? (typeof t.isDestructive === 'function' ? (t as Tool).isDestructive?.(undefined) ?? false : t.isDestructive) : false,
-                isConcurrencySafe: t.isConcurrencySafe ? (typeof t.isConcurrencySafe === 'function' ? (t as Tool).isConcurrencySafe?.(undefined) ?? false : t.isConcurrencySafe) : false,
-                permissionKey: (t as { permission?: { key?: string } }).permission?.key,
-              })), null, 2) + '\n')
+              // 三个安全位与权限键都走 entryFlags / permissionKeyOf —— 这段曾经手抄一遍三元链，
+              // 结果只有它丢了 permissionKey 的 meta 回退（表格显示 read、JSON 里字段直接消失）。
+              out(JSON.stringify(all.map((t) => {
+                const { readOnly, destructive, concurrent } = entryFlags(t)
+                return {
+                  id: t.id,
+                  description: t.description,
+                  aliases: t.aliases,
+                  isReadOnly: readOnly,
+                  isDestructive: destructive,
+                  isConcurrencySafe: concurrent,
+                  permissionKey: permissionKeyOf(t),
+                }
+              }), null, 2) + '\n')
             } else {
               out(`全局注册 ${all.length} 个工具（含未加载的静态元信息）：\n${renderToolTable(inp, all, disabledMcpServers)}\n`)
             }
             return
           }
-          const agentTools = harness.agent.get(inp.agentId)?.tools ?? ['*']
           const usable = agentUsableEntries(inp)
-          out(`Agent「${inp.agentId}」可用工具（白名单：${formatToolWhitelist(agentTools)}）：\n${renderToolTable(inp, usable, disabledMcpServers)}\n`)
+          out(`Agent「${inp.agentId}」可用工具（白名单：${formatToolWhitelist([...agentWhitelist(inp)])}）：\n${renderToolTable(inp, usable, disabledMcpServers)}\n`)
           return
         }
 
@@ -329,6 +398,14 @@ export function createToolsManagerPlugin(): AgentPlugin {
 
         // MCP 场景化工具（mcp__<server>__<tool>）：工具掩码统一收口到 /tools，写入 server 级掩码
         if (mcpToolOf(toolArg)) {
+          // 掩码写的是 config.json（持久、跨进程），`--global` 写的是本轮注册池（进程级、易失）——
+          // 两者语义相反。此前 --global 在这一支被整个忽略，用户要的是"本轮别给我"，得到的是"永久关掉"。
+          if (isGlobal) {
+            out(`MCP 工具不支持 --global：它的启停是写入 config.json 的 server 级掩码（跨进程持久）。\n`
+              + `  本轮临时停用请改 server 粒度：/mcp disable ${mcpToolOf(toolArg)?.server}；\n`
+              + `  只想持久屏蔽该工具请用：/tools ${toolArg} off\n`)
+            return
+          }
           if (!action) {
             out(`MCP 工具：${toolArg}\n  启停语法：/tools ${toolArg} on|off\n`)
             if (mcpServerDown({ id: toolArg } as Tool)) out(`  来源 server 已被 /mcp 禁用，工具当前不可用。\n`)
@@ -336,7 +413,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
           }
           const err = await applyMcpMask(inp, toolArg, isOn)
           if (err) { out(`${err}\n`); return }
-          await bus?.publish(isOn ? LifecycleEvents.toolEnabled : LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+          await emitToolLifecycle(toolArg, inp.agentId, isOn)
           out(`已${isOn ? '启用' : '禁用'} MCP 工具 "${toolArg}"（${isOn ? '清除' : '写入'} server 级掩码，写入 config.json mcpServers[].tools）。\n`)
           return
         }
@@ -356,7 +433,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
             }
             harness.tools.register(cached)
             suspended.delete(toolArg)
-            await bus?.publish(LifecycleEvents.toolEnabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+            await emitToolLifecycle(toolArg, inp.agentId, true)
             out(`已全局启用工具 "${toolArg}"（本轮进程生效）。\n`)
             return
           }
@@ -367,7 +444,7 @@ export function createToolsManagerPlugin(): AgentPlugin {
           }
           suspended.set(toolArg, t)
           harness.tools.unregister(toolArg)
-          await bus?.publish(LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+          await emitToolLifecycle(toolArg, inp.agentId, false)
           out(`已全局禁用工具 "${toolArg}"（影响所有 Agent，本轮进程生效；使用 --global on 恢复）。\n`)
           return
         }
@@ -379,15 +456,21 @@ export function createToolsManagerPlugin(): AgentPlugin {
         }
 
         // 作用域 A：Agent 白名单增删 + 持久化
-        const cur = harness.agent.get(inp.agentId)?.tools ?? ['*']
-        const wildcard = cur.length === 1 && cur[0] === '*'
+        const cur = agentWhitelist(inp)
+        const wildcard = isWildcardWhitelist(cur)
         if (isOn) {
           if (wildcard || cur.includes(toolArg)) {
             out(`工具 "${toolArg}" 已在 Agent「${inp.agentId}」白名单中（${wildcard ? '默认全部允许' : '已显式启用'}）。\n`)
             return
           }
+          // 既不在注册池也不在内置元信息里 ⇒ 几乎一定是拼错。以前照样写进 config.json 并报"已启用"，
+          // 那条记录此后永远留在白名单里，而对应工具一天都不会出现。
+          if (!harness.tools.get(toolArg) && !inp.toolMeta?.get(toolArg)) {
+            out(`工具 "${toolArg}" 不存在（既未注册，也不在内置元信息中），未写入白名单。先用 /tools --all 确认 id。\n`)
+            return
+          }
           await inp.setAgentTools(inp.agentId, [...cur, toolArg])
-          await bus?.publish(LifecycleEvents.toolEnabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+          await emitToolLifecycle(toolArg, inp.agentId, true)
           out(`已启用工具 "${toolArg}" 并写入 config.json（Agent「${inp.agentId}」白名单，重启后保持）。\n`)
           return
         }
@@ -402,11 +485,11 @@ export function createToolsManagerPlugin(): AgentPlugin {
           const allIds = harness.tools.list().map((t) => t.id)
           out(`注意：Agent 白名单当前为全允许（*），"${toolArg}" 将转为显式白名单（除 ${toolArg} 外全部允许）后持久化。\n`)
           await inp.setAgentTools(inp.agentId, allIds.filter((id) => id !== toolArg))
-          await bus?.publish(LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+          await emitToolLifecycle(toolArg, inp.agentId, false)
           return
         }
         await inp.setAgentTools(inp.agentId, cur.filter((id) => id !== toolArg))
-        await bus?.publish(LifecycleEvents.toolDisabled, { id: toolArg, agentId: inp.agentId }, { source: 'tools-manager' })
+        await emitToolLifecycle(toolArg, inp.agentId, false)
         out(`已禁用工具 "${toolArg}" 并写入 config.json（Agent「${inp.agentId}」白名单）。\n`)
       } finally {
         // 关键：标记命令已处理，避免 cli 因未设 result 而 fallthrough 到"未知命令"
@@ -437,16 +520,13 @@ export function createToolsManagerPlugin(): AgentPlugin {
           disabledMcpServers.delete(payload.name)
         }),
       )
-      offs.push(
-        bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => {
-          if (payload.id === 'mcp.server-registry') disabledMcpServers.clear()
-        }),
-      )
-      offs.push(
-        bus.subscribe(LifecycleEvents.pluginUpdated, ({ payload }) => {
-          if (payload.id === 'mcp.server-registry') disabledMcpServers.clear()
-        }),
-      )
+      // registry 插件被卸载 / 热更新 ⇒ 它缓存的"哪些 server 被禁用"已过期，整体清空。
+      // 两个事件的处理体逐字相同，收敛成一个函数（否则改一处忘一处就是半个语义）。
+      const clearOnRegistryReload = (payload: { id: string }) => {
+        if (payload.id === 'mcp.server-registry') disabledMcpServers.clear()
+      }
+      offs.push(bus.subscribe(LifecycleEvents.pluginUnloaded, ({ payload }) => clearOnRegistryReload(payload)))
+      offs.push(bus.subscribe(LifecycleEvents.pluginUpdated, ({ payload }) => clearOnRegistryReload(payload)))
       return hooks
     },
     async uninstall() {
@@ -454,6 +534,16 @@ export function createToolsManagerPlugin(): AgentPlugin {
       offs.length = 0
       bus = undefined
       disabledMcpServers.clear()
+      // 把 `--global off` 卸下的工具还回注册池：插件卸载 = 本插件"本轮"结束，
+      // 若把 Tool 留在这个即将被丢弃的 Map 里，工具就永久消失（只能重启进程恢复）。
+      // 已被别处重新注册的同 id 不动（`get` 有值即跳过），避免覆盖别人的实现。
+      if (toolsRegistry) {
+        for (const [id, tool] of suspended) {
+          if (!toolsRegistry.get(id)) toolsRegistry.register(tool)
+        }
+        toolsRegistry = undefined
+      }
+      suspended.clear()
     },
   }
 }
