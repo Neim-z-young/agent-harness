@@ -281,3 +281,146 @@ describe('tools-manager 事件解耦 + mcp 工具掩码', () => {
     expect(bus.emitted).toContainEqual({ name: 'tool.disabled', payload: { id: 'read_file', agentId: 'default' } })
   })
 })
+
+describe('tools-manager 边界与契约', () => {
+  /** 只喂 mcpServers（刻意不喂 setMcpServers），用于验证"宿主没提供写回能力"这条路径 */
+  async function runMcpRaw(
+    h: Hooks,
+    arg: string,
+    o: { harness: unknown; mcpServers: any[]; setMcpServers?: (l: any[]) => Promise<void> },
+  ): Promise<string> {
+    const out: string[] = []
+    const input = {
+      command: 'tools', raw: arg, arg, sessionId: 's',
+      out: (s: string) => { out.push(s) },
+      harness: o.harness,
+      agentId: 'default',
+      setAgentTools: async () => undefined,
+      mcpServers: o.mcpServers,
+      ...(o.setMcpServers ? { setMcpServers: o.setMcpServers } : {}),
+    } as unknown as CliCommandInput
+    await h['cli.command']?.(input)
+    return out.join('')
+  }
+
+  // `--json` 曾自己抄一份三元链，唯一漏掉的是权限键的 meta 回退 ⇒ 同一个工具
+  // 表格里权限列显示 `read`、JSON 里 permissionKey 字段直接消失。两者必须同源。
+  it('★ --json 与表格取同一份安全声明与权限键（含 meta 回退）', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
+    const meta = {
+      get: (id: string) => (id === 'glob' ? { id: 'glob', description: 'glob 描述', isReadOnly: true, isConcurrencySafe: false, permissionKey: 'read' } : undefined),
+      list: () => [{ id: 'glob', description: 'glob 描述', isReadOnly: true, isConcurrencySafe: false, permissionKey: 'read' }],
+    }
+    await run(h, '--all --json', { harness, out, saved }, meta)
+    const rows = JSON.parse(out.join('')) as Array<Record<string, unknown>>
+    const glob = rows.find((r) => r.id === 'glob')!
+    expect(glob.permissionKey).toBe('read')          // 关键：meta 的 permissionKey 必须回退到 JSON
+    expect(glob.isReadOnly).toBe(true)
+    expect(glob.isConcurrencySafe).toBe(false)
+    // 已加载工具：三个安全位与 entryFlags 同源（mkTool 声明 可写/非危险/并发安全）
+    const bash = rows.find((r) => r.id === 'bash')!
+    expect(bash.isReadOnly).toBe(false)
+    expect(bash.isConcurrencySafe).toBe(true)
+    // 与表格视图对照：同一工具在两种视图里的权限键一致
+    out.length = 0
+    await run(h, '--all', { harness, out, saved }, meta)
+    const line = out.join('').split('\n').find((l) => l.includes('glob'))!
+    expect(line).toContain('read')
+  })
+
+  it('未知选项报「未知选项」而不是被当成工具 id', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
+    await run(h, '--nope', { harness, out, saved })
+    const text = out.join('')
+    expect(text).toContain('未知选项')
+    expect(text).toContain('--nope')
+    expect(text).not.toContain('未找到')   // 旧行为：提示去看 /tools --all，指向一个不存在的地方
+  })
+
+  // 掩码写 config.json（跨进程持久），--global 写注册池（进程级、易失）—— 语义相反，
+  // 静默二选一会让用户以为"本轮临时停用"实际拿到"永久关掉"。
+  it('★ MCP 工具拒绝 --global，且不写 config.json', async () => {
+    const h = await getHooks()
+    const { harness } = makeHarness([mkTool('mcp__github__create_issue')], ['*'])
+    const savedMcp: any[] = []
+    const text = await runMcpRaw(h, 'mcp__github__create_issue --global off', {
+      harness, mcpServers: [{ name: 'github' }],
+      setMcpServers: async (l: any[]) => { savedMcp.push(l) },
+    })
+    expect(text).toContain('不支持 --global')
+    expect(savedMcp.length).toBe(0)        // 没有落盘
+    expect(text).not.toContain('已禁用 MCP 工具')
+  })
+
+  it('★ 宿主未注入 setMcpServers ⇒ 如实报"无法持久化"，不谎称已写入', async () => {
+    const h = await getHooks()
+    const { harness } = makeHarness([mkTool('mcp__github__create_issue')], ['*'])
+    const text = await runMcpRaw(h, 'mcp__github__create_issue off', {
+      harness, mcpServers: [{ name: 'github' }],
+    })
+    expect(text).toContain('无法持久化')
+    expect(text).not.toContain('写入 config.json mcpServers')
+  })
+
+  it('on 一个不存在的工具 ⇒ 拒绝，不把拼错的 id 写进白名单', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash'), mkTool('read_file')], ['read_file'])
+    await run(h, 'bogus_tool on', { harness, out, saved })
+    expect(out.join('')).toContain('不存在')
+    expect(saved.length).toBe(0)           // 关键：config.json 里不留垃圾条目
+  })
+
+  it('uninstall 把 --global off 卸下的工具还回注册池', async () => {
+    const plugin = createToolsManagerPlugin()
+    const h = (await plugin.install({ bus: makeBus() } as never)) as Hooks
+    const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
+    await run(h, 'bash --global off', { harness, out, saved })
+    expect((harness as any).tools.get('bash')).toBeUndefined()
+    await plugin.uninstall!()
+    // "本轮进程生效"的终点就是这个插件的生命周期：卸载后不能永久少一个工具
+    expect((harness as any).tools.get('bash')).toBeDefined()
+  })
+
+  // 此前"同名工具已加载"这条路径没有任何用例：dedupe 只在实际重叠时才生效，
+  // 而既有夹具里运行时工具与 meta 的 id 从不相交 ⇒ 去掉去重也全绿。
+  it('--all 对「已加载且 meta 里也有」的工具只出现一次', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash')], ['*'])
+    const meta = {
+      get: () => undefined,
+      list: () => [{ id: 'bash', description: 'bash 描述', isReadOnly: false, permissionKey: 'bash' }, { id: 'glob', description: 'g' }],
+    }
+    await run(h, '--all', { harness, out, saved }, meta)
+    const hits = out.join('').split('\n').filter((l) => l.trimStart().startsWith('bash'))
+    expect(hits.length).toBe(1)
+    expect(out.join('')).toContain('glob')   // 未重叠的 meta 仍要补上
+  })
+
+  // agent 定义缺失时的缺省白名单（`?? ['*']`）也是一个"只有出错时才看见"的判据：
+  // 若默认成 []，未知 agent id 会显示"零工具"，而运行时实际是全允许。
+  it('agent 定义缺失 ⇒ 缺省白名单为通配（全部显示为启用）', async () => {
+    const h = await getHooks()
+    const registry = new Map<string, Tool>([['bash', mkTool('bash')]])
+    const harness = {
+      tools: {
+        list: () => [...registry.values()],
+        get: (id: string) => registry.get(id),
+        unregister: (id: string) => { registry.delete(id) },
+        register: (t: Tool) => { registry.set(t.id, t) },
+        filterByWhitelist: (wl: string[] | ['*']) => (wl.length === 1 && wl[0] === '*' ? [...registry.values()] : []),
+      },
+      agent: { get: () => undefined },
+    }
+    const out: string[] = []
+    const input = {
+      command: 'tools', raw: '', arg: '', sessionId: 's',
+      out: (s: string) => { out.push(s) }, harness, agentId: 'ghost',
+      setAgentTools: async () => undefined,
+    } as unknown as CliCommandInput
+    await h['cli.command']?.(input)
+    const line = out.join('').split('\n').find((l) => l.trimStart().startsWith('bash'))!
+    expect(line).toContain('启用')
+  })
+})
