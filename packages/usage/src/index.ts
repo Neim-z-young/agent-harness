@@ -58,9 +58,15 @@ export interface ToolRecord {
   output?: number
 }
 
-/** 单 Provider 实例统计（键 = ProviderConfig.id 实例路由键；`'default'` / `'unknown'` 见包注释） */
-export interface ProviderUsage {
-  provider: string
+/**
+ * 调用维度共有的计数列。
+ *
+ * Provider / 模型 / 小时桶三者除了**分区键字段名**（`provider` / `model` / `hour`）之外，
+ * 计数列逐字相同。抽出来不是为了省几行，而是为了让"这三个维度怎么相加"只有一处实现：
+ * 它们此前是 4 份手写的相加块（recordCall 三份 + mergeUsage 三份），任何一处漏加
+ * `cacheWrite` 都只会表现为"某个维度的缓存写入永远偏小"，且没有任何用例会红。
+ */
+export interface TokenTally {
   calls: number
   inputTokens: number
   outputTokens: number
@@ -70,16 +76,14 @@ export interface ProviderUsage {
   cacheWrite: number
 }
 
+/** 单 Provider 实例统计（键 = ProviderConfig.id 实例路由键；`'default'` / `'unknown'` 见包注释） */
+export interface ProviderUsage extends TokenTally {
+  provider: string
+}
+
 /** 单模型统计 */
-export interface ModelUsage {
+export interface ModelUsage extends TokenTally {
   model: string
-  calls: number
-  inputTokens: number
-  outputTokens: number
-  /** 命中缓存 token */
-  cacheRead: number
-  /** 写入缓存 token */
-  cacheWrite: number
 }
 
 /** 工具/技能调用统计（含归并 token 用量） */
@@ -102,14 +106,9 @@ export interface AgentUsage {
 }
 
 /** 单小时桶（时序展示） */
-export interface HourlyUsage {
+export interface HourlyUsage extends TokenTally {
   /** 小时时间戳（本小时起点，ms） */
   hour: number
-  calls: number
-  inputTokens: number
-  outputTokens: number
-  cacheRead: number
-  cacheWrite: number
 }
 
 /** 会话级用量统计累积器 */
@@ -170,96 +169,95 @@ export function normalizeUsage(u: UsageStats | undefined): UsageStats {
   }
 }
 
+/**
+ * 按分区键把 `inc` 归并进一组行：命中则用 `add` 合并、未命中则插入。
+ *
+ * 这是本包**唯一**的"维度相加"实现。此前它有 9 份手写副本（recordCall 4 份、
+ * mergeUsage 5 份），副本之间的差异全靠人眼对齐 —— 其中一份漏了 `cacheWrite`
+ * 也不会红任何用例，只会让某个维度的缓存写入偏小。
+ *
+ * `order` 给出时按它维持有序（小时桶必须升序，否则时序图/当日截取的口径会乱），
+ * 未给出则追加到末尾（provider / model / agent 的稳定顺序 = 首次出现顺序，
+ * 这正是展示时"先出现的先显示"所依赖的）。
+ */
+function accumulateRows<T>(
+  rows: readonly T[],
+  inc: T,
+  sameKey: (a: T, b: T) => boolean,
+  add: (cur: T, inc: T) => T,
+  order?: (a: T, b: T) => number,
+): T[] {
+  const at = rows.findIndex((r) => sameKey(r, inc))
+  if (at !== -1) {
+    const next = [...rows]
+    next[at] = add(next[at]!, inc)
+    return next
+  }
+  if (!order) return [...rows, inc]
+  const insertAt = rows.findIndex((r) => order(r, inc) > 0)
+  return insertAt === -1 ? [...rows, inc] : [...rows.slice(0, insertAt), inc, ...rows.slice(insertAt)]
+}
+
+/** 计数列相加（calls / input / output / cacheRead / cacheWrite），只动计数列、保留分区键 */
+function addTally<T extends TokenTally>(cur: T, inc: T): T {
+  return {
+    ...cur,
+    calls: cur.calls + inc.calls,
+    inputTokens: cur.inputTokens + inc.inputTokens,
+    outputTokens: cur.outputTokens + inc.outputTokens,
+    cacheRead: cur.cacheRead + inc.cacheRead,
+    cacheWrite: cur.cacheWrite + inc.cacheWrite,
+  }
+}
+
 /** 记录一次 LLM 调用（含用量与缓存明细），并按 provider / 模型 / agent / 小时维度归并 */
 export function recordCall(usage: UsageStats, rec: CallRecord = {}): UsageStats {
+  // 读边界归一放在**入口**而不是各维度就地兜底：早先只给 `providers` 写了 `?? []`，
+  // 其余三个维度直接 `usage.models.findIndex(...)`，于是旧落盘记录（本维度引入前没有
+  // providers、更早的连 models 都没有）从这条路进来会抛 `undefined is not an object`。
+  // 而抛点在 core 的 accumulateUsage try/catch 里 ⇒ 症状是"用量静默不增长"，不是崩溃。
+  // 一半维度防御、一半不防御，比两半都不防御更难发现。
+  usage = normalizeUsage(usage)
   const m = rec.model || 'unknown'
   const prov = rec.provider || 'unknown'
-  const agentId = rec.model ? (rec.agentId || 'root') : 'root'
+  // agent 归因只看 `agentId`，**不再**用 "有没有 model" 当门。（旧写法
+  // `rec.model ? (rec.agentId || 'root') : 'root'` 会在"消息带 tokenUsage 但没有 model"
+  // 时把子 agent 的用量静默记到 root 名下 —— 而 foldMessage 恰好就是那么传的。）
+  const agentId = rec.agentId || 'root'
   const i = rec.input ?? 0
   const o = rec.output ?? 0
   const cr = rec.cacheRead ?? 0
   const cw = rec.cacheWrite ?? 0
   const ts = rec.ts ?? Date.now()
 
-  // 按 Provider 实例归并（粒度最粗，放在最前 —— 与展示顺序一致）
-  let providers = usage.providers ?? []
-  const pIdx = providers.findIndex((x) => x.provider === prov)
-  if (pIdx === -1) {
-    providers = [...providers, { provider: prov, calls: 1, inputTokens: i, outputTokens: o, cacheRead: cr, cacheWrite: cw }]
-  } else {
-    const cur = providers[pIdx]
-    providers = [
-      ...providers.slice(0, pIdx),
-      {
-        ...cur,
-        calls: cur.calls + 1,
-        inputTokens: cur.inputTokens + i,
-        outputTokens: cur.outputTokens + o,
-        cacheRead: cur.cacheRead + cr,
-        cacheWrite: cur.cacheWrite + cw,
-      },
-      ...providers.slice(pIdx + 1),
-    ]
-  }
+  const tally: TokenTally = { calls: 1, inputTokens: i, outputTokens: o, cacheRead: cr, cacheWrite: cw }
 
+  // Provider 实例归并（粒度最粗，放在最前 —— 与展示顺序一致）
+  const providers = accumulateRows(usage.providers, { ...tally, provider: prov }, (a, b) => a.provider === b.provider, addTally)
   // 按模型归并
-  let models = usage.models
-  const mIdx = models.findIndex((x) => x.model === m)
-  if (mIdx === -1) {
-    models = [...models, { model: m, calls: 1, inputTokens: i, outputTokens: o, cacheRead: cr, cacheWrite: cw }]
-  } else {
-    const cur = models[mIdx]
-    models = [
-      ...models.slice(0, mIdx),
-      {
-        ...cur,
-        calls: cur.calls + 1,
-        inputTokens: cur.inputTokens + i,
-        outputTokens: cur.outputTokens + o,
-        cacheRead: cur.cacheRead + cr,
-        cacheWrite: cur.cacheWrite + cw,
-      },
-      ...models.slice(mIdx + 1),
-    ]
-  }
-
-  // 按 agent/任务归并
-  let agents = usage.agents
-  const aIdx = agents.findIndex((x) => x.agentId === agentId)
-  if (aIdx === -1) {
-    agents = [...agents, { agentId, calls: 1, inputTokens: i, outputTokens: o, tasksDone: 0 }]
-  } else {
-    const cur = agents[aIdx]
-    agents = [
-      ...agents.slice(0, aIdx),
-      { ...cur, calls: cur.calls + 1, inputTokens: cur.inputTokens + i, outputTokens: cur.outputTokens + o },
-      ...agents.slice(aIdx + 1),
-    ]
-  }
-
+  const models = accumulateRows(usage.models, { ...tally, model: m }, (a, b) => a.model === b.model, addTally)
+  // 按 agent/任务归并（tasksDone 只由 recordTaskDone 增加，这里恒不变）
+  const agents = accumulateRows(
+    usage.agents,
+    { agentId, calls: 1, inputTokens: i, outputTokens: o, tasksDone: 0 },
+    (a, b) => a.agentId === b.agentId,
+    (cur, inc) => ({
+      ...cur,
+      calls: cur.calls + inc.calls,
+      inputTokens: cur.inputTokens + inc.inputTokens,
+      outputTokens: cur.outputTokens + inc.outputTokens,
+      tasksDone: cur.tasksDone + inc.tasksDone,
+    }),
+  )
   // 按小时归并（保持 hour 升序）
   const hour = Math.floor(ts / 3_600_000) * 3_600_000
-  let hourly = usage.hourly
-  const hIdx = hourly.findIndex((x) => x.hour === hour)
-  if (hIdx === -1) {
-    const entry = { hour, calls: 1, inputTokens: i, outputTokens: o, cacheRead: cr, cacheWrite: cw }
-    const insertAt = hourly.findIndex((x) => x.hour > hour)
-    hourly = insertAt === -1 ? [...hourly, entry] : [...hourly.slice(0, insertAt), entry, ...hourly.slice(insertAt)]
-  } else {
-    const cur = hourly[hIdx]
-    hourly = [
-      ...hourly.slice(0, hIdx),
-      {
-        ...cur,
-        calls: cur.calls + 1,
-        inputTokens: cur.inputTokens + i,
-        outputTokens: cur.outputTokens + o,
-        cacheRead: cur.cacheRead + cr,
-        cacheWrite: cur.cacheWrite + cw,
-      },
-      ...hourly.slice(hIdx + 1),
-    ]
-  }
+  const hourly = accumulateRows(
+    usage.hourly,
+    { hour, ...tally },
+    (a, b) => a.hour === b.hour,
+    addTally,
+    (a, b) => a.hour - b.hour,
+  )
 
   return {
     llmCalls: usage.llmCalls + 1,
@@ -289,53 +287,54 @@ export function recordTool(usage: UsageStats, tool: string, rec: ToolRecord = {}
   const attrInput = rec.input ?? 0
   const attrOutput = rec.output ?? 0
 
-  let tools = usage.tools
-  const idx = tools.findIndex((x) => x.tool === t)
-  if (idx === -1) {
-    tools = [
-      ...tools,
-      {
-        tool: t,
-        count: 1,
-        errors: isError ? 1 : 0,
-        inputTokens: isError ? 0 : attrInput,
-        outputTokens: isError ? 0 : attrOutput,
-      },
-    ]
-  } else {
-    const cur = tools[idx]
-    tools = [
-      ...tools.slice(0, idx),
-      {
-        ...cur,
-        count: cur.count + 1,
-        errors: cur.errors + (isError ? 1 : 0),
-        inputTokens: cur.inputTokens + (isError ? 0 : attrInput),
-        outputTokens: cur.outputTokens + (isError ? 0 : attrOutput),
-      },
-      ...tools.slice(idx + 1),
-    ]
+  const inc: ToolUsage = {
+    tool: t,
+    count: 1,
+    errors: isError ? 1 : 0,
+    inputTokens: isError ? 0 : attrInput,
+    outputTokens: isError ? 0 : attrOutput,
   }
+  const tools = accumulateRows(usage.tools, inc, (a, b) => a.tool === b.tool, (cur, add) => ({
+    ...cur,
+    count: cur.count + add.count,
+    errors: cur.errors + add.errors,
+    inputTokens: cur.inputTokens + add.inputTokens,
+    outputTokens: cur.outputTokens + add.outputTokens,
+  }))
   return { ...usage, tools }
 }
 
 /** 标记某 agent 完成一个任务（用于 agent 维度 tasksDone） */
 export function recordTaskDone(usage: UsageStats, agentId?: string): UsageStats {
   const id = agentId || 'root'
-  let agents = usage.agents
-  const idx = agents.findIndex((x) => x.agentId === id)
-  if (idx === -1) {
-    agents = [...agents, { agentId: id, calls: 0, inputTokens: 0, outputTokens: 0, tasksDone: 1 }]
-  } else {
-    const cur = agents[idx]
-    agents = [...agents.slice(0, idx), { ...cur, tasksDone: cur.tasksDone + 1 }, ...agents.slice(idx + 1)]
-  }
+  const agents = accumulateRows(
+    usage.agents,
+    { agentId: id, calls: 0, inputTokens: 0, outputTokens: 0, tasksDone: 1 },
+    (a, b) => a.agentId === b.agentId,
+    (cur, inc) => ({ ...cur, tasksDone: cur.tasksDone + inc.tasksDone }),
+  )
   return { ...usage, agents }
+}
+
+/**
+ * 非有限值（NaN / ±Infinity）按 0 计。
+ *
+ * 本包所有"把数字直接插进文案"的地方都过它。这不是防御性编程的洁癖：
+ * `NaN` 一旦进到 `/stats` 或导出报告，用户看到的是「命中 NaN（0%）· 未命中 NaN」，
+ * 没有任何提示说数据坏了 —— 而源头往往只是 provider 少回报了一个字段。
+ * 宁可显示 0（并在类型上标注这是"不知道"，见 cacheHitRate 的注释），也不要显示 NaN。
+ */
+function asFinite(n: number): number {
+  return Number.isFinite(n) ? n : 0
 }
 
 /** 未命中缓存（需实际计费）的输入 token */
 export function uncachedInput(u: UsageStats): number {
-  return Math.max(0, u.inputTokens - u.cacheReadTokens - u.cacheWriteTokens)
+  // 与 cacheHitRate 同一口径：非有限值按 0 计，**绝不让 NaN 漏到 UI**。
+  // 早先这里只写了 `Math.max(0, 差值)`，而 `Math.max(0, NaN)` 是 NaN ⇒
+  // /stats 会打出「未命中 NaN」，且**同一行**的命中率是 0%（那边守住了）——
+  // 一行里两个数口径不一致，读者只会认为整个统计坏了。
+  return Math.max(0, asFinite(u.inputTokens) - asFinite(u.cacheReadTokens) - asFinite(u.cacheWriteTokens))
 }
 
 /** 缓存命中率（0~100，一位小数）；无输入时为 0 */
@@ -415,89 +414,38 @@ export function mergeUsage(a: UsageStats, b: UsageStats): UsageStats {
   a = normalizeUsage(a)
   b = normalizeUsage(b)
 
-  const providers = [...a.providers]
-  for (const p of b.providers) {
-    const i = providers.findIndex((x) => x.provider === p.provider)
-    if (i === -1) providers.push({ ...p })
-    else {
-      const c = providers[i]
-      providers[i] = {
-        ...c,
-        calls: c.calls + p.calls,
-        inputTokens: c.inputTokens + p.inputTokens,
-        outputTokens: c.outputTokens + p.outputTokens,
-        cacheRead: c.cacheRead + p.cacheRead,
-        cacheWrite: c.cacheWrite + p.cacheWrite,
-      }
-    }
-  }
+  // 五个维度同一套加法：命中则逐列相加，未命中则并入（行对象全部 `{...}` 复制，
+  // 不把 `b` 的行对象直接塞进结果 —— 否则调用方改 `a` 的返回体会连带改到 `b`）
+  let providers = a.providers
+  for (const p of b.providers) providers = accumulateRows(providers, p, (x, y) => x.provider === y.provider, addTally)
 
-  const models = [...a.models]
-  for (const m of b.models) {
-    const i = models.findIndex((x) => x.model === m.model)
-    if (i === -1) models.push({ ...m })
-    else {
-      const c = models[i]
-      models[i] = {
-        ...c,
-        calls: c.calls + m.calls,
-        inputTokens: c.inputTokens + m.inputTokens,
-        outputTokens: c.outputTokens + m.outputTokens,
-        cacheRead: c.cacheRead + m.cacheRead,
-        cacheWrite: c.cacheWrite + m.cacheWrite,
-      }
-    }
-  }
+  let models = a.models
+  for (const m of b.models) models = accumulateRows(models, m, (x, y) => x.model === y.model, addTally)
 
-  const tools = [...a.tools]
+  let tools = a.tools
   for (const t of b.tools) {
-    const i = tools.findIndex((x) => x.tool === t.tool)
-    if (i === -1) tools.push({ ...t })
-    else {
-      const c = tools[i]
-      tools[i] = {
-        ...c,
-        count: c.count + t.count,
-        errors: c.errors + t.errors,
-        inputTokens: c.inputTokens + t.inputTokens,
-        outputTokens: c.outputTokens + t.outputTokens,
-      }
-    }
+    tools = accumulateRows(tools, t, (x, y) => x.tool === y.tool, (cur, inc) => ({
+      ...cur,
+      count: cur.count + inc.count,
+      errors: cur.errors + inc.errors,
+      inputTokens: cur.inputTokens + inc.inputTokens,
+      outputTokens: cur.outputTokens + inc.outputTokens,
+    }))
   }
 
-  const agents = [...a.agents]
+  let agents = a.agents
   for (const g of b.agents) {
-    const i = agents.findIndex((x) => x.agentId === g.agentId)
-    if (i === -1) agents.push({ ...g })
-    else {
-      const c = agents[i]
-      agents[i] = {
-        ...c,
-        calls: c.calls + g.calls,
-        inputTokens: c.inputTokens + g.inputTokens,
-        outputTokens: c.outputTokens + g.outputTokens,
-        tasksDone: c.tasksDone + g.tasksDone,
-      }
-    }
+    agents = accumulateRows(agents, g, (x, y) => x.agentId === y.agentId, (cur, inc) => ({
+      ...cur,
+      calls: cur.calls + inc.calls,
+      inputTokens: cur.inputTokens + inc.inputTokens,
+      outputTokens: cur.outputTokens + inc.outputTokens,
+      tasksDone: cur.tasksDone + inc.tasksDone,
+    }))
   }
 
-  const hourly = [...a.hourly]
-  for (const h of b.hourly) {
-    const i = hourly.findIndex((x) => x.hour === h.hour)
-    if (i === -1) hourly.push({ ...h })
-    else {
-      const c = hourly[i]
-      hourly[i] = {
-        ...c,
-        calls: c.calls + h.calls,
-        inputTokens: c.inputTokens + h.inputTokens,
-        outputTokens: c.outputTokens + h.outputTokens,
-        cacheRead: c.cacheRead + h.cacheRead,
-        cacheWrite: c.cacheWrite + h.cacheWrite,
-      }
-    }
-  }
-  hourly.sort((x, y) => x.hour - y.hour)
+  let hourly = a.hourly
+  for (const h of b.hourly) hourly = accumulateRows(hourly, h, (x, y) => x.hour === y.hour, addTally, (x, y) => x.hour - y.hour)
 
   return {
     llmCalls: a.llmCalls + b.llmCalls,
@@ -526,10 +474,7 @@ export function sumUsage(list: readonly UsageStats[]): UsageStats {
  * 优先级：meta 持久化的累积器（有数据时）→ 由消息历史重建 → 空累积器。
  * 这样重连（resume）后能立刻看到重连前累计的用量，而不是从 0 开始。
  */
-export function hydrateUsage(s?: {
-  meta?: Record<string, unknown>
-  messages?: Array<{ meta?: Record<string, unknown>; createdAt?: number; parts?: Array<{ type: string; toolId?: string; isError?: boolean }> }>
-}): UsageStats {
+export function hydrateUsage(s?: UsageSourceLike): UsageStats {
   const fromMeta = usageFromMeta(s?.meta)
   if (fromMeta && !isBlankUsage(fromMeta)) return fromMeta
   const rebuilt = usageFromMessages(s?.messages ?? [])
@@ -539,19 +484,29 @@ export function hydrateUsage(s?: {
 
 /** 当日用量单行摘要：`今日 N次 · inX/outY` */
 export function todayUsageLine(u: UsageStats): string {
-  return `今日 ${u.llmCalls}次 · in${u.inputTokens}/out${u.outputTokens}`
+  // 与 renderStatsText 同口径（asFinite）：这是 TUI 常驻状态行，插一个 NaN 进去比少一行更糟
+  return `今日 ${u.llmCalls}次 · in${asFinite(u.inputTokens)}/out${asFinite(u.outputTokens)}`
+}
+
+/**
+ * 计数行通用格式：`key ×calls · inN(⚡cr/wcw)outN`。
+ *
+ * provider 与 model 两行此前是**逐字相同**的两份实现（只差取哪个字段当 key），
+ * 于是"缓存段的格式"改一处漏一处，两行在同一个面板里长得不一样。
+ */
+function tokenRow(key: string, t: TokenTally): string {
+  const cache = t.cacheRead > 0 || t.cacheWrite > 0 ? `⚡${t.cacheRead}/w${t.cacheWrite} ` : ''
+  return `${key} ×${t.calls} · ${cache}in${t.inputTokens}/out${t.outputTokens}`
 }
 
 /** 单 Provider 统计行：`provider ×calls · inN(⚡cr)outN`（与 modelUsageRow 同形，便于对照阅读） */
 export function providerUsageRow(p: ProviderUsage): string {
-  const cache = p.cacheRead > 0 || p.cacheWrite > 0 ? `⚡${p.cacheRead}/w${p.cacheWrite} ` : ''
-  return `${p.provider} ×${p.calls} · ${cache}in${p.inputTokens}/out${p.outputTokens}`
+  return tokenRow(p.provider, p)
 }
 
 /** 单模型统计行：`model ×calls · inN(⚡cr)outN` */
 export function modelUsageRow(m: ModelUsage): string {
-  const cache = m.cacheRead > 0 || m.cacheWrite > 0 ? `⚡${m.cacheRead}/w${m.cacheWrite} ` : ''
-  return `${m.model} ×${m.calls} · ${cache}in${m.inputTokens}/out${m.outputTokens}`
+  return tokenRow(m.model, m)
 }
 
 /** 单工具调用行：`tool ×count(失败)` + 归并 token */
@@ -573,10 +528,16 @@ export function hourLabel(hour: number): string {
   return `${String(d.getHours()).padStart(2, '0')}:00`
 }
 
-/** 单小时行：`HH:00 ███░░ 123`（迷你条形 + 用量） */
-export function hourlyRow(h: HourlyUsage, maxInput: number): string {
+/**
+ * 单小时行：`HH:00 ███░░ 123`（迷你条形 + 用量）
+ *
+ * 条形与右侧数字必须**同一个量**。早先条形只画 `inputTokens` 却拿 `maxTotal` 当分母
+ * （renderStatsText 传的是 `input+output` 的最大值）⇒ 只要该小时有输出，条形就系统性偏短，
+ * 长期看起来像"高峰期也不满"。现在两者都是 `input+output`。
+ */
+export function hourlyRow(h: HourlyUsage, maxTotal: number): string {
   const total = h.inputTokens + h.outputTokens
-  const bar = sparkline(h.inputTokens, maxInput, 6)
+  const bar = sparkline(total, maxTotal, 6)
   return `${hourLabel(h.hour)} ${bar} ${total}`
 }
 
@@ -616,6 +577,18 @@ export interface UsageFoldState {
 /** 空折叠状态 */
 export function emptyFoldState(): UsageFoldState {
   return { pending: null, attributed: false }
+}
+
+/**
+ * 水合/归集所需的**最小会话视图**（不带 id：只看 meta 与消息）。
+ *
+ * `messages` 复用 {@link UsageMessageLike}：本包原有三处各自内联了同一份
+ * `{ meta, createdAt, parts }` 形状（hydrateUsage 参数、StatsSessionLike、UsageSessionLike），
+ * 三份之间连字段顺序都靠人眼对齐。折叠规则只认 UsageMessageLike，边界就只该有它一种。
+ */
+export interface UsageSourceLike {
+  meta?: Record<string, unknown>
+  messages?: readonly UsageMessageLike[]
 }
 
 /** `foldMessage` 能消费的最小消息形状（避免包依赖 @harness/session 的 Message） */
@@ -705,7 +678,12 @@ export function renderStatsText(u: UsageStats): string {
   const lines: string[] = []
   lines.push(`LLM 调用 ${u.llmCalls} 次 · in ${u.inputTokens} / out ${u.outputTokens}`)
   if (u.cacheReadTokens > 0 || u.cacheWriteTokens > 0) {
-    lines.push(`缓存：命中 ${u.cacheReadTokens}（${cacheHitRate(u)}%），写入 ${u.cacheWriteTokens}，未命中 ${uncachedInput(u)}`)
+    // 命中/写入的**原始值**也必须过 asFinite：cacheHitRate 守住了百分比、
+    // uncachedInput 守住了未命中，唯独这两个直接插值的字段此前原样输出 ⇒
+    // 一行里「命中 NaN（0%）」——守了两半，坏在第三半。
+    lines.push(
+      `缓存：命中 ${asFinite(u.cacheReadTokens)}（${cacheHitRate(u)}%），写入 ${asFinite(u.cacheWriteTokens)}，未命中 ${uncachedInput(u)}`,
+    )
   }
   // Provider 在模型**之前**：读统计是自顶向下"先看在哪个端点、再看哪个模型"，
   // 且 provider 是更粗的划分（一个 provider 常含多个模型），粗→细才不会来回跳。
@@ -730,7 +708,9 @@ export function renderStatsText(u: UsageStats): string {
     lines.push('按小时时序：')
     for (const h of u.hourly) lines.push(`  ${hourlyRow(h, max)}`)
   }
-  if (lines.length === 0) lines.push('（无用量数据）')
+  // 早先这里还有 `if (lines.length === 0) lines.push('（无用量数据）')` —— 死分支：
+  // 第一行（LLM 调用数）永远会 push，空累积器输出的是「LLM 调用 0 次 · in 0 / out 0」。
+  // 留着只会让人以为存在"完全空"的展示形态，进而按那个形态写断言。
   return lines.join('\n')
 }
 
@@ -850,15 +830,8 @@ export function exportStatsMarkdown(u: UsageStats, ctx: ExportStatsCtx = {}): st
 // ========================================================================
 
 /** 统计页函数所需的**最小会话视图**（Session / 落盘会话文件均结构性满足） */
-export interface StatsSessionLike {
-  id: string
+export interface StatsSessionLike extends UsageSessionLike {
   agentId?: string
-  meta?: Record<string, unknown>
-  messages?: Array<{
-    meta?: Record<string, unknown>
-    createdAt?: number
-    parts?: Array<{ type: string; toolId?: string; isError?: boolean }>
-  }>
 }
 
 /**
@@ -1066,15 +1039,9 @@ export interface UsageStoreLike {
   load(id: string): Promise<unknown | undefined>
 }
 
-/** 归集所需的最小会话视图（Session / 磁盘会话文件均满足） */
-export interface UsageSessionLike {
+/** 归集所需的最小会话视图（Session / 磁盘会话文件均满足）—— 与 {@link StatsSessionLike} 同一份消息形状 */
+export interface UsageSessionLike extends UsageSourceLike {
   id: string
-  meta?: Record<string, unknown>
-  messages?: Array<{
-    meta?: Record<string, unknown>
-    createdAt?: number
-    parts?: Array<{ type: string; toolId?: string; isError?: boolean }>
-  }>
 }
 
 /**
