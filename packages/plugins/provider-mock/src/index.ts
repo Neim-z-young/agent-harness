@@ -27,9 +27,26 @@
  * })
  */
 
-import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk, ProviderRuntime } from '@harness/core'
+import type { ChatProvider, ChatCompletionOutput, ChatStreamChunk, ProviderRuntime, Tool } from '@harness/core'
 import type { AgentPlugin, Hooks, PluginContext, ProviderConfig, ProviderTypeFactory } from '@harness/plugin'
 import type { Message } from '@harness/session'
+
+// ===== 契约入参（**唯一来源**，不手抄）=====
+
+/**
+ * 引擎调用 provider 的入参 —— 直接取 `ChatProvider` 契约的类型，**不再手抄一份**。
+ *
+ * 为什么：`complete` / `stream` 里曾各自内联同一份参数对象字面量。契约后来新增了
+ * `tools`（本 agent **实际可用**的工具，已按白名单过滤），两处内联都没跟上 ⇒ mock 既收不到
+ * 也不记录它。而 mock 是全仓 6 个包（core/cli/a2a-server/tools-builtin/bench/host）共用的
+ * 测试替身：它看不见的东西，等于全仓都断言不了 —— "白名单是否真的传到了 provider"
+ * 这条链路此前没有任何用例能覆盖，看起来却处处都有 mock 在跑。
+ *
+ * 用 `Parameters<…>` 取型后，契约再加字段时这里自动跟随（至少能编译期暴露"没处理"）。
+ */
+type CompleteParams = Parameters<ChatProvider['complete']>[0]
+/** `stream` 的入参（与 complete 同形，但**各自取型**：任一契约分叉都会在调用点变红） */
+type StreamParams = Parameters<NonNullable<ChatProvider['stream']>>[0]
 
 // ===== 配置类型 =====
 
@@ -101,6 +118,94 @@ export interface MockProviderConfig {
 
 // ===== MockChatProvider 实现 =====
 
+/** 一次 `complete` / `stream` 调用的记录（测试断言用） */
+export interface MockCallRecord {
+  providerId: string
+  modelId?: string
+  messages: Message[]
+  params: Record<string, unknown>
+  headers?: Record<string, string>
+  sessionId?: string
+  agentId?: string
+  /**
+   * 本 agent **实际可用**的工具 —— 引擎按白名单过滤后传进来的那一份。
+   *
+   * 缺省 `undefined` 表示调用方未提供（**不是**"没有工具"）。两者必须能区分：
+   * 前者是"这条链路上没人传"，后者是"传了、但一个都不允许"，混在一起就分不清
+   * 是引擎漏传还是白名单为空。
+   */
+  tools?: Tool[]
+  /**
+   * 命中的响应规则下标（`responses` 里第几条）；`undefined` = 无规则命中、走了默认响应。
+   *
+   * 为什么记：**未命中时现象与"规则写错"完全一致**（都拿到 defaultResponse）。没有这个字段
+   * 只能靠复现匹配过程猜；有了它，断言可以直接说"命中的是第 2 条"。
+   */
+  matchedRuleIndex?: number
+}
+
+/** 匹配结果：命中的规则 + 它的下标 */
+interface RuleHit {
+  rule: MockResponseRule
+  index: number
+}
+
+/**
+ * 关键词 / 正则匹配。
+ *
+ * ⚠️ 正则**是有状态的**：带 `g` / `y` 标志的 RegExp 会沿用 `lastIndex`，同一个实例第二次
+ * `test()` 会从上次命中的位置继续 ⇒ 同一输入交替给出 命中/落空（实测 `/hello/g` 连调三次
+ * 得到 hit / miss / hit）。配置允许直接传 RegExp，故每次匹配前必须归零。
+ */
+function textMatches(match: string | RegExp, text: string): boolean {
+  if (typeof match === 'string') return text.includes(match)
+  match.lastIndex = 0
+  return match.test(text)
+}
+
+/**
+ * 内部用量 → 契约用量。`total` 与缓存字段的**唯一产地**。
+ *
+ * 此前 `complete` 与 `stream` 各写一份同样的对象字面量：`total` 的算法一旦有一侧改
+ * （比如改成 input+output+cacheWrite），两条路径就会给出不同的用量口径 —— 而用量正是
+ * 缓存归因 / 占用率那些用例的输入，注释里"与 complete 逐位一致"的承诺会静默失效。
+ */
+function toUsage(u: MockTokenUsage): ChatCompletionOutput['tokenUsage'] {
+  return {
+    input: u.input,
+    output: u.output,
+    total: u.input + u.output,
+    ...(u.cacheRead != null ? { cacheRead: u.cacheRead } : {}),
+    ...(u.cacheWrite != null ? { cacheWrite: u.cacheWrite } : {}),
+  }
+}
+
+/**
+ * 结束原因（complete 与 stream 共用的唯一判据）。
+ *
+ * 对齐真实 Provider 语义：有工具调用 ⇒ 因工具调用结束（`tool_calls`），否则自然结束（`stop`）。
+ * 引擎的 agentic loop 依赖这个字段决定是否续轮，mock 若不给就会退化成"finish 缺失"的路径，
+ * 主流程测不到。
+ */
+function finishOf(toolCalls: MockResponseRule['toolCalls']): NonNullable<ChatCompletionOutput['finish']> {
+  return toolCalls && toolCalls.length > 0 ? 'tool_calls' : 'stop'
+}
+
+/**
+ * 与 `DOMException(…, 'AbortError')` 同形的中断错误。
+ *
+ * 名字是**契约**：core 的 `isAbortError` 只认 `name === 'AbortError' | 'TimeoutError'`，
+ * 名字不对就会被当成真实故障往上抛（"用户取消"被报成崩溃）。
+ * 优先透传 `signal.reason`（调用方可能塞了自定义原因，它自带正确的 name）。
+ */
+function abortError(signal?: AbortSignal): unknown {
+  const reason: unknown = signal?.reason
+  if (reason && typeof reason === 'object' && (reason as { name?: unknown }).name === 'AbortError') {
+    return reason
+  }
+  return new DOMException('Mock provider call aborted', 'AbortError')
+}
+
 /**
  * Mock ChatProvider 实现
  *
@@ -114,16 +219,8 @@ export class MockChatProvider implements ChatProvider {
    * 不再是硬编码常量：硬编码会让多实例自报同一个 id，在注册表里互相覆盖。
    */
   readonly id: string
-  /** 调用历史（每次 complete 的 params） */
-  readonly calls: Array<{
-    providerId: string
-    modelId?: string
-    messages: Message[]
-    params: Record<string, unknown>
-    headers?: Record<string, string>
-    sessionId?: string
-    agentId?: string
-  }> = []
+  /** 调用历史（每次 complete / stream 的入参） */
+  readonly calls: MockCallRecord[] = []
 
   private readonly config: Required<
     Pick<MockProviderConfig, 'defaultResponse' | 'defaultReasoning' | 'model' | 'tokenUsage' | 'recordCalls' | 'delayMs'>
@@ -143,6 +240,33 @@ export class MockChatProvider implements ChatProvider {
     return u
   }
 
+  /**
+   * 模拟网络延迟；`signal` 中断时**立即**结束并抛 AbortError。
+   *
+   * 两条约束：
+   * - 定时器**刻意不 unref**：被 await 的定时器一旦 unref，Windows 上事件循环会认为
+   *   没有存活句柄而跳过轮询 ⇒ 永不到期 ⇒ 静默挂死（项目 MEMORY 已钉住）。
+   * - 中断时必须 `clearTimeout` 并摘掉监听器，否则被取消的调用还会把定时器留在事件循环里，
+   *   把「取消」变成「等满 delayMs 才返回」。
+   */
+  private async delay(signal?: AbortSignal): Promise<void> {
+    const ms = this.config.delayMs
+    // 已中断的 signal：一个 chunk 都不该发（更别等延迟）
+    if (signal?.aborted) throw abortError(signal)
+    if (ms <= 0) return
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        clearTimeout(timer)
+        reject(abortError(signal))
+      }
+      const timer: ReturnType<typeof setTimeout> = setTimeout(() => {
+        signal?.removeEventListener('abort', onAbort)
+        resolve()
+      }, ms)
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
+  }
+
   constructor(config: MockProviderConfig = {}) {
     this.id = config.providerId ?? 'mock'
     this.config = {
@@ -157,173 +281,155 @@ export class MockChatProvider implements ChatProvider {
     }
   }
 
-  /** 从 messages 提取最后一条 user 消息的文本内容 */
+  /**
+   * 最后一条 **user** 消息的全部文本片段（按顺序以换行拼接）。
+   *
+   * 只取第一个 text part 会漏掉后续片段（如 `[text 摘要, text 正文]`）—— 关键词恰好在
+   * 被漏掉的那段上时，现象是"文字明明在消息里却走了默认响应"，且没有任何信号可查。
+   * 真实 provider 序列化时也是把同一条消息里的多个文本块全部发出去，这里与之一致。
+   *
+   * 该消息一个文本片段都没有（如只带 file）时继续往前找 —— 否则"末尾一条纯附件消息"
+   * 会让整轮匹配退化到默认响应。
+   */
   private lastUserText(messages: Message[]): string {
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i]
-      if (m.role === 'user') {
-        const textPart = m.parts.find((p) => p.type === 'text') as { type: 'text'; text: string } | undefined
-        if (textPart) return textPart.text
-      }
+      if (m.role !== 'user') continue
+      const text = m.parts
+        .filter((p): p is { type: 'text'; text: string } => p.type === 'text')
+        .map((p) => p.text)
+        .filter((t) => t.length > 0)
+        .join('\n')
+      if (text) return text
     }
     return ''
   }
 
-  /** 按 user 消息内容匹配响应规则 */
-  private matchRule(userText: string): MockResponseRule | undefined {
-    for (const rule of this.config.responses) {
+  /** 按 user 消息内容匹配响应规则（首个命中者胜出；`once` 规则用尽后跳过） */
+  private matchRule(userText: string): RuleHit | undefined {
+    for (let i = 0; i < this.config.responses.length; i++) {
+      const rule = this.config.responses[i]
       // 已耗尽的 once 规则直接跳过（complete 与 stream 共享同一份计数）
       if (rule.once && this.consumedOnce.has(rule)) continue
-      const hit = typeof rule.match === 'string'
-        ? userText.includes(rule.match)
-        : rule.match.test(userText)
-      if (hit) {
-        if (rule.once) this.consumedOnce.add(rule)
-        return rule
-      }
+      if (!textMatches(rule.match, userText)) continue
+      if (rule.once) this.consumedOnce.add(rule)
+      return { rule, index: i }
     }
     return undefined
   }
 
-  async complete(params: {
-    providerId: string
-    modelId?: string
-    messages: Message[]
-    params: Record<string, unknown>
-    headers?: Record<string, string>
-    signal?: AbortSignal
-    sessionId?: string
-    agentId?: string
-  }): Promise<ChatCompletionOutput> {
-    // 模拟延迟
-    if (this.config.delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.config.delayMs))
-    }
+  /** 记录调用入参（`recordCalls: false` 时整体跳过） */
+  private recordCall(params: CompleteParams, matchedRuleIndex: number | undefined): void {
+    if (!this.config.recordCalls) return
+    this.calls.push({
+      providerId: params.providerId,
+      modelId: params.modelId,
+      messages: params.messages,
+      params: params.params,
+      headers: params.headers,
+      sessionId: params.sessionId,
+      agentId: params.agentId,
+      ...(params.tools ? { tools: params.tools } : {}),
+      ...(matchedRuleIndex != null ? { matchedRuleIndex } : {}),
+    })
+  }
 
-    // 记录调用
-    if (this.config.recordCalls) {
-      this.calls.push({
-        providerId: params.providerId,
-        modelId: params.modelId,
-        messages: params.messages,
-        params: params.params,
-        headers: params.headers,
-        sessionId: params.sessionId,
-        agentId: params.agentId,
-      })
-    }
+  /**
+   * 一次调用的**全部**事实：延迟 → 记录 → 规则匹配 → 取用量。
+   *
+   * complete 与 stream 共用本函数。此前两条路径各自内联同一段约 40 行逻辑（含用量字面量与
+   * finish 表达式各两份）：只要一侧被改、另一侧忘改，"流式断言"与"非流式断言"就会给出
+   * 互相矛盾的结论，而两边跑起来都是绿的。
+   *
+   * 顺序有意为之：先记录入参再匹配 —— 调用记录反映的是"provider 收到了什么"，
+   * 不能因为匹配失败就丢掉（否则排查"为什么拿到默认文案"时连输入都看不到）。
+   */
+  private async resolveTurn(params: CompleteParams): Promise<{
+    response: string
+    reasoning: string
+    model: string
+    toolCalls: MockResponseRule['toolCalls']
+    usage: ChatCompletionOutput['tokenUsage']
+  }> {
+    await this.delay(params.signal)
 
-    // 匹配规则
     const userText = this.lastUserText(params.messages)
-    const rule = this.matchRule(userText)
+    const hit = this.matchRule(userText)
+    this.recordCall(params, hit?.index)
 
-    const response = rule?.response ?? this.config.defaultResponse
-    const reasoning = rule?.reasoning ?? this.config.defaultReasoning
-    const model = rule?.model ?? this.config.model
-    const toolCalls = rule?.toolCalls
-    const tokenUsage = this.nextUsage()
-    const outUsage = {
-      input: tokenUsage.input,
-      output: tokenUsage.output,
-      total: tokenUsage.input + tokenUsage.output,
-      ...(tokenUsage.cacheRead != null ? { cacheRead: tokenUsage.cacheRead } : {}),
-      ...(tokenUsage.cacheWrite != null ? { cacheWrite: tokenUsage.cacheWrite } : {}),
+    return {
+      response: hit?.rule.response ?? this.config.defaultResponse,
+      reasoning: hit?.rule.reasoning ?? this.config.defaultReasoning,
+      model: hit?.rule.model ?? this.config.model,
+      toolCalls: hit?.rule.toolCalls,
+      usage: toUsage(this.nextUsage()),
     }
+  }
+
+  async complete(params: CompleteParams): Promise<ChatCompletionOutput> {
+    const turn = await this.resolveTurn(params)
 
     const output: ChatCompletionOutput = {
-      content: response,
-      model,
-      tokenUsage: outUsage,
+      content: turn.response,
+      model: turn.model,
+      tokenUsage: turn.usage,
     }
-    if (reasoning) output.reasoning = reasoning
-    if (toolCalls && toolCalls.length > 0) output.toolCalls = toolCalls
-    // 对齐真实 Provider 语义：有工具调用 ⇒ 因工具调用结束（tool_calls），否则自然结束（stop）。
-    // 引擎的 agentic loop 依赖这个字段决定是否续轮，mock 若不给就会退化成"finish 缺失"的路径，
-    // 测不到主流程。
-    output.finish = toolCalls && toolCalls.length > 0 ? 'tool_calls' : 'stop'
+    if (turn.reasoning) output.reasoning = turn.reasoning
+    if (turn.toolCalls && turn.toolCalls.length > 0) output.toolCalls = turn.toolCalls
+    output.finish = finishOf(turn.toolCalls)
     return output
   }
 
   /**
-   * 流式完成：把 complete() 的结果按 token 分块 yield。
+   * 流式完成：把同一次 turn 的结果按 token 分块 yield。
    * 默认按空格/换行分词，每块 1-3 个 token。
    * 若 config.chunkSize 设置，按指定大小切字符。
+   *
+   * `signal` 在**每个 chunk 之前**检查：中断即抛 AbortError（不发 `done`）。
+   * 真实 provider 中断时同样是"流半途结束 + 抛中断错误"，若不抛，消费方会把这轮当成
+   * 正常结束 —— 取消变成静默成功，且已产出的半截文本会被当成完整回答落库。
    */
-  async *stream(params: {
-    providerId: string
-    modelId?: string
-    messages: Message[]
-    params: Record<string, unknown>
-    headers?: Record<string, string>
-    signal?: AbortSignal
-    sessionId?: string
-    agentId?: string
-  }): AsyncGenerator<ChatStreamChunk, void, unknown> {
-    // 模拟延迟
-    if (this.config.delayMs > 0) {
-      await new Promise((resolve) => setTimeout(resolve, this.config.delayMs))
+  async *stream(params: StreamParams): AsyncGenerator<ChatStreamChunk, void, unknown> {
+    const turn = await this.resolveTurn(params)
+    const guard = (): void => {
+      if (params.signal?.aborted) throw abortError(params.signal)
     }
-
-    // 记录调用
-    if (this.config.recordCalls) {
-      this.calls.push({
-        providerId: params.providerId,
-        modelId: params.modelId,
-        messages: params.messages,
-        params: params.params,
-        headers: params.headers,
-        sessionId: params.sessionId,
-        agentId: params.agentId,
-      })
-    }
-
-    // 匹配规则（与 complete 共用）
-    const userText = this.lastUserText(params.messages)
-    const rule = this.matchRule(userText)
-    const response = rule?.response ?? this.config.defaultResponse
-    const reasoning = rule?.reasoning ?? this.config.defaultReasoning
-    const model = rule?.model ?? this.config.model
-    const toolCalls = rule?.toolCalls
-    const tokenUsage = this.nextUsage()
 
     // yield reasoning（按行分块）
-    if (reasoning) {
-      for (const line of this._splitTokens(reasoning)) {
+    if (turn.reasoning) {
+      for (const line of this._splitTokens(turn.reasoning)) {
+        guard()
         yield { type: 'reasoning_delta', text: line }
       }
     }
 
     // yield text（按词分块）
-    if (response) {
-      for (const tok of this._splitTokens(response)) {
+    if (turn.response) {
+      for (const tok of this._splitTokens(turn.response)) {
+        guard()
         yield { type: 'text_delta', text: tok }
       }
     }
 
     // yield tool calls
-    if (toolCalls) {
-      for (const tc of toolCalls) {
+    if (turn.toolCalls) {
+      for (const tc of turn.toolCalls) {
+        guard()
         yield { type: 'tool_use_start', toolUseId: tc.toolUseId, toolId: tc.toolId }
         yield { type: 'tool_use_delta', inputDelta: JSON.stringify(tc.input) }
         yield { type: 'tool_use_stop' }
       }
     }
 
-    // done
+    guard()
     yield {
       type: 'done',
-      model,
-      tokenUsage: {
-        input: tokenUsage.input,
-        output: tokenUsage.output,
-        total: tokenUsage.input + tokenUsage.output,
-        ...(tokenUsage.cacheRead != null ? { cacheRead: tokenUsage.cacheRead } : {}),
-        ...(tokenUsage.cacheWrite != null ? { cacheWrite: tokenUsage.cacheWrite } : {}),
-      },
-      // 与 complete() 同一套语义（见该处注释）
-      finish: toolCalls && toolCalls.length > 0 ? 'tool_calls' : 'stop',
+      model: turn.model,
+      tokenUsage: turn.usage,
+      finish: finishOf(turn.toolCalls),
     }
   }
+
 
   /** 将文本按词/标点分块（模拟逐 token 流式） */
   private _splitTokens(text: string): string[] {
