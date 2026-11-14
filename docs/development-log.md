@@ -1,5 +1,58 @@
 # Agent Harness 开发日志
 
+## 2026-11-14（续 294）五条定时重构分支审查 + 合入 main（6 个必须修全部修好）
+
+盘点：`refactor/auto-20261110`（usage）、`20261111`（acp-context）、`20261112`（bench retail）、
+`20261113`（provider-mock）、`20261114`（tools-manager）**全部基于 `9181cec`**，改动文件互不重叠
+→ `--no-ff` 逐个合入无冲突。两路并行只读审查（每条结论附 文件:行号）+ 亲自复核 6 个高风险结论。
+
+### 修掉的问题（6 个必须修 + 2 处加固）
+
+**usage（3 个）**
+1. `accumulateRows` 未命中分支不复制 `inc`，与 `mergeUsage` 注释「行对象全部 `{...}` 复制」矛盾
+   ⇒ `b` 独有行是裸引用，改返回体会污染入参 `b`（回归）。修：`const fresh = { ...inc }`。
+2. 删掉 `hourly.sort()` 后不再保证升序：有序插入只在 `a.hourly` 本身有序时成立，旧落盘记录
+   乱序时 `findIndex(>0)` 插错位置；而函数文档仍写「保持升序」、既有用例注释仍写「末尾会自己 sort」。
+   修：循环后恢复一次排序 + 修注释 + 补乱序 `a` 用例。
+3. NaN 只守在显示层的 3 个点，**入口 `recordCall` 用 `?? 0` 不挡 NaN/Infinity** ⇒ 五个维度、
+   落盘、`/stats` 第一行全被污染；`foldMessage` 的 pending 也会把 NaN 带给工具维度。且既有用例
+   把整篇 `not.toContain('NaN')` 收窄成「只查缓存行」，第一行的坏值测不到。
+   修：`asFinite` 夹负数、`recordCall` / `foldMessage.pending` / `renderStatsText` 首行统一过守卫；
+   恢复整篇 NaN 断言 + 补 NaN 入口用例。
+
+**bench / tools-manager（3 个）**
+4. bench 只读性两条用例的期望值都从 `MUTATES_STATE_TOOLS` 自己算 —— 与实现同源，集合漏项时
+   全部用例照样绿。修：补一份独立硬编码的 7 个写工具名单作 oracle。
+5. tools-manager `/tools <id> off` 在**通配白名单**下没做未知 id 校验（与刚补的 `on` 校验不对称）：
+   拼错 id 会把 `['*']` 展开成显式列表写进 config.json，此后未加载 / 懒加载 / 未连接的 MCP 工具被
+   永久排除，还广播 `tool.disabled`。修：wildcard 分支加对称校验 + 用例。
+6. tools-manager 的 `cli.command` 只有 `try/finally`、**没有 catch**，而 CLI 侧
+   `try { await trigger } catch { /* 忽略 */ }` 吞掉插件异常、finally 又无条件置 `result='continue'`
+   ⇒ 持久化 / 发布失败时用户零输出、看起来像成功。修：把 `out` 提到 try 外加 `catch` 明确报错 + 用例。
+
+**两处加固（建议修里挑的高价值项）**
+- acp-context `defaultRuleSummary` 把判空从真值改成 `=== undefined`，`textOf` 返回空串时
+  拼出 `head\n…\n`（比旧版更脏）。修：改回真值判断 + 补空文本尾消息用例。
+- provider-mock「complete 与 stream 逐位一致」用例的期望值全取自 `complete()` 自身，两条路径
+  共用 `resolveTurn` ⇒ 同源实现一起错也全绿，且完全没断言 tool_use 事件序列。修：补硬编码
+  usage 五列 / finish / `tool_use_*` 序列断言。
+
+审查还列了若干「修了但没修全」的残留（OTLP 之外的 acp-context 空块/CRLF 边界、bench
+`item_ids` 缺省静默写状态、`--global off` 被 assemble 复活、provider-mock `guard()` 漏检
+tool_use_delta 前中断等），多为分支声称范围外的既有取舍，本轮**未动**，避免过度扩张。
+
+### 验证
+
+- **反向验证 8 组**（先写预测、cp 备份、变异、`shasum -a 256 -c` 还原 10/10 OK、无残留）：
+  ①不复制 inc ②删 hourly 排序 ③NaN 入口失守 ④off 无校验 ⑤去掉 catch ⑥tail 判空回退
+  ⑦集合漏一项 ⑧toUsage total 算错 ⇒ **8 组各红 1，与预测一致**。
+  ⚠️ ⑥首跑「0 红」是 `-t` 过滤名没匹配到（断言加在 `defaultRuleSummary` 用例内部、不是独立
+  用例），按协议追查后用正确 pattern 重跑 ⇒ 红 1。记录在此以免把「pattern 不匹配」误当断言失效。
+- 五个受影响包：typecheck 均 0 error；usage **55** / bench **75** / tools-manager **26** /
+  acp-context **134** / provider-mock **27** pass，均 0 fail。
+- 合并+修复后最终状态：`typecheck` 49 包 **0 error**；`test` **3450 pass / 0 fail**（49 包 exit 0，
+  原 3389 → +61）；`build` **49/49 exit 0**；`adapters/vscode` 自口径 0 error / **276 pass**。
+
 ## 2026-11-09（续 293）三条新重构分支审查 + 合入 main（这次真有问题，已修）
 
 盘点：`refactor/auto-20261107`（mcp-client / mcp-server-registry，2 提交）、
