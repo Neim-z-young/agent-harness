@@ -560,10 +560,27 @@ describe('契约保真度', () => {
       const done = await pc.complete({ providerId: 'mock', messages: msgs(c.text), params: {} })
 
       let streamed = ''
+      const types: string[] = []
       let last: { model?: string; tokenUsage?: unknown; finish?: string } | undefined
       for await (const ch of ps.stream({ providerId: 'mock', messages: msgs(c.text), params: {} })) {
+        types.push(ch.type)
         if (ch.type === 'text_delta') streamed += ch.text
         if (ch.type === 'done') last = ch
+      }
+
+      // ★ 下面四条只是「两条路径一致」，同源实现一起错也全绿。补硬编码 oracle：
+      //   usage 五列、finish、以及 tool_use_* 事件序列必须独立可判。
+      if (c.name === '规则命中 + 缓存用量') {
+        expect(done.content).toBe('K')
+        expect(done.finish).toBe('stop')
+        expect(done.tokenUsage).toStrictEqual({ input: 9, output: 4, total: 13, cacheRead: 7, cacheWrite: 3 })
+      }
+      if (c.name === '工具调用') {
+        expect(done.finish).toBe('tool_calls')
+        expect(types.filter((t) => t.startsWith('tool_use'))).toStrictEqual([
+          'tool_use_start', 'tool_use_delta', 'tool_use_stop',
+        ])
+        expect(types[types.length - 1]).toBe('done')
       }
 
       expect(streamed).toBe(done.content)
