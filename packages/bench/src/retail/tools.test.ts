@@ -629,6 +629,25 @@ describe('只读性派生（readOnly 唯一来源 = MUTATES_STATE_TOOLS）', () 
     const ids = new Set(buildRetailHarnessTools(makeDb()).map((t) => t.id))
     for (const name of MUTATES_STATE_TOOLS) expect(ids.has(name)).toBe(true)
   })
+
+  it('★独立硬编码的写工具名单：集合漏项时也必须红', () => {
+    // 上面两条的期望值都从 MUTATES_STATE_TOOLS 自己算出来 —— 与实现同源，
+    // 集合本身漏掉一个写工具时全部用例照样绿。这里写死一份独立 oracle。
+    const expectedMutating = [
+      'cancel_pending_order',
+      'exchange_delivered_order_items',
+      'modify_pending_order_address',
+      'modify_pending_order_items',
+      'modify_pending_order_payment',
+      'modify_user_address',
+      'return_delivered_order_items',
+    ]
+    expect([...MUTATES_STATE_TOOLS].sort()).toStrictEqual([...expectedMutating].sort())
+    const tools = buildRetailHarnessTools(makeDb())
+    for (const name of expectedMutating) {
+      expect(tools.find((t) => t.id === name)?.isReadOnly?.()).toBe(false)
+    }
+  })
 })
 
 describe('createRetailPlugin', () => {
