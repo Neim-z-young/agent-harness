@@ -2148,7 +2148,9 @@ export function defaultRuleSummary(window: Message[]): string {
   const tail = window.length > 1 ? textOf(window[window.length - 1]) : undefined
   // 只有 tail 存在时才拼进来：此前写成 `[head, tail ? … : ''].join('\n')` ⇒ 单条窗口的
   // 摘要尾巴上会多一个换行（既脏了块摘要，又让下面的 2000 字截断点偏一位）。
-  const joined = tail === undefined ? head : [head, `…\n${tail}`].join('\n')
+  // ★ 用真值判断而非 `=== undefined`：textOf 对「工具消息无 result/input」或空 parts
+  //   返回空字符串，=== undefined 会拼出 `head\n…\n` 这种比旧版更脏的尾巴。
+  const joined = tail ? [head, `…\n${tail}`].join('\n') : head
   return joined.length > 2000 ? `${joined.slice(0, 2000)}…` : joined
 }
 

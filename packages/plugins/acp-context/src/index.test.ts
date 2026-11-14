@@ -855,6 +855,11 @@ test('defaultRuleSummary：单条窗口不留尾换行、首尾拼接、超长�
 
   // 空窗口：不抛错，返回空串（窗口闸在无可压原文时会走到这里）
   expect(defaultRuleSummary([])).toBe('')
+
+  // ★ 尾消息文本为空（工具消息缺 result / parts 为空）时不能拼出多余的 `…\n`
+  const emptyTail = defaultRuleSummary([msg('user', '开头', 0), msg('assistant', '', 1)])
+  expect(emptyTail).toBe('开头')
+  expect(emptyTail.endsWith('\n')).toBe(false)
 })
 
 test('四个工具对「无上下文会话」返回同一份拒绝（NO_CTX 文案不漂移）', async () => {
