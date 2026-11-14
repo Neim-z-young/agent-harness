@@ -193,9 +193,12 @@ function accumulateRows<T>(
     next[at] = add(next[at]!, inc)
     return next
   }
-  if (!order) return [...rows, inc]
+  // ★ 未命中也必须复制 inc：mergeUsage 的注释承诺「不把 b 的行对象直接塞进结果」，
+  //   否则 b 独有的行全是裸引用，调用方改返回体会连带改到入参 b。
+  const fresh = { ...inc }
+  if (!order) return [...rows, fresh]
   const insertAt = rows.findIndex((r) => order(r, inc) > 0)
-  return insertAt === -1 ? [...rows, inc] : [...rows.slice(0, insertAt), inc, ...rows.slice(insertAt)]
+  return insertAt === -1 ? [...rows, fresh] : [...rows.slice(0, insertAt), fresh, ...rows.slice(insertAt)]
 }
 
 /** 计数列相加（calls / input / output / cacheRead / cacheWrite），只动计数列、保留分区键 */
@@ -224,10 +227,12 @@ export function recordCall(usage: UsageStats, rec: CallRecord = {}): UsageStats 
   // `rec.model ? (rec.agentId || 'root') : 'root'` 会在"消息带 tokenUsage 但没有 model"
   // 时把子 agent 的用量静默记到 root 名下 —— 而 foldMessage 恰好就是那么传的。）
   const agentId = rec.agentId || 'root'
-  const i = rec.input ?? 0
-  const o = rec.output ?? 0
-  const cr = rec.cacheRead ?? 0
-  const cw = rec.cacheWrite ?? 0
+  // ★ 入口就守：`?? 0` 只挡 nullish，NaN/Infinity 会一路污染五个维度、落盘与
+  //   /stats 文案。asFinite 是显示层变量，但函数声明会提升，可以直接在这里用。
+  const i = asFinite(rec.input ?? 0)
+  const o = asFinite(rec.output ?? 0)
+  const cr = asFinite(rec.cacheRead ?? 0)
+  const cw = asFinite(rec.cacheWrite ?? 0)
   const ts = rec.ts ?? Date.now()
 
   const tally: TokenTally = { calls: 1, inputTokens: i, outputTokens: o, cacheRead: cr, cacheWrite: cw }
@@ -325,7 +330,8 @@ export function recordTaskDone(usage: UsageStats, agentId?: string): UsageStats 
  * 宁可显示 0（并在类型上标注这是"不知道"，见 cacheHitRate 的注释），也不要显示 NaN。
  */
 function asFinite(n: number): number {
-  return Number.isFinite(n) ? n : 0
+  // 负数同样是坏值（token 计数不可能为负）；与「非法输入一律归 0」的注释对齐。
+  return Number.isFinite(n) ? Math.max(0, n) : 0
 }
 
 /** 未命中缓存（需实际计费）的输入 token */
@@ -446,6 +452,9 @@ export function mergeUsage(a: UsageStats, b: UsageStats): UsageStats {
 
   let hourly = a.hourly
   for (const h of b.hourly) hourly = accumulateRows(hourly, h, (x, y) => x.hour === y.hour, addTally, (x, y) => x.hour - y.hour)
+  // ★ 有序插入只在 a.hourly 本身有序时成立；旧落盘记录 / 外部构造可能是乱序，
+  //   在乱序数组上 findIndex(>0) 会插错位置。恢复一次排序，兑现文档「保持升序」的承诺。
+  hourly = [...hourly].sort((x, y) => x.hour - y.hour)
 
   return {
     llmCalls: a.llmCalls + b.llmCalls,
@@ -629,7 +638,7 @@ export function foldMessage(u: UsageStats, m: UsageMessageLike, state: UsageFold
       cacheWrite: tu.cacheWrite,
       ts: typeof m.createdAt === 'number' ? m.createdAt : undefined,
     })
-    state.pending = { input: tu.input ?? 0, output: tu.output ?? 0 }
+    state.pending = { input: asFinite(tu.input ?? 0), output: asFinite(tu.output ?? 0) }
     state.attributed = false
   }
   for (const p of m.parts ?? []) {
@@ -676,7 +685,7 @@ export function usageFromMessages(messages: readonly UsageMessageLike[]): UsageS
 /** 详细统计文本报告（/stats 命令输出，纯文本） */
 export function renderStatsText(u: UsageStats): string {
   const lines: string[] = []
-  lines.push(`LLM 调用 ${u.llmCalls} 次 · in ${u.inputTokens} / out ${u.outputTokens}`)
+  lines.push(`LLM 调用 ${asFinite(u.llmCalls)} 次 · in ${asFinite(u.inputTokens)} / out ${asFinite(u.outputTokens)}`)
   if (u.cacheReadTokens > 0 || u.cacheWriteTokens > 0) {
     // 命中/写入的**原始值**也必须过 asFinite：cacheHitRate 守住了百分比、
     // uncachedInput 守住了未命中，唯独这两个直接插值的字段此前原样输出 ⇒

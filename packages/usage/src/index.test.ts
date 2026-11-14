@@ -146,8 +146,7 @@ describe('mergeUsage / sumUsage', () => {
   })
 
   it('recordCall 自己就把小时桶插在升序位置（不能指望 mergeUsage 事后排）', () => {
-    // 覆盖缺口（反向验证实测）：上面那条「不同小时桶各自保留并升序」全程走 mergeUsage，
-    // 而 mergeUsage 末尾会自己 sort ⇒ 把 recordCall 的升序插入去掉，那条用例照样绿。
+    // 覆盖缺口（反向验证实测）：上面那条「不同小时桶各自保留并升序」全程走 mergeUsage。
     // 引擎的增量折叠路径**只**调 recordCall、不经过 mergeUsage，所以必须直接钉它：
     // 乱序到达的时间戳（真机上跨小时、甚至时钟回拨）也得插在正确位置，
     // 否则当日截取（usageSince 按 hour 前缀比较）与时间序列会错位。
@@ -157,6 +156,35 @@ describe('mergeUsage / sumUsage', () => {
     u = recordCall(u, { model: 'm', input: 3, output: 3, ts: at(0, 9) })
     expect(u.hourly.map((h) => h.hour)).toStrictEqual([at(0, 8), at(0, 9), at(0, 10)])
     expect(u.hourly.map((h) => h.inputTokens)).toStrictEqual([2, 3, 1])
+  })
+
+  it('★recordCall 喂 NaN/Infinity：入口归 0，五个维度与落盘都不被污染', () => {
+    const u = recordCall(emptyUsage(), { model: 'm', input: NaN, output: Infinity, cacheRead: -1, cacheWrite: 3, ts: at(0, 8) })
+    expect(u.inputTokens).toBe(0)
+    expect(u.outputTokens).toBe(0)
+    expect(u.cacheReadTokens).toBe(0)
+    expect(u.providers[0]!.inputTokens).toBe(0)
+    expect(u.models[0]!.outputTokens).toBe(0)
+    expect(u.hourly[0]!.inputTokens).toBe(0)
+    expect(JSON.stringify(u)).not.toContain('null') // NaN/Infinity 序列化成 null
+  })
+
+  it('★mergeUsage 传入乱序 a.hourly 仍保证升序', () => {
+    let a = emptyUsage()
+    a = recordCall(a, { model: 'm', input: 1, output: 1, ts: at(0, 10) })
+    a = recordCall(a, { model: 'm', input: 2, output: 2, ts: at(0, 8) })
+    const shuffled = { ...a, hourly: [...a.hourly].reverse() }
+    expect(shuffled.hourly.map((h) => h.hour)).toStrictEqual([at(0, 10), at(0, 8)]) // 前提：输入确实乱序
+    expect(mergeUsage(shuffled, emptyUsage()).hourly.map((h) => h.hour)).toStrictEqual([at(0, 8), at(0, 10)])
+  })
+
+  it('★mergeUsage 返回体不与入参 b 共享行对象', () => {
+    let b = emptyUsage()
+    b = recordCall(b, { model: 'm', input: 1, output: 1, ts: at(0, 8) })
+    const merged = mergeUsage(emptyUsage(), b)
+    expect(merged.providers).toHaveLength(1)
+    merged.providers[0]!.calls = 99
+    expect(b.providers[0]!.calls).toBe(1)
   })
 
   it('sumUsage 汇总多个会话', () => {
@@ -270,6 +298,9 @@ describe('usageFromMeta / 杂项', () => {
       .find((l) => l.startsWith('缓存：'))
     expect(nanLine).toBeDefined() // 证明真的走到了缓存行
     expect(nanLine).not.toContain('NaN')
+    // ★ 不能只守缓存行：第一行 `in ${u.inputTokens}` 与下面各 row 也会把 NaN 打进报告。
+    //   早期用例把整篇断言收窄成单行，于是第一行的坏值一直没被抓到。
+    expect(renderStatsText(base({ inputTokens: NaN, cacheReadTokens: NaN, cacheWriteTokens: 5 }))).not.toContain('NaN')
     // 未命中 = 已知项相减，非有限项按 0 计（与命中率同口径）
     expect(uncachedInput(base({ inputTokens: 1000, cacheReadTokens: NaN, cacheWriteTokens: 5 }))).toBe(995)
     expect(uncachedInput(base({ inputTokens: NaN, cacheReadTokens: 1, cacheWriteTokens: 1 }))).toBe(0)
