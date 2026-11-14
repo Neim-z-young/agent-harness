@@ -372,6 +372,30 @@ describe('tools-manager 边界与契约', () => {
     expect(saved.length).toBe(0)           // 关键：config.json 里不留垃圾条目
   })
 
+  it('★ off 一个不存在的工具（通配白名单）⇒ 拒绝，不展开写坏 config.json', async () => {
+    const h = await getHooks()
+    const { harness, out, saved } = makeHarness([mkTool('bash'), mkTool('read_file')], ['*'])
+    await run(h, 'bogus_tool off', { harness, out, saved })
+    expect(out.join('')).toContain('不存在')
+    expect(saved.length).toBe(0)
+    expect(out.join('')).not.toContain('转为显式白名单')
+  })
+
+  it('★ 持久化抛错 ⇒ 明确报错，不静默伪装成功', async () => {
+    const h = await getHooks()
+    const { harness } = makeHarness([mkTool('bash'), mkTool('read_file')], ['read_file'])
+    const out: string[] = []
+    const input = {
+      command: 'tools', raw: 'bash on', arg: 'bash on', sessionId: 's',
+      out: (s: string) => { out.push(s) }, harness, agentId: 'default',
+      setAgentTools: async () => { throw new Error('disk full') },
+    } as unknown as CliCommandInput
+    await h['cli.command']?.(input)
+    expect(out.join('')).toContain('执行失败')
+    expect(out.join('')).toContain('disk full')
+    expect(out.join('')).not.toContain('已启用工具')
+  })
+
   it('uninstall 把 --global off 卸下的工具还回注册池', async () => {
     const plugin = createToolsManagerPlugin()
     const h = (await plugin.install({ bus: makeBus() } as never)) as Hooks

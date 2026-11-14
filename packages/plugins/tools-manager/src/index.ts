@@ -338,8 +338,9 @@ export function createToolsManagerPlugin(): AgentPlugin {
     async 'cli.command'(input: CliCommandInput) {
       if (input.command !== 'tools') return
       const inp = input as ToolsCtx
+      const out = inp.out // 提到 try 外：catch 里也要能报错
       try {
-        const { out, harness } = inp
+        const { harness } = inp
         // 记下工具池：uninstall 时靠它把 `--global off` 卸下的工具还回去（见 toolsRegistry 注释）
         toolsRegistry = harness.tools
         const tokens = inp.arg.trim().split(/\s+/).filter(Boolean)
@@ -481,6 +482,12 @@ export function createToolsManagerPlugin(): AgentPlugin {
           return
         }
         if (wildcard) {
+          // ★ 与 on 分支对称：通配白名单下拼错 id 会把 ['*'] 展开成显式列表写进
+          //   config.json，此后未加载 / 懒加载 / 未连接的 MCP 工具被永久排除，还会广播 tool.disabled。
+          if (!harness.tools.get(toolArg) && !inp.toolMeta?.get(toolArg)) {
+            out(`工具 "${toolArg}" 不存在（既未注册，也不在内置元信息中），未改动白名单。先用 /tools --all 确认 id。\n`)
+            return
+          }
           // 默认全部 → 移除一个需展开为显式白名单（除目标外全部注册工具）
           const allIds = harness.tools.list().map((t) => t.id)
           out(`注意：Agent 白名单当前为全允许（*），"${toolArg}" 将转为显式白名单（除 ${toolArg} 外全部允许）后持久化。\n`)
@@ -491,6 +498,11 @@ export function createToolsManagerPlugin(): AgentPlugin {
         await inp.setAgentTools(inp.agentId, cur.filter((id) => id !== toolArg))
         await emitToolLifecycle(toolArg, inp.agentId, false)
         out(`已禁用工具 "${toolArg}" 并写入 config.json（Agent「${inp.agentId}」白名单）。\n`)
+      } catch (err) {
+        // ★ CLI 侧用 `try { await trigger } catch { /* 忽略 */ }` 吞掉插件异常，
+        //   而 finally 又无条件把 result 置成 continue ⇒ 不在这里 catch 就变成
+        //   「零输出、看起来像成功」。持久化 / 发布失败必须明确报出来。
+        out(`❌ /tools 执行失败：${err instanceof Error ? err.message : String(err)}\n`)
       } finally {
         // 关键：标记命令已处理，避免 cli 因未设 result 而 fallthrough 到"未知命令"
         input.result = 'continue'
